@@ -62,7 +62,7 @@ impl SqliteReadPool {
     }
 
     fn reject_write() -> DbErr {
-        DbErr::Custom("write attempted through the SQLite read pool".to_owned())
+        DbErr::Custom("write attempted through the database read pool".to_owned())
     }
 
     fn ensure_read_statement(statement: &Statement) -> Result<(), DbErr> {
@@ -74,10 +74,17 @@ impl SqliteReadPool {
     }
 
     fn max_connections(&self) -> u32 {
-        self.connection
-            .get_sqlite_connection_pool()
-            .options()
-            .get_max_connections()
+        if self.connection.get_database_backend() == DbBackend::Postgres {
+            self.connection
+                .get_postgres_connection_pool()
+                .options()
+                .get_max_connections()
+        } else {
+            self.connection
+                .get_sqlite_connection_pool()
+                .options()
+                .get_max_connections()
+        }
     }
 
     async fn query_only_enabled(&self, class: SqliteReadClass) -> Result<bool, DbErr> {
@@ -87,17 +94,25 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
+            let backend = self.connection.get_database_backend();
+            let sql = if backend == DbBackend::Postgres {
+                "SELECT current_setting('transaction_read_only') AS query_only"
+            } else {
+                "PRAGMA query_only"
+            };
             let row = observe_control(
-                self.connection.query_one_raw(Statement::from_string(
-                    DbBackend::Sqlite,
-                    "PRAGMA query_only".to_owned(),
-                )),
+                self.connection
+                    .query_one_raw(Statement::from_string(backend, sql)),
                 "bootstrap",
             )
             .in_pool(reader_pool_context(class))
             .await?
-            .ok_or_else(|| DbErr::Custom("PRAGMA query_only returned no row".to_owned()))?;
-            Ok(row.try_get::<i64>("", "query_only")? != 0)
+            .ok_or_else(|| DbErr::Custom("read-only pool check returned no row".to_owned()))?;
+            if backend == DbBackend::Postgres {
+                Ok(row.try_get::<String>("", "query_only")? == "on")
+            } else {
+                Ok(row.try_get::<i64>("", "query_only")? != 0)
+            }
         }
         .await;
         operation.finish(if result.is_ok() {
@@ -166,6 +181,7 @@ impl SqliteReadPool {
         result
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn read_blob_range(
         &self,
         class: SqliteReadClass,
@@ -323,11 +339,15 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
-            // Read-only access belongs to the physical reader connection and
-            // this wrapper's guards. SQLite ignores transaction AccessMode.
-            let transaction = observe_control(self.connection.begin(), "begin")
-                .in_pool(reader_pool_context(class))
-                .await?;
+            let transaction = observe_control(
+                self.connection.begin_with_config(
+                    Some(IsolationLevel::RepeatableRead),
+                    Some(AccessMode::ReadOnly),
+                ),
+                "begin",
+            )
+            .in_pool(reader_pool_context(class))
+            .await?;
             Ok((transaction, permit))
         }
         .await;
@@ -522,7 +542,7 @@ impl StreamTrait for SqliteReadTransaction {
     }
 }
 
-/// Typed SQLite runtime with independent read and write contours.
+/// Scoped database access with independent read and write pools.
 ///
 /// Calls which return rows are classified from the actual SQL so that
 /// `INSERT`, `UPDATE`, and `DELETE ... RETURNING` still use the writer. All
@@ -543,16 +563,7 @@ impl SqliteDatabase {
     }
 
     pub(crate) async fn settle_dispatched_writes(&self) -> Result<(), DbErr> {
-        // A control fence, not a domain query. The single physical writer
-        // executes it after earlier dispatched commands (including rollback).
-        // This is used only following an unknown mutation outcome.
-        self.writer_connection()
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1".to_owned(),
-            ))
-            .await?;
-        Ok(())
+        self.writer.settle_dispatched_writes(self.write_class).await
     }
 
     /// Stable across scheduling-class clones. Intended for process-local test
@@ -641,7 +652,7 @@ impl SqliteDatabase {
         self.reader.ping(self.read_class).await?;
         if !self.reader.query_only_enabled(self.read_class).await? {
             return Err(DbErr::Custom(
-                "SQLite read pool is not protected by PRAGMA query_only".to_owned(),
+                "Gateway read pool requires read-only transactions".to_owned(),
             ));
         }
         Ok(())
@@ -667,6 +678,7 @@ impl SqliteDatabase {
     /// can walk the overflow prefix again. No cursor survives between ranges.
     /// Cancellation drops admission/pool/handle waits; the synchronous native
     /// call finishes before cancellation can be observed, without detached work.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn read_blob_range(
         &self,
         source: crate::SqliteBlobSource,

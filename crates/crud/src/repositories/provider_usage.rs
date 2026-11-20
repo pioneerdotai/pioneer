@@ -4,8 +4,8 @@ use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::provider_usage_observation as journal;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +213,14 @@ impl CrudStore {
             .map(str::to_owned);
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
+            // The first journal revision has no row to lock. SeaORM has no
+            // transaction-scoped advisory lock API for this compare-and-set.
+            tx.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+                [record.id.clone().into(), 0x7069_6f6e_7573_6701_i64.into()],
+            ))
+            .await?;
             ensure!(
                 pioneer_entity::workspace::Entity::find_by_id(&record.workspace_id)
                     .one(&tx)

@@ -14,15 +14,47 @@ use pioneer_keystore::{
     DbKeyStoreConfig, SecretEntryMeta, SecretKind, inspect_keystore_sqlite_files,
     inspect_private_runtime_dir,
 };
+use pioneer_tasks::{TaskRuntimeInvariantReport, TaskRuntimeInvariantScanner};
 use serde::Serialize;
 
 pub use pioneer_keystore::{SecretPermissionHealthReport, SecretPermissionHealthStatus};
 
-use crate::database::{
-    gateway_database_path, initialize_existing_for_operations, read_existing_for_operations,
-};
+use crate::database::{OperatorAccess, with_existing_database};
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::secrets::GatewaySecrets;
+
+pub async fn task_runtime_invariants(
+    config: &AppConfig,
+    runtime_home: &Path,
+    observed_at_unix: i64,
+    stale_turn_after_seconds: Option<i64>,
+) -> Result<TaskRuntimeInvariantReport> {
+    let mut scanner = TaskRuntimeInvariantScanner::new();
+    if let Some(seconds) = stale_turn_after_seconds {
+        scanner = scanner.with_stale_turn_after_seconds(seconds);
+    }
+    let report = with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::ReadOnly,
+        async |database| {
+            scanner
+                .scan_store(&CrudStore::new(database), observed_at_unix)
+                .await
+        },
+    )
+    .await?
+    .context("Gateway PostgreSQL database is missing")?;
+    if config.gateway.database.development_url.is_some() {
+        Ok(report)
+    } else {
+        Ok(report.with_db_path(
+            pioneer_postgres::data_directory(runtime_home)
+                .display()
+                .to_string(),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretsStatusReport {
@@ -92,7 +124,7 @@ pub async fn secrets_status(
     runtime_home: &Path,
 ) -> Result<SecretsStatusReport> {
     let storage_path = DbKeyStoreConfig::for_runtime_home(runtime_home).path;
-    let gateway_db_path = gateway_database_path(runtime_home, config)?;
+    let gateway_db_path = pioneer_postgres::data_directory(runtime_home);
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
     let entries = gateway_secrets.list_secret_entries()?;
     let counts = count_secret_kinds(entries.as_slice());
@@ -101,22 +133,27 @@ pub async fn secrets_status(
     permissions.push(inspect_private_runtime_dir(runtime_home));
     permissions.extend(inspect_keystore_sqlite_files(storage_path.as_path()));
 
-    let mcp_orphans = match read_existing_for_operations(runtime_home, config).await? {
-        Some(database) => {
+    let report = with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::ReadOnly,
+        async |database| {
             let crud_store = CrudStore::new(database);
-            let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
+            garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
                 .await
-                .context("failed to compute MCP orphan secret status")?;
-
-            McpSecretOrphanStatusReport {
-                available: true,
-                gateway_db_path,
-                active_refs: Some(report.active_refs),
-                stored_refs: Some(report.stored_refs),
-                orphan_refs: Some(report.orphan_refs),
-                unavailable_reason: None,
-            }
-        }
+                .context("failed to compute MCP orphan secret status")
+        },
+    )
+    .await?;
+    let mcp_orphans = match report {
+        Some(report) => McpSecretOrphanStatusReport {
+            available: true,
+            gateway_db_path,
+            active_refs: Some(report.active_refs),
+            stored_refs: Some(report.stored_refs),
+            orphan_refs: Some(report.orphan_refs),
+            unavailable_reason: None,
+        },
         None => McpSecretOrphanStatusReport {
             available: false,
             gateway_db_path,
@@ -145,19 +182,20 @@ pub async fn secrets_garbage_collection(
     runtime_home: &Path,
     dry_run: bool,
 ) -> Result<McpSecretGarbageCollectionReport> {
-    let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = read_existing_for_operations(runtime_home, config).await? else {
-        bail!(
-            "gateway database `{}` is missing; refusing to garbage collect MCP secrets",
-            gateway_db_path.display()
-        );
-    };
-
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
-    let crud_store = CrudStore::new(database);
-    let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, dry_run)
-        .await
-        .context("failed to garbage collect orphan MCP secrets")?;
+    let report = with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::ReadOnly,
+        async |database| {
+            let crud_store = CrudStore::new(database);
+            garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, dry_run)
+                .await
+                .context("failed to garbage collect orphan MCP secrets")
+        },
+    )
+    .await?
+    .context("Gateway database is missing; refusing to garbage collect MCP secrets")?;
 
     Ok(McpSecretGarbageCollectionReport {
         oauth_stored: report.oauth_stored,
@@ -184,11 +222,21 @@ pub async fn artifact_storage_usage(
     runtime_home: &Path,
     workspace_id: &str,
 ) -> Result<ArtifactWorkspaceUsage> {
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
-        .workspace_usage(workspace_id)
-        .await
-        .with_context(|| format!("failed to compute artifact storage usage for `{workspace_id}`"))
+    with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::ReadOnly,
+        async |database| {
+            artifact_service_for_database(config, runtime_home, database)
+                .workspace_usage(workspace_id)
+                .await
+                .with_context(|| {
+                    format!("failed to compute artifact storage usage for `{workspace_id}`")
+                })
+        },
+    )
+    .await?
+    .context("Gateway database is missing; refusing artifact operations")
 }
 
 pub async fn artifact_gc_dry_run(
@@ -197,11 +245,19 @@ pub async fn artifact_gc_dry_run(
     workspace_id: &str,
     now_unix_ms: i64,
 ) -> Result<ArtifactGcPlan> {
-    let service = open_artifact_service_for_operations(config, runtime_home).await?;
-    service
-        .gc_dry_run(workspace_id, now_unix_ms)
-        .await
-        .with_context(|| format!("failed to plan artifact GC for `{workspace_id}`"))
+    with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::ReadOnly,
+        async |database| {
+            artifact_service_for_database(config, runtime_home, database)
+                .gc_dry_run(workspace_id, now_unix_ms)
+                .await
+                .with_context(|| format!("failed to plan artifact GC for `{workspace_id}`"))
+        },
+    )
+    .await?
+    .context("Gateway database is missing; refusing artifact operations")
 }
 
 pub async fn artifact_gc_execute(
@@ -214,9 +270,25 @@ pub async fn artifact_gc_execute(
     if !execute {
         bail!("artifact GC execute requires execute=true; call dry-run first for visibility");
     }
-    let database = match initialize_existing_for_operations(runtime_home, config).await {
-        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {
-            return crate::transport::local_operations::request(
+    let result = with_existing_database(
+        runtime_home,
+        config,
+        OperatorAccess::Write,
+        async |database| {
+            artifact_service_for_database(config, runtime_home, database)
+                .gc_execute(workspace_id, now_unix_ms)
+                .await
+                .with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
+        },
+    )
+    .await;
+    match result {
+        Err(error)
+            if error
+                .downcast_ref::<pioneer_postgres::ClusterBusy>()
+                .is_some() =>
+        {
+            crate::transport::local_operations::request(
                 runtime_home,
                 config,
                 crate::transport::local_operations::Operation::ArtifactGc {
@@ -229,32 +301,10 @@ pub async fn artifact_gc_execute(
                     },
                 },
             )
-            .await;
+            .await
         }
-        result => result?.context("Gateway database missing; refusing artifact GC")?,
-    };
-    artifact_service_for_database(config, runtime_home, database)
-        .gc_execute(workspace_id, now_unix_ms)
-        .await
-        .with_context(|| format!("failed to execute artifact GC for `{workspace_id}`"))
-}
-
-async fn open_artifact_service_for_operations(
-    config: &AppConfig,
-    runtime_home: &Path,
-) -> Result<ArtifactService> {
-    let gateway_db_path = gateway_database_path(runtime_home, config)?;
-    let Some(database) = read_existing_for_operations(runtime_home, config).await? else {
-        bail!(
-            "gateway database `{}` is missing; refusing artifact operations",
-            gateway_db_path.display()
-        );
-    };
-    Ok(artifact_service_for_database(
-        config,
-        runtime_home,
-        database,
-    ))
+        result => result?.context("Gateway database is missing; refusing artifact GC"),
+    }
 }
 
 fn artifact_service_for_database(
@@ -352,40 +402,56 @@ mod tests {
     use sea_orm::ConnectionTrait;
 
     use super::*;
-    use crate::database::initialize as initialize_database;
+    use pioneer_postgres_test::with_database;
 
     #[tokio::test]
-    async fn status_counts_secret_kinds_and_reports_disabled_encryption() {
-        let runtime_home = unique_temp_dir("status-counts");
-        let config = test_app_config();
-        let secrets = GatewaySecrets::open(&runtime_home).expect("open secrets");
-        seed_all_secret_kinds(&runtime_home, &secrets);
-        seed_active_mcp_installation(&runtime_home, &config, "active_ref").await;
-
-        let report = secrets_status(&config, &runtime_home)
+    async fn task_invariant_scan_of_missing_cluster_does_not_initialize_it() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let error = task_runtime_invariants(&test_app_config(), home.path(), 0, None)
             .await
-            .expect("status report");
-
-        assert_eq!(report.encryption.enabled, false);
-        assert_eq!(report.encryption.mode, "disabled");
-        assert_eq!(report.counts.provider_api_key, 1);
-        assert_eq!(report.counts.mcp_secret, 2);
-        assert_eq!(report.counts.user_jwt_token, 1);
-        assert_eq!(report.counts.desktop_gateway_session, 1);
-        assert_eq!(report.total_entries, 5);
-        assert!(report.mcp_orphans.available);
-        assert_eq!(report.mcp_orphans.active_refs, Some(1));
-        assert_eq!(report.mcp_orphans.stored_refs, Some(2));
-        assert_eq!(report.mcp_orphans.orphan_refs, Some(1));
-
-        let serialized = serde_json::to_string(&report).expect("serialize report");
-        assert!(!serialized.contains("sk-provider-secret"));
-        assert!(!serialized.contains("mcp-active-secret"));
-        assert!(!serialized.contains("desktop-refresh-secret"));
+            .expect_err("missing database must fail");
+        assert!(error.to_string().contains("PostgreSQL database is missing"));
+        assert!(!home.path().join("postgres").exists());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_reports_mcp_orphans_unavailable_when_gateway_db_is_missing() {
+    async fn status_counts_secret_kinds_and_reports_disabled_encryption() -> anyhow::Result<()> {
+        with_database(async |fixture| {
+            let dir = tempfile::tempdir()?;
+            let runtime_home = dir.path().to_path_buf();
+            let config = postgres_test_config(fixture.url())?;
+            let secrets = GatewaySecrets::open(&runtime_home).expect("open secrets");
+            seed_all_secret_kinds(&runtime_home, &secrets);
+            seed_active_mcp_installation(fixture.connection(), "active_ref").await;
+
+            let report = secrets_status(&config, &runtime_home)
+                .await
+                .expect("status report");
+
+            assert_eq!(report.encryption.enabled, false);
+            assert_eq!(report.encryption.mode, "disabled");
+            assert_eq!(report.counts.provider_api_key, 1);
+            assert_eq!(report.counts.mcp_secret, 2);
+            assert_eq!(report.counts.user_jwt_token, 1);
+            assert_eq!(report.counts.desktop_gateway_session, 1);
+            assert_eq!(report.total_entries, 5);
+            assert!(report.mcp_orphans.available);
+            assert_eq!(report.mcp_orphans.active_refs, Some(1));
+            assert_eq!(report.mcp_orphans.stored_refs, Some(2));
+            assert_eq!(report.mcp_orphans.orphan_refs, Some(1));
+
+            let serialized = serde_json::to_string(&report).expect("serialize report");
+            assert!(!serialized.contains("sk-provider-secret"));
+            assert!(!serialized.contains("mcp-active-secret"));
+            assert!(!serialized.contains("desktop-refresh-secret"));
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn status_reports_mcp_orphans_unavailable_when_private_postgres_is_missing() {
         let runtime_home = unique_temp_dir("status-missing-db");
         let config = test_app_config();
 
@@ -398,64 +464,69 @@ mod tests {
             report.mcp_orphans.unavailable_reason.as_deref(),
             Some("gateway_db_missing")
         );
-        assert!(!runtime_home.join("gateway.db").exists());
+        assert!(!pioneer_postgres::data_directory(&runtime_home).exists());
     }
 
     #[tokio::test]
-    async fn gc_dry_run_keeps_orphan_and_apply_deletes_only_mcp_orphan() {
-        let runtime_home = unique_temp_dir("gc");
-        let config = test_app_config();
-        let secrets = GatewaySecrets::open(&runtime_home).expect("open secrets");
-        seed_all_secret_kinds(&runtime_home, &secrets);
-        seed_active_mcp_installation(&runtime_home, &config, "active_ref").await;
+    async fn gc_dry_run_keeps_orphan_and_apply_deletes_only_mcp_orphan() -> anyhow::Result<()> {
+        with_database(async |fixture| {
+            let dir = tempfile::tempdir()?;
+            let runtime_home = dir.path().to_path_buf();
+            let config = postgres_test_config(fixture.url())?;
+            let secrets = GatewaySecrets::open(&runtime_home).expect("open secrets");
+            seed_all_secret_kinds(&runtime_home, &secrets);
+            seed_active_mcp_installation(fixture.connection(), "active_ref").await;
 
-        let dry_run = secrets_garbage_collection(&config, &runtime_home, true)
-            .await
-            .expect("dry-run gc");
-        assert!(dry_run.dry_run);
-        assert_eq!(dry_run.orphan_refs, 1);
-        assert_eq!(dry_run.deleted_refs, 0);
-        assert_eq!(
-            secrets
-                .get_mcp_secret("orphan_ref")
-                .expect("read orphan after dry-run"),
-            Some("mcp-orphan-secret".to_owned())
-        );
+            let dry_run = secrets_garbage_collection(&config, &runtime_home, true)
+                .await
+                .expect("dry-run gc");
+            assert!(dry_run.dry_run);
+            assert_eq!(dry_run.orphan_refs, 1);
+            assert_eq!(dry_run.deleted_refs, 0);
+            assert_eq!(
+                secrets
+                    .get_mcp_secret("orphan_ref")
+                    .expect("read orphan after dry-run"),
+                Some("mcp-orphan-secret".to_owned())
+            );
 
-        let applied = secrets_garbage_collection(&config, &runtime_home, false)
-            .await
-            .expect("apply gc");
-        assert!(!applied.dry_run);
-        assert_eq!(applied.orphan_refs, 1);
-        assert_eq!(applied.deleted_refs, 1);
-        assert_eq!(
-            secrets
-                .get_mcp_secret("active_ref")
-                .expect("read active after gc"),
-            Some("mcp-active-secret".to_owned())
-        );
-        assert_eq!(
-            secrets
-                .get_mcp_secret("orphan_ref")
-                .expect("read orphan after gc"),
-            None
-        );
-        assert_eq!(
-            secrets
-                .get_provider_api_key("openrouter")
-                .expect("provider key should remain"),
-            Some("sk-provider-secret".to_owned())
-        );
+            let applied = secrets_garbage_collection(&config, &runtime_home, false)
+                .await
+                .expect("apply gc");
+            assert!(!applied.dry_run);
+            assert_eq!(applied.orphan_refs, 1);
+            assert_eq!(applied.deleted_refs, 1);
+            assert_eq!(
+                secrets
+                    .get_mcp_secret("active_ref")
+                    .expect("read active after gc"),
+                Some("mcp-active-secret".to_owned())
+            );
+            assert_eq!(
+                secrets
+                    .get_mcp_secret("orphan_ref")
+                    .expect("read orphan after gc"),
+                None
+            );
+            assert_eq!(
+                secrets
+                    .get_provider_api_key("openrouter")
+                    .expect("provider key should remain"),
+                Some("sk-provider-secret".to_owned())
+            );
 
-        let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(&runtime_home))
-            .expect("open raw store");
-        assert_eq!(
-            store
-                .list(SecretFilter::Kind(SecretKind::DesktopGatewaySession))
-                .expect("list desktop sessions")
-                .len(),
-            1
-        );
+            let store = DbKeyStore::open(DbKeyStoreConfig::for_runtime_home(&runtime_home))
+                .expect("open raw store");
+            assert_eq!(
+                store
+                    .list(SecretFilter::Kind(SecretKind::DesktopGatewaySession))
+                    .expect("list desktop sessions")
+                    .len(),
+                1
+            );
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
@@ -475,16 +546,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_gc_dry_run_and_execute_requires_explicit_apply() {
-        let runtime_home = unique_temp_dir("artifact-gc");
+    async fn artifact_gc_dry_run_and_execute_requires_explicit_apply() -> anyhow::Result<()> {
+        with_database(async |fixture| {
+        let dir = tempfile::tempdir()?;
+        let runtime_home = dir.path().to_path_buf();
         std::fs::create_dir_all(&runtime_home).expect("create runtime home");
-        let config = test_app_config();
-        let database = initialize_database(&runtime_home, &config)
-            .await
-            .expect("initialize gateway db");
+        let config = postgres_test_config(fixture.url())?;
+        let database = fixture.connect().await?;
         database
             .execute_unprepared(
-                "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_ops', 'Ops', 1, 1)",
+                "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_ops', 'Ops', true, false)",
             )
             .await
             .expect("insert workspace");
@@ -531,19 +602,22 @@ mod tests {
             .await
             .expect("execute artifact gc");
         assert_eq!(report.deleted_blobs, 1);
-        let crud_store = CrudStore::new(
-            read_existing_for_operations(&runtime_home, &config)
-                .await
-                .expect("open result reader")
-                .expect("existing gateway database"),
-        );
-        assert_eq!(
-            crud_store
-                .count_artifact_blobs_by_workspace("ws_ops")
-                .await
-                .expect("query blobs"),
-            0
-        );
+        let remaining = with_existing_database(
+            &runtime_home,
+            &config,
+            OperatorAccess::ReadOnly,
+            async |database| {
+                CrudStore::new(database)
+                    .count_artifact_blobs_by_workspace("ws_ops")
+                    .await
+            },
+        )
+        .await
+        .expect("query blobs")
+        .expect("existing gateway database");
+        assert_eq!(remaining, 0);
+            Ok(())
+        }).await
     }
 
     fn seed_all_secret_kinds(runtime_home: &Path, secrets: &GatewaySecrets) {
@@ -580,13 +654,13 @@ mod tests {
     }
 
     async fn seed_active_mcp_installation(
-        runtime_home: &Path,
-        config: &AppConfig,
+        database: &sea_orm::DatabaseConnection,
         active_ref: &str,
     ) {
-        let database = initialize_database(runtime_home, config)
+        database
+            .execute_unprepared("INSERT INTO workspace (id, name) VALUES ('ws_ops', 'Ops')")
             .await
-            .expect("initialize gateway db");
+            .expect("seed workspace");
         let crud_store = CrudStore::new(database);
         let record = McpServerInstallationRecord {
             id: None,
@@ -628,6 +702,14 @@ mod tests {
             .upsert_mcp_server_installation_with_audit(&record, &audit, 1_700_000_000)
             .await
             .expect("persist active MCP installation");
+    }
+
+    fn postgres_test_config(url: &url::Url) -> anyhow::Result<AppConfig> {
+        let mut config = test_app_config();
+        config.gateway.database.development_url = Some(serde_json::from_value(
+            serde_json::Value::String(url.to_string()),
+        )?);
+        Ok(config)
     }
 
     fn test_app_config() -> AppConfig {
@@ -680,7 +762,7 @@ mod tests {
                 voice: Default::default(),
                 provider: GatewayProviderConfig::default(),
                 database: GatewayDatabaseConfig {
-                    file_name: "gateway.db".to_owned(),
+                    development_url: None,
                     max_connections: 10,
                     connect_timeout_ms: 5_000,
                     acquire_timeout_ms: 5_000,

@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_lifecycle_pending")]
 pub struct Model {
+    pub attempts: i64,
+    pub eligible_at: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub retry_not_before: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
     pub generation: i64,
-    pub eligible_at: i64,
-    pub retry_not_before: i64,
     pub due_at: i64,
-    pub attempts: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub claim_token: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

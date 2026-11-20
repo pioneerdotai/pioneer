@@ -7,32 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_agent_spec")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub task_id: String,
-    pub run_id: Option<String>,
-    pub agent_role: Option<String>,
-    pub agent_nickname: Option<String>,
-    pub model: Option<String>,
-    pub model_provider: Option<String>,
+    pub result_contract_json: Option<Json>,
+    pub permission_cap_json: Option<Json>,
+    pub review_policy_json: Option<Json>,
+    pub tool_policy_json: Option<Json>,
+    pub security_cap_json: Option<Json>,
     #[sea_orm(column_type = "Text")]
-    pub prompt_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub context_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub tool_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub result_contract_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub review_policy_json: Option<String>,
-    pub depth: i64,
-    pub max_depth: i64,
+    pub task_id: String,
     pub created_at: DateTimeWithTimeZone,
+    pub depth: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub agent_nickname: Option<String>,
+    pub prompt_json: Json,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub model: Option<String>,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
-    pub permission_cap_json: Option<String>,
+    pub agent_role: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub security_cap_json: Option<String>,
+    pub run_id: Option<String>,
+    pub max_depth: i64,
+    pub context_policy_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub model_provider: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,21 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_history")]
 pub struct Model {
-    pub expired: i64,
+    pub import_count: i64,
+    pub next_import: i64,
+    #[sea_orm(column_type = "Text")]
+    pub owner_thread: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub owner_thread: String,
-    #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
-    pub message_count: i64,
     pub next_ordinal: i64,
-    pub import_count: i64,
     #[sea_orm(column_type = "Text")]
     pub imports_sha256: String,
-    pub next_import: i64,
+    pub message_count: i64,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    pub expired: i64,
     pub ready: i64,
     pub storage_registered: i64,
     #[sea_orm(has_many)]
@@ -41,7 +41,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",
@@ -49,7 +49,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -117,10 +117,10 @@ pub(super) async fn bootstrap_step(store: &CrudStore) -> Result<bool> {
                         .and_where(Expr::col(bootstrap::Column::Kind).eq(kind))
                         .and_where(Expr::col(bootstrap::Column::Complete).eq(0))
                         .and_where(Expr::col(bootstrap::Column::Started).eq(started))
-                        .and_where(
-                            Expr::col(bootstrap::Column::AfterManifest)
-                                .binary(BinOper::Is, Expr::val(after.clone())),
-                        )
+                        .and_where(Expr::col(bootstrap::Column::AfterManifest).binary(
+                            BinOper::Custom("IS NOT DISTINCT FROM"),
+                            Expr::val(after.clone()),
+                        ))
                         .to_owned(),
                 )
                 .await?
@@ -161,32 +161,35 @@ fn scope_witness_guard(id: &str, row: &sea_orm::QueryResult) -> Result<SelectSta
             .to_owned());
     }
     let witness: i64 = row.try_get("", "scope_row")?;
-    let (table, header, predicate) = match via {
+    let (table, header, predicate, ordinal) = match via {
         1 => (
             layout::Entity.into_table_ref(),
             layout::Column::ManifestId.into_iden(),
             layout::Column::Candidate.into_iden(),
+            layout::Column::InsertionOrdinal.into_iden(),
         ),
         2 => (
             layout::Entity.into_table_ref(),
             layout::Column::Candidate.into_iden(),
             layout::Column::ManifestId.into_iden(),
+            layout::Column::InsertionOrdinal.into_iden(),
         ),
         3 => (
             span::Entity.into_table_ref(),
             span::Column::ManifestId.into_iden(),
             span::Column::SourceManifest.into_iden(),
+            span::Column::InsertionOrdinal.into_iden(),
         ),
         4 => (
             span::Entity.into_table_ref(),
             span::Column::SourceManifest.into_iden(),
             span::Column::ManifestId.into_iden(),
+            span::Column::InsertionOrdinal.into_iden(),
         ),
         _ => anyhow::bail!("invalid frozen scope witness"),
     };
-    // rowid only locates a witness; current link/header predicates authorize
-    // scope. Reuse cannot forge known scope, and malformed legacy kind/start
-    // values do not introduce a stricter prerequisite than the original oracle.
+    // The insertion ordinal locates the witness; current link and header
+    // predicates authorize its scope.
     Ok(Query::select()
         .expr(Expr::val(1))
         .from_as(table, Alias::new("s"))
@@ -197,7 +200,7 @@ fn scope_witness_guard(id: &str, row: &sea_orm::QueryResult) -> Result<SelectSta
             Expr::col((Alias::new("h"), history::Column::Id))
                 .eq(Expr::col((Alias::new("s"), header))),
         )
-        .and_where(Expr::col((Alias::new("s"), Alias::new("rowid"))).eq(witness))
+        .and_where(Expr::col((Alias::new("s"), ordinal)).eq(witness))
         .and_where(Expr::col((Alias::new("s"), predicate)).eq(id))
         .and_where(Expr::col((Alias::new("h"), history::Column::WorkspaceId)).ne(""))
         .to_owned())
@@ -215,8 +218,7 @@ fn addressed_scope(targets: Option<&[String]>) -> Condition {
 }
 
 pub(super) async fn fanout_step(store: &CrudStore, targets: Option<&[String]>) -> Result<bool> {
-    // Explicit retained INTEGER PRIMARY KEY columns alias rowid, including
-    // across VACUUM. Freeze an insertion frontier for each fair service round.
+    // An explicit insertion ordinal bounds each service round.
     let cursor = store
         .connection
         .query_one(
@@ -347,10 +349,10 @@ pub(super) async fn fanout_step(store: &CrudStore, targets: Option<&[String]>) -
                         .and_where(Expr::col(consumer::Column::Kind).eq(kind))
                         .and_where(Expr::col(consumer::Column::Revision).eq(revision))
                         .and_where(Expr::col(consumer::Column::Pending).eq(1))
-                        .and_where(
-                            Expr::col(consumer::Column::AfterSource)
-                                .binary(BinOper::Is, Expr::val(after.clone())),
-                        )
+                        .and_where(Expr::col(consumer::Column::AfterSource).binary(
+                            BinOper::Custom("IS NOT DISTINCT FROM"),
+                            Expr::val(after.clone()),
+                        ))
                         .to_owned(),
                 )
                 .await?
@@ -452,9 +454,9 @@ pub(super) async fn discover(
         })
         .and_where(Expr::col(work::Column::Pending).eq(1))
         .and_where(Expr::col(work::Column::Kind).eq(kind))
-        .and_where(
-            Expr::col(work::Column::RetryAt).lte(Expr::expr(Func::cust(Alias::new("unixepoch")))),
-        )
+        .and_where(Expr::col(work::Column::RetryAt).lte(Expr::cust(
+            "floor(extract(epoch FROM statement_timestamp()))::bigint",
+        )))
         .limit(1);
     for (id, kind) in active {
         due.and_where(
@@ -464,27 +466,8 @@ pub(super) async fn discover(
                 .not(),
         );
     }
-    // SeaQuery's SQLite SELECT builder has no INDEXED BY API (its index hint
-    // extension is MySQL-only). Inject only the hint into builder-owned SQL;
-    // all projections/predicates/limits/values remain typed and bound.
-    let mut due = DbBackend::Sqlite.build(&due);
-    ensure!(
-        due.sql
-            .matches("FROM \"compaction_frozen_sweep_work\"")
-            .count()
-            == 1,
-        "unexpected sweep due table"
-    );
-    // Addressed IN seeks may use the existing manifest/kind unique key.
-    if targets.is_none() {
-        due.sql = due.sql.replacen(
-        "FROM \"compaction_frozen_sweep_work\"",
-        "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_pending\"",
-        1,
-    );
-    }
     // No due non-active work means idle without walking future-retry pages.
-    if store.connection.query_one_raw(due).await?.is_none() {
+    if store.connection.query_one(&due).await?.is_none() {
         round.complete = true;
         round.propagated = false;
         return Ok(Admission::Idle);
@@ -524,7 +507,9 @@ pub(super) async fn discover(
             work::Column::Revision,
         ])
         .expr_as(
-            Expr::col(work::Column::RetryAt).lte(Expr::expr(Func::cust(Alias::new("unixepoch")))),
+            Expr::col(work::Column::RetryAt).lte(Expr::cust(
+                "floor(extract(epoch FROM statement_timestamp()))::bigint",
+            )),
             Alias::new("due"),
         )
         .from(work::Entity)
@@ -541,30 +526,14 @@ pub(super) async fn discover(
         .order_by(work::Column::WorkRow, Order::Asc)
         .limit(16)
         .to_owned();
-    let mut page = DbBackend::Sqlite.build(&page);
-    ensure!(
-        page.sql
-            .matches("FROM \"compaction_frozen_sweep_work\"")
-            .count()
-            == 1,
-        "unexpected sweep service table"
-    );
-    // Addressed IN seeks may use the existing manifest/kind unique key.
-    if targets.is_none() {
-        page.sql = page.sql.replacen(
-        "FROM \"compaction_frozen_sweep_work\"",
-        "FROM \"compaction_frozen_sweep_work\" INDEXED BY \"compaction_frozen_sweep_work_service\"",
-        1,
-    );
-    }
-    let rows = store.connection.query_all_raw(page).await?;
+    let rows = store.connection.query_all(&page).await?;
     if rows.is_empty() {
         round.after_row = round.until_row;
     }
     for row in rows {
         round.after_row = row.try_get("", "work_row")?;
         let id: String = row.try_get("", "manifest_id")?;
-        if row.try_get::<i64>("", "due")? == 0 || active.contains(&(id.as_str(), kind)) {
+        if !row.try_get::<bool>("", "due")? || active.contains(&(id.as_str(), kind)) {
             continue;
         }
         return Ok(Admission::Selected(Work {
@@ -610,7 +579,7 @@ impl Work {
             .and_where(Expr::col((Alias::new("s"), span::Column::Kind)).eq(self.kind))
             .and_where(Expr::exists(pending))
             .to_owned();
-        DbBackend::Sqlite.build(
+        DbBackend::Postgres.build(
             &Query::select()
                 .expr(Expr::val(1))
                 .from(work::Entity)
@@ -644,7 +613,7 @@ impl Work {
                     // invalidation. It is not an error-owned clock retry.
                     Expr::val(0)
                 } else {
-                    Expr::expr(Func::cust(Alias::new("unixepoch"))).add(60)
+                    Expr::cust("floor(extract(epoch FROM statement_timestamp()))::bigint").add(60)
                 };
                 tx.execute(
                     &Query::update()

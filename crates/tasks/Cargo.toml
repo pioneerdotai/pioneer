@@ -25,7 +25,8 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 pioneer-crud = { workspace = true, features = ["test-support"] }
-pioneer-migration.workspace = true
+pioneer-crud-payloads.workspace = true
+pioneer-postgres-test.workspace = true
 pioneer-entity.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tempfile.workspace = true

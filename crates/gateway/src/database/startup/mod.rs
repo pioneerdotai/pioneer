@@ -1,13 +1,6 @@
 mod authorization_integrity_audit;
 mod execution_authority_integrity;
-mod execution_observability;
-mod html_preview_io;
-mod memory_storage_reset;
-mod task_child_work_seed;
 pub(crate) mod thread_episodic_refill;
-mod turn_event_projection_stream_state_backfill;
-mod turn_permission_profile_backfill;
-mod zstd_payload_compression;
 
 use crate::thread_episodic::ThreadEpisodicIndexExecutorConfig;
 use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
@@ -425,85 +418,16 @@ async fn run_inner(
     let trace = pioneer_observability::GatewayOperationTrace::start(
         pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,
     );
-    let mut failed = false;
-    macro_rules! run_stage {
-        ($stage:expr, $future:expr) => {{
-            if let Err(error) = maintenance_checkpoint().await {
-                trace.finish_cancelled();
-                return Err(error);
-            }
-            let stage = trace.stage($stage);
-            let cancellation = maintenance_cancellation();
-            let result = tokio::select! { biased;
-                _ = cancellation.cancelled() => Err(StartupMaintenanceCancelled.into()),
-                result = $future => result,
-            };
-            if let Err(error) = result {
-                if is_maintenance_cancelled(&error) {
-                    stage.cancel();
-                    trace.finish_cancelled();
-                    return Err(error);
-                } else {
-                    drop(stage);
-                    failed = true;
-                    tracing::warn!(error = %format!("{error:#}"), "Gateway startup maintenance stage failed");
-                }
-            } else {
-                stage.succeed();
-            }
-        }};
-    }
-    // No new startup gate: failure preserves compatibility discovery and the
-    // maintenance worker resumes durable seed obligations.
-    if let Err(error) = html_preview_io::run(crud_store.as_ref()).await {
+    if let Err(error) = authorization_integrity_audit::run(crud_store.as_ref()).await {
         if is_maintenance_cancelled(&error) {
             trace.finish_cancelled();
-            return Err(error);
+        } else {
+            trace.finish_failure();
         }
-        failed = true;
-        tracing::warn!("HTML preview IO seed deferred; compatibility discovery retained");
+        return Err(error);
     }
-    if let Err(error) = execution_observability::run(crud_store.as_ref()).await {
-        if is_maintenance_cancelled(&error) {
-            return Err(error);
-        }
-        failed = true;
-        tracing::warn!("execution observation legacy backfill incomplete");
-    }
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,
-        turn_event_projection_stream_state_backfill::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseAuthorizationIntegrityAudit,
-        authorization_integrity_audit::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTurnPermissionProfileBackfill,
-        turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabasePayloadCompression,
-        zstd_payload_compression::run(crud_store.as_ref())
-    );
-    run_stage!(
-        pioneer_observability::GatewayOperationStage::DatabaseTaskChildSeed,
-        task_child_work_seed::run(crud_store.as_ref())
-    );
     let refill_stage =
         trace.stage(pioneer_observability::GatewayOperationStage::DatabaseThreadEpisodicRefill);
-    if let Err(error) = memory_storage_reset::run(crud_store.as_ref(), runtime_home.as_path()).await
-    {
-        if is_maintenance_cancelled(&error) {
-            trace.finish_cancelled();
-            return Err(error);
-        }
-        failed = true;
-        tracing::warn!(
-            failure_class = "legacy_memory_reset",
-            "legacy memory storage reset deferred"
-        );
-    }
     let refill_cancellation = maintenance_cancellation();
     run_thread_episodic_refill(
         crud_store,
@@ -526,12 +450,7 @@ async fn run_inner(
         return Err(StartupMaintenanceCancelled.into());
     }
     refill_stage.succeed();
-    if failed {
-        trace.finish_failure();
-        anyhow::bail!("one or more Gateway startup maintenance stages failed");
-    } else {
-        trace.finish_success();
-    }
+    trace.finish_success();
     Ok(())
 }
 
@@ -766,150 +685,5 @@ mod tests {
 
         assert!(first_stopped.load(Ordering::Acquire));
         supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn legacy_memory_cleanup_resumes_pending_files_and_touches_only_owned_storage() {
-        use migration::{Migrator, MigratorTrait};
-        use sea_orm::Database;
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        let database = Database::connect({
-            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-            options
-                .max_connections(1)
-                .sqlx_logging(false)
-                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-            options
-        })
-        .await
-        .unwrap();
-        Migrator::up(&database, None).await.unwrap();
-        let store = CrudStore::new(database).with_maintenance_access();
-        use sea_orm::{ConnectionTrait, DbBackend, Statement};
-        let root = tempfile::tempdir().unwrap();
-        let owned = root.path().join("memory/capsules");
-        let locks = root.path().join("memory/locks");
-        let models = root.path().join("models");
-        let history = root.path().join("history");
-        for path in [&owned, &locks, &models, &history] {
-            tokio::fs::create_dir_all(path).await.unwrap();
-        }
-        let mut deep = owned.clone();
-        for _ in 0..20 {
-            deep = deep.join("d");
-        }
-        tokio::fs::create_dir_all(&deep).await.unwrap();
-        tokio::fs::write(deep.join("service.tmp"), b"obsolete")
-            .await
-            .unwrap();
-        for n in 0..65 {
-            tokio::fs::write(owned.join(format!("old-{n}.mv2")), b"derived")
-                .await
-                .unwrap();
-        }
-        tokio::fs::write(owned.join("service.json"), b"obsolete service state")
-            .await
-            .unwrap();
-        let protected = [
-            models.join("model.onnx"),
-            history.join("canonical.mv2"),
-            root.path().join("memory/notes.json"),
-        ];
-        for path in &protected {
-            tokio::fs::write(path, b"must survive").await.unwrap();
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&history, owned.join("foreign-history")).unwrap();
-        let live_lock = locks.join("workspace-live.lock");
-        let live = std::fs::File::create(&live_lock).unwrap();
-        fs4::FileExt::try_lock(&live).unwrap();
-        assert_eq!(
-            store
-                .reset_legacy_memory_payload_quantum(1_800_000_000)
-                .await
-                .unwrap(),
-            pioneer_crud::MemoryPayloadResetOutcome::FilesPending
-        );
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let canceled = STARTUP_MAINTENANCE_CANCELLATION
-            .scope(cancellation, memory_storage_reset::run(&store, root.path()))
-            .await;
-        assert!(is_maintenance_cancelled(&canceled.unwrap_err()));
-        assert!(!store.legacy_memory_tree_cleanup_complete().await.unwrap());
-        assert!(owned.join("old-0.mv2").exists());
-        // An already-complete v1 checkpoint still owes full tree removal.
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "UPDATE thread_timeline_projection_meta SET status='complete',projection_version=1 WHERE projection_key=?", ["memory_sqlite_payload_reset_v1".into()])).await.unwrap();
-        let legacy_path = owned.join("held.lock");
-        let legacy = std::fs::File::create(&legacy_path).unwrap();
-        fs4::FileExt::try_lock(&legacy).unwrap();
-        assert!(
-            memory_storage_reset::run(&store, root.path())
-                .await
-                .is_err()
-        );
-        assert!(legacy_path.exists(), "held inode must not be unlinked");
-        assert!(!store.legacy_memory_tree_cleanup_complete().await.unwrap());
-        fs4::FileExt::unlock(&legacy).unwrap();
-        drop(legacy);
-        // Fresh facade represents restart; durable version remains authoritative.
-        let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
-        memory_storage_reset::run(&restarted, root.path())
-            .await
-            .unwrap();
-        assert!(!owned.exists());
-        assert!(root.path().join("memory").is_dir());
-        assert!(locks.is_dir() && live_lock.exists());
-        assert!(store.legacy_memory_tree_cleanup_complete().await.unwrap());
-        for path in &protected {
-            assert_eq!(tokio::fs::read(path).await.unwrap(), b"must survive");
-        }
-        let competing = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&live_lock)
-            .unwrap();
-        assert!(
-            matches!(
-                fs4::FileExt::try_lock(&competing),
-                Err(fs4::TryLockError::WouldBlock)
-            ),
-            "cleanup must retain the current lock inode"
-        );
-        fs4::FileExt::unlock(&live).unwrap();
-        drop(live);
-        fs4::FileExt::try_lock(&competing).unwrap();
-        drop(competing);
-        memory_storage_reset::run(&restarted, root.path())
-            .await
-            .unwrap();
-        assert!(!owned.exists());
-        assert!(live_lock.exists());
-        // Exceeding the explicit descriptor budget is a visible incomplete
-        // duty, never a successful partial walk. Removing only the excess depth
-        // in this fixture allows a later restart to finish the remaining tree.
-        let mut excess = owned.clone();
-        for _ in 0..129 {
-            excess = excess.join("d");
-        }
-        tokio::fs::create_dir_all(&excess).await.unwrap();
-        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "UPDATE thread_timeline_projection_meta SET projection_version=1 WHERE projection_key=?", ["memory_sqlite_payload_reset_v1".into()])).await.unwrap();
-        assert!(
-            memory_storage_reset::run(&restarted, root.path())
-                .await
-                .is_err()
-        );
-        assert!(!store.legacy_memory_tree_cleanup_complete().await.unwrap());
-        for _ in 0..2 {
-            tokio::fs::remove_dir(&excess).await.unwrap();
-            excess.pop();
-        }
-        memory_storage_reset::run(&restarted, root.path())
-            .await
-            .unwrap();
-        assert!(!owned.exists());
-        assert!(live_lock.exists());
     }
 }

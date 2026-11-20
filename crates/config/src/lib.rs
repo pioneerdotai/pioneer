@@ -2839,12 +2839,28 @@ const fn default_skills_runtime_allow_function_proxy_tools() -> bool {
     true
 }
 
+/// An explicit database connection for an isolated development Gateway.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct DevelopmentDatabaseUrl(String);
+
+impl std::fmt::Debug for DevelopmentDatabaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+impl DevelopmentDatabaseUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayDatabaseConfig {
-    pub file_name: String,
-    /// Requested number of parallel read-only Gateway database connections.
-    /// The runtime preserves at least four readers; the writer is a separate,
-    /// fixed single-connection contour.
+    #[serde(default)]
+    pub development_url: Option<DevelopmentDatabaseUrl>,
+    /// Requested connection capacity per PostgreSQL pool.
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
     pub acquire_timeout_ms: u64,
@@ -3152,14 +3168,11 @@ impl AppConfig {
                 &self.gateway.settings_file_name,
                 "gateway.settings_file_name",
             ),
-            (
-                &self.gateway.database.file_name,
-                "gateway.database.file_name",
-            ),
         ] {
             let file = normalize_runtime_file_name(value, field)?;
             ensure_development_path(&home.join(file))?;
         }
+        ensure_development_path(&home.join("postgres"))?;
         let remote_dir = Path::new(&self.gateway.remote_access.runtime_dir);
         anyhow::ensure!(
             !remote_dir.as_os_str().is_empty()
@@ -3717,7 +3730,7 @@ mod tests {
         let explicit = unique_temp_file_path("dev-nested-paths");
         write_file(
             &explicit,
-            "install_state_file_name = 'state/install-state.toml'\n[gateway]\nsettings_file_name = 'settings/gateway.toml'\n[gateway.database]\nfile_name = 'data/gateway.db'\n",
+            "install_state_file_name = 'state/install-state.toml'\n[gateway]\nsettings_file_name = 'settings/gateway.toml'",
         );
         let config = super::load_profile_config(
             true,
@@ -3732,12 +3745,7 @@ mod tests {
             home.join("state/install-state.toml")
         );
         assert_eq!(config.gateway.settings_file_name, "settings/gateway.toml");
-        assert_eq!(config.gateway.database.file_name, "data/gateway.db");
-        for field in [
-            "install_state_file_name",
-            "gateway.settings_file_name",
-            "gateway.database.file_name",
-        ] {
+        for field in ["install_state_file_name", "gateway.settings_file_name"] {
             for path in ["../.pioneer/foreign.toml", "/absolute/foreign.toml"] {
                 let contents = match field.split_once('.') {
                     Some((section, key)) => format!("[{section}]\n{key} = {path:?}\n"),
@@ -3764,11 +3772,12 @@ mod tests {
         fs::create_dir_all(root.join(".pioneer.dev")).unwrap();
         fs::create_dir(root.join(".pioneer")).unwrap();
         let root = root.canonicalize().unwrap();
-        let production = root.join(".pioneer/gateway.db");
+        let production = root.join(".pioneer/gateway-settings.toml");
         fs::write(&production, b"production fixture remains untouched").unwrap();
         std::os::unix::fs::symlink(root.join(".pioneer"), root.join(".pioneer.dev/data")).unwrap();
         let error =
-            super::ensure_development_path(&root.join(".pioneer.dev/data/gateway.db")).unwrap_err();
+            super::ensure_development_path(&root.join(".pioneer.dev/data/gateway-settings.toml"))
+                .unwrap_err();
         assert!(error.to_string().contains("symbolic link"));
         assert_eq!(
             fs::read(production).unwrap(),
@@ -3793,7 +3802,6 @@ mod tests {
             "[gateway]\nlisten_addr = '0.0.0.0:17878'",
             "[gateway.remote_access]\nservice_name = 'pioneer_gateway'",
             "[gateway.remote_access]\nlocal_addr = '127.0.0.1:17878'",
-            "[gateway.database]\nfile_name = '../.pioneer/gateway.db'",
             "[desktop.mcp_oauth]\ncallback_port = 37643",
         ] {
             write_file(&explicit, contents);
@@ -3811,10 +3819,7 @@ mod tests {
                     "legacy prod overlap must fail dev validation: {contents}: {text}"
                 );
             }
-            assert!(
-                text.contains("dev") || text.contains("gateway.database.file_name"),
-                "{contents}: {text}"
-            );
+            assert!(text.contains("dev"), "{contents}: {text}");
         }
         fs::remove_file(explicit).unwrap();
     }

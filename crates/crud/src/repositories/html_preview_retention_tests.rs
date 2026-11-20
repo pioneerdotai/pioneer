@@ -357,9 +357,7 @@ async fn start_imports(
 ) {
     manifest(f, "a", "parent", targets, proofs, declared, expected).await;
     // Exercise import continuation and all publication guards through the
-    // post-backfill work selection path. Legacy discovery is covered separately.
-    f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
-        .await;
+
     f.sql(&format!(
         "UPDATE html_preview_frozen_index SET next_ordinal={} WHERE manifest_id='a'",
         targets.len()
@@ -681,74 +679,6 @@ async fn walker_db_error_and_cancelled_read_discard_partial_ram_before_retry() {
 }
 
 #[tokio::test]
-async fn missing_legacy_marker_messages_and_backfill_gate_remain_supported() {
-    let f = fixture().await;
-    // Model a header predating the HTML migration using its exact insert
-    // trigger DDL; restore before the production owner runs.
-    let trigger:String = f.store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='html_preview_header_insert'"
-    )).await.unwrap().unwrap().try_get("","sql").unwrap();
-    f.sql("DROP TRIGGER html_preview_header_insert").await;
-    let message = reference(
-        SourceRef {
-            scope: "event:parent-turn".into(),
-            id: "legacy-source".into(),
-            version: "event-revision:1".into(),
-        },
-        "parent",
-        None,
-    );
-    manifest(&f, "a", "parent", &[message], &[], 0, None).await;
-    f.sql(&trigger).await;
-    let mut after = String::new();
-    let mut progress = None;
-    f.routes.reset();
-    f.step(&mut after, &mut progress).await;
-    assert_eq!(
-        f.routes.counts().1,
-        2,
-        "one legacy INSERT and one message transaction"
-    );
-    let marker = f.marker("a").await;
-    assert_eq!(
-        (marker.next_ordinal, marker.complete, marker.unknown),
-        (1, 1, 0)
-    );
-    assert_eq!(
-        backfill::Entity::find_by_id(1_i64)
-            .one(&f.store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .complete,
-        0
-    );
-    assert!(
-        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
-            .await
-            .unwrap()
-    );
-    assert!(after.is_empty());
-    assert_eq!(
-        backfill::Entity::find_by_id(1_i64)
-            .one(&f.store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .complete,
-        1
-    );
-    no_intermediate_writes(&f).await;
-    f.routes.reset();
-    assert!(
-        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
-            .await
-            .unwrap()
-    ); // Complete markers are no longer enumerated.
-    assert_eq!(f.routes.counts(), (2, 0));
-}
-
-#[tokio::test]
 async fn full_member_without_the_wanted_leaf_cannot_publish_safe() {
     let f = fixture().await;
     let (mut targets, proofs) = seed(&f, 2, 0, false).await;
@@ -887,8 +817,7 @@ async fn complete_gate_selects_only_live_ready_work_and_unknown_does_not_starve(
     f.sql("UPDATE compaction_frozen_history SET expired=1 WHERE id='b-expired'")
         .await;
     f.sql("UPDATE html_preview_frozen_index SET unknown=1 WHERE manifest_id IN ('d-unknown','f-unknown-complete')").await;
-    f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
-        .await;
+
     let mut after = String::new();
     let mut progress = None;
     for expected in [
@@ -918,8 +847,7 @@ async fn work_cursor_wrap_and_restart_find_new_and_newly_ready_headers_behind_cu
     let f = fixture().await;
     manifest(&f, "m", "parent", &[], &[], 0, None).await;
     f.sql("INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,ready) VALUES('b','ws','parent','e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0,0)").await;
-    f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
-        .await;
+
     let mut after = String::new();
     let mut progress = None;
     f.step(&mut after, &mut progress).await;
@@ -972,73 +900,11 @@ async fn work_cursor_wrap_and_restart_find_new_and_newly_ready_headers_behind_cu
 }
 
 #[tokio::test]
-async fn missing_gate_still_backfills_a_legacy_header_without_marker() {
-    let f = fixture().await;
-    f.sql("DELETE FROM html_preview_index_backfill WHERE singleton=1")
-        .await;
-    let trigger: String = f.store.connection.query_one_raw(Statement::from_string(
-        DbBackend::Sqlite,
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='html_preview_header_insert'",
-    )).await.unwrap().unwrap().try_get("", "sql").unwrap();
-    f.sql("DROP TRIGGER html_preview_header_insert").await;
-    manifest(&f, "legacy", "parent", &[], &[], 0, None).await;
-    f.sql(&trigger).await; // Restore the production trigger before maintenance.
-    let mut after = String::new();
-    let mut progress = None;
-    f.step(&mut after, &mut progress).await;
-    assert_eq!(f.marker("legacy").await.complete, 1);
-    assert!(
-        !index_quantum(&f.store, &mut after, &mut progress, "\u{10ffff}")
-            .await
-            .unwrap()
-    );
-    f.step(&mut after, &mut progress).await; // Missing gate remains conservative.
-    assert_eq!(after, "legacy");
-    assert!(
-        backfill::Entity::find_by_id(1_i64)
-            .one(&f.store.connection)
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn completed_unknown_import_is_discoverable_and_rechecked_after_restart() {
-    let f = fixture().await;
-    let (targets, proofs) = seed(&f, 2, 0, false).await;
-    start_imports(&f, &targets, &proofs, 2, None).await;
-    for _ in 0..2 {
-        f.sql("UPDATE html_preview_frozen_index SET complete=1,unknown=1,next_ordinal=2 WHERE manifest_id='a'").await;
-        let mut after = String::new();
-        let mut progress = None;
-        f.step(&mut after, &mut progress).await; // Legacy marker reset.
-        assert!(after.is_empty());
-        assert_eq!(
-            (f.marker("a").await.complete, f.marker("a").await.unknown),
-            (0, 0)
-        );
-        f.step(&mut after, &mut progress).await;
-        assert!(after.is_empty()); // Message page keeps cursor before imports.
-        assert_eq!(f.marker("a").await.next_ordinal, 2);
-        // Revisit from the pre-manifest cursor to start import verification.
-        f.step(&mut after, &mut progress).await;
-        f.step(&mut after, &mut progress).await;
-        assert_eq!(
-            (f.marker("a").await.complete, f.marker("a").await.unknown),
-            (1, 0)
-        );
-        assert!(progress.is_none());
-    }
-}
-
-#[tokio::test]
 async fn failed_index_read_or_completion_remains_discoverable_after_wrap() {
     for reader_failure in [false, true] {
         let f = fixture().await;
         manifest(&f, "a", "parent", &[], &[], 0, None).await;
-        f.sql("UPDATE html_preview_index_backfill SET complete=1 WHERE singleton=1")
-            .await;
+
         let repair = if reader_failure {
             // Fail the physical reader's bounded page query after the index
             // header advanced the keyset. Restore only this fixture's view.
@@ -1068,59 +934,6 @@ async fn failed_index_read_or_completion_remains_discoverable_after_wrap() {
         // No domain wake/restart: the same cursor wraps to the retained row.
         f.step(&mut after, &mut progress).await;
         assert_eq!(f.marker("a").await.complete, 1);
-    }
-}
-
-#[tokio::test]
-async fn input_gate_is_conservative_until_complete_and_quiet_after_completion() {
-    for missing in [false, true] {
-        let f = fixture().await;
-        if missing {
-            f.sql("DELETE FROM html_preview_index_backfill WHERE singleton=1")
-                .await;
-        }
-        f.sql(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('old','parent-turn',0,'text','legacy','{"type":"text","text":"legacy"}',CURRENT_TIMESTAMP)"#).await;
-        let mut after = String::new();
-        f.routes.reset();
-        assert!(
-            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                .await
-                .unwrap()
-        );
-        assert_eq!(after, "old");
-        assert_eq!(f.routes.counts(), (2, 0));
-        assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                .await
-                .unwrap()
-        );
-        if missing {
-            assert!(
-                input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                    .await
-                    .unwrap()
-            );
-            f.sql("INSERT INTO html_preview_index_backfill(singleton,complete,inputs_complete) VALUES(1,0,1)").await;
-        }
-        for _ in 0..2 {
-            f.routes.reset();
-            assert!(
-                !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                    .await
-                    .unwrap()
-            );
-            assert!(after.is_empty());
-            assert_eq!(f.routes.counts(), (1, 0));
-        }
-        // A future legacy importer can explicitly reopen the durable gate.
-        f.sql("UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1")
-            .await;
-        assert!(
-            input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                .await
-                .unwrap()
-        );
-        assert_eq!(after, "old");
     }
 }
 
@@ -1155,12 +968,11 @@ async fn preview_is_temporary(f: &Fixture) -> bool {
 }
 
 #[tokio::test]
-async fn new_inputs_after_complete_gate_are_adopted_atomically_and_rollback_preserves_old_input() {
+async fn new_inputs_are_adopted_atomically_and_rollback_preserves_old_input() {
     for failure in ["binding", "input"] {
         let f = fixture().await;
         preview_input_fixture(&f).await;
-        f.sql("UPDATE html_preview_index_backfill SET inputs_complete=1 WHERE singleton=1")
-            .await;
+
         f.sql(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload) VALUES('old','parent-turn',0,'text','old','{"type":"text","text":"old"}')"#).await;
         let input = pioneer_protocol::UserInput::Artifact {
             artifact_id: "preview".into(),
@@ -1223,7 +1035,6 @@ async fn new_inputs_after_complete_gate_are_adopted_atomically_and_rollback_pres
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].input_type, "artifact");
-        assert!(rows[0].id.as_str() < "~"); // Behind the previous legacy cursor.
         f.sql("UPDATE artifact SET current_version_id='v2' WHERE id='preview'")
             .await;
         assert!(!preview_is_temporary(&f).await);
@@ -1244,59 +1055,30 @@ async fn new_inputs_after_complete_gate_are_adopted_atomically_and_rollback_pres
                 .unwrap(),
             1
         );
-        let mut after = "~".to_owned();
-        f.routes.reset();
-        assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                .await
-                .unwrap()
-        );
-        assert_eq!(f.routes.counts(), (1, 0));
     }
 }
 
 #[tokio::test]
-async fn legacy_versionless_input_is_adopted_once_and_protects_later_current_version() {
+async fn versionless_input_preserves_the_bound_version_when_current_changes() {
     let f = fixture().await;
     preview_input_fixture(&f).await;
-    let input = pioneer_protocol::UserInput::Artifact {
-        artifact_id: "preview".into(),
-        version_id: None,
-    };
-    // Legacy row predating synchronous adoption, not a supported new writer.
-    f.store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload) VALUES('legacy','parent-turn',0,'artifact',?)",
-        [serde_json::to_string(&input).unwrap().into()],
-    )).await.unwrap();
-    let mut after = String::new();
-    assert!(
-        input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-            .await
-            .unwrap()
-    );
-    assert!(!preview_is_temporary(&f).await);
-    let binding = artifact_binding::Entity::find()
-        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
-        .one(&f.store.connection)
+    f.store
+        .replace_turn_input_projection_for_test(
+            "parent-turn",
+            &[pioneer_protocol::UserInput::Artifact {
+                artifact_id: "preview".into(),
+                version_id: None,
+            }],
+            1,
+            1_700_000_000,
+        )
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(binding.artifact_version_id.as_deref(), Some("v1"));
-    assert!(
-        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-            .await
-            .unwrap()
-    );
+    assert!(!preview_is_temporary(&f).await);
+
     f.sql("UPDATE artifact SET current_version_id='v2' WHERE id='preview'")
         .await;
     assert!(!preview_is_temporary(&f).await);
-    f.routes.reset();
-    assert!(
-        !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-            .await
-            .unwrap()
-    );
-    assert_eq!(f.routes.counts(), (1, 0));
     let bindings = artifact_binding::Entity::find()
         .filter(artifact_binding::Column::BindingKind.eq("user_input"))
         .all(&f.store.connection)
@@ -1311,14 +1093,7 @@ async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commi
     for commit in [false, true] {
         let f = fixture().await;
         preview_input_fixture(&f).await;
-        f.sql("UPDATE html_preview_index_backfill SET inputs_complete=1 WHERE singleton=1")
-            .await;
-        let mut after = "~".to_owned();
-        assert!(
-            !input_adoption_quantum(&f.store, &mut after, "\u{10ffff}", true)
-                .await
-                .unwrap()
-        );
+
         let prepared = super::super::turn::prepare_turn_input_projection(
             "parent-turn",
             &[pioneer_protocol::UserInput::Artifact {
@@ -1376,7 +1151,7 @@ async fn retirement_page_keeps_individual_metadata_budget_and_empty_reader_only_
         )).await.unwrap();
     }
     let mut progress = HtmlPreviewRetentionProgress::default();
-    progress.upper[2] = Some(f.store.html_preview_artifact_frontier().await.unwrap());
+    progress.upper[1] = Some(f.store.html_preview_artifact_frontier().await.unwrap());
     f.routes.reset();
     for _ in 0..17 {
         assert!(progress.artifact_quantum(&f.store).await.unwrap());
@@ -3150,65 +2925,6 @@ async fn blocked_io_recovery_revisits_an_older_row_with_a_growing_suffix() {
 
 // An error behind the input cursor must not make the startup gate terminal.
 // The service owner retries the finite traversal after EOF/backoff.
-#[tokio::test]
-async fn input_failure_keeps_gate_open_through_eof_and_retry_adopts_source() {
-    let f = fixture().await;
-    preview_input_fixture(&f).await;
-    f.sql("UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1")
-        .await;
-    // Keep retirement independently blocked while testing legacy adoption.
-    f.sql("UPDATE turn SET status='in_progress' WHERE id='parent-turn'")
-        .await;
-    let input = pioneer_protocol::UserInput::Artifact {
-        artifact_id: "preview".into(),
-        version_id: Some("v1".into()),
-    };
-    f.store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_input(id,turn_id,input_index,input_type,payload) VALUES('legacy','parent-turn',0,'artifact',?)",
-        [serde_json::to_string(&input).unwrap().into()],
-    )).await.unwrap();
-    f.sql("CREATE TRIGGER fail_legacy_adoption BEFORE INSERT ON artifact_binding WHEN NEW.binding_kind='user_input' BEGIN SELECT RAISE(ABORT,'fixture adoption failure'); END").await;
-    let mut progress = HtmlPreviewRetentionProgress::default();
-    let mut failed = false;
-    for _ in 0..32 {
-        if progress.quantum(&f.store).await.is_err() {
-            failed = true;
-            break;
-        }
-    }
-    assert!(failed);
-    let mut eof = false;
-    for _ in 0..32 {
-        if !progress.quantum(&f.store).await.unwrap() {
-            eof = true;
-            break;
-        }
-    }
-    assert!(eof);
-    let gate = backfill::Entity::find_by_id(1_i64)
-        .one(&f.store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        gate.inputs_complete, 0,
-        "failed source is still a durable obligation"
-    );
-    f.sql("DROP TRIGGER fail_legacy_adoption").await;
-    for _ in 0..32 {
-        if !progress.quantum(&f.store).await.unwrap() {
-            break;
-        }
-    }
-    let bindings = artifact_binding::Entity::find()
-        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
-        .all(&f.store.connection)
-        .await
-        .unwrap();
-    assert_eq!(bindings.len(), 1);
-    assert_eq!(bindings[0].artifact_version_id.as_deref(), Some("v1"));
-}
-
 // The cap is an actual retirement hold even when none of the held histories
 // contains this turn. Its release must reach HTML without waking frozen work.
 #[tokio::test]
@@ -3227,8 +2943,7 @@ async fn html_reader_limit_release_wakes_only_the_waiting_owner() {
             break;
         }
     }
-    f.sql("UPDATE html_preview_index_backfill SET complete=1,inputs_complete=1 WHERE singleton=1")
-        .await;
+
     let root = crate::canonical_agent_id('E', "root-agent-turn\0parent-turn");
     let database = f.store.database_connection();
     let released = database.work_signal("maintenance.html.release");

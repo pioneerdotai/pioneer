@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use pioneer_crud_payloads::json_projection::{json_path_text, queryable_json};
 use pioneer_entity::task;
 use pioneer_protocol::{Task, TaskError, TaskResult, TaskStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict, Query, SelectStatement};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query, SelectStatement};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
@@ -12,7 +13,7 @@ use crate::convention::{
     task_status_to_db,
 };
 use crate::repositories::ProjectionWriteOutcome;
-use crate::util::{optional_typed_json_to_db, unix_to_datetime};
+use crate::util::{optional_json_value_to_db, optional_typed_json_to_db, unix_to_datetime};
 
 const DB_ID_LEN: usize = 21;
 
@@ -496,12 +497,12 @@ fn active_model_from_task(task_model: &Task) -> Result<task::ActiveModel> {
         title: Set(task_model.title.clone()),
         goal: Set(task_model.goal.clone()),
         priority: Set(task_model.priority),
-        lifecycle_policy_json: Set(optional_typed_json_to_db(&task_model.lifecycle_policy)?),
-        delivery_policy_json: Set(optional_typed_json_to_db(&task_model.delivery_policy)?),
-        retry_policy_json: Set(optional_typed_json_to_db(&task_model.retry_policy)?),
-        timeout_policy_json: Set(optional_typed_json_to_db(&task_model.timeout_policy)?),
-        concurrency_policy_json: Set(optional_typed_json_to_db(&task_model.concurrency_policy)?),
-        metadata_json: Set(optional_typed_json_to_db(&task_model.metadata)?),
+        lifecycle_policy_json: Set(optional_json_value_to_db(&task_model.lifecycle_policy)?),
+        delivery_policy_json: Set(optional_json_value_to_db(&task_model.delivery_policy)?),
+        retry_policy_json: Set(optional_json_value_to_db(&task_model.retry_policy)?),
+        timeout_policy_json: Set(optional_json_value_to_db(&task_model.timeout_policy)?),
+        concurrency_policy_json: Set(optional_json_value_to_db(&task_model.concurrency_policy)?),
+        metadata_json: Set(optional_json_value_to_db(&task_model.metadata)?),
         result_json: Set(optional_typed_json_to_db(&task_model.result)?),
         error_json: Set(optional_typed_json_to_db(&task_model.error)?),
         revision: Set(task_model.revision),
@@ -541,14 +542,14 @@ pub(crate) async fn find_delivery_task_facts<C: ConnectionTrait>(
         .context("failed to read Task delivery ownership facts")
 }
 
+pub use pioneer_crud_tasks::projection::finish_requested_expr;
+
 /// Read the server-owned admission fence without decoding potentially large metadata.
 pub(crate) async fn finish_requested<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<bool> {
     Ok(task::Entity::find_by_id(task_id.to_owned())
         .select_only()
         .column(task::Column::Id)
-        .filter(Expr::cust(
-            "json_extract(metadata_json, '$.finishRequest') IS NOT NULL",
-        ))
+        .filter(finish_requested_expr())
         .into_tuple::<String>()
         .one(db)
         .await?
@@ -562,7 +563,11 @@ pub(crate) async fn finish_first_run<C: ConnectionTrait>(
     Ok(task::Entity::find_by_id(task_id.to_owned())
         .select_only()
         .expr_as(
-            Expr::cust("json_extract(metadata_json, '$.finishRequest.firstRunNumber')"),
+            json_path_text(
+                queryable_json(Expr::col(task::Column::MetadataJson)),
+                &["finishRequest", "firstRunNumber"],
+            )
+            .cast_as(Alias::new("bigint")),
             "first_run",
         )
         .into_tuple::<Option<i64>>()

@@ -10,18 +10,18 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(column_type = "Text")]
-    pub thread_id: String,
+    pub execution_owner_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_event_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
-    pub execution_owner_id: String,
+    pub context_sha256: String,
     #[sea_orm(column_type = "Text")]
     pub context_json: String,
     #[sea_orm(column_type = "Text")]
-    pub context_sha256: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub accepted_event_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub thread_id: String,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
@@ -29,7 +29,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

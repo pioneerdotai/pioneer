@@ -4,9 +4,10 @@ use super::compaction_lifecycle_pending as queue;
 use crate::{CanonicalTurnEventPayload, CrudStore};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::RunnerState;
+use pioneer_crud_compaction::runner_state::{RunnerStateRecord, observation, update_runner_state};
 use pioneer_entity::{
     compaction_context, compaction_execution_stop, compaction_history_check, compaction_operation,
-    compaction_runner_state, thread, turn, turn_event, turn_item,
+    thread, turn, turn_event, turn_item,
 };
 use sea_orm::TransactionTrait;
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
@@ -127,7 +128,7 @@ struct LifecycleFacts {
     context: Option<compaction_context::Model>,
     turn: Option<turn::Model>,
     thread: Option<thread::Model>,
-    runner: Option<compaction_runner_state::Model>,
+    runner: Option<RunnerStateRecord>,
     item: Option<turn_item::Model>,
     stopped: bool,
 }
@@ -213,7 +214,9 @@ impl LifecycleFacts {
         };
         let stopped = if let Some(op) = &operation {
             if let Some(turn) = &op.execution_turn {
-                compaction_execution_stop::Entity::find_by_id((op.owner.clone(), turn.clone()))
+                compaction_execution_stop::Entity::find()
+                    .filter(compaction_execution_stop::Column::Owner.eq(&op.owner))
+                    .filter(compaction_execution_stop::Column::TurnId.eq(turn))
                     .one(db)
                     .await?
                     .is_some()
@@ -223,9 +226,7 @@ impl LifecycleFacts {
         } else {
             false
         };
-        let runner = compaction_runner_state::Entity::find_by_id(id)
-            .one(db)
-            .await?;
+        let runner = observation(db, id).await?;
         let item = if let Some(turn) = &turn {
             turn_item::Entity::find()
                 .filter(turn_item::Column::TurnId.eq(&turn.id))
@@ -265,7 +266,9 @@ impl LifecycleFacts {
         };
         // This preserves the previous details.status predicate, without SQL
         // JSON or a historical anti-join. Malformed JSON is durable retry work.
-        let payload: serde_json::Value = serde_json::from_str(&item.payload)?;
+        let Some(payload) = item.payload.as_ref() else {
+            anyhow::bail!("compaction lifecycle item payload was not loaded");
+        };
         Ok(matches!(
             payload["details"]["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
@@ -362,11 +365,7 @@ pub(crate) async fn prepare_lifecycle(
         return Ok(Some(prepared));
     }
     if let Some(runner) = &prepared.facts.runner {
-        let state: RunnerState = serde_json::from_str(&runner.state)?;
-        ensure!(
-            i64::try_from(state.generation)? == runner.generation,
-            "runner generation mismatch"
-        );
+        let state = runner.decode()?;
         let terminal = super::compaction_runner::reconciled_terminal_runner(
             &state,
             &op.status,
@@ -535,13 +534,8 @@ pub(crate) async fn repair_lifecycle(
         changed |= super::compaction::compaction_finish(&tx, id, status, outcome).await?;
     }
     if let Some((generation, state)) = prepared.encoded_runner {
-        let updated = compaction_runner_state::Entity::update_many()
-            .col_expr(
-                compaction_runner_state::Column::Generation,
-                Expr::val(generation),
-            )
-            .col_expr(compaction_runner_state::Column::State, Expr::val(state))
-            .filter(compaction_runner_state::Column::OperationId.eq(id))
+        let updated = update_runner_state(generation, state)
+            .filter(pioneer_entity::compaction_runner_state::Column::OperationId.eq(id))
             .exec(&tx)
             .await?;
         changed |= updated.rows_affected > 0;

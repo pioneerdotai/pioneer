@@ -27,9 +27,10 @@ def main():
     workspace = tomllib.loads(Path("Cargo.toml").read_text())
     version = workspace["workspace"]["package"]["version"]
     tag = os.environ["GITHUB_REF_NAME"]
-    tagged_version = tag[1:] if tag.startswith(("v", "V")) else tag
-    if not re.fullmatch(SEMVER, tagged_version) or tagged_version != version:
-        raise ValueError(f"Release tag {tag!r} must match workspace version {version!r}")
+    if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or os.environ.get("GITHUB_REF_TYPE") == "tag":
+        tagged_version = tag[1:] if tag.startswith(("v", "V")) else tag
+        if not re.fullmatch(SEMVER, tagged_version) or tagged_version != version:
+            raise ValueError(f"Release tag {tag!r} must match workspace version {version!r}")
     declaration = runpy.run_path("scripts/packaging/cua-driver.py")["release"]()
     if declaration.get("schema_version") != 1 or declaration.get("repository") != "https://github.com/trycua/cua":
         raise ValueError("Unsupported CUA release declaration/repository")

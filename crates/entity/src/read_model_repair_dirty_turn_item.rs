@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "read_model_repair_dirty_turn_item")]
 pub struct Model {
+    pub changed_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_item_id: String,
     pub generation: i64,
-    pub changed_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

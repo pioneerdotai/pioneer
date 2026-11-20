@@ -1,6 +1,60 @@
 """Deferred tests; do not run before explicit external acceptance."""
+import hashlib
 import unittest
-from prompt_cache_report import aggregate, collapse, measures, timestamp
+from compression.zstd import compress
+from prompt_cache_report import aggregate, collapse, decode_payload, measures, timestamp
+
+
+
+class FixtureSource:
+    """Fixtures for report interpretation without a database connection."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def seed(self, table, values):
+        self.rows.setdefault(table, []).append(values)
+
+    def remove_snapshots(self, turn_ids):
+        self.rows["turn_runtime_snapshot"] = [
+            row for row in self.rows.get("turn_runtime_snapshot", ()) if row[0] not in turn_ids
+        ]
+
+    def runtime_snapshot(self, turn):
+        return next((row[1:] for row in self.rows.get("turn_runtime_snapshot", ())
+                     if row[0] == turn), None)
+
+    def event_page(self, turn, after):
+        rows = [(identifier, thread, sequence, created, payload)
+                for identifier, thread, scope, sequence, created, payload in self.rows.get("turn_event", ())
+                if scope == turn and sequence > after]
+        return sorted(rows, key=lambda row: row[2])[:16]
+
+    def journal(self, owner):
+        return [(identifier, workspace, purpose, status, usage, start, end)
+                for identifier, workspace, scope, purpose, status, usage, start, end
+                in self.rows.get("provider_usage_observation", ()) if scope == owner]
+
+    def task_bindings(self, turn):
+        tasks = {row[0]: row[1:] for row in self.rows.get("task", ())}
+        threads = dict(self.rows.get("thread", ()))
+        turns = dict(self.rows.get("turn", ()))
+        runs = dict(self.rows.get("task_run", ()))
+        result = []
+        for task, run, execution, bound_turn in self.rows.get("task_run_turn", ()):
+            if bound_turn != turn:
+                continue
+            facts = tasks.get(task, (None,) * 8)
+            owner, origin = facts[2], facts[4]
+            result.append((task, execution, *facts, threads.get(execution), turns.get(turn),
+                           threads.get(owner), turns.get(origin), runs.get(run)))
+        return result[:2]
 
 
 def row(ident, total=100, read=80, status='completed', attempt=None, **metadata):
@@ -14,6 +68,26 @@ def row(ident, total=100, read=80, status='completed', attempt=None, **metadata)
 
 
 class CacheReportTests(unittest.TestCase):
+    def test_blocked_event_checks_utf8_offsets_and_original_hash(self):
+        text_parts = ["é" * 32768, "🧪" + r"\u0000"]
+        parts = []
+        byte_offset = char_offset = 0
+        for text in text_parts:
+            data = text.encode("utf-8")
+            frame = compress(data, level=3)
+            codec, stored = (1, frame) if len(frame) + 2 < len(data) else (0, data)
+            parts.append([byte_offset, char_offset, codec, stored.hex(), len(data), len(text),
+                          hashlib.sha256(data).hexdigest()])
+            byte_offset += len(data)
+            char_offset += len(text)
+        payload = "".join(text_parts)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        args = (None, byte_offset, char_offset, digest, None, None, parts)
+        self.assertEqual(decode_payload(*args), payload)
+        parts[1][1] -= 1
+        with self.assertRaisesRegex(ValueError, "invalid event block range"):
+            decode_payload(*args)
+
     def test_provider_diagnostics_remain_separate_from_measured_cache_ratio(self):
         record = row('observed', total=100, read=80)
         record['usage']['prompt_cache_comparison_response_id'] = 'resp_baseline'
@@ -27,7 +101,6 @@ class CacheReportTests(unittest.TestCase):
 
     def test_load_opencode_summary_raw_envelope_and_native_turn_partial_evidence(self):
         import json
-        import sqlite3
         from prompt_cache_report import load
         details = dict(nativeItemKind='tokenUsage',
                        semantics='opencode_v2_exclusive_cache_separate_reasoning',
@@ -41,17 +114,12 @@ class CacheReportTests(unittest.TestCase):
                      semantics=details['semantics'], input_tokens=None,
                      uncached_input_tokens=30, cache_read_input_tokens=None,
                      cache_write_input_tokens=0, raw_usage=details)
-        with sqlite3.connect(':memory:') as connection:
-            connection.execute('CREATE TABLE provider_usage_observation(id TEXT,workspace_id TEXT,owner_id TEXT,operation_kind TEXT,status TEXT,usage_json TEXT,started_at REAL,updated_at REAL)')
-            connection.execute('INSERT INTO provider_usage_observation VALUES (?,?,?,?,?,?,?,?)',
-                               ('summary', 'fixture-workspace', 'operation', 'compaction', 'completed', json.dumps(usage), 1, 2))
-            connection.execute('CREATE TABLE turn_event(id TEXT,thread_id TEXT,turn_id TEXT,sequence INTEGER,created_at TEXT,payload TEXT)')
+        with FixtureSource() as connection:
+            connection.seed("provider_usage_observation", ('summary', 'fixture-workspace', 'operation', 'compaction', 'completed', json.dumps(usage), 1, 2))
             event = dict(kind='item_completed', payload=dict(item=dict(
                 code='agent_runtime_item', details=details)))
-            connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)',
-                               ('native', 'thread', 'turn', 1, '2026-01-01T00:00:00Z', json.dumps(event)))
-            connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)',
-                               ('terminal', 'thread', 'turn', 2, '2026-01-01T00:00:01Z', json.dumps(
+            connection.seed("turn_event", ('native', 'thread', 'turn', 1, '2026-01-01T00:00:00Z', json.dumps(event)))
+            connection.seed("turn_event", ('terminal', 'thread', 'turn', 2, '2026-01-01T00:00:01Z', json.dumps(
                                    dict(kind='turn_completed', payload=dict(turn=dict(status='completed'))))))
             report = load(connection, ['turn'], ['operation'], {})
         self.assertEqual(len(report['groups']), 2)
@@ -152,15 +220,13 @@ class CacheReportTests(unittest.TestCase):
 
     def test_native_cli_cumulative_updates_have_no_invented_turn_baseline(self):
         import json
-        import sqlite3
         from prompt_cache_report import load
-        with sqlite3.connect(':memory:') as connection:
-            connection.execute('CREATE TABLE turn_event(id TEXT,thread_id TEXT,turn_id TEXT,sequence INTEGER,created_at TEXT,payload TEXT)')
+        with FixtureSource() as connection:
             for sequence, total in [(1, 100), (2, 150), (3, 150)]:
                 event = dict(kind='item_completed', payload=dict(item=dict(code='agent_runtime_event', details=dict(
                     nativeMethod='thread/tokenUsage/updated', nativeThreadId='native-session',
                     payload=dict(tokenUsage=dict(total=dict(inputTokens=total, cachedInputTokens=80, outputTokens=10)))))))
-                connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)', (str(sequence), 'thread', 'turn', sequence, '2026-01-01T00:00:00Z', json.dumps(event)))
+                connection.seed("turn_event", (str(sequence), 'thread', 'turn', sequence, '2026-01-01T00:00:00Z', json.dumps(event)))
             report = load(connection, ['turn'], [], {})
         self.assertEqual(report['groups'], [])
         self.assertEqual(len(report['cumulative_cli']), 1)
@@ -169,7 +235,6 @@ class CacheReportTests(unittest.TestCase):
 
     def test_retained_native_cache_observations_do_not_become_paid_writes_or_hits(self):
         import json
-        import sqlite3
         from prompt_cache_report import load
         records = [
             dict(provider='sambanova', input_tokens=100, cache_read_input_tokens=50,
@@ -182,12 +247,10 @@ class CacheReportTests(unittest.TestCase):
                      cache_read_input_tokens=6266, cache_creation_input_tokens=0,
                      cache_write_5_minutes_input_tokens=0, cache_write_1_hour_input_tokens=0))),
         ]
-        with sqlite3.connect(':memory:') as connection:
-            connection.execute('CREATE TABLE provider_usage_observation(id TEXT,workspace_id TEXT,owner_id TEXT,operation_kind TEXT,status TEXT,usage_json TEXT,started_at REAL,updated_at REAL)')
+        with FixtureSource() as connection:
             for index, usage in enumerate(records):
                 usage.update(physical_attempt_id=str(index), api='chat_completions', model='fixture')
-                connection.execute('INSERT INTO provider_usage_observation VALUES (?,?,?,?,?,?,?,?)',
-                                   (str(index), 'fixture-workspace', 'operation', 'main', 'completed', json.dumps(usage), 1, 2))
+                connection.seed("provider_usage_observation", (str(index), 'fixture-workspace', 'operation', 'main', 'completed', json.dumps(usage), 1, 2))
             report = load(connection, [], ['operation'], {})
         groups = {group['provider']: group['all'] for group in report['groups']}
         for provider, field, meaning in [('sambanova', 'cache_creation_tokens', 'informational_creation'),
@@ -235,31 +298,23 @@ class CacheReportTests(unittest.TestCase):
 
     def test_persisted_parent_and_child_executions_keep_separate_cohorts_and_sources(self):
         import json
-        import sqlite3
         from prompt_cache_report import load
         # Composer uses distinct hidden executions/Tasks for ordinary messages.
         # Both storage states must preserve the same logical first/subsequent.
         for storage in ['retained_snapshot', 'terminal_cleanup']:
-            with self.subTest(storage=storage), sqlite3.connect(':memory:') as connection:
-                connection.execute('CREATE TABLE turn_event(id TEXT,thread_id TEXT,turn_id TEXT,sequence INTEGER,created_at REAL,payload TEXT)')
-                connection.execute('CREATE TABLE turn_runtime_snapshot(turn_id TEXT,workspace_id TEXT,thread_id TEXT,hook_runtime_context_json TEXT)')
-                connection.execute('CREATE TABLE thread(id TEXT PRIMARY KEY,workspace_id TEXT)')
-                connection.execute('CREATE TABLE turn(id TEXT PRIMARY KEY,thread_id TEXT)')
-                connection.execute('CREATE TABLE task(id TEXT PRIMARY KEY,workspace_id TEXT,owner_kind TEXT,owner_id TEXT,created_by_thread_id TEXT,created_by_turn_id TEXT,executor_kind TEXT,lifecycle_policy_json TEXT,metadata_json TEXT)')
-                connection.execute('CREATE TABLE task_run(id TEXT PRIMARY KEY,task_id TEXT)')
-                connection.execute('CREATE TABLE task_run_turn(task_id TEXT,run_id TEXT,thread_id TEXT,turn_id TEXT UNIQUE)')
-                connection.execute('INSERT INTO thread VALUES (?,?)', ('conversation', 'workspace'))
+            with self.subTest(storage=storage), FixtureSource() as connection:
+                connection.seed("thread", ('conversation', 'workspace'))
                 negative = ['unknown', 'owner-only', 'foreign-workspace', 'wrong-binding',
                             'conflicting-launch', 'unsupported-version', 'conflicting-snapshot']
                 executions = ['parent-a', 'parent-b', 'child'] + negative
                 for name in executions:
                     thread, turn, task = name+'-exec', name+'-turn', name+'-task'
-                    connection.execute('INSERT INTO thread VALUES (?,?)', (thread, 'workspace'))
-                    connection.execute('INSERT INTO turn VALUES (?,?)', (turn, thread))
+                    connection.seed("thread", (thread, 'workspace'))
+                    connection.seed("turn", (turn, thread))
                     if name == 'unknown':
                         continue
                     origin = name+'-composer-turn'
-                    connection.execute('INSERT INTO turn VALUES (?,?)', (origin, 'conversation'))
+                    connection.seed("turn", (origin, 'conversation'))
                     work = dict(version=1, launch=dict(thread_id='conversation', turn_id=origin))
                     metadata = dict(labels=['composer'], composerWork=work)
                     attachment, workspace, binding_thread = 'detached', 'workspace', thread
@@ -277,21 +332,18 @@ class CacheReportTests(unittest.TestCase):
                         work['launch']['thread_id'] = 'another-conversation'
                     elif name == 'unsupported-version':
                         work['version'] = 2
-                    connection.execute('INSERT INTO task VALUES (?,?,?,?,?,?,?,?,?)',
-                        (task, workspace, 'thread', 'conversation', 'conversation', origin,
+                    connection.seed("task", (task, workspace, 'thread', 'conversation', 'conversation', origin,
                          'agent', json.dumps(dict(attachment=attachment)), json.dumps(metadata)))
-                    connection.execute('INSERT INTO task_run VALUES (?,?)', (name+'-run', task))
-                    connection.execute('INSERT INTO task_run_turn VALUES (?,?,?,?)',
-                                       (task, name+'-run', binding_thread, turn))
+                    connection.seed("task_run", (name+'-run', task))
+                    connection.seed("task_run_turn", (task, name+'-run', binding_thread, turn))
                     if name in ['parent-a', 'parent-b', 'child', 'conflicting-snapshot']:
                         hook = dict(task_id=task, conversation_thread_id=(
                             None if name == 'child' else 'different-owner' if name == 'conflicting-snapshot' else 'conversation'))
-                        connection.execute('INSERT INTO turn_runtime_snapshot VALUES (?,?,?,?)',
-                                           (turn, 'workspace', thread, json.dumps(hook)))
+                        connection.seed("turn_runtime_snapshot", (turn, 'workspace', thread, json.dumps(hook)))
                 if storage == 'terminal_cleanup':
                     # Real successful reconciliation removes runtime snapshots;
                     # exact Task/run/Composer records survive, not a prefilled cohort.
-                    connection.execute("DELETE FROM turn_runtime_snapshot WHERE turn_id IN ('parent-a-turn','parent-b-turn','child-turn')")
+                    connection.remove_snapshots(('parent-a-turn', 'parent-b-turn', 'child-turn'))
                 calls = [('parent-a', 'p1', 100, 80, 'authority'),
                          ('parent-b', 'p2', 200, 180, 'authority'),
                          ('child', 'c1', 200, 0, 'authority'),
@@ -309,20 +361,17 @@ class CacheReportTests(unittest.TestCase):
                                         item=dict(id=ident, code='provider_usage', details=details))
                     event = dict(kind='item_completed', payload=notification)
                     for suffix, sequence in [('', time), ('-duplicate', time+100)]:
-                        connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)',
-                            (ident+suffix, thread, turn, sequence, time, json.dumps(event)))
+                        connection.seed("turn_event", (ident+suffix, thread, turn, sequence, time, json.dumps(event)))
                     if ident == 'p2':
                         # Partial cumulative observation and another retained
                         # surface of the same physical attempt are not extra calls.
                         partial = dict(details, status='started', usage=dict(physical_attempt_id=ident))
                         start = dict(kind='item_started', payload=dict(notification,
                                      item=dict(id=ident, code='provider_usage', details=partial)))
-                        connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)',
-                            ('partial', thread, turn, time+200, time-0.5, json.dumps(start)))
+                        connection.seed("turn_event", ('partial', thread, turn, time+200, time-0.5, json.dumps(start)))
                         mirror = dict(details, observation_id='same-physical-surface')
                         event['payload'] = dict(notification, item=dict(id='same-physical-surface', code='provider_usage', details=mirror))
-                        connection.execute('INSERT INTO turn_event VALUES (?,?,?,?,?,?)',
-                            ('mirror', thread, turn, time+300, time, json.dumps(event)))
+                        connection.seed("turn_event", ('mirror', thread, turn, time+300, time, json.dumps(event)))
                 report = load(connection, [name+'-turn' for name in executions], [], {})
             groups = {(g['connection'], g['execution_cohort']['owner_id']):g for g in report['groups']}
             parent = groups['authority', 'conversation']
@@ -358,10 +407,8 @@ class CacheReportTests(unittest.TestCase):
 
     def test_persisted_auxiliary_authorities_and_legacy_unknown_keep_separate_cohorts(self):
         import json
-        import sqlite3
         from prompt_cache_report import load
-        with sqlite3.connect(':memory:') as connection:
-            connection.execute('CREATE TABLE provider_usage_observation(id TEXT,workspace_id TEXT,owner_id TEXT,operation_kind TEXT,status TEXT,usage_json TEXT,started_at REAL,updated_at REAL)')
+        with FixtureSource() as connection:
             for ident, authority, total, read, time in [
                     ('a1', 'authority-a', 100, 0, 1), ('b1', 'authority-b', 100, 80, 2),
                     ('a2', 'authority-a', 200, 180, 3), ('legacy', None, 100, 50, 4)]:
@@ -370,8 +417,7 @@ class CacheReportTests(unittest.TestCase):
                              raw_usage=dict(_pioneer_journal=dict(schema_version=1, connection_id='untrusted-native')))
                 if authority:
                     usage['_pioneer_journal'] = dict(schema_version=1, connection_id=authority)
-                connection.execute('INSERT INTO provider_usage_observation VALUES (?,?,?,?,?,?,?,?)',
-                                   (ident, 'workspace', 'same-owner', 'summary', 'completed', json.dumps(usage), time, time))
+                connection.seed("provider_usage_observation", (ident, 'workspace', 'same-owner', 'summary', 'completed', json.dumps(usage), time, time))
             report = load(connection, [], ['same-owner'], {})
         groups = {g['connection']:g for g in report['groups']}
         self.assertEqual(set(groups), {'authority-a', 'authority-b', None})

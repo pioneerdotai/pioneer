@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{
-    self_improvement_run, self_improvement_source_turn, task, task_delivery, task_result_candidate,
-    task_run, task_run_conversation_snapshot, task_run_thread_binding, task_run_turn, thread,
-    thread_lineage, turn,
+    self_improvement_source_turn, task, task_delivery, task_result_candidate, task_run,
+    task_run_conversation_snapshot, task_run_thread_binding, task_run_turn, thread, thread_lineage,
+    turn,
 };
 use pioneer_protocol::{
     ItemCompletedNotification, TASK_COMPOSER_WORK_VERSION, TaskDeliveryMode, TaskMetadata,
@@ -12,15 +12,12 @@ use pioneer_protocol::{
     task_delivery_id_from_result_item_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict, Query};
+use sea_orm::sea_query::{ExprTrait, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use super::membership::{
-    PersistedThreadAccessClass, persisted_thread_access_class_from_db,
-    persisted_thread_access_class_to_db,
-};
+use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
 use crate::SelfImprovementSourceTurnRecord;
 use crate::convention::{
     is_terminal_task_run_status_db, is_terminal_task_status_db, task_delivery_mode_to_db,
@@ -30,6 +27,10 @@ use crate::convention::{
     thread_sidebar_visibility_to_db, turn_kind_from_db, turn_kind_to_db, turn_origin_from_db,
     turn_origin_to_db, turn_status_from_db, turn_status_to_db,
 };
+pub(crate) use pioneer_crud_self_improvement::source_history::processed_history_date;
+use pioneer_crud_self_improvement::source_history::{
+    SOURCE_ACCESS_CLASSES, SOURCE_ORIGINS, processed_source_predicate,
+};
 
 #[derive(Debug)]
 pub(crate) struct VerifiedCollaborativeExchange {
@@ -38,38 +39,6 @@ pub(crate) struct VerifiedCollaborativeExchange {
     pub task_id: String,
     pub run_id: String,
     pub accepted_task_run_turn_id: Option<String>,
-}
-
-/// Chronological reference for backfill. Source IDs represent discovery order, not
-/// message age. Use the original user turn date of successfully analyzed tasks.
-/// A single aggregate row is materialized; no history payload is read here.
-pub(crate) async fn processed_history_date<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-) -> Result<Option<i64>> {
-    let source_date = Func::max(
-        Expr::from(Func::cust(Alias::new("strftime")).args([
-            Expr::val("%s"),
-            Expr::col((turn::Entity, turn::Column::CreatedAt)),
-        ]))
-        .cast_as(Alias::new("INTEGER")),
-    );
-    self_improvement_source_turn::Entity::find()
-        .select_only()
-        .column_as(Expr::from(source_date), "source_date")
-        .join(
-            JoinType::InnerJoin,
-            self_improvement_source_turn::Entity::belongs_to(turn::Entity)
-                .from(self_improvement_source_turn::Column::TurnId)
-                .to(turn::Column::Id)
-                .into(),
-        )
-        .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
-        .filter(processed_source_predicate())
-        .into_tuple::<Option<i64>>()
-        .one(db)
-        .await?
-        .context("missing processed history date aggregate")
 }
 
 #[derive(Debug, Clone)]
@@ -320,8 +289,7 @@ async fn collaborative_parent_turn_id_for_delivery<C: ConnectionTrait>(
     };
     let metadata = task
         .metadata_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TaskMetadata>(json).ok());
+        .and_then(|json| serde_json::from_value::<TaskMetadata>(json).ok());
     let Some(composer_work) = metadata
         .as_ref()
         .and_then(|metadata| metadata.composer_work.as_ref())
@@ -390,8 +358,7 @@ pub(crate) async fn verify_collaborative_exchange<C: ConnectionTrait>(
     };
     let metadata = task
         .metadata_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TaskMetadata>(json).ok());
+        .and_then(|json| serde_json::from_value::<TaskMetadata>(json).ok());
     let Some(composer_work) = metadata
         .as_ref()
         .and_then(|metadata| metadata.composer_work.as_ref())
@@ -446,7 +413,9 @@ pub(crate) async fn verify_collaborative_exchange<C: ConnectionTrait>(
         return Ok(None);
     }
     let successful_result = if expected_success {
-        let Some(delivery_result) = decode_task_result(delivery.result_snapshot_json.as_deref())
+        let Some(delivery_result) = delivery
+            .result_snapshot_json
+            .and_then(|value| serde_json::from_value::<TaskResult>(value).ok())
         else {
             return Ok(None);
         };
@@ -675,51 +644,6 @@ pub async fn contains_source_id<C: ConnectionTrait>(
         .is_some())
 }
 
-// Completed ranges are the durable consumption ledger, including previous activation epochs.
-// Backfill can rewind over holes without turning already-consumed sources into new anchors.
-pub(super) fn processed_source_predicate() -> Expr {
-    Expr::exists(
-        Query::select()
-            .expr(Expr::val(1))
-            .from(self_improvement_run::Entity)
-            .and_where(
-                Expr::col((
-                    self_improvement_run::Entity,
-                    self_improvement_run::Column::WorkspaceId,
-                ))
-                .equals((
-                    self_improvement_source_turn::Entity,
-                    self_improvement_source_turn::Column::WorkspaceId,
-                )),
-            )
-            .and_where(
-                self_improvement_run::Column::Status
-                    .eq(super::self_improvement_run::STATUS_COMPLETED),
-            )
-            .and_where(
-                Expr::col((
-                    self_improvement_run::Entity,
-                    self_improvement_run::Column::SourceLowerExclusive,
-                ))
-                .lt(Expr::col((
-                    self_improvement_source_turn::Entity,
-                    self_improvement_source_turn::Column::Id,
-                ))),
-            )
-            .and_where(
-                Expr::col((
-                    self_improvement_run::Entity,
-                    self_improvement_run::Column::SourceUpperInclusive,
-                ))
-                .gte(Expr::col((
-                    self_improvement_source_turn::Entity,
-                    self_improvement_source_turn::Column::Id,
-                ))),
-            )
-            .to_owned(),
-    )
-}
-
 pub async fn list_after_cursor<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
@@ -744,13 +668,13 @@ pub async fn list_after_cursor<C: ConnectionTrait>(
         )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
+        .filter(thread::Column::AccessClass.is_in(SOURCE_ACCESS_CLASSES))
         .filter(
             thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
                 ThreadSidebarVisibility::Visible,
             )),
         )
-        .filter(thread::Column::OriginKind.is_in(source_origins()))
+        .filter(thread::Column::OriginKind.is_in(SOURCE_ORIGINS))
         .filter(self_improvement_source_turn::Column::Id.gt(cursor_source_id))
         .filter(processed_source_predicate().not())
         .order_by_asc(self_improvement_source_turn::Column::Id)
@@ -786,13 +710,13 @@ pub(crate) async fn recent_processed_sources<C: ConnectionTrait>(
         )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
-        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
+        .filter(thread::Column::AccessClass.is_in(SOURCE_ACCESS_CLASSES))
         .filter(
             thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
                 ThreadSidebarVisibility::Visible,
             )),
         )
-        .filter(thread::Column::OriginKind.is_in(source_origins()))
+        .filter(thread::Column::OriginKind.is_in(SOURCE_ORIGINS))
         .filter(turn::Column::Status.eq(turn_status_to_db(TurnStatus::Completed)))
         .filter(turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::Conversation)))
         .filter(turn::Column::Origin.eq(turn_origin_to_db(TurnOrigin::User)))
@@ -831,13 +755,13 @@ pub async fn list_frozen_range<C: ConnectionTrait>(
         )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
+        .filter(thread::Column::AccessClass.is_in(SOURCE_ACCESS_CLASSES))
         .filter(
             thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
                 ThreadSidebarVisibility::Visible,
             )),
         )
-        .filter(thread::Column::OriginKind.is_in(source_origins()))
+        .filter(thread::Column::OriginKind.is_in(SOURCE_ORIGINS))
         .filter(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
         .filter(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
         .filter(processed_source_predicate().not())
@@ -954,27 +878,6 @@ async fn records_from_models<C: ConnectionTrait>(
             Ok(record_from_model(model, parent_turn.created_at.timestamp()))
         })
         .collect()
-}
-
-pub(super) fn source_origins() -> Vec<String> {
-    [
-        ThreadOriginKind::Collaborative,
-        ThreadOriginKind::DirectMessage,
-        ThreadOriginKind::User,
-    ]
-    .into_iter()
-    .map(|origin| thread_origin_kind_to_db(origin).to_owned())
-    .collect()
-}
-
-pub(super) fn source_access_classes() -> Vec<&'static str> {
-    [
-        PersistedThreadAccessClass::Private,
-        PersistedThreadAccessClass::Workspace,
-    ]
-    .into_iter()
-    .map(persisted_thread_access_class_to_db)
-    .collect()
 }
 
 // Self-improvement is shared within the workspace, including experience from

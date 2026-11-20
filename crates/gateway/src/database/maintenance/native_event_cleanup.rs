@@ -5,14 +5,11 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Bootstrap and cleanup alternate bounded portions, so neither a large legacy
-/// table nor a continuous live backlog monopolizes this maintenance worker.
+/// Drain the jobs published by committed native-event and lifecycle writes.
 pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
     let database = store.database_connection();
     let mut wake = database.work_signal("maintenance.native").subscribe();
-    let mut bootstrap_pending = true;
-    let mut bootstrap_next = true;
     let mut last_log = Instant::now();
     let mut progress = Progress::default();
     loop {
@@ -28,62 +25,35 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
             },
         }
         let started = Instant::now();
-        let bootstrap_phase = bootstrap_pending && bootstrap_next;
-        bootstrap_next = !bootstrap_next;
-        // Do not abandon dispatched SQLite work with a local per-query timeout.
-        // Cancellation is the worker owner's shutdown signal, not a poll timeout.
         let result: anyhow::Result<bool> = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
             result = crate::database::attribution::scope_database_workload_result(
                 pioneer_observability::DatabaseWorkload::NativeEventCleanup, pioneer_observability::DatabaseOperationSite::NativeEventCleanupQuantum,
                 async {
-                    if bootstrap_phase {
-                        let outcome = store.bootstrap_native_event_cleanup_quantum().await?;
-                        progress.bootstrap_rows += outcome.rows_scanned;
-                        progress.bootstrap_jobs += outcome.jobs_inserted;
-                        progress.bootstrap_elapsed_us += micros(started);
-                        bootstrap_pending = !outcome.complete;
-                        // Always offer a cleanup quantum after the final page;
-                        // only empty queue discovery earns the idle sleep.
-                        Ok(false)
-                    } else {
-                        let metrics = store.cleanup_native_events_quantum().await?;
-                        let empty = metrics.jobs_examined == 0;
-                        progress.add(metrics);
-                        Ok(empty)
-                    }
+                    let metrics = store.cleanup_native_events_quantum().await?;
+                    let empty = metrics.jobs_examined == 0;
+                    progress.add(metrics);
+                    Ok(empty)
                 },
             ) => result,
         };
         progress.quanta += 1;
-        let idle = matches!(&result, Ok(true)) && !bootstrap_pending;
+        let idle = matches!(&result, Ok(true));
         let pause = match result {
-            Ok(empty) if empty && !bootstrap_pending => Duration::from_secs(60),
+            Ok(empty) if empty => Duration::from_secs(60),
             Ok(_) => started
                 .elapsed()
                 .saturating_mul(9)
                 .max(Duration::from_millis(25)),
             Err(_) => {
                 progress.failures += 1;
-                tracing::warn!(
-                    reason = "database_error",
-                    phase = if bootstrap_phase {
-                        "bootstrap"
-                    } else {
-                        "cleanup"
-                    },
-                    "native event cleanup deferred"
-                );
+                tracing::warn!(reason = "database_error", "native event cleanup deferred");
                 Duration::from_secs(60)
             }
         };
         if last_log.elapsed() >= Duration::from_secs(30) || pause == Duration::from_secs(60) {
             tracing::info!(
-                bootstrap_complete = !bootstrap_pending,
-                bootstrap_rows = progress.bootstrap_rows,
-                bootstrap_jobs = progress.bootstrap_jobs,
-                bootstrap_elapsed_us = progress.bootstrap_elapsed_us,
                 quanta = progress.quanta,
                 failures = progress.failures,
                 jobs_examined = progress.metrics.jobs_examined,
@@ -128,14 +98,8 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
     }
 }
 
-fn micros(start: Instant) -> u64 {
-    start.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
-}
 #[derive(Default)]
 struct Progress {
-    bootstrap_rows: u64,
-    bootstrap_jobs: u64,
-    bootstrap_elapsed_us: u64,
     quanta: u64,
     failures: u64,
     metrics: NativeEventCleanupMetrics,

@@ -7,18 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_event_revision")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub source_id: String,
+    pub capture_order: i64,
     #[sea_orm(column_type = "Text")]
     pub turn_id: String,
-    pub revision: i64,
     pub present: i64,
-    pub capture_order: i64,
-    pub projection_revision: Option<i64>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub source_id: String,
+    pub revision: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub item_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub projection_kind: Option<String>,
+    pub projection_revision: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

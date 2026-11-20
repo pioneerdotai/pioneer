@@ -1227,9 +1227,19 @@ pub async fn set_diagnostic<C: ConnectionTrait>(db: &C, job_id: &str, value: Str
 /// Called only after a successful fenced transition in the same transaction.
 pub async fn clear_diagnostic_stop_reason<C: ConnectionTrait>(db: &C, job_id: &str) -> Result<()> {
     recovery_job::Entity::update_many()
-        .col_expr(recovery_job::Column::Diagnostic,
-            sea_orm::sea_query::Expr::cust("CASE WHEN json_valid(diagnostic) THEN json_remove(diagnostic, '$.stopReason') ELSE NULL END"))
+        .col_expr(
+            recovery_job::Column::Diagnostic,
+            sea_orm::sea_query::Expr::cust(
+                "CASE WHEN diagnostic IS JSON OBJECT THEN
+                COALESCE((SELECT json_object_agg(field.key, field.value ORDER BY field.ordinality)
+                          FROM json_each(diagnostic::json) WITH ORDINALITY AS field
+                          WHERE field.key <> 'stopReason'), '{}'::json)::text
+                ELSE diagnostic END",
+            ),
+        )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
-        .exec(db).await.context("failed to clear stale recovery stop reason")?;
+        .exec(db)
+        .await
+        .context("failed to clear stale recovery stop reason")?;
     Ok(())
 }

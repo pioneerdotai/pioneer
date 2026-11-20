@@ -253,24 +253,6 @@ pub(crate) async fn prepare_completed_history_owned(
         diagnostic.code = "catalog_unavailable".into();
         return Ok(HistoryCheckOutcome::WaitingCatalog);
     }
-    diagnostic.stage = "history_preparation".into();
-    // One resumable registration quantum. No incomplete projection is budgeted.
-    let mut ready = false;
-    for _ in 0..16 {
-        ready = tokio::select! { biased;
-            _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
-            _ = clock.sleep_until(deadline) => return Ok(HistoryCheckOutcome::Preparing),
-            result = store.compaction_prepare_history_quantum(workspace, thread) => result?,
-        };
-        if ready {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    if !ready {
-        diagnostic.code = "history_preparation_incomplete".into();
-        return Ok(HistoryCheckOutcome::Preparing);
-    }
     let mut authorization_revision = None;
     let prepare = async {
         authorization_revision = if root_check_revision.is_some() {

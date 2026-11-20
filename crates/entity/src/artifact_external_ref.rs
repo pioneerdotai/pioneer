@@ -7,28 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_external_ref")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
-    pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
-    pub artifact_id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
-    pub artifact_version_id: Option<String>,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
-    pub provider: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_artifact_external_ref"
+    )]
     pub model_family: Option<String>,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
-    pub transport_kind: String,
     #[sea_orm(column_type = "Text")]
     pub external_id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
+    pub transport_kind: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub external_uri: Option<String>,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
+    pub artifact_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_artifact_external_ref"
+    )]
+    pub artifact_version_id: Option<String>,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
+    pub workspace_id: String,
     pub expires_at: Option<DateTimeWithTimeZone>,
+    pub metadata_json: Json,
     pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
+    pub provider: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

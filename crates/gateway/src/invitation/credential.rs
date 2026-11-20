@@ -105,8 +105,7 @@ impl std::fmt::Debug for IssuedInvitationCredential {
 
 #[cfg(test)]
 mod tests {
-    use migration::{Migrator, MigratorTrait};
-    use sea_orm::{Database, TransactionTrait};
+    use sea_orm::TransactionTrait;
 
     use super::*;
 
@@ -130,34 +129,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_and_unknown_credentials_share_safe_unavailable_result() {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&database, None).await.unwrap();
-        let transaction = database.begin().await.unwrap();
-        let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
-        let service = InvitationCredentialService::new(&key).unwrap();
-        let issued = service.issue();
-        let now = chrono::DateTime::from_timestamp(
-            crate::tests::authorization::EPIC5_TEST_NOW_UNIX as i64,
-            0,
-        )
-        .unwrap()
-        .fixed_offset();
+    async fn malformed_and_unknown_credentials_share_safe_unavailable_result() -> anyhow::Result<()>
+    {
+        pioneer_postgres_test::with_database(async |database| {
+            let transaction = database.connection().begin().await?;
+            let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
+            let service = InvitationCredentialService::new(&key).unwrap();
+            let issued = service.issue();
+            let now = chrono::DateTime::from_timestamp(
+                crate::tests::authorization::EPIC5_TEST_NOW_UNIX as i64,
+                0,
+            )
+            .unwrap()
+            .fixed_offset();
 
-        assert_eq!(
-            service
-                .lookup_presented(&transaction, "malformed-secret", now)
-                .await
-                .unwrap(),
-            InvitationCredentialLookup::Unavailable
-        );
-        assert_eq!(
-            service
-                .lookup_presented(&transaction, issued.credential().expose_secret(), now)
-                .await
-                .unwrap(),
-            InvitationCredentialLookup::Unavailable
-        );
-        transaction.rollback().await.unwrap();
+            assert_eq!(
+                service
+                    .lookup_presented(&transaction, "malformed-secret", now)
+                    .await?,
+                InvitationCredentialLookup::Unavailable
+            );
+            assert_eq!(
+                service
+                    .lookup_presented(&transaction, issued.credential().expose_secret(), now)
+                    .await?,
+                InvitationCredentialLookup::Unavailable
+            );
+            transaction.rollback().await?;
+            Ok(())
+        })
+        .await
     }
 }

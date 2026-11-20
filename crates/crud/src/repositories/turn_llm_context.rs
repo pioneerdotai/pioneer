@@ -53,8 +53,13 @@ pub async fn insert_turn_llm_context<C: ConnectionTrait>(
     entry: NewTurnLlmContextEntry,
 ) -> Result<turn_llm_context::Model> {
     let child_turn = entry.turn_id.clone();
-    let creates_capsule =
-        super::task_child_producers::context_will_create(db, &entry.turn_id, &entry.source).await?;
+    let creates_capsule = super::task_child_producers::context_will_create(
+        db,
+        &entry.turn_id,
+        &entry.source,
+        &MODEL_HISTORY_CONTEXT_SOURCES,
+    )
+    .await?;
     let id = generate_id(DB_ID_LEN);
     turn_llm_context::Entity::insert(turn_llm_context::ActiveModel {
         id: Set(id.clone()),
@@ -121,8 +126,13 @@ pub async fn append_turn_llm_context<C: ConnectionTrait>(
 
     entry.sequence = next_sequence_for_turn(db, entry.turn_id.as_str()).await?;
     let child_turn = entry.turn_id.clone();
-    let creates_capsule =
-        super::task_child_producers::context_will_create(db, &entry.turn_id, &entry.source).await?;
+    let creates_capsule = super::task_child_producers::context_will_create(
+        db,
+        &entry.turn_id,
+        &entry.source,
+        &MODEL_HISTORY_CONTEXT_SOURCES,
+    )
+    .await?;
     let id = generate_id(DB_ID_LEN);
     turn_llm_context::Entity::insert(turn_llm_context::ActiveModel {
         id: Set(id.clone()),

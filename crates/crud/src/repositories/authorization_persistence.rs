@@ -701,7 +701,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use migration::{Migrator, MigratorTrait};
     use pioneer_entity::{
         agent_skill, agent_skill_version, gateway_identity, gateway_principal,
         self_improvement_source_turn, thread, thread_membership, turn, workspace,
@@ -709,8 +708,8 @@ mod tests {
     };
     use pioneer_protocol::GatewayId;
     use sea_orm::{
-        ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, Database,
-        DatabaseConnection, EntityTrait, QueryFilter, Set,
+        ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection,
+        EntityTrait, QueryFilter, Set,
     };
 
     use super::*;
@@ -724,9 +723,15 @@ mod tests {
     const SKILL_ID: &str = "K00000000000000000001";
     const VERSION_ID: &str = "V00000000000000000001";
 
-    async fn base_database(include_member: bool) -> DatabaseConnection {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&database, None).await.unwrap();
+    async fn base_database(
+        fixture: &pioneer_postgres_test::TestDatabase,
+        include_member: bool,
+    ) -> DatabaseConnection {
+        let database = fixture.connection().clone();
+        database
+            .execute_unprepared("UPDATE workspace SET is_current = FALSE WHERE is_current")
+            .await
+            .unwrap();
         let now = chrono::Utc::now().fixed_offset();
         gateway_identity::ActiveModel {
             unread_started_at: sea_orm::NotSet,
@@ -822,119 +827,139 @@ mod tests {
 
     #[tokio::test]
     async fn superuser_only_legacy_state_is_ready() {
-        let database = base_database(false).await;
-        let report = scan_authorization_persistence_invariants(
-            &database,
-            &GatewayId::new(GATEWAY_ID).unwrap(),
-        )
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = base_database(fixture, false).await;
+            let report = scan_authorization_persistence_invariants(
+                &database,
+                &GatewayId::new(GATEWAY_ID).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(report.is_valid(), "{}", report.safe_diagnostic());
+            assert_eq!(report.ineligible_active_learned_versions, 0);
+            Ok(())
+        })
         .await
         .unwrap();
-        assert!(report.is_valid(), "{}", report.safe_diagnostic());
-        assert_eq!(report.ineligible_active_learned_versions, 0);
     }
 
     #[tokio::test]
     async fn cooperative_scan_checkpoints_between_bounded_table_batches() {
-        let database = base_database(true).await;
-        let checkpoints = Arc::new(AtomicUsize::new(0));
-        let observed = checkpoints.clone();
-        let report = scan_authorization_persistence_invariants_cooperative(
-            &database,
-            &GatewayId::new(GATEWAY_ID).unwrap(),
-            1,
-            move || {
-                observed.fetch_add(1, Ordering::Relaxed);
-                std::future::ready(Ok(()))
-            },
-        )
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = base_database(fixture, true).await;
+            let checkpoints = Arc::new(AtomicUsize::new(0));
+            let observed = checkpoints.clone();
+            let report = scan_authorization_persistence_invariants_cooperative(
+                &database,
+                &GatewayId::new(GATEWAY_ID).unwrap(),
+                1,
+                move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(report.is_valid(), "{}", report.safe_diagnostic());
+            assert!(checkpoints.load(Ordering::Relaxed) >= 4);
+            Ok(())
+        })
         .await
         .unwrap();
-
-        assert!(report.is_valid(), "{}", report.safe_diagnostic());
-        assert!(checkpoints.load(Ordering::Relaxed) >= 4);
     }
 
     #[tokio::test]
     async fn thread_membership_without_parent_workspace_grant_fails_closed() {
-        let database = base_database(true).await;
-        let now = chrono::Utc::now().fixed_offset();
-        thread_membership::ActiveModel {
-            thread_id: Set(THREAD_ID.to_owned()),
-            principal_id: Set(MEMBER_ID.to_owned()),
-            added_by_actor_kind: Set("system".to_owned()),
-            added_by_actor_id: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&database)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = base_database(fixture, true).await;
+            let now = chrono::Utc::now().fixed_offset();
+            thread_membership::ActiveModel {
+                thread_id: Set(THREAD_ID.to_owned()),
+                principal_id: Set(MEMBER_ID.to_owned()),
+                added_by_actor_kind: Set("system".to_owned()),
+                added_by_actor_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&database)
+            .await
+            .unwrap();
+            let report = scan_authorization_persistence_invariants(
+                &database,
+                &GatewayId::new(GATEWAY_ID).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                report.violations.contains(
+                    &AuthorizationPersistenceInvariantKind::ThreadMembershipParentMissing
+                )
+            );
+            let diagnostic = report.safe_diagnostic();
+            assert!(!diagnostic.contains(THREAD_ID));
+            assert!(!diagnostic.contains(MEMBER_ID));
+            assert!(diagnostic.len() <= 512);
+            Ok(())
+        })
         .await
         .unwrap();
-        let report = scan_authorization_persistence_invariants(
-            &database,
-            &GatewayId::new(GATEWAY_ID).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            report
-                .violations
-                .contains(&AuthorizationPersistenceInvariantKind::ThreadMembershipParentMissing)
-        );
-        let diagnostic = report.safe_diagnostic();
-        assert!(!diagnostic.contains(THREAD_ID));
-        assert!(!diagnostic.contains(MEMBER_ID));
-        assert!(diagnostic.len() <= 512);
     }
 
     #[tokio::test]
     async fn workspace_visibility_preserves_explicit_thread_memberships_as_valid_state() {
-        let database = base_database(true).await;
-        let now = chrono::Utc::now().fixed_offset();
-        workspace_membership::ActiveModel {
-            principal_id: Set(MEMBER_ID.to_owned()),
-            workspace_id: Set(WORKSPACE_ID.to_owned()),
-            granted_by_actor_kind: Set("system".to_owned()),
-            granted_by_actor_id: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&database)
-        .await
-        .unwrap();
-        thread_membership::ActiveModel {
-            thread_id: Set(THREAD_ID.to_owned()),
-            principal_id: Set(MEMBER_ID.to_owned()),
-            added_by_actor_kind: Set("system".to_owned()),
-            added_by_actor_id: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&database)
-        .await
-        .unwrap();
-        let thread = thread::Entity::find_by_id(THREAD_ID.to_owned())
-            .one(&database)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = base_database(fixture, true).await;
+            let now = chrono::Utc::now().fixed_offset();
+            workspace_membership::ActiveModel {
+                principal_id: Set(MEMBER_ID.to_owned()),
+                workspace_id: Set(WORKSPACE_ID.to_owned()),
+                granted_by_actor_kind: Set("system".to_owned()),
+                granted_by_actor_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&database)
             .await
-            .unwrap()
             .unwrap();
-        let mut thread: thread::ActiveModel = thread.into();
-        thread.access_class = Set("workspace".to_owned());
-        thread.update(&database).await.unwrap();
+            thread_membership::ActiveModel {
+                thread_id: Set(THREAD_ID.to_owned()),
+                principal_id: Set(MEMBER_ID.to_owned()),
+                added_by_actor_kind: Set("system".to_owned()),
+                added_by_actor_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&database)
+            .await
+            .unwrap();
+            let thread = thread::Entity::find_by_id(THREAD_ID.to_owned())
+                .one(&database)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut thread: thread::ActiveModel = thread.into();
+            thread.access_class = Set("workspace".to_owned());
+            thread.update(&database).await.unwrap();
 
-        let report = scan_authorization_persistence_invariants(
-            &database,
-            &GatewayId::new(GATEWAY_ID).unwrap(),
-        )
+            let report = scan_authorization_persistence_invariants(
+                &database,
+                &GatewayId::new(GATEWAY_ID).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                report.is_valid(),
+                "private/workspace/private transitions preserve explicit participants: {}",
+                report.safe_diagnostic()
+            );
+            Ok(())
+        })
         .await
         .unwrap();
-        assert!(
-            report.is_valid(),
-            "private/workspace/private transitions preserve explicit participants: {}",
-            report.safe_diagnostic()
-        );
     }
 
     async fn add_learned_version_fixture(database: &DatabaseConnection) {
@@ -1022,155 +1047,158 @@ mod tests {
 
     #[tokio::test]
     async fn learned_eligibility_accepts_private_provenance_but_preserves_source_integrity() {
-        let database = base_database(false).await;
-        add_learned_version_fixture(&database).await;
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
-                .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Eligible
-        );
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = base_database(fixture, false).await;
+            add_learned_version_fixture(&database).await;
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Eligible
+            );
 
-        thread::Entity::update_many()
-            .col_expr(
-                thread::Column::AccessClass,
-                sea_orm::sea_query::Expr::value("private"),
-            )
-            .filter(thread::Column::Id.eq(THREAD_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+            thread::Entity::update_many()
+                .col_expr(
+                    thread::Column::AccessClass,
+                    sea_orm::sea_query::Expr::value("private"),
+                )
+                .filter(thread::Column::Id.eq(THREAD_ID))
+                .exec(&database)
                 .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Eligible
-        );
+                .unwrap();
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Eligible
+            );
 
-        thread::Entity::update_many()
-            .col_expr(
-                thread::Column::AccessClass,
-                sea_orm::sea_query::Expr::value("internal"),
-            )
-            .col_expr(
-                thread::Column::OriginKind,
-                sea_orm::sea_query::Expr::value("system"),
-            )
-            .col_expr(
-                thread::Column::SidebarVisibility,
-                sea_orm::sea_query::Expr::value("hidden"),
-            )
-            .filter(thread::Column::Id.eq(THREAD_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+            thread::Entity::update_many()
+                .col_expr(
+                    thread::Column::AccessClass,
+                    sea_orm::sea_query::Expr::value("internal"),
+                )
+                .col_expr(
+                    thread::Column::OriginKind,
+                    sea_orm::sea_query::Expr::value("system"),
+                )
+                .col_expr(
+                    thread::Column::SidebarVisibility,
+                    sea_orm::sea_query::Expr::value("hidden"),
+                )
+                .filter(thread::Column::Id.eq(THREAD_ID))
+                .exec(&database)
                 .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::SourceThreadIneligible
-            )
-        );
+                .unwrap();
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Ineligible(
+                    LearnedVersionIneligibleReason::SourceThreadIneligible
+                )
+            );
 
-        thread::Entity::update_many()
-            .col_expr(
-                thread::Column::AccessClass,
-                sea_orm::sea_query::Expr::value("workspace"),
-            )
-            .col_expr(
-                thread::Column::OriginKind,
-                sea_orm::sea_query::Expr::value("user"),
-            )
-            .col_expr(
-                thread::Column::SidebarVisibility,
-                sea_orm::sea_query::Expr::value("visible"),
-            )
-            .filter(thread::Column::Id.eq(THREAD_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        agent_skill_version::Entity::update_many()
-            .col_expr(
-                agent_skill_version::Column::SourceTurnIdsJson,
-                sea_orm::sea_query::Expr::value("[\"U00000000000000000999\"]"),
-            )
-            .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+            thread::Entity::update_many()
+                .col_expr(
+                    thread::Column::AccessClass,
+                    sea_orm::sea_query::Expr::value("workspace"),
+                )
+                .col_expr(
+                    thread::Column::OriginKind,
+                    sea_orm::sea_query::Expr::value("user"),
+                )
+                .col_expr(
+                    thread::Column::SidebarVisibility,
+                    sea_orm::sea_query::Expr::value("visible"),
+                )
+                .filter(thread::Column::Id.eq(THREAD_ID))
+                .exec(&database)
                 .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::MissingSourceLedgerRow
-            )
-        );
+                .unwrap();
+            agent_skill_version::Entity::update_many()
+                .col_expr(
+                    agent_skill_version::Column::SourceTurnIdsJson,
+                    sea_orm::sea_query::Expr::value("[\"U00000000000000000999\"]"),
+                )
+                .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
+                .exec(&database)
+                .await
+                .unwrap();
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Ineligible(
+                    LearnedVersionIneligibleReason::MissingSourceLedgerRow
+                )
+            );
 
-        database
-            .execute_unprepared(
-                "INSERT INTO workspace (id,name,is_active,is_current) VALUES \
-                    ('W00000000000000000002','Other workspace',1,0); \
-                 INSERT INTO thread (
-                    id,workspace_id,preview,mode,model,model_provider,status,origin_kind,
-                    sidebar_visibility,access_class,created_at,updated_at
-                 ) VALUES (
-                    'T00000000000000000002','W00000000000000000002','','chat','test','test',
-                    'active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                 ); \
-                 INSERT INTO turn (
-                    id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at
-                 ) VALUES (
-                    'U00000000000000000002','T00000000000000000002','completed','{}',
-                    'conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                 ); \
-                 INSERT INTO self_improvement_source_turn (
-                    workspace_id,thread_id,turn_id,terminal_event_id,terminal_at,created_at
-                 ) VALUES (
-                    'W00000000000000000002','T00000000000000000002',
-                    'U00000000000000000002','E00000000000000000002',
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                 );",
-            )
-            .await
-            .unwrap();
-        agent_skill_version::Entity::update_many()
-            .col_expr(
-                agent_skill_version::Column::SourceTurnIdsJson,
-                sea_orm::sea_query::Expr::value(format!(
-                    "[\"{TURN_ID}\",\"U00000000000000000002\"]"
-                )),
-            )
-            .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+            database
+                .execute_unprepared(
+                    "INSERT INTO workspace (id,name,is_active,is_current) VALUES \
+                        ('W00000000000000000002','Other workspace',1,0); \
+                     INSERT INTO thread (
+                        id,workspace_id,preview,mode,model,model_provider,status,origin_kind,
+                        sidebar_visibility,access_class,created_at,updated_at
+                     ) VALUES (
+                        'T00000000000000000002','W00000000000000000002','','chat','test','test',
+                        'active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                     ); \
+                     INSERT INTO turn (
+                        id,thread_id,status,prompt_manifest_json,turn_kind,origin,created_at,updated_at
+                     ) VALUES (
+                        'U00000000000000000002','T00000000000000000002','completed','{}',
+                        'conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                     ); \
+                     INSERT INTO self_improvement_source_turn (
+                        workspace_id,thread_id,turn_id,terminal_event_id,terminal_at,created_at
+                     ) VALUES (
+                        'W00000000000000000002','T00000000000000000002',
+                        'U00000000000000000002','E00000000000000000002',
+                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                     );",
+                )
                 .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::MixedWorkspace
-            )
-        );
+                .unwrap();
+            agent_skill_version::Entity::update_many()
+                .col_expr(
+                    agent_skill_version::Column::SourceTurnIdsJson,
+                    sea_orm::sea_query::Expr::value(format!(
+                        "[\"{TURN_ID}\",\"U00000000000000000002\"]"
+                    )),
+                )
+                .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
+                .exec(&database)
+                .await
+                .unwrap();
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Ineligible(
+                    LearnedVersionIneligibleReason::MixedWorkspace
+                )
+            );
 
-        agent_skill_version::Entity::update_many()
-            .col_expr(
-                agent_skill_version::Column::SourceTurnIdsJson,
-                sea_orm::sea_query::Expr::value("[]"),
-            )
-            .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
-            .exec(&database)
-            .await
-            .unwrap();
-        assert_eq!(
-            derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+            agent_skill_version::Entity::update_many()
+                .col_expr(
+                    agent_skill_version::Column::SourceTurnIdsJson,
+                    sea_orm::sea_query::Expr::value("[]"),
+                )
+                .filter(agent_skill_version::Column::Id.eq(VERSION_ID))
+                .exec(&database)
                 .await
-                .unwrap(),
-            MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::EmptyProvenance
-            )
-        );
+                .unwrap();
+            assert_eq!(
+                derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
+                    .await
+                    .unwrap(),
+                MemberLearnedVersionEligibility::Ineligible(
+                    LearnedVersionIneligibleReason::EmptyProvenance
+                )
+            );
+            Ok(())
+        }).await.unwrap();
     }
 }

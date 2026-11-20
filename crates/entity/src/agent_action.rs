@@ -7,19 +7,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_agent_action_idempotency")]
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_action_idempotency")]
     pub execution_id: String,
-    pub action_kind: String,
-    #[sea_orm(unique_key = "uq_agent_action_idempotency")]
-    pub idempotency_key: String,
+    #[sea_orm(column_type = "Text")]
     pub request_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
-    pub created_at: DateTimeWithTimeZone,
     pub committed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
     pub response_json: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub action_kind: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_action_idempotency")]
+    pub idempotency_key: String,
     #[sea_orm(has_one)]
     pub agent_action_outbox: HasOne<super::agent_action_outbox::Entity>,
     #[sea_orm(has_one)]
@@ -33,7 +36,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

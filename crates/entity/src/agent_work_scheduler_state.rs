@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_work_scheduler_state")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub scheduler_key: String,
-    pub schedule_generation: i64,
     pub updated_at: DateTimeWithTimeZone,
+    pub schedule_generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

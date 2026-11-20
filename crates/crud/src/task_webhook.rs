@@ -135,7 +135,7 @@ impl CrudStore {
             occurrence
                 .validate()
                 .map_err(|_| anyhow::anyhow!("invalid webhook occurrence"))?;
-            let expected_spec = serde_json::to_string(&expected_trigger.spec)?;
+            let expected_spec = serde_json::to_value(&expected_trigger.spec)?;
             // This fresh occurrence is insert-only. Serialize before writer admission.
             let expected_generation = occurrence.execution_generation;
             let prepared_occurrence = task_occurrence_contract::ActiveModel {
@@ -168,6 +168,8 @@ impl CrudStore {
                 let prepared = self.refresh_task_event_preflight(prepared.clone()).await?;
                 let transaction = self.connection.begin().await?;
                 let outcome = async {
+                    pioneer_crud_tasks::event_log::lock_task(&transaction, &expected_task.id)
+                        .await?;
                     if let Some(action) = action.as_ref()
                         && let Some(existing) =
                             crate::repositories::agent_domain::load_agent_action(

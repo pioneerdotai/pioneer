@@ -7,25 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_episodic_recall_events")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub query_hash: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub search_profile_json: Option<String>,
-    pub search_mode: Option<String>,
-    pub adaptive_strategy: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cutoff_json: Option<String>,
+    pub fallback_used: bool,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    pub latency_ms: i64,
     pub candidate_count: i64,
     pub returned_count: i64,
-    pub latency_ms: i64,
-    pub fallback_used: bool,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub search_mode: Option<String>,
+    pub cutoff_json: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
+    pub search_profile_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub adaptive_strategy: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

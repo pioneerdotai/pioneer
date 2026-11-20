@@ -156,7 +156,7 @@ async fn insert_root(store: &CrudStore, descriptor: &FrozenHistoryRef, kind: usi
             "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id) VALUES('run','task','ws','thread',?1,?2)"
         }
         1 => {
-            "INSERT INTO turn_runtime_snapshot(turn_id,thread_id,workspace_id,mode_json,model,provider_name,hook_runtime_context_json,workspace_skill_policies_json,input_json,capabilities_json,resolved_artifacts_json,runtime_environment_json,history_json,frozen_manifest_id) VALUES('turn','thread','ws','{}','m','p','{}','{}','[]','{}','[]','{}',?1,?2)"
+            "INSERT INTO turn_runtime_snapshot(turn_id,thread_id,workspace_id,mode,model,provider_name,hook_runtime_context_json,workspace_skill_policies_json,input_json,capabilities_json,resolved_artifacts_json,runtime_environment_json,history_json,frozen_manifest_id) VALUES('turn','thread','ws','agent','m','p','{}','{}','[]','{}','[]','{}',?1,?2)"
         }
         2 => {
             "INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status,frozen_manifest_id) VALUES('thread','ws','runtime','claude','native',?1,'active',?2)"

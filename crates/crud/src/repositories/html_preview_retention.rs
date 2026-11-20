@@ -6,8 +6,8 @@ use pioneer_entity::{
     artifact, artifact_binding, artifact_blob, artifact_external_ref, artifact_projection,
     artifact_version, compaction_frozen_history as history, compaction_source_revision,
     html_preview_frozen_index as frozen_index, html_preview_frozen_result as frozen_result,
-    html_preview_frozen_turn as frozen_turn, html_preview_index_backfill as backfill,
-    thread as thread_entity, turn as turn_entity, turn_input, turn_llm_context,
+    html_preview_frozen_turn as frozen_turn, thread as thread_entity, turn as turn_entity,
+    turn_input, turn_llm_context,
 };
 use sea_orm::sea_query::{BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query};
 use sea_orm::{
@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, VecDeque};
 // Used by every user list, before identity pagination. A separate real binding
 // adopts the artifact; an ordinary screenshot from another tool never matches.
 pub(super) fn temporary_preview_predicate(alias: &'static str) -> Expr {
-    queries::temporary_preview(alias)
+    pioneer_crud_artifacts::visibility::temporary_preview_predicate(alias)
 }
 
 /// One immutable manifest page per call. Existing logical views include shared
@@ -43,12 +43,6 @@ async fn index_quantum(
         }
         return Ok(true);
     }
-    // Missing state never proves that legacy headers have markers. Pending
-    // import continuation above must not rediscover work or reread this gate.
-    let backfill_complete = backfill::Entity::find_by_id(1_i64)
-        .one(&store.connection)
-        .await?
-        .is_some_and(|state| state.complete == 1);
     let previous_after = after.clone();
     let mut query = Query::select()
         .columns([
@@ -59,154 +53,37 @@ async fn index_quantum(
             ("h", history::Column::MessageCount),
             ("h", history::Column::ImportCount),
             ("h", history::Column::ImportsSha256),
-            ("h", history::Column::Ready),
-            ("h", history::Column::Expired),
         ])
-        .expr_as(col("i", frozen_index::Column::ManifestId), "marker_id")
-        .expr_as(
-            Func::coalesce([col("i", frozen_index::Column::NextOrdinal), Expr::val(0)]),
-            "next_ordinal",
-        )
-        .expr_as(
-            Func::coalesce([col("i", frozen_index::Column::Complete), Expr::val(0)]),
-            "complete",
-        )
-        .expr_as(
-            Func::coalesce([col("i", frozen_index::Column::Unknown), Expr::val(0)]),
-            "unknown",
-        )
+        .expr_as(col("i", frozen_index::Column::NextOrdinal), "next_ordinal")
         .limit(1)
         .to_owned();
-    if backfill_complete {
-        // Keep literal predicate terms identical to html_preview_frozen_work.
-        // Bound parameters or COALESCE would obscure partial-index eligibility.
-        query
-            .from_as(frozen_index::Entity, "i")
-            .join_as(
-                JoinType::InnerJoin,
-                history::Entity,
-                "h",
-                col("h", history::Column::Id).eq(col("i", frozen_index::Column::ManifestId)),
-            )
-            .and_where(col("i", frozen_index::Column::Expired).eq(Expr::Constant(0.into())))
-            .and_where(col("i", frozen_index::Column::Ready).eq(Expr::Constant(1.into())))
-            .and_where(
-                col("i", frozen_index::Column::Complete)
-                    .ne(Expr::Constant(1.into()))
-                    .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
-            )
-            .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
-            .and_where(col("i", frozen_index::Column::ManifestId).lte(upper))
-            .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);
-    } else {
-        query
-            .from_as(history::Entity, "h")
-            .join_as(
-                JoinType::LeftJoin,
-                frozen_index::Entity,
-                "i",
-                col("i", frozen_index::Column::ManifestId).eq(col("h", history::Column::Id)),
-            )
-            .and_where(col("h", history::Column::Id).gt(after.as_str()))
-            .and_where(col("h", history::Column::Id).lte(upper))
-            .order_by(("h", history::Column::Id), Order::Asc);
-    }
+    // The manifest triggers create the marker with the header. Discover only
+    // active work using the predicate of the partial index.
+    query
+        .from_as(frozen_index::Entity, "i")
+        .join_as(
+            JoinType::InnerJoin,
+            history::Entity,
+            "h",
+            col("h", history::Column::Id).eq(col("i", frozen_index::Column::ManifestId)),
+        )
+        .and_where(col("i", frozen_index::Column::Expired).eq(Expr::Constant(0.into())))
+        .and_where(col("i", frozen_index::Column::Ready).eq(Expr::Constant(1.into())))
+        .and_where(
+            col("i", frozen_index::Column::Complete)
+                .ne(Expr::Constant(1.into()))
+                .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
+        )
+        .and_where(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(0.into())))
+        .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
+        .and_where(col("i", frozen_index::Column::ManifestId).lte(upper))
+        .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);
     let row = store.connection.query_one(&query).await?;
     let Some(row) = row else {
-        // Every old header was visited. Header triggers cover every insertion,
-        // update, key change and deletion concurrent with this keyset traversal.
-        if !backfill_complete {
-            store
-                .run_serialized_write(|| async {
-                    backfill::Entity::update_many()
-                        .col_expr(backfill::Column::Complete, Expr::val(1))
-                        .filter(backfill::Column::Singleton.eq(1))
-                        .filter(backfill::Column::Complete.eq(0))
-                        .exec(&store.connection)
-                        .await?;
-                    Ok(())
-                })
-                .await?;
-        }
         after.clear();
         return Ok(false);
     };
-    let discovered_id: String = row.try_get("", "id")?;
-    if row.try_get::<Option<String>>("", "marker_id")?.is_none() {
-        store
-            .run_serialized_write(|| async {
-                store
-                    .connection
-                    .execute(
-                        &Query::insert()
-                            .into_table(frozen_index::Entity)
-                            .columns([
-                                frozen_index::Column::ManifestId,
-                                frozen_index::Column::WorkspaceId,
-                                frozen_index::Column::IdentitySha256,
-                                frozen_index::Column::MessageCount,
-                                frozen_index::Column::Ready,
-                                frozen_index::Column::Expired,
-                            ])
-                            .select_from(
-                                history::Entity::find()
-                                    .select_only()
-                                    .columns([
-                                        history::Column::Id,
-                                        history::Column::WorkspaceId,
-                                        history::Column::IdentitySha256,
-                                        history::Column::MessageCount,
-                                        history::Column::Ready,
-                                        history::Column::Expired,
-                                    ])
-                                    .filter(history::Column::Id.eq(&discovered_id))
-                                    .into_query(),
-                            )?
-                            .on_conflict(
-                                OnConflict::column(frozen_index::Column::ManifestId)
-                                    .do_nothing()
-                                    .to_owned(),
-                            )
-                            .to_owned(),
-                    )
-                    .await?;
-                Ok(())
-            })
-            .await?;
-    }
     *after = row.try_get("", "id")?;
-    // Older derived markers treated every import stream as opaque. Revisit
-    // these metadata-only markers; they remain unsafe until fully verified.
-    if row.try_get::<i64>("", "expired")? == 0
-        && row.try_get::<i64>("", "ready")? == 1
-        && row.try_get::<i64>("", "unknown")? == 1
-        && row.try_get::<i64>("", "import_count")? > 0
-    {
-        store
-            .run_serialized_write(|| async {
-                frozen_index::Entity::update_many()
-                    .col_expr(frozen_index::Column::NextOrdinal, Expr::val(0))
-                    .col_expr(frozen_index::Column::Complete, Expr::val(0))
-                    .col_expr(frozen_index::Column::Unknown, Expr::val(0))
-                    .filter(frozen_index::Column::ManifestId.eq(&discovered_id))
-                    .filter(frozen_index::Column::Unknown.eq(1))
-                    .filter(frozen_index::Column::Expired.eq(0))
-                    .exec(&store.connection)
-                    .await?;
-                Ok(())
-            })
-            .await?;
-        *imports = None;
-        *after = previous_after;
-        return Ok(true);
-    }
-    if row.try_get::<i64>("", "expired")? == 1
-        || row.try_get::<i64>("", "ready")? != 1
-        || row.try_get::<i64>("", "complete")? == 1
-        || row.try_get::<i64>("", "unknown")? == 1
-    {
-        return Ok(true);
-    }
     let id: String = row.try_get("", "id")?;
     let workspace: String = row.try_get("", "workspace_id")?;
     let owner: String = row.try_get("", "owner_thread")?;
@@ -726,38 +603,26 @@ pub struct HtmlPreviewRetentionProgress {
     artifact_pending: VecDeque<PreviewArtifactHeader>,
     index_after: String,
     imports: Option<PreviewImportIndex>,
-    input_after: String,
     phase: usize,
-    idle: [bool; 3],
-    // Legacy input EOF cannot publish completion after skipping a failed row.
-    input_retry_debt: bool,
-    // Frozen index, legacy inputs and artifact IDs each own a finite pass.
-    // A producer cannot extend an active suffix and postpone wrap forever.
-    upper: [Option<String>; 3],
+    idle: [bool; 2],
+    // Frozen index work and artifact discovery each own a finite pass.
+    upper: [Option<String>; 2],
 }
 impl HtmlPreviewRetentionProgress {
     /// Returns false at discovery EOF. Errors do not pin the cursor to poison
     /// data; the maintenance owner must retain retry debt through pass EOF.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         while self.idle[self.phase] {
-            self.phase = (self.phase + 1) % 3;
+            self.phase = (self.phase + 1) % 2;
         }
         let path = self.phase;
-        self.phase = (self.phase + 1) % 3;
+        self.phase = (self.phase + 1) % 2;
         if self.upper[path].is_none() {
             self.upper[path] = Some(match path {
                 0 => history::Entity::find()
                     .select_only()
                     .column(history::Column::Id)
                     .order_by_desc(history::Column::Id)
-                    .into_tuple::<String>()
-                    .one(&store.connection)
-                    .await?
-                    .unwrap_or_default(),
-                1 => turn_input::Entity::find()
-                    .select_only()
-                    .column(turn_input::Column::Id)
-                    .order_by_desc(turn_input::Column::Id)
                     .into_tuple::<String>()
                     .one(&store.connection)
                     .await?
@@ -775,29 +640,11 @@ impl HtmlPreviewRetentionProgress {
                 )
                 .await?
             }
-            1 => {
-                let retry_debt = self.input_retry_debt;
-                // Cancellation after cursor advancement also keeps the durable
-                // completion gate open when this progress is reused.
-                self.input_retry_debt = true;
-                let more = input_adoption_quantum(
-                    store,
-                    &mut self.input_after,
-                    self.upper[1].as_deref().expect("captured frontier"),
-                    !retry_debt,
-                )
-                .await?;
-                self.input_retry_debt = retry_debt;
-                more
-            }
             _ => self.artifact_quantum(store).await?,
         };
-        if path == 1 && !more {
-            self.input_retry_debt = false;
-        }
         self.idle[path] = !more;
         if self.idle.iter().all(|idle| *idle) {
-            self.idle = [false; 3];
+            self.idle = [false; 2];
             self.upper = Default::default();
             Ok(false)
         } else {
@@ -812,7 +659,7 @@ impl HtmlPreviewRetentionProgress {
                 .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
                 .filter(artifact::Column::Id.gt(self.after.as_str()))
                 .filter(
-                    artifact::Column::Id.lte(self.upper[2].as_deref().expect("captured frontier")),
+                    artifact::Column::Id.lte(self.upper[1].as_deref().expect("captured frontier")),
                 )
                 .filter(
                     Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())),
@@ -909,9 +756,12 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                 .and(
                     json_field(
                         Expr::col(artifact::Column::MetadataJson),
-                        "$.htmlTool.retention",
+                        &["htmlTool", "retention"],
                     )
-                    .binary(BinOper::Is, Expr::val("released")),
+                    .binary(
+                        BinOper::Custom("IS NOT DISTINCT FROM"),
+                        Expr::val("released"),
+                    ),
                 )
                 .not(),
         )
@@ -919,14 +769,14 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
         .filter(
             json_field(
                 Expr::col(artifact::Column::MetadataJson),
-                "$.htmlTool.turnId",
+                &["htmlTool", "turnId"],
             )
             .eq(turn),
         )
         .filter(
             json_field(
                 Expr::col(artifact::Column::MetadataJson),
-                "$.htmlTool.callId",
+                &["htmlTool", "callId"],
             )
             .eq(call),
         )
@@ -1309,10 +1159,10 @@ impl CrudStore {
             .and(Func::coalesce([
                 json_field(
                     col("b", artifact_blob::Column::MetadataJson),
-                    "$.htmlToolTemporary",
+                    &["htmlToolTemporary"],
                 )
-                .eq(1),
-                Expr::val(0),
+                .is_in(["1", "true"]),
+                Expr::val(false),
             ]))
             .and(queries::blob_has_owners("b").not());
         let query = Query::select()
@@ -1334,7 +1184,7 @@ impl CrudStore {
         let mut candidates = Vec::new();
         for row in rows {
             next = row.try_get("", "id")?;
-            if row.try_get::<i64>("", "orphan")? != 0 {
+            if row.try_get::<bool>("", "orphan")? {
                 candidates.push((
                     row.try_get("", "workspace_id")?,
                     super::artifact::ArtifactGcBlobCandidateRecord {
@@ -1347,6 +1197,7 @@ impl CrudStore {
         }
         Ok((next, candidates))
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_released_copies_page(
         &self,
         after: &str,
@@ -1355,6 +1206,7 @@ impl CrudStore {
         self.html_preview_released_copies_page_through(after, &upper)
             .await
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_released_copies_page_through(
         &self,
         after: &str,
@@ -1545,21 +1397,21 @@ pub(crate) async fn preview_result_was_released<C: ConnectionTrait>(
         .filter(
             json_field(
                 Expr::col(artifact::Column::MetadataJson),
-                "$.htmlTool.turnId",
+                &["htmlTool", "turnId"],
             )
             .eq(turn),
         )
         .filter(
             json_field(
                 Expr::col(artifact::Column::MetadataJson),
-                "$.htmlTool.callId",
+                &["htmlTool", "callId"],
             )
             .eq(call),
         )
         .filter(
             json_field(
                 Expr::col(artifact::Column::MetadataJson),
-                "$.htmlTool.retention",
+                &["htmlTool", "retention"],
             )
             .eq("released"),
         )
@@ -1711,120 +1563,6 @@ pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn input_adoption_quantum(
-    store: &CrudStore,
-    after: &mut String,
-    upper: &str,
-    may_complete: bool,
-) -> Result<bool> {
-    // Supported input projection writers retain previews in their atomic write
-    // set, including inputs inserted behind this legacy cursor after completion.
-    // Do not cache the gate: a legacy-data migration may need to reopen it.
-    if backfill::Entity::find_by_id(1_i64)
-        .one(&store.connection)
-        .await?
-        .is_some_and(|state| state.inputs_complete == 1)
-    {
-        after.clear();
-        return Ok(false);
-    }
-    // Enumerate source IDs first: no request/commit scans all input payloads.
-    let payload_bytes: Expr = Expr::case(
-        Expr::col(turn_input::Column::InputType).eq("artifact"),
-        bytes(Expr::col(turn_input::Column::Payload)),
-    )
-    .finally(0)
-    .into();
-    let query = turn_input::Entity::find()
-        .select_only()
-        .columns([
-            turn_input::Column::Id,
-            turn_input::Column::TurnId,
-            turn_input::Column::InputType,
-            turn_input::Column::InputIndex,
-            turn_input::Column::CreatedAt,
-        ])
-        .column_as(payload_bytes, "bytes")
-        .filter(turn_input::Column::Id.gt(after.as_str()))
-        .filter(turn_input::Column::Id.lte(upper))
-        .order_by_asc(turn_input::Column::Id)
-        .limit(1)
-        .into_query();
-    let row = store.connection.query_one(&query).await?;
-    let Some(row) = row else {
-        if !may_complete {
-            // The owner retains retry debt through the common pass EOF. Keep
-            // the durable gate open so a fresh pass/restart revisits failures.
-            after.clear();
-            return Ok(false);
-        }
-        store
-            .run_serialized_write(|| async {
-                backfill::Entity::update_many()
-                    .col_expr(backfill::Column::InputsComplete, Expr::val(1))
-                    .filter(backfill::Column::Singleton.eq(1))
-                    .filter(backfill::Column::InputsComplete.eq(0))
-                    .exec(&store.connection)
-                    .await?;
-                Ok(())
-            })
-            .await?;
-        after.clear();
-        return Ok(false);
-    };
-    *after = row.try_get("", "id")?;
-    if row.try_get::<String>("", "input_type")? != "artifact" {
-        return Ok(true);
-    }
-    if row.try_get::<i64>("", "bytes")? > 8192 {
-        tracing::warn!("HTML preview adoption backfill preserved oversized canonical input");
-        return Ok(true);
-    }
-    let query = turn_input::Entity::find_by_id(after.as_str())
-        .select_only()
-        .column(turn_input::Column::Payload)
-        .filter(bytes(Expr::col(turn_input::Column::Payload)).lte(8192))
-        .into_query();
-    let current = store.connection.query_one(&query).await?;
-    let Some(current) = current else {
-        return Ok(true);
-    };
-    let payload: String = current.try_get("", "payload")?;
-    let pioneer_protocol::UserInput::Artifact {
-        artifact_id,
-        version_id,
-    } = serde_json::from_str(&payload)?
-    else {
-        tracing::warn!("HTML preview adoption backfill preserved unknown canonical input");
-        return Ok(true);
-    };
-    let turn: String = row.try_get("", "turn_id")?;
-    let adoption = PreparedPreviewInputAdoption::new(
-        &turn,
-        &artifact_id,
-        version_id.as_deref(),
-        row.try_get("", "input_index")?,
-        row.try_get("", "created_at")?,
-    );
-    store
-        .run_serialized_write(|| async {
-            let tx = store.connection.begin().await?;
-            let current = turn_input::Entity::find_by_id(after.as_str())
-                .filter(turn_input::Column::TurnId.eq(&turn))
-                .filter(turn_input::Column::InputType.eq("artifact"))
-                .filter(turn_input::Column::Payload.eq(&payload))
-                .one(&tx)
-                .await?;
-            if current.is_some() {
-                retain_preview_input(&tx, &adoption).await?;
-            }
-            tx.commit().await?;
-            Ok(())
-        })
-        .await?;
-    Ok(true)
-}
-
 /// A bounded, derived verification receipt, not a second history payload.
 /// Gateway verifies the original frozen rendering before preparing its hash.
 #[derive(Clone)]
@@ -1837,6 +1575,7 @@ pub struct HtmlPreviewArchiveWitness {
     pub payload: String,
 }
 impl CrudStore {
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_archive_witness_page(
         &self,
         after: &(String, i64),
@@ -1845,6 +1584,7 @@ impl CrudStore {
         self.html_preview_archive_witness_page_through(after, &upper)
             .await
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_archive_witness_page_through(
         &self,
         after: &(String, i64),
@@ -1954,6 +1694,7 @@ impl CrudStore {
         Ok((next, witness))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn record_html_preview_archive_witness(
         &self,
         witness: &HtmlPreviewArchiveWitness,
@@ -1996,14 +1737,17 @@ impl CrudStore {
         let reference = serde_json::to_string(&witness.reference)?;
         let io_locator = super::html_preview_io_work::HtmlPreviewIoLocator::new(&witness.manifest);
         let Some((source_version, source_id, source_turn)) =
-            frozen_result::Entity::find_by_id((witness.manifest.clone(), witness.ordinal))
-                .select_only()
-                .column(frozen_result::Column::SourceVersion)
-                .column(frozen_result::Column::SourceId)
-                .column(frozen_result::Column::TurnId)
-                .into_tuple::<(String, String, String)>()
-                .one(&self.connection)
-                .await?
+            pioneer_crud_artifacts::html_preview::find_frozen_result(
+                witness.manifest.clone(),
+                witness.ordinal,
+            )
+            .select_only()
+            .column(frozen_result::Column::SourceVersion)
+            .column(frozen_result::Column::SourceId)
+            .column(frozen_result::Column::TurnId)
+            .into_tuple::<(String, String, String)>()
+            .one(&self.connection)
+            .await?
         else {
             change.completed(false);
             return Ok(false);
@@ -2093,10 +1837,10 @@ impl CrudStore {
                 // A concurrent publisher may already have stored this exact receipt;
                 // reread under current domain authority before acknowledging it.
                 if changed != 1 {
-                    let stored = frozen_result::Entity::find_by_id((
+                    let stored = pioneer_crud_artifacts::html_preview::find_frozen_result(
                         witness.manifest.clone(),
                         witness.ordinal,
-                    ))
+                    )
                     .select_only()
                     .column(frozen_result::Column::ArchiveWireSha256)
                     .filter(frozen_result::Column::ReferenceJson.eq(&reference))
@@ -2193,7 +1937,7 @@ impl CrudStore {
             .and_where(
                 col("r", frozen_result::Column::ArchiveWireSha256).ne(json_field(
                     col("r", frozen_result::Column::ReferenceJson),
-                    "$.wire_sha256",
+                    &["wire_sha256"],
                 )),
             )
             .and_where(Expr::exists(queries::released_marker(workspace)))
@@ -2230,33 +1974,37 @@ impl CrudStore {
         if !claim.has_valid_point_locator() {
             return Ok(Source::Quarantine);
         }
-        let reference_bytes =
-            frozen_result::Entity::find_by_id((claim.source_id().to_owned(), claim.row.ordinal))
-                .select_only()
-                .column_as(
-                    super::html_preview_io_work::io_bytes(
-                        self.connection.get_database_backend(),
-                        Expr::col(frozen_result::Column::ReferenceJson),
-                    ),
-                    "bytes",
-                )
-                .into_tuple::<i64>()
-                .one(&self.connection)
-                .await?;
+        let reference_bytes = pioneer_crud_artifacts::html_preview::find_frozen_result(
+            claim.source_id().to_owned(),
+            claim.row.ordinal,
+        )
+        .select_only()
+        .column_as(
+            super::html_preview_io_work::io_bytes(
+                self.connection.get_database_backend(),
+                Expr::col(frozen_result::Column::ReferenceJson),
+            ),
+            "bytes",
+        )
+        .into_tuple::<i64>()
+        .one(&self.connection)
+        .await?;
         if reference_bytes.is_some_and(|n| n > 524288) {
             return Ok(Source::Quarantine);
         }
-        let Some(row) =
-            frozen_result::Entity::find_by_id((claim.source_id().to_owned(), claim.row.ordinal))
-                .filter(
-                    super::html_preview_io_work::io_bytes(
-                        self.connection.get_database_backend(),
-                        Expr::col(frozen_result::Column::ReferenceJson),
-                    )
-                    .lte(524288),
-                )
-                .one(&self.connection)
-                .await?
+        let Some(row) = pioneer_crud_artifacts::html_preview::find_frozen_result(
+            claim.source_id().to_owned(),
+            claim.row.ordinal,
+        )
+        .filter(
+            super::html_preview_io_work::io_bytes(
+                self.connection.get_database_backend(),
+                Expr::col(frozen_result::Column::ReferenceJson),
+            )
+            .lte(524288),
+        )
+        .one(&self.connection)
+        .await?
         else {
             return Ok(if reference_bytes.is_none() {
                 Source::Obsolete
@@ -2520,9 +2268,9 @@ impl CrudStore {
             .filter(
                 json_field(
                     Expr::col(artifact_blob::Column::MetadataJson),
-                    "$.htmlToolTemporary",
+                    &["htmlToolTemporary"],
                 )
-                .eq(1),
+                .is_in(["1", "true"]),
             )
             .filter(queries::blob_has_owners("artifact_blob").not())
             .order_by_asc(artifact_blob::Column::CreatedAt)
@@ -2559,6 +2307,7 @@ impl CrudStore {
             .await?
             .unwrap_or_default())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_witness_frontier(&self) -> Result<(String, i64)> {
         Ok(frozen_result::Entity::find()
             .select_only()

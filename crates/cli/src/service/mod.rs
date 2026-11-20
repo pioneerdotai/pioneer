@@ -13,6 +13,8 @@ pub const SERVICE_MODE_ARG: &str = "gateway-service";
 
 pub(crate) struct ServiceSettings {
     pub service_name: String,
+    #[cfg(windows)]
+    pub runtime_home: PathBuf,
     #[cfg(target_os = "macos")]
     pub legacy_service_names: Vec<String>,
     #[cfg(target_os = "macos")]
@@ -298,7 +300,7 @@ pub fn gateway_service_status() -> Result<GatewayServiceStatus> {
     })
 }
 
-fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
+pub(crate) fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
     let config = AppConfig::load().context("failed to load app config")?;
     let runtime_home = config
         .ensure_runtime_home_dir()
@@ -306,7 +308,7 @@ fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
     Ok((config, runtime_home))
 }
 
-fn block_on_gateway_operation<F, T>(future: F) -> Result<T>
+pub(crate) fn block_on_gateway_operation<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -363,9 +365,11 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
     legacy_service_names.sort();
     legacy_service_names.dedup();
 
-    config.runtime_home_dir()?;
+    let _runtime_home = config.runtime_home_dir()?;
     Ok(ServiceSettings {
         service_name,
+        #[cfg(windows)]
+        runtime_home: _runtime_home,
         #[cfg(target_os = "macos")]
         legacy_service_names,
         #[cfg(target_os = "macos")]

@@ -416,11 +416,7 @@ async fn mysql_rr_parent_counterpart_repair_cannot_suppress_later_run_obligation
         Err(error) => {
             // A stale sequence CAS is allowed only by unwinding the entire
             // source transaction; never retry its old RR snapshot in place.
-            assert!(
-                error
-                    .downcast_ref::<crate::repositories::portable_payload::PreflightRace>()
-                    .is_some()
-            );
+            assert!(error.downcast_ref::<crate::util::PreflightRace>().is_some());
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();
             assert!(

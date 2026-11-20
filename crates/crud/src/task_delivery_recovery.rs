@@ -25,7 +25,10 @@ impl CrudStore {
         &self,
         id: &str,
     ) -> Result<Option<DeliveryRecoverySnapshot>> {
-        recovery::snapshot(&self.connection, id).await
+        let read = self.connection.begin_read().await?;
+        let snapshot = recovery::snapshot(&read, id).await?;
+        read.commit().await?;
+        Ok(snapshot)
     }
 
     /// No domain mutation; clock is read only after writer admission. Failure

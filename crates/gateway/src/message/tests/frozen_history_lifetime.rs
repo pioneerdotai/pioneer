@@ -1782,7 +1782,7 @@ async fn commit_current(
                 turn_id: turn.into(),
                 thread_id: thread.into(),
                 workspace_id: f.h.workspace_id.clone(),
-                mode_json: "\"Agent\"".into(),
+                mode: pioneer_protocol::ThreadMode::Agent,
                 model: "fixture".into(),
                 provider_name: "fixture".into(),
                 reasoning_effort: None,

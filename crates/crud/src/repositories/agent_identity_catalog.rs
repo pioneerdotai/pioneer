@@ -123,13 +123,12 @@ pub async fn ensure_pioneer_for_workspace<C: ConnectionTrait>(
         .await?
     };
 
-    let nickname = actor_nickname_index::Entity::find_by_id((
-        workspace_id.to_owned(),
-        PIONEER_NICKNAME.to_owned(),
-    ))
-    .one(db)
-    .await
-    .context("failed to inspect reserved Pioneer nickname")?;
+    let nickname = actor_nickname_index::Entity::find()
+        .filter(actor_nickname_index::Column::WorkspaceId.eq(workspace_id))
+        .filter(actor_nickname_index::Column::NicknameKey.eq(PIONEER_NICKNAME))
+        .one(db)
+        .await
+        .context("failed to inspect reserved Pioneer nickname")?;
     match nickname {
         Some(row)
             if row.owner_kind == NICKNAME_OWNER_RESERVED
@@ -526,15 +525,19 @@ fn short_hash(value: &str) -> String {
 mod tests {
     use super::{CliRuntimeIdentitySeed, runtime_nickname, validate_runtime_catalog};
 
-    use migration::{Migrator, MigratorTrait};
     use pioneer_entity::{agent_identity, agent_presentation_snapshot, workspace};
     use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
-    async fn catalog_database() -> SqliteDatabase {
-        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&connection, None).await.unwrap();
-        let db = SqliteDatabase::from_single_connection(connection);
+    async fn catalog_database(fixture: &pioneer_postgres_test::TestDatabase) -> SqliteDatabase {
+        let db = SqliteDatabase::new(
+            fixture.connect_read_only().await.unwrap(),
+            fixture.connection().clone(),
+        );
+        workspace::Entity::delete_by_id(pioneer_crud_access::workspace::DEFAULT_WORKSPACE_ID)
+            .exec(&db)
+            .await
+            .unwrap();
         workspace::ActiveModel {
             id: Set("workspace".into()),
             name: Set("Workspace".into()),
@@ -567,195 +570,217 @@ mod tests {
 
     #[tokio::test]
     async fn large_identity_catalog_survives_sync_paging_and_bounded_retirement() {
-        let db = catalog_database().await;
-        let seeds = (0..260)
-            .map(|n| CliRuntimeIdentitySeed {
-                id: format!("runtime-{n:03}"),
-                kind: "codex".into(),
-                display_name: format!("Runtime {n}"),
-                nickname: format!("runtime-{n:03}"),
-                enabled: true,
-                source_revision_material: "configured".into(),
-            })
-            .collect::<Vec<_>>();
-        sync(&db, &seeds).await;
-        let mut after = None;
-        let mut ids = std::collections::BTreeSet::new();
-        loop {
-            let page = crate::list_active_agent_identities_page(&db, "workspace", after.as_deref())
+        pioneer_postgres_test::with_database(async |fixture| {
+            let db = catalog_database(fixture).await;
+            let seeds = (0..260)
+                .map(|n| CliRuntimeIdentitySeed {
+                    id: format!("runtime-{n:03}"),
+                    kind: "codex".into(),
+                    display_name: format!("Runtime {n}"),
+                    nickname: format!("runtime-{n:03}"),
+                    enabled: true,
+                    source_revision_material: "configured".into(),
+                })
+                .collect::<Vec<_>>();
+            sync(&db, &seeds).await;
+            let mut after = None;
+            let mut ids = std::collections::BTreeSet::new();
+            loop {
+                let page =
+                    crate::list_active_agent_identities_page(&db, "workspace", after.as_deref())
+                        .await
+                        .unwrap();
+                let done = page.len() < 200;
+                after = page.last().map(|identity| identity.id.clone());
+                for identity in page {
+                    assert!(ids.insert(identity.id));
+                }
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(ids.len(), 261); // CLI identities plus the reserved Pioneer.
+            sync(&db, &seeds[..129]).await;
+            let rows = crate::list_active_agent_identities_page(&db, "workspace", None)
                 .await
                 .unwrap();
-            let done = page.len() < 200;
-            after = page.last().map(|identity| identity.id.clone());
-            for identity in page {
-                assert!(ids.insert(identity.id));
-            }
-            if done {
-                break;
-            }
-        }
-        assert_eq!(ids.len(), 261); // CLI identities plus the reserved Pioneer.
-        sync(&db, &seeds[..129]).await;
-        let rows = crate::list_active_agent_identities_page(&db, "workspace", None)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 130);
+            assert_eq!(rows.len(), 130);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn cli_provider_off_on_cycles_keep_immutable_history_and_are_idempotent() {
         for kind in ["codex", "claude"] {
-            let db = catalog_database().await;
-            let mut previous = Vec::new();
-            for (index, enabled) in [true, false, true, false, true].into_iter().enumerate() {
-                // Keep both sources configured so switching one does not retire the other.
-                let instances = [
-                    runtime_seed("codex", enabled),
-                    runtime_seed("claude", enabled),
-                ];
-                sync(&db, &instances).await;
-                let identity = super::load_agent_identity_by_source(
-                    &db,
-                    "workspace",
-                    super::SOURCE_CLI_RUNTIME_INSTANCE,
-                    kind,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                let snapshots = agent_presentation_snapshot::Entity::find()
-                    .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
-                    .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
-                    .all(&db)
+            pioneer_postgres_test::with_database(async |fixture| {
+                let db = catalog_database(fixture).await;
+                let mut previous = Vec::new();
+                for (index, enabled) in [true, false, true, false, true].into_iter().enumerate() {
+                    // Keep both sources configured so switching one does not retire the other.
+                    let instances = [
+                        runtime_seed("codex", enabled),
+                        runtime_seed("claude", enabled),
+                    ];
+                    sync(&db, &instances).await;
+                    let identity = super::load_agent_identity_by_source(
+                        &db,
+                        "workspace",
+                        super::SOURCE_CLI_RUNTIME_INSTANCE,
+                        kind,
+                    )
                     .await
+                    .unwrap()
                     .unwrap();
-                if index > 0 {
-                    assert_eq!(&snapshots[..previous.len()], previous.as_slice());
+                    let snapshots = agent_presentation_snapshot::Entity::find()
+                        .filter(
+                            agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id),
+                        )
+                        .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    if index > 0 {
+                        assert_eq!(&snapshots[..previous.len()], previous.as_slice());
+                    }
+                    assert_eq!(
+                        snapshots.last().unwrap().source_revision,
+                        identity.source_revision
+                    );
+                    assert_eq!(
+                        snapshots.last().unwrap().source_fingerprint,
+                        identity.source_fingerprint
+                    );
+                    assert_eq!(identity.status, "active");
+                    assert_eq!(snapshots.len(), index + 1);
+                    sync(&db, &instances).await;
+                    let replay = agent_presentation_snapshot::Entity::find()
+                        .filter(
+                            agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id),
+                        )
+                        .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        snapshots, replay,
+                        "replay must not rewrite or append history"
+                    );
+                    previous = snapshots;
                 }
-                assert_eq!(
-                    snapshots.last().unwrap().source_revision,
-                    identity.source_revision
-                );
-                assert_eq!(
-                    snapshots.last().unwrap().source_fingerprint,
-                    identity.source_fingerprint
-                );
-                assert_eq!(identity.status, "active");
-                assert_eq!(snapshots.len(), index + 1);
-                sync(&db, &instances).await;
-                let replay = agent_presentation_snapshot::Entity::find()
-                    .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
-                    .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
-                    .all(&db)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    snapshots, replay,
-                    "replay must not rewrite or append history"
-                );
-                previous = snapshots;
-            }
-            db.close().await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn cli_provider_projection_recovers_after_failed_reenable_and_rollback() {
         for partial_revision in [3, 4] {
-            let db = catalog_database().await;
-            let on = runtime_seed("codex", true);
-            let off = runtime_seed("codex", false);
-            sync(&db, &[on.clone()]).await;
-            sync(&db, &[off.clone()]).await;
-            let identity = super::load_agent_identity_by_source(
-                &db,
-                "workspace",
-                super::SOURCE_CLI_RUNTIME_INSTANCE,
-                "codex",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            // Old code advanced the identity before its snapshot insert failed. The
-            // rollback also failed, leaving this identity ahead of the settings file.
-            let mut partial: agent_identity::ActiveModel = identity.into();
-            partial.source_revision = Set(partial_revision);
-            partial.source_fingerprint = Set(super::cli_runtime_identity_fingerprint(
-                if partial_revision == 3 { &on } else { &off },
-            ));
-            partial.update(&db).await.unwrap();
-            sync(&db, &[off]).await;
-            sync(&db, &[on]).await;
-            let identity = super::load_agent_identity_by_source(
-                &db,
-                "workspace",
-                super::SOURCE_CLI_RUNTIME_INSTANCE,
-                "codex",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(identity.source_revision, 5);
-            let history = agent_presentation_snapshot::Entity::find()
-                .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(identity.id))
-                .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
-                .all(&db)
+            pioneer_postgres_test::with_database(async |fixture| {
+                let db = catalog_database(fixture).await;
+                let on = runtime_seed("codex", true);
+                let off = runtime_seed("codex", false);
+                sync(&db, &[on.clone()]).await;
+                sync(&db, &[off.clone()]).await;
+                let identity = super::load_agent_identity_by_source(
+                    &db,
+                    "workspace",
+                    super::SOURCE_CLI_RUNTIME_INSTANCE,
+                    "codex",
+                )
                 .await
+                .unwrap()
                 .unwrap();
-            assert_eq!(
-                history
-                    .iter()
-                    .map(|row| row.source_revision)
-                    .collect::<Vec<_>>(),
-                vec![1, 2, 4, 5]
-            );
-            db.close().await.unwrap();
+                // Old code advanced the identity before its snapshot insert failed. The
+                // rollback also failed, leaving this identity ahead of the settings file.
+                let mut partial: agent_identity::ActiveModel = identity.into();
+                partial.source_revision = Set(partial_revision);
+                partial.source_fingerprint = Set(super::cli_runtime_identity_fingerprint(
+                    if partial_revision == 3 { &on } else { &off },
+                ));
+                partial.update(&db).await.unwrap();
+                sync(&db, &[off]).await;
+                sync(&db, &[on]).await;
+                let identity = super::load_agent_identity_by_source(
+                    &db,
+                    "workspace",
+                    super::SOURCE_CLI_RUNTIME_INSTANCE,
+                    "codex",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(identity.source_revision, 5);
+                let history = agent_presentation_snapshot::Entity::find()
+                    .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(identity.id))
+                    .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    history
+                        .iter()
+                        .map(|row| row.source_revision)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2, 4, 5]
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn cli_provider_projection_preserves_legacy_snapshot_ids() {
-        let db = catalog_database().await;
-        let on = runtime_seed("codex", true);
-        sync(&db, &[on.clone()]).await;
-        let identity = super::load_agent_identity_by_source(
-            &db,
-            "workspace",
-            super::SOURCE_CLI_RUNTIME_INSTANCE,
-            "codex",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let legacy_id = super::deterministic_id(
-            'S',
-            &format!(
-                "cli-snapshot\0workspace\0codex\0{}",
-                identity.source_fingerprint,
-            ),
-        );
-        agent_presentation_snapshot::Entity::update_many()
-            .col_expr(
-                agent_presentation_snapshot::Column::Id,
-                sea_orm::sea_query::Expr::value(&legacy_id),
+        pioneer_postgres_test::with_database(async |fixture| {
+            let db = catalog_database(fixture).await;
+            let on = runtime_seed("codex", true);
+            sync(&db, &[on.clone()]).await;
+            let identity = super::load_agent_identity_by_source(
+                &db,
+                "workspace",
+                super::SOURCE_CLI_RUNTIME_INSTANCE,
+                "codex",
             )
-            .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
-            .exec(&db)
-            .await
-            .unwrap();
-        let before = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
-            .one(&db)
             .await
             .unwrap()
             .unwrap();
-        sync(&db, &[on]).await;
-        let after = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(before, after);
-        db.close().await.unwrap();
+            let legacy_id = super::deterministic_id(
+                'S',
+                &format!(
+                    "cli-snapshot\0workspace\0codex\0{}",
+                    identity.source_fingerprint,
+                ),
+            );
+            agent_presentation_snapshot::Entity::update_many()
+                .col_expr(
+                    agent_presentation_snapshot::Column::Id,
+                    sea_orm::sea_query::Expr::value(&legacy_id),
+                )
+                .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
+                .exec(&db)
+                .await
+                .unwrap();
+            let before = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            sync(&db, &[on]).await;
+            let after = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(before, after);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

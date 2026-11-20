@@ -7,22 +7,36 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run_conversation_snapshot")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frozen_manifest_id: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub run_id: String,
-    pub task_id: String,
-    pub workspace_id: String,
-    pub conversation_thread_id: String,
-    pub source_turn_id: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub history_json: String,
+    pub conversation_thread_id: String,
     pub created_at: DateTimeWithTimeZone,
     pub portable_revision: i64,
     #[sea_orm(column_type = "Text")]
-    pub portable_identity: String,
+    pub workspace_id: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub history_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub portable_identity: String,
+    #[sea_orm(column_type = "Text", nullable, unique)]
     pub history_json_payload_id: Option<String>,
+    #[sea_orm(
+        belongs_to,
+        from = "history_json_payload_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "NoAction"
+    )]
+    pub portable_payload_value: BelongsTo<Option<super::portable_payload_value::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

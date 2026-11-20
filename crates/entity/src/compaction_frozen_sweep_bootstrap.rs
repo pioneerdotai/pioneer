@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_sweep_bootstrap")]
 pub struct Model {
+    pub complete: i64,
+    pub started: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub kind: i64,
-    pub started: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub upper_manifest: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub after_manifest: Option<String>,
-    pub complete: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub upper_manifest: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

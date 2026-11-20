@@ -7,13 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "patch_commit_terminal")]
 pub struct Model {
-    #[sea_orm(
-        primary_key,
-        auto_increment = false,
-        column_type = "Text",
-        unique_key = "uq_patch_commit_terminal_commit_ordinal"
-    )]
-    pub thread_id: String,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         primary_key,
         auto_increment = false,
@@ -21,21 +15,27 @@ pub struct Model {
         unique_key = "uq_patch_commit_terminal_commit_ordinal"
     )]
     pub turn_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub invocation_id: String,
-    #[sea_orm(unique_key = "uq_patch_commit_terminal_commit_ordinal")]
-    pub commit_ordinal: i64,
-    #[sea_orm(column_type = "Binary(1)")]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub plan_fingerprint: Vec<u8>,
     #[sea_orm(column_type = "Text")]
     pub operations_json: String,
     #[sea_orm(column_type = "Text")]
-    pub authority: String,
-    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub invocation_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub record_id: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub authority: String,
+    #[sea_orm(unique_key = "uq_patch_commit_terminal_commit_ordinal")]
+    pub commit_ordinal: i64,
+    #[sea_orm(
+        primary_key,
+        auto_increment = false,
+        column_type = "Text",
+        unique_key = "uq_patch_commit_terminal_commit_ordinal"
+    )]
+    pub thread_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

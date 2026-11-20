@@ -59,6 +59,8 @@ async fn projected_binding_keeps_internal_capsule_and_corrupt_lineage_checks() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("child Turn has no durable lineage"));
     pioneer_entity::thread_lineage::Entity::insert(pioneer_entity::thread_lineage::ActiveModel {
+        insertion_ordinal: Default::default(),
+        publication_xid: Default::default(),
         child_thread_id: Set(child.into()),
         parent_thread_id: Set(root.id.clone()),
         root_thread_id: Set(root.id.clone()),

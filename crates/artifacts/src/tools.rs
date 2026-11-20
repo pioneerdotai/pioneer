@@ -1302,14 +1302,14 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::CrudStore;
+    use pioneer_postgres_test::{TestDatabase, with_database};
     use pioneer_protocol::{
         TurnExecutionSecuritySnapshot, TurnFilesystemAccess, TurnFilesystemSandboxEntry,
         TurnPermissionMode, TurnPermissionProfileSnapshot, TurnPermissionProfileSource,
     };
     use pioneer_tools::{ToolCallSource, ToolEventBus, ToolInvocation};
-    use sea_orm::Database;
+    use sea_orm::ConnectionTrait;
     use serde_json::Value as JsonValue;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_util::sync::CancellationToken;
@@ -1398,221 +1398,255 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_prepare_returns_safe_path_inside_output_dir() {
-        let output_dir = temp_output_dir("safe");
-        let state = Arc::new(ArtifactToolState::default());
-        let handler = ArtifactToolHandler::new(
-            Arc::new(artifact_register_service(temp_output_dir("runtime")).await),
-            artifact_register_context(),
-            state.clone(),
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
+        with_database(async |database| {
+            let output_dir = temp_output_dir("safe");
+            let state = Arc::new(ArtifactToolState::default());
+            let handler = ArtifactToolHandler::new(
+                Arc::new(artifact_register_service(database, temp_output_dir("runtime")).await),
+                artifact_register_context(),
+                state.clone(),
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
 
-        let output = handler
-            .handle(
-                invocation(
-                    Some(output_dir.as_path()),
-                    serde_json::json!({
-                        "displayName": "../../report.png",
-                        "kind": "image",
-                        "mimeType": "image/png"
-                    }),
-                    "call_safe",
-                ),
-                trace(),
-            )
-            .await
-            .expect("prepare should succeed");
+            let output = handler
+                .handle(
+                    invocation(
+                        Some(output_dir.as_path()),
+                        serde_json::json!({
+                            "displayName": "../../report.png",
+                            "kind": "image",
+                            "mimeType": "image/png"
+                        }),
+                        "call_safe",
+                    ),
+                    trace(),
+                )
+                .await
+                .expect("prepare should succeed");
 
-        let payload = output.raw_json();
-        let output_path = PathBuf::from(payload["outputPath"].as_str().expect("path"));
-        let canonical_output_dir = std::fs::canonicalize(output_dir.as_path()).expect("dir");
-        assert!(output_path.starts_with(canonical_output_dir.as_path()));
-        assert!(
-            !payload["displayName"]
-                .as_str()
-                .expect("display")
-                .contains('/')
-        );
-        assert_eq!(state.prepared_outputs().len(), 1);
-        assert!(
-            state
-                .prepared_output_for_path(output_path.as_path())
-                .is_some()
-        );
+            let payload = output.raw_json();
+            let output_path = PathBuf::from(payload["outputPath"].as_str().expect("path"));
+            let canonical_output_dir = std::fs::canonicalize(output_dir.as_path()).expect("dir");
+            assert!(output_path.starts_with(canonical_output_dir.as_path()));
+            assert!(
+                !payload["displayName"]
+                    .as_str()
+                    .expect("display")
+                    .contains('/')
+            );
+            assert_eq!(state.prepared_outputs().len(), 1);
+            assert!(
+                state
+                    .prepared_output_for_path(output_path.as_path())
+                    .is_some()
+            );
 
-        let _ = std::fs::remove_dir_all(canonical_output_dir);
+            let _ = std::fs::remove_dir_all(canonical_output_dir);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_prepare_adds_mime_extension_to_extensionless_name() {
-        let output_dir = temp_output_dir("extension");
-        let state = Arc::new(ArtifactToolState::default());
-        let handler = ArtifactToolHandler::new(
-            Arc::new(artifact_register_service(temp_output_dir("runtime")).await),
-            artifact_register_context(),
-            state,
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
+        with_database(async |database| {
+            let output_dir = temp_output_dir("extension");
+            let state = Arc::new(ArtifactToolState::default());
+            let handler = ArtifactToolHandler::new(
+                Arc::new(artifact_register_service(database, temp_output_dir("runtime")).await),
+                artifact_register_context(),
+                state,
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
 
-        let output = handler
-            .handle(
-                invocation(
-                    Some(output_dir.as_path()),
-                    serde_json::json!({
-                        "displayName": "auto.ru_screenshot",
-                        "kind": "image",
-                        "mimeType": "image/png"
-                    }),
-                    "call_extension",
-                ),
-                trace(),
-            )
-            .await
-            .expect("prepare should succeed")
-            .raw_json();
+            let output = handler
+                .handle(
+                    invocation(
+                        Some(output_dir.as_path()),
+                        serde_json::json!({
+                            "displayName": "auto.ru_screenshot",
+                            "kind": "image",
+                            "mimeType": "image/png"
+                        }),
+                        "call_extension",
+                    ),
+                    trace(),
+                )
+                .await
+                .expect("prepare should succeed")
+                .raw_json();
 
-        assert_eq!(
-            output["displayName"].as_str(),
-            Some("auto.ru_screenshot.png")
-        );
-        assert!(
-            output["outputPath"]
-                .as_str()
-                .expect("output path")
-                .ends_with("auto.ru_screenshot.png")
-        );
+            assert_eq!(
+                output["displayName"].as_str(),
+                Some("auto.ru_screenshot.png")
+            );
+            assert!(
+                output["outputPath"]
+                    .as_str()
+                    .expect("output path")
+                    .ends_with("auto.ru_screenshot.png")
+            );
 
-        let _ = std::fs::remove_dir_all(output_dir);
+            let _ = std::fs::remove_dir_all(output_dir);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_prepare_duplicate_display_names_are_deterministic() {
-        let output_dir = temp_output_dir("dupe");
-        let state = Arc::new(ArtifactToolState::default());
-        let handler = ArtifactToolHandler::new(
-            Arc::new(artifact_register_service(temp_output_dir("runtime")).await),
-            artifact_register_context(),
-            state.clone(),
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
-        let args = serde_json::json!({
-            "displayName": "chart.csv",
-            "kind": "data"
-        });
+        with_database(async |database| {
+            let output_dir = temp_output_dir("dupe");
+            let state = Arc::new(ArtifactToolState::default());
+            let handler = ArtifactToolHandler::new(
+                Arc::new(artifact_register_service(database, temp_output_dir("runtime")).await),
+                artifact_register_context(),
+                state.clone(),
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
+            let args = serde_json::json!({
+                "displayName": "chart.csv",
+                "kind": "data"
+            });
 
-        let first = handler
-            .handle(
-                invocation(Some(output_dir.as_path()), args.clone(), "call_first"),
-                trace(),
-            )
-            .await
-            .expect("first prepare should succeed")
-            .raw_json();
-        let second = handler
-            .handle(
-                invocation(Some(output_dir.as_path()), args, "call_second"),
-                trace(),
-            )
-            .await
-            .expect("second prepare should succeed")
-            .raw_json();
+            let first = handler
+                .handle(
+                    invocation(Some(output_dir.as_path()), args.clone(), "call_first"),
+                    trace(),
+                )
+                .await
+                .expect("first prepare should succeed")
+                .raw_json();
+            let second = handler
+                .handle(
+                    invocation(Some(output_dir.as_path()), args, "call_second"),
+                    trace(),
+                )
+                .await
+                .expect("second prepare should succeed")
+                .raw_json();
 
-        assert!(
-            first["outputPath"]
-                .as_str()
-                .expect("first")
-                .ends_with("chart.csv")
-        );
-        assert!(
-            second["outputPath"]
-                .as_str()
-                .expect("second")
-                .ends_with("chart-2.csv")
-        );
-        assert_eq!(state.prepared_outputs().len(), 2);
+            assert!(
+                first["outputPath"]
+                    .as_str()
+                    .expect("first")
+                    .ends_with("chart.csv")
+            );
+            assert!(
+                second["outputPath"]
+                    .as_str()
+                    .expect("second")
+                    .ends_with("chart-2.csv")
+            );
+            assert_eq!(state.prepared_outputs().len(), 2);
 
-        let _ = std::fs::remove_dir_all(output_dir);
+            let _ = std::fs::remove_dir_all(output_dir);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_prepare_requires_output_dir_environment() {
-        let handler = ArtifactToolHandler::new(
-            Arc::new(artifact_register_service(temp_output_dir("runtime")).await),
-            artifact_register_context(),
-            Arc::new(ArtifactToolState::default()),
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
+        with_database(async |database| {
+            let handler = ArtifactToolHandler::new(
+                Arc::new(artifact_register_service(database, temp_output_dir("runtime")).await),
+                artifact_register_context(),
+                Arc::new(ArtifactToolState::default()),
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
 
-        let error = match handler
-            .handle(
-                invocation(
-                    None,
-                    serde_json::json!({
-                        "displayName": "image.png",
-                        "kind": "image"
-                    }),
-                    "call_missing_env",
-                ),
-                trace(),
-            )
-            .await
-        {
-            Ok(_) => panic!("missing env should fail"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("PIONEER_ARTIFACT_OUTPUT_DIR"));
-    }
-
-    #[tokio::test]
-    async fn artifact_prepare_allows_app_output_dir_outside_snapshot() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace_root = temp.path().join("workspace");
-        let output_dir = temp.path().join("artifact-output");
-        tokio::fs::create_dir_all(workspace_root.as_path())
-            .await
-            .expect("create workspace");
-        let state = Arc::new(ArtifactToolState::default());
-        let handler = ArtifactToolHandler::new(
-            Arc::new(artifact_register_service(temp.path().join("runtime")).await),
-            artifact_register_context(),
-            state.clone(),
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
-        let snapshot = workspace_write_security_snapshot(workspace_root.as_path());
-
-        let output = handler
-            .handle(
-                with_execution_security_snapshot(
+            let error = match handler
+                .handle(
                     invocation(
-                        Some(output_dir.as_path()),
+                        None,
                         serde_json::json!({
                             "displayName": "image.png",
                             "kind": "image"
                         }),
-                        "call_app_output_dir",
+                        "call_missing_env",
                     ),
-                    snapshot,
-                ),
-                trace(),
-            )
-            .await
-            .expect("artifact output dir should be allowed even outside workspace snapshot")
-            .raw_json();
+                    trace(),
+                )
+                .await
+            {
+                Ok(_) => panic!("missing env should fail"),
+                Err(error) => error,
+            };
 
-        let output_path = PathBuf::from(output["outputPath"].as_str().expect("output path"));
-        let canonical_output_dir = std::fs::canonicalize(output_dir.as_path()).expect("output dir");
-        assert!(output_path.starts_with(canonical_output_dir.as_path()));
-        assert_eq!(state.prepared_outputs().len(), 1);
+            assert!(error.to_string().contains("PIONEER_ARTIFACT_OUTPUT_DIR"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
-    async fn artifact_register_service(runtime_home: PathBuf) -> ArtifactService {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite");
-        Migrator::up(&db, None).await.expect("migrate");
+    #[tokio::test]
+    async fn artifact_prepare_allows_app_output_dir_outside_snapshot() {
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace_root = temp.path().join("workspace");
+            let output_dir = temp.path().join("artifact-output");
+            tokio::fs::create_dir_all(workspace_root.as_path())
+                .await
+                .expect("create workspace");
+            let state = Arc::new(ArtifactToolState::default());
+            let handler = ArtifactToolHandler::new(
+                Arc::new(artifact_register_service(database, temp.path().join("runtime")).await),
+                artifact_register_context(),
+                state.clone(),
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
+            let snapshot = workspace_write_security_snapshot(workspace_root.as_path());
+
+            let output = handler
+                .handle(
+                    with_execution_security_snapshot(
+                        invocation(
+                            Some(output_dir.as_path()),
+                            serde_json::json!({
+                                "displayName": "image.png",
+                                "kind": "image"
+                            }),
+                            "call_app_output_dir",
+                        ),
+                        snapshot,
+                    ),
+                    trace(),
+                )
+                .await
+                .expect("artifact output dir should be allowed even outside workspace snapshot")
+                .raw_json();
+
+            let output_path = PathBuf::from(output["outputPath"].as_str().expect("output path"));
+            let canonical_output_dir =
+                std::fs::canonicalize(output_dir.as_path()).expect("output dir");
+            assert!(output_path.starts_with(canonical_output_dir.as_path()));
+            assert_eq!(state.prepared_outputs().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn artifact_register_service(
+        database: &TestDatabase,
+        runtime_home: PathBuf,
+    ) -> ArtifactService {
+        database.connection().execute_unprepared(
+            "INSERT INTO workspace(id,name) VALUES ('ws_artifact_register','Fixture');
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+             VALUES ('thr_artifact_register','ws_artifact_register','','agent','model','provider','active');
+             INSERT INTO turn(id,thread_id,status) VALUES ('turn_artifact_register','thr_artifact_register','in_progress');",
+        ).await.expect("create artifact owner");
         ArtifactService::new(
-            Arc::new(CrudStore::new(db)),
+            Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+                database.connect_read_only().await.unwrap(),
+                database.connection().clone(),
+            ))),
             Arc::new(crate::LocalArtifactBlobStore::new(runtime_home)),
         )
     }
@@ -1679,415 +1713,466 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_register_registers_file_from_output_dir_and_defers_cleanup_to_gc() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let output_dir = temp.path().join("output");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        tokio::fs::create_dir_all(output_dir.as_path())
-            .await
-            .expect("create output dir");
-        let source_path = output_dir.join("report.txt");
-        tokio::fs::write(source_path.as_path(), b"registered output")
-            .await
-            .expect("write source");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation = with_execution_security_snapshot(
-            artifact_register_invocation(
-                workspace.clone(),
-                Some(output_dir.clone()),
-                source_path.display().to_string(),
-            ),
-            workspace_write_security_snapshot(workspace.as_path()),
-        );
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let output_dir = temp.path().join("output");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            tokio::fs::create_dir_all(output_dir.as_path())
+                .await
+                .expect("create output dir");
+            let source_path = output_dir.join("report.txt");
+            tokio::fs::write(source_path.as_path(), b"registered output")
+                .await
+                .expect("write source");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation = with_execution_security_snapshot(
+                artifact_register_invocation(
+                    workspace.clone(),
+                    Some(output_dir.clone()),
+                    source_path.display().to_string(),
+                ),
+                workspace_write_security_snapshot(workspace.as_path()),
+            );
 
-        let outcome = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
-        .await
-        .expect("register output artifact");
-
-        assert_eq!(outcome.response.display_name, "registered.txt");
-        assert_eq!(outcome.response.kind, ArtifactKind::File);
-        assert!(
-            source_path.exists(),
-            "output-dir source stays until turn-output GC can remove it without a path race"
-        );
-        let page = service
-            .list_thread_artifacts(
-                "ws_artifact_register",
-                "thr_artifact_register",
-                crate::ArtifactListFilter::default(),
+            let outcome = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
             )
             .await
-            .expect("list artifacts");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0].artifact.artifact_id,
-            outcome.response.artifact_id
-        );
+            .expect("register output artifact");
+
+            assert_eq!(outcome.response.display_name, "registered.txt");
+            assert_eq!(outcome.response.kind, ArtifactKind::File);
+            assert!(
+                source_path.exists(),
+                "output-dir source stays until turn-output GC can remove it without a path race"
+            );
+            let page = service
+                .list_thread_artifacts(
+                    "ws_artifact_register",
+                    "thr_artifact_register",
+                    crate::ArtifactListFilter::default(),
+                )
+                .await
+                .expect("list artifacts");
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(
+                page.items[0].artifact.artifact_id,
+                outcome.response.artifact_id
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_closes_explicit_prepared_output_when_registering_copy() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let output_dir = temp.path().join("output");
-        let downloads = workspace.join("Downloads");
-        tokio::fs::create_dir_all(downloads.as_path())
-            .await
-            .expect("create downloads");
-        tokio::fs::create_dir_all(output_dir.as_path())
-            .await
-            .expect("create output dir");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let prepared =
-            reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
-        tokio::fs::write(prepared.output_path.as_path(), b"registered copy")
-            .await
-            .expect("write prepared");
-        let copy_path = downloads.join("report.txt");
-        tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
-            .await
-            .expect("copy prepared output");
-        let invocation = artifact_register_invocation_with_prepared(
-            workspace.clone(),
-            Some(output_dir.clone()),
-            copy_path.display().to_string(),
-            Some(prepared.output_path.display().to_string()),
-        );
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let output_dir = temp.path().join("output");
+            let downloads = workspace.join("Downloads");
+            tokio::fs::create_dir_all(downloads.as_path())
+                .await
+                .expect("create downloads");
+            tokio::fs::create_dir_all(output_dir.as_path())
+                .await
+                .expect("create output dir");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let prepared =
+                reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
+            tokio::fs::write(prepared.output_path.as_path(), b"registered copy")
+                .await
+                .expect("write prepared");
+            let copy_path = downloads.join("report.txt");
+            tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
+                .await
+                .expect("copy prepared output");
+            let invocation = artifact_register_invocation_with_prepared(
+                workspace.clone(),
+                Some(output_dir.clone()),
+                copy_path.display().to_string(),
+                Some(prepared.output_path.display().to_string()),
+            );
 
-        let outcome = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
+            let outcome = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
+            .await
+            .expect("register copied prepared output");
+
+            let prepared_after = state
+                .prepared_output_for_path(prepared.output_path.as_path())
+                .expect("prepared output remains tracked");
+            assert!(prepared_after.is_registered());
+            assert_eq!(outcome.response.display_name, "registered.txt");
+            assert!(
+                prepared.output_path.exists(),
+                "staging source stays until turn-output GC can remove it without a path race"
+            );
+            assert!(copy_path.exists(), "user-requested copy should remain");
+            Ok(())
+        })
         .await
-        .expect("register copied prepared output");
-
-        let prepared_after = state
-            .prepared_output_for_path(prepared.output_path.as_path())
-            .expect("prepared output remains tracked");
-        assert!(prepared_after.is_registered());
-        assert_eq!(outcome.response.display_name, "registered.txt");
-        assert!(
-            prepared.output_path.exists(),
-            "staging source stays until turn-output GC can remove it without a path race"
-        );
-        assert!(copy_path.exists(), "user-requested copy should remain");
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_infers_single_prepared_copy_by_fingerprint() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let output_dir = temp.path().join("output");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        tokio::fs::create_dir_all(output_dir.as_path())
-            .await
-            .expect("create output dir");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let prepared =
-            reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
-        tokio::fs::write(prepared.output_path.as_path(), b"same bytes")
-            .await
-            .expect("write prepared");
-        let copy_path = workspace.join("report-copy.txt");
-        tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
-            .await
-            .expect("copy prepared output");
-        let invocation = artifact_register_invocation(
-            workspace.clone(),
-            Some(output_dir.clone()),
-            copy_path.display().to_string(),
-        );
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let output_dir = temp.path().join("output");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            tokio::fs::create_dir_all(output_dir.as_path())
+                .await
+                .expect("create output dir");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let prepared =
+                reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_prepare");
+            tokio::fs::write(prepared.output_path.as_path(), b"same bytes")
+                .await
+                .expect("write prepared");
+            let copy_path = workspace.join("report-copy.txt");
+            tokio::fs::copy(prepared.output_path.as_path(), copy_path.as_path())
+                .await
+                .expect("copy prepared output");
+            let invocation = artifact_register_invocation(
+                workspace.clone(),
+                Some(output_dir.clone()),
+                copy_path.display().to_string(),
+            );
 
-        register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
+            register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
+            .await
+            .expect("register copied prepared output");
+
+            let prepared_after = state
+                .prepared_output_for_path(prepared.output_path.as_path())
+                .expect("prepared output remains tracked");
+            assert!(prepared_after.is_registered());
+            assert!(
+                prepared.output_path.exists(),
+                "matched staging source stays until turn-output GC"
+            );
+            Ok(())
+        })
         .await
-        .expect("register copied prepared output");
-
-        let prepared_after = state
-            .prepared_output_for_path(prepared.output_path.as_path())
-            .expect("prepared output remains tracked");
-        assert!(prepared_after.is_registered());
-        assert!(
-            prepared.output_path.exists(),
-            "matched staging source stays until turn-output GC"
-        );
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_rejects_ambiguous_prepared_copy_without_explicit_path() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let output_dir = temp.path().join("output");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        tokio::fs::create_dir_all(output_dir.as_path())
-            .await
-            .expect("create output dir");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let first = reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_1");
-        let second = reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_2");
-        tokio::fs::write(first.output_path.as_path(), b"same bytes")
-            .await
-            .expect("write first prepared");
-        tokio::fs::write(second.output_path.as_path(), b"same bytes")
-            .await
-            .expect("write second prepared");
-        let copy_path = workspace.join("report-copy.txt");
-        tokio::fs::write(copy_path.as_path(), b"same bytes")
-            .await
-            .expect("write copy");
-        let invocation = artifact_register_invocation(
-            workspace.clone(),
-            Some(output_dir.clone()),
-            copy_path.display().to_string(),
-        );
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let output_dir = temp.path().join("output");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            tokio::fs::create_dir_all(output_dir.as_path())
+                .await
+                .expect("create output dir");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let first =
+                reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_1");
+            let second =
+                reserve_prepared_output(&state, output_dir.as_path(), "report.txt", "call_2");
+            tokio::fs::write(first.output_path.as_path(), b"same bytes")
+                .await
+                .expect("write first prepared");
+            tokio::fs::write(second.output_path.as_path(), b"same bytes")
+                .await
+                .expect("write second prepared");
+            let copy_path = workspace.join("report-copy.txt");
+            tokio::fs::write(copy_path.as_path(), b"same bytes")
+                .await
+                .expect("write copy");
+            let invocation = artifact_register_invocation(
+                workspace.clone(),
+                Some(output_dir.clone()),
+                copy_path.display().to_string(),
+            );
 
-        let error = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
-        .await
-        .expect_err("ambiguous prepared copy should fail before registration")
-        .to_string();
-
-        assert!(error.contains("preparedOutputPath"), "{error}");
-        assert!(
-            state
-                .prepared_output_for_path(first.output_path.as_path())
-                .expect("first prepared")
-                .is_reserved()
-        );
-        assert!(
-            state
-                .prepared_output_for_path(second.output_path.as_path())
-                .expect("second prepared")
-                .is_reserved()
-        );
-        let page = service
-            .list_thread_artifacts(
-                "ws_artifact_register",
-                "thr_artifact_register",
-                crate::ArtifactListFilter::default(),
+            let error = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
             )
             .await
-            .expect("list artifacts");
-        assert!(page.items.is_empty());
+            .expect_err("ambiguous prepared copy should fail before registration")
+            .to_string();
+
+            assert!(error.contains("preparedOutputPath"), "{error}");
+            assert!(
+                state
+                    .prepared_output_for_path(first.output_path.as_path())
+                    .expect("first prepared")
+                    .is_reserved()
+            );
+            assert!(
+                state
+                    .prepared_output_for_path(second.output_path.as_path())
+                    .expect("second prepared")
+                    .is_reserved()
+            );
+            let page = service
+                .list_thread_artifacts(
+                    "ws_artifact_register",
+                    "thr_artifact_register",
+                    crate::ArtifactListFilter::default(),
+                )
+                .await
+                .expect("list artifacts");
+            assert!(page.items.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_registers_file_from_workspace_root() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        let source_path = workspace.join("report.txt");
-        tokio::fs::write(source_path.as_path(), b"registered workspace")
-            .await
-            .expect("write source");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation =
-            artifact_register_invocation(workspace.clone(), None, "report.txt".to_owned());
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            let source_path = workspace.join("report.txt");
+            tokio::fs::write(source_path.as_path(), b"registered workspace")
+                .await
+                .expect("write source");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation =
+                artifact_register_invocation(workspace.clone(), None, "report.txt".to_owned());
 
-        let outcome = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
-        .await
-        .expect("register workspace artifact");
-
-        assert!(
-            source_path.exists(),
-            "workspace source should remain in place"
-        );
-        let page = service
-            .list_thread_artifacts(
-                "ws_artifact_register",
-                "thr_artifact_register",
-                crate::ArtifactListFilter::default(),
+            let outcome = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
             )
             .await
-            .expect("list artifacts");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0].artifact.artifact_id,
-            outcome.response.artifact_id
-        );
+            .expect("register workspace artifact");
+
+            assert!(
+                source_path.exists(),
+                "workspace source should remain in place"
+            );
+            let page = service
+                .list_thread_artifacts(
+                    "ws_artifact_register",
+                    "thr_artifact_register",
+                    crate::ArtifactListFilter::default(),
+                )
+                .await
+                .expect("list artifacts");
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(
+                page.items[0].artifact.artifact_id,
+                outcome.response.artifact_id
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_rejects_outside_allowed_roots() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let outside = temp.path().join("outside");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        tokio::fs::create_dir_all(outside.as_path())
-            .await
-            .expect("create outside");
-        let outside_file = outside.join("secret.txt");
-        tokio::fs::write(outside_file.as_path(), b"outside")
-            .await
-            .expect("write outside");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation =
-            artifact_register_invocation(workspace, None, outside_file.display().to_string());
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let outside = temp.path().join("outside");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            tokio::fs::create_dir_all(outside.as_path())
+                .await
+                .expect("create outside");
+            let outside_file = outside.join("secret.txt");
+            tokio::fs::write(outside_file.as_path(), b"outside")
+                .await
+                .expect("write outside");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation =
+                artifact_register_invocation(workspace, None, outside_file.display().to_string());
 
-        let error = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
+            let error = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
+            .await
+            .expect_err("outside-root registration should fail")
+            .to_string();
+
+            assert!(error.contains("outside allowed roots"), "{error}");
+            Ok(())
+        })
         .await
-        .expect_err("outside-root registration should fail")
-        .to_string();
-
-        assert!(error.contains("outside allowed roots"), "{error}");
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_policy_denies_source_outside_snapshot_before_registration() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        let outside = temp.path().join("outside");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        tokio::fs::create_dir_all(outside.as_path())
-            .await
-            .expect("create outside");
-        let outside_file = outside.join("secret.txt");
-        tokio::fs::write(outside_file.as_path(), b"outside")
-            .await
-            .expect("write outside");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation = with_execution_security_snapshot(
-            artifact_register_invocation(
-                workspace.clone(),
-                None,
-                outside_file.display().to_string(),
-            ),
-            workspace_write_security_snapshot(workspace.as_path()),
-        );
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let outside = temp.path().join("outside");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            tokio::fs::create_dir_all(outside.as_path())
+                .await
+                .expect("create outside");
+            let outside_file = outside.join("secret.txt");
+            tokio::fs::write(outside_file.as_path(), b"outside")
+                .await
+                .expect("write outside");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation = with_execution_security_snapshot(
+                artifact_register_invocation(
+                    workspace.clone(),
+                    None,
+                    outside_file.display().to_string(),
+                ),
+                workspace_write_security_snapshot(workspace.as_path()),
+            );
 
-        let error = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
-        .await
-        .expect_err("outside-snapshot registration should fail")
-        .to_string();
-
-        assert!(error.contains("artifact_register source path"), "{error}");
-        assert!(
-            error.contains("outside the allowed sandbox roots"),
-            "{error}"
-        );
-        let page = service
-            .list_thread_artifacts(
-                "ws_artifact_register",
-                "thr_artifact_register",
-                crate::ArtifactListFilter::default(),
+            let error = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
             )
             .await
-            .expect("list artifacts");
-        assert!(page.items.is_empty());
+            .expect_err("outside-snapshot registration should fail")
+            .to_string();
+
+            assert!(error.contains("artifact_register source path"), "{error}");
+            assert!(
+                error.contains("outside the allowed sandbox roots"),
+                "{error}"
+            );
+            let page = service
+                .list_thread_artifacts(
+                    "ws_artifact_register",
+                    "thr_artifact_register",
+                    crate::ArtifactListFilter::default(),
+                )
+                .await
+                .expect("list artifacts");
+            assert!(page.items.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn artifact_register_rejects_symlink() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        let target = workspace.join("target.txt");
-        tokio::fs::write(target.as_path(), b"target")
-            .await
-            .expect("write target");
-        let link = workspace.join("link.txt");
-        std::os::unix::fs::symlink(target.as_path(), link.as_path()).expect("create symlink");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation = artifact_register_invocation(workspace, None, link.display().to_string());
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            let target = workspace.join("target.txt");
+            tokio::fs::write(target.as_path(), b"target")
+                .await
+                .expect("write target");
+            let link = workspace.join("link.txt");
+            std::os::unix::fs::symlink(target.as_path(), link.as_path()).expect("create symlink");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation =
+                artifact_register_invocation(workspace, None, link.display().to_string());
 
-        let error = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
+            let error = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
+            .await
+            .expect_err("symlink registration should fail")
+            .to_string();
+
+            assert!(error.contains("symlink is not allowed"), "{error}");
+            Ok(())
+        })
         .await
-        .expect_err("symlink registration should fail")
-        .to_string();
-
-        assert!(error.contains("symlink is not allowed"), "{error}");
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_register_rejects_non_regular_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        tokio::fs::create_dir_all(workspace.as_path())
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let invocation = artifact_register_invocation(
+                workspace.clone(),
+                None,
+                workspace.display().to_string(),
+            );
+
+            let error = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
             .await
-            .expect("create workspace");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let invocation =
-            artifact_register_invocation(workspace.clone(), None, workspace.display().to_string());
+            .expect_err("directory registration should fail")
+            .to_string();
 
-        let error = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
+            assert!(error.contains("not a regular file"), "{error}");
+            Ok(())
+        })
         .await
-        .expect_err("directory registration should fail")
-        .to_string();
-
-        assert!(error.contains("not a regular file"), "{error}");
+        .unwrap();
     }
 
     #[test]
@@ -2129,34 +2214,39 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_register_failed_registration_returns_before_notifications() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        tokio::fs::create_dir_all(workspace.as_path())
-            .await
-            .expect("create workspace");
-        let service = artifact_register_service(temp.path().join("runtime")).await;
-        let state = ArtifactToolState::default();
-        let missing_path = workspace.join("missing.txt");
-        let invocation =
-            artifact_register_invocation(workspace, None, missing_path.display().to_string());
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            tokio::fs::create_dir_all(workspace.as_path())
+                .await
+                .expect("create workspace");
+            let service = artifact_register_service(database, temp.path().join("runtime")).await;
+            let state = ArtifactToolState::default();
+            let missing_path = workspace.join("missing.txt");
+            let invocation =
+                artifact_register_invocation(workspace, None, missing_path.display().to_string());
 
-        let result = register_artifact_for_invocation(
-            &service,
-            &artifact_register_context(),
-            &state,
-            &invocation,
-            decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
-        )
-        .await;
+            let result = register_artifact_for_invocation(
+                &service,
+                &artifact_register_context(),
+                &state,
+                &invocation,
+                decode_artifact_tool_args(invocation.clone()).expect("decode register input"),
+            )
+            .await;
 
-        assert!(
-            result.is_err(),
-            "failed registration must return before notification emission"
-        );
-        assert!(
-            artifact_register_projection_notifications(&artifact_register_context(), &[], 0)
-                .is_empty()
-        );
+            assert!(
+                result.is_err(),
+                "failed registration must return before notification emission"
+            );
+            assert!(
+                artifact_register_projection_notifications(&artifact_register_context(), &[], 0)
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -2196,51 +2286,58 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_read_tool_uses_domain_bounded_bytes_without_client_rpc_dto() {
-        let service = Arc::new(artifact_register_service(temp_output_dir("read-runtime")).await);
-        let summary = service
-            .ingest_bytes(crate::IngestArtifactBytesRequest {
-                workspace_id: "ws_artifact_register".to_owned(),
-                primary_thread_id: Some("thr_artifact_register".to_owned()),
-                bytes: b"hello bounded artifact".to_vec(),
-                display_name: "bounded.txt".to_owned(),
-                kind: ArtifactKind::Text,
-                mime_type: Some("text/plain".to_owned()),
-                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Agent,
-                created_by_actor_id: Some("agent_test".to_owned()),
-                binding: None,
-                metadata: BTreeMap::new(),
-            })
-            .await
-            .expect("ingest bounded artifact");
-        let handler = ArtifactToolHandler::new(
-            service,
-            artifact_register_context(),
-            Arc::new(ArtifactToolState::default()),
-            Arc::new(NoopArtifactToolNotificationSink),
-        );
-        let mut read = invocation(
-            None,
-            serde_json::json!({
-                "artifactId": summary.artifact.artifact_id,
-                "offset": 6,
-                "maxBytes": 7
-            }),
-            "call_read",
-        );
-        read.tool_name = ARTIFACT_READ_TOOL.to_owned();
+        with_database(async |database| {
+            let service = Arc::new(
+                artifact_register_service(database, temp_output_dir("read-runtime")).await,
+            );
+            let summary = service
+                .ingest_bytes(crate::IngestArtifactBytesRequest {
+                    workspace_id: "ws_artifact_register".to_owned(),
+                    primary_thread_id: Some("thr_artifact_register".to_owned()),
+                    bytes: b"hello bounded artifact".to_vec(),
+                    display_name: "bounded.txt".to_owned(),
+                    kind: ArtifactKind::Text,
+                    mime_type: Some("text/plain".to_owned()),
+                    created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Agent,
+                    created_by_actor_id: Some("agent_test".to_owned()),
+                    binding: None,
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect("ingest bounded artifact");
+            let handler = ArtifactToolHandler::new(
+                service,
+                artifact_register_context(),
+                Arc::new(ArtifactToolState::default()),
+                Arc::new(NoopArtifactToolNotificationSink),
+            );
+            let mut read = invocation(
+                None,
+                serde_json::json!({
+                    "artifactId": summary.artifact.artifact_id,
+                    "offset": 6,
+                    "maxBytes": 7
+                }),
+                "call_read",
+            );
+            read.tool_name = ARTIFACT_READ_TOOL.to_owned();
 
-        let output = handler
-            .handle(read, trace())
-            .await
-            .expect("bounded artifact read")
-            .raw_json();
+            let output = handler
+                .handle(read, trace())
+                .await
+                .expect("bounded artifact read")
+                .raw_json();
 
-        assert_eq!(output["offset"], 6);
-        assert_eq!(output["len"], 7);
-        assert_eq!(output["text"], "bounded");
-        assert_eq!(output["nextOffset"], 13);
-        assert_eq!(output["truncated"], true);
-        assert!(output.get("content_base64").is_none());
+            assert_eq!(output["offset"], 6);
+            assert_eq!(output["len"], 7);
+            assert_eq!(output["text"], "bounded");
+            assert_eq!(output["nextOffset"], 13);
+            assert_eq!(output["truncated"], true);
+            assert!(output.get("content_base64").is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn assert_schema_descriptions_have_no_json_object_examples(value: &JsonValue, label: &str) {

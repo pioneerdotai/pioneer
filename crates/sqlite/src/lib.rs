@@ -5,6 +5,7 @@ use std::path::{Component, Path};
 use std::pin::Pin;
 use std::time::Duration;
 
+#[cfg(any(test, feature = "test-support"))]
 mod blob_range;
 mod database;
 mod query_scope;
@@ -16,6 +17,7 @@ pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_de
 mod writer_ownership;
 pub use writer_ownership::{WriterBusy, WriterOwnership};
 
+#[cfg(any(test, feature = "test-support"))]
 pub use blob_range::SqliteBlobSource;
 pub use database::{SqliteDatabase, SqliteReadTransaction};
 pub use reader::{
@@ -58,7 +60,9 @@ impl SqliteAdmissionSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod search;
+#[cfg(any(test, feature = "test-support"))]
 pub mod zstd;
 
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
@@ -116,6 +120,24 @@ pub fn is_sqlite_lock_message(message: &str) -> bool {
 
 pub fn is_anyhow_sqlite_lock(error: &anyhow::Error) -> bool {
     is_sqlite_lock_message(format!("{error:#}").as_str())
+}
+
+/// A transaction rejected by PostgreSQL must be retried from its beginning.
+pub fn is_retryable_database_conflict(error: &anyhow::Error) -> bool {
+    use sea_orm::{DbErr, RuntimeErr, sqlx};
+
+    let retryable_postgres = error.chain().any(|source| {
+        let error = match source.downcast_ref::<DbErr>() {
+            Some(DbErr::Exec(RuntimeErr::SqlxError(error)))
+            | Some(DbErr::Query(RuntimeErr::SqlxError(error))) => Some(error.as_ref()),
+            _ => source.downcast_ref::<sqlx::Error>(),
+        };
+        let Some(sqlx::Error::Database(error)) = error else {
+            return false;
+        };
+        matches!(error.code().as_deref(), Some("40001" | "40P01"))
+    });
+    retryable_postgres || is_anyhow_sqlite_lock(error)
 }
 
 pub fn is_sqlite_transient_open_message(message: &str) -> bool {

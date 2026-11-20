@@ -7,29 +7,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_execution_resource_state")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_agent_resource_state_attempt")]
-    pub execution_id: String,
-    #[sea_orm(unique_key = "uq_agent_resource_state_attempt")]
-    pub attempt_generation: i64,
     pub progress_sequence: i64,
-    #[sea_orm(column_type = "Text")]
-    pub progress_frontier_json: String,
-    pub last_progress_at: Option<DateTimeWithTimeZone>,
+    pub fenced_at: Option<DateTimeWithTimeZone>,
     pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
-    pub idle_deadline: Option<DateTimeWithTimeZone>,
     pub hard_deadline: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text")]
-    pub local_usage_json: String,
-    pub permit_id: Option<String>,
-    pub branch_key: String,
-    pub fair_order: i64,
     pub status: String,
+    #[sea_orm(unique_key = "uq_agent_resource_state_attempt")]
+    pub attempt_generation: i64,
+    pub idle_deadline: Option<DateTimeWithTimeZone>,
+    pub last_progress_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub progress_frontier_json: String,
+    pub fair_order: i64,
     pub fencing_generation: i64,
-    pub fenced_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique_key = "uq_agent_resource_state_attempt")]
+    pub execution_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub local_usage_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub branch_key: String,
     pub updated_at: DateTimeWithTimeZone,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub permit_id: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "execution_id",
@@ -37,7 +40,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -1,8 +1,8 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, binary, integer, json, json_binary, text, text_null,
-    timestamp_with_time_zone, timestamp_with_time_zone_null,
+    big_integer, big_integer_null, binary, binary_null, json, small_integer, small_integer_null,
+    text, text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
 };
 
 #[derive(DeriveMigrationName)]
@@ -28,7 +28,8 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(timestamp_with_time_zone_null("last_verified_at"))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -81,7 +82,8 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(timestamp_with_time_zone_null("deleted_at"))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -154,7 +156,8 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -217,7 +220,8 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -355,7 +359,7 @@ impl MigrationTrait for Migration {
                     .col(text("status"))
                     .col(text_null("text_content"))
                     .col(text_null("blob_id"))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -364,6 +368,7 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -459,8 +464,10 @@ impl MigrationTrait for Migration {
                     .col(text("exactness").default("uncertain"))
                     .col(big_integer("committed_at_unix_ms").default(0))
                     .col(binary("plan_fingerprint"))
-                    .col(json("outcome_json"))
-                    .col(json("changes_json"))
+                    .col(text("outcome_json"))
+                    .check(Expr::cust("outcome_json IS JSON"))
+                    .col(text("changes_json"))
+                    .check(Expr::cust("changes_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -520,7 +527,8 @@ impl MigrationTrait for Migration {
                     .col(big_integer("sequence"))
                     .col(text("source_path"))
                     .col(text_null("destination_path"))
-                    .col(json("change_json"))
+                    .col(text("change_json"))
+                    .check(Expr::cust("change_json IS JSON"))
                     .primary_key(Index::create().col("record_id").col("sequence"))
                     .to_owned(),
             )
@@ -606,7 +614,8 @@ impl MigrationTrait for Migration {
                     .col(binary("content_hash"))
                     .col(big_integer("byte_len"))
                     .col(text("encoding"))
-                    .col(json_binary("line_endings_json"))
+                    .col(text("line_endings_json"))
+                    .check(Expr::cust("line_endings_json IS JSON"))
                     .col(binary("compressed_bytes"))
                     .col(big_integer("raw_byte_len"))
                     .col(big_integer("ref_count").default(0))
@@ -626,6 +635,56 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // Startup reconciliation decodes immutable patch records between
+        // bounded transactions. Its scratch data cannot live on a pooled
+        // connection and is scoped to the durable scan identifier.
+        manager
+            .create_table(
+                Table::create()
+                    .table("patch_snapshot_scan")
+                    .col(text("id").primary_key())
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust("statement_timestamp()")),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("patch_snapshot_scan_age")
+                    .table("patch_snapshot_scan")
+                    .col("updated_at")
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table("patch_snapshot_scan_reference")
+                    .col(text("scan_id"))
+                    .col(text("domain_id").extra(r#"COLLATE "C""#))
+                    .col(binary("content_hash"))
+                    .col(big_integer("byte_len"))
+                    .col(big_integer("ref_count"))
+                    .primary_key(
+                        Index::create()
+                            .col("scan_id")
+                            .col("domain_id")
+                            .col("content_hash")
+                            .col("byte_len"),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from("patch_snapshot_scan_reference", "scan_id")
+                            .to("patch_snapshot_scan", "id")
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .check(Expr::cust("ref_count > 0 AND byte_len >= 0"))
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -635,9 +694,12 @@ impl MigrationTrait for Migration {
                     .col(text("invocation_id"))
                     .col(big_integer("commit_ordinal"))
                     .col(binary("plan_fingerprint"))
-                    .col(json("operations_json"))
-                    .col(json("recovery_json"))
-                    .col(json("progress_json"))
+                    .col(text("operations_json"))
+                    .check(Expr::cust("operations_json IS JSON"))
+                    .col(text("recovery_json"))
+                    .check(Expr::cust("recovery_json IS JSON"))
+                    .col(text("progress_json"))
+                    .check(Expr::cust("progress_json IS JSON"))
                     .col(text("status"))
                     .col(
                         timestamp_with_time_zone("updated_at")
@@ -689,7 +751,8 @@ impl MigrationTrait for Migration {
                     .col(text("invocation_id"))
                     .col(big_integer("commit_ordinal"))
                     .col(binary("plan_fingerprint"))
-                    .col(json("operations_json"))
+                    .col(text("operations_json"))
+                    .check(Expr::cust("operations_json IS JSON"))
                     .col(text("authority"))
                     .col(text("status"))
                     .col(text_null("record_id"))
@@ -754,11 +817,13 @@ impl MigrationTrait for Migration {
                     .col(big_integer("revision"))
                     .col(text("authority"))
                     .col(big_integer("exact"))
-                    .col(json("coverage_json"))
+                    .col(text("coverage_json"))
+                    .check(Expr::cust("coverage_json IS JSON"))
                     .col(big_integer_null("applied_through_ordinal"))
                     .col(big_integer("record_count"))
                     .col(big_integer("final_state").default(0))
-                    .col(json("state_json"))
+                    .col(text("state_json"))
+                    .check(Expr::cust("state_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -782,13 +847,17 @@ impl MigrationTrait for Migration {
                     .col(text("id"))
                     .col(text("turn_id"))
                     .col(text("item_id"))
-                    .col(text("stream"))
-                    .col(text("text"))
+                    .col(text_null("stream"))
+                    .col(binary("text"))
+                    .col(ColumnDef::new("text_encoding").small_integer().not_null())
+                    .col(big_integer("text_original_bytes"))
+                    .col(big_integer("text_original_chars"))
+                    .col(binary("text_sha256"))
                     .col(text_null("metadata"))
-                    .col(big_integer("portable_revision").default(0))
-                    .col(text("portable_identity").default(""))
-                    .col(text_null("text_payload_id"))
-                    .col(text_null("metadata_payload_id"))
+                    .check(Expr::cust("text_original_bytes BETWEEN 0 AND 131072"))
+                    .check(Expr::cust("text_original_chars BETWEEN 0 AND text_original_bytes"))
+                    .check(Expr::cust("octet_length(text_sha256) = 32"))
+                    .check(Expr::cust("(text_encoding = 0 AND octet_length(text) = text_original_bytes) OR (text_encoding = 1 AND octet_length(text) + 2 < text_original_bytes)"))
                     .index(Index::create().unique().col("id"))
                     .check(Expr::cust(r#""stream" IN ('agent_message', 'stdout', 'stderr', 'tool_progress', 'file_change', 'generic')"#))
                     .to_owned(),
@@ -807,131 +876,13 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // SeaQuery does not expose PostgreSQL column storage strategy.
         manager
-            .create_index(
-                Index::create()
-                    .name("tool_output_chunk_metadata_portable_pending")
-                    .table("tool_output_chunk")
-                    .col("metadata_payload_id")
-                    .col("id")
-                    .and_where(Expr::cust(
-                        r#""metadata_payload_id" IS NULL AND "metadata" IS NOT NULL"#,
-                    ))
-                    .to_owned(),
-            )
+            .get_connection()
+            .execute_unprepared(include_str!("sql/m20261119_000003_payloads/storage.sql"))
             .await?;
 
-        manager
-            .create_index(
-                Index::create()
-                    .name("tool_output_chunk_text_portable_pending")
-                    .table("tool_output_chunk")
-                    .col("text_payload_id")
-                    .col("id")
-                    .and_where(Expr::cust(r#""text_payload_id" IS NULL"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
-                    .table("portable_payload_dictionary")
-                    .col(text("id").primary_key())
-                    .col(text("family"))
-                    .col(integer("version"))
-                    .col(binary("data"))
-                    .check(Expr::cust(r#"length ( data ) BETWEEN 1 AND 32768"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("portable_payload_dictionary_family_version")
-                    .table("portable_payload_dictionary")
-                    .unique()
-                    .col("family")
-                    .col("version")
-                    .to_owned(),
-            )
-            .await?;
-
-        manager.create_table(
-            Table::create().table("portable_payload")
-                .col(text("id").primary_key())
-                .col(text("family"))
-                .col(big_integer("original_bytes"))
-                .col(big_integer("original_chars"))
-                .col(binary("sha256"))
-                .col(integer("raw"))
-                .col(integer("retired").default(1))
-                .col(text_null("dictionary_id"))
-                .check(Expr::cust(r#""original_bytes" >= 0"#))
-                .check(Expr::cust(r#"original_chars >= 0 AND original_chars <= original_bytes"#))
-                .check(Expr::cust(r#"( length ( sha256 ) = 32 OR ( retired = 1 AND length ( sha256 ) = 0 ) )"#))
-                .check(Expr::cust(r#""raw" IN ( 0 , 1 )"#))
-                .check(Expr::cust(r#""retired" IN ( 0 , 1 )"#))
-                .to_owned(),
-        ).await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("portable_payload_retired")
-                    .table("portable_payload")
-                    .col("retired")
-                    .col("id")
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
-                    .table("portable_payload_block")
-                    .col(text("payload_id"))
-                    .col(big_integer("ordinal"))
-                    .col(big_integer("byte_offset"))
-                    .col(big_integer("char_offset"))
-                    .col(big_integer("original_bytes"))
-                    .col(big_integer("original_chars"))
-                    .col(binary("data"))
-                    .primary_key(Index::create().col("payload_id").col("ordinal"))
-                    .check(Expr::cust(r#""ordinal" >= 0"#))
-                    .check(Expr::cust(r#""byte_offset" >= 0"#))
-                    .check(Expr::cust(r#""char_offset" >= 0"#))
-                    .check(Expr::cust(r#""original_bytes" BETWEEN 1 AND 65536"#))
-                    .check(Expr::cust(
-                        r#"original_chars >= 1 AND original_chars <= original_bytes"#,
-                    ))
-                    .check(Expr::cust(r#"length ( data ) BETWEEN 78 AND 66638"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("portable_payload_block_bytes")
-                    .table("portable_payload_block")
-                    .col("payload_id")
-                    .col("byte_offset")
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("portable_payload_block_chars")
-                    .table("portable_payload_block")
-                    .col("payload_id")
-                    .col("char_offset")
-                    .to_owned(),
-            )
-            .await?;
+        create_portable_payload_storage(manager).await?;
         Ok(())
     }
 
@@ -939,14 +890,15 @@ impl MigrationTrait for Migration {
         drop_tables(
             manager,
             &[
-                "portable_payload_block",
-                "portable_payload",
-                "portable_payload_dictionary",
+                "portable_payload_part",
+                "portable_payload_value",
                 "tool_output_chunk",
                 "turn_diff_state",
                 "patch_snapshot_reservation",
                 "patch_commit_terminal",
                 "patch_commit_intent",
+                "patch_snapshot_scan_reference",
+                "patch_snapshot_scan",
                 "patch_snapshot",
                 "applied_patch_change_index",
                 "applied_patch_record",
@@ -961,4 +913,78 @@ impl MigrationTrait for Migration {
         )
         .await
     }
+}
+
+async fn create_portable_payload_storage(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table("portable_payload_value")
+                .col(text("id").primary_key())
+                .col(big_integer("original_bytes"))
+                .col(big_integer("original_chars"))
+                .col(binary("sha256"))
+                .col(small_integer_null("codec"))
+                .col(binary_null("body"))
+                .check(Expr::cust("original_chars BETWEEN 0 AND original_bytes"))
+                .check(Expr::cust("octet_length(sha256) = 32"))
+                .check(Expr::cust(
+                    "CASE WHEN original_bytes <= 65536 THEN
+                         codec IS NOT NULL AND body IS NOT NULL
+                         AND ((codec = 0 AND octet_length(body) = original_bytes)
+                             OR (codec = 1 AND octet_length(body) + 2 < original_bytes))
+                     ELSE codec IS NULL AND body IS NULL END",
+                ))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_table(
+            Table::create()
+                .table("portable_payload_part")
+                .col(text("payload_id"))
+                .col(big_integer("byte_offset"))
+                .col(big_integer("char_offset"))
+                .col(big_integer("original_bytes"))
+                .col(big_integer("original_chars"))
+                .col(binary("sha256"))
+                .col(small_integer("codec"))
+                .col(binary("body"))
+                .primary_key(Index::create().col("payload_id").col("byte_offset"))
+                .foreign_key(
+                    ForeignKey::create()
+                        .name("fk_portable_payload_part_value")
+                        .from("portable_payload_part", "payload_id")
+                        .to("portable_payload_value", "id")
+                        .on_delete(ForeignKeyAction::Cascade),
+                )
+                .check(Expr::cust("byte_offset >= 0 AND char_offset BETWEEN 0 AND byte_offset"))
+                .check(Expr::cust("original_bytes BETWEEN 1 AND 65536 AND original_chars BETWEEN 1 AND original_bytes"))
+                .check(Expr::cust("octet_length(sha256) = 32"))
+                .check(Expr::cust(
+                    "(codec = 0 AND octet_length(body) = original_bytes)
+                     OR (codec = 1 AND octet_length(body) + 2 < original_bytes)",
+                ))
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .name("portable_payload_part_chars")
+                .table("portable_payload_part")
+                .col("payload_id")
+                .col("char_offset")
+                .unique()
+                .to_owned(),
+        )
+        .await?;
+    // SeaQuery does not expose PostgreSQL's per-column TOAST storage strategy.
+    manager
+        .get_connection()
+        .execute_unprepared(include_str!(
+            "sql/m20261119_000003_payloads/portable_payload_storage.sql"
+        ))
+        .await?;
+    Ok(())
 }

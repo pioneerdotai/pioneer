@@ -7,36 +7,36 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "applied_patch_change_index")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub record_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub environment_id: String,
     #[sea_orm(
         column_type = "Text",
         unique_key = "uq_patch_change_index_commit_sequence"
     )]
     pub thread_id: String,
-    #[sea_orm(
-        column_type = "Text",
-        unique_key = "uq_patch_change_index_commit_sequence"
-    )]
-    pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub change_json: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub record_id: String,
     #[sea_orm(column_type = "Text")]
     pub invocation_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub environment_id: String,
-    #[sea_orm(unique_key = "uq_patch_change_index_commit_sequence")]
-    pub commit_ordinal: i64,
     #[sea_orm(
         primary_key,
         auto_increment = false,
         unique_key = "uq_patch_change_index_commit_sequence"
     )]
     pub sequence: i64,
-    #[sea_orm(column_type = "Text")]
-    pub source_path: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub destination_path: Option<String>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_patch_change_index_commit_sequence"
+    )]
+    pub turn_id: String,
     #[sea_orm(column_type = "Text")]
-    pub change_json: String,
+    pub source_path: String,
+    #[sea_orm(unique_key = "uq_patch_change_index_commit_sequence")]
+    pub commit_ordinal: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

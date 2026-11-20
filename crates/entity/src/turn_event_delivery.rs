@@ -7,25 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event_delivery")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_turn_event_delivery_event_consumer")]
+    pub next_run_at: DateTimeWithTimeZone,
+    pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_event_delivery_event_consumer"
+    )]
     pub event_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub claim_token: Option<String>,
+    pub delivered_at: Option<DateTimeWithTimeZone>,
     pub sequence: i64,
-    #[sea_orm(unique_key = "uq_turn_event_delivery_event_consumer")]
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_event_delivery_event_consumer"
+    )]
     pub consumer: String,
-    pub status: String,
     pub attempt_count: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
-    pub next_run_at: DateTimeWithTimeZone,
-    pub claim_token: Option<String>,
-    pub claim_expires_at: Option<DateTimeWithTimeZone>,
-    pub delivered_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
     #[sea_orm(
         belongs_to,
         from = "event_id",
@@ -33,7 +43,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn_event: HasOne<super::turn_event::Entity>,
+    pub turn_event: BelongsTo<super::turn_event::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -46,6 +46,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 sentry = { workspace = true, features = ["test"] }
 
-# Real SQLx acquisitions through the exact SQLite attribution adapter in unit tests.
-sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+# Real PostgreSQL acquisitions and callbacks through Gateway's attribution adapter.
+pioneer-postgres-test.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 futures-util.workspace = true

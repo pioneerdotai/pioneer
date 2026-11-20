@@ -136,6 +136,7 @@ pub const CHECKPOINT_SOURCE_LIMIT: usize = pioneer_compaction::REPLAY_ALIAS_LIMI
 
 // Correlated SQLite json_each validation and bounded MATERIALIZED metadata
 // quanta require SQLite-specific SQL. Ordinary reads/writes use entities.
+#[cfg(test)]
 pub(super) fn sqlite_specific_sql(
     statement: &str,
     values: impl IntoIterator<Item = Value>,
@@ -534,7 +535,7 @@ struct CanonicalProjection<E: EntityTrait, P = SourcePaging> {
     query: sea_orm::Select<E>,
     id: E::Column,
     payload: E::Column,
-    portable: Option<(E::Column, super::portable_payload::Family)>,
+    portable: Option<E::Column>,
     revision: Expr,
     present: Expr,
     paging: P,
@@ -575,10 +576,7 @@ async fn read_source_page<E: EntityTrait>(
     before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 ) -> Result<SourcePage> {
     let kind = CanonicalSource::from(kind);
-    let payload_bytes = logical_payload_bytes::<E>(
-        projection.payload,
-        projection.portable.map(|(reference, _)| reference),
-    );
+    let payload_bytes = logical_payload_bytes::<E>(projection.payload, projection.portable);
     let rows = projection
         .query
         .clone()
@@ -813,10 +811,7 @@ fn turn_event_projection(
             .filter(turn_event::Column::TurnId.eq(turn_id)),
         id: turn_event::Column::Id,
         payload: turn_event::Column::Payload,
-        portable: Some((
-            turn_event::Column::PayloadPayloadId,
-            super::portable_payload::Family::TurnEvent,
-        )),
+        portable: Some(turn_event::Column::PayloadPayloadId),
         revision: Func::coalesce([
             Expr::col((
                 compaction_event_revision::Entity,
@@ -970,10 +965,7 @@ fn turn_item_projection(
             .filter(turn_item::Column::TurnId.eq(turn_id)),
         id: turn_item::Column::Id,
         payload: turn_item::Column::Payload,
-        portable: Some((
-            turn_item::Column::PayloadPayloadId,
-            super::portable_payload::Family::TurnItem,
-        )),
+        portable: Some(turn_item::Column::PayloadPayloadId),
         revision: Func::coalesce([
             Expr::col((
                 compaction_item_revision::Entity,
@@ -1066,7 +1058,7 @@ pub(crate) async fn compaction_admit_for_turn(
             // Epochs were read before the source projection was resolved.
             // Revalidate their workspace and revision inside admission; parsing
             // the bounded metadata here is part of this atomic DB transition.
-            let changed = txn.query_one_raw(sqlite_specific_sql("SELECT wanted.key FROM json_each(?,'$.source_epochs') wanted WHERE NOT EXISTS (SELECT 1 FROM thread t LEFT JOIN compaction_projection_epoch e ON e.thread_id=t.id WHERE t.id=wanted.key AND t.workspace_id=? AND COALESCE(e.version,0)=wanted.value) LIMIT 1", [snapshot_json.clone().into(), workspace.into()])).await?;
+            let changed = txn.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres, "SELECT wanted.key FROM json_each($1::text::json->'source_epochs') wanted WHERE NOT EXISTS (SELECT 1 FROM thread t LEFT JOIN compaction_projection_epoch e ON e.thread_id=t.id WHERE t.id=wanted.key AND t.workspace_id=$2 AND COALESCE(e.version,0)=wanted.value::text::bigint) LIMIT 1", [snapshot_json.clone().into(), workspace.into()])).await?;
             ensure!(changed.is_none(), "source scope or epoch changed before admission");
             compaction_operation::Entity::insert(compaction_operation::ActiveModel {id: sea_orm::Set((snapshot.id.clone())
                         .to_owned()), owner: sea_orm::Set((snapshot.owner.clone())
@@ -1125,23 +1117,23 @@ pub(crate) async fn compaction_invalid_completion_progress<C: ConnectionTrait>(
         .filter(compaction_context::Column::ThreadId.eq(thread))
         .filter(compaction_operation::Column::Owner.eq(owner))
         .filter(compaction_operation::Column::Status.eq("failed"))
-        .filter(
-            Expr::col((
-                compaction_operation::Entity,
-                compaction_operation::Column::ExpectedHead,
-            ))
-            .binary(
-                BinOper::Is,
+        .filter(Expr::cust_with_exprs(
+            "$1 IS NOT DISTINCT FROM $2",
+            [
+                Expr::col((
+                    compaction_operation::Entity,
+                    compaction_operation::Column::ExpectedHead,
+                )),
                 Expr::col((compaction_context::Entity, compaction_context::Column::Head)),
-            ),
-        )
+            ],
+        ))
         .filter(Expr::cust(
             r#"EXISTS (SELECT 1 FROM compaction_runner_state s
             WHERE s.operation_id=compaction_operation.id
-            AND json_extract(s.state,'$.phase.Failed.kind')='InvalidCompletion'
-            AND (json_extract(s.state,'$.cursor.unit')>0
-                OR json_extract(s.state,'$.cursor.source')>0
-                OR json_extract(s.state,'$.cursor.character')>0))"#,
+            AND (s.state->'phase'->'Failed'->>'kind')='InvalidCompletion'
+            AND ((s.state->'cursor'->>'unit')::bigint>0
+                OR (s.state->'cursor'->>'source')::bigint>0
+                OR (s.state->'cursor'->>'character')::bigint>0))"#,
         ))
         .order_by_asc(compaction_operation::Column::Id)
         .limit(1)
@@ -1167,7 +1159,7 @@ pub(crate) async fn compaction_operation<C: ConnectionTrait>(
 /// checkpoint object itself is published in the requested scope.
 const COMPACTION_SOURCES_CURRENT_SQL: &str = r#"
 SELECT COUNT(*) AS matched
-FROM json_each(?1) wanted
+FROM json_array_elements($1::text::json) AS wanted(value)
 WHERE
   EXISTS (
     SELECT 1
@@ -1178,11 +1170,11 @@ WHERE
     JOIN turn context_turn ON context_turn.id=context_revision.turn_id
     JOIN thread context_thread ON context_thread.id=context_turn.thread_id
     WHERE context_revision.present=1
-      AND context_thread.workspace_id=?2
-      AND context_turn.thread_id=?3
-      AND 'context:'||context_revision.turn_id=json_extract(wanted.value,'$.scope')
-      AND context_revision.source_id=json_extract(wanted.value,'$.id')
-      AND 'revision:'||context_revision.revision=json_extract(wanted.value,'$.version')
+      AND context_thread.workspace_id=$2
+      AND context_turn.thread_id=$3
+      AND 'context:'||context_revision.turn_id=(wanted.value->>'scope')
+      AND context_revision.source_id=(wanted.value->>'id')
+      AND 'revision:'||context_revision.revision=(wanted.value->>'version')
   )
   OR EXISTS (
     SELECT 1
@@ -1193,11 +1185,11 @@ WHERE
     JOIN turn item_turn ON item_turn.id=item_revision.turn_id
     JOIN thread item_thread ON item_thread.id=item_turn.thread_id
     WHERE item_revision.present=1
-      AND item_thread.workspace_id=?2
-      AND item_turn.thread_id=?3
-      AND 'item:'||item_revision.turn_id=json_extract(wanted.value,'$.scope')
-      AND item_revision.source_id=json_extract(wanted.value,'$.id')
-      AND 'item-revision:'||item_revision.revision=json_extract(wanted.value,'$.version')
+      AND item_thread.workspace_id=$2
+      AND item_turn.thread_id=$3
+      AND 'item:'||item_revision.turn_id=(wanted.value->>'scope')
+      AND item_revision.source_id=(wanted.value->>'id')
+      AND 'item-revision:'||item_revision.revision=(wanted.value->>'version')
   )
   OR EXISTS (
     SELECT 1
@@ -1208,11 +1200,11 @@ WHERE
     JOIN turn event_turn ON event_turn.id=event_revision.turn_id
     JOIN thread event_thread ON event_thread.id=event_turn.thread_id
     WHERE event_revision.present=1
-      AND event_thread.workspace_id=?2
-      AND event_turn.thread_id=?3
-      AND 'event:'||event_revision.turn_id=json_extract(wanted.value,'$.scope')
-      AND event_revision.source_id=json_extract(wanted.value,'$.id')
-      AND 'event-revision:'||event_revision.revision=json_extract(wanted.value,'$.version')
+      AND event_thread.workspace_id=$2
+      AND event_turn.thread_id=$3
+      AND 'event:'||event_revision.turn_id=(wanted.value->>'scope')
+      AND event_revision.source_id=(wanted.value->>'id')
+      AND 'event-revision:'||event_revision.revision=(wanted.value->>'version')
       AND (
         event_source.event_type NOT IN ('turn/started', 'turn/message/edited')
         OR NOT EXISTS (
@@ -1232,11 +1224,11 @@ WHERE
     JOIN turn input_turn ON input_turn.id=input_revision.turn_id
     JOIN thread input_thread ON input_thread.id=input_turn.thread_id
     WHERE input_revision.present=1
-      AND input_thread.workspace_id=?2
-      AND input_turn.thread_id=?3
-      AND 'input:'||input_revision.turn_id=json_extract(wanted.value,'$.scope')
-      AND input_revision.source_id=json_extract(wanted.value,'$.id')
-      AND 'input-revision:'||input_revision.revision=json_extract(wanted.value,'$.version')
+      AND input_thread.workspace_id=$2
+      AND input_turn.thread_id=$3
+      AND 'input:'||input_revision.turn_id=(wanted.value->>'scope')
+      AND input_revision.source_id=(wanted.value->>'id')
+      AND 'input-revision:'||input_revision.revision=(wanted.value->>'version')
       AND input_turn.message_revision=0
       AND input_turn.message_deleted_at IS NULL
   )
@@ -1248,22 +1240,22 @@ WHERE
      AND basis_thread.workspace_id=basis.workspace_id
     LEFT JOIN compaction_task_basis_revision basis_revision
       ON basis_revision.run_id=basis.run_id
-    WHERE substr(ltrim(basis.history_json),1,1)='['
-      AND basis.workspace_id=?2
-      AND basis.conversation_thread_id=?3
-      AND 'task-basis:'||basis.run_id=json_extract(wanted.value,'$.scope')
-      AND basis.run_id=json_extract(wanted.value,'$.id')
-      AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=json_extract(wanted.value,'$.version')
+    WHERE basis.history_json_payload_id IS NOT NULL
+      AND basis.workspace_id=$2
+      AND basis.conversation_thread_id=$3
+      AND 'task-basis:'||basis.run_id=(wanted.value->>'scope')
+      AND basis.run_id=(wanted.value->>'id')
+      AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=(wanted.value->>'version')
   )
   OR EXISTS (
     SELECT 1
     FROM compaction_checkpoint published_checkpoint
     JOIN compaction_context published_context ON published_context.owner=published_checkpoint.owner
-    WHERE published_context.workspace_id=?2
-      AND published_context.thread_id=?3
-      AND 'checkpoint:'||published_checkpoint.owner=json_extract(wanted.value,'$.scope')
-      AND published_checkpoint.id=json_extract(wanted.value,'$.id')
-      AND published_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
+    WHERE published_context.workspace_id=$2
+      AND published_context.thread_id=$3
+      AND 'checkpoint:'||published_checkpoint.owner=(wanted.value->>'scope')
+      AND published_checkpoint.id=(wanted.value->>'id')
+      AND published_checkpoint.identity_sha256=(wanted.value->>'version')
       AND published_checkpoint.format_version=1
       AND (
         published_checkpoint.status='applied'
@@ -1285,7 +1277,8 @@ pub(super) fn compaction_sources_current_statement(
     workspace: &str,
     thread: &str,
 ) -> Statement {
-    sqlite_specific_sql(
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
         COMPACTION_SOURCES_CURRENT_SQL,
         [payload.into(), workspace.into(), thread.into()],
     )
@@ -1333,19 +1326,19 @@ pub(crate) async fn compaction_model_context_sources_current<C: ConnectionTrait>
         payload.len() <= SOURCE_PAGE_BYTES,
         "source validation batch exceeds byte bound"
     );
-    let row = MatchedSourceCount::find_by_statement(sqlite_specific_sql(
-        r#"SELECT COUNT(*) AS matched FROM json_each(?1) wanted WHERE EXISTS (
+    let row = MatchedSourceCount::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres,
+        r#"SELECT COUNT(*) AS matched FROM json_array_elements($1::text::json) AS wanted(value) WHERE EXISTS (
             SELECT 1 FROM compaction_source_revision revision
             JOIN turn_llm_context context_source
               ON context_source.id=revision.source_id AND context_source.turn_id=revision.turn_id
             JOIN turn context_turn ON context_turn.id=revision.turn_id
             JOIN thread context_thread ON context_thread.id=context_turn.thread_id
-            WHERE revision.present=1 AND context_thread.workspace_id=?2
-              AND context_turn.thread_id=?3
-              AND context_source.source IN (?4,?5,?6,?7,?8)
-              AND 'context:'||revision.turn_id=json_extract(wanted.value,'$.scope')
-              AND revision.source_id=json_extract(wanted.value,'$.id')
-              AND 'revision:'||revision.revision=json_extract(wanted.value,'$.version')
+            WHERE revision.present=1 AND context_thread.workspace_id=$2
+              AND context_turn.thread_id=$3
+              AND context_source.source IN ($4,$5,$6,$7,$8)
+              AND 'context:'||revision.turn_id=(wanted.value->>'scope')
+              AND revision.source_id=(wanted.value->>'id')
+              AND 'revision:'||revision.revision=(wanted.value->>'version')
         )"#,
         [
             payload.into(),
@@ -1398,17 +1391,17 @@ pub(crate) async fn compaction_historical_event_projections<C: ConnectionTrait>(
         payload.len() <= SOURCE_PAGE_BYTES,
         "event projection metadata batch exceeds byte bound"
     );
-    let rows = HistoricalEventProjectionRow::find_by_statement(sqlite_specific_sql(
+    let rows = HistoricalEventProjectionRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT r.source_id,r.turn_id,'event-revision:'||r.projection_revision AS source_version,r.item_id,r.projection_kind \
-         FROM json_each(?) w \
+         FROM json_array_elements($1::text::json) WITH ORDINALITY AS w(value, ordinal) \
          JOIN compaction_event_revision r \
-           ON 'event:'||r.turn_id=json_extract(w.value,'$.scope') \
-          AND r.source_id=json_extract(w.value,'$.id') \
-          AND 'event-revision:'||r.projection_revision=json_extract(w.value,'$.version') \
+           ON 'event:'||r.turn_id=(w.value->>'scope') \
+          AND r.source_id=(w.value->>'id') \
+          AND 'event-revision:'||r.projection_revision=(w.value->>'version') \
           AND r.projection_kind IS NOT NULL \
-         JOIN turn t ON t.id=r.turn_id AND t.thread_id=? \
-         JOIN thread h ON h.id=t.thread_id AND h.workspace_id=? \
-         ORDER BY CAST(w.key AS INTEGER)",
+         JOIN turn t ON t.id=r.turn_id AND t.thread_id=$2 \
+         JOIN thread h ON h.id=t.thread_id AND h.workspace_id=$3 \
+         ORDER BY w.ordinal",
         [payload.into(), thread.into(), workspace.into()],
     ))
     .all(db)
@@ -1446,8 +1439,8 @@ pub(crate) async fn compaction_reference_thread<C: ConnectionTrait>(
     );
     if source.scope.starts_with("checkpoint:") {
         return Ok(compaction_live_sources::ThreadRow::find_by_statement(
-            sqlite_specific_sql(
-                "SELECT c.thread_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=? AND 'checkpoint:'||p.owner=? AND p.id=? AND p.identity_sha256=? AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))) LIMIT 1",
+            Statement::from_sql_and_values(DbBackend::Postgres,
+                "SELECT c.thread_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=$1 AND 'checkpoint:'||p.owner=$2 AND p.id=$3 AND p.identity_sha256=$4 AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))) LIMIT 1",
                 [
                     workspace.into(),
                     source.scope.clone().into(),
@@ -1657,7 +1650,7 @@ pub(crate) async fn compaction_save_candidate(
                 previous: sea_orm::Set(checkpoint.previous.clone()),
                 portion: sea_orm::Set(portion),
                 summary: sea_orm::Set((checkpoint.summary.clone()).to_owned()),
-                selection: sea_orm::Set((selection.clone()).to_owned()),
+                selection: sea_orm::Set(serde_json::from_str(&selection)?),
                 projection_version: sea_orm::Set(projection),
                 format_version: sea_orm::Set(i64::from(FORMAT_VERSION)),
                 identity_sha256: sea_orm::Set((identity.clone()).to_owned()),
@@ -1706,7 +1699,7 @@ pub(crate) async fn compaction_save_candidate(
             compaction_operation::Entity::update_many()
                 .col_expr(
                     compaction_operation::Column::NextPortion,
-                    Expr::expr(Func::cust(Alias::new("max")).args([
+                    Expr::expr(Func::cust(Alias::new("greatest")).args([
                         Expr::col(compaction_operation::Column::NextPortion),
                         Expr::Value((portion + 1).into()),
                     ])),
@@ -1912,22 +1905,24 @@ impl CheckpointTopologyRead {
         let (scope, id, version) = self
             .after
             .as_ref()
-            .map(|s| (s.scope.clone(), s.id.clone(), s.version.clone()))
+            .map(|s| {
+                (
+                    Some(s.scope.as_str()),
+                    Some(s.id.as_str()),
+                    Some(s.version.as_str()),
+                )
+            })
             .unwrap_or_default();
         // Seek coverage keys first, before ownership lookup. Two indexed
         // thread extrema prove the sole owner, including duplicates at other
         // ordinals, without a checkpoint-wide DISTINCT join or sort.
-        let range = if self.after.is_some() {
-            "AND (source_scope,source_id,source_version)>(?3,?4,?5)"
-        } else {
-            ""
-        };
-        let coverage = format!(
-            "SELECT source_scope,source_id,source_version FROM compaction_coverage WHERE checkpoint_id=?1 {range} ORDER BY source_scope,source_id,source_version LIMIT ?6"
-        );
+        let coverage = "SELECT source_scope,source_id,source_version FROM compaction_coverage
+            WHERE checkpoint_id=$1 AND $2::text IS NOT NULL
+              AND ($3::text IS NULL OR (source_scope,source_id,source_version)>($3,$4,$5))
+            ORDER BY source_scope,source_id,source_version LIMIT $6";
         let owner = |descending: bool| {
             format!(
-                "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=?2 AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version ORDER BY m.source_thread {} LIMIT 1)",
+                "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=$2 AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version ORDER BY m.source_thread {} LIMIT 1)",
                 if descending { "DESC" } else { "ASC" }
             )
         };
@@ -1941,9 +1936,10 @@ impl CheckpointTopologyRead {
             "SELECT v.*,'' AS source_thread,'' AS last_thread FROM coverage_page v".into()
         };
         let sql = format!(
-            "WITH coverage_page AS MATERIALIZED ({coverage}), owners AS MATERIALIZED ({ownership}), page AS MATERIALIZED (SELECT *,length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))+length(CAST(source_thread AS BLOB)) AS bytes FROM owners), budget AS (SELECT *,sum(bytes) OVER (ORDER BY source_scope,source_id,source_version,source_thread ROWS UNBOUNDED PRECEDING) AS used FROM page), stats AS (SELECT count(*) AS n,COALESCE(sum(source_thread IS NULL OR last_thread IS NULL OR source_thread<>last_thread),0) AS invalid FROM page) SELECT b.source_scope,b.source_id,b.source_version,b.source_thread,stats.n,stats.invalid FROM stats LEFT JOIN budget b ON stats.invalid=0 AND b.used<=?7 ORDER BY b.source_scope,b.source_id,b.source_version,b.source_thread"
+            "WITH coverage_page AS MATERIALIZED ({coverage}), owners AS MATERIALIZED ({ownership}), page AS MATERIALIZED (SELECT *,octet_length(source_scope)::bigint+octet_length(source_id)::bigint+octet_length(source_version)::bigint+octet_length(source_thread)::bigint AS bytes FROM owners), budget AS (SELECT *,sum(bytes) OVER (ORDER BY source_scope,source_id,source_version,source_thread ROWS UNBOUNDED PRECEDING) AS used FROM page), stats AS (SELECT count(*) AS n,count(*) FILTER (WHERE source_thread IS NULL OR last_thread IS NULL OR source_thread<>last_thread) AS invalid FROM page) SELECT b.source_scope,b.source_id,b.source_version,b.source_thread,stats.n,stats.invalid FROM stats LEFT JOIN budget b ON stats.invalid=0 AND b.used<=$7 ORDER BY b.source_scope,b.source_id,b.source_version,b.source_thread"
         );
-        Ok(sqlite_specific_sql(
+        Ok(Statement::from_sql_and_values(
+            DbBackend::Postgres,
             &sql,
             vec![
                 self.row.id.clone().into(),
@@ -1951,7 +1947,7 @@ impl CheckpointTopologyRead {
                 scope.into(),
                 id.into(),
                 version.into(),
-                SOURCE_PAGE_ROWS.into(),
+                i64::try_from(SOURCE_PAGE_ROWS)?.into(),
                 i64::try_from(SOURCE_PAGE_BYTES)?.into(),
             ],
         ))
@@ -2011,7 +2007,8 @@ pub(super) async fn checkpoint_row<C: ConnectionTrait>(
             .lt(Expr::col((
                 compaction_operation::Entity,
                 compaction_operation::Column::NextPortion,
-            ))),
+            )))
+            .cast_as(Alias::new("bigint")),
             Alias::new("coverage_closed"),
         )
         .columns(
@@ -2125,17 +2122,18 @@ pub(super) async fn checkpoint_source_owner<C: ConnectionTrait>(
 ) -> Result<String> {
     let owner = |descending: bool| {
         format!(
-            "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=?2 AND m.reference_only=0 AND m.source_scope=?3 AND m.source_id=?4 AND m.source_version=?5 ORDER BY m.source_thread {} LIMIT 1)",
+            "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=$2 AND m.reference_only=0 AND m.source_scope=$3 AND m.source_id=$4 AND m.source_version=$5 ORDER BY m.source_thread {} LIMIT 1)",
             if descending { "DESC" } else { "ASC" }
         )
     };
     let sql = format!(
-        "WITH owners AS MATERIALIZED (SELECT {} AS first,{} AS last WHERE EXISTS(SELECT 1 FROM compaction_coverage WHERE checkpoint_id=?1 AND source_scope=?3 AND source_id=?4 AND source_version=?5)) SELECT first AS source_thread FROM owners WHERE first=last AND length(CAST(first AS BLOB)) BETWEEN 1 AND ?6",
+        "WITH owners AS MATERIALIZED (SELECT {} AS first,{} AS last WHERE EXISTS(SELECT 1 FROM compaction_coverage WHERE checkpoint_id=$1 AND source_scope=$3 AND source_id=$4 AND source_version=$5)) SELECT first AS source_thread FROM owners WHERE first=last AND octet_length(first) BETWEEN 1 AND $6",
         owner(false),
         owner(true)
     );
     let item = db
-        .query_one_raw(sqlite_specific_sql(
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
             &sql,
             [
                 row.id.clone().into(),
@@ -2578,10 +2576,11 @@ pub(super) async fn checkpoint_projection_page_test_pause(
 }
 
 pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: i64) -> Statement {
-    sqlite_specific_sql(
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
         "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
          JOIN compaction_frozen_history h ON h.id=d.manifest_id \
-         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=$1 AND d.ordinal>=$2 \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2591,11 +2590,9 @@ pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: 
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
          JOIN compaction_frozen_history h ON h.id=s.manifest_id \
-         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
-         ORDER BY ordinal LIMIT ?",
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=$1 AND s.kind=0 AND d.ordinal>=$2 \
+         ORDER BY ordinal LIMIT $3",
         [
-            manifest.into(),
-            start.into(),
             manifest.into(),
             start.into(),
             (SOURCE_PAGE_ROWS as i64).into(),
@@ -2608,10 +2605,11 @@ pub(super) fn checkpoint_projection_page_statement(
     start: i64,
     end: i64,
 ) -> Statement {
-    sqlite_specific_sql(
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
         "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
          JOIN compaction_frozen_history h ON h.id=d.manifest_id \
-         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=$1 AND d.ordinal>=$2 AND d.ordinal<$3 AND d.bytes BETWEEN 0 AND 262144 AND octet_length(d.reference_json::text)=d.bytes \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2621,16 +2619,9 @@ pub(super) fn checkpoint_projection_page_statement(
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
          JOIN compaction_frozen_history h ON h.id=s.manifest_id \
-         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=$1 AND s.kind=0 AND d.ordinal>=$2 AND d.ordinal<$3 AND d.bytes BETWEEN 0 AND 262144 AND octet_length(d.reference_json::text)=d.bytes \
          ORDER BY ordinal",
-        [
-            manifest.into(),
-            start.into(),
-            end.into(),
-            manifest.into(),
-            start.into(),
-            end.into(),
-        ],
+        [manifest.into(), start.into(), end.into()],
     )
 }
 
@@ -2652,7 +2643,7 @@ pub(crate) async fn compaction_checkpoint<C: ConnectionTrait>(
         owner: row.owner,
         previous: row.previous,
         summary: row.summary,
-        selection: serde_json::from_str(&row.selection)?,
+        selection: serde_json::from_value(row.selection)?,
         coverage,
         projection_version: row.projection_version as u64,
         format_version: row.format_version as u32,
@@ -2735,7 +2726,7 @@ pub(crate) async fn compaction_checkpoint_metadata<C: ConnectionTrait>(
         projection_version,
         format_version,
     )) = compaction_checkpoint::Entity::find_by_id(id)
-        .filter(Expr::cust("length(CAST(selection AS BLOB)) <= 262144"))
+        .filter(Expr::cust("octet_length(selection::text) <= 262144"))
         .select_only()
         .column(compaction_checkpoint::Column::Id)
         .column(compaction_checkpoint::Column::OperationId)
@@ -2821,19 +2812,19 @@ pub(crate) async fn compaction_apply(
                 .and(Expr::col(compaction_operation::Column::Owner)
                     .eq(Expr::Value(checkpoint.owner.clone()
                             .into())))
-                .and(Expr::col(compaction_operation::Column::ExpectedHead)
-                    .binary(BinOper::Is, Expr::Value(expected_head.map(str::to_owned)
-                            .into()))))
+                .and(Expr::cust_with_exprs("$1 IS NOT DISTINCT FROM $2", [Expr::col(compaction_operation::Column::ExpectedHead), Expr::val(expected_head)])))
             .into_tuple::<String>()
             .one(&txn)
             .await?;
             let status: String = op.ok_or_else(|| anyhow::anyhow!("operation missing"))?;
             if status == "completed" { txn.rollback().await?; return Ok(CommitOutcome::AlreadyApplied); }
             if status != "running" { txn.rollback().await?; return Ok(CommitOutcome::Cancelled); }
-            let projection_still_matches = txn.query_one_raw(sqlite_specific_sql(
-                "SELECT 1 FROM compaction_operation_projection WHERE operation_id=? LIMIT 1",
-                [checkpoint.operation_id.clone().into()],
-            )).await?.is_some() == has_projection;
+            let projection_still_matches =
+                compaction_operation_projection::Entity::find_by_id(&checkpoint.operation_id)
+                    .select_only()
+                    .column(compaction_operation_projection::Column::OperationId)
+                    .into_tuple::<String>()
+                    .one(&txn).await?.is_some() == has_projection;
             if !projection_still_matches { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
             let stopped = compaction_operation::Entity::find()
             .select_only()
@@ -2846,8 +2837,7 @@ pub(crate) async fn compaction_apply(
                 .eq(Expr::Value(checkpoint.operation_id.clone()
                         .into()))
                 .and(Expr::col((compaction_operation::Entity, compaction_operation::Column::ExecutionTurn))
-                    .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                    .not())
+                    .is_not_null())
                 .and(Expr::exists(Query::select()
                         .expr(Expr::val(1_i64))
                         .from_as(compaction_execution_stop::Entity, "stop")
@@ -2861,8 +2851,9 @@ pub(crate) async fn compaction_apply(
             .await?;
             if stopped.is_some() { txn.rollback().await?; return Ok(CommitOutcome::Cancelled); }
             if let Some(previous) = &checkpoint.previous {
-                let previous_available = txn.query_one_raw(sqlite_specific_sql(
-                    "SELECT p.id FROM compaction_checkpoint p WHERE p.id=? AND p.owner=? AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS (SELECT 1 FROM compaction_operation committed WHERE committed.id=p.operation_id AND committed.status='completed'))) LIMIT 1",
+                let previous_available = txn.query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT p.id FROM compaction_checkpoint p WHERE p.id=$1 AND p.owner=$2 AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS (SELECT 1 FROM compaction_operation committed WHERE committed.id=p.operation_id AND committed.status='completed'))) LIMIT 1",
                     [previous.clone().into(), checkpoint.owner.clone().into()],
                 )).await?;
                 if previous_available.is_none() { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
@@ -2874,7 +2865,7 @@ pub(crate) async fn compaction_apply(
             // advance a coarse thread epoch, while every newly covered raw
             // source below is still checked by its exact assertion.
             if checkpoint.previous.is_none() {
-                let dependency_changed = txn.query_one_raw(sqlite_specific_sql("SELECT o.id FROM compaction_operation o WHERE o.id=? AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t JOIN compaction_context c ON c.workspace_id=t.workspace_id WHERE t.id=wanted.key AND c.owner=o.owner))", [checkpoint.operation_id.clone()
+                let dependency_changed = txn.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,"SELECT o.id FROM compaction_operation o WHERE o.id=$1 AND EXISTS (SELECT 1 FROM json_each(o.snapshot::json->'source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value::text::bigint OR NOT EXISTS (SELECT 1 FROM thread t JOIN compaction_context c ON c.workspace_id=t.workspace_id WHERE t.id=wanted.key AND c.owner=o.owner))", [checkpoint.operation_id.clone()
                             .into()]))
                 .await?;
                 if dependency_changed.is_some() { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
@@ -2902,9 +2893,7 @@ CanonicalSource::ToolItem => source_assertion_matches::<_,turn_item::Entity,comp
             .filter(Expr::col(compaction_context::Column::Owner)
                 .eq(Expr::Value(checkpoint.owner.clone()
                         .into()))
-                .and(Expr::col(compaction_context::Column::Head)
-                    .binary(BinOper::Is, Expr::Value(expected_head.map(str::to_owned)
-                            .into())))
+                .and(Expr::cust_with_exprs("$1 IS NOT DISTINCT FROM $2", [Expr::col(compaction_context::Column::Head), Expr::val(expected_head)]))
                 .and(Expr::col(compaction_context::Column::FormatVersion)
                     .eq(Expr::val(1_i64)))
                 .and(Expr::exists(Query::select()
@@ -3122,13 +3111,13 @@ pub(crate) async fn tool_result_access_source(
             "download",
             "dynamic_tool_call",
         ]));
-    let Some(row) = super::turn_payload::items(&store.connection, query.limit(1))
+    let Some((row, payload)) = super::turn_payload::exact_items(&store.connection, query.limit(1))
         .await?
         .pop()
     else {
         return Ok(None);
     };
-    let value = super::turn_payload::json1_fields(&row.payload, &["toolName"])?;
+    let value = pioneer_crud_payloads::json_fields::first_object_fields(&payload, &["toolName"])?;
     let tool = value.get("toolName").and_then(|v| v.as_str());
     let arguments = if matches!(
         tool,
@@ -3139,7 +3128,8 @@ pub(crate) async fn tool_result_access_source(
                 | "threads_tools_result_read"
         )
     ) {
-        let value = super::turn_payload::json1_fields(&row.payload, &["arguments"])?;
+        let value =
+            pioneer_crud_payloads::json_fields::first_object_fields(&payload, &["arguments"])?;
         match value.get("arguments") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => {
@@ -3203,9 +3193,12 @@ pub(crate) async fn compaction_tool_result_fragment(
     if let Some(source) = source {
         // Malformed legacy JSON did not satisfy the old json_valid predicate.
         // Portable integrity failures have already propagated from hydration.
-        if super::turn_payload::json1_value(&source.payload).is_ok_and(|payload| {
-            payload.pointer("/storage/kind").and_then(|v| v.as_str()) == Some("shell")
-        }) {
+        if source.payload.as_ref().and_then(|payload| {
+            payload
+                .pointer("/storage/kind")
+                .and_then(serde_json::Value::as_str)
+        }) == Some("shell")
+        {
             return store
                 .compaction_payload_fragment(
                     workspace,
@@ -3245,143 +3238,39 @@ pub(crate) async fn compaction_reference_fragment(
     character_offset: u64,
 ) -> Result<Option<CanonicalFragment>> {
     if reference.scope.starts_with("task-basis:") {
-        return observe::scope_result(
-            observe::Family::TaskHistory,
-            observe::Mode::Range,
-            async {
-                use pioneer_entity::compaction_task_basis_revision as basis_revision;
-                use sea_orm::QueryTrait;
-                use task_run_conversation_snapshot::Column as Col;
-                if reference.scope != format!("task-basis:{}", reference.id) {
-                    return Ok(None);
-                }
-                // Reproduce the Task branch's relational live-source fences directly.
-                // Joining the legacy live-source view here would evaluate ltrim(TEXT)
-                // and materialize the entire history before the native byte read.
-                let query = task_run_conversation_snapshot::Entity::find()
-                    .select_only()
-                    .join(
-                        JoinType::InnerJoin,
-                        task_run_conversation_snapshot::Entity::belongs_to(thread::Entity)
-                            .from(Col::ConversationThreadId)
-                            .to(thread::Column::Id)
-                            .into(),
-                    )
-                    .join(
-                        JoinType::LeftJoin,
-                        task_run_conversation_snapshot::Entity::belongs_to(basis_revision::Entity)
-                            .from(Col::RunId)
-                            .to(basis_revision::Column::RunId)
-                            .into(),
-                    )
-                    .filter(Col::RunId.eq(&reference.id))
-                    .filter(Col::WorkspaceId.eq(workspace))
-                    .filter(Col::ConversationThreadId.eq(thread))
-                    .filter(
-                        Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            Col::WorkspaceId,
-                        ))),
-                    )
-                    .filter(
-                        Expr::cust(
-                            "'task-basis-revision:'||COALESCE(compaction_task_basis_revision.revision,1)",
-                        )
-                        .eq(&reference.version),
-                    );
-                let length = "CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN octet_length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END";
-                let source_read = observe::stage(observe::Stage::SourceRead);
-                let row = query.clone()
-                    .expr_as(Expr::cust(length), "history_bytes")
-                    .column(Col::HistoryJsonPayloadId).column(Col::PortableIdentity).column(Col::PortableRevision)
-                    // Only a completed compressed value has a tiny base projection.
-                    // The legacy branch never evaluates OP_Column on history_json.
-                    .expr_as(Expr::cust("CASE WHEN (SELECT p.raw FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id)=0 THEN task_run_conversation_snapshot.history_json ELSE NULL END"), "projection")
-                    .limit(1).into_tuple::<(i64, Option<String>, String, i64, Option<String>)>()
-                    .one(&store.connection).await?;
-                drop(source_read);
-                let Some((size, payload_id, identity, revision, projection)) = row else {
-                    observe::outcome(observe::Outcome::Stale);
-                    return Ok(None);
-                };
-                if let Some(id) = &payload_id {
-                    let meta = super::portable_payload::header(
-                        &store.connection,
-                        id,
-                        super::portable_payload::Family::TaskHistory,
-                    )
-                    .await?;
-                    ensure!(
-                        meta.original_bytes == size,
-                        "Task basis byte length changed"
-                    );
-                    if meta.raw == 0 {
-                        let projection =
-                            projection.ok_or_else(|| anyhow::anyhow!("Task basis projection missing"))?;
-                        if !projection.trim_start_matches(' ').starts_with('[') {
-                            return Ok(None);
-                        }
-                        let characters = u64::try_from(meta.original_chars)?;
-                        ensure!(character_offset <= characters, "source offset is past end");
-                        let bytes = super::portable_payload::read_range(
-                            &store.connection,
-                            &meta,
-                            i64::try_from(character_offset)?,
-                            16384,
-                            true,
-                        )
-                        .await?;
-                        let _verify = observe::stage(observe::Stage::VerifyAssemble);
-                        let text = String::from_utf8(bytes)?;
-                        let end = character_offset + text.chars().count() as u64;
-                        return Ok(Some(CanonicalFragment {
-                            reference: reference.clone(),
-                            text,
-                            next_character: (end < characters).then_some(end),
-                        }));
-                    }
-                }
-                let guard = query
-                    .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
-                    .filter(Col::PortableIdentity.eq(&identity))
-                    .filter(Col::PortableRevision.eq(revision))
-                    .filter(Expr::cust(length).eq(size))
-                    .filter(match &payload_id {
-                        Some(id) => Col::HistoryJsonPayloadId.eq(id),
-                        None => Col::HistoryJsonPayloadId.is_null(),
+        return observe::scope_result(observe::Family::TaskHistory, observe::Mode::Range, async {
+            let reader = store.connection.begin_read().await?;
+            let captured = pioneer_crud_compaction::task_basis::capture(
+                &reader,
+                workspace,
+                thread,
+                reference,
+                Some(character_offset),
+            )
+            .await?;
+            reader.commit().await?;
+            captured
+                .map(|captured| {
+                    Ok(CanonicalFragment {
+                        reference: reference.clone(),
+                        text: captured.body.into_text()?,
+                        next_character: captured.next_character,
                     })
-                    .limit(1)
-                    .build(DbBackend::Sqlite);
-                let result = super::portable_payload_legacy_text::fragment(
-                    store,
-                    guard,
-                    super::portable_payload_legacy_text::Key {
-                        run: reference.id.clone(),
-                        identity,
-                        revision,
-                    },
-                    u64::try_from(size)?,
-                    character_offset,
-                )
-                .await?;
-                Ok(result.map(|(text, next_character)| CanonicalFragment {
-                    reference: reference.clone(),
-                    text,
-                    next_character,
-                }))
-            },
-        )
+                })
+                .transpose()
+        })
         .await;
     }
     if reference.scope.starts_with("checkpoint:") {
         let offset = i64::try_from(character_offset)?
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
-        let row = SourceFragmentRow::find_by_statement(sqlite_specific_sql(
-            r#"SELECT 1 AS revision,substr(p.summary,?,16384) AS fragment,length(p.summary) AS characters
+        let row = SourceFragmentRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"SELECT 1::bigint AS revision,substr(p.summary,$1::bigint::int,16384) AS fragment,length(p.summary)::bigint AS characters
 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
- AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
+WHERE p.id=$2 AND 'checkpoint:'||p.owner=$3 AND p.identity_sha256=$4
+ AND p.format_version=1 AND c.workspace_id=$5 AND c.thread_id=$6
  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
 LIMIT 1"#,
@@ -3443,10 +3332,7 @@ LIMIT 1"#,
         .await
 }
 
-/// Load one exact source as a whole value. The reader is released when this
-/// future returns; callers parse/hash only afterward. Compressed event/item
-/// rows are deliberately loaded one object at a time so SQLite performs one
-/// transparent decompression and memory is bounded by one admitted object.
+/// Parse and validate one canonical revision before fetching its payload.
 fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Result<i64> {
     let prefix = format!("{}:", kind.version_prefix());
     let revision = reference
@@ -3462,10 +3348,10 @@ fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Res
 }
 
 const COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL: &str = r#"
-SELECT 1 AS revision,p.summary AS fragment,length(p.summary) AS characters
+SELECT 1::bigint AS revision,p.summary AS fragment,length(p.summary)::bigint AS characters
 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-WHERE p.id=?1 AND 'checkpoint:'||p.owner=?2 AND p.identity_sha256=?3
- AND p.format_version=1 AND c.workspace_id=?4 AND c.thread_id=?5
+WHERE p.id=$1 AND 'checkpoint:'||p.owner=$2 AND p.identity_sha256=$3
+ AND p.format_version=1 AND c.workspace_id=$4 AND c.thread_id=$5
  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
 LIMIT 1
@@ -3476,7 +3362,8 @@ fn compaction_reference_checkpoint_payload_statement(
     thread: &str,
     reference: &SourceRef,
 ) -> Statement {
-    sqlite_specific_sql(
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
         COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL,
         [
             reference.id.clone().into(),
@@ -3495,71 +3382,15 @@ pub(crate) async fn compaction_reference_payload(
     reference: &SourceRef,
 ) -> Result<Option<String>> {
     if reference.scope.starts_with("task-basis:") {
-        let captured = task_run_conversation_snapshot::Entity::find()
-            .select_only()
-            .join(
-                JoinType::InnerJoin,
-                compaction_live_sources::join(
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::RunId,
-                    compaction_live_sources::Column::SourceId,
-                ),
-            )
-            .column(task_run_conversation_snapshot::Column::HistoryJson)
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::WorkspaceId,
-                ))
-                .eq(workspace),
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::ThreadId,
-                ))
-                .eq(thread),
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::SourceScope,
-                ))
-                .eq(&reference.scope),
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::SourceId,
-                ))
-                .eq(&reference.id),
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::SourceVersion,
-                ))
-                .eq(&reference.version),
-            )
-            .column(task_run_conversation_snapshot::Column::HistoryJsonPayloadId)
-            .into_tuple::<(String, Option<String>)>()
-            .one(&store.connection)
-            .await?;
-        // Plain/raw remains one linear TEXT read. Compressed rows select only
-        // the tiny shape projection and reference; hydrate reads bounded byte
-        // blocks sequentially, never a growing Unicode substr prefix.
-        return match captured {
-            Some((plain, id)) => Ok(Some(
-                super::portable_payload::hydrate(
-                    &store.connection,
-                    super::portable_payload::Family::TaskHistory,
-                    id.as_deref(),
-                    plain,
-                )
-                .await?,
-            )),
-            None => Ok(None),
-        };
+        let reader = store.connection.begin_read().await?;
+        let captured = pioneer_crud_compaction::task_basis::capture(
+            &reader, workspace, thread, reference, None,
+        )
+        .await?;
+        reader.commit().await?;
+        return captured
+            .map(|captured| captured.body.into_text())
+            .transpose();
     }
     if reference.scope.starts_with("checkpoint:") {
         let row = SourceFragmentRow::find_by_statement(
@@ -3623,13 +3454,13 @@ pub(crate) async fn compaction_reference_payload(
 }
 
 fn logical_payload_bytes<E: EntityTrait>(payload: E::Column, reference: Option<E::Column>) -> Expr {
-    let plain: Expr = Func::cust(Alias::new("octet_length"))
-        .arg(Expr::col((E::default(), payload)))
-        .into();
+    let plain = Func::cust(Alias::new("octet_length"))
+        .arg(Expr::col((E::default(), payload)).cast_as("text"))
+        .cast_as("bigint");
     match reference {
         None => plain,
         Some(reference) => {
-            use pioneer_entity::portable_payload as p;
+            use pioneer_entity::portable_payload_value as p;
             Expr::case(Expr::col((E::default(), reference)).is_null(), plain)
                 .finally(Expr::from(
                     Query::select()
@@ -3652,49 +3483,51 @@ async fn read_source_payload<E: EntityTrait, P>(
     id: &str,
     expected_revision: i64,
 ) -> Result<Option<String>> {
-    let reference = projection
-        .portable
-        .map_or(Expr::val(Option::<String>::None), |(column, _)| {
-            Expr::col((E::default(), column))
-        });
+    if let Some(reference) = projection.portable {
+        use pioneer_crud_payloads::storage::{self, Selection};
+        let reader = db.begin_read().await?;
+        let row = projection
+            .query
+            .select_only()
+            .expr(Expr::col((E::default(), projection.payload)).cast_as("text"))
+            .column(reference)
+            .filter(projection.id.eq(id))
+            .filter(projection.revision.eq(expected_revision))
+            .filter(projection.present.eq(1_i64))
+            .into_tuple::<(Option<String>, Option<String>)>()
+            .one(&reader)
+            .await?;
+        let Some((inline, pointer)) = row else {
+            return Ok(None);
+        };
+        let body = match pointer {
+            Some(pointer) => Some(
+                storage::capture(&reader, &pointer, Selection::Full)
+                    .await?
+                    .context("missing canonical event payload")?,
+            ),
+            None => None,
+        };
+        reader.commit().await?;
+        return body
+            .map(|body| body.into_text())
+            .transpose()
+            .map(|stored| stored.or(inline));
+    }
     let row = projection
         .query
         .select_only()
-        .column(projection.payload)
-        .expr(reference)
+        .expr(Expr::col((E::default(), projection.payload)).cast_as("text"))
         .filter(projection.id.eq(id))
         .filter(projection.revision.eq(expected_revision))
         .filter(projection.present.eq(1_i64))
-        .into_tuple::<(String, Option<String>)>()
+        .into_tuple::<String>()
         .one(db)
         .await?;
-    let Some((plain, id)) = row else {
-        return Ok(None);
-    };
-    match projection.portable {
-        Some((_, family)) => Ok(Some(
-            super::portable_payload::hydrate(db, family, id.as_deref(), plain).await?,
-        )),
-        None => Ok(Some(plain)),
-    }
+    Ok(row)
 }
 
-#[derive(FromQueryResult)]
-struct PayloadSizeRow {
-    ordinal: i64,
-    bytes: i64,
-}
-
-#[derive(FromQueryResult)]
-struct PayloadValueRow {
-    ordinal: i64,
-    payload: String,
-}
-
-/// Batch the uncompressed canonical columns by both row count and actual UTF-8
-/// bytes. Event and item payloads may be transparent-zstd views and therefore
-/// intentionally take the single-object path above: a size probe would itself
-/// decompress the complete value and repeat that work.
+/// Batch uncompressed history columns by row count and actual UTF-8 bytes.
 pub(crate) async fn compaction_reference_payload_batch(
     store: &CrudStore,
     workspace: &str,
@@ -3724,42 +3557,17 @@ pub(crate) async fn compaction_reference_payload_batch(
         };
         exact_canonical_revision(reference, kind)?;
     }
+    use pioneer_crud_compaction::source_payloads;
+
     let encoded = serde_json::to_string(candidates)?;
-    let projection = |field: &str| {
-        format!(
-            "SELECT CAST(w.key AS INTEGER) AS ordinal,{field} FROM json_each(?) w \
-         JOIN compaction_live_sources s ON s.workspace_id=? AND s.thread_id=? \
-          AND s.source_scope=json_extract(w.value,'$.scope') \
-          AND s.source_id=json_extract(w.value,'$.id') \
-          AND s.source_version=json_extract(w.value,'$.version') \
-         JOIN turn_input i ON substr(s.source_scope,1,6)='input:' \
-          AND i.id=s.source_id AND i.turn_id=substr(s.source_scope,7) \
-         UNION ALL \
-         SELECT CAST(w.key AS INTEGER) AS ordinal,{context_field} FROM json_each(?) w \
-         JOIN compaction_live_sources s ON s.workspace_id=? AND s.thread_id=? \
-          AND s.source_scope=json_extract(w.value,'$.scope') \
-          AND s.source_id=json_extract(w.value,'$.id') \
-          AND s.source_version=json_extract(w.value,'$.version') \
-         JOIN turn_llm_context c ON substr(s.source_scope,1,8)='context:' \
-          AND c.id=s.source_id AND c.turn_id=substr(s.source_scope,9) ORDER BY ordinal",
-            context_field = field.replace("i.payload", "c.payload")
-        )
-    };
-    let values = || {
-        [
-            encoded.clone().into(),
-            workspace.into(),
-            thread.into(),
-            encoded.clone().into(),
-            workspace.into(),
-            thread.into(),
-        ]
-    };
-    let sizes = PayloadSizeRow::find_by_statement(sqlite_specific_sql(
-        &projection("length(CAST(i.payload AS BLOB)) AS bytes"),
-        values(),
-    ))
-    .all(&store.connection)
+    let reader = store.connection.begin_read().await?;
+    let sizes = source_payloads::sizes(
+        &reader,
+        workspace,
+        thread,
+        &encoded,
+        i64::try_from(batchable)?,
+    )
     .await?;
     ensure!(
         sizes.len() == candidates.len(),
@@ -3780,23 +3588,15 @@ pub(crate) async fn compaction_reference_payload_batch(
         consumed += 1;
     }
     // A single large value is admitted rather than imposing a new history limit.
-    let selected = serde_json::to_string(&candidates[..consumed])?;
-    let selected_values = || {
-        [
-            selected.clone().into(),
-            workspace.into(),
-            thread.into(),
-            selected.clone().into(),
-            workspace.into(),
-            thread.into(),
-        ]
-    };
-    let rows = PayloadValueRow::find_by_statement(sqlite_specific_sql(
-        &projection("i.payload AS payload"),
-        selected_values(),
-    ))
-    .all(&store.connection)
+    let rows = source_payloads::values(
+        &reader,
+        workspace,
+        thread,
+        &encoded,
+        i64::try_from(consumed)?,
+    )
     .await?;
+    reader.commit().await?;
     ensure!(
         rows.len() == consumed,
         "selected history source changed while loading"
@@ -3854,7 +3654,7 @@ const COMPACTION_CHECKPOINT_SOURCE_SQL: &str = r#"
 SELECT 'checkpoint:'||p.owner AS source_scope,p.id AS source_id,
  p.identity_sha256 AS source_version
 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-WHERE p.id=?1 AND c.workspace_id=?2 AND c.thread_id=?3
+WHERE p.id=$1 AND c.workspace_id=$2 AND c.thread_id=$3
  AND p.format_version=1
  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
@@ -3866,7 +3666,8 @@ fn compaction_checkpoint_source_statement(
     thread: &str,
     checkpoint: &str,
 ) -> Statement {
-    sqlite_specific_sql(
+    Statement::from_sql_and_values(
+        DbBackend::Postgres,
         COMPACTION_CHECKPOINT_SOURCE_SQL,
         [checkpoint.into(), workspace.into(), thread.into()],
     )
@@ -4184,77 +3985,45 @@ async fn read_source_fragment<E: EntityTrait, P>(
     id: &str,
     offset: i64,
 ) -> Result<Option<SourceFragmentRow>> {
-    if let Some((reference, family)) = projection.portable {
-        use pioneer_entity::portable_payload as p;
-        // Capture the raw fallback and legacy fragment with their reference in
-        // one snapshot. A second source SELECT could otherwise see publication
-        // or a logical replacement instead of the value whose header we read.
-        let raw = Query::select()
-            .column(p::Column::Raw)
-            .from(p::Entity)
-            .and_where(
-                Expr::col((p::Entity, p::Column::Id)).eq(Expr::col((E::default(), reference))),
-            )
-            .to_owned();
-        let source = projection
+    if let Some(reference) = projection.portable {
+        use pioneer_crud_payloads::storage::{self, Selection};
+        let reader = db.begin_read().await?;
+        let row = projection
             .query
-            .clone()
             .select_only()
-            .expr(projection.revision.clone())
+            .expr(projection.revision)
+            .expr(Expr::col((E::default(), projection.payload)).cast_as("text"))
             .column(reference)
-            .expr(
-                Expr::case(
-                    Expr::from(raw).eq(1_i64),
-                    Expr::col((E::default(), projection.payload)),
-                )
-                .finally(Expr::val(Option::<String>::None)),
-            )
-            .expr(Func::cust(Alias::new("substr")).args([
-                Expr::col((E::default(), projection.payload)),
-                Expr::val(offset),
-                Expr::val(16384_i64),
-            ]))
-            .expr(Func::char_length(Expr::col((
-                E::default(),
-                projection.payload,
-            ))))
             .filter(projection.id.eq(id))
-            .filter(projection.present.clone().eq(1_i64))
-            .into_tuple::<(i64, Option<String>, Option<String>, String, i64)>()
-            .one(db)
+            .filter(projection.present.eq(1_i64))
+            .into_tuple::<(i64, Option<String>, Option<String>)>()
+            .one(&reader)
             .await?;
-        let Some((revision, payload_id, raw, fragment, characters)) = source else {
+        let Some((revision, inline, pointer)) = row else {
             return Ok(None);
         };
-        if let Some(id) = payload_id {
-            let meta = super::portable_payload::header(db, &id, family).await?;
-            let fragment = if meta.raw == 0 {
-                String::from_utf8(
-                    super::portable_payload::read_range(db, &meta, offset - 1, 16384, true).await?,
-                )?
-            } else {
-                let plain = super::portable_payload::hydrate_header(
-                    db,
-                    &meta,
-                    raw.context("portable raw source missing")?,
-                )
-                .await?;
-                plain
-                    .chars()
-                    .skip(usize::try_from(offset - 1)?)
-                    .take(16384)
-                    .collect()
-            };
+        let start = usize::try_from(offset - 1)?;
+        if let Some(pointer) = pointer {
+            let meta = storage::metadata(&reader, &pointer)
+                .await?
+                .context("missing canonical event payload")?;
+            let end = start.saturating_add(16384).min(meta.original_chars);
+            let captured = storage::capture(&reader, &pointer, Selection::Characters(start..end))
+                .await?
+                .context("missing canonical event payload")?;
+            reader.commit().await?;
             return Ok(Some(SourceFragmentRow {
                 revision,
-                fragment,
-                characters: meta.original_chars,
+                fragment: captured.into_text()?,
+                characters: i64::try_from(meta.original_chars)?,
             }));
         }
+        reader.commit().await?;
+        let inline = inline.context("missing inline event payload")?;
         return Ok(Some(SourceFragmentRow {
             revision,
-            fragment,
-            characters,
+            fragment: inline.chars().skip(start).take(16384).collect(),
+            characters: i64::try_from(inline.chars().count())?,
         }));
     }
     Ok(projection

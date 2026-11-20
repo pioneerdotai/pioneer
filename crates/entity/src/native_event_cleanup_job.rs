@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    pub available_at: i64,
     pub last_served_at: i64,
-    pub revision: i64,
+    pub available_at: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
+    pub revision: i64,
+    #[sea_orm(column_type = "Text")]
+    pub state: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

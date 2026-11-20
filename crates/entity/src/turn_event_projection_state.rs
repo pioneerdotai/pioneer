@@ -7,23 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event_projection_state")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub event_id: String,
-    pub thread_id: String,
-    pub turn_id: String,
-    pub sequence: i64,
-    pub status: String,
+    pub next_run_at: DateTimeWithTimeZone,
     pub attempt_count: i64,
+    pub sequence: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub event_id: String,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
-    pub next_run_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
-    pub claim_expires_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text")]
     pub projection_context_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     pub projected_at: Option<DateTimeWithTimeZone>,
+    pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

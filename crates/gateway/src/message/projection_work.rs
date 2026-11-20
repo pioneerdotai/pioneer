@@ -146,52 +146,57 @@ mod tests {
     async fn a_full_quantum_yields_without_consuming_the_next_pass_wake() {
         use futures_util::FutureExt;
 
-        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(
-            sea_orm::Database::connect("sqlite::memory:").await.unwrap(),
-        );
-        let signal = database.work_signal("projection");
-        let mut changes = signal.subscribe();
-        let mut work = ProjectionWork::default();
-        work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 99);
-        work.advance(None, true);
-        signal.notify_keys(
-            &(0..65)
-                .map(|id| format!("turn:{id:02}"))
-                .collect::<Vec<_>>(),
-        );
-        work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 100);
-        let first = work.current().unwrap().turns.unwrap();
-        assert_eq!(first.len(), 64);
-        // A commit arrives behind the captured frontier. It must still wake
-        // a new pass after all current scopes reach EOF, without another write.
-        signal.notify_keys(&["turn:arrived-during-pass".into()]);
-        work.advance(Some(100), false);
-        assert_eq!(work.deadline(), Some(0));
-        work.wait(&mut changes).await;
-        assert_eq!(work.current().unwrap().turns.unwrap(), vec!["64"]);
-        work.advance(None, true);
-        work.wait(&mut changes).await;
-        assert_eq!(work.current().unwrap().turns.unwrap(), first);
-        work.advance(None, false);
-        work.wait(&mut changes).await;
-        let remaining = work.current().unwrap();
-        assert!(!remaining.replay && remaining.finalization);
-        assert_eq!(work.deadline(), Some(0));
-        work.advance(None, true);
-        assert!(work.is_complete());
-        assert_eq!(work.deadline(), None);
-        assert!(
-            work.wait(&mut changes).now_or_never().is_some(),
-            "completion must not park over an unprocessed source change"
-        );
-        work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 101);
-        assert_eq!(
-            work.current().unwrap().turns.unwrap(),
-            vec!["arrived-during-pass"]
-        );
-        work.advance(None, true);
-        assert!(work.wait(&mut changes).now_or_never().is_none());
-        database.close().await.unwrap();
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = pioneer_sqlite::SqliteDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connection().clone(),
+            );
+            let signal = database.work_signal("projection");
+            let mut changes = signal.subscribe();
+            let mut work = ProjectionWork::default();
+            work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 99);
+            work.advance(None, true);
+            signal.notify_keys(
+                &(0..65)
+                    .map(|id| format!("turn:{id:02}"))
+                    .collect::<Vec<_>>(),
+            );
+            work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 100);
+            let first = work.current().unwrap().turns.unwrap();
+            assert_eq!(first.len(), 64);
+            // A commit arrives behind the captured frontier. It must still wake
+            // a new pass after all current scopes reach EOF, without another write.
+            signal.notify_keys(&["turn:arrived-during-pass".into()]);
+            work.advance(Some(100), false);
+            assert_eq!(work.deadline(), Some(0));
+            work.wait(&mut changes).await;
+            assert_eq!(work.current().unwrap().turns.unwrap(), vec!["64"]);
+            work.advance(None, true);
+            work.wait(&mut changes).await;
+            assert_eq!(work.current().unwrap().turns.unwrap(), first);
+            work.advance(None, false);
+            work.wait(&mut changes).await;
+            let remaining = work.current().unwrap();
+            assert!(!remaining.replay && remaining.finalization);
+            assert_eq!(work.deadline(), Some(0));
+            work.advance(None, true);
+            assert!(work.is_complete());
+            assert_eq!(work.deadline(), None);
+            assert!(
+                work.wait(&mut changes).now_or_never().is_some(),
+                "completion must not park over an unprocessed source change"
+            );
+            work.begin(changes.begin_keyed_pass(&database).await.unwrap(), 101);
+            assert_eq!(
+                work.current().unwrap().turns.unwrap(),
+                vec!["arrived-during-pass"]
+            );
+            work.advance(None, true);
+            assert!(work.wait(&mut changes).now_or_never().is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

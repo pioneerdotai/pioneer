@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_work_branch_schedule")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub root_execution_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub branch_key: String,
     pub last_scheduled_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub root_execution_id: String,
     pub last_scheduled_sequence: i64,
-    pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
@@ -22,7 +22,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_work_resource_scope: HasOne<super::agent_work_resource_scope::Entity>,
+    pub agent_work_resource_scope: BelongsTo<super::agent_work_resource_scope::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

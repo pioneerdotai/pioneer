@@ -6,8 +6,8 @@ use futures_util::Stream;
 use pioneer_observability::query_cpu::{self, QueryScope};
 use sea_orm::{
     AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
-    ExecResult, IsolationLevel, QueryResult, QueryStream, Statement, StreamTrait, TransactionError,
-    TransactionOptions, TransactionSession, TransactionStream, TransactionTrait,
+    ExecResult, IsolationLevel, QueryResult, QueryStream, RuntimeErr, Statement, StreamTrait,
+    TransactionError, TransactionOptions, TransactionSession, TransactionStream, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::VecDeque;
@@ -167,7 +167,8 @@ struct Waiter {
 #[derive(Default)]
 struct AdmissionState {
     observation_revision: u64,
-    active: bool,
+    active: usize,
+    active_maintenance: usize,
     critical: VecDeque<Waiter>,
     interactive: VecDeque<Waiter>,
     maintenance: VecDeque<Waiter>,
@@ -196,6 +197,7 @@ impl AdmissionState {
 struct AdmissionInner {
     state: Mutex<AdmissionState>,
     next_waiter_id: AtomicU64,
+    capacity: usize,
     policy: SqliteWritePolicy,
     observer: Arc<dyn SqliteWriteObserver>,
 }
@@ -234,7 +236,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let held = self.acquired_at.elapsed();
-        let (queue, snapshot, dispatch) = self.inner.release();
+        let (queue, snapshot, dispatch) = self.inner.release(self.class);
         if self.started {
             self.inner.observer.observe_admission(
                 SqliteWriteEvent::Released {
@@ -367,9 +369,7 @@ impl AdmissionInner {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.queue_mut(class).push_back(waiter);
             let queue = state.snapshot();
-            let dispatch = (!state.active)
-                .then(|| self.grant_next_locked(&mut state, true))
-                .flatten();
+            let dispatch = self.grant_next_locked(&mut state, true);
             let snapshot = Self::queue_observation_locked(&mut state);
             (queue, snapshot, dispatch)
         };
@@ -407,15 +407,14 @@ impl AdmissionInner {
             .position(|waiter| waiter.id == id)?;
         state.queue_mut(class).remove(position);
         let snapshot = state.snapshot();
-        let dispatch = (!state.active)
-            .then(|| self.grant_next_locked(&mut state, false))
-            .flatten();
+        let dispatch = self.grant_next_locked(&mut state, false);
         let current = Self::queue_observation_locked(&mut state);
         Some((snapshot, current, dispatch))
     }
 
     fn release(
         self: &Arc<Self>,
+        class: SqliteWriteClass,
     ) -> (
         SqliteWriteQueueSnapshot,
         crate::SqliteAdmissionSnapshot,
@@ -425,8 +424,14 @@ impl AdmissionInner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(state.active, "SQLite writer released without an owner");
-        state.active = false;
+        debug_assert!(
+            state.active > 0,
+            "database writer released without an owner"
+        );
+        state.active -= 1;
+        if class == SqliteWriteClass::Maintenance {
+            state.active_maintenance -= 1;
+        }
         let queue = state.snapshot();
         let dispatch = self.grant_next_locked(&mut state, false);
         let current = Self::queue_observation_locked(&mut state);
@@ -438,11 +443,13 @@ impl AdmissionInner {
         state: &mut AdmissionState,
         newly_uncontended: bool,
     ) -> Option<Dispatch> {
-        debug_assert!(!state.active);
+        if state.active >= self.capacity {
+            return None;
+        }
         let now = Instant::now();
         let critical = !state.critical.is_empty();
         let interactive = !state.interactive.is_empty();
-        let maintenance = !state.maintenance.is_empty();
+        let maintenance = !state.maintenance.is_empty() && state.active_maintenance == 0;
         let class_count =
             usize::from(critical) + usize::from(interactive) + usize::from(maintenance);
 
@@ -460,7 +467,7 @@ impl AdmissionInner {
 
         let (class, reason) = if class_count == 0 {
             return None;
-        } else if newly_uncontended {
+        } else if newly_uncontended && class_count == 1 {
             debug_assert_eq!(class_count, 1);
             let class = if critical {
                 SqliteWriteClass::Critical
@@ -535,7 +542,10 @@ impl AdmissionInner {
             .queue_mut(class)
             .pop_front()
             .expect("selected SQLite writer queue must contain a waiter");
-        state.active = true;
+        state.active += 1;
+        if class == SqliteWriteClass::Maintenance {
+            state.active_maintenance += 1;
+        }
         let queue = state.snapshot();
         Some(Dispatch {
             sender: waiter.sender,
@@ -561,13 +571,14 @@ impl AdmissionInner {
     }
 }
 
-/// Sole owner of the physical SQLite writer connection and its scheduling
-/// queue. A write cannot reach the connection without a classed reservation.
+/// Write pool and its scheduling queue. A write cannot reach the pool without
+/// a classed reservation.
 #[derive(Clone)]
 pub struct SqliteWriteExecutor {
     connection: DatabaseConnection,
     admission: Arc<AdmissionInner>,
     work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
+    settlement: Arc<tokio::sync::Mutex<()>>,
     ownership: Arc<Mutex<Option<Arc<crate::WriterOwnership>>>>,
 }
 
@@ -602,13 +613,23 @@ impl SqliteWriteExecutor {
         policy: SqliteWritePolicy,
         observer: Arc<dyn SqliteWriteObserver>,
     ) -> Self {
+        let capacity = match connection.get_database_backend() {
+            DbBackend::Postgres if !connection.is_mock_connection() => connection
+                .get_postgres_connection_pool()
+                .options()
+                .get_max_connections()
+                as usize,
+            _ => 1,
+        };
         Self {
             connection,
             work_signals: Default::default(),
+            settlement: Default::default(),
             ownership: Default::default(),
             admission: Arc::new(AdmissionInner {
                 state: Mutex::new(AdmissionState::default()),
                 next_waiter_id: AtomicU64::new(1),
+                capacity,
                 policy,
                 observer,
             }),
@@ -623,10 +644,17 @@ impl SqliteWriteExecutor {
     }
 
     pub fn max_connections(&self) -> u32 {
-        self.connection
-            .get_sqlite_connection_pool()
-            .options()
-            .get_max_connections()
+        if self.connection.get_database_backend() == DbBackend::Postgres {
+            self.connection
+                .get_postgres_connection_pool()
+                .options()
+                .get_max_connections()
+        } else {
+            self.connection
+                .get_sqlite_connection_pool()
+                .options()
+                .get_max_connections()
+        }
     }
 
     pub(crate) fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
@@ -636,6 +664,44 @@ impl SqliteWriteExecutor {
             .entry(domain)
             .or_default()
             .clone()
+    }
+
+    pub(crate) async fn settle_dispatched_writes(
+        &self,
+        class: SqliteWriteClass,
+    ) -> Result<(), DbErr> {
+        let backend = self.connection.get_database_backend();
+        if backend != DbBackend::Postgres || self.connection.is_mock_connection() {
+            self.connection(class)
+                .query_one_raw(Statement::from_string(backend, "SELECT 1"))
+                .await?;
+            return Ok(());
+        }
+
+        // SQLx flushes outstanding protocol responses before returning a
+        // connection to the pool. Reserve each slot after an unknown outcome
+        // so discovery cannot run before another session's pending COMMIT
+        // or rollback. Normal writes never take the settlement lock.
+        let _settlement = self.settlement.lock().await;
+        let permit = self.acquire(class).await;
+        let pool = self.connection.get_postgres_connection_pool();
+        let capacity = pool.options().get_max_connections();
+        observe_control(
+            async {
+                let mut sessions = Vec::with_capacity(capacity as usize);
+                for _ in 0..capacity {
+                    sessions.push(
+                        pool.acquire()
+                            .await
+                            .map_err(|error| DbErr::Conn(RuntimeErr::SqlxError(error.into())))?,
+                    );
+                }
+                Ok(())
+            },
+            "settle",
+        )
+        .in_pool(writer_pool_context(permit.class()))
+        .await
     }
 
     pub fn retain_ownership(self, ownership: Arc<crate::WriterOwnership>) -> Self {
@@ -1244,6 +1310,7 @@ mod tests {
         Arc::new(AdmissionInner {
             state: Mutex::new(AdmissionState::default()),
             next_waiter_id: AtomicU64::new(1),
+            capacity: 1,
             policy,
             observer: Arc::new(NoopSqliteWriteObserver),
         })
@@ -1608,6 +1675,7 @@ mod tests {
         let inner = Arc::new(AdmissionInner {
             state: Mutex::new(AdmissionState::default()),
             next_waiter_id: AtomicU64::new(1),
+            capacity: 1,
             policy: SqliteWritePolicy::default(),
             observer: observer.clone(),
         });

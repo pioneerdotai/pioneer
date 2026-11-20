@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_pack_installation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub name: String,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub scope_key: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
     #[sea_orm(column_type = "Text")]
     pub source_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub name: String,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]
     pub skill_installations: HasMany<super::skill_installation::Entity>,
 }

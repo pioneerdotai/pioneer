@@ -6,9 +6,9 @@ use anyhow::{Result, ensure};
 use pioneer_entity::{
     compaction_frozen_history as history, compaction_frozen_import_data as import_data,
     compaction_frozen_layout as layout, compaction_frozen_message_data as message_data,
-    compaction_frozen_span as span,
+    compaction_frozen_span as span, compaction_frozen_sweep_consumer as consumer,
 };
-use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
+use sea_orm::sea_query::{Expr, ExprTrait, LockType, OnConflict};
 use sea_orm::{ActiveValue::Set, QueryOrder, QuerySelect, TransactionTrait, entity::prelude::*};
 const ROWS: u64 = 128;
 const BYTES: i64 = 256 * 1024;
@@ -42,7 +42,7 @@ pub(crate) async fn rows<C: ConnectionTrait>(
             }
             let loaded = q.select_only().column($e::Column::Ordinal).column($e::Column::$field)
                 .filter($e::Column::Ordinal.lt(end))
-                .filter(Expr::cust(format!("length(CAST({} AS BLOB))=bytes AND bytes BETWEEN 0 AND {}", $json, BYTES)))
+                .filter(Expr::cust(format!("octet_length({})::bigint=bytes AND bytes BETWEEN 0 AND {}", $json, BYTES)))
                 .order_by_asc($e::Column::Ordinal)
                 .into_tuple::<(i64,String)>().all(db).await?;
             ensure!(loaded.len() == usize::try_from(end-start)?, "frozen range readback incomplete");
@@ -166,7 +166,7 @@ async fn register(
                 && candidate.owner_thread == h.owner_thread,
             "base scope unavailable"
         );
-        let layout = layout::Entity::find_by_id((base.clone(), kind))
+        let layout = pioneer_crud_compaction::frozen::find_layout(base.clone(), kind)
             .one(&tx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("base layout missing"))?;
@@ -187,6 +187,7 @@ async fn register(
         cleanup_to: Set(0),
         cleanup_next: Set(0),
         failed: Set(0),
+        ..Default::default()
     })
     .on_conflict(
         OnConflict::columns([layout::Column::ManifestId, layout::Column::Kind])
@@ -195,7 +196,7 @@ async fn register(
     )
     .exec_without_returning(&tx)
     .await?;
-    let state = layout::Entity::find_by_id((h.id.clone(), kind))
+    let state = pioneer_crud_compaction::frozen::find_layout(h.id.clone(), kind)
         .one(&tx)
         .await?
         .ok_or_else(|| anyhow::anyhow!("capture layout removed during registration"))?;
@@ -220,7 +221,7 @@ async fn same_import_target<C: ConnectionTrait>(
             .select_only()
             .column(message::Column::ReferenceJson)
             .filter(Expr::cust(
-                "length(CAST(reference_json AS BLOB))=bytes AND bytes>=0",
+                "octet_length(reference_json)::bigint=bytes AND bytes>=0",
             ))
             .into_tuple::<String>()
             .one(db)
@@ -302,14 +303,14 @@ pub(crate) async fn prepare(
         let verified = if state.copy_to.is_some_and(|end| end == state.copy_next) {
             let mut check = StagedCopyCheck::new(h.clone(), state.clone())?;
             while !check.step(store).await? {}
-            true
+            check.revisions
         } else {
-            false
+            None
         };
         if publish(store, &h, &state, matched as i64, verified).await? {
             break;
         }
-        state = layout::Entity::find_by_id((id.to_owned(), kind))
+        state = pioneer_crud_compaction::frozen::find_layout(id.to_owned(), kind)
             .one(&store.connection)
             .await?
             .ok_or_else(|| anyhow::anyhow!("capture layout removed during preparation"))?;
@@ -324,7 +325,7 @@ async fn publish(
     h: &history::Model,
     l: &layout::Model,
     prefix: i64,
-    verified: bool,
+    verified: Option<CopyRevisions>,
 ) -> Result<bool> {
     let changes = [
         store
@@ -373,8 +374,9 @@ async fn publish(
                     next = end;
                 }
                 let tx = store.connection.begin().await?;
+                lock_copy_headers(&tx, h, l).await?;
                 checked_copy_dependencies(&tx, h, l).await?;
-                let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
+                let state = pioneer_crud_compaction::frozen::find_layout(h.id.clone(), l.kind)
                     .one(&tx)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("copy state removed"))?;
@@ -401,9 +403,9 @@ async fn publish(
                 }
             }
         }
-        if !verified {
+        let Some(verified) = verified else {
             return Ok(false);
-        }
+        };
         let count = if l.kind == 0 {
             h.message_count
         } else {
@@ -411,11 +413,12 @@ async fn publish(
         };
         ensure!(prefix <= count, "shared prefix exceeds capture");
         let tx = store.connection.begin().await?;
+        lock_copy_headers(&tx, h, l).await?;
         let current = history::Entity::find_by_id(&h.id)
             .one(&tx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("capture removed"))?;
-        let state = layout::Entity::find_by_id((h.id.clone(), l.kind))
+        let state = pioneer_crud_compaction::frozen::find_layout(h.id.clone(), l.kind)
             .one(&tx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("capture layout removed"))?;
@@ -423,6 +426,10 @@ async fn publish(
         if state.active != 0 {
             tx.commit().await?;
             return Ok(true);
+        }
+        if CopyRevisions::read(&tx, h, l).await? != verified {
+            tx.rollback().await?;
+            return Ok(false);
         }
         ensure!(
             current.workspace_id == h.workspace_id
@@ -466,8 +473,10 @@ async fn publish(
         if h.ready != 0 && prefix < count {
             exact_span_insert(&tx, &h.id, l.kind, prefix, count, &h.id).await?;
         }
+        let revision = span_revision(&tx, &h.id, l.kind).await?;
         layout::Entity::update_many()
             .col_expr(layout::Column::Active, Expr::val(1))
+            .col_expr(layout::Column::VerifiedSpanRevision, Expr::val(revision))
             .col_expr(
                 layout::Column::Pending,
                 Expr::val(i64::from(h.ready != 0 && prefix > 0)),
@@ -521,6 +530,61 @@ async fn publish(
     result
 }
 
+async fn lock_copy_headers<C: ConnectionTrait>(
+    db: &C,
+    h: &history::Model,
+    l: &layout::Model,
+) -> Result<()> {
+    let ids = std::iter::once(h.id.as_str()).chain(l.candidate.as_deref());
+    let locked = history::Entity::find()
+        .select_only()
+        .column(history::Column::Id)
+        .filter(history::Column::Id.is_in(ids))
+        .order_by_asc(history::Column::Id)
+        .lock(LockType::NoKeyUpdate)
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    ensure!(
+        locked.len() == 1 + usize::from(l.candidate.is_some()),
+        "frozen copy header disappeared"
+    );
+    Ok(())
+}
+
+pub(super) async fn span_revision<C: ConnectionTrait>(db: &C, id: &str, kind: i64) -> Result<i64> {
+    consumer::Entity::find()
+        .select_only()
+        .column(consumer::Column::Revision)
+        .filter(consumer::Column::ManifestId.eq(id))
+        .filter(consumer::Column::Kind.eq(kind))
+        .into_tuple::<i64>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("frozen span revision missing"))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CopyRevisions {
+    target: i64,
+    candidate: Option<i64>,
+}
+
+impl CopyRevisions {
+    async fn read<C: ConnectionTrait>(
+        db: &C,
+        h: &history::Model,
+        l: &layout::Model,
+    ) -> Result<Self> {
+        let target = span_revision(db, &h.id, l.kind).await?;
+        let candidate = match &l.candidate {
+            Some(base) => Some(span_revision(db, base, l.kind).await?),
+            None => None,
+        };
+        Ok(Self { target, candidate })
+    }
+}
+
 async fn checked_copy_dependencies<C: ConnectionTrait>(
     db: &C,
     h: &history::Model,
@@ -551,7 +615,7 @@ async fn checked_copy_dependencies<C: ConnectionTrait>(
             b.ready == 1 && b.workspace_id == h.workspace_id && b.owner_thread == h.owner_thread,
             "copy logical base unavailable"
         );
-        let bl = layout::Entity::find_by_id((base.clone(), l.kind))
+        let bl = pioneer_crud_compaction::frozen::find_layout(base.clone(), l.kind)
             .one(db)
             .await?
             .ok_or_else(|| anyhow::anyhow!("copy base layout missing"))?;
@@ -580,6 +644,7 @@ async fn exact_span_insert<C: ConnectionTrait>(
         start: Set(start),
         end: Set(end),
         source_manifest: Set(source.into()),
+        ..Default::default()
     })
     .on_conflict(
         OnConflict::columns([
@@ -592,7 +657,7 @@ async fn exact_span_insert<C: ConnectionTrait>(
     )
     .exec_without_returning(db)
     .await?;
-    let actual = span::Entity::find_by_id((id.to_owned(), kind, start))
+    let actual = pioneer_crud_compaction::frozen::find_span(id.to_owned(), kind, start)
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("span readback missing"))?;
@@ -611,7 +676,7 @@ pub(crate) async fn append_source<C: ConnectionTrait>(
     kind: i64,
     ordinal: i64,
 ) -> Result<String> {
-    if layout::Entity::find_by_id((id.to_owned(), kind))
+    if pioneer_crud_compaction::frozen::find_layout(id.to_owned(), kind)
         .filter(layout::Column::Active.eq(1))
         .one(db)
         .await?
@@ -668,6 +733,7 @@ pub(crate) async fn append_source<C: ConnectionTrait>(
         start: Set(ordinal),
         end: Set(ordinal + 1),
         source_manifest: Set(id.into()),
+        ..Default::default()
     })
     .exec(db)
     .await?;
@@ -701,7 +767,7 @@ pub(crate) async fn maintain(
             Ok(false) => return Ok(true),
             Ok(true) => {
                 let check = progress.conversion.take().expect("copy validation");
-                let deleted = maintain_layout(store, &check.layout, true).await?;
+                let deleted = maintain_layout(store, &check.layout, check.revisions).await?;
                 progress
                     .acknowledge_physical(check.layout.kind, deleted)
                     .await;
@@ -713,10 +779,10 @@ pub(crate) async fn maintain(
                     return Err(error);
                 }
                 let check = progress.conversion.take().expect("copy validation");
-                let current = layout::Entity::find_by_id((
+                let current = pioneer_crud_compaction::frozen::find_layout(
                     check.layout.manifest_id.clone(),
                     check.layout.kind,
-                ))
+                )
                 .one(&store.connection)
                 .await?;
                 let header = history::Entity::find_by_id(&check.header.id)
@@ -789,7 +855,7 @@ pub(crate) async fn maintain(
                 progress.conversion = Some(StagedCopyCheck::new(h, l)?);
                 return Ok(true);
             }
-            let deleted = match maintain_layout(store, &l, false).await {
+            let deleted = match maintain_layout(store, &l, None).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
                     if error.downcast_ref::<sea_orm::DbErr>().is_some() {
@@ -862,7 +928,7 @@ pub(crate) async fn maintain(
 async fn maintain_layout(
     store: &CrudStore,
     l: &layout::Model,
-    verified: bool,
+    verified: Option<CopyRevisions>,
 ) -> Result<Option<super::frozen_storage_lifetime::PhysicalDeleteResult>> {
     let h = history::Entity::find_by_id(&l.manifest_id)
         .one(&store.connection)
@@ -912,7 +978,7 @@ async fn maintain_layout(
             done |= matched == count;
         }
         if done {
-            publish(store, &h, l, matched, false).await?;
+            publish(store, &h, l, matched, None).await?;
         } else {
             layout::Entity::update_many()
                 .col_expr(layout::Column::Compared, Expr::val(matched))
@@ -931,7 +997,7 @@ async fn maintain_layout(
                 .select_only()
                 .column(message_data::Column::Ordinal)
                 .column(message_data::Column::Bytes)
-                .expr(Expr::cust("length(CAST(reference_json AS BLOB))"))
+                .expr(Expr::cust("octet_length(reference_json)::bigint"))
                 .order_by_asc(message_data::Column::Ordinal)
                 .limit(ROWS)
                 .into_tuple::<(i64, i64, i64)>()
@@ -945,7 +1011,7 @@ async fn maintain_layout(
                 .select_only()
                 .column(import_data::Column::Ordinal)
                 .column(import_data::Column::Bytes)
-                .expr(Expr::cust("length(CAST(proof_json AS BLOB))"))
+                .expr(Expr::cust("octet_length(proof_json)::bigint"))
                 .order_by_asc(import_data::Column::Ordinal)
                 .limit(ROWS)
                 .into_tuple::<(i64, i64, i64)>()
@@ -981,7 +1047,7 @@ async fn maintain_layout(
             .work_signal("maintenance.frozen")
             .changing();
         let tx = store.connection.begin().await?;
-        let current = layout::Entity::find_by_id((h.id.clone(), l.kind))
+        let current = pioneer_crud_compaction::frozen::find_layout(h.id.clone(), l.kind)
             .one(&tx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("cleanup layout removed"))?;
@@ -1047,6 +1113,7 @@ pub(super) struct StagedCopyCheck {
     next: i64,
     base_layout: Option<crate::frozen_lifetime::LayoutScan>,
     base_started: bool,
+    revisions: Option<CopyRevisions>,
 }
 impl StagedCopyCheck {
     fn new(header: history::Model, layout: layout::Model) -> Result<Self> {
@@ -1065,9 +1132,15 @@ impl StagedCopyCheck {
             next: 0,
             base_layout: None,
             base_started: false,
+            revisions: None,
         })
     }
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
+        if self.revisions.is_none() {
+            let revisions =
+                CopyRevisions::read(&store.connection, &self.header, &self.layout).await?;
+            self.revisions = Some(revisions);
+        }
         checked_copy_dependencies(&store.connection, &self.header, &self.layout).await?;
         if !self.base_started {
             if let Some(base) = &self.layout.candidate {
@@ -1089,10 +1162,11 @@ impl StagedCopyCheck {
             }
             return Ok(false);
         }
-        let current = layout::Entity::find_by_id((self.header.id.clone(), self.layout.kind))
-            .one(&store.connection)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("staged copy removed"))?;
+        let current =
+            pioneer_crud_compaction::frozen::find_layout(self.header.id.clone(), self.layout.kind)
+                .one(&store.connection)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("staged copy removed"))?;
         ensure!(
             current == self.layout,
             "staged copy changed during verification"

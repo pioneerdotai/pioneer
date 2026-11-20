@@ -7,18 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_agents_doc_revision")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(column_type = "Text")]
+    pub save_reason: String,
+    pub saved_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub content_sha256: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(unique_key = "uq_thread_agents_doc_revision_doc_version")]
-    pub doc_id: String,
-    #[sea_orm(unique_key = "uq_thread_agents_doc_revision_doc_version")]
     pub version: i64,
-    pub content_sha256: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub saved_by: Option<String>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_thread_agents_doc_revision_doc_version"
+    )]
+    pub doc_id: String,
     #[sea_orm(column_type = "Text")]
     pub content: String,
-    pub saved_at: DateTimeWithTimeZone,
-    pub saved_by: Option<String>,
-    pub save_reason: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,30 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_repair_job")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub job_kind: String,
-    pub status: String,
-    pub workspace_id: Option<String>,
-    pub scope_kind: Option<String>,
-    pub scope_key_hash: Option<String>,
-    pub memory_id: Option<String>,
-    pub priority: i64,
-    pub attempts: i64,
-    pub max_attempts: i64,
-    pub locked_by: Option<String>,
-    pub lock_expires_at: Option<DateTimeWithTimeZone>,
-    pub scheduled_at: DateTimeWithTimeZone,
-    pub started_at: Option<DateTimeWithTimeZone>,
-    pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
+    pub scope_kind: Option<String>,
+    pub scheduled_at: DateTimeWithTimeZone,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub job_kind: String,
+    pub max_attempts: i64,
+    pub lock_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub result_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub payload_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub result_json: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub locked_by: Option<String>,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub memory_id: Option<String>,
+    pub attempts: i64,
+    pub started_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub scope_key_hash: Option<String>,
+    pub priority: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

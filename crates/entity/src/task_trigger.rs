@@ -7,18 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_trigger")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub task_id: String,
-    pub webhook_secret_ref: Option<String>,
-    pub kind: String,
-    pub status: String,
-    #[sea_orm(column_type = "Text")]
-    pub spec_json: String,
     pub next_fire_at: Option<DateTimeWithTimeZone>,
-    pub last_fire_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub kind: String,
+    pub last_fire_at: Option<DateTimeWithTimeZone>,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub webhook_secret_ref: Option<String>,
+    pub spec_json: Json,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

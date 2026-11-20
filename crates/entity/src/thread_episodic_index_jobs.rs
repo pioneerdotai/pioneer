@@ -7,20 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_episodic_index_jobs")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub workspace_id: String,
-    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub index_item_id: String,
-    pub status: String,
-    pub attempt_count: i64,
-    pub last_attempt_latency_ms: Option<i64>,
-    pub next_run_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub last_attempt_latency_ms: Option<i64>,
+    pub next_run_at: DateTimeWithTimeZone,
+    pub attempt_count: i64,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
     pub updated_at: DateTimeWithTimeZone,
     pub completed_at: Option<DateTimeWithTimeZone>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

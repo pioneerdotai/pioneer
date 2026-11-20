@@ -240,27 +240,17 @@ impl Iterator for SourcePayloadBatch {
     }
 }
 
-/// Preparation belongs to the requesting operation, never a detached startup
-/// scan. Each quantum releases SQLite capacity; cancellation leaves a durable
-/// cursor for the next request. Capture the history fence only after this returns.
+/// Revisions are maintained on writes. Pin the history fence after verifying
+/// that the thread belongs to the requested workspace.
 pub(crate) async fn prepare_history(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
 ) -> Result<()> {
-    scope_current_stage(Stage::HistoryMetadata, async {
-        loop {
-            let finished = store
-                .compaction_prepare_history_quantum(workspace, thread)
-                .await?;
-            record_work(Work::Quanta, 1);
-            if finished {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        Ok(())
-    })
+    scope_current_stage(
+        Stage::HistoryMetadata,
+        store.compaction_assert_history_scope(workspace, thread),
+    )
     .await
 }
 
@@ -349,6 +339,7 @@ pub(crate) async fn reference_payload(
         .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))
 }
 
+#[cfg(test)]
 pub(crate) async fn prepare_references(
     store: &CrudStore,
     workspace: &str,

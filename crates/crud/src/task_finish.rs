@@ -50,11 +50,30 @@ pub(crate) async fn finish_runs<C: ConnectionTrait>(
         .into_model::<FinishActive>()
         .one(db)
         .await?;
-    let outcome = query.filter(Column::Status.is_in(["succeeded", "failed", "blocked", "cancelled", "timed_out"]))
+    use pioneer_crud_payloads::json_projection::{json_path_text, queryable_json};
+    use sea_orm::sea_query::{Expr, ExprTrait, Func};
+    let error = queryable_json(Expr::col(Column::ErrorJson));
+    let disposed = Column::Status
+        .eq("cancelled")
+        .and(Column::StartedAt.is_null())
+        .and(
+            Func::coalesce([json_path_text(error.clone(), &["code"]), Expr::val("")])
+                .eq("task_run_cancelled"),
+        )
+        .and(
+            Func::coalesce([json_path_text(error, &["message"]), Expr::val("")])
+                .eq("task finished before this run started"),
+        );
+    let outcome = query
+        .filter(Column::Status.is_in(["succeeded", "failed", "blocked", "cancelled", "timed_out"]))
         // Queue disposal is bookkeeping, never a real cancellation of work.
-        .filter(sea_orm::sea_query::Expr::cust("NOT (status = 'cancelled' AND started_at IS NULL AND COALESCE(json_extract(error_json, '$.code'), '') = 'task_run_cancelled' AND COALESCE(json_extract(error_json, '$.message'), '') = 'task finished before this run started')"))
-        .order_by_asc(sea_orm::sea_query::Expr::cust("CASE status WHEN 'succeeded' THEN 1 ELSE 0 END"))
-        .order_by_desc(Column::RunNumber).one(db).await?;
+        .filter(disposed.not())
+        .order_by_asc(sea_orm::sea_query::Expr::cust(
+            "CASE status WHEN 'succeeded' THEN 1 ELSE 0 END",
+        ))
+        .order_by_desc(Column::RunNumber)
+        .one(db)
+        .await?;
     Ok(FinishRuns { active, outcome })
 }
 

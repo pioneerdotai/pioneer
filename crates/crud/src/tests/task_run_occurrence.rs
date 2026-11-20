@@ -877,7 +877,7 @@ async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort
                     .unwrap();
             }
         }
-        let statement = DatabaseBackend::Sqlite.build(&queue::due_query(NOW, 64));
+        let statement = queue::due_query(NOW, 64).build(DatabaseBackend::Sqlite);
         assert!(!statement.sql.contains("task_run "));
         assert!(!statement.sql.contains("JOIN"));
         // EXPLAIN QUERY PLAN has no SeaQuery builder; preserve builder values.

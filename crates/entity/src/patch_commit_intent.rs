@@ -13,29 +13,29 @@ pub struct Model {
         column_type = "Text",
         unique_key = "uq_patch_commit_intent_commit_ordinal"
     )]
-    pub thread_id: String,
+    pub turn_id: String,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub plan_fingerprint: Vec<u8>,
+    #[sea_orm(column_type = "Text")]
+    pub operations_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub progress_json: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub invocation_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub recovery_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(unique_key = "uq_patch_commit_intent_commit_ordinal")]
+    pub commit_ordinal: i64,
     #[sea_orm(
         primary_key,
         auto_increment = false,
         column_type = "Text",
         unique_key = "uq_patch_commit_intent_commit_ordinal"
     )]
-    pub turn_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub invocation_id: String,
-    #[sea_orm(unique_key = "uq_patch_commit_intent_commit_ordinal")]
-    pub commit_ordinal: i64,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub plan_fingerprint: Vec<u8>,
-    #[sea_orm(column_type = "Text")]
-    pub operations_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub recovery_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub progress_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub status: String,
-    pub updated_at: DateTimeWithTimeZone,
+    pub thread_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

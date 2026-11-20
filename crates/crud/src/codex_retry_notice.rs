@@ -461,13 +461,14 @@ impl CrudStore {
                         .add(turn_item::Column::ItemId.eq(target.task.id.clone())),
                 );
             }
-            let anchors = turn_item::Entity::find()
-                .filter(exact)
-                .all(&self.connection)
-                .await?
-                .into_iter()
-                .map(|row| ((row.turn_id.clone(), row.item_id.clone()), row))
-                .collect::<HashMap<_, _>>();
+            let anchors = crate::repositories::turn_payload::items(
+                &self.connection,
+                turn_item::Entity::find().filter(exact),
+            )
+            .await?
+            .into_iter()
+            .map(|row| ((row.turn_id.clone(), row.item_id.clone()), row))
+            .collect::<HashMap<_, _>>();
             let mut eligible = Vec::with_capacity(targets.len());
             for target in targets {
                 let valid = (|| -> Result<bool> {
@@ -566,7 +567,7 @@ impl CrudStore {
                         return Ok(false);
                     }
                     let TurnItem::Task { item } =
-                        serde_json::from_str::<TurnItem>(&anchor.payload)?
+                        crate::repositories::turn_payload::decode_item(anchor)?
                     else {
                         return Ok(false);
                     };
@@ -606,10 +607,11 @@ impl CrudStore {
                             .add(turn_item::Column::ItemId.eq(id.clone())),
                     );
                 }
-                let rows = turn_item::Entity::find()
-                    .filter(exact)
-                    .all(&self.connection)
-                    .await?;
+                let rows = crate::repositories::turn_payload::items(
+                    &self.connection,
+                    turn_item::Entity::find().filter(exact),
+                )
+                .await?;
                 for row in rows {
                     let TurnItem::SystemEvent {
                         id,
@@ -617,7 +619,7 @@ impl CrudStore {
                         code: Some(code),
                         message,
                         details: None,
-                    } = serde_json::from_str::<TurnItem>(&row.payload)?
+                    } = crate::repositories::turn_payload::decode_item(&row)?
                     else {
                         bail!("invalid canonical Codex retry notice")
                     };

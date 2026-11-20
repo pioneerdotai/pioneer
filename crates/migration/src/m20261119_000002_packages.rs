@@ -1,7 +1,7 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, boolean, boolean_null, json, json_null, text, text_null,
+    big_integer, big_integer_null, boolean, boolean_null, json, text, text_null,
     timestamp_with_time_zone, timestamp_with_time_zone_null,
 };
 
@@ -420,11 +420,12 @@ impl MigrationTrait for Migration {
                     .col(text("action"))
                     .col(text("decision"))
                     .col(text_null("reason_code"))
-                    .col(json("details_json").default("{}"))
+                    .col(text("details_json").default("{}"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("details_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -460,11 +461,12 @@ impl MigrationTrait for Migration {
                     .col(text_null("skill_owner"))
                     .col(text("skill_slug"))
                     .col(text("source_kind"))
-                    .col(json("diagnostics_json").default("[]"))
+                    .col(text("diagnostics_json").default("[]"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("diagnostics_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -618,15 +620,16 @@ impl MigrationTrait for Migration {
                 .col(boolean("allow_implicit_invocation").default(false))
                 .col(text("state"))
                 .col(big_integer("revision"))
-                .col(json_null("pending_json"))
-                .col(json_null("last_error_json"))
+                .col(text_null("pending_json"))
+                .col(text_null("last_error_json"))
                 .col(timestamp_with_time_zone("created_at"))
                 .col(timestamp_with_time_zone("updated_at"))
                 .col(text("kind").default("plugin"))
                 .index(Index::create().unique().col("source_upload_id"))
                 .check(Expr::cust(r#""state" IN ( 'installing' , 'installed' , 'updating' , 'removing' , 'interrupted' )"#))
                 .check(Expr::cust(r#""revision" > 0"#))
-                .check(Expr::cust(r#"pending_json IS NULL OR length ( pending_json::text ) <= 65536"#))
+                .check(Expr::cust("pending_json IS NULL OR (pending_json IS JSON AND octet_length(pending_json) <= 65536)"))
+                .check(Expr::cust("last_error_json IS NULL OR last_error_json IS JSON"))
                 .check(Expr::cust(r#""kind" IN ( 'plugin' , 'app' )"#))
                 .to_owned(),
         ).await?;
@@ -690,7 +693,8 @@ impl MigrationTrait for Migration {
                 .col(text_null("package_fingerprint"))
                 .col(text("status"))
                 .col(text_null("diagnostic"))
-                .col(json("override_fields_json").default("[]"))
+                .col(text("override_fields_json").default("[]"))
+                .check(Expr::cust("override_fields_json IS JSON ARRAY"))
                 .primary_key(Index::create().col("package_id").col("kind").col("member_key"))
                 .index(Index::create().unique().col("mcp_installation_id"))
                 .index(Index::create().unique().col("skill_id"))
@@ -736,8 +740,8 @@ impl MigrationTrait for Migration {
             Table::create().table("app_installation")
                 .col(text("id").primary_key())
                 .col(text("slug"))
-                .col(json("manifest_json"))
-                .col(json("localizations_json").default("{}"))
+                .col(text("manifest_json"))
+                .col(text("localizations_json").default("{}"))
                 .check(Expr::cust(r#"CASE WHEN (manifest_json IS JSON) THEN json_typeof(manifest_json::json) = 'object' AND json_typeof(manifest_json::json -> 'slug') = 'string' AND ((manifest_json)::json #>> '{slug}') = slug ELSE FALSE END"#))
                 .check(Expr::cust(r#"CASE WHEN (localizations_json IS JSON) THEN json_typeof(localizations_json::json) = 'object' ELSE FALSE END"#))
                 .to_owned(),

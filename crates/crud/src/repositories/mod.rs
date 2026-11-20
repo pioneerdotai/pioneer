@@ -1,17 +1,9 @@
-pub mod administrative_audit;
+pub use pioneer_crud_access::administrative_audit;
 pub mod agent_domain;
 pub mod agent_identity_catalog;
-pub mod agent_memory;
-pub mod agent_memory_candidate;
-pub mod agent_memory_event;
-pub(crate) mod agent_memory_identity;
-pub mod agent_memory_policy_decision;
-pub mod agent_memory_quality_decision;
-pub mod agent_memory_quarantine;
-pub mod agent_memory_repair_job;
 pub(crate) mod agent_skill;
-pub mod artifact;
-pub(crate) mod auth_session;
+pub(crate) use pioneer_crud_access::auth_session;
+pub use pioneer_crud_artifacts::artifact;
 pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
@@ -30,60 +22,59 @@ pub(crate) mod compaction_runner;
 pub(crate) mod compaction_source_projection;
 pub(crate) mod compaction_task_output;
 pub mod execution_admission_lease;
-pub mod hook_run;
+pub use pioneer_crud_execution::hook_run;
 pub(crate) mod identity;
-pub(crate) mod invitation;
-pub mod mcp_audit_event;
-pub mod mcp_server_catalog_snapshot;
-pub mod mcp_server_installation;
+pub(crate) use pioneer_crud_access::invitation;
 pub(crate) mod membership;
-pub(crate) mod native_cancellation_context;
+pub(crate) use pioneer_crud_execution::native_cancellation_context;
 pub(crate) mod native_event_cleanup;
 pub mod native_terminal_effect_outbox;
-pub mod patch_history;
-pub mod policy;
-pub(crate) mod policy_generation;
-pub(crate) mod principal_avatar;
-pub(crate) mod projection_receipt_cleanup;
+pub use pioneer_crud_access::policy;
+pub(crate) use pioneer_crud_access::policy_generation;
+pub(crate) use pioneer_crud_access::principal_avatar;
+pub use pioneer_crud_artifacts::patch_history;
+pub(crate) use pioneer_crud_conversations::projection_receipts as projection_receipt_cleanup;
+#[cfg(test)]
+mod projection_receipt_cleanup_tests;
 pub mod provider_usage;
-pub(crate) mod read_model_repair;
+pub(crate) use pioneer_crud_conversations::read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
 pub(crate) mod self_improvement_finalization;
-pub(crate) mod self_improvement_history;
-pub(crate) mod self_improvement_run;
+pub use pioneer_crud_self_improvement::history_cursor as self_improvement_history;
+pub(crate) use pioneer_crud_self_improvement::self_improvement_run;
 pub(crate) mod self_improvement_source_turn;
-pub(crate) mod self_improvement_workspace_state;
-pub mod skill_audit_event;
-pub mod skill_dependency_snapshot;
-pub mod skill_installation;
-pub mod skill_pack_installation;
-pub mod skill_upload_session;
-pub mod skill_workspace_policy;
+pub use pioneer_crud_packages::skill_audit_event;
+pub use pioneer_crud_packages::skill_dependency_snapshot;
+pub use pioneer_crud_packages::skill_installation;
+pub use pioneer_crud_packages::skill_pack_installation;
+pub use pioneer_crud_packages::skill_upload_session;
+pub use pioneer_crud_packages::skill_workspace_policy;
+pub(crate) use pioneer_crud_self_improvement::self_improvement_workspace_state;
 pub mod task;
 pub mod task_actor_contract;
-pub mod task_agent_spec;
-pub mod task_completion_inbox;
-pub mod task_delivery;
-pub(crate) mod task_delivery_recovery;
-pub mod task_dependency;
+pub use pioneer_crud_tasks::completion_inbox as task_completion_inbox;
+pub use pioneer_crud_tasks::delivery as task_delivery;
+pub(crate) use pioneer_crud_tasks::delivery_recovery as task_delivery_recovery;
+pub use pioneer_crud_tasks::task_agent_spec;
+pub use pioneer_crud_tasks::task_dependency;
 pub mod task_event;
 pub(crate) mod task_execution_admission;
 pub mod task_result_candidate;
 pub mod task_result_review_event;
-pub mod task_run;
-pub mod task_run_conversation_snapshot;
-pub mod task_run_execution;
+pub use pioneer_crud_tasks::conversation_snapshot as task_run_conversation_snapshot;
+pub use pioneer_crud_tasks::task_run;
+pub use pioneer_crud_tasks::task_run_execution;
 pub mod task_run_thread_binding;
 pub mod task_run_turn;
-pub mod task_trigger;
+pub use pioneer_crud_tasks::task_trigger;
 pub mod task_write_lock;
 pub mod thread;
-pub mod thread_agents_doc;
+pub use pioneer_crud_conversations::thread_agents_doc;
 pub mod thread_episodic;
 pub mod thread_lineage;
-pub mod thread_timeline_projection;
-pub mod thread_tree;
+pub use pioneer_crud_conversations::thread_timeline_projection;
+pub use pioneer_crud_conversations::thread_tree;
 pub mod turn;
 pub mod turn_admission;
 pub mod turn_cli_runtime_instruction;
@@ -91,39 +82,30 @@ pub mod turn_event;
 pub mod turn_event_delivery;
 pub mod turn_event_projection_state;
 pub mod turn_event_projection_stream_state;
-pub mod turn_execution;
+pub use pioneer_crud_execution::turn_execution;
 pub mod turn_execution_window;
 pub mod turn_finalization;
 pub mod turn_item_attempt;
-pub mod turn_liveness;
+pub use pioneer_crud_conversations::turn_liveness;
 pub mod turn_llm_context;
 pub mod turn_mcp_binding;
 pub mod turn_mcp_projection;
 pub mod turn_runtime_snapshot;
 pub mod turn_skill_binding;
-pub(crate) mod user_notification_outbox;
+pub use pioneer_crud_tasks::user_notification_outbox;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectionWriteOutcome {
-    Applied,
-    NoopAlreadyStarted,
-    NoopAlreadyTerminal,
-    NoopDuplicateTerminal,
-    InvariantViolation { reason: String },
-}
+pub use pioneer_crud_tasks::projection::ProjectionWriteOutcome;
 
 mod compaction_live_sources;
-
-pub(crate) mod tool_output;
 
 pub(crate) mod compaction_frozen_storage;
 
 mod compaction_check_result;
 
-pub(crate) mod task_event_fanout;
-pub(crate) mod task_run_occurrence_reconcile;
+pub(crate) use pioneer_crud_tasks::event_fanout as task_event_fanout;
+pub(crate) use pioneer_crud_tasks::occurrence_reconcile as task_run_occurrence_reconcile;
 
-pub(crate) mod plugins;
+pub(crate) use pioneer_crud_packages::plugins;
 
 pub(crate) mod task_occurrence_reconcile;
 
@@ -132,28 +114,24 @@ mod frozen_sweep_work;
 
 pub(crate) mod html_preview_retention;
 
-pub(crate) mod task_cancellation_actor;
-pub(crate) mod task_child_cleanup;
+pub(crate) use pioneer_crud_tasks::task_cancellation_actor;
+pub(crate) use pioneer_crud_tasks::task_child_cleanup;
 
-pub(crate) mod unread_start;
+#[cfg(test)]
+pub(crate) use pioneer_crud_conversations::unread_start;
 
-pub(crate) mod thread_history_read;
-
-pub(crate) mod portable_payload;
-pub(crate) mod portable_payload_legacy_text;
-
-mod portable_payload_json;
+pub(crate) use pioneer_crud_conversations::saved_history as thread_history_read;
 
 pub mod html_preview_io_work;
 pub(crate) mod recovery_watchdog;
-pub(crate) mod task_child_producers;
+pub(crate) use pioneer_crud_tasks::task_child_producers;
 
 pub mod task_child_work;
 
 pub(crate) mod task_occurrence_producers;
 
 pub mod execution_observability;
-pub(crate) mod plugin_metadata;
+pub(crate) use pioneer_crud_packages::plugin_metadata;
 pub(crate) mod thread_episodic_search;
 
 pub(crate) mod turn_payload;

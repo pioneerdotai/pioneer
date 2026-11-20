@@ -25,238 +25,251 @@ fn entry(id: &str, sequence: i64) -> context::NewTurnLlmContextEntry {
 
 #[tokio::test]
 async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status() {
-    let store = test_store_with_workspace("ws_task").await;
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-        .await
-        .unwrap();
-    let db = store.database_connection();
-    // No Turn and no Link: publication must retain an obligation even when
-    // neither cross-table dependency exists in the source transaction.
-    let tx = db.begin().await.unwrap();
-    context::insert_turn_llm_context(&tx, entry("late-birth", 1))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let old = point::Entity::find_by_id("late-birth")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    let claim = store
-        .claim_child_point(&old, i64::MAX / 2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(store.finish_child_point(&claim, None, true).await.unwrap());
-    let tx = db.begin().await.unwrap();
-    context::delete_turn_llm_context_for_turn(&tx, "late-birth")
-        .await
-        .unwrap();
-    context::insert_turn_llm_context(&tx, entry("late-birth", 2))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let fresh = point::Entity::find_by_id("late-birth")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(fresh.revision, old.revision);
-    assert!(fresh.next_attempt_at.is_some());
-    assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
-    // Further payload appends do not wake/replace the existing obligation.
-    let tx = db.begin().await.unwrap();
-    context::insert_turn_llm_context(&tx, entry("late-birth", 3))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(
-        point::Entity::find_by_id("late-birth")
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        // No Turn and no Link: publication must retain an obligation even when
+        // neither cross-table dependency exists in the source transaction.
+        let tx = db.begin().await.unwrap();
+        context::insert_turn_llm_context(&tx, entry("late-birth", 1))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let old = point::Entity::find_by_id("late-birth")
             .one(&db)
             .await
             .unwrap()
+            .unwrap();
+        let claim = store
+            .claim_child_point(&old, i64::MAX / 2)
+            .await
             .unwrap()
-            .revision,
-        fresh.revision
-    );
+            .unwrap();
+        assert!(store.finish_child_point(&claim, None, true).await.unwrap());
+        let tx = db.begin().await.unwrap();
+        context::delete_turn_llm_context_for_turn(&tx, "late-birth")
+            .await
+            .unwrap();
+        context::insert_turn_llm_context(&tx, entry("late-birth", 2))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let fresh = point::Entity::find_by_id("late-birth")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(fresh.revision, old.revision);
+        assert!(fresh.next_attempt_at.is_some());
+        assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
+        // Further payload appends do not wake/replace the existing obligation.
+        let tx = db.begin().await.unwrap();
+        context::insert_turn_llm_context(&tx, entry("late-birth", 3))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            point::Entity::find_by_id("late-birth")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            fresh.revision
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn stale_advisory_locator_is_revised_before_no_record_ack() {
-    let store = test_store_with_workspace("ws_task").await;
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+            .await
+            .unwrap();
+        let header = sample_thread("ws_task", "canonical-thread", AT);
+        store
+            .upsert_thread_model(&header, PersistedActorRef::System)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        turn::upsert_turn(
+            &db,
+            "locator-turn",
+            &header.id,
+            &sample_turn("locator-turn"),
+            None,
+            None,
+            unix_to_datetime(AT),
+            unix_to_datetime(AT),
+        )
         .await
         .unwrap();
-    let header = sample_thread("ws_task", "canonical-thread", AT);
-    store
-        .upsert_thread_model(&header, PersistedActorRef::System)
-        .await
-        .unwrap();
-    let db = store.database_connection();
-    turn::upsert_turn(
-        &db,
-        "locator-turn",
-        &header.id,
-        &sample_turn("locator-turn"),
-        None,
-        None,
-        unix_to_datetime(AT),
-        unix_to_datetime(AT),
-    )
-    .await
-    .unwrap();
-    let tx = db.begin().await.unwrap();
-    crate::repositories::task_child_work::enqueue_point(&tx, "stale-thread", "locator-turn", AT)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let candidate = point::Entity::find_by_id("locator-turn")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    let claim = store
-        .claim_child_point(&candidate, AT)
-        .await
-        .unwrap()
-        .unwrap();
-    // A refused conditional repair is an error, never permission for the
-    // caller's no-record ACK. The original lease must remain intact.
-    db.execute_unprepared("CREATE TRIGGER test_ignore_locator_repair BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id='locator-turn' AND NEW.thread_id='canonical-thread' BEGIN SELECT RAISE(IGNORE); END").await.unwrap();
-    assert!(store.child_point_record(&claim).await.is_err());
-    assert_eq!(
-        point::Entity::find_by_id("locator-turn")
+        let tx = db.begin().await.unwrap();
+        crate::repositories::task_child_work::enqueue_point(&tx, "stale-thread", "locator-turn", AT)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let candidate = point::Entity::find_by_id("locator-turn")
             .one(&db)
             .await
             .unwrap()
-            .unwrap(),
-        claim
-    );
-    db.execute_unprepared("DROP TRIGGER test_ignore_locator_repair")
-        .await
-        .unwrap();
-    assert!(store.child_point_record(&claim).await.unwrap().is_none());
-    assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
-    let repaired = point::Entity::find_by_id("locator-turn")
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(repaired.thread_id, header.id);
-    assert_ne!(repaired.revision, claim.revision);
-    assert!(repaired.next_attempt_at.is_some());
-    assert!(repaired.claim_token.is_none());
-    assert_eq!(repaired.attempt_count, 0);
-    assert!(
-        store
-            .discover_child_points(i64::MAX / 4, 32)
+            .unwrap();
+        let claim = store
+            .claim_child_point(&candidate, AT)
             .await
             .unwrap()
-            .iter()
-            .any(|row| row.turn_id == repaired.turn_id && row.revision == repaired.revision)
-    );
+            .unwrap();
+        // A refused conditional repair is an error, never permission for the
+        // caller's no-record ACK. The original lease must remain intact.
+        db.execute_unprepared("CREATE TRIGGER test_ignore_locator_repair BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id='locator-turn' AND NEW.thread_id='canonical-thread' BEGIN SELECT RAISE(IGNORE); END").await.unwrap();
+        assert!(store.child_point_record(&claim).await.is_err());
+        assert_eq!(
+            point::Entity::find_by_id("locator-turn")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            claim
+        );
+        db.execute_unprepared("DROP TRIGGER test_ignore_locator_repair")
+            .await
+            .unwrap();
+        assert!(store.child_point_record(&claim).await.unwrap().is_none());
+        assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
+        let repaired = point::Entity::find_by_id("locator-turn")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.thread_id, header.id);
+        assert_ne!(repaired.revision, claim.revision);
+        assert!(repaired.next_attempt_at.is_some());
+        assert!(repaired.claim_token.is_none());
+        assert_eq!(repaired.attempt_count, 0);
+        assert!(
+            store
+                .discover_child_points(i64::MAX / 4, 32)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.turn_id == repaired.turn_id && row.revision == repaired.revision)
+        );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn old_wrong_locator_claim_cannot_rotate_new_canonical_revision_or_lease() {
-    let store = test_store_with_workspace("ws_task").await;
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-        .await
-        .unwrap();
-    let db = store.database_connection();
-    for id in ["claim-thread-a", "claim-thread-b"] {
-        store
-            .upsert_thread_model(&sample_thread("ws_task", id, AT), PersistedActorRef::System)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
             .await
             .unwrap();
-    }
-    let mut terminal = sample_turn("moved-claim-turn");
-    terminal.status = TurnStatus::Completed;
-    let init = db.begin().await.unwrap();
-    turn::upsert_turn(
-        &init,
-        &terminal.id,
-        "claim-thread-a",
-        &terminal,
-        None,
-        None,
-        unix_to_datetime(AT),
-        unix_to_datetime(AT),
-    )
-    .await
-    .unwrap();
-    init.commit().await.unwrap();
-    let first = point::Entity::find_by_id(&terminal.id)
-        .one(&db)
+        let db = store.database_connection();
+        for id in ["claim-thread-a", "claim-thread-b"] {
+            store
+                .upsert_thread_model(&sample_thread("ws_task", id, AT), PersistedActorRef::System)
+                .await
+                .unwrap();
+        }
+        let mut terminal = sample_turn("moved-claim-turn");
+        terminal.status = TurnStatus::Completed;
+        let init = db.begin().await.unwrap();
+        turn::upsert_turn(
+            &init,
+            &terminal.id,
+            "claim-thread-a",
+            &terminal,
+            None,
+            None,
+            unix_to_datetime(AT),
+            unix_to_datetime(AT),
+        )
         .await
-        .unwrap()
         .unwrap();
-    let old_claim = store
-        .claim_child_point(&first, i64::MAX / 4)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(old_claim.thread_id, "claim-thread-a");
-
-    // A real domain move publishes B while the old consumer still holds A.
-    let moved = db.begin().await.unwrap();
-    turn::upsert_turn(
-        &moved,
-        &terminal.id,
-        "claim-thread-b",
-        &terminal,
-        None,
-        None,
-        unix_to_datetime(AT),
-        unix_to_datetime(AT + 1),
-    )
-    .await
-    .unwrap();
-    moved.commit().await.unwrap();
-    let canonical = point::Entity::find_by_id(&terminal.id)
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    let new_claim = store
-        .claim_child_point(&canonical, i64::MAX / 4)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(new_claim.thread_id, "claim-thread-b");
-    assert_ne!(new_claim.revision, old_claim.revision);
-    assert!(new_claim.claim_token.is_some());
-    assert_ne!(new_claim.claim_token, old_claim.claim_token);
-    assert!(
-        store
-            .child_point_record(&old_claim)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let retained = point::Entity::find_by_id(&terminal.id)
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        retained, new_claim,
-        "old consumer must preserve every field of the newer lease"
-    );
-    assert!(
-        !store
-            .finish_child_point(&old_claim, None, true)
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        point::Entity::find_by_id(&terminal.id)
+        init.commit().await.unwrap();
+        let first = point::Entity::find_by_id(&terminal.id)
             .one(&db)
             .await
             .unwrap()
-            .unwrap(),
-        new_claim
-    );
+            .unwrap();
+        let old_claim = store
+            .claim_child_point(&first, i64::MAX / 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_claim.thread_id, "claim-thread-a");
+
+        // A real domain move publishes B while the old consumer still holds A.
+        let moved = db.begin().await.unwrap();
+        turn::upsert_turn(
+            &moved,
+            &terminal.id,
+            "claim-thread-b",
+            &terminal,
+            None,
+            None,
+            unix_to_datetime(AT),
+            unix_to_datetime(AT + 1),
+        )
+        .await
+        .unwrap();
+        moved.commit().await.unwrap();
+        let canonical = point::Entity::find_by_id(&terminal.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_claim = store
+            .claim_child_point(&canonical, i64::MAX / 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_claim.thread_id, "claim-thread-b");
+        assert_ne!(new_claim.revision, old_claim.revision);
+        assert!(new_claim.claim_token.is_some());
+        assert_ne!(new_claim.claim_token, old_claim.claim_token);
+        assert!(
+            store
+                .child_point_record(&old_claim)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retained = point::Entity::find_by_id(&terminal.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained, new_claim,
+            "old consumer must preserve every field of the newer lease"
+        );
+        assert!(
+            !store
+                .finish_child_point(&old_claim, None, true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            point::Entity::find_by_id(&terminal.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap(),
+            new_claim
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[cfg(feature = "mysql")]
@@ -430,121 +443,130 @@ async fn mysql_rr_late_source_commit_after_other_publication_ack_keeps_ticket() 
 
 #[tokio::test]
 async fn ambiguous_transport_outcome_is_not_replayed() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let store = test_store_with_workspace("ws_task").await;
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-        .await
-        .unwrap();
-    let attempts = AtomicUsize::new(0);
-    let result: anyhow::Result<()> = store
-        .run_serialized_write(|| {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async {
-                Err(
-                    sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(std::sync::Arc::new(
-                        sea_orm::sqlx::Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionReset,
-                            "unknown commit outcome",
-                        )),
-                    )))
-                    .into(),
-                )
-            }
-        })
-        .await;
-    assert!(result.is_err());
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    pioneer_postgres_test::with_database(async |fixture| {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result: anyhow::Result<()> =
+            store
+                .run_serialized_write(|| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Err(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(
+                            std::sync::Arc::new(sea_orm::sqlx::Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "unknown commit outcome",
+                            ))),
+                        ))
+                        .into())
+                    }
+                })
+                .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 #[ignore = "requires disposable provisioned MySQL; closed validation gate"]
 async fn mysql_numeric_timeout_rolls_back_entire_transaction_before_replay() {
-    use sea_orm::sea_query::Expr;
-    use sea_orm::{ConnectionTrait, QuerySelect};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    let db = remote().await;
-    let id = pioneer_protocol::generate_id(21);
-    let row = sample_thread("ws_task", &id, AT);
-    let init = db.begin().await.unwrap();
-    crate::repositories::thread::upsert_thread_with_creator(
-        &init,
-        &row,
-        &PersistedActorRef::System,
-        unix_to_datetime(AT),
-        unix_to_datetime(AT),
-    )
+    pioneer_postgres_test::with_database(async |fixture| {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ConnectionTrait, QuerySelect};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let db = remote().await;
+        let id = pioneer_protocol::generate_id(21);
+        let row = sample_thread("ws_task", &id, AT);
+        let init = db.begin().await.unwrap();
+        crate::repositories::thread::upsert_thread_with_creator(
+            &init,
+            &row,
+            &PersistedActorRef::System,
+            unix_to_datetime(AT),
+            unix_to_datetime(AT),
+        )
+        .await
+        .unwrap();
+        // Keep the context's real Turn on a different Thread from the lock
+        // target, so FK/header locking cannot cause the timeout prematurely.
+        remote_capsule_parent(&init, &id, &pioneer_protocol::generate_id(21)).await;
+        init.commit().await.unwrap();
+        let owner = db.begin().await.unwrap();
+        pioneer_entity::thread::Entity::find_by_id(&id)
+            .lock_exclusive()
+            .one(&owner)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = Arc::new(tokio::sync::Mutex::new(Some(owner)));
+        let attempts = AtomicUsize::new(0);
+        // Use the actual owning retry loop, with real driver errors. Its SQLite
+        // handle only supplies the retry policy; all remote writes own their Tx.
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
+            .await
+            .unwrap();
+        store
+            .run_serialized_write(|| {
+                let owner = owner.clone();
+                let db = &db;
+                let id = &id;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let tx = db
+                        .begin_with_config(Some(sea_orm::IsolationLevel::RepeatableRead), None)
+                        .await?;
+                    tx.execute_unprepared("SET SESSION innodb_lock_wait_timeout = 1")
+                        .await?;
+                    assert!(
+                        pioneer_entity::turn_llm_context::Entity::find()
+                            .filter(pioneer_entity::turn_llm_context::Column::TurnId.eq(id))
+                            .one(&tx)
+                            .await?
+                            .is_none(),
+                        "previous attempt's earlier statements must have rolled back"
+                    );
+                    context::insert_turn_llm_context(&tx, entry(id, 1)).await?;
+                    if attempt == 0 {
+                        let error = pioneer_entity::thread::Entity::update_many()
+                            .filter(pioneer_entity::thread::Column::Id.eq(id))
+                            .col_expr(pioneer_entity::thread::Column::Name, Expr::value("blocked"))
+                            .exec(&tx)
+                            .await
+                            .unwrap_err();
+                        let wrapped: anyhow::Error = error.into();
+                        assert!(crate::repositories::task_child_work::is_transaction_retry(
+                            &wrapped
+                        ));
+                        // MySQL timeout can abort only the statement. Explicit rollback
+                        // here models the required owner teardown before retry.
+                        tx.rollback().await?;
+                        let held = owner.lock().await.take().unwrap();
+                        held.rollback().await?;
+                        return Err(wrapped);
+                    }
+                    tx.commit().await?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        Ok(())
+    })
     .await
     .unwrap();
-    // Keep the context's real Turn on a different Thread from the lock
-    // target, so FK/header locking cannot cause the timeout prematurely.
-    remote_capsule_parent(&init, &id, &pioneer_protocol::generate_id(21)).await;
-    init.commit().await.unwrap();
-    let owner = db.begin().await.unwrap();
-    pioneer_entity::thread::Entity::find_by_id(&id)
-        .lock_exclusive()
-        .one(&owner)
-        .await
-        .unwrap()
-        .unwrap();
-    let owner = Arc::new(tokio::sync::Mutex::new(Some(owner)));
-    let attempts = AtomicUsize::new(0);
-    // Use the actual owning retry loop, with real driver errors. Its SQLite
-    // handle only supplies the retry policy; all remote writes own their Tx.
-    let store = test_store_with_workspace("ws_task").await;
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-        .await
-        .unwrap();
-    store
-        .run_serialized_write(|| {
-            let owner = owner.clone();
-            let db = &db;
-            let id = &id;
-            let attempts = &attempts;
-            async move {
-                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                let tx = db
-                    .begin_with_config(Some(sea_orm::IsolationLevel::RepeatableRead), None)
-                    .await?;
-                tx.execute_unprepared("SET SESSION innodb_lock_wait_timeout = 1")
-                    .await?;
-                assert!(
-                    pioneer_entity::turn_llm_context::Entity::find()
-                        .filter(pioneer_entity::turn_llm_context::Column::TurnId.eq(id))
-                        .one(&tx)
-                        .await?
-                        .is_none(),
-                    "previous attempt's earlier statements must have rolled back"
-                );
-                context::insert_turn_llm_context(&tx, entry(id, 1)).await?;
-                if attempt == 0 {
-                    let error = pioneer_entity::thread::Entity::update_many()
-                        .filter(pioneer_entity::thread::Column::Id.eq(id))
-                        .col_expr(pioneer_entity::thread::Column::Name, Expr::value("blocked"))
-                        .exec(&tx)
-                        .await
-                        .unwrap_err();
-                    let wrapped: anyhow::Error = error.into();
-                    assert!(crate::repositories::task_child_work::is_transaction_retry(
-                        &wrapped
-                    ));
-                    // MySQL timeout can abort only the statement. Explicit rollback
-                    // here models the required owner teardown before retry.
-                    tx.rollback().await?;
-                    let held = owner.lock().await.take().unwrap();
-                    held.rollback().await?;
-                    return Err(wrapped);
-                }
-                tx.commit().await?;
-                Ok(())
-            }
-        })
-        .await
-        .unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(feature = "mysql")]

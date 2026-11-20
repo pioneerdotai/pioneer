@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Assemble Gateway assets from retained inputs; never compile or download."""
 import argparse
-import gzip
 import json
 import os
 from pathlib import Path
@@ -15,6 +14,7 @@ import zipfile
 RUNTIME = runpy.run_path(str(Path(__file__).with_name("runtime-inputs.py")))
 CUA = runpy.run_path(str(Path(__file__).with_name("cua-driver.py")))
 SYMBOLS = Path(__file__).with_name("symbol-inputs.py")
+POSTGRES = runpy.run_path(str(Path(__file__).with_name("postgres-runtime.py")))
 
 
 def package(args):
@@ -25,6 +25,7 @@ def package(args):
     metadata = RUNTIME["read"](args.inputs, args.target, args.variant, [name])
     if args.variant == "computer-use" and args.prepared is None:
         raise ValueError("CU packaging requires --prepared verified CUA inputs")
+    POSTGRES["validate"](args.target, args.postgres)
     args.out.mkdir(parents=True, exist_ok=False)
     assets = args.out / "assets"
     assets.mkdir()
@@ -50,7 +51,8 @@ def package(args):
             # the signing runner's independently selected installation.
             if args.target == "x86_64-apple-darwin":
                 os.environ["PIONEER_ONNXRUNTIME_DYLIB_DIR"] = str(args.inputs.resolve())
-            CUA["package"](args.target, binary, args.prepared, archive, args.notary_log_dir)
+            CUA["package"](args.target, binary, args.prepared, archive, args.notary_log_dir,
+                           postgres=args.postgres)
             CUA["validate_archive"](args.target, archive,
                                      verify_signatures="apple-darwin" in args.target)
             runtime = args.out / "runtime"
@@ -77,19 +79,27 @@ def package(args):
                              gateway_asset=archive.name, gateway_sha256=RUNTIME["digest"](archive))
             packaged_binary = binary
         else:
-            if archive.suffix == ".gz":
-                with binary.open("rb") as source, gzip.open(archive, "wb", compresslevel=9) as destination:
-                    shutil.copyfileobj(source, destination)
-            else:
-                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED,
-                                     compresslevel=9) as destination:
-                    destination.write(binary, binary.name)
-                    if args.target == "x86_64-apple-darwin":
-                        libraries = sorted(args.inputs.glob("libonnxruntime*.dylib"))
-                        if not libraries:
-                            raise ValueError("Gateway Intel ONNX Runtime inputs missing")
-                        for library in libraries:
-                            destination.write(library, library.name)
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED,
+                                 compresslevel=9) as destination:
+                destination.write(binary, binary.name)
+                for path in sorted(args.postgres.rglob("*")):
+                    if path.is_symlink():
+                        raise ValueError("PostgreSQL runtime archive requires regular files")
+                    if path.is_file():
+                        member = Path("cua/postgres") / path.relative_to(args.postgres)
+                        # GitHub artifact transfers flatten Unix modes.
+                        entry = zipfile.ZipInfo.from_file(path, member.as_posix())
+                        if path.parent == args.postgres / "bin":
+                            entry.external_attr = (0o100755 << 16)
+                        entry.compress_type = zipfile.ZIP_DEFLATED
+                        with path.open("rb") as source, destination.open(entry, "w") as output:
+                            shutil.copyfileobj(source, output)
+                if args.target == "x86_64-apple-darwin":
+                    libraries = sorted(args.inputs.glob("libonnxruntime*.dylib"))
+                    if not libraries:
+                        raise ValueError("Gateway Intel ONNX Runtime inputs missing")
+                    for library in libraries:
+                        destination.write(library, library.name)
             packaged_binary = binary
         subprocess.run([sys.executable, str(SYMBOLS), "record", str(packaged_binary),
                         str(symbols / "packaged.json")], check=True)
@@ -106,6 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--asset", required=True)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--prepared", type=Path)
+    parser.add_argument("--postgres", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--notary-log-dir", type=Path, default=Path("notary-logs/gateway"))
     package(parser.parse_args())

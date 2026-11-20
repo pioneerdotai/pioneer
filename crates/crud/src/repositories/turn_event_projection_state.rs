@@ -19,7 +19,7 @@ pub const PROJECTION_STATUS_EXHAUSTED: &str = "exhausted";
 
 const CLAIM_TOKEN_LEN: usize = 21;
 const OBSERVE_PROJECTED_WATERMARK_SQL: &str = r#"
-WITH compaction AS (SELECT ? AS floor),
+WITH compaction AS (SELECT $1::bigint AS floor),
 ordered_events AS (
     SELECT
         event.id,
@@ -28,7 +28,7 @@ ordered_events AS (
         (SELECT floor FROM compaction)
             + ROW_NUMBER() OVER (ORDER BY event.sequence) AS expected_sequence
     FROM turn_event AS event
-    WHERE event.turn_id = ?
+    WHERE event.turn_id = $2
       AND event.sequence > (SELECT floor FROM compaction)
 ),
 evaluated_events AS (
@@ -48,7 +48,7 @@ evaluated_events AS (
 SELECT COALESCE(
     MIN(
         CASE
-            WHEN sequence <> expected_sequence OR has_projected_receipt = 0
+            WHEN sequence <> expected_sequence OR NOT has_projected_receipt
                 THEN expected_sequence - 1
         END
     ),

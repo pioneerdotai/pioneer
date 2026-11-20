@@ -1,0 +1,24 @@
+[package]
+name = "pioneer-crud-access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+pioneer-crud-execution.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+pioneer-postgres-test.workspace = true
+pioneer-sqlite.workspace = true
+tokio.workspace = true

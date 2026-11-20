@@ -10,19 +10,19 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub slug: String,
+    pub localizations_json: String,
     #[sea_orm(column_type = "Text")]
     pub manifest_json: String,
     #[sea_orm(column_type = "Text")]
-    pub localizations_json: String,
+    pub slug: String,
     #[sea_orm(
         belongs_to,
         from = "id",
         to = "id",
         on_update = "NoAction",
-        on_delete = "Restrict"
+        on_delete = "Cascade"
     )]
-    pub package_installation: HasOne<super::package_installation::Entity>,
+    pub package_installation: BelongsTo<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

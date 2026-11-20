@@ -135,34 +135,6 @@ impl MessageProcessor {
             return self.read_thread_tool_output_log(params, protection).await;
         }
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
-        let item_reference = self
-            .crud_store
-            .compaction_tool_item_reference(
-                &params.workspace_id,
-                &params.thread_id,
-                &params.turn_id,
-                &params.item_id,
-            )
-            .await?;
-        let context_reference = self
-            .crud_store
-            .compaction_context_reference_for_item(
-                &params.workspace_id,
-                &params.thread_id,
-                &params.turn_id,
-                &params.item_id,
-                "tool_result_v2",
-            )
-            .await?;
-        let references = item_reference
-            .into_iter()
-            .chain(context_reference)
-            .collect::<Vec<_>>();
-        if !references.is_empty() {
-            self.crud_store
-                .compaction_prepare_references(&params.workspace_id, &params.thread_id, &references)
-                .await?;
-        }
         let fragment = self
             .crud_store
             .compaction_tool_result_fragment(
@@ -476,37 +448,6 @@ impl MessageProcessor {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("tool result source unavailable"))?;
             digest.update(serde_json::to_vec(&value)?);
-            let references = [
-                self.crud_store
-                    .compaction_tool_item_reference(
-                        &target.workspace_id,
-                        &target.thread_id,
-                        &target.turn_id,
-                        &target.item_id,
-                    )
-                    .await?,
-                self.crud_store
-                    .compaction_context_reference_for_item(
-                        &target.workspace_id,
-                        &target.thread_id,
-                        &target.turn_id,
-                        &target.item_id,
-                        "tool_result_v2",
-                    )
-                    .await?,
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            if !references.is_empty() {
-                self.crud_store
-                    .compaction_prepare_references(
-                        &target.workspace_id,
-                        &target.thread_id,
-                        &references,
-                    )
-                    .await?;
-            }
             if !target.output_log {
                 if let Some(fragment) = self
                     .crud_store
@@ -636,7 +577,7 @@ impl MessageProcessor {
             "output cursor is stale"
         );
         let text = serde_json::to_string(&serde_json::json!({
-            "stream": serde_json::from_str::<serde_json::Value>(&first.1.stream)?,
+            "stream": first.1.stream,
             "text": first.1.text,
             "metadata": first.1.metadata.as_ref().map(|m| serde_json::from_str::<serde_json::Value>(m)).transpose()?,
         }))?;

@@ -349,12 +349,9 @@ main() {
     checksums_file="${WORK_DIR}/inputs/SHA256SUMS"
     tag="local-bundle"
   else
-    local asset_suffix="" asset_ext="gz"
+    local asset_suffix="" asset_ext="zip"
     if [[ "$COMPUTER_USE" -eq 1 ]]; then
       asset_suffix="-computer-use-package"
-      asset_ext="zip"
-    elif [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
-      asset_ext="zip"
     fi
     asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.${asset_ext}"
     tag="$(resolve_release_tag)"

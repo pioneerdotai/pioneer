@@ -7,21 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_timeline_block")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub block_id: String,
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: Option<String>,
-    pub block_kind: String,
-    pub sort_key: String,
-    pub source_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_key: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub sort_key: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub block_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     pub started_at: Option<DateTimeWithTimeZone>,
-    pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_kind: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub metadata_json: String,
+    pub completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub block_kind: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

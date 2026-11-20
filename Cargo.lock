@@ -10906,6 +10906,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
 dependencies = [
  "serde",
+ "sqlx",
 ]
 
 [[package]]
@@ -11261,8 +11262,8 @@ dependencies = [
  "image",
  "mime_guess",
  "pioneer-crud",
- "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-provider",
  "pioneer-sqlite",
@@ -11290,7 +11291,6 @@ dependencies = [
  "pioneer-gateway",
  "pioneer-observability",
  "pioneer-protocol",
- "pioneer-tasks",
  "reqwest",
  "serde",
  "serde_json",
@@ -11427,11 +11427,22 @@ dependencies = [
  "hex",
  "pioneer-apps",
  "pioneer-compaction",
+ "pioneer-crud-access",
+ "pioneer-crud-artifacts",
+ "pioneer-crud-compaction",
+ "pioneer-crud-conversations",
+ "pioneer-crud-execution",
+ "pioneer-crud-memory",
+ "pioneer-crud-packages",
+ "pioneer-crud-payloads",
+ "pioneer-crud-self-improvement",
+ "pioneer-crud-tasks",
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
  "pioneer-observability",
  "pioneer-packages",
+ "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-sqlite",
  "sea-orm",
@@ -11444,6 +11455,174 @@ dependencies = [
  "tracing",
  "uuid",
  "zstd 0.14.3",
+]
+
+[[package]]
+name = "pioneer-crud-access"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "pioneer-crud-execution",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
+ "sea-orm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-artifacts"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pioneer-entity",
+ "pioneer-migration",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-compaction"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "pioneer-compaction",
+ "pioneer-crud-payloads",
+ "pioneer-crud-tasks",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "sea-orm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-conversations"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "pioneer-crud-payloads",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-execution"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "pioneer-crud-payloads",
+ "pioneer-entity",
+ "pioneer-hooks",
+ "pioneer-migration",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "sea-orm",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-memory"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-packages"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pioneer-apps",
+ "pioneer-entity",
+ "pioneer-migration",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-payloads"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "uuid",
+ "zstd 0.14.3",
+]
+
+[[package]]
+name = "pioneer-crud-self-improvement"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "sea-orm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-crud-tasks"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "pioneer-crud-access",
+ "pioneer-crud-execution",
+ "pioneer-crud-payloads",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -11748,6 +11927,8 @@ dependencies = [
  "pioneer-observability",
  "pioneer-packages",
  "pioneer-plugins",
+ "pioneer-postgres",
+ "pioneer-postgres-test",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
@@ -11878,8 +12059,8 @@ dependencies = [
  "hex",
  "pioneer-crud",
  "pioneer-hooks",
- "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-test",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-sqlite",
@@ -11917,6 +12098,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pioneer-postgres-test",
  "reqwest",
  "sea-orm",
  "sentry",
@@ -11963,6 +12145,37 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "url",
+]
+
+[[package]]
+name = "pioneer-postgres"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "libc",
+ "pioneer-migration",
+ "process-wrap",
+ "sea-orm",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "pioneer-postgres-test"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "pioneer-migration",
+ "process-wrap",
+ "sea-orm",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -12105,9 +12318,10 @@ dependencies = [
  "chrono-tz",
  "hex",
  "pioneer-crud",
+ "pioneer-crud-payloads",
  "pioneer-entity",
- "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-sqlite",
  "sea-orm",
@@ -12139,6 +12353,7 @@ dependencies = [
  "pioneer-mcp",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-provider",
  "pioneer-skills",
@@ -14354,6 +14569,7 @@ checksum = "546040c653a705e60ec65ecd3191a809603734bebbc225775916dea9ae409b31"
 dependencies = [
  "chrono",
  "ordered-float 4.6.0",
+ "pgvector",
  "rust_decimal",
  "sea-query-derive",
  "serde_json",
@@ -14381,6 +14597,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4eaa419cdb9157da1361186b1959983eb2ea0dcb9a3c69dc45c449ecb2af8fef"
 dependencies = [
+ "pgvector",
  "sea-query",
  "sqlx",
 ]

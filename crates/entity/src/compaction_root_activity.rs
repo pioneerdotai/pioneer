@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_root_activity")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub thread_id: String,
     #[sea_orm(column_type = "Text", unique)]
     pub user_turn_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub thread_id: String,
     pub last_user_activity_ms: i64,
     #[sea_orm(
         belongs_to,
@@ -19,7 +19,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(
         belongs_to,
         from = "user_turn_id",
@@ -27,7 +27,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

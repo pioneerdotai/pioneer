@@ -23,6 +23,10 @@ pub enum HookRunStoreCauseClass {
     SqliteCantOpen,
     SqliteConstraint,
     SqliteOther,
+    PostgresConstraint,
+    PostgresConnection,
+    PostgresContention,
+    PostgresOther,
 }
 
 impl HookRunStoreCauseClass {
@@ -33,6 +37,10 @@ impl HookRunStoreCauseClass {
             Self::SqliteLocked => "sqlite_locked",
             Self::SqliteCantOpen => "sqlite_cantopen",
             Self::SqliteConstraint => "sqlite_constraint",
+            Self::PostgresConstraint => "postgres_constraint",
+            Self::PostgresConnection => "postgres_connection",
+            Self::PostgresContention => "postgres_contention",
+            Self::PostgresOther => "postgres_other",
             Self::SqliteOther => "sqlite_other",
         }
     }

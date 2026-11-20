@@ -6,8 +6,7 @@
 
 use std::path::Path;
 
-use migration::{Migrator, MigratorTrait};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 
 use crate::auth::test_support::{IsolatedAuthRuntime, TEST_GATEWAY_ID, TEST_SUPERUSER_ID};
 use crate::identity::{
@@ -40,32 +39,31 @@ pub(crate) struct IsolatedEpic4Harness {
 }
 
 impl IsolatedEpic4Harness {
-    pub(crate) async fn new() -> anyhow::Result<Self> {
-        Self::populated().await
+    pub(crate) async fn new(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> anyhow::Result<Self> {
+        Self::populated(test_database).await
     }
 
-    pub(crate) async fn empty() -> anyhow::Result<Self> {
-        Self::with_member_foundation(false).await
+    pub(crate) async fn empty(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> anyhow::Result<Self> {
+        Self::with_member_foundation(test_database, false).await
     }
 
-    pub(crate) async fn populated() -> anyhow::Result<Self> {
-        Self::with_member_foundation(true).await
+    pub(crate) async fn populated(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> anyhow::Result<Self> {
+        Self::with_member_foundation(test_database, true).await
     }
 
-    async fn with_member_foundation(populated: bool) -> anyhow::Result<Self> {
-        pioneer_sqlite::search::register_auto_extension_once()?;
+    async fn with_member_foundation(
+        test_database: &pioneer_postgres_test::TestDatabase,
+        populated: bool,
+    ) -> anyhow::Result<Self> {
         let runtime = IsolatedAuthRuntime::new()?;
         runtime.validate()?;
-        let database = Database::connect({
-            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-            options
-                .max_connections(1)
-                .sqlx_logging(false)
-                .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-            options
-        })
-        .await?;
-        Migrator::up(&database, None).await?;
+        let database = test_database.connection().clone();
         if populated {
             materialize_member_auth_foundation(&database).await?;
         }
@@ -110,14 +108,15 @@ async fn materialize_member_auth_foundation(database: &DatabaseConnection) -> an
     let transaction = database.begin().await?;
     let result = transaction
         .execute_unprepared(
-            "INSERT INTO workspace(\
+            "DELETE FROM workspace WHERE id = '000000000000000000000';\
+             INSERT INTO workspace(\
                 id,name,is_active,is_current,created_at,updated_at\
              ) VALUES\
-                ('W00000000000000000001','Epic 4 Red',1,1,\
+                ('W00000000000000000001','Epic 4 Red',TRUE,TRUE,\
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                ('W00000000000000000002','Epic 4 Blue',1,0,\
+                ('W00000000000000000002','Epic 4 Blue',TRUE,FALSE,\
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                ('W00000000000000000003','Epic 4 Green',1,0,\
+                ('W00000000000000000003','Epic 4 Green',TRUE,FALSE,\
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
              INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
@@ -215,30 +214,30 @@ async fn materialize_member_auth_foundation(database: &DatabaseConnection) -> an
                 ('S0000000000000000000A','G00000000000000000001',\
                  'P0000000000000000000A','D0000000000000000000A',\
                  'F0000000000000000000A',NULL,\
-                 X'000000000000000000000000000000000000000000000000000000000000000A',\
-                 X'100000000000000000000000000000000000000000000000000000000000000A',\
-                 0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                 decode('000000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                 decode('100000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                 0,CURRENT_TIMESTAMP + INTERVAL '10 minutes',CURRENT_TIMESTAMP,'active',0,\
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                 datetime('now','+90 days'),NULL,NULL),\
+                 CURRENT_TIMESTAMP + INTERVAL '90 days',NULL,NULL),\
                 ('S0000000000000000000B','G00000000000000000001',\
                  'P0000000000000000000B','D0000000000000000000B',\
                  'F0000000000000000000B',NULL,\
-                 X'000000000000000000000000000000000000000000000000000000000000000B',\
-                 X'100000000000000000000000000000000000000000000000000000000000000B',\
-                 0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                 decode('000000000000000000000000000000000000000000000000000000000000000B','hex'),\
+                 decode('100000000000000000000000000000000000000000000000000000000000000B','hex'),\
+                 0,CURRENT_TIMESTAMP + INTERVAL '10 minutes',CURRENT_TIMESTAMP,'active',0,\
                  CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                 datetime('now','+90 days'),NULL,NULL);\
+                 CURRENT_TIMESTAMP + INTERVAL '90 days',NULL,NULL);\
              INSERT INTO auth_refresh_credential(\
                 id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
              ) VALUES\
                 ('R0000000000000000000A','S0000000000000000000A',\
                  'F0000000000000000000A',0,\
-                 X'200000000000000000000000000000000000000000000000000000000000000A',\
-                 CURRENT_TIMESTAMP,datetime('now','+90 days')),\
+                 decode('200000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '90 days'),\
                 ('R0000000000000000000B','S0000000000000000000B',\
                  'F0000000000000000000B',0,\
-                 X'200000000000000000000000000000000000000000000000000000000000000B',\
-                 CURRENT_TIMESTAMP,datetime('now','+90 days'));",
+                 decode('200000000000000000000000000000000000000000000000000000000000000B','hex'),\
+                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + INTERVAL '90 days');",
         )
         .await;
     match result {
@@ -285,190 +284,208 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_fixture_provides_empty_and_populated_database_states() {
-        let empty = IsolatedEpic4Harness::empty()
-            .await
-            .expect("empty isolated Epic 4 harness");
-        assert_eq!(
-            scalar_i64(
-                &empty.database,
-                "SELECT COUNT(*) AS value FROM gateway_principal"
-            )
-            .await,
-            0
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let empty = IsolatedEpic4Harness::empty(test_database)
+                    .await
+                    .expect("empty isolated Epic 4 harness");
+                assert_eq!(
+                    scalar_i64(
+                        &empty.database,
+                        "SELECT COUNT(*) AS value FROM gateway_principal"
+                    )
+                    .await,
+                    0
+                );
 
-        let populated = IsolatedEpic4Harness::populated()
-            .await
-            .expect("populated isolated Epic 4 harness");
-        assert_eq!(
-            scalar_i64(
-                &populated.database,
-                "SELECT COUNT(*) AS value FROM gateway_principal"
-            )
-            .await,
-            5
-        );
+                let populated = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .expect("populated isolated Epic 4 harness");
+                assert_eq!(
+                    scalar_i64(
+                        &populated.database,
+                        "SELECT COUNT(*) AS value FROM gateway_principal"
+                    )
+                    .await,
+                    5
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn authorization_fixture_uses_only_isolated_runtime_and_database() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated Epic 4 harness");
-        assert!(harness.config_path().is_file());
-        assert!(harness.runtime_home().is_dir());
-        assert_eq!(
-            harness.database_path().parent(),
-            Some(harness.runtime_home())
-        );
-        assert!(!harness.runtime_home().ends_with(".pioneer"));
-        harness
-            .database
-            .ping()
-            .await
-            .expect("in-memory database is isolated and live");
-        assert_eq!(harness.identity.gateway.id.as_str(), TEST_GATEWAY_ID);
-        harness
-            .database
-            .execute_unprepared(
-                "INSERT INTO invitation(\
-                    id,gateway_id,created_by_principal_id,created_by_session_id,target_role_key,status,token_hash,\
-                    token_format_version,expires_at,accepted_at,revoked_at,expired_at,\
-                    accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,\
-                    created_at,updated_at\
-                 ) VALUES\
-                    ('I0000000000000000000A','G00000000000000000001',\
-                     'P0000000000000000000B','S0000000000000000000B','member','accepted',NULL,1,\
-                     datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
-                     'P0000000000000000000A','D0000000000000000000A',\
-                     'S0000000000000000000A',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                    ('I0000000000000000000B','G00000000000000000001',\
-                     'P0000000000000000000A','S0000000000000000000A','member','accepted',NULL,1,\
-                     datetime(CURRENT_TIMESTAMP,'+7 days'),CURRENT_TIMESTAMP,NULL,NULL,\
-                     'P0000000000000000000B','D0000000000000000000B',\
-                     'S0000000000000000000B',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
-                 INSERT INTO invitation_workspace_grant(invitation_id,workspace_id,created_at)\
-                 VALUES\
-                    ('I0000000000000000000A','W00000000000000000001',CURRENT_TIMESTAMP),\
-                    ('I0000000000000000000B','W00000000000000000001',CURRENT_TIMESTAMP)",
-            )
-            .await
-            .expect("seed exact invitation provenance for Member fixture sessions");
-        crate::auth::ensure_auth_readiness(&harness.database, &harness.identity)
-            .await
-            .expect("materialized Member fixture passes auth readiness");
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&harness.database)
-                .await
-                .expect("scan materialized auth fixture")
-                .is_valid()
-        );
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM auth_session WHERE status='active'"
-            )
-            .await,
-            2
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated Epic 4 harness");
+                assert!(harness.config_path().is_file());
+                assert!(harness.runtime_home().is_dir());
+                assert!(harness.database_path().starts_with(harness.runtime_home()));
+                assert!(!harness.runtime_home().ends_with(".pioneer"));
+                harness
+                    .database
+                    .ping()
+                    .await
+                    .expect("PostgreSQL database is isolated and live");
+                assert_eq!(harness.identity.gateway.id.as_str(), TEST_GATEWAY_ID);
+                harness
+                    .database
+                    .execute_unprepared(
+                        "INSERT INTO invitation(\
+                            id,gateway_id,created_by_principal_id,created_by_session_id,target_role_key,status,token_hash,\
+                            token_format_version,expires_at,accepted_at,revoked_at,expired_at,\
+                            accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,\
+                            created_at,updated_at\
+                         ) VALUES\
+                            ('I0000000000000000000A','G00000000000000000001',\
+                             'P0000000000000000000B','S0000000000000000000B','member','accepted',NULL,1,\
+                             CURRENT_TIMESTAMP + INTERVAL '7 days',CURRENT_TIMESTAMP,NULL,NULL,\
+                             'P0000000000000000000A','D0000000000000000000A',\
+                             'S0000000000000000000A',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
+                            ('I0000000000000000000B','G00000000000000000001',\
+                             'P0000000000000000000A','S0000000000000000000A','member','accepted',NULL,1,\
+                             CURRENT_TIMESTAMP + INTERVAL '7 days',CURRENT_TIMESTAMP,NULL,NULL,\
+                             'P0000000000000000000B','D0000000000000000000B',\
+                             'S0000000000000000000B',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
+                         INSERT INTO invitation_workspace_grant(invitation_id,workspace_id,created_at)\
+                         VALUES\
+                            ('I0000000000000000000A','W00000000000000000001',CURRENT_TIMESTAMP),\
+                            ('I0000000000000000000B','W00000000000000000001',CURRENT_TIMESTAMP)",
+                    )
+                    .await
+                    .expect("seed exact invitation provenance for Member fixture sessions");
+                crate::auth::ensure_auth_readiness(&harness.database, &harness.identity)
+                    .await
+                    .expect("materialized Member fixture passes auth readiness");
+                assert!(
+                    pioneer_crud::scan_auth_persistence_invariants(&harness.database)
+                        .await
+                        .expect("scan materialized auth fixture")
+                        .is_valid()
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM auth_session WHERE status='active'"
+                    )
+                    .await,
+                    2
+                );
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn authorization_fixture_materializes_the_complete_cross_principal_acl_matrix() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated Epic 4 harness");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated Epic 4 harness");
 
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM workspace \
-                 WHERE id IN ('W00000000000000000001','W00000000000000000002',\
-                              'W00000000000000000003')"
-            )
-            .await,
-            3
-        );
-        assert_eq!(
-            scalar_string(
-                &harness.database,
-                "SELECT group_concat(workspace_id, ',') AS value FROM (\
-                    SELECT workspace_id FROM workspace_membership \
-                    WHERE principal_id='P0000000000000000000A' ORDER BY workspace_id\
-                 )"
-            )
-            .await,
-            format!("{WORKSPACE_RED_ID},{WORKSPACE_BLUE_ID}")
-        );
-        assert_eq!(
-            scalar_string(
-                &harness.database,
-                "SELECT group_concat(workspace_id, ',') AS value FROM (\
-                    SELECT workspace_id FROM workspace_membership \
-                    WHERE principal_id='P0000000000000000000B' ORDER BY workspace_id\
-                 )"
-            )
-            .await,
-            format!("{WORKSPACE_RED_ID},{WORKSPACE_GREEN_ID}")
-        );
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM workspace_membership \
-                 WHERE principal_id='P00000000000000000001'"
-            )
-            .await,
-            0,
-            "Superuser must not receive synthetic workspace grants"
-        );
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM thread \
-                 WHERE id IN ('T00000000000000000001','T00000000000000000002',\
-                              'T00000000000000000003','T00000000000000000004',\
-                              'T00000000000000000005','T00000000000000000006')"
-            )
-            .await,
-            6
-        );
-        assert_eq!(
-            scalar_string(
-                &harness.database,
-                "SELECT group_concat(access_class, ',') AS value FROM (\
-                    SELECT access_class FROM thread \
-                    WHERE id IN ('T00000000000000000001','T00000000000000000002',\
-                                 'T00000000000000000003','T00000000000000000004',\
-                                 'T00000000000000000005','T00000000000000000006') \
-                    ORDER BY id\
-                 )"
-            )
-            .await,
-            "private,private,workspace,internal,private,private"
-        );
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM thread_membership \
-                 WHERE (thread_id='T00000000000000000001' \
-                        AND principal_id='P0000000000000000000A') \
-                    OR (thread_id='T00000000000000000002' \
-                        AND principal_id='P0000000000000000000B') \
-                    OR (thread_id='T00000000000000000005' \
-                        AND principal_id='P0000000000000000000A') \
-                    OR (thread_id='T00000000000000000006' \
-                        AND principal_id='P0000000000000000000B')"
-            )
-            .await,
-            4
-        );
-        assert_eq!(
-            scalar_i64(
-                &harness.database,
-                "SELECT COUNT(*) AS value FROM pragma_foreign_key_check"
-            )
-            .await,
-            0
-        );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM workspace \
+                         WHERE id IN ('W00000000000000000001','W00000000000000000002',\
+                                      'W00000000000000000003')"
+                    )
+                    .await,
+                    3
+                );
+                assert_eq!(
+                    scalar_string(
+                        &harness.database,
+                        "SELECT group_concat(workspace_id, ',') AS value FROM (\
+                            SELECT workspace_id FROM workspace_membership \
+                            WHERE principal_id='P0000000000000000000A' ORDER BY workspace_id\
+                         )"
+                    )
+                    .await,
+                    format!("{WORKSPACE_RED_ID},{WORKSPACE_BLUE_ID}")
+                );
+                assert_eq!(
+                    scalar_string(
+                        &harness.database,
+                        "SELECT group_concat(workspace_id, ',') AS value FROM (\
+                            SELECT workspace_id FROM workspace_membership \
+                            WHERE principal_id='P0000000000000000000B' ORDER BY workspace_id\
+                         )"
+                    )
+                    .await,
+                    format!("{WORKSPACE_RED_ID},{WORKSPACE_GREEN_ID}")
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM workspace_membership \
+                         WHERE principal_id='P00000000000000000001'"
+                    )
+                    .await,
+                    0,
+                    "Superuser must not receive synthetic workspace grants"
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM thread \
+                         WHERE id IN ('T00000000000000000001','T00000000000000000002',\
+                                      'T00000000000000000003','T00000000000000000004',\
+                                      'T00000000000000000005','T00000000000000000006')"
+                    )
+                    .await,
+                    6
+                );
+                assert_eq!(
+                    scalar_string(
+                        &harness.database,
+                        "SELECT group_concat(access_class, ',') AS value FROM (\
+                            SELECT access_class FROM thread \
+                            WHERE id IN ('T00000000000000000001','T00000000000000000002',\
+                                         'T00000000000000000003','T00000000000000000004',\
+                                         'T00000000000000000005','T00000000000000000006') \
+                            ORDER BY id\
+                         )"
+                    )
+                    .await,
+                    "private,private,workspace,internal,private,private"
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM thread_membership \
+                         WHERE (thread_id='T00000000000000000001' \
+                                AND principal_id='P0000000000000000000A') \
+                            OR (thread_id='T00000000000000000002' \
+                                AND principal_id='P0000000000000000000B') \
+                            OR (thread_id='T00000000000000000005' \
+                                AND principal_id='P0000000000000000000A') \
+                            OR (thread_id='T00000000000000000006' \
+                                AND principal_id='P0000000000000000000B')"
+                    )
+                    .await,
+                    4
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &harness.database,
+                        "SELECT COUNT(*) AS value FROM pragma_foreign_key_check"
+                    )
+                    .await,
+                    0
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

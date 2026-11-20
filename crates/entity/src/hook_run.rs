@@ -7,46 +7,61 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "hook_run")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique)]
-    pub idempotency_key: String,
-    pub subscription_id: String,
-    pub hook_id: String,
-    pub phase: String,
-    pub status: String,
-    pub scope_kind: Option<String>,
-    pub scope_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub task_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub actor_id: Option<String>,
-    pub context_mode: Option<String>,
-    pub attempt_count: i64,
-    pub contribution_count: i64,
-    pub diagnostic_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub contribution_hashes_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub agent_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub diagnostic_previews_json: String,
-    pub error_code: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub error_message_preview: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub phase: String,
+    pub diagnostic_count: i64,
     pub error_retryable: bool,
+    pub deadline_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub contribution_hashes_json: String,
     pub error_safe_for_user: bool,
     #[sea_orm(column_type = "Text")]
     pub metadata_json: String,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    pub queued_at: Option<DateTimeWithTimeZone>,
-    pub started_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
     pub completed_at: Option<DateTimeWithTimeZone>,
-    pub deadline_at: Option<DateTimeWithTimeZone>,
+    pub attempt_count: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub resume_state_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    pub contribution_count: i64,
+    #[sea_orm(column_type = "Text", unique)]
+    pub idempotency_key: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub context_mode: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error_message_preview: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub hook_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub error_code: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub subscription_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub scope_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub scope_id: Option<String>,
+    pub updated_at: DateTimeWithTimeZone,
+    pub started_at: Option<DateTimeWithTimeZone>,
+    pub queued_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

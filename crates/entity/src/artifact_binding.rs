@@ -7,25 +7,38 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_binding")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub artifact_id: String,
-    pub artifact_version_id: Option<String>,
-    pub workspace_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub message_id: Option<String>,
-    pub turn_item_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub task_id: Option<String>,
-    pub task_run_id: Option<String>,
-    pub binding_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub direction: String,
-    pub item_index: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub role: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub artifact_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub binding_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub task_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub metadata_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub task_run_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub message_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub tool_call_id: Option<String>,
+    pub item_index: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub artifact_version_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_item_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

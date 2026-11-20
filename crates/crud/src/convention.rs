@@ -1,14 +1,16 @@
+pub use pioneer_crud_access::turn_execution::{
+    turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
+};
+
 use anyhow::{Context, Result, bail};
-use pioneer_hooks::HookRunStatus;
 use pioneer_protocol::{
     ExecutionWindowExhaustionReason, ExecutionWindowStatus, MemoryActorKind, MemoryCandidateStatus,
     MemoryCategory, MemoryEvidenceClass, MemoryFactClass, MemoryLifecycleActorKind,
     MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
     MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
     NewMemberProfile, PersistedActorRef, PromptManifestProfile, ProviderFailureClass,
-    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, SandboxMode,
-    TaskConcurrencyConflictPolicy, TaskDeliveryAttemptStatus, TaskDeliveryMode, TaskDeliveryStatus,
-    TaskDeliveryThreadTarget, TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
+    TaskConcurrencyConflictPolicy, TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
     TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind,
@@ -47,233 +49,6 @@ pub const RECOVERY_STATUS_EXHAUSTED: &str = "exhausted";
 pub const RECOVERY_STATUS_BLOCKED: &str = "blocked";
 pub const RECOVERY_STATUS_CANCELLED: &str = "cancelled";
 
-pub const MEMORY_NAMESPACE_DEFAULT: &str = "default";
-pub const MEMORY_REPAIR_STATUS_OK: &str = "ok";
-
-pub const MEMORY_EVENT_CREATED: &str = "created";
-pub const MEMORY_EVENT_UPDATED: &str = "updated";
-pub const MEMORY_EVENT_FORGOTTEN: &str = "forgotten";
-pub const MEMORY_EVENT_SUPERSEDED: &str = "superseded";
-pub const MEMORY_EVENT_EXPIRED: &str = "expired";
-pub const MEMORY_EVENT_ACCESSED: &str = "accessed";
-pub const MEMORY_EVENT_REPAIR_STATUS_CHANGED: &str = "repair_status_changed";
-pub const MEMORY_EVENT_QUARANTINED: &str = "quarantined";
-pub const MEMORY_EVENT_RESTORED: &str = "restored";
-pub const MEMORY_EVENT_CANDIDATE_CREATED: &str = "candidate_created";
-pub const MEMORY_EVENT_CANDIDATE_APPROVED: &str = "candidate_approved";
-pub const MEMORY_EVENT_CANDIDATE_REJECTED: &str = "candidate_rejected";
-pub const MEMORY_EVENT_CANDIDATE_EXPIRED: &str = "candidate_expired";
-
-pub const MEMORY_REPAIR_JOB_STATUS_PENDING: &str = "pending";
-pub const MEMORY_REPAIR_JOB_STATUS_RUNNING: &str = "running";
-pub const MEMORY_REPAIR_JOB_STATUS_COMPLETED: &str = "completed";
-pub const MEMORY_REPAIR_JOB_STATUS_FAILED: &str = "failed";
-
-pub const HOOK_RUN_STATUS_QUEUED: &str = "queued";
-pub const HOOK_RUN_STATUS_RUNNING: &str = "running";
-pub const HOOK_RUN_STATUS_SUCCEEDED: &str = "succeeded";
-pub const HOOK_RUN_STATUS_FAILED: &str = "failed";
-pub const HOOK_RUN_STATUS_TIMED_OUT: &str = "timed_out";
-pub const HOOK_RUN_STATUS_SKIPPED: &str = "skipped";
-
-pub fn hook_run_status_to_db(status: HookRunStatus) -> &'static str {
-    match status {
-        HookRunStatus::Queued => HOOK_RUN_STATUS_QUEUED,
-        HookRunStatus::Running => HOOK_RUN_STATUS_RUNNING,
-        HookRunStatus::Succeeded => HOOK_RUN_STATUS_SUCCEEDED,
-        HookRunStatus::Failed => HOOK_RUN_STATUS_FAILED,
-        HookRunStatus::TimedOut => HOOK_RUN_STATUS_TIMED_OUT,
-        HookRunStatus::Skipped => HOOK_RUN_STATUS_SKIPPED,
-    }
-}
-
-pub fn hook_run_status_from_db(value: &str) -> Result<HookRunStatus> {
-    match value {
-        HOOK_RUN_STATUS_QUEUED => Ok(HookRunStatus::Queued),
-        HOOK_RUN_STATUS_RUNNING => Ok(HookRunStatus::Running),
-        HOOK_RUN_STATUS_SUCCEEDED => Ok(HookRunStatus::Succeeded),
-        HOOK_RUN_STATUS_FAILED => Ok(HookRunStatus::Failed),
-        HOOK_RUN_STATUS_TIMED_OUT => Ok(HookRunStatus::TimedOut),
-        HOOK_RUN_STATUS_SKIPPED => Ok(HookRunStatus::Skipped),
-        _ => bail!("unknown hook run status `{value}`"),
-    }
-}
-
-pub fn memory_scope_kind_to_db(kind: MemoryScopeKind) -> &'static str {
-    match kind {
-        MemoryScopeKind::User => "user",
-        MemoryScopeKind::Workspace => "workspace",
-        MemoryScopeKind::Thread => "thread",
-        MemoryScopeKind::Agent => "agent",
-        MemoryScopeKind::Task => "task",
-    }
-}
-
-pub fn memory_scope_kind_from_db(value: &str) -> Result<MemoryScopeKind> {
-    match value {
-        "user" => Ok(MemoryScopeKind::User),
-        "workspace" => Ok(MemoryScopeKind::Workspace),
-        "thread" => Ok(MemoryScopeKind::Thread),
-        "agent" => Ok(MemoryScopeKind::Agent),
-        "task" => Ok(MemoryScopeKind::Task),
-        _ => bail!("unknown memory scope kind `{value}`"),
-    }
-}
-
-pub fn memory_category_to_db(category: MemoryCategory) -> &'static str {
-    match category {
-        MemoryCategory::Identity => "identity",
-        MemoryCategory::Preference => "preference",
-        MemoryCategory::Biography => "biography",
-        MemoryCategory::Relationship => "relationship",
-        MemoryCategory::RecurringInstruction => "recurring_instruction",
-        MemoryCategory::ProjectPolicy => "project_policy",
-        MemoryCategory::ProjectFact => "project_fact",
-        MemoryCategory::ProjectDecision => "project_decision",
-        MemoryCategory::Procedure => "procedure",
-        MemoryCategory::Todo => "todo",
-        MemoryCategory::Constraint => "constraint",
-        MemoryCategory::CommunicationStyle => "communication_style",
-        MemoryCategory::Custom => "custom",
-    }
-}
-
-pub fn memory_category_from_db(value: &str) -> Result<MemoryCategory> {
-    match value {
-        "identity" => Ok(MemoryCategory::Identity),
-        "preference" => Ok(MemoryCategory::Preference),
-        "biography" => Ok(MemoryCategory::Biography),
-        "relationship" => Ok(MemoryCategory::Relationship),
-        "recurring_instruction" => Ok(MemoryCategory::RecurringInstruction),
-        "project_policy" => Ok(MemoryCategory::ProjectPolicy),
-        "project_fact" => Ok(MemoryCategory::ProjectFact),
-        "project_decision" => Ok(MemoryCategory::ProjectDecision),
-        "procedure" => Ok(MemoryCategory::Procedure),
-        "todo" => Ok(MemoryCategory::Todo),
-        "constraint" => Ok(MemoryCategory::Constraint),
-        "communication_style" => Ok(MemoryCategory::CommunicationStyle),
-        "custom" => Ok(MemoryCategory::Custom),
-        _ => bail!("unknown memory category `{value}`"),
-    }
-}
-
-pub fn memory_status_to_db(status: MemoryStatus) -> &'static str {
-    match status {
-        MemoryStatus::Active => "active",
-        MemoryStatus::Superseded => "superseded",
-        MemoryStatus::Deleted => "deleted",
-        MemoryStatus::Expired => "expired",
-    }
-}
-
-pub fn memory_status_from_db(value: &str) -> Result<MemoryStatus> {
-    match value {
-        "active" => Ok(MemoryStatus::Active),
-        "superseded" => Ok(MemoryStatus::Superseded),
-        "deleted" => Ok(MemoryStatus::Deleted),
-        "expired" => Ok(MemoryStatus::Expired),
-        _ => bail!("unknown memory status `{value}`"),
-    }
-}
-
-pub fn memory_sensitivity_to_db(sensitivity: MemorySensitivity) -> &'static str {
-    match sensitivity {
-        MemorySensitivity::Normal => "normal",
-        MemorySensitivity::Personal => "personal",
-        MemorySensitivity::SecretLike => "secret_like",
-        MemorySensitivity::Regulated => "regulated",
-    }
-}
-
-pub fn memory_sensitivity_from_db(value: &str) -> Result<MemorySensitivity> {
-    match value {
-        "normal" => Ok(MemorySensitivity::Normal),
-        "personal" => Ok(MemorySensitivity::Personal),
-        "secret_like" => Ok(MemorySensitivity::SecretLike),
-        "regulated" => Ok(MemorySensitivity::Regulated),
-        _ => bail!("unknown memory sensitivity `{value}`"),
-    }
-}
-
-pub fn memory_source_context_kind_to_db(kind: MemorySourceContextKind) -> &'static str {
-    match kind {
-        MemorySourceContextKind::DirectUserConversation => "direct_user_conversation",
-        MemorySourceContextKind::AssistantResponse => "assistant_response",
-        MemorySourceContextKind::ToolResult => "tool_result",
-        MemorySourceContextKind::TaskRuntime => "task_runtime",
-        MemorySourceContextKind::SystemRuntime => "system_runtime",
-        MemorySourceContextKind::DeveloperInstruction => "developer_instruction",
-        MemorySourceContextKind::ConnectorContent => "connector_content",
-        MemorySourceContextKind::ImportedDocument => "imported_document",
-        MemorySourceContextKind::GeneratedSummary => "generated_summary",
-        MemorySourceContextKind::Unknown => "unknown",
-    }
-}
-
-pub fn memory_source_context_kind_from_db(value: &str) -> MemorySourceContextKind {
-    match value {
-        "direct_user_conversation" => MemorySourceContextKind::DirectUserConversation,
-        "assistant_response" => MemorySourceContextKind::AssistantResponse,
-        "tool_result" => MemorySourceContextKind::ToolResult,
-        "task_runtime" => MemorySourceContextKind::TaskRuntime,
-        "system_runtime" => MemorySourceContextKind::SystemRuntime,
-        "developer_instruction" => MemorySourceContextKind::DeveloperInstruction,
-        "connector_content" => MemorySourceContextKind::ConnectorContent,
-        "imported_document" => MemorySourceContextKind::ImportedDocument,
-        "generated_summary" => MemorySourceContextKind::GeneratedSummary,
-        "unknown" => MemorySourceContextKind::Unknown,
-        _ => MemorySourceContextKind::Unknown,
-    }
-}
-
-pub fn memory_quality_action_to_db(action: MemoryQualityAction) -> String {
-    enum_to_snake_string(action)
-}
-
-pub fn memory_quality_action_from_db(value: &str) -> Result<MemoryQualityAction> {
-    enum_from_snake_string(value, "memory quality action")
-}
-
-pub fn memory_fact_class_to_db(fact_class: MemoryFactClass) -> String {
-    enum_to_snake_string(fact_class)
-}
-
-pub fn memory_fact_class_from_db(value: &str) -> Result<MemoryFactClass> {
-    enum_from_snake_string(value, "memory fact class")
-}
-
-pub fn memory_lifetime_class_to_db(lifetime_class: MemoryLifetimeClass) -> String {
-    enum_to_snake_string(lifetime_class)
-}
-
-pub fn memory_lifetime_class_from_db(value: &str) -> Result<MemoryLifetimeClass> {
-    enum_from_snake_string(value, "memory lifetime class")
-}
-
-pub fn memory_ownership_class_to_db(ownership_class: MemoryOwnershipClass) -> String {
-    enum_to_snake_string(ownership_class)
-}
-
-pub fn memory_ownership_class_from_db(value: &str) -> Result<MemoryOwnershipClass> {
-    enum_from_snake_string(value, "memory ownership class")
-}
-
-pub fn memory_evidence_class_to_db(evidence_class: MemoryEvidenceClass) -> String {
-    enum_to_snake_string(evidence_class)
-}
-
-pub fn memory_evidence_class_from_db(value: &str) -> Result<MemoryEvidenceClass> {
-    enum_from_snake_string(value, "memory evidence class")
-}
-
-pub fn memory_write_relation_to_db(relation: MemoryWriteRelation) -> String {
-    enum_to_snake_string(relation)
-}
-
-pub fn memory_write_relation_from_db(value: &str) -> Result<MemoryWriteRelation> {
-    enum_from_snake_string(value, "memory write relation")
-}
-
 fn enum_to_snake_string<T: Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .ok()
@@ -286,86 +61,7 @@ fn enum_from_snake_string<T: DeserializeOwned>(value: &str, type_name: &str) -> 
         .map_err(|err| anyhow::anyhow!("unknown {type_name} `{value}`: {err}"))
 }
 
-pub fn memory_actor_kind_to_db(kind: MemoryActorKind) -> &'static str {
-    match kind {
-        MemoryActorKind::User => "user",
-        MemoryActorKind::Assistant => "assistant",
-        MemoryActorKind::Extractor => "extractor",
-        MemoryActorKind::System => "system",
-        MemoryActorKind::Tool => "tool",
-    }
-}
-
-pub fn memory_actor_kind_from_db(value: &str) -> Result<MemoryActorKind> {
-    match value {
-        "user" => Ok(MemoryActorKind::User),
-        "assistant" => Ok(MemoryActorKind::Assistant),
-        "extractor" => Ok(MemoryActorKind::Extractor),
-        "system" => Ok(MemoryActorKind::System),
-        "tool" => Ok(MemoryActorKind::Tool),
-        _ => bail!("unknown memory actor kind `{value}`"),
-    }
-}
-
-pub fn memory_lifecycle_actor_kind_to_db(kind: MemoryLifecycleActorKind) -> String {
-    enum_to_snake_string(kind)
-}
-
-pub fn memory_lifecycle_actor_kind_from_db(value: &str) -> Result<MemoryLifecycleActorKind> {
-    enum_from_snake_string(value, "memory lifecycle actor kind")
-}
-
-pub fn memory_lifecycle_reason_code_to_db(reason: MemoryLifecycleReasonCode) -> String {
-    enum_to_snake_string(reason)
-}
-
-pub fn memory_lifecycle_reason_code_from_db(value: &str) -> Result<MemoryLifecycleReasonCode> {
-    // Preserve historical audit/quarantine records without exposing an obsolete
-    // engine-specific reason in the current product protocol.
-    if value == "memvid_stale_vector" {
-        return Ok(MemoryLifecycleReasonCode::StaleEmbeddingProjection);
-    }
-    enum_from_snake_string(value, "memory lifecycle reason code")
-}
-
-pub fn memory_candidate_status_to_db(status: MemoryCandidateStatus) -> &'static str {
-    match status {
-        MemoryCandidateStatus::Pending => "pending",
-        MemoryCandidateStatus::PendingSilent => "pending_silent",
-        MemoryCandidateStatus::AskOnUse => "ask_on_use",
-        MemoryCandidateStatus::NeedsReview => "needs_review",
-        MemoryCandidateStatus::Approved => "approved",
-        MemoryCandidateStatus::Rejected => "rejected",
-        MemoryCandidateStatus::AutoRejected => "auto_rejected",
-        MemoryCandidateStatus::ReviewDisabledRejected => "review_disabled_rejected",
-        MemoryCandidateStatus::Superseded => "superseded",
-        MemoryCandidateStatus::MergedDuplicate => "merged_duplicate",
-        MemoryCandidateStatus::Expired => "expired",
-    }
-}
-
-pub fn memory_candidate_status_from_db(value: &str) -> Result<MemoryCandidateStatus> {
-    match value {
-        "pending" => Ok(MemoryCandidateStatus::Pending),
-        "pending_silent" => Ok(MemoryCandidateStatus::PendingSilent),
-        "ask_on_use" => Ok(MemoryCandidateStatus::AskOnUse),
-        "needs_review" => Ok(MemoryCandidateStatus::NeedsReview),
-        "approved" => Ok(MemoryCandidateStatus::Approved),
-        "rejected" => Ok(MemoryCandidateStatus::Rejected),
-        "auto_rejected" => Ok(MemoryCandidateStatus::AutoRejected),
-        "review_disabled_rejected" => Ok(MemoryCandidateStatus::ReviewDisabledRejected),
-        "superseded" => Ok(MemoryCandidateStatus::Superseded),
-        "merged_duplicate" => Ok(MemoryCandidateStatus::MergedDuplicate),
-        "expired" => Ok(MemoryCandidateStatus::Expired),
-        _ => bail!("unknown memory candidate status `{value}`"),
-    }
-}
-
-pub fn sandbox_mode_to_db(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::FullAccess => "full_access",
-    }
-}
+pub use pioneer_crud_access::policy::sandbox_mode_to_db;
 
 pub fn thread_mode_to_db(mode: ThreadMode) -> &'static str {
     match mode {
@@ -597,142 +293,22 @@ pub fn is_terminal_task_status_db(status: &str) -> bool {
     task_status_from_db(status).is_some_and(TaskStatus::is_terminal)
 }
 
-pub fn task_trigger_kind_to_db(kind: TaskTriggerKind) -> &'static str {
-    match kind {
-        TaskTriggerKind::Immediate => "immediate",
-        TaskTriggerKind::ScheduledAt => "scheduled_at",
-        TaskTriggerKind::Interval => "interval",
-        TaskTriggerKind::Cron => "cron",
-        TaskTriggerKind::Manual => "manual",
-        TaskTriggerKind::External => "external",
-        TaskTriggerKind::Dependency => "dependency",
-    }
-}
+pub use pioneer_crud_tasks::status::{task_run_status_from_db, task_run_status_to_db};
 
-pub fn task_trigger_kind_from_db(value: &str) -> Option<TaskTriggerKind> {
-    match value {
-        "immediate" => Some(TaskTriggerKind::Immediate),
-        "scheduled_at" => Some(TaskTriggerKind::ScheduledAt),
-        "interval" => Some(TaskTriggerKind::Interval),
-        "cron" => Some(TaskTriggerKind::Cron),
-        "manual" => Some(TaskTriggerKind::Manual),
-        "external" => Some(TaskTriggerKind::External),
-        "dependency" => Some(TaskTriggerKind::Dependency),
-        _ => None,
-    }
-}
-
-pub fn task_trigger_status_to_db(status: TaskTriggerStatus) -> &'static str {
-    match status {
-        TaskTriggerStatus::Active => "active",
-        TaskTriggerStatus::Paused => "paused",
-        TaskTriggerStatus::Exhausted => "exhausted",
-        TaskTriggerStatus::Cancelled => "cancelled",
-    }
-}
-
-pub fn task_trigger_status_from_db(value: &str) -> Option<TaskTriggerStatus> {
-    match value {
-        "active" => Some(TaskTriggerStatus::Active),
-        "paused" => Some(TaskTriggerStatus::Paused),
-        "exhausted" => Some(TaskTriggerStatus::Exhausted),
-        "cancelled" => Some(TaskTriggerStatus::Cancelled),
-        _ => None,
-    }
-}
-
-pub fn task_executor_kind_to_db(kind: TaskExecutorKind) -> &'static str {
-    match kind {
-        TaskExecutorKind::Agent => "agent",
-        TaskExecutorKind::Tool => "tool",
-        TaskExecutorKind::Workflow => "workflow",
-        TaskExecutorKind::Webhook => "webhook",
-        TaskExecutorKind::System => "system",
-    }
-}
-
-pub fn task_executor_kind_from_db(value: &str) -> Option<TaskExecutorKind> {
-    match value {
-        "agent" => Some(TaskExecutorKind::Agent),
-        "tool" => Some(TaskExecutorKind::Tool),
-        "workflow" => Some(TaskExecutorKind::Workflow),
-        "webhook" => Some(TaskExecutorKind::Webhook),
-        "system" => Some(TaskExecutorKind::System),
-        _ => None,
-    }
-}
-
-pub fn task_run_status_to_db(status: TaskRunStatus) -> &'static str {
-    match status {
-        TaskRunStatus::Queued => "queued",
-        TaskRunStatus::Starting => "starting",
-        TaskRunStatus::Running => "running",
-        TaskRunStatus::Waiting => "waiting",
-        TaskRunStatus::WaitingReview => "waiting_review",
-        TaskRunStatus::Succeeded => "succeeded",
-        TaskRunStatus::Failed => "failed",
-        TaskRunStatus::Blocked => "blocked",
-        TaskRunStatus::Cancelled => "cancelled",
-        TaskRunStatus::TimedOut => "timed_out",
-    }
-}
-
-pub fn task_run_status_from_db(value: &str) -> Option<TaskRunStatus> {
-    match value {
-        "queued" => Some(TaskRunStatus::Queued),
-        "starting" => Some(TaskRunStatus::Starting),
-        "running" => Some(TaskRunStatus::Running),
-        "waiting" => Some(TaskRunStatus::Waiting),
-        "waiting_review" => Some(TaskRunStatus::WaitingReview),
-        "succeeded" => Some(TaskRunStatus::Succeeded),
-        "failed" => Some(TaskRunStatus::Failed),
-        "blocked" => Some(TaskRunStatus::Blocked),
-        "cancelled" => Some(TaskRunStatus::Cancelled),
-        "timed_out" => Some(TaskRunStatus::TimedOut),
-        _ => None,
-    }
-}
-
-pub fn is_terminal_task_run_status(status: TaskRunStatus) -> bool {
-    status.is_terminal()
-}
+pub use pioneer_crud_tasks::status::{
+    is_terminal_task_run_status, task_executor_kind_from_db, task_executor_kind_to_db,
+    task_trigger_kind_from_db, task_trigger_kind_to_db, task_trigger_status_from_db,
+    task_trigger_status_to_db,
+};
 
 pub fn is_terminal_task_run_status_db(status: &str) -> bool {
     task_run_status_from_db(status).is_some_and(TaskRunStatus::is_terminal)
 }
 
-pub fn task_run_execution_status_to_db(status: TaskRunExecutionStatus) -> &'static str {
-    match status {
-        TaskRunExecutionStatus::Reserved => "reserved",
-        TaskRunExecutionStatus::Starting => "starting",
-        TaskRunExecutionStatus::Running => "running",
-        TaskRunExecutionStatus::WaitingReview => "waiting_review",
-        TaskRunExecutionStatus::Succeeded => "succeeded",
-        TaskRunExecutionStatus::Failed => "failed",
-        TaskRunExecutionStatus::Blocked => "blocked",
-        TaskRunExecutionStatus::Cancelled => "cancelled",
-        TaskRunExecutionStatus::TimedOut => "timed_out",
-    }
-}
-
-pub fn task_run_execution_status_from_db(value: &str) -> Option<TaskRunExecutionStatus> {
-    match value {
-        "reserved" => Some(TaskRunExecutionStatus::Reserved),
-        "starting" => Some(TaskRunExecutionStatus::Starting),
-        "running" => Some(TaskRunExecutionStatus::Running),
-        "waiting_review" => Some(TaskRunExecutionStatus::WaitingReview),
-        "succeeded" => Some(TaskRunExecutionStatus::Succeeded),
-        "failed" => Some(TaskRunExecutionStatus::Failed),
-        "blocked" => Some(TaskRunExecutionStatus::Blocked),
-        "cancelled" => Some(TaskRunExecutionStatus::Cancelled),
-        "timed_out" => Some(TaskRunExecutionStatus::TimedOut),
-        _ => None,
-    }
-}
-
-pub fn is_terminal_task_run_execution_status(status: TaskRunExecutionStatus) -> bool {
-    status.is_terminal()
-}
+pub use pioneer_crud_tasks::status::{
+    is_terminal_task_run_execution_status, task_run_execution_status_from_db,
+    task_run_execution_status_to_db,
+};
 
 pub fn execution_window_status_to_db(status: ExecutionWindowStatus) -> String {
     enum_to_snake_string(status)
@@ -808,65 +384,6 @@ pub fn task_result_review_decision_from_db(value: &str) -> Result<TaskResultRevi
     enum_from_snake_string(value, "task result review decision")
 }
 
-pub fn task_delivery_mode_to_db(mode: TaskDeliveryMode) -> &'static str {
-    match mode {
-        TaskDeliveryMode::None => "none",
-        TaskDeliveryMode::Thread => "thread",
-        TaskDeliveryMode::UserNotification => "user_notification",
-        TaskDeliveryMode::Webhook => "webhook",
-    }
-}
-
-pub fn task_delivery_mode_from_db(value: &str) -> Option<TaskDeliveryMode> {
-    match value {
-        "none" => Some(TaskDeliveryMode::None),
-        "thread" => Some(TaskDeliveryMode::Thread),
-        "user_notification" => Some(TaskDeliveryMode::UserNotification),
-        "webhook" => Some(TaskDeliveryMode::Webhook),
-        _ => None,
-    }
-}
-
-pub fn task_delivery_thread_target_to_db(target: TaskDeliveryThreadTarget) -> &'static str {
-    match target {
-        TaskDeliveryThreadTarget::OriginThread => "origin_thread",
-        TaskDeliveryThreadTarget::CurrentThread => "current_thread",
-        TaskDeliveryThreadTarget::CollaborationRoot => "collaboration_root",
-        TaskDeliveryThreadTarget::ExactThread => "exact_thread",
-    }
-}
-
-pub fn task_delivery_thread_target_from_db(value: &str) -> Option<TaskDeliveryThreadTarget> {
-    match value {
-        "origin_thread" => Some(TaskDeliveryThreadTarget::OriginThread),
-        "current_thread" => Some(TaskDeliveryThreadTarget::CurrentThread),
-        "collaboration_root" => Some(TaskDeliveryThreadTarget::CollaborationRoot),
-        "exact_thread" => Some(TaskDeliveryThreadTarget::ExactThread),
-        _ => None,
-    }
-}
-
-pub fn task_delivery_status_to_db(status: TaskDeliveryStatus) -> &'static str {
-    match status {
-        TaskDeliveryStatus::Pending => "pending",
-        TaskDeliveryStatus::Delivering => "delivering",
-        TaskDeliveryStatus::Delivered => "delivered",
-        TaskDeliveryStatus::Failed => "failed",
-        TaskDeliveryStatus::Cancelled => "cancelled",
-    }
-}
-
-pub fn task_delivery_status_from_db(value: &str) -> Option<TaskDeliveryStatus> {
-    match value {
-        "pending" => Some(TaskDeliveryStatus::Pending),
-        "delivering" => Some(TaskDeliveryStatus::Delivering),
-        "delivered" => Some(TaskDeliveryStatus::Delivered),
-        "failed" => Some(TaskDeliveryStatus::Failed),
-        "cancelled" => Some(TaskDeliveryStatus::Cancelled),
-        _ => None,
-    }
-}
-
 pub fn task_concurrency_conflict_policy_to_db(
     policy: TaskConcurrencyConflictPolicy,
 ) -> &'static str {
@@ -928,23 +445,6 @@ pub fn task_write_lock_status_from_db(value: &str) -> Option<TaskWriteLockStatus
     }
 }
 
-pub fn task_delivery_attempt_status_to_db(status: TaskDeliveryAttemptStatus) -> &'static str {
-    match status {
-        TaskDeliveryAttemptStatus::Started => "started",
-        TaskDeliveryAttemptStatus::Delivered => "delivered",
-        TaskDeliveryAttemptStatus::Failed => "failed",
-    }
-}
-
-pub fn task_delivery_attempt_status_from_db(value: &str) -> Option<TaskDeliveryAttemptStatus> {
-    match value {
-        "started" => Some(TaskDeliveryAttemptStatus::Started),
-        "delivered" => Some(TaskDeliveryAttemptStatus::Delivered),
-        "failed" => Some(TaskDeliveryAttemptStatus::Failed),
-        _ => None,
-    }
-}
-
 pub fn task_owner_kind_to_db(kind: TaskOwnerKind) -> &'static str {
     match kind {
         TaskOwnerKind::User => "user",
@@ -974,29 +474,10 @@ pub fn turn_status_to_db(status: TurnStatus) -> &'static str {
     }
 }
 
-pub fn turn_status_from_db(value: &str) -> Option<TurnStatus> {
-    match value {
-        "in_progress" => Some(TurnStatus::InProgress),
-        "completed" => Some(TurnStatus::Completed),
-        "failed" => Some(TurnStatus::Failed),
-        "interrupted" => Some(TurnStatus::Interrupted),
-        "blocked" => Some(TurnStatus::Blocked),
-        _ => None,
-    }
-}
-
 pub fn turn_kind_to_db(kind: pioneer_protocol::TurnKind) -> &'static str {
     match kind {
         pioneer_protocol::TurnKind::Conversation => "conversation",
         pioneer_protocol::TurnKind::TaskRun => "task_run",
-    }
-}
-
-pub fn turn_kind_from_db(value: &str) -> Option<pioneer_protocol::TurnKind> {
-    match value {
-        "conversation" => Some(pioneer_protocol::TurnKind::Conversation),
-        "task_run" => Some(pioneer_protocol::TurnKind::TaskRun),
-        _ => None,
     }
 }
 
@@ -1007,17 +488,6 @@ pub fn turn_origin_to_db(origin: pioneer_protocol::TurnOrigin) -> &'static str {
         pioneer_protocol::TurnOrigin::DetachedTask => "detached_task",
         pioneer_protocol::TurnOrigin::AttachedTask => "attached_task",
         pioneer_protocol::TurnOrigin::TaskDelivery => "task_delivery",
-    }
-}
-
-pub fn turn_origin_from_db(value: &str) -> Option<pioneer_protocol::TurnOrigin> {
-    match value {
-        "user" => Some(pioneer_protocol::TurnOrigin::User),
-        "scheduled_task" => Some(pioneer_protocol::TurnOrigin::ScheduledTask),
-        "detached_task" => Some(pioneer_protocol::TurnOrigin::DetachedTask),
-        "attached_task" => Some(pioneer_protocol::TurnOrigin::AttachedTask),
-        "task_delivery" => Some(pioneer_protocol::TurnOrigin::TaskDelivery),
-        _ => None,
     }
 }
 
@@ -1079,22 +549,7 @@ pub fn turn_item_type_to_db(item_type: TurnItemType) -> &'static str {
     }
 }
 
-pub fn turn_item_type_from_db(value: &str) -> Option<TurnItemType> {
-    match value {
-        "user_message" => Some(TurnItemType::UserMessage),
-        "agent_message" => Some(TurnItemType::AgentMessage),
-        "reasoning" => Some(TurnItemType::Reasoning),
-        "system_event" => Some(TurnItemType::SystemEvent),
-        "task" => Some(TurnItemType::Task),
-        "command_execution" => Some(TurnItemType::CommandExecution),
-        "file_change" => Some(TurnItemType::FileChange),
-        "web_search" => Some(TurnItemType::WebSearch),
-        "web_fetch" => Some(TurnItemType::WebFetch),
-        "download" => Some(TurnItemType::Download),
-        "dynamic_tool_call" => Some(TurnItemType::DynamicToolCall),
-        _ => None,
-    }
-}
+pub use pioneer_crud_conversations::turn_item::turn_item_type_from_db;
 
 pub fn turn_item_execution_class_to_db(execution_class: TurnItemExecutionClass) -> &'static str {
     match execution_class {
@@ -1462,3 +917,10 @@ pub fn input_type_and_text(item: &UserInput) -> (&'static str, Option<String>) {
         UserInput::Mention { .. } => ("mention", None),
     }
 }
+
+pub use pioneer_crud_tasks::delivery::{
+    task_delivery_attempt_status_from_db, task_delivery_attempt_status_to_db,
+    task_delivery_mode_from_db, task_delivery_mode_to_db, task_delivery_status_from_db,
+    task_delivery_status_to_db, task_delivery_thread_target_from_db,
+    task_delivery_thread_target_to_db,
+};

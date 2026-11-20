@@ -9,18 +9,18 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub plugin_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub position: i64,
     #[sea_orm(column_type = "Text")]
     pub keyword: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub position: i64,
     #[sea_orm(
         belongs_to,
         from = "plugin_id",
         to = "id",
         on_update = "NoAction",
-        on_delete = "Restrict"
+        on_delete = "Cascade"
     )]
-    pub package_installation: HasOne<super::package_installation::Entity>,
+    pub package_installation: BelongsTo<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

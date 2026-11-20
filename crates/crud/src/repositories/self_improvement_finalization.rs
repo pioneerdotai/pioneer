@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use pioneer_entity::{
-    agent_skill, agent_skill_version, self_improvement_run, self_improvement_source_turn,
-    self_improvement_workspace_state, thread, turn,
+use pioneer_crud_self_improvement::source_history::{
+    PreparedSourceTurnCheck, prepare_source_turn_check,
 };
-use pioneer_protocol::{ThreadSidebarVisibility, TurnKind, TurnOrigin, TurnStatus};
+use pioneer_entity::{
+    agent_skill, agent_skill_version, self_improvement_run, self_improvement_workspace_state,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Alias, Cond, Expr, ExprTrait, Func, JoinType, Query};
+use sea_orm::sea_query::{Expr, JoinType};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QueryFilter,
-    QuerySelect, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect,
 };
 
 use super::agent_skill::{
@@ -20,7 +20,6 @@ use super::agent_skill::{
     apply_update_in_caller_transaction, prepare_agent_skill_version,
 };
 use super::self_improvement_run::STATUS_COMPLETED;
-use super::self_improvement_source_turn::{source_access_classes, source_origins};
 use crate::{
     AcceptedAgentSkillCreate, FinalizeSelfImprovementRunInput, FinalizeSelfImprovementRunResult,
     SelfImprovementFinalOutcome, SelfImprovementFinalizationConflict,
@@ -65,31 +64,6 @@ enum PreparedFinalOutcome {
     NoChange {
         summary: String,
     },
-}
-
-#[derive(Clone)]
-struct PreparedSourceTurnCheck {
-    source_lower_exclusive: i64,
-    source_upper_inclusive: i64,
-    expected_count: i64,
-    statement: Statement,
-}
-
-impl PreparedSourceTurnCheck {
-    async fn matches<C: ConnectionTrait>(self, db: &C) -> Result<bool> {
-        let row = db
-            .query_one_raw(self.statement)
-            .await
-            .context("failed to verify cited Agent skill source provenance")?
-            .context("Agent skill source provenance query returned no aggregate row")?;
-        let matched_count: i64 = row
-            .try_get("", "matched_count")
-            .context("failed to decode cited Agent skill source count")?;
-        let new_anchor_count: i64 = row
-            .try_get("", "new_anchor_count")
-            .context("failed to decode cited Agent skill new-anchor count")?;
-        Ok(matched_count == self.expected_count && new_anchor_count > 0)
-    }
 }
 
 pub async fn prepare<C: ConnectionTrait>(
@@ -452,89 +426,6 @@ fn validate_source_turn_ids(source_turn_ids: &[String]) -> Result<()> {
         bail!("accepted Agent skill source turn identities must be distinct");
     }
     Ok(())
-}
-
-fn prepare_source_turn_check(
-    workspace_id: &str,
-    source_turn_ids: &[String],
-    frozen_bounds: Option<(i64, i64)>,
-) -> Result<Option<PreparedSourceTurnCheck>> {
-    let Some((source_lower_exclusive, source_upper_inclusive)) = frozen_bounds else {
-        return Ok(None);
-    };
-    let expected_count = i64::try_from(source_turn_ids.len())
-        .context("accepted Agent skill source turn count exceeds durable integer range")?;
-    let new_anchor = Cond::all()
-        .add(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
-        .add(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
-        .add(super::self_improvement_source_turn::processed_source_predicate().not());
-    let query = Query::select()
-        .expr_as(
-            Func::count(Expr::col((
-                self_improvement_source_turn::Entity,
-                self_improvement_source_turn::Column::Id,
-            ))),
-            Alias::new("matched_count"),
-        )
-        .expr_as(
-            Func::coalesce([
-                Expr::from(Func::sum(Expr::case(new_anchor, 1).finally(0))),
-                Expr::val(0),
-            ]),
-            Alias::new("new_anchor_count"),
-        )
-        .from(self_improvement_source_turn::Entity)
-        .join(
-            JoinType::InnerJoin,
-            turn::Entity,
-            Cond::all()
-                .add(Expr::col((turn::Entity, turn::Column::Id)).equals((
-                    self_improvement_source_turn::Entity,
-                    self_improvement_source_turn::Column::TurnId,
-                )))
-                .add(Expr::col((turn::Entity, turn::Column::ThreadId)).equals((
-                    self_improvement_source_turn::Entity,
-                    self_improvement_source_turn::Column::ThreadId,
-                ))),
-        )
-        .join(
-            JoinType::InnerJoin,
-            thread::Entity,
-            Cond::all()
-                .add(
-                    Expr::col((thread::Entity, thread::Column::Id))
-                        .equals((turn::Entity, turn::Column::ThreadId)),
-                )
-                .add(
-                    Expr::col((thread::Entity, thread::Column::WorkspaceId)).equals((
-                        self_improvement_source_turn::Entity,
-                        self_improvement_source_turn::Column::WorkspaceId,
-                    )),
-                ),
-        )
-        .and_where(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
-        .and_where(
-            self_improvement_source_turn::Column::TurnId.is_in(source_turn_ids.iter().cloned()),
-        )
-        .and_where(
-            turn::Column::Status.eq(crate::convention::turn_status_to_db(TurnStatus::Completed)),
-        )
-        .and_where(
-            turn::Column::TurnKind.eq(crate::convention::turn_kind_to_db(TurnKind::Conversation)),
-        )
-        .and_where(turn::Column::Origin.eq(crate::convention::turn_origin_to_db(TurnOrigin::User)))
-        .and_where(thread::Column::AccessClass.is_in(source_access_classes()))
-        .and_where(thread::Column::SidebarVisibility.eq(
-            crate::convention::thread_sidebar_visibility_to_db(ThreadSidebarVisibility::Visible),
-        ))
-        .and_where(thread::Column::OriginKind.is_in(source_origins()))
-        .to_owned();
-    Ok(Some(PreparedSourceTurnCheck {
-        source_lower_exclusive,
-        source_upper_inclusive,
-        expected_count,
-        statement: DatabaseBackend::Sqlite.build(&query),
-    }))
 }
 
 fn applied_summary(candidate_key: &str, source_turn_count: usize) -> Result<String> {

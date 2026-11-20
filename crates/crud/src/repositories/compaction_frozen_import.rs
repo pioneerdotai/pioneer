@@ -328,7 +328,7 @@ pub(crate) async fn compaction_prepare_frozen_import(
         )
         .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(output_ordinal)?))
         .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-            .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
+            .filter(Expr::cust("octet_length(compaction_frozen_message.reference_json)=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
         .into_tuple::<String>()
         .one(&store.connection)
         .await?
@@ -737,9 +737,7 @@ async fn prepare_accepted_import(
             .select_only()
             .column(compaction_frozen_import::Column::ProofJson)
             .filter(compaction_frozen_import::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-            .filter(Expr::cust(
-                "length(CAST(proof_json AS BLOB))=bytes AND bytes>=0",
-            ))
+            .filter(Expr::cust("octet_length(proof_json)=bytes AND bytes>=0"))
             .into_tuple::<String>()
             .one(&store.connection)
             .await?
@@ -925,30 +923,29 @@ JOIN thread_lineage lineage
 JOIN thread child
   ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id
 JOIN compaction_frozen_history h
-  ON h.id=?
+  ON h.id=$1
  AND h.owner_thread=snapshot.conversation_thread_id
  AND h.workspace_id=snapshot.workspace_id
 JOIN compaction_frozen_import i
-  ON i.manifest_id=h.id AND i.ordinal=?
-WHERE execution.thread_id=?
-  AND execution.turn_id=?
-  AND snapshot.workspace_id=?
-  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=?)
+  ON i.manifest_id=h.id AND i.ordinal=$2
+WHERE execution.thread_id=$3
+  AND execution.turn_id=$4
+  AND snapshot.workspace_id=$5
+  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=$6)
     OR (snapshot.history_json_payload_id IS NOT NULL AND EXISTS (
-      SELECT 1 FROM portable_payload original
+      SELECT 1 FROM portable_payload_value original
       WHERE original.id=snapshot.history_json_payload_id
-        AND original.family='task.history' AND original.retired=0
-        AND original.sha256=? AND original.original_bytes=?
+        AND original.sha256=$7 AND original.original_bytes=$8
     )))
   AND h.ready=1 AND h.expired=0
   AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND i.ordinal>=0 AND i.ordinal<h.import_count
   AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
-  AND h.identity_sha256=?
+  AND h.identity_sha256=$9
   AND h.next_import=h.import_count
-  AND i.proof_json=?
-  AND h.imports_sha256=?
-  AND h.import_count=?
+  AND i.proof_json=$10
+  AND h.imports_sha256=$11
+  AND h.import_count=$12
 LIMIT 1
 "#;
 
@@ -965,30 +962,29 @@ JOIN thread_lineage lineage
 JOIN thread child
   ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id
 JOIN compaction_frozen_history h
-  ON h.id=?
+  ON h.id=$1
  AND h.owner_thread=snapshot.conversation_thread_id
  AND h.workspace_id=snapshot.workspace_id
 JOIN compaction_frozen_import i
-  ON i.manifest_id=h.id AND i.ordinal=?
-WHERE execution.thread_id=?
-  AND execution.turn_id=?
-  AND snapshot.workspace_id=?
-  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=?)
+  ON i.manifest_id=h.id AND i.ordinal=$2
+WHERE execution.thread_id=$3
+  AND execution.turn_id=$4
+  AND snapshot.workspace_id=$5
+  AND ((snapshot.history_json_payload_id IS NULL AND snapshot.history_json=$6)
     OR (snapshot.history_json_payload_id IS NOT NULL AND EXISTS (
-      SELECT 1 FROM portable_payload original
+      SELECT 1 FROM portable_payload_value original
       WHERE original.id=snapshot.history_json_payload_id
-        AND original.family='task.history' AND original.retired=0
-        AND original.sha256=? AND original.original_bytes=?
+        AND original.sha256=$7 AND original.original_bytes=$8
     )))
   AND h.ready=1 AND h.expired=0
   AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND i.ordinal>=0 AND i.ordinal<h.import_count
   AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
-  AND h.identity_sha256=?
+  AND h.identity_sha256=$9
   AND h.next_import=h.import_count
-  AND i.proof_json=?
-  AND h.imports_sha256=?
-  AND h.import_count=?
+  AND i.proof_json=$10
+  AND h.imports_sha256=$11
+  AND h.import_count=$12
   AND (
     EXISTS (
       SELECT 1
@@ -1080,7 +1076,7 @@ WHERE execution.thread_id=?
         ON basis_thread.id=basis.conversation_thread_id
        AND basis_thread.workspace_id=basis.workspace_id
       LEFT JOIN compaction_task_basis_revision revision ON revision.run_id=basis.run_id
-      WHERE substr(ltrim(basis.history_json),1,1)='['
+      WHERE basis.history_json_payload_id IS NOT NULL
         AND basis.workspace_id=h.workspace_id
         AND basis.conversation_thread_id=i.source_thread
         AND 'task-basis:'||basis.run_id=i.source_scope
@@ -1099,7 +1095,10 @@ fn accepted_import_current_statement(
         .accepted_basis
         .as_ref()
         .expect("accepted import proof");
-    Ok(sqlite_specific_sql(
+    // The set predicate mirrors the checked frozen-source view and compares
+    // the original digest rather than decoding a body inside publication.
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Postgres,
         sql,
         [
             basis.manifest.clone().into(),
@@ -1146,7 +1145,7 @@ pub(crate) async fn compaction_append_frozen_imports(
             .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
             .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(*message)?))
             .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-            .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
+            .filter(Expr::cust("octet_length(compaction_frozen_message.reference_json)=compaction_frozen_message.bytes AND compaction_frozen_message.bytes>=0"))
             .into_tuple::<String>()
             .one(&store.connection)
             .await?
@@ -1715,12 +1714,10 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
         .await?
     {
         crate::frozen_lifetime::logical_bounds(&h)?;
-        if let Some(layout) = pioneer_entity::compaction_frozen_layout::Entity::find_by_id((
-            manifest.to_owned(),
-            1_i64,
-        ))
-        .one(db)
-        .await?
+        if let Some(layout) =
+            pioneer_crud_compaction::frozen::find_layout(manifest.to_owned(), 1_i64)
+                .one(db)
+                .await?
         {
             ensure!(layout.failed == 0, "invalid frozen layout state");
         }
@@ -1765,7 +1762,7 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
         .select_only()
         .column(compaction_frozen_import::Column::ProofJson)
         .filter(compaction_frozen_import::Column::Ordinal.lt(i64::try_from(end)?))
-        .filter(Expr::cust("length(CAST(compaction_frozen_import.proof_json AS BLOB))=compaction_frozen_import.bytes AND compaction_frozen_import.bytes BETWEEN 0 AND 262144"))
+        .filter(Expr::cust("octet_length(compaction_frozen_import.proof_json)=compaction_frozen_import.bytes AND compaction_frozen_import.bytes BETWEEN 0 AND 262144"))
         .order_by_asc(compaction_frozen_import::Column::Ordinal)
         .into_tuple::<String>()
         .all(db)

@@ -225,24 +225,23 @@ fn validate_task_record(record: &pioneer_crud::ActiveTaskExecutionAuthorityRecor
 
 #[cfg(test)]
 mod tests {
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::CrudStore;
     use pioneer_protocol::{
         SandboxMode, TaskStatus, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnStatus, default_turn_permission_profile_snapshot,
     };
-    use sea_orm::{Database, EntityTrait, Set};
+    use pioneer_sqlite::SqliteDatabase;
+    use sea_orm::{ConnectionTrait, EntityTrait, Set};
 
     use super::{QUARANTINE_REASON, run_with_batch_size};
 
     #[tokio::test]
     async fn startup_gate_scans_every_page_and_quarantines_every_invalid_binding() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |database| {
+        let connection = database.connection();
+        connection
+            .execute_unprepared("UPDATE workspace SET is_current = false WHERE is_current")
+            .await?;
         let now = chrono::Utc::now().fixed_offset();
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
             id: Set("workspace_authority_integrity".to_owned()),
@@ -252,11 +251,14 @@ mod tests {
             created_at: Set(now),
             updated_at: Set(now),
         })
-        .exec(&connection)
+        .exec(connection)
         .await
         .expect("workspace should insert");
 
-        let store = CrudStore::new(connection);
+        let store = CrudStore::new(SqliteDatabase::new(
+            database.connect_read_only().await?,
+            connection.clone(),
+        ));
         crate::session::test_support::ensure_test_superuser_execution_authority(&store).await;
         let principal = crate::session::test_support::authenticated_test_superuser();
         let thread_id = "thread_authority_integrity";
@@ -338,7 +340,16 @@ mod tests {
             store
                 .set_turn_execution_authorization_context("turn-authority-c", "{not-json")
                 .await
-                .expect("corrupt authority should persist for integrity test")
+                .is_err()
+        );
+        // PostgreSQL validates JSON syntax. The integrity gate must also validate
+        // the shape and authority of a syntactically valid persisted envelope.
+        let invalid_envelope = "[]";
+        assert!(
+            store
+                .set_turn_execution_authorization_context("turn-authority-c", invalid_envelope)
+                .await
+                .expect("invalid envelope should persist for integrity test")
         );
         let mut unsupported: serde_json::Value =
             serde_json::from_str(&valid_json).expect("valid authority value");
@@ -411,7 +422,6 @@ mod tests {
                 .expect("unknown-actor authority should persist for integrity test")
         );
 
-        use sea_orm::ConnectionTrait;
         store
             .database_connection()
             .execute_unprepared(
@@ -458,7 +468,7 @@ mod tests {
             (
                 "task-authority-c",
                 principal.principal_id.as_str(),
-                "{not-json",
+                invalid_envelope,
             ),
             (
                 "task-authority-d",
@@ -538,5 +548,7 @@ mod tests {
                 Some("execution_authority_integrity")
             );
         }
+        Ok(())
+        }).await.unwrap();
     }
 }

@@ -1,22 +1,19 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{
-    thread, thread_episodic_embedding_artifacts, thread_episodic_exclusions,
-    thread_episodic_index_jobs, thread_episodic_items, thread_episodic_recall_events,
-    thread_episodic_thread_directory, turn, turn_event,
+    thread, thread_episodic_exclusions, thread_episodic_index_jobs, thread_episodic_items,
+    thread_episodic_recall_events, thread_episodic_thread_directory, turn, turn_event,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set,
 };
 use std::collections::HashSet;
-use std::mem::size_of;
 
 use crate::convention::DB_ID_LEN;
 use crate::thread_episodic::{
-    NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicExclusionRecord,
-    NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+    NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
     THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR,
     THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
@@ -54,7 +51,7 @@ pub async fn upsert_item_by_source_identity<C: ConnectionTrait>(
         .id
         .clone()
         .unwrap_or_else(|| pioneer_protocol::generate_id(DB_ID_LEN));
-    let source_context_json = serde_json::to_string(&item.source_context)
+    let source_context_json = serde_json::to_value(item.source_context)
         .context("failed to serialize thread episodic item source context")?;
 
     thread_episodic_items::Entity::insert(thread_episodic_items::ActiveModel {
@@ -692,143 +689,10 @@ pub async fn retire_source_occurrence<C: ConnectionTrait>(
     })
 }
 
-pub async fn find_embedding_artifact_by_id<C: ConnectionTrait>(
-    db: &C,
-    artifact_id: &str,
-) -> Result<Option<thread_episodic_embedding_artifacts::Model>> {
-    thread_episodic_embedding_artifacts::Entity::find_by_id(artifact_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| {
-            format!("failed to find thread episodic embedding artifact `{artifact_id}`")
-        })
-}
-
-#[derive(Clone)]
-pub(crate) struct PreparedEmbeddingArtifact {
-    id: String,
-    model: thread_episodic_embedding_artifacts::ActiveModel,
-    identity: (String, String, String, String, String, i64, bool),
-}
-
-/// Validate and encode the SQLite representation before writer admission. The
-/// identity is immutable; a conflicting insert is checked against the durable
-/// row without accepting a different workspace/model under the same cache key.
-pub(crate) fn prepare_embedding_artifact(
-    artifact: NewThreadEpisodicEmbeddingArtifactRecord,
-    now: DateTimeWithTimeZone,
-) -> Result<PreparedEmbeddingArtifact> {
-    anyhow::ensure!(
-        artifact.dimension > 0
-            && artifact.vector.len() == artifact.dimension
-            && artifact.vector.iter().all(|value| value.is_finite())
-            && artifact.vector.iter().any(|value| *value != 0.0),
-        "invalid embedding artifact vector"
-    );
-    let dimension = i64::try_from(artifact.dimension)
-        .context("thread episodic embedding dimension exceeds i64")?;
-    let vector_bytes = encode_embedding_vector(&artifact.vector);
-    let identity = (
-        artifact.workspace_id.clone(),
-        artifact.pipeline_identity_hash.clone(),
-        artifact.input_hash.clone(),
-        artifact.provider_id.clone(),
-        artifact.model.clone(),
-        dimension,
-        artifact.normalized,
-    );
-    let id = artifact.id.clone();
-    let model = thread_episodic_embedding_artifacts::ActiveModel {
-        id: Set(artifact.id),
-        workspace_id: Set(artifact.workspace_id),
-        pipeline_identity_hash: Set(artifact.pipeline_identity_hash),
-        input_hash: Set(artifact.input_hash),
-        provider_id: Set(artifact.provider_id),
-        model: Set(artifact.model),
-        dimension: Set(dimension),
-        normalized: Set(artifact.normalized),
-        vector_bytes: Set(vector_bytes),
-        created_at: Set(now),
-        last_used_at: Set(now),
-    };
-    Ok(PreparedEmbeddingArtifact {
-        id,
-        model,
-        identity,
-    })
-}
-
-pub(crate) async fn insert_embedding_artifact_if_absent<C: ConnectionTrait>(
-    db: &C,
-    artifact: PreparedEmbeddingArtifact,
-) -> Result<thread_episodic_embedding_artifacts::Model> {
-    let PreparedEmbeddingArtifact {
-        id,
-        model,
-        identity,
-    } = artifact;
-    thread_episodic_embedding_artifacts::Entity::insert(model)
-        .on_conflict(
-            OnConflict::column(thread_episodic_embedding_artifacts::Column::Id)
-                .do_nothing()
-                .to_owned(),
-        )
-        .try_insert()
-        .exec(db)
-        .await
-        .context("failed to insert thread episodic embedding artifact")?;
-    let row = find_embedding_artifact_by_id(db, &id)
-        .await?
-        .context("thread episodic embedding artifact missing after insert")?;
-    anyhow::ensure!(
-        (
-            &row.workspace_id,
-            &row.pipeline_identity_hash,
-            &row.input_hash,
-            &row.provider_id,
-            &row.model,
-            row.dimension,
-            row.normalized
-        ) == (
-            &identity.0,
-            &identity.1,
-            &identity.2,
-            &identity.3,
-            &identity.4,
-            identity.5,
-            identity.6
-        ),
-        "embedding artifact identity conflict"
-    );
-    Ok(row)
-}
-
-pub async fn touch_embedding_artifact<C: ConnectionTrait>(
-    db: &C,
-    artifact_id: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<thread_episodic_embedding_artifacts::Model>> {
-    let Some(row) = find_embedding_artifact_by_id(db, artifact_id).await? else {
-        return Ok(None);
-    };
-    let mut active = row.into_active_model();
-    active.last_used_at = Set(now);
-    active
-        .update(db)
-        .await
-        .with_context(|| {
-            format!("failed to touch thread episodic embedding artifact `{artifact_id}`")
-        })
-        .map(Some)
-}
-
-fn encode_embedding_vector(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len().saturating_mul(size_of::<f32>()));
-    for value in vector {
-        bytes.extend_from_slice(value.to_le_bytes().as_slice());
-    }
-    bytes
-}
+pub(crate) use pioneer_crud_memory::episodic_embeddings::{
+    find_embedding_artifact_by_id, insert_embedding_artifact_if_absent, prepare_embedding_artifact,
+    touch_embedding_artifact,
+};
 
 pub async fn find_item_by_source_identity<C: ConnectionTrait>(
     db: &C,
@@ -1337,6 +1201,7 @@ pub async fn search_source_batch(
     Vec<(
         thread_episodic_items::Model,
         pioneer_entity::turn_item::Model,
+        String,
         Option<String>,
     )>,
 > {
@@ -1397,20 +1262,20 @@ pub async fn search_source_batch(
                 .add(turn_item::Column::ItemId.eq(item.item_id.clone())),
         );
     }
-    let canonical = super::turn_payload::items(db, turn_item::Entity::find().filter(sources))
+    let canonical = super::turn_payload::exact_items(db, turn_item::Entity::find().filter(sources))
         .await?
         .into_iter()
-        .map(|row| ((row.turn_id.clone(), row.item_id.clone()), row))
+        .map(|(row, text)| ((row.turn_id.clone(), row.item_id.clone()), (row, text)))
         .collect::<std::collections::HashMap<_, _>>();
     // Different indexed versions can refer to the same canonical source.
     Ok(items
         .into_iter()
         .filter_map(|item| {
-            let source = canonical
+            let (source, text) = canonical
                 .get(&(item.turn_id.clone(), item.item_id.clone()))?
                 .clone();
             let title = threads.get(&item.thread_id)?.clone();
-            Some((item, source, title))
+            Some((item, source, text, title))
         })
         .collect())
 }
@@ -1905,7 +1770,7 @@ pub async fn unfinished_index_job_exists_for_workspace<C: ConnectionTrait>(
 
 // Running rows are recovery candidates, never dispatch receipts. Gateway must
 // hold exclusive workspace ownership before its exact-attempt settlement.
-// SQLite row-value seek is bounded both by a page and the fixed round end.
+// The row-value seek is bounded both by a page and the fixed round end.
 // Appends beyond that end cannot postpone revisiting an earlier busy job.
 pub async fn list_due_index_jobs_after<C: ConnectionTrait>(
     db: &C,
@@ -1914,32 +1779,33 @@ pub async fn list_due_index_jobs_after<C: ConnectionTrait>(
     through: Option<&crate::ThreadEpisodicIndexJobRecord>,
     limit: u64,
 ) -> Result<Vec<thread_episodic_index_jobs::Model>> {
-    let mut sql = "SELECT * FROM thread_episodic_index_jobs WHERE status IN ('queued','failed','running') AND next_run_at <= ?".to_owned();
-    let mut values: Vec<sea_orm::Value> = vec![now.into()];
+    use thread_episodic_index_jobs::Column as F;
+    let cursor_key = || {
+        Expr::tuple([
+            Expr::col(F::NextRunAt),
+            Expr::col(F::CreatedAt),
+            Expr::col(F::Id),
+        ])
+    };
+    let cursor_values = |row: &crate::ThreadEpisodicIndexJobRecord| {
+        Expr::tuple([
+            Expr::val(row.next_run_at),
+            Expr::val(row.created_at),
+            Expr::val(&row.id),
+        ])
+    };
+    let mut query = runnable_index_jobs(now);
     if let Some(after) = after {
-        sql.push_str(" AND (next_run_at, created_at, id) > (?, ?, ?)");
-        values.extend([
-            after.next_run_at.into(),
-            after.created_at.into(),
-            after.id.clone().into(),
-        ]);
+        query = query.filter(cursor_key().gt(cursor_values(after)));
     }
     if let Some(through) = through {
-        sql.push_str(" AND (next_run_at, created_at, id) <= (?, ?, ?)");
-        values.extend([
-            through.next_run_at.into(),
-            through.created_at.into(),
-            through.id.clone().into(),
-        ]);
+        query = query.filter(cursor_key().lte(cursor_values(through)));
     }
-    sql.push_str(" ORDER BY next_run_at, created_at, id LIMIT ?");
-    values.push(limit.into());
-    thread_episodic_index_jobs::Entity::find()
-        .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            sql,
-            values,
-        ))
+    query
+        .order_by_asc(F::NextRunAt)
+        .order_by_asc(F::CreatedAt)
+        .order_by_asc(F::Id)
+        .limit(limit)
         .all(db)
         .await
         .context("failed to discover bounded episodic runnable jobs")
@@ -1949,10 +1815,22 @@ pub async fn discovery_round_end<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
 ) -> Result<Option<thread_episodic_index_jobs::Model>> {
+    use thread_episodic_index_jobs::Column as F;
+    runnable_index_jobs(now)
+        .order_by_desc(F::NextRunAt)
+        .order_by_desc(F::CreatedAt)
+        .order_by_desc(F::Id)
+        .one(db)
+        .await
+        .context("failed to read episodic discovery round end")
+}
+
+fn runnable_index_jobs(
+    now: DateTimeWithTimeZone,
+) -> sea_orm::Select<thread_episodic_index_jobs::Entity> {
     thread_episodic_index_jobs::Entity::find()
-        .from_raw_sql(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-            "SELECT * FROM thread_episodic_index_jobs WHERE status IN ('queued','failed','running') AND next_run_at <= ? ORDER BY next_run_at DESC, created_at DESC, id DESC LIMIT 1", [now.into()]))
-        .one(db).await.context("failed to read episodic discovery round end")
+        .filter(Expr::cust("status IN ('queued','failed','running')"))
+        .filter(thread_episodic_index_jobs::Column::NextRunAt.lte(now))
 }
 
 pub async fn next_scheduled_index_job_at<C: ConnectionTrait>(
@@ -3148,10 +3026,18 @@ pub async fn insert_recall_event<C: ConnectionTrait>(
         thread_id: Set(event.thread_id),
         turn_id: Set(event.turn_id),
         query_hash: Set(event.query_hash),
-        search_profile_json: Set(event.search_profile_json),
+        search_profile_json: Set(event
+            .search_profile_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?),
         search_mode: Set(event.search_mode),
         adaptive_strategy: Set(event.adaptive_strategy),
-        cutoff_json: Set(event.cutoff_json),
+        cutoff_json: Set(event
+            .cutoff_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?),
         candidate_count: Set(event.candidate_count),
         returned_count: Set(event.returned_count),
         latency_ms: Set(event.latency_ms),

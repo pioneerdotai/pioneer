@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_read_cursor")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub principal_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub last_read_sort_key: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub principal_id: String,
+    #[sea_orm(column_type = "Text")]
     pub last_read_turn_id: String,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(
         belongs_to,
         from = "principal_id",
@@ -21,7 +23,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal: BelongsTo<super::gateway_principal::Entity>,
     #[sea_orm(
         belongs_to,
         from = "thread_id",
@@ -29,7 +31,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(
         belongs_to,
         from = "last_read_turn_id",
@@ -37,7 +39,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

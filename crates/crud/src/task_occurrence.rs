@@ -25,35 +25,13 @@ impl CrudStore {
         &self,
         now: i64,
     ) -> Result<Vec<TaskOccurrenceReconcileCandidate>> {
-        let discovery = self
-            .discover_task_occurrence_reconcile_with_audit(now)
-            .await?;
-        if let Some(error) = discovery.audit_error {
-            return Err(error);
-        }
-        Ok(discovery.candidates)
-    }
-
-    pub async fn discover_task_occurrence_reconcile_with_audit(
-        &self,
-        now: i64,
-    ) -> Result<OccurrenceReconcileDiscovery<TaskOccurrenceReconcileCandidate>> {
         let maintenance = self.with_maintenance_access();
-        let audit_error = maintenance
-            .audit_legacy_occurrence_producers(true)
-            .await
-            .err();
-        // Independent durable tickets remain serviceable after an audit error.
-        let candidates = queue::discover(
+        queue::discover(
             &maintenance.connection,
             now,
             queue::TASK_OCCURRENCE_RUN_QUOTA,
         )
-        .await?;
-        Ok(OccurrenceReconcileDiscovery {
-            candidates,
-            audit_error,
-        })
+        .await
     }
 
     pub async fn has_pending_task_occurrence_reconcile(&self) -> Result<bool> {

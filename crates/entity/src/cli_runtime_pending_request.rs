@@ -7,42 +7,49 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "cli_runtime_pending_request")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub request_id: String,
-    pub runtime_id: String,
-    pub runtime_kind: String,
-    pub workspace_id: String,
-    pub thread_id: String,
-    pub turn_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub native_thread_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub native_turn_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub native_item_id: Option<String>,
-    pub request_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub response_json: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
+    pub initiating_session_generation: Option<i64>,
+    pub delivery_attempts: i64,
     pub updated_at: DateTimeWithTimeZone,
-    pub resolved_at: Option<DateTimeWithTimeZone>,
+    pub response_json: Option<Json>,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub responding_principal_id: Option<String>,
+    pub payload_json: Json,
     #[sea_orm(column_type = "Text", nullable)]
     pub initiating_principal_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub initiating_session_id: Option<String>,
-    pub initiating_session_generation: Option<i64>,
+    #[sea_orm(column_type = "Text")]
+    pub request_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub runtime_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub authorization_context_fingerprint: Option<String>,
-    pub responding_principal_id: Option<String>,
-    pub responding_session_id: Option<String>,
-    pub response_authorization_revision: Option<i64>,
-    pub delivery_attempts: i64,
+    pub response_contains_secret: bool,
     #[sea_orm(column_type = "Text", nullable)]
     pub delivery_error: Option<String>,
-    pub response_contains_secret: bool,
+    #[sea_orm(column_type = "Text")]
+    pub runtime_kind: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_thread_id: Option<String>,
+    pub resolved_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    pub response_authorization_revision: Option<i64>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub request_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub responding_session_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub native_turn_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

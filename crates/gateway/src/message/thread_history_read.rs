@@ -102,7 +102,7 @@ impl MessageProcessor {
             let state: HistoryCursor = serde_json::from_value(cursor)
                 .map_err(|_| anyhow::anyhow!("invalid history cursor"))?;
             ensure!(
-                state.version == 3
+                state.version == 4
                     && state.workspace_id == workspace_id
                     && state.thread_id == thread_id
                     && state.limit == limit
@@ -118,12 +118,9 @@ impl MessageProcessor {
             );
             state
         } else {
-            let snapshot = self.crud_store.saved_history_snapshot(thread_id).await?;
-            let newest = self
-                .crud_store
-                .saved_history_page_at_snapshot(thread_id, None, None, 1, &snapshot)
-                .await?;
-            let Some(newest) = newest.first() else {
+            let Some((snapshot, boundary, revision)) =
+                self.crud_store.saved_history_start(thread_id).await?
+            else {
                 ensure!(anchor.is_none(), "history source unavailable");
                 return Ok(SavedHistoryPage {
                     events: Vec::new(),
@@ -133,11 +130,6 @@ impl MessageProcessor {
                     newer_cursor: None,
                 });
             };
-            // Capture the logical revision before resolving/reading the anchor.
-            let revision = self
-                .crud_store
-                .saved_history_revision_at_snapshot(thread_id, &newest.key, &snapshot)
-                .await?;
             let mut position = None;
             if let Some(anchor) = anchor {
                 let row = self
@@ -162,7 +154,7 @@ impl MessageProcessor {
                     .crud_store
                     .saved_history_page_direction_at_snapshot(
                         thread_id,
-                        Some(&newest.key),
+                        Some(&boundary),
                         Some(&row.key),
                         false,
                         direction == ThreadHistoryDirection::Older,
@@ -177,11 +169,11 @@ impl MessageProcessor {
                 });
             }
             HistoryCursor {
-                version: 3,
+                version: 4,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 limit,
-                boundary: newest.key.clone(),
+                boundary,
                 snapshot,
                 revision,
                 direction,

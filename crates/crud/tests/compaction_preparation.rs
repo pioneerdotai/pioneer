@@ -1,7 +1,8 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::CrudStore;
+use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -21,7 +22,10 @@ impl SqliteWriteObserver for WriteCounter {
 async fn scalar(store: &CrudStore, sql: &str) -> i64 {
     store
         .database_connection()
-        .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql))
+        .query_one_raw(Statement::from_string(
+            store.database_connection().get_database_backend(),
+            sql,
+        ))
         .await
         .unwrap()
         .unwrap()
@@ -652,57 +656,83 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
     }
 }
 
-#[tokio::test]
-async fn tool_output_chunks_are_scoped_ordered_and_idempotent() {
-    let store = fixture(false).await;
-    let mut n = pioneer_protocol::ItemDeltaNotification {
-        workspace_id: "ws".into(),
-        thread_id: "thread".into(),
-        turn_id: "turn".into(),
-        item_id: "command".into(),
-        delta: "same text\n".into(),
-        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-        payload: None,
-        markdown: None,
-        markdown_version: None,
-    };
-    store.record_tool_output("chunk-a", &n).await.unwrap();
-    store.record_tool_output("chunk-a", &n).await.unwrap();
-    store.record_tool_output("chunk-b", &n).await.unwrap();
-    n.stream = Some(pioneer_protocol::ItemDeltaStream::Stderr);
-    n.delta = "failure detail".into();
-    store.record_tool_output("chunk-c", &n).await.unwrap();
-    assert!(store.record_tool_output("chunk-a", &n).await.is_err());
-    n.thread_id = "other".into();
-    assert!(store.record_tool_output("bad", &n).await.is_err());
-    let reopened = CrudStore::new(store.database_connection());
-    let rows = reopened
-        .tool_output_page("ws", "thread", "turn", "command", 0)
+async fn postgres_store(database: &TestDatabase) -> CrudStore {
+    let writer = database.connection();
+    writer
+        .execute_unprepared(
+            "INSERT INTO workspace(id,name) VALUES ('ws','Compaction fixtures');
+         INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,access_class)
+         VALUES ('thread','ws','','agent','model','provider','active','workspace'),
+                ('other','ws','','agent','model','provider','active','workspace');
+         INSERT INTO turn(id,thread_id,status) VALUES ('turn','thread','completed'),
+                ('other-turn','other','completed');",
+        )
         .await
         .unwrap();
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].1.text, "same text\n");
-    assert_eq!(rows[1].1.text, "same text\n");
-    assert_eq!(rows[2].1.text, "failure detail");
-    assert!(
-        reopened
-            .tool_output_page("foreign", "thread", "turn", "command", 0)
+    let reader = database.connect_read_only().await.unwrap();
+    CrudStore::new(SqliteDatabase::new(reader, writer.clone())).with_maintenance_access()
+}
+
+#[tokio::test]
+async fn tool_output_chunks_are_scoped_ordered_and_idempotent() {
+    with_database(async |fixture| {
+        let store = postgres_store(fixture).await;
+        let mut n = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "command".into(),
+            delta: "same text\n".into(),
+            stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        };
+        store.record_tool_output("chunk-a", &n).await.unwrap();
+        store.record_tool_output("chunk-a", &n).await.unwrap();
+        store.record_tool_output("chunk-b", &n).await.unwrap();
+        n.stream = Some(pioneer_protocol::ItemDeltaStream::Stderr);
+        n.delta = "failure detail".into();
+        store.record_tool_output("chunk-c", &n).await.unwrap();
+        assert!(store.record_tool_output("chunk-a", &n).await.is_err());
+        n.thread_id = "other".into();
+        assert!(store.record_tool_output("bad", &n).await.is_err());
+        let reopened = CrudStore::new(SqliteDatabase::new(
+            fixture.connect_read_only().await.unwrap(),
+            fixture.connect().await.unwrap(),
+        ));
+        let rows = reopened
+            .tool_output_page("ws", "thread", "turn", "command", 0)
             .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        reopened
-            .tool_output_page("ws", "thread", "turn", "command", rows[2].0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1.text, "same text\n");
+        assert_eq!(rows[1].1.text, "same text\n");
+        assert_eq!(rows[2].1.text, "failure detail");
+        assert!(
+            reopened
+                .tool_output_page("foreign", "thread", "turn", "command", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .tool_output_page("ws", "thread", "turn", "command", rows[2].0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies() {
-    let store = fixture(false).await;
+    with_database(async |fixture| {
+    let store = postgres_store(fixture).await;
     let original = "вывод🦀\n".repeat(30000);
     let n = pioneer_protocol::ItemDeltaNotification {
         workspace_id: "ws".into(),
@@ -716,19 +746,7 @@ async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies(
         markdown_version: None,
     };
     store.record_tool_output("large", &n).await.unwrap();
-    // Exercise the existing retry/page contract after an abandoned staging
-    // preparation and a fresh maintenance worker have converted the storage.
-    let maintenance = store.with_maintenance_access();
-    let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    for _ in 0..4 {
-        progress.quantum(&maintenance).await.unwrap();
-    }
-    drop(progress);
-    let mut progress = pioneer_crud::PortablePayloadProgress::default();
-    for _ in 0..200 {
-        progress.quantum(&maintenance).await.unwrap();
-    }
-    assert!(scalar(&store,"SELECT count(*) AS n FROM tool_output_chunk WHERE text_payload_id IS NOT NULL AND text='' ").await>0);
+    assert!(scalar(&store, "SELECT count(*) AS n FROM tool_output_chunk WHERE text_encoding = 1 AND octet_length(text) < text_original_bytes").await > 0);
     store.record_tool_output("large", &n).await.unwrap();
     let rows = store
         .tool_output_page("ws", "thread", "turn", "large", 0)
@@ -763,157 +781,179 @@ async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies(
             .unwrap()
             .is_empty()
     );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
-async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission() {
-    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
-    use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
-    use sea_orm::{ConnectOptions, EntityTrait, TransactionTrait};
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-check-retry-{}.db",
-        pioneer_protocol::generate_id(21)
-    ));
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let mut options = ConnectOptions::new(url.clone());
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let setup = fixture_on(writer.clone(), false).await;
-    let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
-    let store = CrudStore::new(database.clone()).with_maintenance_access();
-    // Keep the shared legacy fixture cold. Only a new principal input and
-    // its canonical ready answer may create optional root work.
-    let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
-    thread.updated_at = 1;
-    let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
-    turn.id = "root-turn".into();
-    turn.status = pioneer_protocol::TurnStatus::InProgress;
-    store
-        .materialize_turn_start(
-            &thread,
-            pioneer_protocol::SandboxMode::FullAccess,
-            &turn,
-            &[pioneer_protocol::UserInput::Text {
-                text: "new root question".into(),
-                text_elements: Vec::new(),
-            }],
-            pioneer_protocol::PersistedActorRef::Principal(
-                pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
-    store
-        .materialize_item_completed(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: "ws".into(),
-                thread_id: "thread".into(),
-                turn_id: turn.id.clone(),
-                item: pioneer_protocol::TurnItem::AgentMessage {
-                    id: "root-answer".into(),
-                    text: "ready root answer".into(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
+async fn history_check_retry_survives_reopening_the_pool_and_a_cancelled_claim() {
+    with_database(async |fixture| {
+        use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+        use sea_orm::EntityTrait;
+        use std::time::Duration;
+        let store = postgres_store(fixture).await;
+        let mut thread = store.get_thread_model("thread").await.unwrap().unwrap();
+        thread.updated_at = 1;
+        let (_, mut turn) = store.get_turn("thread", "turn").await.unwrap().unwrap();
+        turn.id = "root-turn".into();
+        turn.status = pioneer_protocol::TurnStatus::InProgress;
+        store
+            .materialize_turn_start(
+                &thread,
+                pioneer_protocol::SandboxMode::FullAccess,
+                &turn,
+                &[pioneer_protocol::UserInput::Text {
+                    text: "new root question".into(),
+                    text_elements: Vec::new(),
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(
+                    pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: turn.id.clone(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: "root-answer".into(),
+                        text: "ready root answer".into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
                 },
-            },
-            1,
-        )
-        .await
-        .unwrap();
-    turn.status = pioneer_protocol::TurnStatus::Completed;
-    store
-        .materialize_turn_completed(
-            pioneer_protocol::TurnCompletedNotification {
-                workspace_id: "ws".into(),
-                thread_id: "thread".into(),
-                turn,
-            },
-            1,
-        )
-        .await
-        .unwrap();
-    let page = store.compaction_due_history_checks(1000).await.unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].turn_id, "root-turn");
-    let revision = page[0].revision;
-    let held = database.begin().await.unwrap();
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            store.compaction_claim_history_check("root-turn", revision, 1000)
-        )
-        .await
-        .is_err()
-    );
-    // Interactive readers still run while the maintenance write is queued.
-    assert_eq!(
-        scalar(
-            &CrudStore::new(database.clone()),
-            "SELECT count(*) AS n FROM turn"
-        )
-        .await,
-        3
-    );
-    held.rollback().await.unwrap();
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT revision AS n FROM compaction_history_check WHERE turn_id='root-turn'"
-        )
-        .await,
-        revision
-    );
-    let claim = store
-        .compaction_claim_history_check("root-turn", revision, 1000)
-        .await
-        .unwrap()
-        .unwrap();
-    store
-        .compaction_begin_history_attempt("root-turn", claim.revision, "{}", "safe-digest", 1000)
-        .await
-        .unwrap();
-    store
-        .compaction_record_history_result(
-            "root-turn",
-            claim.revision,
-            0,
-            O::Retryable,
-            &D::new("history_capture", "database_error", "Temporary failure"),
-            1000,
-        )
-        .await
-        .unwrap();
-    drop(store);
-    drop(database);
-    drop(setup);
-    let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
-    assert!(
-        reopened
-            .compaction_due_history_checks(60999)
+                1,
+            )
+            .await
+            .unwrap();
+        turn.status = pioneer_protocol::TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                pioneer_protocol::TurnCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let page = store.compaction_due_history_checks(1000).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].turn_id, "root-turn");
+        let revision = page[0].revision;
+        let writer = fixture.connect().await.unwrap();
+        let held = writer.begin().await.unwrap();
+        let holder_pid: i32 = held
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_backend_pid()",
+            ))
             .await
             .unwrap()
-            .is_empty()
-    );
-    let page = reopened.compaction_due_history_checks(61000).await.unwrap();
-    assert_eq!(page[0].failures, 1);
-    assert_eq!(page[0].config_hash.as_deref(), Some("safe-digest"));
-    let row = pioneer_entity::compaction_history_check::Entity::find_by_id("root-turn")
-        .one(&reopened.database_connection())
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        held.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT turn_id FROM compaction_history_check WHERE turn_id='root-turn' FOR UPDATE",
+        ))
         .await
         .unwrap()
         .unwrap();
-    assert!(row.diagnostic.unwrap().contains("database_error"));
-    drop(reopened);
-    let _ = std::fs::remove_file(path);
+        let claim_store = store.clone();
+        let contender = tokio::spawn(async move {
+            claim_store
+                .compaction_claim_history_check("root-turn", revision, 1000)
+                .await
+        });
+        let reader = fixture.connect_read_only().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = reader.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                [holder_pid.into()],
+            )).await.unwrap().unwrap().try_get_by_index(0).unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the competing claim must reach the PostgreSQL row lock");
+        assert_eq!(scalar(&store, "SELECT count(*) AS n FROM turn").await, 3);
+        contender.abort();
+        assert!(contender.await.unwrap_err().is_cancelled());
+        held.rollback().await.unwrap();
+        assert_eq!(
+            scalar(
+                &store,
+                "SELECT revision AS n FROM compaction_history_check WHERE turn_id='root-turn'"
+            )
+            .await,
+            revision
+        );
+        let claim = store
+            .compaction_claim_history_check("root-turn", revision, 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .compaction_begin_history_attempt(
+                "root-turn",
+                claim.revision,
+                "{}",
+                "safe-digest",
+                1000,
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_record_history_result(
+                "root-turn",
+                claim.revision,
+                0,
+                O::Retryable,
+                &D::new("history_capture", "database_error", "Temporary failure"),
+                1000,
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = CrudStore::new(SqliteDatabase::new(
+            fixture.connect_read_only().await.unwrap(),
+            fixture.connect().await.unwrap(),
+        ))
+        .with_maintenance_access();
+        assert!(
+            reopened
+                .compaction_due_history_checks(60999)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let page = reopened.compaction_due_history_checks(61000).await.unwrap();
+        assert_eq!(page[0].failures, 1);
+        assert_eq!(page[0].config_hash.as_deref(), Some("safe-digest"));
+        let row = pioneer_entity::compaction_history_check::Entity::find_by_id("root-turn")
+            .one(&reopened.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.diagnostic
+                .unwrap()
+                .to_string()
+                .contains("database_error")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

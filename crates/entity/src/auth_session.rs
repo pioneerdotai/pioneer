@@ -7,37 +7,36 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "auth_session")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "idx_auth_session_pending_activation_locator_hash")]
-    pub gateway_id: String,
-    #[sea_orm(unique_key = "idx_auth_session_pending_local")]
-    pub principal_id: String,
-    #[sea_orm(unique)]
-    pub device_id: String,
-    #[sea_orm(unique)]
-    pub token_family_id: String,
-    #[sea_orm(unique)]
-    pub created_by_session_id: Option<String>,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub activation_token_hash: Vec<u8>,
-    #[sea_orm(
-        column_type = "Binary(1)",
-        unique_key = "idx_auth_session_pending_activation_locator_hash"
-    )]
-    pub activation_locator_hash: Vec<u8>,
-    pub activation_failed_attempts: i64,
-    pub activation_expires_at: DateTimeWithTimeZone,
-    pub activated_at: Option<DateTimeWithTimeZone>,
-    pub status: String,
-    pub refresh_generation: i64,
-    pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    pub last_seen_at: Option<DateTimeWithTimeZone>,
+    pub refresh_generation: i64,
+    #[sea_orm(column_type = "Text", unique)]
+    pub token_family_id: String,
+    pub revoked_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub revoke_reason: Option<String>,
+    pub activated_at: Option<DateTimeWithTimeZone>,
     pub last_refreshed_at: Option<DateTimeWithTimeZone>,
     pub refresh_expires_at: Option<DateTimeWithTimeZone>,
-    pub revoked_at: Option<DateTimeWithTimeZone>,
-    pub revoke_reason: Option<String>,
+    pub activation_expires_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub gateway_id: String,
+    pub last_seen_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub device_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub principal_id: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub activation_failed_attempts: i64,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub activation_token_hash: Vec<u8>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub activation_locator_hash: Vec<u8>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_session_id: Option<String>,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_one)]
@@ -50,7 +49,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub auth_session: HasOne<Entity>,
+    pub auth_session: BelongsTo<Option<Entity>>,
     #[sea_orm(
         belongs_to,
         from = "device_id",
@@ -58,7 +57,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub device: HasOne<super::device::Entity>,
+    pub device: BelongsTo<super::device::Entity>,
     #[sea_orm(
         belongs_to,
         from = "gateway_id",
@@ -66,7 +65,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    pub gateway_identity: BelongsTo<super::gateway_identity::Entity>,
     #[sea_orm(
         belongs_to,
         from = "principal_id",
@@ -74,7 +73,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal: BelongsTo<super::gateway_principal::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

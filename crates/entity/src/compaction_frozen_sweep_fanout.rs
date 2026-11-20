@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_sweep_fanout")]
 pub struct Model {
+    pub after_row: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: i64,
-    pub revision: i64,
-    pub after_row: i64,
     pub until_row: i64,
+    pub revision: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

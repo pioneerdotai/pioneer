@@ -89,9 +89,7 @@ CREATE VIEW compaction_live_sources
           INNER JOIN thread AS th ON th.id = s.conversation_thread_id
                                  AND th.workspace_id = s.workspace_id
           LEFT JOIN compaction_task_basis_revision AS r ON r.run_id = s.run_id
-     WHERE substr(ltrim(s.history_json)
-                , 1
-                , 1) = '[';
+     WHERE s.history_json_payload_id IS NOT NULL;
 
 CREATE VIEW compaction_frozen_message
   AS SELECT d.manifest_id

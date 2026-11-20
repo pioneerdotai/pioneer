@@ -7,8 +7,8 @@ use pioneer_entity::{
     workspace,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement, TransactionTrait, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,6 +184,19 @@ async fn commit_revision_inner<C: ConnectionTrait>(
     revision: i64,
 ) -> Result<()> {
     let i = &prepared.input;
+    // The workspace's frontier is the largest published sequence. Hold its
+    // advisory lock through commit so a later sequence cannot hide a row that
+    // was still uncommitted when the reader advanced the frontier.
+    // SeaORM has no transaction-scoped advisory lock API.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+        [
+            i.workspace_id.clone().into(),
+            0x7069_6f6e_6f62_7301_i64.into(),
+        ],
+    ))
+    .await?;
     validate_prepared_owner(db, prepared).await?;
     let parent_scope = if (i.kind == "provider_attempt"
         && i.operation_id.starts_with("provider:journal:"))
@@ -742,11 +755,11 @@ impl CrudStore {
         workspace: &str,
         hash: &str,
     ) -> Result<Option<tariff::Model>> {
-        Ok(
-            tariff::Entity::find_by_id((workspace.to_owned(), hash.to_owned()))
-                .one(&self.connection)
-                .await?,
-        )
+        Ok(tariff::Entity::find()
+            .filter(tariff::Column::WorkspaceId.eq(workspace.to_owned()))
+            .filter(tariff::Column::ContentHash.eq(hash.to_owned()))
+            .one(&self.connection)
+            .await?)
     }
 }
 
@@ -1173,273 +1186,41 @@ pub fn reference_event_tariff(
     }
 }
 
-const BACKFILL_KEY: &str = "execution_observation_legacy_v1";
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ExecutionObservationBackfillProgress {
-    pub after: String,
-    pub complete: bool,
-    pub scanned: u64,
-    pub unavailable: u64,
-}
-impl CrudStore {
-    pub async fn execution_observation_backfill_progress(
-        &self,
-    ) -> Result<ExecutionObservationBackfillProgress> {
-        self.execution_backfill_progress_for(BACKFILL_KEY).await
-    }
-    pub async fn execution_aux_observation_backfill_progress(
-        &self,
-    ) -> Result<ExecutionObservationBackfillProgress> {
-        self.execution_backfill_progress_for(AUX_BACKFILL_KEY).await
-    }
-    async fn execution_backfill_progress_for(
-        &self,
-        key: &str,
-    ) -> Result<ExecutionObservationBackfillProgress> {
-        let row = pioneer_entity::thread_timeline_projection_meta::Entity::find_by_id(key)
-            .one(&self.connection)
-            .await?;
-        row.and_then(|r| r.projection_config_json)
-            .map(|json| serde_json::from_str(&json).map_err(Into::into))
-            .unwrap_or_else(|| Ok(Default::default()))
-    }
-    /// Finite, restartable data-migration quantum. Preparation is outside the
-    /// writer; progress and all accepted facts commit together. No provider calls.
-    pub async fn backfill_execution_observations_quantum(
-        &self,
-    ) -> Result<ExecutionObservationBackfillProgress> {
-        use pioneer_entity::{thread_timeline_projection_meta as meta, turn_event as source};
-        use sea_orm::sea_query::{Alias, Expr, Func};
-        use sea_orm::{ExprTrait, FromQueryResult};
-        #[derive(FromQueryResult)]
-        struct Row {
-            id: String,
-            thread_id: String,
-            turn_id: String,
-            sequence: i64,
-            payload: Option<String>,
-            created_at: sea_orm::prelude::DateTimeWithTimeZone,
-        }
-        let predecessor = meta::Entity::find_by_id(BACKFILL_KEY)
-            .one(&self.connection)
-            .await?;
-        let previous_json = predecessor
-            .as_ref()
-            .and_then(|row| row.projection_config_json.clone());
-        let before: ExecutionObservationBackfillProgress = previous_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?
-            .unwrap_or_default();
-        if before.complete {
-            return Ok(before);
-        }
-        let length = Func::cust(Alias::new("length"))
-            .arg(Expr::col(source::Column::Payload).cast_as(Alias::new("BLOB")));
-        let rows = source::Entity::find()
-            .select_only()
-            .columns([
-                source::Column::Id,
-                source::Column::ThreadId,
-                source::Column::TurnId,
-                source::Column::Sequence,
-                source::Column::CreatedAt,
-            ])
-            .column_as(
-                Expr::expr(
-                    Expr::case(
-                        Expr::expr(length).lte(2 * 1024 * 1024),
-                        Expr::col(source::Column::Payload),
-                    )
-                    .finally(Option::<String>::None),
-                ),
-                "payload",
-            )
-            .filter(source::Column::Id.gt(&before.after))
-            .filter(source::Column::EventType.is_in([
-                pioneer_protocol::constants::events::ITEM_STARTED,
-                pioneer_protocol::constants::events::ITEM_COMPLETED,
-                pioneer_protocol::constants::events::ITEM_UPDATED,
-                pioneer_protocol::constants::events::ITEM_RETRY_SCHEDULED,
-                pioneer_protocol::constants::events::ITEM_RETRY_ATTEMPT_STARTED,
-                pioneer_protocol::constants::events::ITEM_RECOVERY_OPENED,
-                pioneer_protocol::constants::events::ITEM_RECOVERY_SUCCEEDED,
-                pioneer_protocol::constants::events::ITEM_RECOVERY_EXHAUSTED,
-                pioneer_protocol::constants::events::ITEM_TIMEOUT_DETECTED,
-                pioneer_protocol::constants::events::ITEM_TOOL_RETRY_SCHEDULED,
-                pioneer_protocol::constants::events::ITEM_TOOL_RETRY_RESOLVED,
-                pioneer_protocol::constants::events::ITEM_TOOL_RETRY_EXHAUSTED,
-                pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT,
-                pioneer_protocol::constants::events::TURN_EXECUTION_WINDOW_STARTED,
-                pioneer_protocol::constants::events::TURN_EXECUTION_WINDOW_EXHAUSTED,
-                pioneer_protocol::constants::events::TURN_EXECUTION_WINDOW_CHECKPOINTED,
-                pioneer_protocol::constants::events::TURN_EXECUTION_WINDOW_CONTINUED,
-                pioneer_protocol::constants::events::TURN_EXECUTION_WINDOW_BLOCKED,
-            ]))
-            .order_by_asc(source::Column::Id)
-            .limit(32)
-            .into_model::<Row>()
-            .all(&self.connection)
-            .await?;
-        let count = rows.len();
-        let mut progress = before.clone();
-        let mut prepared = Vec::new();
-        for row in rows {
-            progress.after = row.id.clone();
-            progress.scanned += 1;
-            let Some(body) = row.payload else {
-                progress.unavailable += 1;
-                continue;
-            };
-            let parsed = serde_json::from_str::<crate::CanonicalTurnEventPayload>(&body);
-            let Ok(payload) = parsed else {
-                progress.unavailable += 1;
-                continue;
-            };
-            if payload.thread_id() != row.thread_id || payload.turn_id() != row.turn_id {
-                progress.unavailable += 1;
-                continue;
-            }
-            match prepare_event(&payload) {
-                Ok(Some(mut fact)) => {
-                    // Preserve source-owned observations; projection time is not
-                    // a historical start/end and never substitutes updated_at.
-                    fact.input.recorded_at_ms = row.created_at.timestamp_millis();
-                    // Quarantine unavailable legacy owners/evidence by advancing
-                    // durable progress. A malformed old row must not poison EOF.
-                    let owner_thread = thread::Entity::find_by_id(&row.thread_id)
-                        .one(&self.connection)
-                        .await?;
-                    let owner_turn = turn::Entity::find_by_id(&row.turn_id)
-                        .one(&self.connection)
-                        .await?;
-                    let valid = owner_thread
-                        .as_ref()
-                        .is_some_and(|t| t.workspace_id == fact.input.workspace_id)
-                        && owner_turn
-                            .as_ref()
-                            .is_some_and(|t| t.thread_id == row.thread_id)
-                        && workspace::Entity::find_by_id(&fact.input.workspace_id)
-                            .one(&self.connection)
-                            .await?
-                            .is_some();
-                    let missing_evidence = if fact.tariff.is_none() {
-                        if let Some(hash) = &fact.tariff_reference {
-                            self.execution_tariff(&fact.input.workspace_id, hash)
-                                .await?
-                                .is_none()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !valid || missing_evidence {
-                        progress.unavailable += 1;
-                        continue;
-                    }
-                    if let Some(existing) = self
-                        .execution_observation_latest(
-                            &fact.input.workspace_id,
-                            &row.thread_id,
-                            &fact.input.operation_id,
-                        )
-                        .await?
-                    {
-                        if existing.owner_id != fact.input.owner_id
-                            || existing.owner_kind != fact.input.owner_kind
-                            || existing.kind != fact.input.kind
-                        {
-                            progress.unavailable += 1;
-                            continue;
-                        }
-                    }
-                    prepared.push((row.id, row.sequence, fact));
-                }
-                Ok(None) => {}
-                Err(_) => progress.unavailable += 1,
-            }
-        }
-        progress.complete = count < 32;
-        let next_json = serde_json::to_string(&progress)?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let current = meta::Entity::find_by_id(BACKFILL_KEY).one(&tx).await?;
-            ensure!(
-                current
-                    .as_ref()
-                    .and_then(|r| r.projection_config_json.as_deref())
-                    == previous_json.as_deref(),
-                "observation backfill progress changed"
-            );
-            for (id, sequence, fact) in &prepared {
-                // Source deletion during preparation must not resurrect a
-                // removed thread's diagnostic facts. Owners are checked again.
-                if source::Entity::find_by_id(id)
-                    .select_only()
-                    .column(source::Column::Id)
-                    .into_tuple::<String>()
-                    .one(&tx)
-                    .await?
-                    .is_some()
-                    && thread::Entity::find_by_id(fact.input.thread_id.as_deref().unwrap_or(""))
-                        .filter(thread::Column::WorkspaceId.eq(&fact.input.workspace_id))
-                        .one(&tx)
-                        .await?
-                        .is_some()
-                    && turn::Entity::find_by_id(fact.input.turn_id.as_deref().unwrap_or(""))
-                        .filter(
-                            turn::Column::ThreadId.eq(fact
-                                .input
-                                .thread_id
-                                .as_deref()
-                                .unwrap_or("")),
-                        )
-                        .one(&tx)
-                        .await?
-                        .is_some()
-                {
-                    commit_revision(&tx, fact, *sequence).await?;
-                }
-            }
-            commit_backfill_checkpoint(&tx, BACKFILL_KEY, current, &next_json, progress.complete)
-                .await?;
-            tx.commit().await?;
-            Ok(())
-        })
-        .await?;
-        Ok(progress)
-    }
-}
-
 pub(crate) async fn retain_prepared_tariff<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedExecutionObservation,
 ) -> Result<Option<String>> {
     let i = &prepared.input;
     let hash = if let Some((hash, evidence)) = &prepared.tariff {
-        if let Some(existing) = tariff::Entity::find_by_id((i.workspace_id.clone(), hash.clone()))
+        tariff::Entity::insert(tariff::ActiveModel {
+            workspace_id: Set(i.workspace_id.clone()),
+            content_hash: Set(hash.clone()),
+            evidence_json: Set(evidence.clone()),
+            captured_at_ms: Set(i.recorded_at_ms),
+        })
+        .on_conflict(
+            OnConflict::columns([tariff::Column::WorkspaceId, tariff::Column::ContentHash])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+        let existing = tariff::Entity::find()
+            .filter(tariff::Column::WorkspaceId.eq(i.workspace_id.clone()))
+            .filter(tariff::Column::ContentHash.eq(hash.clone()))
             .one(db)
             .await?
-        {
-            ensure!(
-                existing.evidence_json == *evidence,
-                "tariff content hash conflict"
-            );
-        } else {
-            tariff::ActiveModel {
-                workspace_id: Set(i.workspace_id.clone()),
-                content_hash: Set(hash.clone()),
-                evidence_json: Set(evidence.clone()),
-                captured_at_ms: Set(i.recorded_at_ms),
-            }
-            .insert(db)
-            .await?;
-        }
+            .context("retained tariff disappeared")?;
+        ensure!(
+            existing.evidence_json == *evidence,
+            "tariff content hash conflict"
+        );
         Some(hash.clone())
     } else if let Some(hash) = &prepared.tariff_reference {
         ensure!(
-            tariff::Entity::find_by_id((i.workspace_id.clone(), hash.clone()))
+            tariff::Entity::find()
+                .filter(tariff::Column::WorkspaceId.eq(i.workspace_id.clone()))
+                .filter(tariff::Column::ContentHash.eq(hash.clone()))
                 .one(db)
                 .await?
                 .is_some(),
@@ -1733,270 +1514,6 @@ impl CrudStore {
             "basis":"turn_execution_window_source_wall","revision_semantics":"live_domain_owner_not_frozen_at_diagnostic_frontier"}));
         }
         Ok(out)
-    }
-}
-
-async fn commit_backfill_checkpoint<C: ConnectionTrait>(
-    db: &C,
-    key: &str,
-    current: Option<pioneer_entity::thread_timeline_projection_meta::Model>,
-    json: &str,
-    complete: bool,
-) -> Result<()> {
-    use pioneer_entity::thread_timeline_projection_meta as meta;
-    let now = chrono::Utc::now().fixed_offset();
-    let existed = current.is_some();
-    let model = if let Some(current) = current {
-        let mut m: meta::ActiveModel = current.into();
-        m.projection_config_json = Set(Some(json.to_owned()));
-        m.status = Set(if complete { "complete" } else { "backfilling" }.into());
-        m.updated_at = Set(now);
-        m
-    } else {
-        meta::ActiveModel {
-            projection_key: Set(key.into()),
-            projection_version: Set(1),
-            status: Set(if complete { "complete" } else { "backfilling" }.into()),
-            source_thread_count: Set(0),
-            source_turn_count: Set(0),
-            source_turn_item_count: Set(0),
-            source_turn_event_count: Set(0),
-            last_error: Set(None),
-            backfill_started_at: Set(Some(now)),
-            backfilled_at: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            projection_config_hash: Set(None),
-            projection_config_json: Set(Some(json.to_owned())),
-        }
-    };
-    if existed {
-        model.update(db).await?;
-    } else {
-        model.insert(db).await?;
-    }
-    Ok(())
-}
-
-const AUX_BACKFILL_KEY: &str = "execution_aux_usage_legacy_v1";
-impl CrudStore {
-    pub async fn backfill_aux_execution_observations_quantum(
-        &self,
-    ) -> Result<ExecutionObservationBackfillProgress> {
-        use pioneer_entity::{
-            provider_usage_observation as source, thread_timeline_projection_meta as meta,
-        };
-        let checkpoint = meta::Entity::find_by_id(AUX_BACKFILL_KEY)
-            .one(&self.connection)
-            .await?;
-        let previous_json = checkpoint
-            .as_ref()
-            .and_then(|row| row.projection_config_json.clone());
-        let before: ExecutionObservationBackfillProgress = previous_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?
-            .unwrap_or_default();
-        if before.complete {
-            return Ok(before);
-        }
-        use sea_orm::sea_query::{Alias, Expr, Func};
-        use sea_orm::{ExprTrait, FromQueryResult};
-        #[derive(FromQueryResult)]
-        struct Row {
-            id: String,
-            workspace_id: String,
-            owner_id: String,
-            operation_kind: String,
-            status: String,
-            usage_json: Option<String>,
-            started_at: i64,
-        }
-        let length = Func::cust(Alias::new("length"))
-            .arg(Expr::col(source::Column::UsageJson).cast_as(Alias::new("BLOB")));
-        let rows = source::Entity::find()
-            .select_only()
-            .columns([
-                source::Column::Id,
-                source::Column::WorkspaceId,
-                source::Column::OwnerId,
-                source::Column::OperationKind,
-                source::Column::Status,
-                source::Column::StartedAt,
-            ])
-            .column_as(
-                Expr::expr(
-                    Expr::case(
-                        Expr::expr(length).lte(32 * 1024),
-                        Expr::col(source::Column::UsageJson),
-                    )
-                    .finally(Option::<String>::None),
-                ),
-                "usage_json",
-            )
-            .filter(source::Column::Id.gt(&before.after))
-            .order_by_asc(source::Column::Id)
-            .limit(32)
-            .into_model::<Row>()
-            .all(&self.connection)
-            .await?;
-        let count = rows.len();
-        let mut progress = before;
-        let mut prepared = Vec::new();
-        for row in rows {
-            progress.after = row.id.clone();
-            progress.scanned += 1;
-            let Some(body) = row.usage_json else {
-                progress.unavailable += 1;
-                continue;
-            };
-            let Ok(mut usage) = serde_json::from_str::<Value>(&body) else {
-                progress.unavailable += 1;
-                continue;
-            };
-            // New producers already projected atomically. Main numeric refinements
-            // share the native attempt leaf and must never create a second charge.
-            if usage["_pioneer_observation"].is_object() || row.operation_kind == "main" {
-                continue;
-            }
-            if workspace::Entity::find_by_id(&row.workspace_id)
-                .one(&self.connection)
-                .await?
-                .is_none()
-            {
-                progress.unavailable += 1;
-                continue;
-            }
-            let owner = thread::Entity::find_by_id(&row.owner_id)
-                .one(&self.connection)
-                .await?
-                .filter(|t| t.workspace_id == row.workspace_id);
-            let run_owner = if owner.is_none() && row.operation_kind == "self_improvement" {
-                pioneer_entity::self_improvement_run::Entity::find_by_id(&row.owner_id)
-                    .one(&self.connection)
-                    .await?
-                    .filter(|run| run.workspace_id == row.workspace_id)
-            } else {
-                None
-            };
-            if owner.is_none() && run_owner.is_none() && row.owner_id != row.workspace_id {
-                // A deleted/private legacy thread cannot be reassigned to a
-                // broader WorkspaceRead scope. Preserve its original journal,
-                // mark unavailable progress, and never invent an owner.
-                progress.unavailable += 1;
-                continue;
-            }
-            let evidence = usage["accounting"]
-                .get("pricing")
-                .filter(|v| v.is_object())
-                .cloned();
-            if let Some(accounting) = usage.get_mut("accounting").and_then(Value::as_object_mut) {
-                accounting.remove("pricing");
-            }
-            let thread_id = owner.map(|t| t.id);
-            let input = ExecutionObservationInput {
-                workspace_id: row.workspace_id.clone(),
-                operation_id: format!("provider:journal:{}", row.id),
-                revision: 0,
-                thread_id: thread_id.clone(),
-                turn_id: None,
-                owner_kind: if thread_id.is_some() {
-                    "thread"
-                } else if run_owner.is_some() {
-                    "self_improvement_run"
-                } else {
-                    "workspace"
-                }
-                .into(),
-                owner_id: thread_id.unwrap_or_else(|| {
-                    if run_owner.is_some() {
-                        row.owner_id.clone()
-                    } else {
-                        row.workspace_id.clone()
-                    }
-                }),
-                parent_operation_id: None,
-                kind: if matches!(
-                    usage["provider"].as_str(),
-                    Some("codex-cli" | "claude-cli" | "opencode-cli")
-                ) {
-                    "external_usage_snapshot"
-                } else {
-                    "provider_attempt"
-                }
-                .into(),
-                purpose: row.operation_kind.clone(),
-                provider: usage["provider"].as_str().map(str::to_owned),
-                model: usage["model"].as_str().map(str::to_owned),
-                status: row.status.clone(),
-                recorded_at_ms: row.started_at.saturating_mul(1000),
-                facts: serde_json::json!({"usage":usage,"legacy_owner_id":row.owner_id,
-                    "usage_source_fingerprint":hex::encode(Sha256::digest(body.as_bytes())),
-                    "coverage":"legacy_journal_no_dispatch_or_final_manifest_evidence","timing":{"prepared_at_unix_seconds":row.started_at,"basis":"legacy_source_preparation_only"}}),
-                tariff_evidence: evidence,
-            };
-            match input.prepare() {
-                Ok(fact) => {
-                    let missing = if fact.tariff.is_none() {
-                        if let Some(hash) = &fact.tariff_reference {
-                            self.execution_tariff(&row.workspace_id, hash)
-                                .await?
-                                .is_none()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if missing {
-                        progress.unavailable += 1;
-                    } else {
-                        prepared.push((row.id, body, fact));
-                    }
-                }
-                Err(_) => progress.unavailable += 1,
-            }
-        }
-        progress.complete = count < 32;
-        let next_json = serde_json::to_string(&progress)?;
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let current = meta::Entity::find_by_id(AUX_BACKFILL_KEY).one(&tx).await?;
-            ensure!(
-                current
-                    .as_ref()
-                    .and_then(|row| row.projection_config_json.as_deref())
-                    == previous_json.as_deref(),
-                "auxiliary backfill progress changed"
-            );
-            for (id, expected, fact) in &prepared {
-                let source = source::Entity::find_by_id(id)
-                    .select_only()
-                    .column(source::Column::Id)
-                    .filter(source::Column::UsageJson.eq(expected.clone()))
-                    .into_tuple::<String>()
-                    .one(&tx)
-                    .await?;
-                if source.is_none() {
-                    continue;
-                }
-                // A concurrent deletion is retried from the same durable cursor;
-                // the next preparation classifies the now-missing source/owner.
-                commit(&tx, fact).await?;
-            }
-            commit_backfill_checkpoint(
-                &tx,
-                AUX_BACKFILL_KEY,
-                current,
-                &next_json,
-                progress.complete,
-            )
-            .await?;
-            tx.commit().await?;
-            Ok(())
-        })
-        .await?;
-        Ok(progress)
     }
 }
 

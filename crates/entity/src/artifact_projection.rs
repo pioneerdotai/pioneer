@@ -7,20 +7,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_projection")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub workspace_id: String,
-    pub artifact_id: String,
-    pub artifact_version_id: String,
-    pub projection_kind: String,
-    pub status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub text_content: Option<String>,
-    pub blob_id: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
+    pub projection_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub artifact_version_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub text_content: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub metadata_json: String,
+    #[sea_orm(column_type = "Text")]
+    pub artifact_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub blob_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

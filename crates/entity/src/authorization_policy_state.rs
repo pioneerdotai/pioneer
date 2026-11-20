@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "authorization_policy_state")]
 pub struct Model {
+    pub generation: i64,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false)]
     pub singleton_id: i64,
-    pub generation: i64,
+    #[sea_orm(column_type = "Text")]
     pub code_policy_fingerprint: String,
-    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

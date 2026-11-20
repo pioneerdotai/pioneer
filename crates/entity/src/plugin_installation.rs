@@ -7,62 +7,62 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "plugin_installation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub id: String,
-    #[sea_orm(column_type = "Text")]
-    pub name: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub version: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub display_name: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub short_description: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub description: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub long_description: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub developer_name: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub author_name: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub author_email: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub author_url: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub homepage: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub repository: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub documentation_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub support_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub privacy_policy_url: Option<String>,
+    pub repository: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub short_description: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub logo_path: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub category: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub composer_icon_revision: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub brand_color: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub author_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub terms_of_service_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub license: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub category: Option<String>,
+    pub homepage: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub brand_color: Option<String>,
+    pub author_email: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub name: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub logo_path: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub logo_revision: Option<String>,
+    pub privacy_policy_url: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub composer_icon_path: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub composer_icon_revision: Option<String>,
+    pub display_name: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub logo_revision: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub version: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub documentation_url: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub author_name: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub long_description: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub developer_name: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub description: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "id",
         to = "id",
         on_update = "NoAction",
-        on_delete = "Restrict"
+        on_delete = "Cascade"
     )]
-    pub package_installation: HasOne<super::package_installation::Entity>,
+    pub package_installation: BelongsTo<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

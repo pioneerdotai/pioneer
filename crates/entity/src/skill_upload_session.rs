@@ -7,27 +7,32 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_upload_session")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub upload_id: String,
-    pub workspace_id: String,
-    pub connection_id: i64,
-    pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub file_name: String,
-    pub archive_format: String,
-    pub compressed_size_bytes: i64,
-    pub received_bytes: i64,
-    pub sha256: String,
+    pub finalized_at_unix: Option<i64>,
+    pub aborted_at_unix: Option<i64>,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    pub expires_at_unix: i64,
     #[sea_orm(column_type = "Text")]
     pub payload_path: String,
-    pub created_at_unix: i64,
-    pub expires_at_unix: i64,
-    pub finalized_at_unix: Option<i64>,
-    pub consumed_at_unix: Option<i64>,
-    pub aborted_at_unix: Option<i64>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub purpose: String,
+    pub updated_at: DateTimeWithTimeZone,
+    pub created_at_unix: i64,
+    pub compressed_size_bytes: i64,
+    #[sea_orm(column_type = "Text")]
+    pub sha256: String,
+    pub consumed_at_unix: Option<i64>,
+    pub connection_id: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub upload_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub archive_format: String,
+    pub received_bytes: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

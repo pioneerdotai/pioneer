@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "unread_message_position")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub thread_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub block_id: String,
-    pub turn_id: String,
-    pub sort_key: String,
     pub published_at: i64,
+    #[sea_orm(column_type = "Text")]
+    pub sort_key: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub turn_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,24 +7,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_timeline_projection_meta")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub projection_key: String,
-    pub projection_version: i64,
-    pub status: String,
     pub source_thread_count: i64,
-    pub source_turn_count: i64,
-    pub source_turn_item_count: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub projection_key: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub projection_config_json: Option<String>,
+    pub backfill_started_at: Option<DateTimeWithTimeZone>,
     pub source_turn_event_count: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,
-    pub backfill_started_at: Option<DateTimeWithTimeZone>,
-    pub backfilled_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    pub source_turn_item_count: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub projection_config_hash: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub projection_config_json: Option<String>,
+    pub source_turn_count: i64,
+    pub created_at: DateTimeWithTimeZone,
+    pub updated_at: DateTimeWithTimeZone,
+    pub backfilled_at: Option<DateTimeWithTimeZone>,
+    pub projection_version: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,30 +7,45 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_item")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_turn_item_turn_id_item_id")]
-    pub turn_id: String,
-    #[sea_orm(unique_key = "uq_turn_item_turn_id_item_id")]
-    pub item_id: String,
-    pub item_type: String,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub status: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub payload: String,
-    pub active_attempt_number: i64,
-    pub active_attempt_status: Option<String>,
-    pub active_attempt_id: Option<String>,
-    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
-    pub lease_expires_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    pub portable_revision: i64,
-    #[sea_orm(column_type = "Text")]
     pub portable_identity: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub last_heartbeat_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", unique_key = "uq_turn_item_turn_id_item_id")]
+    pub turn_id: String,
+    pub lease_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub publication_xid: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub active_attempt_id: Option<String>,
+    pub active_attempt_number: i64,
+    #[sea_orm(column_type = "Text", unique_key = "uq_turn_item_turn_id_item_id")]
+    pub item_id: String,
+    pub portable_revision: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable, unique)]
     pub payload_payload_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub item_type: String,
+    pub payload: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub active_attempt_status: Option<String>,
     #[sea_orm(has_one)]
     pub agent_action_timeline_target: HasOne<super::agent_action_timeline_target::Entity>,
+    #[sea_orm(
+        belongs_to,
+        from = "payload_payload_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "NoAction"
+    )]
+    pub portable_payload_value: BelongsTo<Option<super::portable_payload_value::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

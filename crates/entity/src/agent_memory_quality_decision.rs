@@ -7,30 +7,45 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_quality_decision")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub workspace_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub item_id: Option<String>,
-    pub task_id: Option<String>,
-    pub memory_id: Option<String>,
-    pub candidate_id: Option<String>,
-    pub canonical_key: Option<String>,
-    pub action: String,
-    pub target_ownership: String,
-    pub source_context_kind: String,
-    pub fact_class: String,
-    pub lifetime_class: String,
-    pub ownership_class: String,
+    #[sea_orm(column_type = "Text")]
     pub evidence_class: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub lifetime_class: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub canonical_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub memory_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub candidate_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub task_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub ownership_class: String,
+    #[sea_orm(column_type = "Text")]
+    pub fact_class: String,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub item_id: Option<String>,
+    pub input_snapshot_json: Option<Json>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub target_ownership: String,
+    #[sea_orm(column_type = "Text")]
     pub relation: String,
     #[sea_orm(column_type = "Text")]
-    pub reason_codes_json: String,
+    pub source_context_kind: String,
+    #[sea_orm(column_type = "Text")]
+    pub action: String,
+    #[sea_orm(column_type = "JsonBinary")]
+    pub reason_codes_json: Json,
     #[sea_orm(column_type = "Text", nullable)]
-    pub input_snapshot_json: Option<String>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    pub workspace_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

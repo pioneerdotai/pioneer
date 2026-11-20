@@ -11,7 +11,7 @@ import plistlib
 import zipfile
 
 
-def fixture(binary, archive, target):
+def fixture(binary, archive, target, postgres):
     windows = "windows" in target
     macos = "apple-darwin" in target
     executable = "pioneer.exe" if windows else "pioneer"
@@ -46,6 +46,9 @@ def fixture(binary, archive, target):
             info.external_attr = (0o100000 | mode) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             output.writestr(info, data)
+        for path in sorted(postgres.rglob("*")):
+            if path.is_file():
+                output.write(path, (Path("cua/postgres") / path.relative_to(postgres)).as_posix())
 
 
 if __name__ == "__main__":
@@ -53,5 +56,6 @@ if __name__ == "__main__":
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--postgres", type=Path, required=True)
     args = parser.parse_args()
-    fixture(args.binary, args.archive, args.target)
+    fixture(args.binary, args.archive, args.target, args.postgres)

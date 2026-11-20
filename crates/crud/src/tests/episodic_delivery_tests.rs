@@ -242,96 +242,102 @@ async fn episodic_delivery_requires_matching_stream_scope_and_positive_sequence(
 
 #[tokio::test]
 async fn episodic_quarantined_prefix_remains_ready_and_unprojected_turn_does_not_starve_others() {
-    let (store, thread, turn) =
-        test_store_with_started_turn("ws_prefix", "thr_prefix", "turn_a_prefix").await;
-    append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
-    let db = store.database_connection();
-    stream::Entity::update_many()
-        .filter(stream::Column::TurnId.eq(turn.id.clone()))
-        .col_expr(stream::Column::Status, Expr::value("quarantined"))
-        .col_expr(stream::Column::ProjectedThroughSequence, Expr::value(2_i64))
-        .exec(&db)
-        .await
-        .unwrap();
-    let prefix = store
-        .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
-        .await
-        .unwrap();
-    assert_eq!(prefix.len(), 1);
-    assert_eq!(prefix[0].event.sequence, 2);
-    assert!(
-        store
-            .complete_turn_event_delivery(&prefix[0].id, &prefix[0].claim_token, NOW)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, thread, turn) =
+            postgres_store_with_started_turn(fixture, "ws_prefix", "thr_prefix", "turn_a_prefix")
+                .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 2).await;
+        let db = store.database_connection();
+        stream::Entity::update_many()
+            .filter(stream::Column::TurnId.eq(turn.id.clone()))
+            .col_expr(stream::Column::Status, Expr::value("quarantined"))
+            .col_expr(stream::Column::ProjectedThroughSequence, Expr::value(2_i64))
+            .exec(&db)
             .await
-            .unwrap()
-    );
-    // Sequence 3 still has a projected receipt, but exceeds the authority.
-    assert!(
-        store
+            .unwrap();
+        let prefix = store
             .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
             .await
-            .unwrap()
-            .is_empty()
-    );
-    let mut independent = turn.clone();
-    independent.id = "turn_b_prefix".into();
-    store
-        .materialize_turn_start(
-            &thread,
-            SandboxMode::FullAccess,
-            &independent,
-            &[],
-            pioneer_protocol::PersistedActorRef::System,
-        )
-        .await
-        .unwrap();
-    append_optional_delivery_test_items(&store, &thread, &independent.id, 1).await;
-    let ready = store
-        .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
-        .await
-        .unwrap();
-    assert_eq!(
-        ready.len(),
-        1,
-        "projection eligibility must be applied before LIMIT"
-    );
-    assert_eq!(ready[0].event.turn_id, independent.id);
-    assert!(
+            .unwrap();
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].event.sequence, 2);
+        assert!(
+            store
+                .complete_turn_event_delivery(&prefix[0].id, &prefix[0].claim_token, NOW)
+                .await
+                .unwrap()
+        );
+        // Sequence 3 still has a projected receipt, but exceeds the authority.
+        assert!(
+            store
+                .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut independent = turn.clone();
+        independent.id = "turn_b_prefix".into();
         store
-            .complete_turn_event_delivery(&ready[0].id, &ready[0].claim_token, NOW)
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &independent,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
-            .unwrap()
-    );
+            .unwrap();
+        append_optional_delivery_test_items(&store, &thread, &independent.id, 1).await;
+        let ready = store
+            .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ready.len(),
+            1,
+            "projection eligibility must be applied before LIMIT"
+        );
+        assert_eq!(ready[0].event.turn_id, independent.id);
+        assert!(
+            store
+                .complete_turn_event_delivery(&ready[0].id, &ready[0].claim_token, NOW)
+                .await
+                .unwrap()
+        );
 
-    // Restore the replay fixture to the real unprojected crash window.
-    stream::Entity::update_many()
-        .filter(stream::Column::TurnId.eq(turn.id.clone()))
-        .col_expr(stream::Column::Status, Expr::value("healthy"))
-        .exec(&db)
-        .await
-        .unwrap();
-    receipt::Entity::update_many()
-        .filter(receipt::Column::TurnId.eq(turn.id.clone()))
-        .filter(receipt::Column::Sequence.eq(3_i64))
-        .col_expr(receipt::Column::Status, Expr::value("pending"))
-        .exec(&db)
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .replay_due_turn_event_projections(NOW, 10)
+        // Restore the replay fixture to the real unprojected crash window.
+        stream::Entity::update_many()
+            .filter(stream::Column::TurnId.eq(turn.id.clone()))
+            .col_expr(stream::Column::Status, Expr::value("healthy"))
+            .exec(&db)
             .await
-            .unwrap()
-            .projected,
-        1
-    );
-    let projected = store
-        .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
-        .await
-        .unwrap();
-    assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].event.turn_id, turn.id);
-    assert_eq!(projected[0].event.sequence, 3);
+            .unwrap();
+        receipt::Entity::update_many()
+            .filter(receipt::Column::TurnId.eq(turn.id.clone()))
+            .filter(receipt::Column::Sequence.eq(3_i64))
+            .col_expr(receipt::Column::Status, Expr::value("pending"))
+            .exec(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .replay_due_turn_event_projections(NOW, 10)
+                .await
+                .unwrap()
+                .projected,
+            1
+        );
+        let projected = store
+            .claim_due_turn_event_deliveries(EPISODIC, NOW, 1)
+            .await
+            .unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event.turn_id, turn.id);
+        assert_eq!(projected[0].event.sequence, 3);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 // Test-only interception captures the exact statements issued by claim_due.
@@ -620,186 +626,200 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
 
 #[tokio::test]
 async fn mixed_delivery_batch_preserves_individual_retry_deferral_and_ack_state() {
-    let (store, thread, turn) =
-        test_store_with_started_turn("ws_batch", "thr_batch", "batch_a").await;
-    let turns = ["batch_a", "batch_b", "batch_c", "batch_d"];
-    for (index, id) in turns.iter().enumerate() {
-        if index != 0 {
-            let mut next = turn.clone();
-            next.id = (*id).into();
-            store
-                .materialize_turn_start(
-                    &thread,
-                    SandboxMode::FullAccess,
-                    &next,
-                    &[],
-                    pioneer_protocol::PersistedActorRef::System,
-                )
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, thread, turn) =
+            postgres_store_with_started_turn(fixture, "ws_batch", "thr_batch", "batch_a").await;
+        let turns = ["batch_a", "batch_b", "batch_c", "batch_d"];
+        for (index, id) in turns.iter().enumerate() {
+            if index != 0 {
+                let mut next = turn.clone();
+                next.id = (*id).into();
+                store
+                    .materialize_turn_start(
+                        &thread,
+                        SandboxMode::FullAccess,
+                        &next,
+                        &[],
+                        pioneer_protocol::PersistedActorRef::System,
+                    )
+                    .await
+                    .unwrap();
+            }
+            append_optional_delivery_test_items(&store, &thread, id, 2).await;
+        }
+        // Existing retry history is real persisted state, read back into each claim.
+        for (id, count, error) in [
+            ("batch_b", 2, "earlier error"),
+            ("batch_d", 9, "last retry"),
+        ] {
+            delivery::Entity::update_many()
+                .col_expr(delivery::Column::AttemptCount, Expr::value(count))
+                .col_expr(delivery::Column::LastError, Expr::value(error))
+                .filter(delivery::Column::TurnId.eq(id))
+                .filter(delivery::Column::Consumer.eq(LIVE))
+                .exec(&store.connection)
                 .await
                 .unwrap();
         }
-        append_optional_delivery_test_items(&store, &thread, id, 2).await;
-    }
-    // Existing retry history is real persisted state, read back into each claim.
-    for (id, count, error) in [
-        ("batch_b", 2, "earlier error"),
-        ("batch_d", 9, "last retry"),
-    ] {
-        delivery::Entity::update_many()
-            .col_expr(delivery::Column::AttemptCount, Expr::value(count))
-            .col_expr(delivery::Column::LastError, Expr::value(error))
-            .filter(delivery::Column::TurnId.eq(id))
-            .filter(delivery::Column::Consumer.eq(LIVE))
-            .exec(&store.connection)
-            .await
-            .unwrap();
-    }
-    let claims = store
-        .with_maintenance_access()
-        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
-        .await
-        .unwrap();
-    assert_eq!(
-        claims
-            .iter()
-            .map(|c| c.event.turn_id.as_str())
-            .collect::<Vec<_>>(),
-        turns
-    );
-    let outcomes = claims
-        .iter()
-        .enumerate()
-        .map(|(i, c)| crate::TurnEventDeliverySettlement {
-            id: c.id.clone(),
-            claim_token: c.claim_token.clone(),
-            at_unix: NOW,
-            outcome: match i {
-                0 => crate::TurnEventDeliveryOutcome::Delivered,
-                1 => crate::TurnEventDeliveryOutcome::ForegroundDeferred,
-                _ => crate::TurnEventDeliveryOutcome::Failed {
-                    attempt_count: c.attempt_count,
-                    error: format!("failure-{i}"),
-                },
-            },
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        store
+        let claims = store
             .with_maintenance_access()
-            .settle_turn_event_deliveries(&outcomes)
+            .claim_due_turn_event_deliveries(LIVE, NOW, 64)
             .await
-            .unwrap(),
-        4
-    );
-    assert_eq!(
-        store.settle_turn_event_deliveries(&outcomes).await.unwrap(),
-        0
-    );
-    for (i, claim) in claims.iter().enumerate() {
-        let row = delivery::Entity::find_by_id(claim.id.clone())
-            .one(&store.connection)
-            .await
-            .unwrap()
             .unwrap();
-        assert!(row.claim_token.is_none() && row.claim_expires_at.is_none());
-        match i {
-            0 => {
-                assert_eq!(row.status, "delivered");
-                assert_eq!(row.delivered_at, Some(unix_to_datetime(NOW)));
-                assert_eq!(row.attempt_count, 0);
-            }
-            1 => {
-                assert_eq!(row.status, "pending");
-                assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
-                assert_eq!(row.attempt_count, 2);
-                assert_eq!(row.last_error.as_deref(), Some("earlier error"));
-            }
-            2 => {
-                assert_eq!(row.status, "failed");
-                assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
-                assert_eq!(row.attempt_count, 1);
-                assert_eq!(row.last_error.as_deref(), Some("failure-2"));
-            }
-            _ => {
-                assert_eq!(row.status, "exhausted");
-                assert_eq!(row.attempt_count, 10);
-                assert_eq!(row.last_error.as_deref(), Some("failure-3"));
+        assert_eq!(
+            claims
+                .iter()
+                .map(|c| c.event.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            turns
+        );
+        let outcomes = claims
+            .iter()
+            .enumerate()
+            .map(|(i, c)| crate::TurnEventDeliverySettlement {
+                id: c.id.clone(),
+                claim_token: c.claim_token.clone(),
+                at_unix: NOW,
+                outcome: match i {
+                    0 => crate::TurnEventDeliveryOutcome::Delivered,
+                    1 => crate::TurnEventDeliveryOutcome::ForegroundDeferred,
+                    _ => crate::TurnEventDeliveryOutcome::Failed {
+                        attempt_count: c.attempt_count,
+                        error: format!("failure-{i}"),
+                    },
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .with_maintenance_access()
+                .settle_turn_event_deliveries(&outcomes)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store.settle_turn_event_deliveries(&outcomes).await.unwrap(),
+            0
+        );
+        for (i, claim) in claims.iter().enumerate() {
+            let row = delivery::Entity::find_by_id(claim.id.clone())
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(row.claim_token.is_none() && row.claim_expires_at.is_none());
+            match i {
+                0 => {
+                    assert_eq!(row.status, "delivered");
+                    assert_eq!(row.delivered_at, Some(unix_to_datetime(NOW)));
+                    assert_eq!(row.attempt_count, 0);
+                }
+                1 => {
+                    assert_eq!(row.status, "pending");
+                    assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
+                    assert_eq!(row.attempt_count, 2);
+                    assert_eq!(row.last_error.as_deref(), Some("earlier error"));
+                }
+                2 => {
+                    assert_eq!(row.status, "failed");
+                    assert_eq!(row.next_run_at, unix_to_datetime(NOW + 1));
+                    assert_eq!(row.attempt_count, 1);
+                    assert_eq!(row.last_error.as_deref(), Some("failure-2"));
+                }
+                _ => {
+                    assert_eq!(row.status, "exhausted");
+                    assert_eq!(row.attempt_count, 10);
+                    assert_eq!(row.last_error.as_deref(), Some("failure-3"));
+                }
             }
         }
-    }
-    let next = store
-        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
-        .await
-        .unwrap();
-    assert_eq!(
-        next.iter()
-            .map(|c| c.event.turn_id.as_str())
-            .collect::<Vec<_>>(),
-        ["batch_a", "batch_d"],
-        "only delivered/exhausted heads unblock their own successors"
-    );
+        let next = store
+            .claim_due_turn_event_deliveries(LIVE, NOW, 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            next.iter()
+                .map(|c| c.event.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            ["batch_a", "batch_d"],
+            "only delivered/exhausted heads unblock their own successors"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn corrupt_body_in_claim_batch_does_not_suppress_healthy_turn() {
-    let (store, thread, turn) =
-        test_store_with_started_turn("ws_corrupt_batch", "thr_corrupt_batch", "a_corrupt_batch")
-            .await;
-    append_optional_delivery_test_items(&store, &thread, &turn.id, 1).await;
-    let mut other = turn.clone();
-    other.id = "z_healthy_batch".into();
-    store
-        .materialize_turn_start(
-            &thread,
-            SandboxMode::FullAccess,
-            &other,
-            &[],
-            pioneer_protocol::PersistedActorRef::System,
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, thread, turn) = postgres_store_with_started_turn(
+            fixture,
+            "ws_corrupt_batch",
+            "thr_corrupt_batch",
+            "a_corrupt_batch",
         )
-        .await
-        .unwrap();
-    append_optional_delivery_test_items(&store, &thread, &other.id, 1).await;
-    let bad = delivery::Entity::find()
-        .filter(delivery::Column::TurnId.eq(turn.id.clone()))
-        .filter(delivery::Column::Consumer.eq(LIVE))
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    pioneer_entity::turn_event::Entity::update_many()
-        .col_expr(
-            pioneer_entity::turn_event::Column::Payload,
-            Expr::value("{invalid-json"),
-        )
-        .filter(pioneer_entity::turn_event::Column::Id.eq(bad.event_id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let claims = store
-        .claim_due_turn_event_deliveries(LIVE, NOW, 64)
-        .await
-        .unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].event.turn_id, other.id);
-    let bad = delivery::Entity::find_by_id(bad.id)
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(bad.status, "failed");
-    assert_eq!(bad.attempt_count, 1);
-    assert!(bad.claim_token.is_none());
-    assert_eq!(bad.next_run_at, unix_to_datetime(NOW + 1));
-    assert_eq!(
+        .await;
+        append_optional_delivery_test_items(&store, &thread, &turn.id, 1).await;
+        let mut other = turn.clone();
+        other.id = "z_healthy_batch".into();
         store
-            .settle_turn_event_deliveries(&[crate::TurnEventDeliverySettlement {
-                id: claims[0].id.clone(),
-                claim_token: claims[0].claim_token.clone(),
-                at_unix: NOW,
-                outcome: crate::TurnEventDeliveryOutcome::Delivered,
-            }])
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &other,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
             .await
-            .unwrap(),
-        1
-    );
+            .unwrap();
+        append_optional_delivery_test_items(&store, &thread, &other.id, 1).await;
+        let bad = delivery::Entity::find()
+            .filter(delivery::Column::TurnId.eq(turn.id.clone()))
+            .filter(delivery::Column::Consumer.eq(LIVE))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        pioneer_entity::turn_event::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event::Column::Payload,
+                Expr::value("{invalid-json"),
+            )
+            .filter(pioneer_entity::turn_event::Column::Id.eq(bad.event_id))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        let claims = store
+            .claim_due_turn_event_deliveries(LIVE, NOW, 64)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].event.turn_id, other.id);
+        let bad = delivery::Entity::find_by_id(bad.id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bad.status, "failed");
+        assert_eq!(bad.attempt_count, 1);
+        assert!(bad.claim_token.is_none());
+        assert_eq!(bad.next_run_at, unix_to_datetime(NOW + 1));
+        assert_eq!(
+            store
+                .settle_turn_event_deliveries(&[crate::TurnEventDeliverySettlement {
+                    id: claims[0].id.clone(),
+                    claim_token: claims[0].claim_token.clone(),
+                    at_unix: NOW,
+                    outcome: crate::TurnEventDeliveryOutcome::Delivered,
+                }])
+                .await
+                .unwrap(),
+            1
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

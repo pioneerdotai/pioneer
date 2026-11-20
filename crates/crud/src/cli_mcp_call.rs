@@ -113,7 +113,12 @@ impl CrudStore {
                 .await?
                 .pop()
                 .unwrap();
-                let payload: TurnEventPayload = serde_json::from_str(&event.payload)?;
+                let payload: TurnEventPayload = serde::Deserialize::deserialize(
+                    event
+                        .payload
+                        .as_ref()
+                        .context("missing canonical event payload")?,
+                )?;
                 match payload {
                     TurnEventPayload::ItemCompleted(saved)
                         if saved.workspace_id == notification.workspace_id

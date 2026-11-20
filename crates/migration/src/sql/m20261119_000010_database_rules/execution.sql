@@ -719,7 +719,7 @@ CREATE OR REPLACE FUNCTION "read_model_repair_turn_item_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF ((OLD.status IN ('completed', 'failed', 'timed_out', 'cancelled') OR NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')) AND (OLD.status IS DISTINCT FROM NEW.status OR (NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id AND OLD.payload::text IS DISTINCT FROM NEW.payload::text))) IS NOT TRUE THEN
+    IF ((OLD.status IN ('completed', 'failed', 'timed_out', 'cancelled') OR NEW.status IN ('completed', 'failed', 'timed_out', 'cancelled')) AND (OLD.status IS DISTINCT FROM NEW.status OR (NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id OR OLD.payload::text IS DISTINCT FROM NEW.payload::text))) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     UPDATE read_model_repair_change_sequence
@@ -742,5 +742,5 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "read_model_repair_turn_item_update" AFTER UPDATE OF status, payload
+CREATE TRIGGER "read_model_repair_turn_item_update" AFTER UPDATE OF status,payload,payload_payload_id
 ON "turn_item" FOR EACH ROW EXECUTE FUNCTION "read_model_repair_turn_item_update"();

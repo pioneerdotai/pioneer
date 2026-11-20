@@ -1,0 +1,37 @@
+name: Prepare bundled PostgreSQL
+description: Build the native PostgreSQL and pgvector runtime for a Gateway package.
+inputs:
+  target:
+    required: true
+    description: Rust host target of the PostgreSQL binaries.
+  out:
+    required: true
+    description: Directory to receive the relocatable runtime.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+    - name: install-linux-build-tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y bison flex
+    - uses: ilammy/msvc-dev-cmd@v1
+      if: runner.os == 'Windows'
+      with:
+        arch: x64
+    - name: install-windows-build-tools
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        python -m pip install meson ninja
+        if ($LASTEXITCODE -ne 0) { throw "Meson or Ninja installation failed" }
+        choco install winflexbison3 --yes --no-progress
+        if ($LASTEXITCODE -ne 0) { throw "winflexbison installation failed" }
+    - name: build-runtime
+      shell: bash
+      env:
+        POSTGRES_TARGET: ${{ inputs.target }}
+        POSTGRES_OUTPUT: ${{ inputs.out }}
+      run: python scripts/packaging/postgres-runtime.py --target "$POSTGRES_TARGET" --out "$POSTGRES_OUTPUT"

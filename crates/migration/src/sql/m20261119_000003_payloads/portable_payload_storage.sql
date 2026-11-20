@@ -1,0 +1,2 @@
+ALTER TABLE portable_payload_value ALTER COLUMN body SET STORAGE EXTERNAL;
+ALTER TABLE portable_payload_part ALTER COLUMN body SET STORAGE EXTERNAL;

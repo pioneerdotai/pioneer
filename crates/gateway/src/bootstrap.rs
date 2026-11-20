@@ -1,13 +1,9 @@
 use anyhow::{Context, Result};
-use pioneer_entity::workspace;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_anyhow_sqlite_lock, retry_with_backoff,
-};
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
-use std::time::Duration;
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::ConnectionTrait;
 use tracing::{info, warn};
 
+#[cfg(test)]
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
 const STARTUP_TURN_PROJECTION_REPLAY_LIMIT: u64 = 256;
@@ -272,40 +268,7 @@ async fn cleanup_turn_runtime_snapshots(connection: impl Into<SqliteDatabase>) -
 }
 
 async fn ensure_default_workspace_exists(connection: &impl ConnectionTrait) -> Result<bool> {
-    retry_with_backoff(
-        || async {
-            let inserted = workspace::ActiveModel {
-                id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
-                name: Set(DEFAULT_WORKSPACE_NAME.to_owned()),
-                is_active: Set(true),
-                is_current: Set(true),
-                ..Default::default()
-            }
-            .insert(connection)
-            .await;
-
-            match inserted {
-                Ok(_) => Ok(true),
-                Err(insert_error) => {
-                    let has_workspace = workspace::Entity::find()
-                        .one(connection)
-                        .await
-                        .context("failed to query existing workspaces after insert failure")?
-                        .is_some();
-
-                    if has_workspace {
-                        Ok(false)
-                    } else {
-                        Err(insert_error).context("failed to create default workspace")
-                    }
-                }
-            }
-        },
-        is_anyhow_sqlite_lock,
-        DEFAULT_LOCK_RETRY_ATTEMPTS,
-        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-    )
-    .await
+    pioneer_crud::workspace_repository::insert_default(connection).await
 }
 
 #[cfg(test)]
@@ -315,7 +278,6 @@ mod tests {
         ensure_default_workspace_exists, repair_terminal_turn_execution_windows,
         repair_turns_completed_after_final_agent_message,
     };
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, NewTurnExecutionWindowRecord, NewTurnLlmContextEntry};
     use pioneer_entity::{thread, turn, workspace};
     use pioneer_protocol::{
@@ -324,392 +286,317 @@ mod tests {
         Turn, TurnItem, TurnOrigin, TurnStatus,
     };
     use sea_orm::sea_query::Expr;
-    use sea_orm::{
-        ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, QueryOrder, Set,
-    };
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
     const DEFAULT_WORKSPACE_ID_LEN: usize = 21;
 
     #[tokio::test]
     async fn does_not_create_second_default_workspace() {
-        let connection = setup_workspace_database().await;
+        pioneer_postgres_test::with_database(async |test_database| {
+            let connection = setup_workspace_database(test_database).await;
 
-        let first_created = ensure_default_workspace_exists(&connection)
-            .await
-            .expect("first initialization should succeed");
-        assert!(first_created);
+            let first_created = ensure_default_workspace_exists(&connection)
+                .await
+                .expect("first initialization should succeed");
+            assert!(first_created);
 
-        let first_workspaces = workspace::Entity::find()
-            .all(&connection)
-            .await
-            .expect("must read workspaces after first initialization");
-        assert_eq!(first_workspaces.len(), 1);
-        let workspace = &first_workspaces[0];
-        assert_eq!(workspace.name, DEFAULT_WORKSPACE_NAME);
-        assert_eq!(workspace.id.len(), DEFAULT_WORKSPACE_ID_LEN);
-        assert_eq!(workspace.id, DEFAULT_WORKSPACE_ID);
-        assert!(workspace.is_active);
-        assert!(workspace.is_current);
+            let first_workspaces = workspace::Entity::find()
+                .all(&connection)
+                .await
+                .expect("must read workspaces after first initialization");
+            assert_eq!(first_workspaces.len(), 1);
+            let workspace = &first_workspaces[0];
+            assert_eq!(workspace.name, DEFAULT_WORKSPACE_NAME);
+            assert_eq!(workspace.id.len(), DEFAULT_WORKSPACE_ID_LEN);
+            assert_eq!(workspace.id, DEFAULT_WORKSPACE_ID);
+            assert!(workspace.is_active);
+            assert!(workspace.is_current);
 
-        let second_created = ensure_default_workspace_exists(&connection)
-            .await
-            .expect("second initialization should succeed");
-        assert!(!second_created);
+            let second_created = ensure_default_workspace_exists(&connection)
+                .await
+                .expect("second initialization should succeed");
+            assert!(!second_created);
 
-        let workspaces = workspace::Entity::find()
-            .all(&connection)
-            .await
-            .expect("must read workspaces");
-        assert_eq!(workspaces.len(), 1);
+            let workspaces = workspace::Entity::find()
+                .all(&connection)
+                .await
+                .expect("must read workspaces");
+            assert_eq!(workspaces.len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn bootstrap_replays_a_predecessor_before_reconciling_its_finalization() {
-        let connection = setup_workspace_database().await;
-        ensure_default_workspace_exists(&connection)
-            .await
-            .expect("default workspace should exist");
-        let timestamp = 1_700_000_000;
-        let thread_id = "thr_boot_recovery";
-        let turn_id = "turn_boot_recovery";
-        let final_item_id = "final_boot_recovery";
-        let store = CrudStore::new(connection.clone());
-        store
-            .materialize_turn_start(
-                &Thread {
-                    context_window: None,
-                    service_mode: None,
-                    context_authority: None,
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    id: thread_id.to_owned(),
-                    name: Some("Bootstrap recovery".to_owned()),
-                    preview: "recover".to_owned(),
-                    preview_author: None,
-                    mode: ThreadMode::Agent,
-                    model: "test-model".to_owned(),
-                    model_provider: "test-provider".to_owned(),
-                    reasoning_effort: None,
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                    status: ThreadStatus::Active,
-                    origin_kind: ThreadOriginKind::User,
-                    sidebar_visibility: ThreadSidebarVisibility::Visible,
-                    agent_nickname: None,
-                    agent_role: None,
-                    visibility: None,
-                    turns: Vec::new(),
-                },
-                SandboxMode::FullAccess,
-                &Turn {
-                    work_owner: Default::default(),
-                    id: turn_id.to_owned(),
-                    status: TurnStatus::InProgress,
-                    turn_kind: Default::default(),
-                    origin: TurnOrigin::User,
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
-                    ),
-                },
-                &[],
-                PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .prepare_turn_finalization(
-                &ItemCompletedNotification {
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::AgentMessage {
-                        id: final_item_id.to_owned(),
-                        text: "durable final answer".to_owned(),
-                        phase: AgentMessagePhase::FinalAnswer,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                },
-                1,
-                None,
-                timestamp + 1,
-            )
-            .await
-            .expect("finalization intent should prepare");
-
-        let first_event = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .one(&connection)
-            .await
-            .expect("turn event lookup should succeed")
-            .expect("turn start event should exist");
-        pioneer_entity::turn_event_projection_state::Entity::update_many()
-            .col_expr(
-                pioneer_entity::turn_event_projection_state::Column::Status,
-                Expr::value("failed"),
-            )
-            .col_expr(
-                pioneer_entity::turn_event_projection_state::Column::NextRunAt,
-                Expr::value(
-                    chrono::DateTime::from_timestamp(timestamp + 2, 0)
-                        .unwrap()
-                        .fixed_offset(),
-                ),
-            )
-            .col_expr(
-                pioneer_entity::turn_event_projection_state::Column::ClaimToken,
-                Expr::value(Option::<String>::None),
-            )
-            .col_expr(
-                pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
-                Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
-            )
-            .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(first_event.id))
-            .exec(&connection)
-            .await
-            .expect("turn start projection should become replayable");
-
-        bootstrap(&connection)
-            .await
-            .expect("causal recovery backlog must not create a bootstrap restart loop");
-
-        let (_, recovered_turn) = store
-            .get_turn(thread_id, turn_id)
-            .await
-            .expect("recovered Turn should load")
-            .expect("recovered Turn should exist");
-        assert_eq!(recovered_turn.status, TurnStatus::Completed);
-        assert!(
-            store
-                .get_turn_item(turn_id, final_item_id)
+        pioneer_postgres_test::with_database(async |test_database| {
+            let connection = setup_workspace_database(test_database).await;
+            ensure_default_workspace_exists(&connection)
                 .await
-                .expect("final item should load")
-                .is_some()
-        );
+                .expect("default workspace should exist");
+            let timestamp = 1_700_000_000;
+            let thread_id = "thr_boot_recovery";
+            let turn_id = "turn_boot_recovery";
+            let final_item_id = "final_boot_recovery";
+            let store = CrudStore::new(connection.clone());
+            store
+                .materialize_turn_start(
+                    &Thread {
+                        context_window: None,
+                        service_mode: None,
+                        context_authority: None,
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        id: thread_id.to_owned(),
+                        name: Some("Bootstrap recovery".to_owned()),
+                        preview: "recover".to_owned(),
+                        preview_author: None,
+                        mode: ThreadMode::Agent,
+                        model: "test-model".to_owned(),
+                        model_provider: "test-provider".to_owned(),
+                        reasoning_effort: None,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                        status: ThreadStatus::Active,
+                        origin_kind: ThreadOriginKind::User,
+                        sidebar_visibility: ThreadSidebarVisibility::Visible,
+                        agent_nickname: None,
+                        agent_role: None,
+                        visibility: None,
+                        turns: Vec::new(),
+                    },
+                    SandboxMode::FullAccess,
+                    &Turn {
+                        work_owner: Default::default(),
+                        id: turn_id.to_owned(),
+                        status: TurnStatus::InProgress,
+                        turn_kind: Default::default(),
+                        origin: TurnOrigin::User,
+                        mode: Default::default(),
+                        author: None,
+                        reply_to_turn_id: None,
+                        mentions: Vec::new(),
+                        message_revision: 0,
+                        message_deleted: false,
+                        error: None,
+                        prompt_manifest: None,
+                        permission_profile:
+                            pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    },
+                    &[],
+                    PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+            store
+                .prepare_turn_finalization(
+                    &ItemCompletedNotification {
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::AgentMessage {
+                            id: final_item_id.to_owned(),
+                            text: "durable final answer".to_owned(),
+                            phase: AgentMessagePhase::FinalAnswer,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    1,
+                    None,
+                    timestamp + 1,
+                )
+                .await
+                .expect("finalization intent should prepare");
+
+            let first_event = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+                .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+                .one(&connection)
+                .await
+                .expect("turn event lookup should succeed")
+                .expect("turn start event should exist");
+            pioneer_entity::turn_event_projection_state::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::Status,
+                    Expr::value("failed"),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                    Expr::value(
+                        chrono::DateTime::from_timestamp(timestamp + 2, 0)
+                            .unwrap()
+                            .fixed_offset(),
+                    ),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                    Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
+                )
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::EventId.eq(first_event.id),
+                )
+                .exec(&connection)
+                .await
+                .expect("turn start projection should become replayable");
+
+            bootstrap(&connection)
+                .await
+                .expect("causal recovery backlog must not create a bootstrap restart loop");
+
+            let (_, recovered_turn) = store
+                .get_turn(thread_id, turn_id)
+                .await
+                .expect("recovered Turn should load")
+                .expect("recovered Turn should exist");
+            assert_eq!(recovered_turn.status, TurnStatus::Completed);
+            assert!(
+                store
+                    .get_turn_item(turn_id, final_item_id)
+                    .await
+                    .expect("final item should load")
+                    .is_some()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn cleanup_removes_llm_context_for_terminal_turns() {
-        let connection = setup_workspace_database().await;
-        let now = chrono::Utc::now().fixed_offset();
-        turn::ActiveModel {
-            id: Set("terminal_turn".to_owned()),
-            thread_id: Set("thread_1".to_owned()),
-            status: Set("completed".to_owned()),
-            turn_kind: Set("conversation".to_owned()),
-            origin: Set("user".to_owned()),
-            error: Set(None),
-            prompt_manifest_json: Set("{}".to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&connection)
-        .await
-        .expect("terminal turn insert should succeed");
-        turn::ActiveModel {
-            id: Set("active_turn".to_owned()),
-            thread_id: Set("thread_1".to_owned()),
-            status: Set("in_progress".to_owned()),
-            turn_kind: Set("conversation".to_owned()),
-            origin: Set("user".to_owned()),
-            error: Set(None),
-            prompt_manifest_json: Set("{}".to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&connection)
-        .await
-        .expect("active turn insert should succeed");
+        pioneer_postgres_test::with_database(async |test_database| {
+            let connection = setup_workspace_database(test_database).await;
+            let now = chrono::Utc::now().fixed_offset();
+            turn::ActiveModel {
+                id: Set("terminal_turn".to_owned()),
+                thread_id: Set("thread_1".to_owned()),
+                status: Set("completed".to_owned()),
+                turn_kind: Set("conversation".to_owned()),
+                origin: Set("user".to_owned()),
+                error: Set(None),
+                prompt_manifest_json: Set("{}".to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&connection)
+            .await
+            .expect("terminal turn insert should succeed");
+            turn::ActiveModel {
+                id: Set("active_turn".to_owned()),
+                thread_id: Set("thread_1".to_owned()),
+                status: Set("in_progress".to_owned()),
+                turn_kind: Set("conversation".to_owned()),
+                origin: Set("user".to_owned()),
+                error: Set(None),
+                prompt_manifest_json: Set("{}".to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&connection)
+            .await
+            .expect("active turn insert should succeed");
 
-        let store = CrudStore::new(connection.clone());
-        store
-            .insert_turn_llm_context(NewTurnLlmContextEntry {
-                turn_id: "terminal_turn".to_owned(),
-                item_id: Some("item_1".to_owned()),
-                attempt_id: None,
-                sequence: 1,
-                source: "tool_result".to_owned(),
-                tool_name: Some("web_fetch".to_owned()),
-                payload: "{}".to_owned(),
-                output_policy_snapshot: "{}".to_owned(),
-                created_at: now,
-                expires_at: None,
-            })
-            .await
-            .expect("llm context insert should succeed");
-        store
-            .insert_turn_llm_context(NewTurnLlmContextEntry {
-                turn_id: "active_turn".to_owned(),
-                item_id: Some("item_2".to_owned()),
-                attempt_id: None,
-                sequence: 2,
-                source: "tool_result".to_owned(),
-                tool_name: Some("read_file".to_owned()),
-                payload: "{}".to_owned(),
-                output_policy_snapshot: "{}".to_owned(),
-                created_at: now,
-                expires_at: Some(now - chrono::Duration::days(1)),
-            })
-            .await
-            .expect("expired llm context insert should succeed");
-
-        let (deleted_terminal, deleted_expired) = cleanup_turn_llm_context(&connection)
-            .await
-            .expect("cleanup should succeed");
-        assert_eq!(deleted_terminal, 1);
-        assert_eq!(deleted_expired, 0);
-        assert!(
+            let store = CrudStore::new(connection.clone());
             store
-                .list_turn_llm_context("terminal_turn")
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: "terminal_turn".to_owned(),
+                    item_id: Some("item_1".to_owned()),
+                    attempt_id: None,
+                    sequence: 1,
+                    source: "tool_result".to_owned(),
+                    tool_name: Some("web_fetch".to_owned()),
+                    payload: "{}".to_owned(),
+                    output_policy_snapshot: "{}".to_owned(),
+                    created_at: now,
+                    expires_at: None,
+                })
                 .await
-                .expect("context list should succeed")
-                .is_empty()
-        );
-        let active_context = store
-            .list_turn_llm_context("active_turn")
-            .await
-            .expect("active context list should succeed");
-        assert_eq!(active_context.len(), 1);
-        assert_eq!(active_context[0].item_id.as_deref(), Some("item_2"));
+                .expect("llm context insert should succeed");
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: "active_turn".to_owned(),
+                    item_id: Some("item_2".to_owned()),
+                    attempt_id: None,
+                    sequence: 2,
+                    source: "tool_result".to_owned(),
+                    tool_name: Some("read_file".to_owned()),
+                    payload: "{}".to_owned(),
+                    output_policy_snapshot: "{}".to_owned(),
+                    created_at: now,
+                    expires_at: Some(now - chrono::Duration::days(1)),
+                })
+                .await
+                .expect("expired llm context insert should succeed");
+
+            let (deleted_terminal, deleted_expired) = cleanup_turn_llm_context(&connection)
+                .await
+                .expect("cleanup should succeed");
+            assert_eq!(deleted_terminal, 1);
+            assert_eq!(deleted_expired, 0);
+            assert!(
+                store
+                    .list_turn_llm_context("terminal_turn")
+                    .await
+                    .expect("context list should succeed")
+                    .is_empty()
+            );
+            let active_context = store
+                .list_turn_llm_context("active_turn")
+                .await
+                .expect("active context list should succeed");
+            assert_eq!(active_context.len(), 1);
+            assert_eq!(active_context[0].item_id.as_deref(), Some("item_2"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn bootstrap_repair_completes_turn_after_final_agent_message() {
-        let connection = setup_workspace_database().await;
-        ensure_default_workspace_exists(&connection)
-            .await
-            .expect("default workspace creation should succeed");
-        let now = chrono::Utc::now().fixed_offset();
-        let thread_id = "thread_final_agent_message";
-        let turn_id = "turn_final_agent_message";
+        pioneer_postgres_test::with_database(async |test_database| {
+            let connection = setup_workspace_database(test_database).await;
+            ensure_default_workspace_exists(&connection)
+                .await
+                .expect("default workspace creation should succeed");
+            let now = chrono::Utc::now().fixed_offset();
+            let thread_id = "thread_final_agent_message";
+            let turn_id = "turn_final_agent_message";
 
-        thread::ActiveModel {
-            workspace_unread_started_at: sea_orm::NotSet,
-            id: Set(thread_id.to_owned()),
-            workspace_id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
-            name: Set(Some("final message repair".to_owned())),
-            preview: Set("final message repair".to_owned()),
-            preview_author_json: Set(None),
-            mode: Set("agent".to_owned()),
-            model: Set("model-a".to_owned()),
-            model_provider: Set("provider-a".to_owned()),
-            status: Set("active".to_owned()),
-            origin_kind: Set("user".to_owned()),
-            sidebar_visibility: Set("visible".to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&connection)
-        .await
-        .expect("thread insert should succeed");
-        turn::ActiveModel {
-            id: Set(turn_id.to_owned()),
-            thread_id: Set(thread_id.to_owned()),
-            status: Set("in_progress".to_owned()),
-            turn_kind: Set("conversation".to_owned()),
-            origin: Set("user".to_owned()),
-            error: Set(None),
-            prompt_manifest_json: Set("{}".to_owned()),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&connection)
-        .await
-        .expect("turn insert should succeed");
-
-        let store = CrudStore::new(connection.clone());
-        let window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 1,
-                    tool_call_count: 1,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({"runtimeWindowId": "running_window"}),
-                    started_at: now,
-                },
-                now,
-                now,
-            )
+            thread::ActiveModel {
+                workspace_unread_started_at: sea_orm::NotSet,
+                id: Set(thread_id.to_owned()),
+                workspace_id: Set(DEFAULT_WORKSPACE_ID.to_owned()),
+                name: Set(Some("final message repair".to_owned())),
+                preview: Set("final message repair".to_owned()),
+                preview_author_json: Set(None),
+                mode: Set("agent".to_owned()),
+                model: Set("model-a".to_owned()),
+                model_provider: Set("provider-a".to_owned()),
+                status: Set("active".to_owned()),
+                origin_kind: Set("user".to_owned()),
+                sidebar_visibility: Set("visible".to_owned()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&connection)
             .await
-            .expect("running window should insert");
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::AgentMessage {
-                        id: "agent_final_message".to_owned(),
-                        text: "done".to_owned(),
-                        phase: Default::default(),
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                },
-                now.timestamp(),
-            )
-            .await
-            .expect("final agent message should materialize");
-
-        let repaired_completed = repair_turns_completed_after_final_agent_message(&connection)
-            .await
-            .expect("final-agent-message repair should succeed");
-        assert_eq!(repaired_completed, 1);
-        let repaired_windows = repair_terminal_turn_execution_windows(&connection)
-            .await
-            .expect("execution window repair should succeed");
-        assert_eq!(repaired_windows, 1);
-
-        let (_workspace_id, repaired_turn) = store
-            .get_turn(thread_id, turn_id)
-            .await
-            .expect("turn should load")
-            .expect("turn should exist");
-        assert_eq!(repaired_turn.status, TurnStatus::Completed);
-        let repaired_window = store
-            .get_turn_execution_window(window.id.as_str())
-            .await
-            .expect("window should load")
-            .expect("window should exist");
-        assert_eq!(repaired_window.status, ExecutionWindowStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_repair_closes_active_execution_windows_for_terminal_turns() {
-        let connection = setup_workspace_database().await;
-        let now = chrono::Utc::now().fixed_offset();
-        for (turn_id, status, error) in [
-            (
-                "blocked_turn_with_running_window",
-                "blocked",
-                Some("operator action required"),
-            ),
-            ("active_turn_with_running_window", "in_progress", None),
-        ] {
+            .expect("thread insert should succeed");
             turn::ActiveModel {
                 id: Set(turn_id.to_owned()),
-                thread_id: Set("thread_1".to_owned()),
-                status: Set(status.to_owned()),
+                thread_id: Set(thread_id.to_owned()),
+                status: Set("in_progress".to_owned()),
                 turn_kind: Set("conversation".to_owned()),
                 origin: Set("user".to_owned()),
-                error: Set(error.map(str::to_owned)),
+                error: Set(None),
                 prompt_manifest_json: Set("{}".to_owned()),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -718,91 +605,192 @@ mod tests {
             .insert(&connection)
             .await
             .expect("turn insert should succeed");
-        }
 
-        let store = CrudStore::new(connection.clone());
-        let blocked_window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    thread_id: "thread_1".to_owned(),
-                    turn_id: "blocked_turn_with_running_window".to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 1,
-                    tool_call_count: 1,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({"runtimeWindowId": "blocked_window"}),
-                    started_at: now,
-                },
-                now,
-                now,
-            )
-            .await
-            .expect("blocked turn window should insert");
-        let active_window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
-                    thread_id: "thread_1".to_owned(),
-                    turn_id: "active_turn_with_running_window".to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 1,
-                    tool_call_count: 1,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({"runtimeWindowId": "active_window"}),
-                    started_at: now,
-                },
-                now,
-                now,
-            )
-            .await
-            .expect("active turn window should insert");
+            let store = CrudStore::new(connection.clone());
+            let window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 1,
+                        tool_call_count: 1,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({"runtimeWindowId": "running_window"}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .expect("running window should insert");
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::AgentMessage {
+                            id: "agent_final_message".to_owned(),
+                            text: "done".to_owned(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    now.timestamp(),
+                )
+                .await
+                .expect("final agent message should materialize");
 
-        let repaired = repair_terminal_turn_execution_windows(&connection)
-            .await
-            .expect("execution window repair should succeed");
-        assert_eq!(repaired, 1);
+            let repaired_completed = repair_turns_completed_after_final_agent_message(&connection)
+                .await
+                .expect("final-agent-message repair should succeed");
+            assert_eq!(repaired_completed, 1);
+            let repaired_windows = repair_terminal_turn_execution_windows(&connection)
+                .await
+                .expect("execution window repair should succeed");
+            assert_eq!(repaired_windows, 1);
 
-        let repaired_window = store
-            .get_turn_execution_window(blocked_window.id.as_str())
-            .await
-            .expect("blocked window should reload")
-            .expect("blocked window should exist");
-        assert_eq!(repaired_window.status, ExecutionWindowStatus::Blocked);
-        assert_eq!(
-            repaired_window
-                .metadata_json
-                .get("repairedBy")
-                .and_then(serde_json::Value::as_str),
-            Some("bootstrap_terminal_turn_window_repair")
-        );
-        assert_eq!(
-            repaired_window
-                .metadata_json
-                .get("terminalReason")
-                .and_then(serde_json::Value::as_str),
-            Some("operator action required")
-        );
-
-        let untouched_window = store
-            .get_turn_execution_window(active_window.id.as_str())
-            .await
-            .expect("active window should reload")
-            .expect("active window should exist");
-        assert_eq!(untouched_window.status, ExecutionWindowStatus::Running);
+            let (_workspace_id, repaired_turn) = store
+                .get_turn(thread_id, turn_id)
+                .await
+                .expect("turn should load")
+                .expect("turn should exist");
+            assert_eq!(repaired_turn.status, TurnStatus::Completed);
+            let repaired_window = store
+                .get_turn_execution_window(window.id.as_str())
+                .await
+                .expect("window should load")
+                .expect("window should exist");
+            assert_eq!(repaired_window.status, ExecutionWindowStatus::Completed);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
-    async fn setup_workspace_database() -> sea_orm::DatabaseConnection {
-        let connection = Database::connect("sqlite::memory:")
+    #[tokio::test]
+    async fn bootstrap_repair_closes_active_execution_windows_for_terminal_turns() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let connection = setup_workspace_database(test_database).await;
+            let now = chrono::Utc::now().fixed_offset();
+            for (turn_id, status, error) in [
+                (
+                    "blocked_turn_with_running_window",
+                    "blocked",
+                    Some("operator action required"),
+                ),
+                ("active_turn_with_running_window", "in_progress", None),
+            ] {
+                turn::ActiveModel {
+                    id: Set(turn_id.to_owned()),
+                    thread_id: Set("thread_1".to_owned()),
+                    status: Set(status.to_owned()),
+                    turn_kind: Set("conversation".to_owned()),
+                    origin: Set("user".to_owned()),
+                    error: Set(error.map(str::to_owned)),
+                    prompt_manifest_json: Set("{}".to_owned()),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(&connection)
+                .await
+                .expect("turn insert should succeed");
+            }
+
+            let store = CrudStore::new(connection.clone());
+            let blocked_window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        thread_id: "thread_1".to_owned(),
+                        turn_id: "blocked_turn_with_running_window".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 1,
+                        tool_call_count: 1,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({"runtimeWindowId": "blocked_window"}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .expect("blocked turn window should insert");
+            let active_window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                        thread_id: "thread_1".to_owned(),
+                        turn_id: "active_turn_with_running_window".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 1,
+                        tool_call_count: 1,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({"runtimeWindowId": "active_window"}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .expect("active turn window should insert");
+
+            let repaired = repair_terminal_turn_execution_windows(&connection)
+                .await
+                .expect("execution window repair should succeed");
+            assert_eq!(repaired, 1);
+
+            let repaired_window = store
+                .get_turn_execution_window(blocked_window.id.as_str())
+                .await
+                .expect("blocked window should reload")
+                .expect("blocked window should exist");
+            assert_eq!(repaired_window.status, ExecutionWindowStatus::Blocked);
+            assert_eq!(
+                repaired_window
+                    .metadata_json
+                    .get("repairedBy")
+                    .and_then(serde_json::Value::as_str),
+                Some("bootstrap_terminal_turn_window_repair")
+            );
+            assert_eq!(
+                repaired_window
+                    .metadata_json
+                    .get("terminalReason")
+                    .and_then(serde_json::Value::as_str),
+                Some("operator action required")
+            );
+
+            let untouched_window = store
+                .get_turn_execution_window(active_window.id.as_str())
+                .await
+                .expect("active window should reload")
+                .expect("active window should exist");
+            assert_eq!(untouched_window.status, ExecutionWindowStatus::Running);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn setup_workspace_database(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> sea_orm::DatabaseConnection {
+        let connection = test_database.connection();
+        workspace::Entity::delete_by_id(DEFAULT_WORKSPACE_ID)
+            .exec(connection)
             .await
-            .expect("must connect to in-memory database");
-        Migrator::up(&connection, None)
-            .await
-            .expect("must apply migrations");
-        connection
+            .unwrap();
+        connection.clone()
     }
 }

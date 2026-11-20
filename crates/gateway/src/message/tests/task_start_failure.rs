@@ -2266,7 +2266,7 @@ async fn retain_cleanup_fixture_snapshot(store: &pioneer_crud::CrudStore, turn_i
             turn_id: turn_id.to_owned(),
             thread_id: binding.thread_id,
             workspace_id: binding.workspace_id,
-            mode_json: r#""Agent""#.to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             model: "gpt-5".to_owned(),
             provider_name: format!("cli_runtime:{}", binding.runtime_id),
             reasoning_effort: None,

@@ -1137,12 +1137,7 @@ fn gateway_asset_file_name_for(os: &str, arch: &str, computer_use: bool) -> Resu
     } else {
         ""
     };
-    let extension = if computer_use || os == "windows" || (os == "macos" && arch == "x86_64") {
-        "zip"
-    } else {
-        "gz"
-    };
-    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.{extension}"))
+    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.zip"))
 }
 
 fn persist_install_state(
@@ -1882,7 +1877,7 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
             );
         }
         if let Ok(companion) = relative.strip_prefix("cua") {
-            if !cfg!(feature = "computer-use") {
+            if !cfg!(feature = "computer-use") && !companion.starts_with("postgres") {
                 bail!("server archive must not contain a CUA payload");
             }
             if companion.as_os_str().is_empty() {
@@ -1986,7 +1981,7 @@ fn activate_install_companions(directory: &Path) -> Result<()> {
     }
     let current = directory.join("cua");
     let next = directory.join("cua.next");
-    if !current.exists() && !next.join("native-libs").exists() {
+    if !current.exists() && !next.join("native-libs").exists() && !next.join("postgres").exists() {
         if next.exists() {
             fs::remove_dir_all(next)?;
         }
@@ -2000,7 +1995,7 @@ fn activate_install_companions(directory: &Path) -> Result<()> {
 
 fn validate_cua_payload(payload: &Path) -> Result<()> {
     anyhow::ensure!(
-        fs::metadata(payload.join("manifest.json"))?.len() <= 16 * 1024,
+        fs::metadata(payload.join("manifest.json"))?.len() <= 4 * 1024 * 1024,
         "CUA manifest exceeds size budget"
     );
     let manifest: serde_json::Value =
@@ -4233,19 +4228,19 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
             (
                 "linux",
                 "x86_64",
-                "pioneer-gateway-linux-x86_64.gz",
+                "pioneer-gateway-linux-x86_64.zip",
                 "pioneer-gateway-linux-x86_64-computer-use-package.zip",
             ),
             (
                 "linux",
                 "aarch64",
-                "pioneer-gateway-linux-aarch64.gz",
+                "pioneer-gateway-linux-aarch64.zip",
                 "pioneer-gateway-linux-aarch64-computer-use-package.zip",
             ),
             (
                 "macos",
                 "aarch64",
-                "pioneer-gateway-macos-aarch64.gz",
+                "pioneer-gateway-macos-aarch64.zip",
                 "pioneer-gateway-macos-aarch64-computer-use-package.zip",
             ),
             (

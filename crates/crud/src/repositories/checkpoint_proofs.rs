@@ -22,7 +22,9 @@ use pioneer_entity::{
     compaction_task_output as task_output, task_delivery as delivery,
     task_result_candidate as candidate, thread, turn,
 };
-use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, OnConflict, Order, Query};
+use sea_orm::sea_query::{
+    Alias as SqlAlias, Expr, ExprTrait, JoinType, LockType, OnConflict, Order, Query,
+};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter,
     QueryOrder, QuerySelect, QueryTrait, RelationTrait, Statement, TransactionTrait,
@@ -516,7 +518,7 @@ fn import_identity(proof: &import::Model) -> Result<Vec<u8>> {
     ))?)
 }
 fn target_reference_statement(manifest: &str, ordinal: u64) -> Result<Statement> {
-    Ok(DbBackend::Sqlite.build(
+    Ok(DbBackend::Postgres.build(
         &Query::select()
             .columns([SqlAlias::new("reference_json"), SqlAlias::new("bytes")])
             .from(SqlAlias::new("compaction_frozen_message"))
@@ -525,7 +527,7 @@ fn target_reference_statement(manifest: &str, ordinal: u64) -> Result<Statement>
             .and_where(
                 Expr::col(SqlAlias::new("bytes")).between(0, i64::try_from(SOURCE_PAGE_BYTES)?),
             )
-            .and_where(Expr::cust("length(CAST(reference_json AS BLOB))=bytes"))
+            .and_where(Expr::cust("octet_length(reference_json::text)=bytes"))
             .limit(1)
             .to_owned(),
     ))
@@ -946,11 +948,10 @@ fn unsealed_checkpoint(id: &str) -> Expr {
 }
 
 // Byte length must be checked by the payload SELECT, before JSON is returned.
-// SQLite BLOB length is needed for UTF-8 bytes; this is a local expression,
-// not a reason to bypass the typed read/insert statement.
+// Use the byte length of each stored UTF-8 field.
 fn import_payload_size() -> Expr {
     Expr::cust(
-        "length(CAST(proof_json AS BLOB))+length(CAST(target_source_thread AS BLOB))+length(CAST(context_thread AS BLOB))+COALESCE(length(CAST(target_checkpoint_json AS BLOB)),0)",
+        "octet_length(proof_json::text)::bigint+octet_length(target_source_thread)::bigint+octet_length(context_thread)::bigint+COALESCE(octet_length(target_checkpoint_json::text),0)",
     )
 }
 
@@ -987,12 +988,13 @@ async fn stage_import(store: &CrudStore, proof: &import::Model) -> Result<()> {
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             tx.execute(&insert).await?;
-            let exact =
-                import::Entity::find_by_id((proof.checkpoint_id.clone(), proof.import_ordinal))
-                    .filter(import::Column::Bytes.between(0, FROZEN_IMPORT_PAGE_BYTES as i64))
-                    .filter(import_payload_size().lte(FROZEN_IMPORT_PAGE_BYTES as i64))
-                    .one(&tx)
-                    .await?;
+            let exact = import::Entity::find()
+                .filter(import::Column::CheckpointId.eq(&proof.checkpoint_id))
+                .filter(import::Column::ImportOrdinal.eq(proof.import_ordinal))
+                .filter(import::Column::Bytes.between(0, FROZEN_IMPORT_PAGE_BYTES as i64))
+                .filter(import_payload_size().lte(FROZEN_IMPORT_PAGE_BYTES as i64))
+                .one(&tx)
+                .await?;
             ensure!(
                 exact.as_ref() == Some(proof),
                 "selected import staging conflict"
@@ -1110,19 +1112,18 @@ async fn stage_event(store: &CrudStore, id: &str, event: &Event) -> Result<()> {
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
             tx.execute(&insert).await?;
-            let found = event_input::Entity::find_by_id((
-                id.to_owned(),
-                event.source_thread.clone(),
-                event.source_scope.clone(),
-                event.source_id.clone(),
-                event.source_version.clone(),
-            ))
-            .select_only()
-            .column(event_input::Column::CheckpointId)
-            .filter(event_input::Column::Role.eq(&event.role))
-            .into_tuple::<String>()
-            .one(&tx)
-            .await?;
+            let found = event_input::Entity::find()
+                .select_only()
+                .column(event_input::Column::CheckpointId)
+                .filter(event_input::Column::CheckpointId.eq(id))
+                .filter(event_input::Column::SourceThread.eq(&event.source_thread))
+                .filter(event_input::Column::SourceScope.eq(&event.source_scope))
+                .filter(event_input::Column::SourceId.eq(&event.source_id))
+                .filter(event_input::Column::SourceVersion.eq(&event.source_version))
+                .filter(event_input::Column::Role.eq(&event.role))
+                .into_tuple::<String>()
+                .one(&tx)
+                .await?;
             ensure!(found.is_some(), "event role staging conflict");
             tx.commit().await?;
             Ok(())
@@ -1148,7 +1149,9 @@ async fn read_import(store: &CrudStore, id: &str, after: i64) -> Result<Option<i
         (0..=FROZEN_IMPORT_PAGE_BYTES as i64).contains(&bytes),
         "invalid permanent import size"
     );
-    let row = import::Entity::find_by_id((id.to_owned(), ordinal))
+    let row = import::Entity::find()
+        .filter(import::Column::CheckpointId.eq(id))
+        .filter(import::Column::ImportOrdinal.eq(ordinal))
         .filter(import::Column::Bytes.eq(bytes))
         .filter(import_payload_size().eq(bytes))
         .one(&store.connection)
@@ -1186,7 +1189,7 @@ impl MetadataReadback {
         };
         let sum = columns
             .split(',')
-            .map(|c| format!("COALESCE(length(CAST({c} AS BLOB)),0)"))
+            .map(|c| format!("COALESCE(octet_length({c}::text),0)::bigint"))
             .collect::<Vec<_>>()
             .join("+");
         let size = store
@@ -1194,11 +1197,11 @@ impl MetadataReadback {
             .query_one(
                 &Query::select()
                     .from(SqlAlias::new(table))
-                    .column(SqlAlias::new("rowid"))
+                    .column(SqlAlias::new("insertion_ordinal"))
                     .expr_as(Expr::cust(sum.clone()), SqlAlias::new("bytes"))
                     .and_where(Expr::col(SqlAlias::new("checkpoint_id")).eq(id))
-                    .and_where(Expr::col(SqlAlias::new("rowid")).gt(after))
-                    .order_by(SqlAlias::new("rowid"), Order::Asc)
+                    .and_where(Expr::col(SqlAlias::new("insertion_ordinal")).gt(after))
+                    .order_by(SqlAlias::new("insertion_ordinal"), Order::Asc)
                     .limit(1)
                     .to_owned(),
             )
@@ -1211,7 +1214,7 @@ impl MetadataReadback {
             }
             return Ok(());
         };
-        let rowid: i64 = size.try_get("", "rowid")?;
+        let insertion_ordinal: i64 = size.try_get("", "insertion_ordinal")?;
         let bytes: i64 = size.try_get("", "bytes")?;
         ensure!(
             (0..=SOURCE_PAGE_BYTES as i64).contains(&bytes),
@@ -1223,9 +1226,10 @@ impl MetadataReadback {
                 &Query::select()
                     .from(SqlAlias::new(table))
                     .column(SqlAlias::new("checkpoint_id"))
+                    .column(SqlAlias::new("insertion_ordinal"))
                     .columns(columns.split(',').map(SqlAlias::new))
                     .and_where(Expr::col(SqlAlias::new("checkpoint_id")).eq(id))
-                    .and_where(Expr::col(SqlAlias::new("rowid")).eq(rowid))
+                    .and_where(Expr::col(SqlAlias::new("insertion_ordinal")).eq(insertion_ordinal))
                     .and_where(Expr::cust(sum.clone()).eq(bytes))
                     .limit(1)
                     .to_owned(),
@@ -1237,7 +1241,7 @@ impl MetadataReadback {
                 pioneer_entity::compaction_checkpoint_event_input::Model::from_query_result(
                     &row, "",
                 )?;
-            self.event_after = rowid;
+            self.event_after = insertion_ordinal;
             self.metadata.events.insert(Event {
                 source_thread: saved.source_thread,
                 source_scope: saved.source_scope,
@@ -1250,7 +1254,7 @@ impl MetadataReadback {
                 pioneer_entity::compaction_checkpoint_replay_alias::Model::from_query_result(
                     &row, "",
                 )?;
-            self.alias_after = rowid;
+            self.alias_after = insertion_ordinal;
             self.metadata.aliases.insert(Alias {
                 covered_thread: saved.covered_thread,
                 covered_scope: saved.covered_scope,
@@ -1260,7 +1264,7 @@ impl MetadataReadback {
                 replay_scope: saved.replay_scope,
                 replay_id: saved.replay_id,
                 replay_version: saved.replay_version,
-                tool_item_id: saved.tool_item_id.0,
+                tool_item_id: saved.tool_item_id,
             });
         }
         ensure!(
@@ -1480,6 +1484,15 @@ impl NodePreparation {
             super::compaction_runner::PublicationTestPause::ProofSeal,
         )
         .await;
+        let foreign = self
+            .scan
+            .ownership
+            .keys()
+            .filter_map(|source| {
+                let owner = source.scope.strip_prefix("checkpoint:")?;
+                Some((source.id.as_str(), owner, source.version.as_str()))
+            })
+            .collect::<BTreeSet<_>>();
         store
             .run_serialized_write(|| async {
                 #[cfg(test)]
@@ -1487,6 +1500,54 @@ impl NodePreparation {
                     &row.operation_id,
                 );
                 let tx = store.connection.begin().await?;
+                // Use the trigger's lock order. The operation lock fences plan
+                // and projection changes and the origin lock fences expiry.
+                ensure!(
+                    checkpoint::Entity::find_by_id(&row.id)
+                        .select_only()
+                        .column(checkpoint::Column::Id)
+                        .lock(LockType::NoKeyUpdate)
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?
+                        .is_some(),
+                    "proof candidate disappeared"
+                );
+                ensure!(
+                    context::Entity::find_by_id(&row.owner)
+                        .select_only()
+                        .column(context::Column::Owner)
+                        .lock_shared()
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?
+                        .is_some(),
+                    "proof context disappeared"
+                );
+                ensure!(
+                    operation::Entity::find_by_id(&row.operation_id)
+                        .select_only()
+                        .column(operation::Column::Id)
+                        .lock(LockType::NoKeyUpdate)
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?
+                        .is_some(),
+                    "proof operation disappeared"
+                );
+                if let Some(header) = &self.scan.header {
+                    ensure!(
+                        history::Entity::find_by_id(&header.id)
+                            .select_only()
+                            .column(history::Column::Id)
+                            .lock_shared()
+                            .into_tuple::<String>()
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "proof origin disappeared"
+                    );
+                }
                 ensure!(
                     control(&tx, &row.operation_id).await? == self.control,
                     "proof operation changed during preparation"
@@ -1504,6 +1565,41 @@ impl NodePreparation {
                     current.coverage_closed == 1,
                     "proof portion lost its immutable boundary"
                 );
+                if let Some(previous) = &row.previous {
+                    ensure!(
+                        checkpoint::Entity::find_by_id(previous)
+                            .select_only()
+                            .column(checkpoint::Column::Id)
+                            .filter(checkpoint::Column::Owner.eq(&row.owner))
+                            .filter(checkpoint::Column::ProofVersion.eq(1))
+                            .into_tuple::<String>()
+                            .one(&tx)
+                            .await?
+                            .is_some(),
+                        "previous proof changed before seal"
+                    );
+                }
+                if !foreign.is_empty() {
+                    let dependencies = checkpoint::Entity::find()
+                        .select_only()
+                        .columns([
+                            checkpoint::Column::Id,
+                            checkpoint::Column::Owner,
+                            checkpoint::Column::IdentitySha256,
+                        ])
+                        .filter(checkpoint::Column::Id.is_in(foreign.iter().map(|entry| entry.0)))
+                        .filter(checkpoint::Column::ProofVersion.eq(1))
+                        .into_tuple::<(String, String, String)>()
+                        .all(&tx)
+                        .await?;
+                    let dependencies = dependencies
+                        .iter()
+                        .map(|(id, owner, identity)| {
+                            (id.as_str(), owner.as_str(), identity.as_str())
+                        })
+                        .collect::<BTreeSet<_>>();
+                    ensure!(dependencies == foreign, "foreign proof changed before seal");
+                }
                 if let Some(header) = &self.scan.header {
                     let binding = projection::Entity::find()
                         .select_only()
@@ -1550,9 +1646,8 @@ impl NodePreparation {
                 // Coverage/ownership/binding/identity are immutable behind the
                 // closed portion. Staging writers add only exact selected values;
                 // cleanup requires expired origin + no reader/active operation.
-                // Every checked dependency has a permanent incoming edge from this
-                // frozen node, which forbids demotion even while our marker is 0.
-                // Consequently no set scan or per-dependency query belongs here.
+                // Every checked dependency has a permanent incoming edge from
+                // this frozen node, which forbids demotion during publication.
                 checkpoint::Entity::update_many()
                     .col_expr(checkpoint::Column::ProofVersion, Expr::val(1))
                     .filter(checkpoint::Column::Id.eq(&row.id))
@@ -2351,17 +2446,18 @@ impl CheckpointIdentityRead {
             .query_one(
                 &Query::select()
                     .from(checkpoint::Entity)
-                    .columns([
-                        checkpoint::Column::ProjectionVersion,
-                        checkpoint::Column::Selection,
-                    ])
+                    .column(checkpoint::Column::ProjectionVersion)
                     .expr_as(
-                        Expr::cust("length(CAST(summary AS BLOB))"),
+                        Expr::col(checkpoint::Column::Selection).cast_as("text"),
+                        "selection",
+                    )
+                    .expr_as(
+                        Expr::cust("octet_length(summary)::bigint"),
                         SqlAlias::new("size"),
                     )
                     .and_where(checkpoint::Column::Id.eq(&topology.row.id))
                     .and_where(
-                        Expr::cust("length(CAST(selection AS BLOB))")
+                        Expr::cust("octet_length(selection::text)::bigint")
                             .lte(i64::try_from(SOURCE_PAGE_BYTES)?),
                     )
                     .limit(1)
@@ -2389,10 +2485,16 @@ impl CheckpointIdentityRead {
         }
         let row = &self.topology.row;
         if (self.bytes.len() as i64) < self.size {
-            // SQLite bounded BLOB fragment with byte-size/identity stability.
-            // Decode/hash occurs only after this reader statement releases capacity.
-            let page=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT substr(CAST(summary AS BLOB),?2,?3) AS fragment FROM compaction_checkpoint WHERE id=?1 AND identity_sha256=?4 AND length(CAST(summary AS BLOB))=?5 LIMIT 1",[row.id.clone().into(),(self.bytes.len() as i64+1).into(),i64::try_from(SOURCE_PAGE_BYTES)?.into(),row.identity_sha256.clone().into(),self.size.into()])).await?.ok_or_else(||anyhow::anyhow!("checkpoint summary identity changed"))?;
+            // SeaQuery lacks a byte-range function for UTF-8 text. Filter
+            // by the saved identity and byte length before returning a fragment.
+            let page = store.connection.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT substr(convert_to(summary, 'UTF8'), $2::bigint::int, $3::bigint::int) AS fragment
+                 FROM compaction_checkpoint WHERE id=$1 AND identity_sha256=$4
+                 AND octet_length(summary)=$5 LIMIT 1",
+                [row.id.clone().into(), (self.bytes.len() as i64+1).into(),
+                 i64::try_from(SOURCE_PAGE_BYTES)?.into(), row.identity_sha256.clone().into(), self.size.into()],
+            )).await?.ok_or_else(|| anyhow::anyhow!("checkpoint summary identity changed"))?;
             let fragment: Vec<u8> = page.try_get("", "fragment")?;
             ensure!(
                 !fragment.is_empty() && fragment.len() <= SOURCE_PAGE_BYTES,
@@ -3372,10 +3474,14 @@ async fn validate_operation_state(
     if let Some(generation) = control.generation {
         let saved = runner::Entity::find_by_id(&row.operation_id)
             .select_only()
-            .column(runner::Column::State)
+            .expr_as(
+                Expr::col(runner::Column::State).cast_as(SqlAlias::new("text")),
+                "state",
+            )
             .filter(runner::Column::Generation.eq(generation))
             .filter(
-                Expr::cust("length(CAST(state AS BLOB))").lte(i64::try_from(SOURCE_PAGE_BYTES)?),
+                Expr::cust("octet_length(state::text)::bigint")
+                    .lte(i64::try_from(SOURCE_PAGE_BYTES)?),
             )
             .into_tuple::<String>()
             .one(&store.connection)
@@ -3500,7 +3606,7 @@ impl RawAdmissionRead {
                     .from(operation::Entity)
                     .columns([operation::Column::Owner, operation::Column::Fingerprint])
                     .expr_as(
-                        Expr::cust("length(CAST(snapshot AS BLOB))"),
+                        Expr::cust("octet_length(snapshot::text)::bigint"),
                         SqlAlias::new("size"),
                     )
                     .and_where(operation::Column::Id.eq(id))
@@ -3529,10 +3635,18 @@ impl RawAdmissionRead {
             control(&store.connection, &self.id).await? == self.control,
             "raw admission control changed between fragments"
         );
-        let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT substr(CAST(o.snapshot AS BLOB),?4,?5) AS fragment FROM compaction_operation o LEFT JOIN compaction_runner_state r ON r.operation_id=o.id WHERE o.id=?1 AND o.owner=?2 AND o.fingerprint=?3 AND length(CAST(o.snapshot AS BLOB))=?6 AND o.status=?7 AND r.generation IS ?8 LIMIT 1",
-            [self.id.clone().into(),self.owner.clone().into(),self.fingerprint.clone().into(),(i64::try_from(self.bytes.len())?+1).into(),i64::try_from(SOURCE_PAGE_BYTES)?.into(),self.size.into(),self.control.status.clone().into(),self.control.generation.into()])).await?
-            .ok_or_else(||anyhow::anyhow!("raw admission identity changed between fragments"))?;
+        let row = store.connection.query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT substr(convert_to(o.snapshot::text, 'UTF8'), $4::bigint::int, $5::bigint::int) AS fragment
+             FROM compaction_operation o
+             LEFT JOIN compaction_runner_state r ON r.operation_id=o.id
+             WHERE o.id=$1 AND o.owner=$2 AND o.fingerprint=$3
+             AND octet_length(o.snapshot::text)=$6 AND o.status=$7
+             AND r.generation IS NOT DISTINCT FROM $8 LIMIT 1",
+            [self.id.clone().into(), self.owner.clone().into(), self.fingerprint.clone().into(),
+             (i64::try_from(self.bytes.len())?+1).into(), i64::try_from(SOURCE_PAGE_BYTES)?.into(),
+             self.size.into(), self.control.status.clone().into(), self.control.generation.into()],
+        )).await?.ok_or_else(|| anyhow::anyhow!("raw admission identity changed between fragments"))?;
         let fragment: Vec<u8> = row.try_get("", "fragment")?;
         if i64::try_from(self.bytes.len())? == self.size {
             ensure!(fragment.is_empty(), "raw admission extra fragment");

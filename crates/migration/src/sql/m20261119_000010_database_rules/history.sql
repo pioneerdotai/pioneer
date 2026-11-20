@@ -1969,7 +1969,7 @@ CREATE OR REPLACE FUNCTION "compaction_lifecycle_item_payload_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (((substr(OLD.item_id,1,11)='compaction:' OR substr(NEW.item_id,1,11)='compaction:')) AND NEW.payload::text IS DISTINCT FROM OLD.payload::text AND NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id) IS NOT TRUE THEN
+    IF (((substr(OLD.item_id,1,11)='compaction:' OR substr(NEW.item_id,1,11)='compaction:')) AND (NEW.payload::text IS DISTINCT FROM OLD.payload::text OR NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id)) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     IF NOT EXISTS(SELECT 1 FROM compaction_lifecycle_sequence WHERE singleton=1 AND generation<9223372036854775807) THEN
@@ -2093,7 +2093,7 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_lifecycle_item_payload_update" AFTER UPDATE OF payload
+CREATE TRIGGER "compaction_lifecycle_item_payload_update" AFTER UPDATE OF payload,payload_payload_id
 ON "turn_item" FOR EACH ROW EXECUTE FUNCTION "compaction_lifecycle_item_payload_update"();
 
 CREATE OR REPLACE FUNCTION "frozen_expired_monotonic"()
@@ -4449,7 +4449,7 @@ CREATE OR REPLACE FUNCTION "compaction_task_basis_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (OLD.history_json_payload_id IS NOT DISTINCT FROM NEW.history_json_payload_id OR OLD.run_id IS DISTINCT FROM NEW.run_id OR OLD.task_id IS DISTINCT FROM NEW.task_id OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id OR OLD.conversation_thread_id IS DISTINCT FROM NEW.conversation_thread_id OR OLD.source_turn_id IS DISTINCT FROM NEW.source_turn_id OR OLD.created_at IS DISTINCT FROM NEW.created_at OR OLD.frozen_manifest_id IS DISTINCT FROM NEW.frozen_manifest_id) IS NOT TRUE THEN
+    IF (OLD.history_json_payload_id IS DISTINCT FROM NEW.history_json_payload_id OR OLD.history_json IS DISTINCT FROM NEW.history_json OR OLD.run_id IS DISTINCT FROM NEW.run_id OR OLD.task_id IS DISTINCT FROM NEW.task_id OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id OR OLD.conversation_thread_id IS DISTINCT FROM NEW.conversation_thread_id OR OLD.source_turn_id IS DISTINCT FROM NEW.source_turn_id OR OLD.created_at IS DISTINCT FROM NEW.created_at OR OLD.frozen_manifest_id IS DISTINCT FROM NEW.frozen_manifest_id) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_task_basis_revision (run_id
@@ -4472,7 +4472,7 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_task_basis_update" AFTER UPDATE OF history_json,run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,created_at,frozen_manifest_id
+CREATE TRIGGER "compaction_task_basis_update" AFTER UPDATE OF history_json,history_json_payload_id,run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,created_at,frozen_manifest_id
 ON "task_run_conversation_snapshot" FOR EACH ROW EXECUTE FUNCTION "compaction_task_basis_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_event_update"()
@@ -4481,7 +4481,7 @@ AS $trigger$
 BEGIN
     PERFORM pg_advisory_xact_lock(1885955182, 1);
 
-    IF ((NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id AND NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.event_type IS DISTINCT FROM OLD.event_type OR NEW.sequence IS DISTINCT FROM OLD.sequence) IS NOT TRUE THEN
+    IF ((NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id OR NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.event_type IS DISTINCT FROM OLD.event_type OR NEW.sequence IS DISTINCT FROM OLD.sequence) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_event_revision (source_id
@@ -4505,14 +4505,14 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_event_update" AFTER UPDATE OF payload,turn_id,event_type,sequence
+CREATE TRIGGER "compaction_event_update" AFTER UPDATE OF payload,payload_payload_id,turn_id,event_type,sequence
 ON "turn_event" FOR EACH ROW EXECUTE FUNCTION "compaction_event_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_event_epoch_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (((NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id AND NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.event_type IS DISTINCT FROM OLD.event_type OR NEW.sequence IS DISTINCT FROM OLD.sequence) ) IS NOT TRUE THEN
+    IF (((NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id OR NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.event_type IS DISTINCT FROM OLD.event_type OR NEW.sequence IS DISTINCT FROM OLD.sequence) ) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_projection_epoch (thread_id
@@ -4529,14 +4529,14 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_event_epoch_update" AFTER UPDATE OF payload,turn_id,event_type,sequence
+CREATE TRIGGER "compaction_event_epoch_update" AFTER UPDATE OF payload,payload_payload_id,turn_id,event_type,sequence
 ON "turn_event" FOR EACH ROW EXECUTE FUNCTION "compaction_event_epoch_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_item_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF ((NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id AND NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.item_id IS DISTINCT FROM OLD.item_id OR NEW.item_type IS DISTINCT FROM OLD.item_type OR NEW.status IS DISTINCT FROM OLD.status) IS NOT TRUE THEN
+    IF ((NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id OR NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.item_id IS DISTINCT FROM OLD.item_id OR NEW.item_type IS DISTINCT FROM OLD.item_type OR NEW.status IS DISTINCT FROM OLD.status) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_item_revision (source_id
@@ -4553,14 +4553,14 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_item_update" AFTER UPDATE OF payload,turn_id,item_id,item_type,status
+CREATE TRIGGER "compaction_item_update" AFTER UPDATE OF payload,payload_payload_id,turn_id,item_id,item_type,status
 ON "turn_item" FOR EACH ROW EXECUTE FUNCTION "compaction_item_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_item_epoch_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (((NEW.payload_payload_id IS NOT DISTINCT FROM OLD.payload_payload_id AND NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.item_id IS DISTINCT FROM OLD.item_id OR NEW.item_type IS DISTINCT FROM OLD.item_type OR NEW.status IS DISTINCT FROM OLD.status) AND (OLD.item_type='user_message' OR (OLD.item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call') AND (OLD.status IS NULL OR OLD.status IN ('completed','failed'))))) IS NOT TRUE THEN
+    IF (((NEW.payload_payload_id IS DISTINCT FROM OLD.payload_payload_id OR NEW.payload::text IS DISTINCT FROM OLD.payload::text) OR NEW.turn_id IS DISTINCT FROM OLD.turn_id OR NEW.item_id IS DISTINCT FROM OLD.item_id OR NEW.item_type IS DISTINCT FROM OLD.item_type OR NEW.status IS DISTINCT FROM OLD.status) AND (OLD.item_type='user_message' OR (OLD.item_type IN ('command_execution','file_change','web_search','web_fetch','download','dynamic_tool_call') AND (OLD.status IS NULL OR OLD.status IN ('completed','failed'))))) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_projection_epoch (thread_id
@@ -4577,7 +4577,7 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_item_epoch_update" AFTER UPDATE OF payload,turn_id,item_id,item_type,status
+CREATE TRIGGER "compaction_item_epoch_update" AFTER UPDATE OF payload,payload_payload_id,turn_id,item_id,item_type,status
 ON "turn_item" FOR EACH ROW EXECUTE FUNCTION "compaction_item_epoch_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_frozen_sweep_work_allocate"()

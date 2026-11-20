@@ -7,26 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uidx_task_event_task_sequence")]
-    pub task_id: String,
-    pub run_id: Option<String>,
-    pub thread_id: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub payload_json_sha256: Vec<u8>,
+    pub payload_json_bytes: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_task_event_task_idempotency_key"
+    )]
+    pub task_id: String,
+    pub payload_json_chars: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    pub payload_json_codec: i16,
+    #[sea_orm(column_type = "Text")]
+    pub event_type: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub run_id: Option<String>,
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_task_event_task_idempotency_key"
+    )]
+    pub idempotency_key: Option<String>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub payload_json: Vec<u8>,
     #[sea_orm(unique_key = "uidx_task_event_task_sequence")]
     pub sequence: i64,
-    pub event_type: String,
-    #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(unique_key = "uidx_task_event_task_idempotency_key")]
-    pub idempotency_key: Option<String>,
-    pub portable_revision: i64,
-    #[sea_orm(column_type = "Text")]
-    pub portable_identity: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub payload_json_payload_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

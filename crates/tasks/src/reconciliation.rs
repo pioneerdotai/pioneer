@@ -584,7 +584,7 @@ impl TaskStartupReconciler {
             return Ok((0, 0));
         }
         let clock = || chrono::Utc::now().timestamp();
-        // Fixed fair quotas: scope <=16 inputs, seed <=16, due runs <=32.
+        // Fixed quotas: scope <=16 inputs and due runs <=32.
         // Bookkeeping failures don't prevent this pass's healthy run checks.
         let mut storage_error = false;
         if self
@@ -599,33 +599,15 @@ impl TaskStartupReconciler {
                 "Task occurrence scope expansion failed"
             );
         }
-        if self
-            .store
-            .seed_unfinished_task_occurrences(&clock)
-            .await
-            .is_err()
-        {
-            storage_error = true;
-            warn!(
-                failure_class = "task_occurrence_seed_storage_failed",
-                "Task occurrence seed failed"
-            );
-        }
-        let discovery = match self
-            .store
-            .discover_task_occurrence_reconcile_with_audit(clock())
-            .await
-        {
-            Ok(discovery) => discovery,
+        let candidates = match self.store.discover_task_occurrence_reconcile(clock()).await {
+            Ok(candidates) => candidates,
             Err(error) => {
                 *retry_at = Some(Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
                 return Err(error);
             }
         };
-        let audit_error = discovery.audit_error;
-        storage_error |= audit_error.is_some();
         let mut changed = 0;
-        for candidate in discovery.candidates {
+        for candidate in candidates {
             let store = self.store.clone();
             // Reuse the owned/abort-on-drop task boundary. A candidate panic or
             // storage failure cannot abort the rest of the selected quantum.
@@ -673,9 +655,6 @@ impl TaskStartupReconciler {
             }
         }
         *retry_at = storage_error.then(|| Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
-        if let Some(error) = audit_error {
-            return Err(error);
-        }
         // Count confirmed mismatches, not dirty candidates (which may agree).
         Ok((changed, changed))
     }

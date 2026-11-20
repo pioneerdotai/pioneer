@@ -490,24 +490,33 @@ async fn preview_history_replay(format_version: u32) {
         }
     }
     assert!(indexed);
-    let mut cursor = (String::new(), 0);
     let mut accepted_witness = None;
+    let now = chrono::Utc::now().timestamp_millis();
     for _ in 0..256 {
-        let (next, witness) = f
+        let Some(claim) = f
             .store
-            .html_preview_archive_witness_page(&cursor)
+            .claim_html_preview_io_work(now, 300_000)
             .await
-            .unwrap();
-        if let Some(witness) = witness.filter(|w| w.manifest == live_manifest) {
-            accepted_witness = Some(witness);
-            break;
-        }
-        let Some(next) = next else {
+            .unwrap()
+        else {
             break;
         };
-        cursor = next;
+        if claim.row.family == "witness"
+            && let pioneer_crud::HtmlPreviewIoSource::Ready(witness) =
+                f.store.load_html_preview_io_witness(&claim).await.unwrap()
+            && witness.manifest == live_manifest
+        {
+            accepted_witness = Some((claim, witness));
+            break;
+        }
+        assert!(
+            f.store
+                .defer_html_preview_io_work(&claim, pioneer_crud::HtmlPreviewIoOutcome::Retry, now)
+                .await
+                .unwrap()
+        );
     }
-    let witness = accepted_witness.expect("accepted child preview has a pending witness");
+    let (claim, witness) = accepted_witness.expect("accepted child preview has a pending witness");
     assert_eq!(witness.owner_thread, "parent");
     assert_eq!(witness.reference.source_thread, "thread");
     assert_eq!(witness.reference.context_thread.as_deref(), Some("parent"));
@@ -541,54 +550,48 @@ async fn preview_history_replay(format_version: u32) {
             .unwrap()
             .is_none()
     );
-    // Keep durable seed/point tickets timed so this fixture exercises fallback
-    // discovery. The exact source and live task basis above remain authoritative.
-    db.execute_unprepared("UPDATE html_preview_io_work SET state='timed',due_at=9223372036854775807,claim_token=NULL WHERE family IN ('seed_witness','seed_copies') OR state IN ('ready','timed','running','blocked')").await.unwrap();
-    db.execute_unprepared("CREATE TRIGGER fail_fallback_witness BEFORE UPDATE OF archive_wire_sha256 ON html_preview_frozen_result WHEN NEW.archive_wire_sha256 IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture witness commit failure'); END").await.unwrap();
+    use pioneer_entity::html_preview_io_work as work;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let due_now = || {
+        work::Entity::update_many()
+            .filter(work::Column::Family.eq("witness"))
+            .filter(work::Column::ObjectId.eq(&claim.row.object_id))
+            .filter(work::Column::Ordinal.eq(claim.row.ordinal))
+            .col_expr(work::Column::DueAt, sea_orm::sea_query::Expr::val(0_i64))
+    };
+    // A failed physical receipt leaves its work available after the claim
+    // expires. An unrelated preview activity guard must not block that retry.
+    due_now().exec(&db).await.unwrap();
+    db.execute_unprepared(
+        "CREATE FUNCTION fail_point_witness() RETURNS trigger LANGUAGE plpgsql AS $fault$
+         BEGIN RAISE EXCEPTION 'fixture witness commit failure'; END $fault$;
+         CREATE TRIGGER fail_point_witness BEFORE UPDATE OF archive_wire_sha256 ON html_preview_frozen_result
+         FOR EACH ROW WHEN (NEW.archive_wire_sha256 IS NOT NULL) EXECUTE FUNCTION fail_point_witness()",
+    ).await.unwrap();
     let activity = service.html_preview_activity().await;
-    let mut fallback_progress = crate::database::maintenance::html_previews::Progress::default();
-    let mut fallback_failed = false;
-    for _ in 0..256 {
-        if crate::database::maintenance::html_previews::quantum(
-            &f.store,
-            &service,
-            &mut fallback_progress,
-        )
-        .await
-        .is_err()
-        {
-            fallback_failed = true;
-            break;
-        }
-    }
-    assert!(fallback_failed);
-    db.execute_unprepared("DROP TRIGGER fail_fallback_witness")
+    let mut io_progress = crate::database::maintenance::html_previews::Progress::default();
+    assert!(
+        crate::database::maintenance::html_previews::quantum(&f.store, &service, &mut io_progress)
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("DROP TRIGGER fail_point_witness ON html_preview_frozen_result")
         .await
         .unwrap();
-    // DDL repair emits no work wake. Witness EOF must independently rewind,
-    // although the activity guard leaves the service's family unfinished.
-    let mut fallback_retried = false;
-    for _ in 0..256 {
-        let _ = crate::database::maintenance::html_previews::quantum(
-            &f.store,
-            &service,
-            &mut fallback_progress,
-        )
-        .await;
-        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
-            [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
-        if row
-            .try_get::<Option<String>>("", "archive_wire_sha256")
-            .unwrap()
-            .is_some()
-        {
-            fallback_retried = true;
-            break;
-        }
-    }
+    due_now().exec(&db).await.unwrap();
+    crate::database::maintenance::html_previews::quantum(&f.store, &service, &mut io_progress)
+        .await
+        .unwrap();
+    let receipt = pioneer_entity::html_preview_frozen_result::Entity::find_by_id((
+        witness.manifest.clone(),
+        witness.ordinal,
+    ))
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
-        fallback_retried,
+        receipt.archive_wire_sha256.is_some(),
         "witness retry must not wait for unrelated activity release"
     );
     assert!(preview_paths.iter().all(|path| path.exists()));
@@ -1351,21 +1354,24 @@ async fn preview_history_replay(format_version: u32) {
             .iter()
             .any(|b| b.binding_kind == pioneer_protocol::ArtifactBindingKind::UserInput)
     );
-    // Simulate a pre-migration input that predates the synchronous adoption
-    // hook. Its bounded backfill runs before any preview may be retired.
-    request.metadata.get_mut("htmlTool").unwrap()["callId"] = json!("legacy-message-adoption");
-    request.binding.as_mut().unwrap().tool_call_id = Some("legacy-message-adoption".into());
-    let legacy = service.ingest_bytes(request).await.unwrap();
-    let payload = serde_json::to_string(&pioneer_protocol::UserInput::Artifact {
-        artifact_id: legacy.artifact.artifact_id.clone(),
-        version_id: legacy.artifact.version_id.clone(),
-    })
-    .unwrap();
-    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES('legacy-preview-input','turn',1,'artifact',?1,CURRENT_TIMESTAMP)",[payload.into()])).await.unwrap();
+    request.metadata.get_mut("htmlTool").unwrap()["callId"] = json!("second-preview-adoption");
+    request.binding.as_mut().unwrap().tool_call_id = Some("second-preview-adoption".into());
+    let second = service.ingest_bytes(request).await.unwrap();
     f.store
-        .database_connection()
-        .execute_unprepared(
-            "UPDATE html_preview_index_backfill SET inputs_complete=0 WHERE singleton=1",
+        .replace_turn_input_projection_for_test(
+            "turn",
+            &[
+                pioneer_protocol::UserInput::Artifact {
+                    artifact_id: current.artifact.artifact_id.clone(),
+                    version_id: current.artifact.version_id.clone(),
+                },
+                pioneer_protocol::UserInput::Artifact {
+                    artifact_id: second.artifact.artifact_id.clone(),
+                    version_id: second.artifact.version_id.clone(),
+                },
+            ],
+            2,
+            chrono::Utc::now().timestamp(),
         )
         .await
         .unwrap();
@@ -1378,7 +1384,7 @@ async fn preview_history_replay(format_version: u32) {
     }
     assert!(
         service
-            .get_artifact("ws", &legacy.artifact.artifact_id, None)
+            .get_artifact("ws", &second.artifact.artifact_id, None)
             .await
             .unwrap()
             .bindings

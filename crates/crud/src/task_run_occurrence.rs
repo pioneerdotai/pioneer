@@ -75,31 +75,8 @@ impl CrudStore {
         now: i64,
         limit: u64,
     ) -> Result<Vec<TaskRunOccurrenceReconcileCandidate>> {
-        let discovery = self
-            .discover_task_run_occurrence_reconcile_with_audit(now, limit)
-            .await?;
-        if let Some(error) = discovery.audit_error {
-            return Err(error);
-        }
-        Ok(discovery.candidates)
-    }
-
-    pub async fn discover_task_run_occurrence_reconcile_with_audit(
-        &self,
-        now: i64,
-        limit: u64,
-    ) -> Result<OccurrenceReconcileDiscovery<TaskRunOccurrenceReconcileCandidate>> {
         let maintenance = self.with_maintenance_access();
-        let audit_error = maintenance
-            .audit_legacy_occurrence_producers(false)
-            .await
-            .err();
-        // Independent durable tickets remain serviceable after an audit error.
-        let candidates = queue::discover(&maintenance.connection, now, limit).await?;
-        Ok(OccurrenceReconcileDiscovery {
-            candidates,
-            audit_error,
-        })
+        queue::discover(&maintenance.connection, now, limit).await
     }
 
     pub async fn claim_task_run_occurrence_reconcile(
@@ -482,13 +459,7 @@ impl CrudStore {
                     )?;
                     Ok(outcome)
                 }
-                Err(error) => Err(
-                    crate::repositories::portable_payload::rollback_with_hold_refusal(
-                        transaction,
-                        error,
-                    )
-                    .await,
-                ),
+                Err(error) => Err(crate::util::rollback_preserving_error(transaction, error).await),
             }
         }
         .await;

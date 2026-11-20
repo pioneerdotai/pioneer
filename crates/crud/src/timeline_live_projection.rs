@@ -31,6 +31,7 @@ use crate::{
 pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait>(
     db: &C,
     event: &AppendedTurnEvent,
+    item: Option<serde_json::Value>,
 ) -> Result<()> {
     match &event.payload {
         TurnEventPayload::TurnStarted(payload) => {
@@ -56,12 +57,14 @@ pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait
         | TurnEventPayload::ItemToolRetryScheduled(_)
         | TurnEventPayload::ItemToolRetryResolved(_)
         | TurnEventPayload::ItemToolRetryExhausted(_) => {
-            project_turn_item_event(db, event).await.with_context(|| {
-                format!(
-                    "failed to project semantic timeline item event `{}` for turn `{}`",
-                    event.id, event.turn_id
-                )
-            })?;
+            project_turn_item_event(db, event, item)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to project semantic timeline item event `{}` for turn `{}`",
+                        event.id, event.turn_id
+                    )
+                })?;
         }
         TurnEventPayload::TurnMessageEdited(payload) => {
             project_turn_message_mutation(db, event, payload.input.len()).await?;
@@ -412,6 +415,7 @@ async fn project_terminal_turn_state<C: ConnectionTrait>(
 async fn project_turn_item_event<C: ConnectionTrait>(
     db: &C,
     event: &AppendedTurnEvent,
+    item: Option<serde_json::Value>,
 ) -> Result<()> {
     let Some(item_id) = payload_item_id(&event.payload) else {
         return Ok(());
@@ -430,7 +434,7 @@ async fn project_turn_item_event<C: ConnectionTrait>(
         );
     };
     let item_model = turn::find_turn_item_metadata(db, turn_model.id.as_str(), item_id).await?;
-    let Some(item_model) = item_model else {
+    let Some(mut item_model) = item_model else {
         if item_payload_event_requires_canonical_row(&event.payload) {
             anyhow::bail!(
                 "semantic timeline item projection cannot find turn_item `{}` in turn `{}`",
@@ -448,6 +452,9 @@ async fn project_turn_item_event<C: ConnectionTrait>(
         .await;
     };
 
+    if item.is_some() {
+        item_model.payload = item;
+    }
     let classification = classify_turn_item_row_for_turn(&item_model, &turn_model);
     let refresh_work_summary = !matches!(
         classification.placement,
@@ -475,6 +482,7 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
     item_id: &str,
     source_sequence: i64,
     refreshed_at: DateTimeWithTimeZone,
+    item: serde_json::Value,
 ) -> Result<()> {
     let Some(turn_model) = turn::find_turn_by_id(db, turn_id).await? else {
         anyhow::bail!("semantic timeline snapshot cannot find turn `{turn_id}`");
@@ -486,7 +494,7 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
             turn_model.thread_id
         );
     };
-    let Some(item_model) =
+    let Some(mut item_model) =
         turn::find_turn_item_metadata(db, turn_model.id.as_str(), item_id).await?
     else {
         return refresh_turn_work_summary(
@@ -499,6 +507,7 @@ pub(crate) async fn project_semantic_timeline_snapshot_turn_item<C: ConnectionTr
         .await;
     };
 
+    item_model.payload = Some(item);
     let classification = classify_turn_item_row_for_turn(&item_model, &turn_model);
     let refresh_work_summary = !matches!(
         classification.placement,
@@ -975,7 +984,7 @@ struct DetachedTaskRunTiming {
 }
 
 fn detached_task_run_timing(item_model: &turn_item_entity::Model) -> DetachedTaskRunTiming {
-    let task = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+    let task = crate::repositories::turn_payload::decode_item(item_model)
         .ok()
         .and_then(|item| match item {
             TurnItem::Task { item } => Some(item),
@@ -1001,7 +1010,7 @@ async fn detached_task_run_causal_turn<C: ConnectionTrait>(
     turn_model: &turn_entity::Model,
     item_model: &turn_item_entity::Model,
 ) -> Result<Option<turn_entity::Model>> {
-    let Ok(TurnItem::Task { item }) = serde_json::from_str::<TurnItem>(item_model.payload.as_str())
+    let Ok(TurnItem::Task { item }) = crate::repositories::turn_payload::decode_item(item_model)
     else {
         return Ok(None);
     };

@@ -7,26 +7,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "read_model_repair_checkpoint")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub repair_key: String,
+    pub full_scan_completed_at: Option<DateTimeWithTimeZone>,
     pub algorithm_version: i64,
-    #[sea_orm(column_type = "Text")]
-    pub full_scan_status: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub full_scan_cursor_id: Option<String>,
+    pub incremental_started_at: Option<DateTimeWithTimeZone>,
+    pub full_scan_started_at: Option<DateTimeWithTimeZone>,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
     pub full_scan_high_watermark_id: Option<String>,
+    pub incremental_completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text")]
     pub incremental_status: String,
-    pub incremental_high_watermark_generation: Option<i64>,
     pub incremental_cursor_generation: Option<i64>,
-    pub last_completed_generation: i64,
-    pub full_scan_started_at: Option<DateTimeWithTimeZone>,
-    pub full_scan_completed_at: Option<DateTimeWithTimeZone>,
-    pub incremental_started_at: Option<DateTimeWithTimeZone>,
-    pub incremental_completed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub full_scan_status: String,
+    pub incremental_high_watermark_generation: Option<i64>,
+    pub last_completed_generation: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub full_scan_cursor_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub repair_key: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

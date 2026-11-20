@@ -88,11 +88,8 @@ struct Services {
     admission: Arc<tokio::sync::Semaphore>,
 }
 
-fn endpoint_path(runtime_home: &Path, config: &pioneer_config::AppConfig) -> Result<PathBuf> {
-    let database = crate::database::gateway_database_path(runtime_home, config)?;
-    let mut path = pioneer_sqlite::WriterOwnership::database_identity(&database)?.into_os_string();
-    path.push(".operator.json");
-    Ok(PathBuf::from(path))
+pub(crate) fn endpoint_path(runtime_home: &Path) -> PathBuf {
+    runtime_home.join("database-operator.json")
 }
 
 pub(crate) struct LocalOperations {
@@ -104,7 +101,7 @@ pub(crate) struct LocalOperations {
 impl LocalOperations {
     pub(crate) async fn start(
         runtime_home: &Path,
-        config: &pioneer_config::AppConfig,
+        _config: &pioneer_config::AppConfig,
         auth: Arc<crate::auth::GatewayAuthService>,
         artifacts: Arc<pioneer_artifacts::ArtifactService>,
     ) -> Result<Self> {
@@ -123,7 +120,7 @@ impl LocalOperations {
             .route("/operation", post(execute))
             .layer(DefaultBodyLimit::max(8192))
             .with_state(state.clone());
-        let path = endpoint_path(runtime_home, config)?;
+        let path = endpoint_path(runtime_home);
         // Harden before writing a capability, including when reusing a stale
         // endpoint after a crash. The runtime directory is already private.
         let mut options = std::fs::OpenOptions::new();
@@ -228,10 +225,10 @@ async fn execute(
 
 pub(crate) async fn request<T: DeserializeOwned>(
     runtime_home: &Path,
-    config: &pioneer_config::AppConfig,
+    _config: &pioneer_config::AppConfig,
     operation: Operation,
 ) -> Result<T> {
-    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint_path(runtime_home, config)?)
+    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint_path(runtime_home))
         .context("database owner is starting, stopping, or is an offline operation; local operation unavailable")?)?;
     if endpoint.address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || endpoint.token.len() != 64 {
         bail!("invalid local database-owner endpoint");
@@ -296,7 +293,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let key = "c".repeat(64);
         std::fs::write(
-            endpoint_path(home.path(), &config).unwrap(),
+            endpoint_path(home.path()),
             serde_json::to_vec(&Endpoint {
                 address,
                 token: key.clone(),

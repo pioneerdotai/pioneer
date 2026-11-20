@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_task_basis_revision")]
 pub struct Model {
+    pub revision: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub run_id: String,
-    pub revision: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

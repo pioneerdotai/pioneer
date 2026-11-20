@@ -7,24 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event_projection_stream_state")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub turn_id: String,
-    pub thread_id: String,
-    pub status: String,
-    pub blocking_event_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub last_error: Option<String>,
-    pub quarantined_at: Option<DateTimeWithTimeZone>,
-    pub restored_at: Option<DateTimeWithTimeZone>,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    pub projected_through_sequence: i64,
     pub receipts_compacted_through_sequence: i64,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub accepted_terminal_event_id: Option<String>,
+    pub projected_through_sequence: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub last_error: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub accepted_terminal_event_type: Option<String>,
+    pub created_at: DateTimeWithTimeZone,
+    pub quarantined_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub blocking_event_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
     pub accepted_terminal_sequence: Option<i64>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    pub restored_at: Option<DateTimeWithTimeZone>,
+    pub updated_at: DateTimeWithTimeZone,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,21 +7,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "patch_snapshot")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub domain_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Binary(1)")]
-    pub content_hash: Vec<u8>,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub byte_len: i64,
-    #[sea_orm(column_type = "Text")]
-    pub encoding: String,
     #[sea_orm(column_type = "Text")]
     pub line_endings_json: String,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub compressed_bytes: Vec<u8>,
+    #[sea_orm(
+        primary_key,
+        auto_increment = false,
+        column_type = "VarBinary(StringLen::None)"
+    )]
+    pub content_hash: Vec<u8>,
     pub raw_byte_len: i64,
-    pub ref_count: i64,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub byte_len: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub domain_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub encoding: String,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub compressed_bytes: Vec<u8>,
+    pub ref_count: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

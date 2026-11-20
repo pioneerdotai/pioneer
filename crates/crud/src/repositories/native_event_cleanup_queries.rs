@@ -1,5 +1,5 @@
 //! SeaQuery builders for the bounded multi-table reads. Policy constants are
-//! SQL literals so SQLite can prove partial-index predicates; IDs and time are
+//! SQL literals let PostgreSQL prove partial-index predicates; IDs and time are
 //! bound values. Query plans are checked against the real migration.
 use super::{PAGE_ROWS, PAYLOAD_BUDGET};
 use pioneer_entity::{
@@ -48,7 +48,8 @@ fn event_column(alias: Option<&'static str>, column: event::Column) -> Expr {
     }
 }
 fn payload_bytes(alias: Option<&'static str>) -> Expr {
-    Func::char_length(event_column(alias, event::Column::PayloadRedactedJson).cast_as("BLOB"))
+    Func::cust("octet_length")
+        .arg(event_column(alias, event::Column::PayloadRedactedJson))
         .into()
 }
 pub(super) fn candidate_predicate(alias: Option<&'static str>) -> Expr {
@@ -213,7 +214,7 @@ pub(super) fn candidates(turn_id: &str, selected: Option<&[String]>) -> SelectSt
     let source = if selected.is_some_and(|ids| ids.is_empty()) {
         Query::select()
             .expr_as(literal(None::<String>).cast_as("TEXT"), event::Column::Id)
-            .expr_as(literal(None::<i64>).cast_as("INTEGER"), "payload_bytes")
+            .expr_as(literal(None::<i64>).cast_as("bigint"), "payload_bytes")
             .and_where(literal(false))
             .to_owned()
     } else {
@@ -223,7 +224,10 @@ pub(super) fn candidates(turn_id: &str, selected: Option<&[String]>) -> SelectSt
             .to_owned();
         let mut source = Query::select()
             .column(("event", event::Column::Id))
-            .expr_as(payload_bytes(Some("event")), "payload_bytes")
+            .expr_as(
+                payload_bytes(Some("event")).cast_as("bigint"),
+                "payload_bytes",
+            )
             .from_as(event::Entity, "event")
             .and_where(Expr::col(("event", event::Column::TurnId)).eq(turn_id))
             .and_where(Expr::col(("event", event::Column::RuntimeId)).eq(Expr::from(runtime)))

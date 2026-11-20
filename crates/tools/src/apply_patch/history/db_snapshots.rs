@@ -382,20 +382,23 @@ impl SqliteSnapshotStore {
         })
     }
 
-    /// Reconcile ref counts from the immutable record log. This is a bounded
-    /// startup repair for blobs left by older writers or an interrupted
-    /// pre-transaction promotion; it never invents bytes for a missing blob.
-    ///
-    /// Every scan and mutation is cursor-paginated. Expected counts live in a
-    /// connection-local TEMP table, while record decoding runs before a short
-    /// writer transaction. A crash can leave only a partially repaired count;
-    /// the next startup rebuilds the scratch table and deterministically
-    /// completes the remaining idempotent repairs.
+    /// Reconcile reference counts from the immutable log. The scan owns its
+    /// persisted counts, even when its bounded transactions use different pool
+    /// connections. Decode each record before reserving writer capacity.
     pub async fn reconcile_references(&self) -> Result<SnapshotReconciliationReport> {
-        crud::prepare_expected_patch_snapshot_references(&self.db)
-            .await
-            .context("prepare snapshot reference repair scratch state")?;
+        let scan = crud::begin_patch_snapshot_scan(&self.db).await?;
+        let result = self.reconcile_snapshot_scan(&scan).await;
+        let cleanup = crud::finish_patch_snapshot_scan(&self.db, &scan).await;
+        match (result, cleanup) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("clear failed snapshot scan: {cleanup:#}")))
+            }
+        }
+    }
 
+    async fn reconcile_snapshot_scan(&self, scan: &str) -> Result<SnapshotReconciliationReport> {
         let mut reservation_cursor = None;
         loop {
             let reservations = crud::list_patch_snapshot_reservations(
@@ -459,6 +462,7 @@ impl SqliteSnapshotStore {
             if rows.is_empty() {
                 break;
             }
+            crud::touch_patch_snapshot_scan(&self.db, scan).await?;
             for row in rows {
                 last_id = row.id;
                 if row.changes_json.len() > MAX_RECORD_JSON_BYTES {
@@ -510,6 +514,7 @@ impl SqliteSnapshotStore {
                     for (content_hash, byte_len) in reference_batch {
                         crud::increment_expected_patch_snapshot_reference(
                             &transaction,
+                            scan,
                             &domain_id,
                             content_hash,
                             *byte_len,
@@ -537,8 +542,10 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin expected snapshot validation batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             let expected = crud::list_expected_patch_snapshot_references(
                 &transaction,
+                scan,
                 expected_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -593,8 +600,10 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin snapshot reference repair batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             let expected = crud::list_expected_patch_snapshot_references(
                 &transaction,
+                scan,
                 expected_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -666,9 +675,11 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin orphan snapshot collection batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             for snapshot in &snapshots {
                 if !crud::expected_patch_snapshot_reference_exists(
                     &transaction,
+                    scan,
                     &snapshot.domain_id,
                     &snapshot.content_hash,
                     snapshot.byte_len,
@@ -708,9 +719,6 @@ impl SqliteSnapshotStore {
                 break;
             }
         }
-        crud::drop_expected_patch_snapshot_references(&self.db)
-            .await
-            .context("drop snapshot reference repair scratch state")?;
         Ok(SnapshotReconciliationReport {
             repaired_references,
             collected_blobs,

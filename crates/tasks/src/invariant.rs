@@ -5,11 +5,9 @@ use pioneer_crud::{
     TaskRuntimeInvariantTurnRecord,
 };
 use pioneer_protocol::{TaskEventPayload, TaskResult, TaskValue};
-use sea_orm::{ConnectOptions, Database};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
 
 mod task_review_invariants;
 
@@ -484,30 +482,6 @@ impl TaskRuntimeInvariantScanner {
         Ok(report)
     }
 
-    pub async fn scan_sqlite_path(
-        &self,
-        db_path: impl AsRef<Path>,
-        observed_at_unix: i64,
-    ) -> Result<TaskRuntimeInvariantReport> {
-        let db_path = db_path.as_ref();
-        // Auto-extensions only apply to connections opened after registration.
-        // The standalone scanner must also be able to read sqlite-zstd views.
-        pioneer_sqlite::zstd::register_auto_extension_once()
-            .context("failed to register sqlite-zstd extension for invariant scan")?;
-        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(db_path));
-        options.sqlx_logging(false);
-        let connection = Database::connect(options).await.with_context(|| {
-            format!(
-                "failed to open sqlite database `{}` for invariant scan",
-                db_path.display()
-            )
-        })?;
-        let store = CrudStore::new(connection);
-        let mut report = self.scan_store(&store, observed_at_unix).await?;
-        report.db_path = Some(db_path.display().to_string());
-        Ok(report)
-    }
-
     fn scan_snapshot(
         &self,
         snapshot: &TaskRuntimeInvariantSnapshot,
@@ -781,30 +755,13 @@ fn task_result_bool_flag(result: &TaskResult, flag: &str) -> Option<bool> {
     }
 }
 
-fn sqlite_read_only_connection_url(path: &Path) -> String {
-    let normalized_path = path.to_string_lossy().replace('\\', "/");
-    let has_windows_drive_prefix = normalized_path
-        .as_bytes()
-        .get(1)
-        .is_some_and(|value| *value == b':');
-    let needs_leading_slash =
-        (path.is_absolute() || has_windows_drive_prefix) && !normalized_path.starts_with('/');
-    let path_part = if needs_leading_slash {
-        format!("/{normalized_path}")
-    } else {
-        normalized_path
-    };
-    format!("sqlite://{path_part}?mode=ro")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_protocol::{
         TaskError, TaskErrorClass, TaskRunThreadBinding, TaskRunThreadBindingKind, ThreadLineage,
     };
-    use sea_orm::Database;
+    use sea_orm::ConnectionTrait;
 
     fn violation(kind: TaskRuntimeInvariantViolationKind) -> TaskRuntimeInvariantViolation {
         TaskRuntimeInvariantViolation::new(kind, "detected test invariant violation")
@@ -827,7 +784,7 @@ mod tests {
             },
         ];
         let mut report = TaskRuntimeInvariantReport::new()
-            .with_db_path("/tmp/gateway.db")
+            .with_db_path("/tmp/pioneer/postgres/data")
             .with_generated_at(1_770_000_000);
 
         report.push(violation(
@@ -914,11 +871,18 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_reports_target_binding_violations_through_crud_store() {
-        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
-        Migrator::up(&db, None)
-            .await
-            .expect("migrations should run");
-        let store = CrudStore::new(db);
+        pioneer_postgres_test::with_database(async |fixture| {
+        let db = fixture.connection();
+        db.execute_unprepared(
+            "INSERT INTO workspace(id,name) VALUES ('scanner','Scanner');
+             INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+                VALUES ('task_missing_target_refs','scanner','workspace','system','running','Test','Test');
+             INSERT INTO task_run(id,task_id,run_group_id,run_number,status,executor_kind)
+                VALUES ('run_missing_target_refs','task_missing_target_refs','test',1,'running','system');
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+                VALUES ('child_thread_missing_target_refs','scanner','','agent','model','provider','active');",
+        ).await?;
+        let store = CrudStore::new(db.clone());
         store
             .upsert_task_run_thread_binding(TaskRunThreadBinding {
                 id: "binding_missing_target_refs".to_owned(),
@@ -945,6 +909,8 @@ mod tests {
             &violation.kind,
             TaskRuntimeInvariantViolationKind::PrimaryExecutorBindingMissingExecution { .. }
         )));
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]

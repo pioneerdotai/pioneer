@@ -7,22 +7,40 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_import_data")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub manifest_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub source_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub ordinal: i64,
-    pub message_ordinal: i64,
-    #[sea_orm(column_type = "Text")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
     pub source_scope: String,
-    #[sea_orm(column_type = "Text")]
-    pub source_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub source_version: String,
-    #[sea_orm(column_type = "Text")]
+    #[sea_orm(
+        primary_key,
+        auto_increment = false,
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub manifest_id: String,
+    #[sea_orm(unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key")]
+    pub message_ordinal: i64,
+    pub bytes: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
     pub source_thread: String,
     #[sea_orm(column_type = "Text")]
     pub proof_json: String,
-    pub bytes: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_frozen_import_data_manifest_id_message_ordinal_s_key"
+    )]
+    pub source_version: String,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",
@@ -30,7 +48,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_frozen_history: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history: BelongsTo<super::compaction_frozen_history::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

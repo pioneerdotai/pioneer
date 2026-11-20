@@ -190,21 +190,6 @@ mod child_work_regressions {
     }
 }
 
-#[test]
-fn child_ready_renderer_is_portable_and_preserves_positive_launch_proof() {
-    use sea_orm::DbBackend;
-    for backend in [DbBackend::Sqlite, DbBackend::Postgres, DbBackend::MySql] {
-        let sql = crate::repositories::task_child_cleanup::render_ready(backend);
-        assert!(!sql.contains("INDEXED BY"));
-        assert!(!sql.contains(" || "));
-        assert!(!sql.contains("trigger_id IS r.trigger_id"));
-        assert!(sql.contains("accepted_source.thread_id = parent.thread_id"));
-        assert!(sql.contains("parent.turn_kind = 'task_run'"));
-        assert!(sql.contains("parent.turn_kind = 'conversation'"));
-        assert!(sql.contains("s.projected_through_sequence >= s.accepted_terminal_sequence"));
-    }
-}
-
 mod child_queue_pass_regressions {
     use super::*;
     use crate::repositories::task_child_work::{ChildScope, enqueue_scope};
@@ -418,33 +403,6 @@ mod child_queue_pass_regressions {
     }
 }
 
-#[test]
-fn bound_child_cleanup_statement_quotes_outer_turn_and_binds_each_backend() {
-    use sea_orm::DbBackend;
-    for backend in [DbBackend::Sqlite, DbBackend::Postgres, DbBackend::MySql] {
-        let stmt = crate::repositories::task_child_cleanup::ready_statement(
-            backend,
-            "thread-secret",
-            "turn-secret",
-        );
-        assert!(!stmt.sql.contains("thread-secret"));
-        assert!(!stmt.sql.contains("turn-secret"));
-        assert_eq!(stmt.values.as_ref().unwrap().0.len(), 2);
-        if backend == DbBackend::Postgres {
-            assert!(stmt.sql.contains("t.thread_id = $1 AND t.id = $2"));
-            assert!(!stmt.sql.contains('?'));
-        } else {
-            assert!(stmt.sql.contains("t.thread_id = ? AND t.id = ?"));
-        }
-        if backend == DbBackend::MySql {
-            assert!(stmt.sql.contains("JOIN `turn` t"));
-            assert!(!stmt.sql.contains("\"turn\""));
-        } else {
-            assert!(stmt.sql.contains("JOIN \"turn\" t"));
-        }
-    }
-}
-
 #[tokio::test]
 async fn empty_child_polls_use_physical_read_only_reader_without_writer_admission() {
     use sea_orm::{ConnectOptions, Database, EntityTrait};
@@ -544,165 +502,183 @@ async fn empty_child_polls_use_physical_read_only_reader_without_writer_admissio
 
 #[tokio::test]
 async fn child_preflight_race_restarts_the_entire_short_transaction_after_rollback() {
-    use crate::repositories::task_child_work::enqueue_point;
-    use pioneer_entity::task_child_reconcile_pending as point;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let store = test_store_with_workspace("ws_task").await;
-    let attempts = AtomicUsize::new(0);
-    store
-        .run_serialized_write(|| async {
-            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            let tx = store.connection.begin().await?;
-            if attempt == 0 {
-                enqueue_point(&tx, "t", "rolled-back-attempt", 1).await?;
-                return Err(crate::repositories::portable_payload::PreflightRace.into());
-            }
-            assert!(
-                point::Entity::find_by_id("rolled-back-attempt")
-                    .one(&tx)
-                    .await?
-                    .is_none(),
-                "retry must use a new transaction, not the old snapshot/write set"
-            );
-            enqueue_point(&tx, "t", "committed-attempt", 1).await?;
-            tx.commit().await?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    assert!(
-        point::Entity::find_by_id("committed-attempt")
-            .one(&store.connection)
+    pioneer_postgres_test::with_database(async |fixture| {
+        use crate::repositories::task_child_work::enqueue_point;
+        use pioneer_entity::task_child_reconcile_pending as point;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        let attempts = AtomicUsize::new(0);
+        store
+            .run_serialized_write(|| async {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let tx = store.connection.begin().await?;
+                if attempt == 0 {
+                    enqueue_point(&tx, "t", "rolled-back-attempt", 1).await?;
+                    return Err(crate::util::PreflightRace.into());
+                }
+                assert!(
+                    point::Entity::find_by_id("rolled-back-attempt")
+                        .one(&tx)
+                        .await?
+                        .is_none(),
+                    "retry must use a new transaction, not the old snapshot/write set"
+                );
+                enqueue_point(&tx, "t", "committed-attempt", 1).await?;
+                tx.commit().await?;
+                Ok(())
+            })
             .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(!crate::repositories::task_child_work::is_transaction_retry(
-        &anyhow::anyhow!(sea_orm::DbErr::Custom("unknown commit outcome".into()))
-    ));
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(
+            point::Entity::find_by_id("committed-attempt")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!crate::repositories::task_child_work::is_transaction_retry(
+            &anyhow::anyhow!(sea_orm::DbErr::Custom("unknown commit outcome".into()))
+        ));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn independently_fenced_claim_failure_deferral_preserves_an_ambiguous_committed_claim() {
-    use pioneer_entity::task_child_reconcile_pending as point;
-    let store = test_store_with_workspace("ws_task").await;
-    let tx = store.connection.begin().await.unwrap();
-    crate::repositories::task_child_work::enqueue_point(&tx, "t", "unknown-claim", 100)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let preclaim = store.discover_child_points(100, 1).await.unwrap().remove(0);
-    let committed = store
-        .claim_child_point_with_clock(&preclaim, &|| 100)
-        .await
-        .unwrap()
-        .unwrap();
-    // Model the lost claim response: the consumer knows only preclaim snapshot.
-    assert!(
-        !store
-            .defer_child_point_snapshot(&preclaim, &|| 101)
+    pioneer_postgres_test::with_database(async |fixture| {
+        use pioneer_entity::task_child_reconcile_pending as point;
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        let tx = store.connection.begin().await.unwrap();
+        crate::repositories::task_child_work::enqueue_point(&tx, "t", "unknown-claim", 100)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let preclaim = store.discover_child_points(100, 1).await.unwrap().remove(0);
+        let committed = store
+            .claim_child_point_with_clock(&preclaim, &|| 100)
             .await
             .unwrap()
-    );
-    assert_eq!(
-        point::Entity::find_by_id("unknown-claim")
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap(),
-        committed
-    );
-    assert!(
-        store
-            .discover_child_points(159, 1)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let due = store.discover_child_points(160, 1).await.unwrap().remove(0);
-    assert!(
-        store
-            .claim_child_point_with_clock(&due, &|| 160)
-            .await
-            .unwrap()
-            .is_some()
-    );
+            .unwrap();
+        // Model the lost claim response: the consumer knows only preclaim snapshot.
+        assert!(
+            !store
+                .defer_child_point_snapshot(&preclaim, &|| 101)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            point::Entity::find_by_id("unknown-claim")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap(),
+            committed
+        );
+        assert!(
+            store
+                .discover_child_points(159, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let due = store.discover_child_points(160, 1).await.unwrap().remove(0);
+        assert!(
+            store
+                .claim_child_point_with_clock(&due, &|| 160)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn seed_restart_distinguishes_deferred_claimed_missing_and_committed_eof() {
-    use crate::repositories::task_child_work::ChildSeedOutcome;
-    use pioneer_entity::task_child_reconcile_scope as scope;
-    let store = test_store_with_workspace("ws_task").await;
-    let tx = store.connection.begin().await.unwrap();
-    scope::Entity::update_many()
-        .filter(scope::Column::ScopeKind.eq("historical-seed"))
-        .col_expr(scope::Column::NextAttemptAt, Expr::value(200i64))
-        .exec(&tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let restarted = crate::CrudStore::new(store.database_connection());
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 100).await.unwrap(),
-        ChildSeedOutcome::Deferred { retry_at: 200 }
-    );
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 199).await.unwrap(),
-        ChildSeedOutcome::Deferred { retry_at: 200 }
-    );
-    let tx = store.connection.begin().await.unwrap();
-    scope::Entity::update_many()
-        .filter(scope::Column::ScopeKind.eq("historical-seed"))
-        .col_expr(scope::Column::ClaimToken, Expr::value("old-process"))
-        .exec(&tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 199).await.unwrap(),
-        ChildSeedOutcome::Claimed { expires_at: 200 }
-    );
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 200).await.unwrap(),
-        ChildSeedOutcome::CommittedDone
-    );
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 201).await.unwrap(),
-        ChildSeedOutcome::CommittedDone
-    );
-    scope::Entity::delete_by_id(("historical-seed".to_owned(), "v1".to_owned()))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 202).await.unwrap(),
-        ChildSeedOutcome::Missing
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        use crate::repositories::task_child_work::ChildSeedOutcome;
+        use pioneer_entity::task_child_reconcile_scope as scope;
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        let tx = store.connection.begin().await.unwrap();
+        scope::Entity::update_many()
+            .filter(scope::Column::ScopeKind.eq("historical-seed"))
+            .col_expr(scope::Column::NextAttemptAt, Expr::value(200i64))
+            .exec(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let restarted = crate::CrudStore::new(store.database_connection());
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 100).await.unwrap(),
+            ChildSeedOutcome::Deferred { retry_at: 200 }
+        );
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 199).await.unwrap(),
+            ChildSeedOutcome::Deferred { retry_at: 200 }
+        );
+        let tx = store.connection.begin().await.unwrap();
+        scope::Entity::update_many()
+            .filter(scope::Column::ScopeKind.eq("historical-seed"))
+            .col_expr(scope::Column::ClaimToken, Expr::value("old-process"))
+            .exec(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 199).await.unwrap(),
+            ChildSeedOutcome::Claimed { expires_at: 200 }
+        );
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 200).await.unwrap(),
+            ChildSeedOutcome::CommittedDone
+        );
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 201).await.unwrap(),
+            ChildSeedOutcome::CommittedDone
+        );
+        scope::Entity::delete_by_id(("historical-seed".to_owned(), "v1".to_owned()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 202).await.unwrap(),
+            ChildSeedOutcome::Missing
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn failed_seed_claim_retains_owned_deferred_work_until_post_deadline_eof() {
-    use crate::repositories::task_child_work::ChildSeedOutcome;
-    let store = test_store_with_workspace("ws_task").await;
-    store.connection.execute_unprepared("CREATE TRIGGER test_seed_claim_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN NEW.scope_kind='historical-seed' AND NEW.claim_token IS NOT NULL BEGIN SELECT RAISE(FAIL,'seed claim refused'); END").await.unwrap();
-    assert_eq!(
-        store.seed_child_work_with_clock(&|| 100).await.unwrap(),
-        ChildSeedOutcome::Deferred { retry_at: 102 }
-    );
-    let restarted = crate::CrudStore::new(store.database_connection());
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 101).await.unwrap(),
-        ChildSeedOutcome::Deferred { retry_at: 102 }
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER test_seed_claim_refusal")
-        .await
-        .unwrap();
-    assert_eq!(
-        restarted.seed_child_work_with_clock(&|| 102).await.unwrap(),
-        ChildSeedOutcome::CommittedDone
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        use crate::repositories::task_child_work::ChildSeedOutcome;
+        let store = postgres_store_with_workspace(fixture, "ws_task").await;
+        store.connection.execute_unprepared("CREATE TRIGGER test_seed_claim_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN NEW.scope_kind='historical-seed' AND NEW.claim_token IS NOT NULL BEGIN SELECT RAISE(FAIL,'seed claim refused'); END").await.unwrap();
+        assert_eq!(
+            store.seed_child_work_with_clock(&|| 100).await.unwrap(),
+            ChildSeedOutcome::Deferred { retry_at: 102 }
+        );
+        let restarted = crate::CrudStore::new(store.database_connection());
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 101).await.unwrap(),
+            ChildSeedOutcome::Deferred { retry_at: 102 }
+        );
+        store
+            .connection
+            .execute_unprepared("DROP TRIGGER test_seed_claim_refusal")
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.seed_child_work_with_clock(&|| 102).await.unwrap(),
+            ChildSeedOutcome::CommittedDone
+        );
+        Ok(())
+    }).await.unwrap();
 }

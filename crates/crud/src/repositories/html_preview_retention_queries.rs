@@ -1,11 +1,11 @@
-//! SeaQuery ownership predicates. All joins are explicit: Gateway writers use
-//! foreign_keys=OFF, so a missing related row must never imply safe retirement.
+//! Ownership predicates for preview retirement. Scope joins are explicit so
+//! only the candidate workspace's canonical records can release storage.
 use pioneer_entity::{
     agent_execution, agent_execution_resource_state, agent_turn_response_execution, artifact,
     artifact_binding, artifact_blob, artifact_projection, artifact_version,
     compaction_frozen_history, compaction_source_revision, compaction_task_output,
     html_preview_frozen_index, html_preview_frozen_result, html_preview_frozen_turn,
-    html_preview_index_backfill, native_terminal_effect_outbox, recovery_job,
+    native_terminal_effect_outbox, portable_payload_value, recovery_job,
     recovery_terminalization_outbox, task, task_delivery, task_run, task_run_conversation_snapshot,
     task_run_turn, thread, thread_cli_runtime_binding, turn, turn_cli_runtime_binding,
     turn_event_delivery, turn_finalization, turn_llm_context, turn_runtime_snapshot,
@@ -13,6 +13,7 @@ use pioneer_entity::{
 use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, IntoIden, IntoTableRef, JoinType, Query, SelectStatement,
 };
+use sha2::{Digest, Sha256};
 
 pub(in crate::repositories) fn col<C: IntoIden>(alias: &'static str, column: C) -> Expr {
     Expr::col((alias, column))
@@ -32,73 +33,17 @@ fn absent(query: SelectStatement) -> Expr {
 fn call(name: &'static str, args: impl IntoIterator<Item = Expr>) -> Expr {
     Func::cust(Alias::new(name)).args(args).into()
 }
-pub(super) fn safe_json(value: Expr) -> Expr {
-    Expr::case(call("json_valid", [value.clone()]), value)
-        .finally("{}")
-        .into()
-}
-pub(super) fn json(value: Expr, path: &'static str) -> Expr {
-    call("json_extract", [safe_json(value), Expr::val(path)])
+pub(super) fn json(value: Expr, path: &[&str]) -> Expr {
+    call(
+        "json_extract_path_text",
+        std::iter::once(value.cast_as("json")).chain(path.iter().copied().map(Expr::val)),
+    )
 }
 pub(in crate::repositories) fn bytes(value: Expr) -> Expr {
-    Func::char_length(value.cast_as("BLOB")).into()
+    call("octet_length", [value.cast_as("text")]).cast_as("bigint")
 }
 pub(in crate::repositories) fn revision(value: Expr) -> Expr {
     Expr::val("revision:").binary(BinOper::Custom("||"), value)
-}
-fn is(left: Expr, right: Expr) -> Expr {
-    left.binary(BinOper::Is, right)
-}
-
-pub(super) fn temporary_preview(a: &'static str) -> Expr {
-    let metadata = col(a, artifact::Column::MetadataJson);
-    let origin = |path| json(metadata.clone(), path);
-    let binding = one(artifact_binding::Entity, "adopted")
-        .and_where(
-            col("adopted", artifact_binding::Column::ArtifactId).eq(col(a, artifact::Column::Id)),
-        )
-        .and_where(
-            col("adopted", artifact_binding::Column::WorkspaceId)
-                .eq(col(a, artifact::Column::WorkspaceId)),
-        )
-        .and_where(
-            col("adopted", artifact_binding::Column::BindingKind)
-                .eq("tool_output")
-                .and(col("adopted", artifact_binding::Column::Direction).eq("output"))
-                .and(is(
-                    col("adopted", artifact_binding::Column::Role),
-                    Expr::val("tool"),
-                ))
-                .and(is(
-                    col("adopted", artifact_binding::Column::TurnId),
-                    origin("$.htmlTool.turnId"),
-                ))
-                .and(is(
-                    col("adopted", artifact_binding::Column::ToolCallId),
-                    origin("$.htmlTool.callId"),
-                ))
-                .and(is(
-                    col("adopted", artifact_binding::Column::ThreadId),
-                    col(a, artifact::Column::PrimaryThreadId),
-                ))
-                .and(col("adopted", artifact_binding::Column::TaskId).is_null())
-                .and(col("adopted", artifact_binding::Column::TaskRunId).is_null())
-                .and(col("adopted", artifact_binding::Column::MessageId).is_null())
-                .not(),
-        )
-        .to_owned();
-    let kind = |path| call("json_type", [safe_json(metadata.clone()), Expr::val(path)]);
-    let predicate = col(a, artifact::Column::CreatedByKind)
-        .eq("tool")
-        .and(col(a, artifact::Column::CreatedByActorId).eq("html_preview"))
-        .and(kind("$.htmlTool.version").eq("integer"))
-        .and(kind("$.htmlTool.publication").eq("false"))
-        .and(origin("$.htmlTool.version").is_in([1, 2]))
-        .and(origin("$.htmlTool.publication").eq(0))
-        .and(kind("$.htmlTool.turnId").eq("text"))
-        .and(kind("$.htmlTool.callId").eq("text"))
-        .and(absent(binding));
-    Func::coalesce([predicate, Expr::val(0)]).into()
 }
 
 pub(in crate::repositories) fn released_marker(workspace: &str) -> SelectStatement {
@@ -112,21 +57,21 @@ fn released_marker_for_turn(workspace: &str, turn: Expr) -> SelectStatement {
         .and_where(
             json(
                 col("a", artifact::Column::MetadataJson),
-                "$.htmlTool.retention",
+                &["htmlTool", "retention"],
             )
             .eq("released"),
         )
         .and_where(
             json(
                 col("a", artifact::Column::MetadataJson),
-                "$.htmlTool.turnId",
+                &["htmlTool", "turnId"],
             )
             .eq(turn),
         )
         .and_where(
             json(
                 col("a", artifact::Column::MetadataJson),
-                "$.htmlTool.callId",
+                &["htmlTool", "callId"],
             )
             .eq(col("c", turn_llm_context::Column::ItemId)),
         )
@@ -208,7 +153,7 @@ pub(super) fn unowned(
         .and_where(
             col("r", recovery_job::Column::Status)
                 .is_not_in(["succeeded", "failed", "exhausted", "cancelled"])
-                .or(col("r", recovery_job::Column::ResolutionPending).eq(1)),
+                .or(col("r", recovery_job::Column::ResolutionPending).eq(true)),
         )
         .to_owned();
     let recovery_delivery = one(recovery_terminalization_outbox::Entity, "r")
@@ -333,6 +278,15 @@ pub(super) fn unowned(
             "t",
             col("t", task::Column::Id).eq(col("s", task_run_conversation_snapshot::Column::TaskId)),
         )
+        .join_as(
+            JoinType::LeftJoin,
+            portable_payload_value::Entity,
+            "p",
+            col("p", portable_payload_value::Column::Id).eq(col(
+                "s",
+                task_run_conversation_snapshot::Column::HistoryJsonPayloadId,
+            )),
+        )
         .and_where(
             col("s", task_run_conversation_snapshot::Column::WorkspaceId)
                 .eq(workspace)
@@ -350,7 +304,10 @@ pub(super) fn unowned(
                 task_run_conversation_snapshot::Column::FrozenManifestId,
             )
             .is_null()
-            .and(col("s", task_run_conversation_snapshot::Column::HistoryJson).ne("[]"))),
+            .and(col("p", portable_payload_value::Column::Sha256).binary(
+                BinOper::Custom("IS DISTINCT FROM"),
+                Expr::val(Sha256::digest(b"[]").to_vec()),
+            ))),
         )
         .and_where(
             col("t", task::Column::Id)
@@ -358,17 +315,6 @@ pub(super) fn unowned(
                 .or(col("t", task::Column::Status).ne("completed")),
         )
         .to_owned();
-    let opaque_history = |value: Expr, path| {
-        Expr::case(
-            call("json_valid", [value.clone()]),
-            Func::coalesce([
-                call("json_extract", [value, Expr::val(path)]),
-                Expr::val("[]"),
-            ])
-            .ne("[]"),
-        )
-        .finally(1)
-    };
     let opaque_thread = one(thread_cli_runtime_binding::Entity, "s")
         .and_where(
             col("s", thread_cli_runtime_binding::Column::WorkspaceId)
@@ -381,10 +327,16 @@ pub(super) fn unowned(
                 .or(
                     col("s", thread_cli_runtime_binding::Column::FrozenManifestId)
                         .is_null()
-                        .and(opaque_history(
-                            col("s", thread_cli_runtime_binding::Column::ResumeCursorJson),
-                            "$.pioneerContext.contextHistoryJson",
-                        )),
+                        .and(
+                            Func::coalesce([
+                                json(
+                                    col("s", thread_cli_runtime_binding::Column::ResumeCursorJson),
+                                    &["pioneerContext", "contextHistoryJson"],
+                                ),
+                                Expr::val("[]"),
+                            ])
+                            .ne("[]"),
+                        ),
                 ),
         )
         .to_owned();
@@ -399,16 +351,14 @@ pub(super) fn unowned(
                 .eq("")
                 .or(col("s", turn_cli_runtime_binding::Column::FrozenManifestId)
                     .is_null()
-                    .and(opaque_history(
-                        col("s", turn_cli_runtime_binding::Column::InputMappingJson),
-                        "$.pioneerContextBasis.historyJson",
-                    ))),
+                    .and(
+                        col(
+                            "s",
+                            turn_cli_runtime_binding::Column::InputMappingHasInlineHistory,
+                        )
+                        .eq(true),
+                    )),
         )
-        .to_owned();
-    let backfill = one(html_preview_index_backfill::Entity, "b")
-        .and_where(col("b", html_preview_index_backfill::Column::Singleton).eq(1))
-        .and_where(col("b", html_preview_index_backfill::Column::Complete).eq(1))
-        .and_where(col("b", html_preview_index_backfill::Column::InputsComplete).eq(1))
         .to_owned();
     let unknown = one(html_preview_frozen_index::Entity, "i")
         .and_where(col("i", html_preview_frozen_index::Column::WorkspaceId).eq(workspace))
@@ -424,7 +374,6 @@ pub(super) fn unowned(
     Query::select()
         .expr_as(Expr::val(1), "safe")
         .and_where(exists(own_turn))
-        .and_where(exists(backfill))
         .and_where(absent(active_turn))
         .and_where(absent(runtime))
         .and_where(absent(transient))
@@ -530,7 +479,7 @@ fn frozen_media_hold(workspace: &str, turn_id: &str) -> SelectStatement {
             col("r", html_preview_frozen_result::Column::ArchiveWireSha256)
                 .is_null()
                 .or(col("v", compaction_source_revision::Column::Present)
-                    .binary(BinOper::IsNot, Expr::val(1)))
+                    .binary(BinOper::Custom("IS DISTINCT FROM"), Expr::val(1_i64)))
                 .or(col("r", html_preview_frozen_result::Column::SourceVersion)
                     .eq(revision(col(
                         "v",
@@ -587,13 +536,14 @@ pub(super) fn blob_has_owners(alias: &'static str) -> Expr {
 }
 pub(super) fn mark_temporary_blob() -> Expr {
     call(
-        "json_set",
+        "jsonb_set",
         [
-            safe_json(Expr::col(artifact_blob::Column::MetadataJson)),
-            Expr::val("$.htmlToolTemporary"),
-            Expr::val(1),
+            Expr::col(artifact_blob::Column::MetadataJson).cast_as("jsonb"),
+            Expr::val("{htmlToolTemporary}").cast_as("text[]"),
+            Expr::val("1").cast_as("jsonb"),
         ],
     )
+    .cast_as("text")
 }
 
 /// Receipt and immutable output must describe the same exact manifest member.

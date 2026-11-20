@@ -66,6 +66,8 @@ async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges()
     materialize_artifact_api_thread(&store, &workspace, "observe_child", "observe_child_turn")
         .await;
     thread_lineage::Entity::insert(thread_lineage::ActiveModel {
+        insertion_ordinal: Default::default(),
+        publication_xid: Default::default(),
         child_thread_id: Set("observe_child".into()),
         parent_thread_id: Set(h.sandbox_thread_id.clone()),
         root_thread_id: Set(h.sandbox_thread_id.clone()),
@@ -592,16 +594,40 @@ async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_re
             updated_at: 101,
         };
         store.record_provider_usage(record.clone()).await.unwrap();
+        let mut financial = usage;
+        let evidence = financial["accounting"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pricing");
+        let fact = pioneer_crud::ExecutionObservationInput {
+            workspace_id: workspace.clone(),
+            operation_id: format!("provider:journal:{id}"),
+            revision: 0,
+            thread_id: Some(h.sandbox_thread_id.clone()),
+            turn_id: None,
+            owner_kind: "thread".into(),
+            owner_id: h.sandbox_thread_id.clone(),
+            parent_operation_id: None,
+            kind: "provider_attempt".into(),
+            purpose: "summary".into(),
+            provider: Some("fixture".into()),
+            model: Some("fixture".into()),
+            status: "completed".into(),
+            recorded_at_ms: record.started_at * 1000,
+            facts: json!({
+                "usage": financial,
+                "legacy_owner_id": record.owner_id,
+                "usage_source_fingerprint": crate::message::execution_observability::source_fingerprint(&record.usage_json),
+                "timing": {"prepared_at_unix_seconds": record.started_at}
+            }),
+            tariff_evidence: evidence,
+        };
+        store
+            .record_execution_observation(fact.prepare().unwrap())
+            .await
+            .unwrap();
         legacy.push(record);
     }
-    assert!(
-        store
-            .with_maintenance_access()
-            .backfill_aux_execution_observations_quantum()
-            .await
-            .unwrap()
-            .complete
-    );
     let frontier = store
         .execution_workspace_frontier(&workspace)
         .await

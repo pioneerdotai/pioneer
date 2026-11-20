@@ -7,24 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "gateway_identity")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub auth_ready_at: Option<DateTimeWithTimeZone>,
+    pub identity_bootstrap_version: i64,
+    pub unread_started_at: i64,
+    pub auth_schema_version: i64,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(unique)]
     pub singleton_key: i64,
-    pub identity_bootstrap_version: i64,
-    pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
-    pub auth_schema_version: i64,
-    pub auth_ready_at: Option<DateTimeWithTimeZone>,
-    pub unread_started_at: i64,
     #[sea_orm(has_many)]
     pub audit_events: HasMany<super::audit_event::Entity>,
     #[sea_orm(has_many)]
     pub auth_sessions: HasMany<super::auth_session::Entity>,
     #[sea_orm(has_many)]
     pub devices: HasMany<super::device::Entity>,
-    #[sea_orm(has_one)]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    #[sea_orm(has_many)]
+    pub gateway_principals: HasMany<super::gateway_principal::Entity>,
     #[sea_orm(has_many)]
     pub invitations: HasMany<super::invitation::Entity>,
 }

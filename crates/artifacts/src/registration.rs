@@ -209,202 +209,227 @@ fn validate_registration_hints(
 mod tests {
     use super::*;
     use crate::{ArtifactService, LocalArtifactBlobStore};
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::CrudStore;
-    use sea_orm::Database;
+    use pioneer_postgres_test::{TestDatabase, with_database};
+    use sea_orm::ConnectionTrait;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn artifact_registration_local_file_creates_tool_output_binding() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_path = temp.path().join("report.txt");
-        let bytes = b"registered artifact";
-        tokio::fs::write(source_path.as_path(), bytes)
-            .await
-            .expect("write source");
-        let harness = harness(temp.path().join("runtime")).await;
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let source_path = temp.path().join("report.txt");
+            let bytes = b"registered artifact";
+            tokio::fs::write(source_path.as_path(), bytes)
+                .await
+                .expect("write source");
+            let harness = harness(database, temp.path().join("runtime")).await;
 
-        let summary = harness
-            .register_candidate(
-                registration_context(temp.path()),
-                ArtifactRegistrationCandidate {
-                    path: source_path,
-                    display_name: Some("report.txt".to_owned()),
-                    mime_type: Some("text/plain".to_owned()),
-                    kind_hint: None,
-                    description: None,
-                    sha256: Some(sha256(bytes)),
-                    size_bytes: Some(bytes.len() as u64),
-                    source: ArtifactRegistrationSource::DownloadTool,
-                },
-            )
-            .await
-            .expect("register");
+            let summary = harness
+                .register_candidate(
+                    registration_context(temp.path()),
+                    ArtifactRegistrationCandidate {
+                        path: source_path,
+                        display_name: Some("report.txt".to_owned()),
+                        mime_type: Some("text/plain".to_owned()),
+                        kind_hint: None,
+                        description: None,
+                        sha256: Some(sha256(bytes)),
+                        size_bytes: Some(bytes.len() as u64),
+                        source: ArtifactRegistrationSource::DownloadTool,
+                    },
+                )
+                .await
+                .expect("register");
 
-        assert_eq!(summary.workspace_id, "ws_registration");
-        assert_eq!(summary.artifact.kind, ArtifactKind::Text);
-        assert_eq!(summary.bindings.len(), 1);
-        assert_eq!(
-            summary.bindings[0].thread_id.as_deref(),
-            Some("thr_registration")
-        );
-        assert_eq!(
-            summary.bindings[0].turn_id.as_deref(),
-            Some("turn_registration")
-        );
-        assert_eq!(
-            summary.bindings[0].tool_call_id.as_deref(),
-            Some("call_registration")
-        );
-        assert_eq!(
-            summary.bindings[0].binding_kind,
-            ArtifactBindingKind::ToolOutput
-        );
+            assert_eq!(summary.workspace_id, "ws_registration");
+            assert_eq!(summary.artifact.kind, ArtifactKind::Text);
+            assert_eq!(summary.bindings.len(), 1);
+            assert_eq!(
+                summary.bindings[0].thread_id.as_deref(),
+                Some("thr_registration")
+            );
+            assert_eq!(
+                summary.bindings[0].turn_id.as_deref(),
+                Some("turn_registration")
+            );
+            assert_eq!(
+                summary.bindings[0].tool_call_id.as_deref(),
+                Some("call_registration")
+            );
+            assert_eq!(
+                summary.bindings[0].binding_kind,
+                ArtifactBindingKind::ToolOutput
+            );
 
-        let page = harness
-            .list_thread_artifacts(
-                "ws_registration",
-                "thr_registration",
-                crate::ArtifactListFilter::default(),
-            )
-            .await
-            .expect("list");
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0].artifact.artifact_id,
-            summary.artifact.artifact_id
-        );
+            let page = harness
+                .list_thread_artifacts(
+                    "ws_registration",
+                    "thr_registration",
+                    crate::ArtifactListFilter::default(),
+                )
+                .await
+                .expect("list");
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(
+                page.items[0].artifact.artifact_id,
+                summary.artifact.artifact_id
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_registration_detects_mime_and_records_declared_mismatch() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_path = temp.path().join("image-as-text.txt");
-        let bytes = b"\x89PNG\r\n\x1a\nrest";
-        tokio::fs::write(source_path.as_path(), bytes)
-            .await
-            .expect("write source");
-        let harness = harness(temp.path().join("runtime")).await;
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let source_path = temp.path().join("image-as-text.txt");
+            let bytes = b"\x89PNG\r\n\x1a\nrest";
+            tokio::fs::write(source_path.as_path(), bytes)
+                .await
+                .expect("write source");
+            let harness = harness(database, temp.path().join("runtime")).await;
 
-        let summary = harness
-            .register_candidate(
-                registration_context(temp.path()),
-                ArtifactRegistrationCandidate {
-                    path: source_path,
-                    display_name: Some("image-as-text.txt".to_owned()),
-                    mime_type: Some("text/plain".to_owned()),
-                    kind_hint: None,
-                    description: None,
-                    sha256: Some(sha256(bytes)),
-                    size_bytes: Some(bytes.len() as u64),
-                    source: ArtifactRegistrationSource::DownloadTool,
-                },
-            )
-            .await
-            .expect("register");
+            let summary = harness
+                .register_candidate(
+                    registration_context(temp.path()),
+                    ArtifactRegistrationCandidate {
+                        path: source_path,
+                        display_name: Some("image-as-text.txt".to_owned()),
+                        mime_type: Some("text/plain".to_owned()),
+                        kind_hint: None,
+                        description: None,
+                        sha256: Some(sha256(bytes)),
+                        size_bytes: Some(bytes.len() as u64),
+                        source: ArtifactRegistrationSource::DownloadTool,
+                    },
+                )
+                .await
+                .expect("register");
 
-        assert_eq!(summary.artifact.kind, ArtifactKind::Image);
-        assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(
-            summary
-                .metadata
-                .get("declared_mime_type")
-                .and_then(|value| value.as_str()),
-            Some("text/plain")
-        );
-        assert_eq!(
-            summary
-                .metadata
-                .get("detected_mime_type")
-                .and_then(|value| value.as_str()),
-            Some("image/png")
-        );
-        assert_eq!(
-            summary
-                .metadata
-                .get("declared_detected_mime_mismatch")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
+            assert_eq!(summary.artifact.kind, ArtifactKind::Image);
+            assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(
+                summary
+                    .metadata
+                    .get("declared_mime_type")
+                    .and_then(|value| value.as_str()),
+                Some("text/plain")
+            );
+            assert_eq!(
+                summary
+                    .metadata
+                    .get("detected_mime_type")
+                    .and_then(|value| value.as_str()),
+                Some("image/png")
+            );
+            assert_eq!(
+                summary
+                    .metadata
+                    .get("declared_detected_mime_mismatch")
+                    .and_then(|value| value.as_bool()),
+                Some(true)
+            );
 
-        assert_eq!(
-            summary
-                .metadata
-                .get("effective_mime_type")
-                .and_then(|value| value.as_str()),
-            Some("image/png")
-        );
+            assert_eq!(
+                summary
+                    .metadata
+                    .get("effective_mime_type")
+                    .and_then(|value| value.as_str()),
+                Some("image/png")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_registration_adds_mime_extension_to_extensionless_display_name() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_path = temp.path().join("auto.ru_screenshot");
-        let bytes = b"\x89PNG\r\n\x1a\nrest";
-        tokio::fs::write(source_path.as_path(), bytes)
-            .await
-            .expect("write source");
-        let harness = harness(temp.path().join("runtime")).await;
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let source_path = temp.path().join("auto.ru_screenshot");
+            let bytes = b"\x89PNG\r\n\x1a\nrest";
+            tokio::fs::write(source_path.as_path(), bytes)
+                .await
+                .expect("write source");
+            let harness = harness(database, temp.path().join("runtime")).await;
 
-        let summary = harness
-            .register_candidate(
-                registration_context(temp.path()),
-                ArtifactRegistrationCandidate {
-                    path: source_path,
-                    display_name: Some("auto.ru_screenshot".to_owned()),
-                    mime_type: Some("image/png".to_owned()),
-                    kind_hint: Some(ArtifactKind::Image),
-                    description: None,
-                    sha256: Some(sha256(bytes)),
-                    size_bytes: Some(bytes.len() as u64),
-                    source: ArtifactRegistrationSource::ExplicitArtifactRegister,
-                },
-            )
-            .await
-            .expect("register");
+            let summary = harness
+                .register_candidate(
+                    registration_context(temp.path()),
+                    ArtifactRegistrationCandidate {
+                        path: source_path,
+                        display_name: Some("auto.ru_screenshot".to_owned()),
+                        mime_type: Some("image/png".to_owned()),
+                        kind_hint: Some(ArtifactKind::Image),
+                        description: None,
+                        sha256: Some(sha256(bytes)),
+                        size_bytes: Some(bytes.len() as u64),
+                        source: ArtifactRegistrationSource::ExplicitArtifactRegister,
+                    },
+                )
+                .await
+                .expect("register");
 
-        assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
-        assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
+            assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_registration_rejects_oversized_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_path = temp.path().join("large.bin");
-        tokio::fs::write(source_path.as_path(), b"abcdef")
-            .await
-            .expect("write source");
-        let harness = harness(temp.path().join("runtime")).await;
-        let mut context = registration_context(temp.path());
-        context.max_file_bytes = Some(3);
+        with_database(async |database| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let source_path = temp.path().join("large.bin");
+            tokio::fs::write(source_path.as_path(), b"abcdef")
+                .await
+                .expect("write source");
+            let harness = harness(database, temp.path().join("runtime")).await;
+            let mut context = registration_context(temp.path());
+            context.max_file_bytes = Some(3);
 
-        let error = harness
-            .register_candidate(
-                context,
-                ArtifactRegistrationCandidate {
-                    path: source_path,
-                    display_name: Some("large.bin".to_owned()),
-                    mime_type: None,
-                    kind_hint: None,
-                    description: None,
-                    sha256: None,
-                    size_bytes: None,
-                    source: ArtifactRegistrationSource::DownloadTool,
-                },
-            )
-            .await
-            .expect_err("oversized registration must fail");
+            let error = harness
+                .register_candidate(
+                    context,
+                    ArtifactRegistrationCandidate {
+                        path: source_path,
+                        display_name: Some("large.bin".to_owned()),
+                        mime_type: None,
+                        kind_hint: None,
+                        description: None,
+                        sha256: None,
+                        size_bytes: None,
+                        source: ArtifactRegistrationSource::DownloadTool,
+                    },
+                )
+                .await
+                .expect_err("oversized registration must fail");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
-    async fn harness(runtime_home: PathBuf) -> ArtifactService {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite");
-        Migrator::up(&db, None).await.expect("migrate");
+    async fn harness(database: &TestDatabase, runtime_home: PathBuf) -> ArtifactService {
+        database.connection().execute_unprepared(
+            "INSERT INTO workspace(id,name) VALUES ('ws_registration','Fixture');
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+             VALUES ('thr_registration','ws_registration','','agent','model','provider','active');
+             INSERT INTO turn(id,thread_id,status) VALUES ('turn_registration','thr_registration','in_progress');",
+        ).await.expect("create artifact owner");
         ArtifactService::new(
-            Arc::new(CrudStore::new(db)),
+            Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+                database.connect_read_only().await.unwrap(),
+                database.connection().clone(),
+            ))),
             Arc::new(LocalArtifactBlobStore::new(runtime_home)),
         )
     }

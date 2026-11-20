@@ -1,11 +1,10 @@
-use migration::{Migrator, MigratorTrait};
 use pioneer_gateway::cli_mcp_client_validation::{
     CliMcpClientTarget, CliMcpClientValidationAuditContext, CliMcpClientValidationEvidence,
     CliMcpClientValidationRejection, CliMcpClientValidationRejectionCode,
     validate_cli_mcp_client_request_durably,
 };
+use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::TurnCapabilityRejectedReason;
-use sea_orm::Database;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GatewayObservationSpies {
@@ -55,14 +54,11 @@ async fn exercise_gateway_gate(
     Ok(())
 }
 
-async fn test_store() -> pioneer_crud::CrudStore {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("in-memory SQLite");
-    Migrator::up(&connection, None)
-        .await
-        .expect("Gateway client-validation migrations");
-    pioneer_crud::CrudStore::new(connection)
+async fn test_store(database: &TestDatabase) -> pioneer_crud::CrudStore {
+    pioneer_crud::CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        database.connect_read_only().await.unwrap(),
+        database.connection().clone(),
+    ))
 }
 
 fn valid_cli(target: CliMcpClientTarget) -> CliMcpClientValidationEvidence {
@@ -79,113 +75,128 @@ fn valid_cli(target: CliMcpClientTarget) -> CliMcpClientValidationEvidence {
 
 #[tokio::test]
 async fn forged_stale_and_unsupported_requests_stop_before_all_side_effect_boundaries() {
-    let store = test_store().await;
-    let cases = [
-        (
-            "unsupported",
-            CliMcpClientValidationEvidence {
-                runtime_supports_mcp_tools: false,
-                ..valid_cli(CliMcpClientTarget::Codex)
-            },
-            CliMcpClientValidationRejectionCode::RuntimeMcpUnsupported,
-            TurnCapabilityRejectedReason::ProviderUnsupported,
-        ),
-        (
-            "stale runtime",
-            CliMcpClientValidationEvidence {
-                runtime_snapshot_current: false,
-                ..valid_cli(CliMcpClientTarget::Claude)
-            },
-            CliMcpClientValidationRejectionCode::StaleRuntimeSnapshot,
-            TurnCapabilityRejectedReason::Unavailable,
-        ),
-        (
-            "cross workspace",
-            CliMcpClientValidationEvidence {
-                projection_workspace_matches: false,
-                ..valid_cli(CliMcpClientTarget::Codex)
-            },
-            CliMcpClientValidationRejectionCode::CrossWorkspaceProjection,
-            TurnCapabilityRejectedReason::SecurityBlocked,
-        ),
-        (
-            "unresolved explicit",
-            CliMcpClientValidationEvidence {
-                explicit_capabilities_resolved: false,
-                ..valid_cli(CliMcpClientTarget::Claude)
-            },
-            CliMcpClientValidationRejectionCode::ExplicitCapabilityUnresolved,
-            TurnCapabilityRejectedReason::ValidationRejected,
-        ),
-        (
-            "provider switch race",
-            CliMcpClientValidationEvidence {
-                provider_claim_matches: false,
-                ..valid_cli(CliMcpClientTarget::Codex)
-            },
-            CliMcpClientValidationRejectionCode::ProviderSwitchRace,
-            TurnCapabilityRejectedReason::ProviderUnsupported,
-        ),
-    ];
+    with_database(async |database| {
+        let store = test_store(database).await;
+        let cases = [
+            (
+                "unsupported",
+                CliMcpClientValidationEvidence {
+                    runtime_supports_mcp_tools: false,
+                    ..valid_cli(CliMcpClientTarget::Codex)
+                },
+                CliMcpClientValidationRejectionCode::RuntimeMcpUnsupported,
+                TurnCapabilityRejectedReason::ProviderUnsupported,
+            ),
+            (
+                "stale runtime",
+                CliMcpClientValidationEvidence {
+                    runtime_snapshot_current: false,
+                    ..valid_cli(CliMcpClientTarget::Claude)
+                },
+                CliMcpClientValidationRejectionCode::StaleRuntimeSnapshot,
+                TurnCapabilityRejectedReason::Unavailable,
+            ),
+            (
+                "cross workspace",
+                CliMcpClientValidationEvidence {
+                    projection_workspace_matches: false,
+                    ..valid_cli(CliMcpClientTarget::Codex)
+                },
+                CliMcpClientValidationRejectionCode::CrossWorkspaceProjection,
+                TurnCapabilityRejectedReason::SecurityBlocked,
+            ),
+            (
+                "unresolved explicit",
+                CliMcpClientValidationEvidence {
+                    explicit_capabilities_resolved: false,
+                    ..valid_cli(CliMcpClientTarget::Claude)
+                },
+                CliMcpClientValidationRejectionCode::ExplicitCapabilityUnresolved,
+                TurnCapabilityRejectedReason::ValidationRejected,
+            ),
+            (
+                "provider switch race",
+                CliMcpClientValidationEvidence {
+                    provider_claim_matches: false,
+                    ..valid_cli(CliMcpClientTarget::Codex)
+                },
+                CliMcpClientValidationRejectionCode::ProviderSwitchRace,
+                TurnCapabilityRejectedReason::ProviderUnsupported,
+            ),
+        ];
 
-    for (case, evidence, expected_code, expected_reason) in cases {
-        let mut observations = GatewayObservationSpies::default();
-        let rejection = exercise_gateway_gate(&store, case, evidence, &mut observations)
-            .await
-            .expect_err("invalid client MCP evidence must be rejected");
+        for (case, evidence, expected_code, expected_reason) in cases {
+            let mut observations = GatewayObservationSpies::default();
+            let rejection = exercise_gateway_gate(&store, case, evidence, &mut observations)
+                .await
+                .expect_err("invalid client MCP evidence must be rejected");
 
-        assert_eq!(rejection.code, expected_code, "{case}");
-        assert_eq!(rejection.reason, expected_reason, "{case}");
-        assert!(
-            rejection.to_string().starts_with(expected_code.as_str()),
-            "{case}"
-        );
-        assert_eq!(observations.durable_rejections, 1, "{case}");
-        assert_eq!(observations.projection_binding_commits, 0, "{case}");
-        assert_eq!(observations.provider_acquisitions, 0, "{case}");
-        assert_eq!(observations.native_turn_starts, 0, "{case}");
-    }
+            assert_eq!(rejection.code, expected_code, "{case}");
+            assert_eq!(rejection.reason, expected_reason, "{case}");
+            assert!(
+                rejection.to_string().starts_with(expected_code.as_str()),
+                "{case}"
+            );
+            assert_eq!(observations.durable_rejections, 1, "{case}");
+            assert_eq!(observations.projection_binding_commits, 0, "{case}");
+            assert_eq!(observations.provider_acquisitions, 0, "{case}");
+            assert_eq!(observations.native_turn_starts, 0, "{case}");
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn valid_api_codex_and_claude_controls_reach_the_exact_side_effect_boundaries() {
-    let store = test_store().await;
-    for (case, evidence) in [
-        ("native API MCP", CliMcpClientValidationEvidence::api(true)),
-        ("Codex MCP", valid_cli(CliMcpClientTarget::Codex)),
-        ("Claude MCP", valid_cli(CliMcpClientTarget::Claude)),
-    ] {
-        let mut observations = GatewayObservationSpies::default();
-        exercise_gateway_gate(&store, case, evidence, &mut observations)
-            .await
-            .unwrap_or_else(|error| panic!("{case} should pass: {error}"));
+    with_database(async |database| {
+        let store = test_store(database).await;
+        for (case, evidence) in [
+            ("native API MCP", CliMcpClientValidationEvidence::api(true)),
+            ("Codex MCP", valid_cli(CliMcpClientTarget::Codex)),
+            ("Claude MCP", valid_cli(CliMcpClientTarget::Claude)),
+        ] {
+            let mut observations = GatewayObservationSpies::default();
+            exercise_gateway_gate(&store, case, evidence, &mut observations)
+                .await
+                .unwrap_or_else(|error| panic!("{case} should pass: {error}"));
 
-        assert_eq!(observations.durable_rejections, 0, "{case}");
-        assert_eq!(observations.projection_binding_commits, 1, "{case}");
-        assert_eq!(observations.provider_acquisitions, 1, "{case}");
-        assert_eq!(observations.native_turn_starts, 1, "{case}");
-    }
+            assert_eq!(observations.durable_rejections, 0, "{case}");
+            assert_eq!(observations.projection_binding_commits, 1, "{case}");
+            assert_eq!(observations.provider_acquisitions, 1, "{case}");
+            assert_eq!(observations.native_turn_starts, 1, "{case}");
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn no_mcp_cli_control_preserves_existing_provider_start_without_projection_commit() {
-    let store = test_store().await;
-    let evidence = CliMcpClientValidationEvidence {
-        has_mcp_projection: false,
-        runtime_snapshot_current: false,
-        runtime_supports_mcp_tools: false,
-        ..valid_cli(CliMcpClientTarget::Codex)
-    };
-    let mut observations = GatewayObservationSpies::default();
+    with_database(async |database| {
+        let store = test_store(database).await;
+        let evidence = CliMcpClientValidationEvidence {
+            has_mcp_projection: false,
+            runtime_snapshot_current: false,
+            runtime_supports_mcp_tools: false,
+            ..valid_cli(CliMcpClientTarget::Codex)
+        };
+        let mut observations = GatewayObservationSpies::default();
 
-    exercise_gateway_gate(&store, "codex-no-mcp", evidence, &mut observations)
-        .await
-        .expect("no-MCP CLI control should pass");
+        exercise_gateway_gate(&store, "codex-no-mcp", evidence, &mut observations)
+            .await
+            .expect("no-MCP CLI control should pass");
 
-    assert_eq!(observations.durable_rejections, 0);
-    assert_eq!(observations.projection_binding_commits, 0);
-    assert_eq!(observations.provider_acquisitions, 1);
-    assert_eq!(observations.native_turn_starts, 1);
+        assert_eq!(observations.durable_rejections, 0);
+        assert_eq!(observations.projection_binding_commits, 0);
+        assert_eq!(observations.provider_acquisitions, 1);
+        assert_eq!(observations.native_turn_starts, 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]

@@ -7,23 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_delivery_authority")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    pub disclosure_generation: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub destination_route_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub delivery_id: String,
-    pub task_id: String,
-    pub run_id: String,
     #[sea_orm(column_type = "Text")]
     pub author_json: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub reviewer_json: Option<String>,
-    pub destination_route_id: Option<String>,
+    #[sea_orm(column_type = "Text", unique)]
+    pub idempotency_key: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub route_receipt_json: Option<String>,
-    pub disclosure_generation: i64,
-    #[sea_orm(unique)]
-    pub idempotency_key: String,
-    pub status: String,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub run_id: String,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reviewer_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,17 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_operation_projection")]
 pub struct Model {
+    pub terminal_generation: Option<i64>,
+    #[sea_orm(column_type = "Text")]
+    pub imports_sha256: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
     #[sea_orm(column_type = "Text")]
-    pub manifest_id: String,
-    #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
     #[sea_orm(column_type = "Text")]
-    pub imports_sha256: String,
+    pub manifest_id: String,
     pub import_count: i64,
-    /// Derived terminal classification, invalidated by operation/runner writes.
-    pub terminal_generation: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",
@@ -25,7 +24,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "NoAction"
     )]
-    pub compaction_frozen_history: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history: BelongsTo<super::compaction_frozen_history::Entity>,
     #[sea_orm(
         belongs_to,
         from = "operation_id",
@@ -33,7 +32,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

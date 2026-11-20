@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::mem::size_of;
 
 pub const THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR: &str =
     "thread episodic source version superseded during reconciliation";
@@ -246,33 +245,10 @@ pub struct ThreadEpisodicItemIndexedUpdate {
     pub embedding_artifact_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadEpisodicEmbeddingArtifactRecord {
-    pub id: String,
-    pub workspace_id: String,
-    pub pipeline_identity_hash: String,
-    pub input_hash: String,
-    pub provider_id: String,
-    pub model: String,
-    pub dimension: usize,
-    pub normalized: bool,
-    pub vector: Vec<f32>,
-    pub created_at: DateTimeWithTimeZone,
-    pub last_used_at: DateTimeWithTimeZone,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewThreadEpisodicEmbeddingArtifactRecord {
-    pub id: String,
-    pub workspace_id: String,
-    pub pipeline_identity_hash: String,
-    pub input_hash: String,
-    pub provider_id: String,
-    pub model: String,
-    pub dimension: usize,
-    pub normalized: bool,
-    pub vector: Vec<f32>,
-}
+pub use pioneer_crud_memory::episodic_embeddings::{
+    NewThreadEpisodicEmbeddingArtifactRecord, ThreadEpisodicEmbeddingArtifactRecord,
+    thread_episodic_embedding_artifact_record_from_model,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadEpisodicExclusionRecord {
@@ -412,7 +388,7 @@ pub(crate) fn thread_episodic_item_record_from_model(
         item_id: model.item_id,
         source_actor_role: source_actor_role_from_db(model.source_actor_role.as_str())?,
         source_runtime_kind: source_runtime_kind_from_db(model.source_runtime_kind.as_str())?,
-        source_context: serde_json::from_str(model.source_context_json.as_str())?,
+        source_context: serde_json::from_value(model.source_context_json)?,
         visibility: item_visibility_from_db(model.visibility.as_str())?,
         status: item_status_from_db(model.status.as_str())?,
         text_hash: model.text_hash,
@@ -425,48 +401,6 @@ pub(crate) fn thread_episodic_item_record_from_model(
         created_at: model.created_at,
         updated_at: model.updated_at,
         deleted_at: model.deleted_at,
-    })
-}
-
-pub(crate) fn thread_episodic_embedding_artifact_record_from_model(
-    model: pioneer_entity::thread_episodic_embedding_artifacts::Model,
-) -> Result<ThreadEpisodicEmbeddingArtifactRecord> {
-    let dimension = usize::try_from(model.dimension)
-        .map_err(|_| anyhow::anyhow!("thread episodic embedding dimension is negative"))?;
-    let expected_bytes = dimension
-        .checked_mul(size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("thread episodic embedding byte length overflow"))?;
-    if model.vector_bytes.len() != expected_bytes {
-        bail!(
-            "thread episodic embedding artifact `{}` has {} bytes, expected {}",
-            model.id,
-            model.vector_bytes.len(),
-            expected_bytes
-        );
-    }
-    let vector = model
-        .vector_bytes
-        .chunks_exact(size_of::<f32>())
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        dimension > 0
-            && vector.iter().all(|value| value.is_finite())
-            && vector.iter().any(|value| *value != 0.0),
-        "invalid stored embedding artifact"
-    );
-    Ok(ThreadEpisodicEmbeddingArtifactRecord {
-        id: model.id,
-        workspace_id: model.workspace_id,
-        pipeline_identity_hash: model.pipeline_identity_hash,
-        input_hash: model.input_hash,
-        provider_id: model.provider_id,
-        model: model.model,
-        dimension,
-        normalized: model.normalized,
-        vector,
-        created_at: model.created_at,
-        last_used_at: model.last_used_at,
     })
 }
 
@@ -512,10 +446,10 @@ pub(crate) fn thread_episodic_recall_event_record_from_model(
         thread_id: model.thread_id,
         turn_id: model.turn_id,
         query_hash: model.query_hash,
-        search_profile_json: model.search_profile_json,
+        search_profile_json: model.search_profile_json.map(|value| value.to_string()),
         search_mode: model.search_mode,
         adaptive_strategy: model.adaptive_strategy,
-        cutoff_json: model.cutoff_json,
+        cutoff_json: model.cutoff_json.map(|value| value.to_string()),
         candidate_count: model.candidate_count,
         returned_count: model.returned_count,
         latency_ms: model.latency_ms,
@@ -759,67 +693,10 @@ mod tests {
     }
 }
 
-/// Conditions supplied by the product's authorization boundary. A missing
-/// principal restricts no ACL only when the caller has an absolute read grant.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ThreadEpisodicSearchAccess {
-    pub principal_id: Option<String>,
-    pub root_thread_id: Option<String>,
-    pub include_internal: bool,
-    pub current_thread_id: Option<String>,
-}
-
-/// Equal-weight reciprocal-rank policy, independent of the storage engine.
-/// Its top score is 1 when both branches rank a result first. A single first
-/// rank scores 0.5; this scale is suitable for the existing 0..1 thresholds.
-pub const THREAD_SEARCH_RRF_K: f64 = 10.0;
-/// Invalidates continuation positions when ranking/grouping changes.
-pub const THREAD_SEARCH_RANKING_VERSION: u32 = 2;
-pub fn thread_search_rank_score(lexical_rank: Option<i64>, semantic_rank: Option<i64>) -> f32 {
-    let contribution = |rank: Option<i64>| {
-        rank.filter(|rank| *rank > 0).map_or(0.0, |rank| {
-            (THREAD_SEARCH_RRF_K + 1.0) / (THREAD_SEARCH_RRF_K + rank as f64)
-        })
-    };
-    let score = (contribution(lexical_rank) + contribution(semantic_rank)) / 2.0;
-    // Monotonic calibration preserves SQL order and the existing recall scale:
-    // a lone rank r still scores 61/(2*(60+r)), including 0.25 at rank 62.
-    // Above the single-branch ceiling, retain the 0.5..1 agreement range.
-    // This avoids silently dropping lexical/semantic-only recall candidates
-    // when sharpening fusion, without changing any caller's cutoff settings.
-    if score <= 0.5 {
-        const SINGLE_BRANCH_SCORE_K: f64 = 60.0;
-        ((SINGLE_BRANCH_SCORE_K + 1.0) * score
-            / (2.0 * (SINGLE_BRANCH_SCORE_K - THREAD_SEARCH_RRF_K) * score
-                + THREAD_SEARCH_RRF_K
-                + 1.0)) as f32
-    } else {
-        score as f32
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ThreadEpisodicSearchQuery {
-    pub workspace_id: String,
-    pub thread_id: Option<String>,
-    pub access: ThreadEpisodicSearchAccess,
-    pub query: String,
-    pub lexical: bool,
-    pub embedding: Option<ThreadEpisodicSearchEmbedding>,
-    pub created_after_unix: Option<i64>,
-    pub offset: u64,
-    pub limit: u32,
-    pub snippet_chars: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct ThreadEpisodicSearchEmbedding {
-    pub provider_id: String,
-    pub model: String,
-    pub dimension: usize,
-    pub normalized: bool,
-    pub vector: Vec<f32>,
-}
+pub use pioneer_crud_memory::episodic_search::{
+    THREAD_SEARCH_RANKING_VERSION, THREAD_SEARCH_RRF_K, ThreadEpisodicSearchAccess,
+    ThreadEpisodicSearchEmbedding, ThreadEpisodicSearchQuery, thread_search_rank_score,
+};
 
 #[derive(Debug, Clone)]
 pub struct ThreadEpisodicSearchRow {

@@ -26,8 +26,6 @@ async fn shell_outcome(
     else {
         return Ok(None);
     };
-    super::history::prepare_references(store, workspace, thread, std::slice::from_ref(&reference))
-        .await?;
     let payload = super::history::reference_payload(store, workspace, thread, &reference)
         .await
         .map_err(|_| anyhow::anyhow!("terminal tool source changed during recovery"))?;
@@ -253,8 +251,6 @@ pub(crate) async fn retained_tool_policy(
     else {
         return Ok(None);
     };
-    super::history::prepare_references(store, workspace, thread, std::slice::from_ref(&source))
-        .await?;
     let payload = super::history::reference_payload(&store, workspace, thread, &source).await?;
     let item: TurnItem = serde_json::from_str(&payload)?;
     ensure!(

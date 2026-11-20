@@ -14,8 +14,7 @@
 - Justify each new table/index and its installation cost on existing databases,
   including scans and index construction over large tables.
 - Keep schema installation limited to schema changes and necessary seed rows.
-  Heavy historical backfill belongs to the existing
-  [Gateway data-migration mechanism](../gateway/src/database/AGENTS.md).
+  Pioneer 1.0 starts with a fresh PostgreSQL database.
 - After schema changes, follow [Entity generation](../entity/AGENTS.md).
   The schema must support repeatable generation without manual model repairs.
 - Put regressions in the existing integration-fixture suites, outside migration

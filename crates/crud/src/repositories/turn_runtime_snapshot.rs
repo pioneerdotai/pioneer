@@ -1,18 +1,21 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_runtime_snapshot};
-use pioneer_protocol::TurnStatus;
+use pioneer_protocol::{ThreadMode, TurnStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, OnConflict, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QuerySelect, Statement,
+    Value,
+};
 
-use crate::convention::turn_status_to_db;
+use crate::convention::{thread_mode_from_db, thread_mode_to_db, turn_status_to_db};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRuntimeSnapshotRecord {
     pub turn_id: String,
     pub thread_id: String,
     pub workspace_id: String,
-    pub mode_json: String,
+    pub mode: ThreadMode,
     pub model: String,
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
@@ -33,7 +36,7 @@ pub struct NewTurnRuntimeSnapshot {
     pub turn_id: String,
     pub thread_id: String,
     pub workspace_id: String,
-    pub mode_json: String,
+    pub mode: ThreadMode,
     pub model: String,
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
@@ -56,12 +59,15 @@ pub(crate) async fn verify_source_epochs<C: ConnectionTrait>(
     workspace: &str,
     epochs_json: &str,
 ) -> Result<()> {
+    // json_each_text supplies the prepared source epoch map as relational
+    // keys. SeaQuery has no builder for a table-valued JSON expansion.
     let changed = db
-        .query_one_raw(super::compaction::sqlite_specific_sql(
-            "SELECT wanted.key FROM json_each(?) wanted \
-         LEFT JOIN thread t ON t.id=wanted.key AND t.workspace_id=? \
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT wanted.key FROM json_each_text($1::text::json) wanted \
+         LEFT JOIN thread t ON t.id=wanted.key AND t.workspace_id=$2 \
          LEFT JOIN compaction_projection_epoch e ON e.thread_id=t.id \
-         WHERE t.id IS NULL OR COALESCE(e.version,0)<>wanted.value LIMIT 1",
+         WHERE t.id IS NULL OR COALESCE(e.version,0)<>wanted.value::bigint LIMIT 1",
             [epochs_json.into(), workspace.into()],
         ))
         .await?;
@@ -95,51 +101,59 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         thread != &snapshot.thread_id || workspace != &snapshot.workspace_id
     });
     let turn_id = snapshot.turn_id.clone();
-    turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
-        turn_id: Set(snapshot.turn_id),
-        thread_id: Set(snapshot.thread_id),
-        workspace_id: Set(snapshot.workspace_id),
-        mode_json: Set(snapshot.mode_json),
-        model: Set(snapshot.model),
-        provider_name: Set(snapshot.provider_name),
-        reasoning_effort: Set(snapshot.reasoning_effort),
-        agent_skill_versions_json: Set(snapshot.agent_skill_versions_json),
-        hook_runtime_context_json: Set(snapshot.hook_runtime_context_json),
-        workspace_skill_policies_json: Set(snapshot.workspace_skill_policies_json),
-        input_json: Set(snapshot.input_json),
-        capabilities_json: Set(snapshot.capabilities_json),
-        resolved_artifacts_json: Set(snapshot.resolved_artifacts_json),
-        runtime_environment_json: Set(snapshot.runtime_environment_json),
-        history_json: Set(snapshot.history_json),
-        frozen_manifest_id: Set(root.locator()),
-        created_at: Set(snapshot.created_at),
-        updated_at: Set(snapshot.updated_at),
-    })
-    .on_conflict(
-        OnConflict::column(turn_runtime_snapshot::Column::TurnId)
-            .update_columns([
-                turn_runtime_snapshot::Column::ThreadId,
-                turn_runtime_snapshot::Column::WorkspaceId,
-                turn_runtime_snapshot::Column::ModeJson,
-                turn_runtime_snapshot::Column::Model,
-                turn_runtime_snapshot::Column::ProviderName,
-                turn_runtime_snapshot::Column::ReasoningEffort,
-                turn_runtime_snapshot::Column::AgentSkillVersionsJson,
-                turn_runtime_snapshot::Column::HookRuntimeContextJson,
-                turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
-                turn_runtime_snapshot::Column::InputJson,
-                turn_runtime_snapshot::Column::CapabilitiesJson,
-                turn_runtime_snapshot::Column::ResolvedArtifactsJson,
-                turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
-                turn_runtime_snapshot::Column::HistoryJson,
-                turn_runtime_snapshot::Column::FrozenManifestId,
-                turn_runtime_snapshot::Column::UpdatedAt,
-            ])
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to upsert turn_runtime_snapshot row")?;
+    use turn_runtime_snapshot::Column as Col;
+    let mutable = [
+        Col::ThreadId,
+        Col::WorkspaceId,
+        Col::Mode,
+        Col::Model,
+        Col::ProviderName,
+        Col::ReasoningEffort,
+        Col::AgentSkillVersionsJson,
+        Col::HookRuntimeContextJson,
+        Col::WorkspaceSkillPoliciesJson,
+        Col::InputJson,
+        Col::CapabilitiesJson,
+        Col::ResolvedArtifactsJson,
+        Col::RuntimeEnvironmentJson,
+        Col::HistoryJson,
+        Col::FrozenManifestId,
+        Col::UpdatedAt,
+    ];
+    // Insert<ActiveModel> binds JSON through serde_json::Value, which changes
+    // serialized bytes. This insert keeps the original JSON for CAS and history.
+    let insert = Query::insert()
+        .into_table(turn_runtime_snapshot::Entity)
+        .columns([Col::TurnId, Col::CreatedAt].into_iter().chain(mutable))
+        .values([
+            Expr::val(snapshot.turn_id),
+            Expr::val(snapshot.created_at),
+            Expr::val(snapshot.thread_id),
+            Expr::val(snapshot.workspace_id),
+            Expr::val(thread_mode_to_db(snapshot.mode)),
+            Expr::val(snapshot.model),
+            Expr::val(snapshot.provider_name),
+            Expr::val(snapshot.reasoning_effort),
+            json_text(snapshot.agent_skill_versions_json),
+            json_text(snapshot.hook_runtime_context_json),
+            json_text(snapshot.workspace_skill_policies_json),
+            json_text(snapshot.input_json),
+            json_text(snapshot.capabilities_json),
+            json_text(snapshot.resolved_artifacts_json),
+            json_text(snapshot.runtime_environment_json),
+            json_text(snapshot.history_json),
+            Expr::val(root.locator()),
+            Expr::val(snapshot.updated_at),
+        ])?
+        .on_conflict(
+            OnConflict::column(Col::TurnId)
+                .update_columns(mutable)
+                .to_owned(),
+        )
+        .to_owned();
+    db.execute(&insert)
+        .await
+        .context("failed to upsert turn_runtime_snapshot row")?;
 
     if capsule_identity_changed {
         super::task_child_producers::capsule_birth(db, &turn_id).await?;
@@ -153,11 +167,67 @@ pub async fn find_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<TurnRuntimeSnapshotRecord>> {
-    let row = turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
-        .one(db)
+    use turn_runtime_snapshot::Column as Col;
+    let mut query = Query::select();
+    query
+        .from(turn_runtime_snapshot::Entity)
+        .columns([
+            Col::TurnId,
+            Col::ThreadId,
+            Col::WorkspaceId,
+            Col::Mode,
+            Col::Model,
+            Col::ProviderName,
+            Col::ReasoningEffort,
+            Col::CreatedAt,
+            Col::UpdatedAt,
+        ])
+        .and_where(Col::TurnId.eq(turn_id));
+    for (column, name) in [
+        (Col::AgentSkillVersionsJson, "agent_skill_versions_json"),
+        (Col::HookRuntimeContextJson, "hook_runtime_context_json"),
+        (
+            Col::WorkspaceSkillPoliciesJson,
+            "workspace_skill_policies_json",
+        ),
+        (Col::InputJson, "input_json"),
+        (Col::CapabilitiesJson, "capabilities_json"),
+        (Col::ResolvedArtifactsJson, "resolved_artifacts_json"),
+        (Col::RuntimeEnvironmentJson, "runtime_environment_json"),
+        (Col::HistoryJson, "history_json"),
+    ] {
+        query.expr_as(
+            Expr::col(column).cast_as(Alias::new("text")),
+            Alias::new(name),
+        );
+    }
+    let row = db
+        .query_one(&query)
         .await
         .context("failed to query turn_runtime_snapshot row")?;
-    Ok(row.map(record_from_model))
+    row.map(|row| {
+        let mode: String = row.try_get("", "mode")?;
+        Ok(TurnRuntimeSnapshotRecord {
+            turn_id: row.try_get("", "turn_id")?,
+            thread_id: row.try_get("", "thread_id")?,
+            workspace_id: row.try_get("", "workspace_id")?,
+            mode: thread_mode_from_db(&mode).context("invalid runtime snapshot mode")?,
+            model: row.try_get("", "model")?,
+            provider_name: row.try_get("", "provider_name")?,
+            reasoning_effort: row.try_get("", "reasoning_effort")?,
+            agent_skill_versions_json: row.try_get("", "agent_skill_versions_json")?,
+            hook_runtime_context_json: row.try_get("", "hook_runtime_context_json")?,
+            workspace_skill_policies_json: row.try_get("", "workspace_skill_policies_json")?,
+            input_json: row.try_get("", "input_json")?,
+            capabilities_json: row.try_get("", "capabilities_json")?,
+            resolved_artifacts_json: row.try_get("", "resolved_artifacts_json")?,
+            runtime_environment_json: row.try_get("", "runtime_environment_json")?,
+            history_json: row.try_get("", "history_json")?,
+            created_at: row.try_get("", "created_at")?,
+            updated_at: row.try_get("", "updated_at")?,
+        })
+    })
+    .transpose()
 }
 
 pub async fn clear_agent_skill_versions_if_matches<C: ConnectionTrait>(
@@ -170,7 +240,7 @@ pub async fn clear_agent_skill_versions_if_matches<C: ConnectionTrait>(
     let affected = turn_runtime_snapshot::Entity::update_many()
         .col_expr(
             turn_runtime_snapshot::Column::AgentSkillVersionsJson,
-            Expr::value(Option::<String>::None),
+            Expr::cust("NULL"),
         )
         .col_expr(
             turn_runtime_snapshot::Column::UpdatedAt,
@@ -179,8 +249,9 @@ pub async fn clear_agent_skill_versions_if_matches<C: ConnectionTrait>(
         .filter(turn_runtime_snapshot::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_runtime_snapshot::Column::ThreadId.eq(thread_id.to_owned()))
         .filter(
-            turn_runtime_snapshot::Column::AgentSkillVersionsJson
-                .eq(expected_agent_skill_versions_json.to_owned()),
+            Expr::col(turn_runtime_snapshot::Column::AgentSkillVersionsJson)
+                .cast_as(Alias::new("text"))
+                .eq(expected_agent_skill_versions_json),
         )
         .exec(db)
         .await
@@ -228,24 +299,8 @@ pub async fn delete_turn_runtime_snapshots_for_closed_turns<C: ConnectionTrait>(
     Ok(deleted.rows_affected)
 }
 
-fn record_from_model(model: turn_runtime_snapshot::Model) -> TurnRuntimeSnapshotRecord {
-    TurnRuntimeSnapshotRecord {
-        turn_id: model.turn_id,
-        thread_id: model.thread_id,
-        workspace_id: model.workspace_id,
-        mode_json: model.mode_json,
-        model: model.model,
-        provider_name: model.provider_name,
-        reasoning_effort: model.reasoning_effort,
-        agent_skill_versions_json: model.agent_skill_versions_json,
-        hook_runtime_context_json: model.hook_runtime_context_json,
-        workspace_skill_policies_json: model.workspace_skill_policies_json,
-        input_json: model.input_json,
-        capabilities_json: model.capabilities_json,
-        resolved_artifacts_json: model.resolved_artifacts_json,
-        runtime_environment_json: model.runtime_environment_json,
-        history_json: model.history_json,
-        created_at: model.created_at,
-        updated_at: model.updated_at,
-    }
+fn json_text(value: impl Into<Value>) -> Expr {
+    Expr::val(value)
+        .cast_as(Alias::new("text"))
+        .cast_as(Alias::new("json"))
 }

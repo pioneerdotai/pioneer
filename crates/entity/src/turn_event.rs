@@ -7,24 +7,40 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub thread_id: String,
-    #[sea_orm(unique_key = "idx_turn_events_turn_id_sequence")]
-    pub turn_id: String,
-    #[sea_orm(unique_key = "idx_turn_events_turn_id_sequence")]
-    pub sequence: i64,
-    pub event_type: String,
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub payload_payload_id: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub payload: String,
-    pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(unique_key = "uq_turn_event_turn_id_idempotency_key")]
-    pub idempotency_key: Option<String>,
-    pub portable_revision: i64,
+    pub thread_id: String,
     #[sea_orm(column_type = "Text")]
     pub portable_identity: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub payload_payload_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub event_type: String,
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uq_turn_event_turn_id_idempotency_key"
+    )]
+    pub idempotency_key: Option<String>,
+    pub payload: Option<Json>,
+    #[sea_orm(unique_key = "idx_turn_events_turn_id_sequence")]
+    pub sequence: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_event_turn_id_idempotency_key"
+    )]
+    pub turn_id: String,
+    pub created_at: DateTimeWithTimeZone,
+    pub portable_revision: i64,
+    #[sea_orm(
+        belongs_to,
+        from = "payload_payload_id",
+        to = "id",
+        on_update = "NoAction",
+        on_delete = "NoAction"
+    )]
+    pub portable_payload_value: BelongsTo<Option<super::portable_payload_value::Entity>>,
     #[sea_orm(has_many)]
     pub turn_event_deliveries: HasMany<super::turn_event_delivery::Entity>,
 }

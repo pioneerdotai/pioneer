@@ -28,9 +28,7 @@ pub struct HistoryReadFence {
     #[sea_orm(skip)]
     pub source_turn: Option<String>,
 }
-/// Tool items are resolved by exact source references, not enumerated by the
-/// history assembler. A physical turn_item rowid boundary is neither used nor
-/// available when transparent compression exposes the source through a view.
+/// Tool items are resolved by exact source references.
 #[derive(Clone, Debug, FromQueryResult)]
 pub struct HistoryTurnBoundary {
     pub creation_order: i64,
@@ -38,7 +36,7 @@ pub struct HistoryTurnBoundary {
     /// ordering metadata only, never proof of source coverage or a read fence.
     pub legacy_creation_order: i64,
     pub id: String,
-    pub created_at: String,
+    pub created_at: sea_orm::prelude::DateTimeWithTimeZone,
     pub status: String,
     pub turn_kind: String,
     pub send_mode: Option<String>,
@@ -61,21 +59,12 @@ pub struct AcceptedTaskBasis {
     pub history_json: String,
 }
 
-/// All branch cutoffs are whole Unix seconds. Strip only the fractional
-/// seconds before SQLite parses the timezone: its date functions otherwise
-/// round .999999999 into the next second. CURRENT_TIMESTAMP, RFC3339 (T/Z)
-/// and offset timestamps then compare as instants, never as TEXT.
-/// The template accepts only an expression, not interpolated source data.
-pub(super) const HISTORY_WHOLE_SECOND_SQL: &str =
-    "unixepoch(substr(?,1,19) || ltrim(substr(?,20), '.0123456789'))";
-
 pub(super) fn history_before(
     created_at: Expr,
     before: sea_orm::prelude::DateTimeWithTimeZone,
 ) -> Expr {
     debug_assert_eq!(before.timestamp_subsec_nanos(), 0);
-    Expr::cust_with_exprs(HISTORY_WHOLE_SECOND_SQL, [created_at.clone(), created_at])
-        .lt(before.timestamp())
+    created_at.lt(before)
 }
 
 /// Editing replaces a turn's current input rows. Their new insertion date is
@@ -1147,6 +1136,7 @@ async fn compaction_task_basis_snapshot_inner(
     thread: &str,
     turn: &str,
 ) -> Result<Option<AcceptedTaskBasis>> {
+    let reader = db.begin_read().await?;
     let metadata_read = observe::stage(observe::Stage::SourceRead);
     let Some(row) = task_run_turn::Entity::find()
         .select_only()
@@ -1212,16 +1202,6 @@ async fn compaction_task_basis_snapshot_inner(
             task_run_conversation_snapshot::Entity,
             task_run_conversation_snapshot::Column::ConversationThreadId,
         )))
-        .expr(Expr::col((
-            task_run_conversation_snapshot::Entity,
-            task_run_conversation_snapshot::Column::CreatedAt,
-        )))
-        .expr_as(
-            // Correlated immutable-header projection; missing headers stay
-            // SQL NULL and fail typed decoding instead of becoming empty data.
-            Expr::cust(TASK_HISTORY_BYTES_SQL),
-            "history_bytes",
-        )
         .filter(
             Expr::col((task_run_turn::Entity, task_run_turn::Column::ThreadId))
                 .eq(Expr::Value(thread.into()))
@@ -1251,249 +1231,26 @@ async fn compaction_task_basis_snapshot_inner(
         )
         .expr(Expr::col((
             task_run_conversation_snapshot::Entity,
-            task_run_conversation_snapshot::Column::PortableIdentity,
-        )))
-        .expr(Expr::col((
-            task_run_conversation_snapshot::Entity,
-            task_run_conversation_snapshot::Column::PortableRevision,
-        )))
-        .expr(Expr::col((
-            task_run_conversation_snapshot::Entity,
             task_run_conversation_snapshot::Column::HistoryJsonPayloadId,
         )))
         .into_model::<BasisSnapshotMetadata>()
-        .one(db)
+        .one(&reader)
         .await?
     else {
         return Ok(None);
     };
+    let capture = pioneer_crud_tasks::conversation_snapshot::capture_history(
+        &reader,
+        &row.run_id,
+        row.history_json_payload_id.as_deref(),
+    )
+    .await?;
+    reader.commit().await?;
     drop(metadata_read);
-    let run_id: String = row.run_id;
-    let parent_thread: String = row.conversation_thread_id;
-    let created_at: String = row.created_at;
-    let history_bytes = usize::try_from(row.history_bytes)?;
-    let identity = row.portable_identity;
-    let revision = row.portable_revision;
-    let mut original_digest = if let Some(id) = row.history_json_payload_id {
-        let meta =
-            super::portable_payload::header(db, &id, super::portable_payload::Family::TaskHistory)
-                .await?;
-        ensure!(
-            meta.original_bytes == history_bytes as i64,
-            "accepted Task basis length changed"
-        );
-        Some(meta.sha256.clone())
-    } else {
-        None
-    };
-    let mut bytes = Vec::new();
-    bytes.try_reserve(history_bytes)?;
-    while bytes.len() < history_bytes {
-        // Native legacy/raw reads share the driver's 64 KiB byte quantum.
-        let count = std::cmp::min(64 * 1024, history_bytes - bytes.len());
-        let query = task_run_turn::Entity::find()
-            .select_only()
-            .join(
-                JoinType::InnerJoin,
-                task_run_turn::Entity::belongs_to(task_run_conversation_snapshot::Entity)
-                    .from(task_run_turn::Column::RunId)
-                    .to(task_run_conversation_snapshot::Column::RunId)
-                    .on_condition(|_, _| {
-                        sea_orm::Condition::all().add(
-                            Expr::col((
-                                task_run_conversation_snapshot::Entity,
-                                task_run_conversation_snapshot::Column::TaskId,
-                            ))
-                            .eq(Expr::col((
-                                task_run_turn::Entity,
-                                task_run_turn::Column::TaskId,
-                            ))),
-                        )
-                    })
-                    .into(),
-            )
-            .join(
-                JoinType::InnerJoin,
-                task_run_turn::Entity::belongs_to(thread_lineage::Entity)
-                    .from(task_run_turn::Column::ThreadId)
-                    .to(thread_lineage::Column::ChildThreadId)
-                    .on_condition(|_, _| {
-                        sea_orm::Condition::all().add(
-                            Expr::col((
-                                thread_lineage::Entity,
-                                thread_lineage::Column::ParentThreadId,
-                            ))
-                            .eq(Expr::col((
-                                task_run_conversation_snapshot::Entity,
-                                task_run_conversation_snapshot::Column::ConversationThreadId,
-                            ))),
-                        )
-                    })
-                    .into(),
-            )
-            .join_as(
-                JoinType::InnerJoin,
-                task_run_turn::Entity::belongs_to(thread::Entity)
-                    .from(task_run_turn::Column::ThreadId)
-                    .to(thread::Column::Id)
-                    .into(),
-                Alias::new("child"),
-            )
-            .join_as(
-                JoinType::InnerJoin,
-                task_run_conversation_snapshot::Entity::belongs_to(thread::Entity)
-                    .from(task_run_conversation_snapshot::Column::ConversationThreadId)
-                    .to(thread::Column::Id)
-                    .into(),
-                Alias::new("parent"),
-            )
-            .filter(
-                Expr::col((task_run_turn::Entity, task_run_turn::Column::ThreadId))
-                    .eq(Expr::Value(thread.into()))
-                    .and(
-                        Expr::col((task_run_turn::Entity, task_run_turn::Column::TurnId))
-                            .eq(Expr::Value(turn.into())),
-                    )
-                    .and(
-                        Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::WorkspaceId,
-                        ))
-                        .eq(Expr::Value(workspace.into())),
-                    )
-                    .and(
-                        Expr::col(("child", thread::Column::WorkspaceId)).eq(Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::WorkspaceId,
-                        ))),
-                    )
-                    .and(
-                        Expr::col(("parent", thread::Column::WorkspaceId)).eq(Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::WorkspaceId,
-                        ))),
-                    )
-                    .and(
-                        Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::RunId,
-                        ))
-                        .eq(Expr::Value(run_id.clone().into())),
-                    )
-                    .and(
-                        Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::ConversationThreadId,
-                        ))
-                        .eq(Expr::Value(parent_thread.clone().into())),
-                    )
-                    .and(
-                        Expr::col((
-                            task_run_conversation_snapshot::Entity,
-                            task_run_conversation_snapshot::Column::CreatedAt,
-                        ))
-                        .eq(Expr::Value(created_at.clone().into())),
-                    )
-                    .and(
-                        Expr::cust(TASK_HISTORY_BYTES_SQL)
-                            .eq(Expr::Value(i64::try_from(history_bytes)?.into())),
-                    ),
-            )
-            .filter(
-                Expr::col((
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::PortableIdentity,
-                ))
-                .eq(identity.clone()),
-            )
-            .filter(
-                Expr::col((
-                    task_run_conversation_snapshot::Entity,
-                    task_run_conversation_snapshot::Column::PortableRevision,
-                ))
-                .eq(revision),
-            );
-        let payload_id = query
-            .clone()
-            .expr(Expr::col((
-                task_run_conversation_snapshot::Entity,
-                task_run_conversation_snapshot::Column::HistoryJsonPayloadId,
-            )))
-            .into_tuple::<Option<String>>()
-            .one(db)
-            .await?
-            .ok_or_else(|| {
-                observe::outcome(observe::Outcome::Stale);
-                super::portable_payload::PreflightRace
-            })?;
-        let meta = match &payload_id {
-            Some(id) => Some(
-                super::portable_payload::header(
-                    db,
-                    id,
-                    super::portable_payload::Family::TaskHistory,
-                )
-                .await?,
-            ),
-            None => None,
-        };
-        if let Some(meta) = &meta {
-            ensure!(
-                meta.original_bytes == history_bytes as i64,
-                "accepted Task basis length changed"
-            );
-            original_digest = Some(meta.sha256.clone());
-        }
-        let fragment = if let Some(meta) = meta.as_ref().filter(|meta| meta.raw == 0) {
-            super::portable_payload::read_range(db, meta, bytes.len() as i64, count, false).await?
-        } else {
-            let guard = query
-                .expr(Expr::cust("task_run_conversation_snapshot.rowid"))
-                .filter(match &payload_id {
-                    Some(id) => task_run_conversation_snapshot::Column::HistoryJsonPayloadId.eq(id),
-                    None => task_run_conversation_snapshot::Column::HistoryJsonPayloadId.is_null(),
-                })
-                .limit(1)
-                .build(DbBackend::Sqlite);
-            let _read = observe::stage(observe::Stage::SourceRead);
-            db.read_blob_range(
-                pioneer_sqlite::SqliteBlobSource {
-                    table: "task_run_conversation_snapshot",
-                    column: "history_json",
-                },
-                guard,
-                u64::try_from(bytes.len())?,
-                count,
-                u64::try_from(history_bytes)?,
-            )
-            .await?
-            .ok_or_else(|| {
-                observe::outcome(observe::Outcome::Stale);
-                super::portable_payload::PreflightRace
-            })?
-        };
-        ensure!(
-            fragment.len() == count,
-            "accepted Task basis fragment is incomplete"
-        );
-        if meta.as_ref().is_none_or(|meta| meta.raw != 0) {
-            observe::bytes(observe::ByteKind::ReadOriginal, fragment.len() as u64);
-        }
-        let _assembly = observe::stage(observe::Stage::VerifyAssemble);
-        bytes.extend(fragment);
-    }
-    let _verify = observe::stage(observe::Stage::VerifyAssemble);
-    if let Some(expected) = original_digest {
-        use sha2::{Digest, Sha256};
-        ensure!(
-            Sha256::digest(&bytes).as_slice() == expected.as_slice(),
-            "accepted Task basis digest mismatch"
-        );
-    }
     Ok(Some(AcceptedTaskBasis {
-        parent_thread,
-        run_id,
-        history_json: String::from_utf8(bytes)?,
+        parent_thread: row.conversation_thread_id,
+        run_id: row.run_id,
+        history_json: capture.into_text()?,
     }))
 }
 
@@ -1781,11 +1538,7 @@ pub(crate) async fn compaction_task_delivery_command(
                     Expr::col((task_delivery::Entity, task_delivery::Column::Status))
                         .eq(Expr::val("delivered")),
                 )
-                .and(
-                    Expr::col((task::Entity, task::Column::CreatedByTurnId))
-                        .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                        .not(),
-                ),
+                .and(Expr::col((task::Entity, task::Column::CreatedByTurnId)).is_not_null()),
         )
         .into_tuple::<String>()
         .one(&store.connection)
@@ -2060,10 +1813,11 @@ pub(crate) async fn compaction_failed_delivery_command<C: ConnectionTrait>(
                             .gt(Expr::Value(after.clone().into())),
                     )
                     .and(
-                        Expr::Value(command.map(str::to_owned).into())
-                            .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                            .or(Expr::col((task::Entity, task::Column::CreatedByTurnId))
-                                .eq(Expr::Value(command.map(str::to_owned).into()))),
+                        Expr::val(command.is_none()).or(Expr::col((
+                            task::Entity,
+                            task::Column::CreatedByTurnId,
+                        ))
+                        .eq(Expr::Value(command.map(str::to_owned).into()))),
                     )
                     .and(Expr::exists(
                         Query::select()
@@ -2683,7 +2437,7 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
             "creation_order",
         )
         .expr_as(
-            Expr::col((turn::Entity, Alias::new("rowid"))),
+            Expr::col((turn::Entity, turn::Column::InsertionOrdinal)),
             "legacy_creation_order",
         )
         .expr(Expr::col((turn::Entity, turn::Column::CreatedAt)))
@@ -2962,13 +2716,5 @@ use sea_orm::QueryOrder;
 struct BasisSnapshotMetadata {
     run_id: String,
     conversation_thread_id: String,
-    created_at: String,
-    history_bytes: i64,
-    portable_identity: String,
-    portable_revision: i64,
     history_json_payload_id: Option<String>,
 }
-
-// Fixed correlated-header SQL preserves the original length for both raw and
-// compressed storage, without a NULL-to-zero fallback for a missing header.
-const TASK_HISTORY_BYTES_SQL: &str = "CASE WHEN task_run_conversation_snapshot.history_json_payload_id IS NULL THEN octet_length(task_run_conversation_snapshot.history_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_run_conversation_snapshot.history_json_payload_id) END";

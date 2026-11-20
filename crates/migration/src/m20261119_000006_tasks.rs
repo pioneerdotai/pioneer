@@ -1,8 +1,8 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, boolean, double_null, json, json_binary_null, json_null, text,
-    text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
+    big_integer, big_integer_null, binary, boolean, double_null, json, json_binary_null, json_null,
+    small_integer, text, text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
 };
 
 #[derive(DeriveMigrationName)]
@@ -34,8 +34,8 @@ impl MigrationTrait for Migration {
                     .col(json_binary_null("timeout_policy_json"))
                     .col(json_null("concurrency_policy_json"))
                     .col(json_null("metadata_json"))
-                    .col(json_null("result_json"))
-                    .col(json_null("error_json"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
                     .col(big_integer("revision").default(0))
                     .col(
                         timestamp_with_time_zone("created_at")
@@ -46,6 +46,8 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(timestamp_with_time_zone_null("completed_at"))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -162,7 +164,7 @@ impl MigrationTrait for Migration {
             .create_table(
                 Table::create()
                     .table("task_trigger")
-                    .col(text("id").primary_key())
+                    .col(text("id").extra(r#"COLLATE "C""#).primary_key())
                     .col(text("task_id"))
                     .col(text("kind"))
                     .col(text("status"))
@@ -199,6 +201,7 @@ impl MigrationTrait for Migration {
                     .table("task_trigger")
                     .col("status")
                     .col("next_fire_at")
+                    .col("id")
                     .to_owned(),
             )
             .await?;
@@ -245,8 +248,8 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone_null("heartbeat_at"))
                     .col(text_null("locked_by"))
                     .col(timestamp_with_time_zone_null("lock_expires_at"))
-                    .col(json_null("result_json"))
-                    .col(json_null("error_json"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -256,7 +259,14 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(big_integer_null("inbox_sequence"))
-                    .col(json_null("trigger_input_json"))
+                    // A webhook can contain an escaped NUL. Preserve the serialized
+                    // input across the driver's JSONB bind and exact retry checks.
+                    .col(text_null("trigger_input_json"))
+                    .check(Expr::cust(
+                        "trigger_input_json IS NULL OR trigger_input_json IS JSON",
+                    ))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -785,15 +795,23 @@ impl MigrationTrait for Migration {
                     .col(text_null("turn_id"))
                     .col(big_integer("sequence"))
                     .col(text("event_type"))
-                    .col(text("payload_json"))
+                    .col(binary("payload_json"))
+                    .col(small_integer("payload_json_codec"))
+                    .col(big_integer("payload_json_bytes"))
+                    .col(big_integer("payload_json_chars"))
+                    .col(binary("payload_json_sha256"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(text_null("idempotency_key"))
-                    .col(big_integer("portable_revision").default(0))
-                    .col(text("portable_identity").default(""))
-                    .col(text_null("payload_json_payload_id"))
+                    .check(Expr::cust(
+                        "payload_json_codec IN (0, 1)
+                         AND payload_json_chars BETWEEN 0 AND payload_json_bytes
+                         AND octet_length(payload_json_sha256) = 32
+                         AND ((payload_json_codec = 0 AND octet_length(payload_json) = payload_json_bytes)
+                              OR (payload_json_codec = 1 AND octet_length(payload_json) + 2 < payload_json_bytes))",
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -865,15 +883,8 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .create_index(
-                Index::create()
-                    .name("task_event_payload_json_portable_pending")
-                    .table("task_event")
-                    .col("payload_json_payload_id")
-                    .col("id")
-                    .and_where(Expr::cust(r#""payload_json_payload_id" IS NULL"#))
-                    .to_owned(),
-            )
+            .get_connection()
+            .execute_unprepared(include_str!("sql/m20261119_000006_tasks/storage.sql"))
             .await?;
 
         manager
@@ -899,13 +910,13 @@ impl MigrationTrait for Migration {
                     .col(big_integer("attempt_count").default(0))
                     .col(big_integer("contribution_count").default(0))
                     .col(big_integer("diagnostic_count").default(0))
-                    .col(json("contribution_hashes_json").default("[]"))
-                    .col(json("diagnostic_previews_json").default("[]"))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
                     .col(text_null("error_code"))
                     .col(text_null("error_message_preview"))
                     .col(boolean("error_retryable").default(false))
                     .col(boolean("error_safe_for_user").default(true))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -918,7 +929,13 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone_null("started_at"))
                     .col(timestamp_with_time_zone_null("completed_at"))
                     .col(timestamp_with_time_zone_null("deadline_at"))
-                    .col(json_null("resume_state_json"))
+                    .col(text_null("resume_state_json"))
+                    .check(Expr::cust(
+                        "resume_state_json IS NULL OR resume_state_json IS JSON",
+                    ))
+                    .check(Expr::cust("metadata_json IS JSON"))
+                    .check(Expr::cust("contribution_hashes_json IS JSON"))
+                    .check(Expr::cust("diagnostic_previews_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1029,8 +1046,8 @@ impl MigrationTrait for Migration {
                     .col(text("status"))
                     .col(big_integer("contribution_count").default(0))
                     .col(big_integer("diagnostic_count").default(0))
-                    .col(json("contribution_hashes_json").default("[]"))
-                    .col(json("diagnostic_previews_json").default("[]"))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
                     .col(text_null("error_code"))
                     .col(text_null("error_message_preview"))
                     .col(boolean("error_retryable").default(false))
@@ -1046,6 +1063,8 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone_null("started_at"))
                     .col(timestamp_with_time_zone_null("completed_at"))
                     .col(big_integer_null("duration_ms"))
+                    .check(Expr::cust("contribution_hashes_json IS JSON"))
+                    .check(Expr::cust("diagnostic_previews_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1113,11 +1132,12 @@ impl MigrationTrait for Migration {
                     .col(text_null("actor_id"))
                     .col(text_null("context_mode"))
                     .col(boolean("safe_for_user").default(false))
-                    .col(json("details_json").default("null"))
+                    .col(text("details_json").default("null"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("details_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1189,8 +1209,8 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone_null("heartbeat_at"))
                     .col(timestamp_with_time_zone_null("started_at"))
                     .col(timestamp_with_time_zone_null("completed_at"))
-                    .col(json_null("result_json"))
-                    .col(json_null("error_json"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1199,6 +1219,8 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1453,10 +1475,17 @@ impl MigrationTrait for Migration {
                     .col(text("turn_id"))
                     .col(big_integer("round"))
                     .col(text("status"))
-                    .col(json_null("result_json"))
-                    .col(json_null("extraction_error_json"))
+                    .col(text_null("result_json"))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .col(text_null("extraction_error_json"))
+                    .check(Expr::cust(
+                        "extraction_error_json IS NULL OR extraction_error_json IS JSON",
+                    ))
                     .col(text_null("summary"))
-                    .col(json_null("diagnostics_json"))
+                    .col(text_null("diagnostics_json"))
+                    .check(Expr::cust(
+                        "diagnostics_json IS NULL OR diagnostics_json IS JSON",
+                    ))
                     .col(text_null("final_review_event_id"))
                     .col(
                         timestamp_with_time_zone("created_at")
@@ -1573,7 +1602,7 @@ impl MigrationTrait for Migration {
                     .col(text("workspace_id"))
                     .col(text("conversation_thread_id"))
                     .col(text_null("source_turn_id"))
-                    .col(text("history_json"))
+                    .col(text_null("history_json"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1581,7 +1610,16 @@ impl MigrationTrait for Migration {
                     .col(text_null("frozen_manifest_id").default(""))
                     .col(big_integer("portable_revision").default(0))
                     .col(text("portable_identity").default(""))
-                    .col(text_null("history_json_payload_id"))
+                    .col(text_null("history_json_payload_id").unique_key())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_task_history_payload")
+                            .from("task_run_conversation_snapshot", "history_json_payload_id")
+                            .to("portable_payload_value", "id"),
+                    )
+                    .check(Expr::cust(
+                        "(history_json IS NULL) <> (history_json_payload_id IS NULL)",
+                    ))
                     .col(
                         ColumnDef::new("insertion_ordinal")
                             .big_integer()
@@ -1648,14 +1686,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager.create_index(
-            Index::create().name("task_run_conversation_snapshot_history_json_portable_pending").table("task_run_conversation_snapshot")
-                .col("history_json_payload_id")
-                .col("run_id")
-                .and_where(Expr::cust(r#""history_json_payload_id" IS NULL AND ("frozen_manifest_id" IS NULL OR "frozen_manifest_id" <> '')"#))
-                .to_owned(),
-        ).await?;
-
         manager
             .create_table(
                 Table::create()
@@ -1683,7 +1713,8 @@ impl MigrationTrait for Migration {
                     .col(text("workspace_id"))
                     .col(text("root_thread_id"))
                     .col(text("initiating_principal_id"))
-                    .col(json("authorization_context_json"))
+                    .col(text("authorization_context_json"))
+                    .check(Expr::cust("authorization_context_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1756,24 +1787,24 @@ impl MigrationTrait for Migration {
                     .table("task_actor_contract")
                     .col(text("task_id").primary_key())
                     .col(text("workspace_id"))
-                    .col(json("creator_json"))
-                    .col(json_null("creator_snapshot_json"))
-                    .col(json("reviewer_json"))
-                    .col(json("delivery_json"))
-                    .col(json_null("launch_selection_json"))
-                    .col(json_null("requested_identity_json"))
+                    .col(text("creator_json"))
+                    .col(text_null("creator_snapshot_json"))
+                    .col(text("reviewer_json"))
+                    .col(text("delivery_json"))
+                    .col(text_null("launch_selection_json"))
+                    .col(text_null("requested_identity_json"))
                     .col(text_null("resolved_identity_id"))
                     .col(text_null("resolved_profile_id"))
                     .col(text_null("source_config_fingerprint"))
-                    .col(json_null("derived_child_launch_grant_json"))
+                    .col(text_null("derived_child_launch_grant_json"))
                     .col(text_null("execution_destination_thread_id"))
                     .col(text_null("execution_route_id"))
-                    .col(json_null("execution_route_receipt_json"))
+                    .col(text_null("execution_route_receipt_json"))
                     .col(big_integer_null("execution_route_expires_at_millis"))
                     .col(text_null("creator_work_graph_root_execution_id"))
                     .col(text_null("work_graph_root_execution_id"))
                     .col(text_null("root_resource_scope_id"))
-                    .col(json_null("accounting_attribution_json"))
+                    .col(text_null("accounting_attribution_json"))
                     .col(text_null("controller_principal_id"))
                     .col(big_integer("revision").default(1))
                     .col(
@@ -1784,6 +1815,15 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("creator_json IS JSON"))
+                    .check(Expr::cust("creator_snapshot_json IS NULL OR creator_snapshot_json IS JSON"))
+                    .check(Expr::cust("launch_selection_json IS NULL OR launch_selection_json IS JSON"))
+                    .check(Expr::cust("execution_route_receipt_json IS NULL OR execution_route_receipt_json IS JSON"))
+                    .check(Expr::cust("derived_child_launch_grant_json IS NULL OR derived_child_launch_grant_json IS JSON"))
+                    .check(Expr::cust("accounting_attribution_json IS NULL OR accounting_attribution_json IS JSON"))
+                    .check(Expr::cust("delivery_json IS JSON"))
+                    .check(Expr::cust("reviewer_json IS JSON"))
+                    .check(Expr::cust("requested_identity_json IS NULL OR requested_identity_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1826,9 +1866,12 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
-                    .col(json_null("delivery_plan_json"))
+                    .col(text_null("delivery_plan_json"))
                     .index(Index::create().unique().col("action_idempotency_key"))
                     .index(Index::create().unique().col("run_id"))
+                    .check(Expr::cust(
+                        "delivery_plan_json IS NULL OR delivery_plan_json IS JSON",
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -1896,10 +1939,10 @@ impl MigrationTrait for Migration {
                     .col(text("delivery_id").primary_key())
                     .col(text("task_id"))
                     .col(text("run_id"))
-                    .col(json("author_json"))
-                    .col(json_null("reviewer_json"))
+                    .col(text("author_json"))
+                    .col(text_null("reviewer_json"))
                     .col(text_null("destination_route_id"))
-                    .col(json_null("route_receipt_json"))
+                    .col(text_null("route_receipt_json"))
                     .col(big_integer("disclosure_generation").default(1))
                     .col(text("idempotency_key"))
                     .col(text("status").default("pending"))
@@ -1912,6 +1955,11 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .index(Index::create().unique().col("idempotency_key"))
+                    .check(Expr::cust(
+                        "route_receipt_json IS NULL OR route_receipt_json IS JSON",
+                    ))
+                    .check(Expr::cust("author_json IS JSON"))
+                    .check(Expr::cust("reviewer_json IS NULL OR reviewer_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1944,7 +1992,8 @@ impl MigrationTrait for Migration {
                     .col(text("event_kind"))
                     .col(text("decision"))
                     .col(text_null("feedback_text"))
-                    .col(json_null("feedback_json"))
+                    .col(text_null("feedback_json"))
+                    .check(Expr::cust("feedback_json IS NULL OR feedback_json IS JSON"))
                     .col(double_null("confidence"))
                     .col(text_null("supersedes_review_event_id"))
                     .col(text_null("next_task_run_turn_id"))
@@ -1952,7 +2001,8 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
-                    .col(json("reviewer_ref_json"))
+                    .col(text("reviewer_ref_json"))
+                    .check(Expr::cust("reviewer_ref_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -2368,29 +2418,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("task_child_reconcile_scope")
-                    .columns([
-                        "scope_kind",
-                        "scope_key",
-                        "incarnation_token",
-                        "requested_revision",
-                        "next_attempt_at",
-                        "attempt_count",
-                    ])
-                    .values_panic([
-                        "historical-seed".into(),
-                        "v1".into(),
-                        "child-seed-v1".into(),
-                        "child-seed-v1".into(),
-                        0_i64.into(),
-                        0_i64.into(),
-                    ])
-                    .to_owned(),
-            )
-            .await?;
         Ok(())
     }
 

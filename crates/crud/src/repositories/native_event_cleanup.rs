@@ -39,8 +39,9 @@ pub struct NativeEventCleanupMetrics {
     pub prepare_elapsed_us: u64,
     pub apply_elapsed_us: u64,
 }
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct NativeEventCleanupBootstrap {
+pub(crate) struct NativeEventCleanupBootstrap {
     pub rows_scanned: u64,
     pub jobs_inserted: u64,
     pub complete: bool,
@@ -247,12 +248,14 @@ async fn apply(
     tx.commit().await?;
     Ok(())
 }
+#[cfg(test)]
 #[derive(FromQueryResult)]
 struct BootstrapRow {
     id: String,
     turn_id: Option<String>,
     eligible: bool,
 }
+#[cfg(test)]
 pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupBootstrap> {
     let state = bootstrap_state::Entity::find_by_id(1_i64)
         .one(db)

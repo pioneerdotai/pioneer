@@ -7,15 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "workspace_membership")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub principal_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub workspace_id: String,
-    pub granted_by_actor_kind: String,
-    pub granted_by_actor_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub granted_by_actor_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub principal_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub granted_by_actor_kind: String,
     pub inbox_after_sequence: Option<i64>,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,
         from = "principal_id",
@@ -23,7 +25,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal: BelongsTo<super::gateway_principal::Entity>,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",
@@ -31,7 +33,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

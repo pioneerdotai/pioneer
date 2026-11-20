@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_lifecycle_sequence")]
 pub struct Model {
+    pub seed_complete: i64,
     #[sea_orm(primary_key, auto_increment = false)]
     pub singleton: i64,
     pub generation: i64,
-    pub seed_complete: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

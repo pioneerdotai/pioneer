@@ -2,7 +2,9 @@
 use anyhow::{Result, ensure};
 use pioneer_compaction::frozen::FrozenHistoryRef;
 use pioneer_entity::compaction_frozen_history as history;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -86,35 +88,7 @@ impl Drop for FrozenReadHold {
     }
 }
 
-/// R1: both streams must be valid, even when the caller reads only one.
-pub(crate) fn logical_bounds(h: &history::Model) -> Result<(i64, i64)> {
-    let bounds = header_bounds(h)?;
-    ensure!(
-        h.expired == 0,
-        "frozen_input_expired: сохранённый input освобождён; точный replay недоступен"
-    );
-    Ok(bounds)
-}
-
-/// Counter validation also applies to expired physical backing metadata.
-pub(crate) fn header_bounds(h: &history::Model) -> Result<(i64, i64)> {
-    ensure!(
-        matches!(h.expired, 0 | 1)
-            && matches!(h.ready, 0 | 1)
-            && h.message_count >= 0
-            && h.import_count >= 0
-            && (0..=h.message_count).contains(&h.next_ordinal)
-            && (0..=h.import_count).contains(&h.next_import)
-            && (h.ready == 0
-                || (h.next_ordinal == h.message_count && h.next_import == h.import_count)),
-        "invalid frozen history counters"
-    );
-    Ok(if h.ready == 1 {
-        (h.message_count, h.import_count)
-    } else {
-        (h.next_ordinal, h.next_import)
-    })
-}
+pub(crate) use pioneer_crud_compaction::frozen::{header_bounds, logical_bounds};
 
 /// Decoded outside database capacity, then checked against the exact header by
 /// the authoritative writer. None is verified no-descriptor; unknown legacy
@@ -340,8 +314,10 @@ pub(crate) async fn exact_header<C: ConnectionTrait>(
     d: &FrozenHistoryRef,
 ) -> Result<history::Model> {
     ensure!(d.format == 1, "unsupported frozen history format");
+    // Expiration locks the same header exclusively before testing live roots.
     let h = history::Entity::find_by_id(&d.manifest_id)
         .filter(history::Column::WorkspaceId.eq(workspace))
+        .lock_shared()
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("frozen input identity is unavailable"))?;
@@ -427,7 +403,7 @@ impl LayoutScan {
             self.bounds.1
         };
         if !self.layout_read {
-            let l = layout::Entity::find_by_id((self.h.id.clone(), self.kind))
+            let l = pioneer_crud_compaction::frozen::find_layout(self.h.id.clone(), self.kind)
                 .one(&store.connection)
                 .await?;
             let active = if let Some(l) = l {

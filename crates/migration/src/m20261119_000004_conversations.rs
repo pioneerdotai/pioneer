@@ -1,8 +1,8 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, json, json_null, text, text_null, timestamp_with_time_zone,
-    timestamp_with_time_zone_null,
+    big_integer, big_integer_null, binary, boolean, json, json_null, small_integer, text,
+    text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
 };
 
 #[derive(DeriveMigrationName)]
@@ -31,7 +31,8 @@ impl MigrationTrait for Migration {
                 .col(timestamp_with_time_zone("updated_at").default(Expr::cust(r#"statement_timestamp()"#)))
                 .col(text_null("created_by_actor_id"))
                 .col(text("access_class").default("private"))
-                .col(json_null("preview_author_json"))
+                .col(text_null("preview_author_json"))
+                .check(Expr::cust("preview_author_json IS NULL OR preview_author_json IS JSON"))
                 .col(text_null("created_by_actor_kind"))
                 .col(big_integer_null("inbox_workspace_after_sequence"))
                 .col(timestamp_with_time_zone_null("inbox_workspace_started_at"))
@@ -208,6 +209,7 @@ impl MigrationTrait for Migration {
                     .col(text_null("origin_kind"))
                     .col(text_null("created_by_thread_id"))
                     .col(text_null("created_by_turn_id"))
+                    .col(history_publication_xid())
                     .col(
                         ColumnDef::new("insertion_ordinal")
                             .big_integer()
@@ -266,7 +268,8 @@ impl MigrationTrait for Migration {
                 .col(text("thread_id"))
                 .col(text("status"))
                 .col(text_null("error"))
-                .col(json("prompt_manifest_json").default("{}"))
+                .col(text("prompt_manifest_json").default("{}"))
+                .check(Expr::cust("prompt_manifest_json IS JSON"))
                 .col(text_null("prompt_compiler_version"))
                 .col(text_null("prompt_profile"))
                 .col(text_null("prompt_fingerprint_stable"))
@@ -279,9 +282,11 @@ impl MigrationTrait for Migration {
                 .col(text_null("reasoning_effort"))
                 .col(text_null("permission_profile_mode"))
                 .col(text_null("permission_profile_source"))
-                .col(json_null("permission_profile_snapshot_json"))
+                .col(text_null("permission_profile_snapshot_json"))
+                .check(Expr::cust("permission_profile_snapshot_json IS NULL OR permission_profile_snapshot_json IS JSON"))
                 .col(big_integer_null("execution_security_snapshot_version"))
-                .col(json_null("execution_security_snapshot_json"))
+                .col(text_null("execution_security_snapshot_json"))
+                .check(Expr::cust("execution_security_snapshot_json IS NULL OR execution_security_snapshot_json IS JSON"))
                 .col(text_null("initiated_by_actor_id"))
                 .col(json_null("execution_authorization_context_json"))
                 .col(text_null("send_mode"))
@@ -289,15 +294,19 @@ impl MigrationTrait for Migration {
                 .col(text_null("author_nickname_snapshot"))
                 .col(text_null("author_avatar_revision_snapshot"))
                 .col(text_null("reply_to_turn_id"))
-                .col(json("mentions_json").default("[]"))
+                .col(text("mentions_json").default("[]"))
+                .check(Expr::cust("mentions_json IS JSON"))
                 .col(big_integer("message_revision").default(0))
                 .col(timestamp_with_time_zone_null("message_deleted_at"))
                 .col(text_null("message_deleted_by_actor_id"))
                 .col(text_null("message_deleted_by_actor_kind"))
-                .col(json_null("author_agent_snapshot_json"))
+                .col(text_null("author_agent_snapshot_json"))
+                .check(Expr::cust("author_agent_snapshot_json IS NULL OR author_agent_snapshot_json IS JSON"))
                 .col(text_null("initiated_by_actor_kind"))
                 .col(text("work_owner").default("turn"))
-                .col(json_null("package_selection_json"))
+                .col(text_null("package_selection_json"))
+                .check(Expr::cust("package_selection_json IS NULL OR package_selection_json IS JSON"))
+                .col(history_publication_xid())
                 .col(ColumnDef::new("insertion_ordinal").big_integer().not_null().unique_key().extra("GENERATED ALWAYS AS IDENTITY"))
                 .check(Expr::cust(r#"send_mode IS NULL OR send_mode IN ( 'message' , 'chat' , 'agent' )"#))
                 .check(Expr::cust(r#"author_display_name_snapshot IS NULL OR length ( author_display_name_snapshot ) BETWEEN 1 AND 512"#))
@@ -399,7 +408,9 @@ impl MigrationTrait for Migration {
                     .col(big_integer("input_index"))
                     .col(text("input_type"))
                     .col(text_null("text"))
-                    .col(json("payload").default("{}"))
+                    .col(text("payload").default("{}"))
+                    .check(Expr::cust("payload IS JSON"))
+                    .col(history_publication_xid())
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -446,7 +457,7 @@ impl MigrationTrait for Migration {
                     .col(text("turn_id"))
                     .col(big_integer("sequence"))
                     .col(text("event_type"))
-                    .col(json("payload"))
+                    .col(json_null("payload"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -454,7 +465,16 @@ impl MigrationTrait for Migration {
                     .col(text_null("idempotency_key"))
                     .col(big_integer("portable_revision").default(0))
                     .col(text("portable_identity").default(""))
-                    .col(text_null("payload_payload_id"))
+                    .col(text_null("payload_payload_id").unique_key())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_turn_event_payload")
+                            .from("turn_event", "payload_payload_id")
+                            .to("portable_payload_value", "id"),
+                    )
+                    .check(Expr::cust(
+                        "(payload IS NULL) <> (payload_payload_id IS NULL)",
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -507,20 +527,6 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .create_index(
-                Index::create()
-                    .name("turn_event_payload_portable_pending")
-                    .table("turn_event")
-                    .col("payload_payload_id")
-                    .col("id")
-                    .and_where(Expr::cust(
-                        r#""portable_identity" <> '' AND "payload_payload_id" IS NULL"#,
-                    ))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
             .create_table(
                 Table::create()
                     .table("turn_item")
@@ -529,7 +535,7 @@ impl MigrationTrait for Migration {
                     .col(text("item_id"))
                     .col(text("item_type"))
                     .col(text_null("status"))
-                    .col(json("payload").default("{}"))
+                    .col(json_null("payload"))
                     .col(big_integer("active_attempt_number").default(0))
                     .col(text_null("active_attempt_status"))
                     .col(text_null("active_attempt_id"))
@@ -545,7 +551,17 @@ impl MigrationTrait for Migration {
                     )
                     .col(big_integer("portable_revision").default(0))
                     .col(text("portable_identity").default(""))
-                    .col(text_null("payload_payload_id"))
+                    .col(text_null("payload_payload_id").unique_key())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_turn_item_payload")
+                            .from("turn_item", "payload_payload_id")
+                            .to("portable_payload_value", "id"),
+                    )
+                    .check(Expr::cust(
+                        "(payload IS NULL) <> (payload_payload_id IS NULL)",
+                    ))
+                    .col(history_publication_xid())
                     .col(
                         ColumnDef::new("insertion_ordinal")
                             .big_integer()
@@ -592,20 +608,6 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .create_index(
-                Index::create()
-                    .name("turn_item_payload_portable_pending")
-                    .table("turn_item")
-                    .col("payload_payload_id")
-                    .col("id")
-                    .and_where(Expr::cust(
-                        r#""portable_identity" <> '' AND "payload_payload_id" IS NULL"#,
-                    ))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
             .create_table(
                 Table::create()
                     .table("turn_item_attempt")
@@ -620,7 +622,7 @@ impl MigrationTrait for Migration {
                     .col(text_null("recovery_action"))
                     .col(text_null("idempotency_key"))
                     .col(text_null("trace_id"))
-                    .col(json("payload").default("{}"))
+                    .col(text("payload").default("{}"))
                     .col(
                         timestamp_with_time_zone("started_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -638,6 +640,7 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone_null("recovery_suppressed_at"))
                     .col(json_null("recovery_suppression_context_json"))
                     .col(text_null("execution_class"))
+                    .check(Expr::cust("payload IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -732,7 +735,8 @@ impl MigrationTrait for Migration {
                     .col(text("source"))
                     .col(text_null("tool_name"))
                     .col(text("payload"))
-                    .col(json("output_policy_snapshot").default("{}"))
+                    .col(text("output_policy_snapshot").default("{}"))
+                    .check(Expr::cust("output_policy_snapshot IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -860,7 +864,8 @@ impl MigrationTrait for Migration {
                     .col(text("provider_callable_name").default("legacy_unrecoverable"))
                     .col(text("canonical_schema_fingerprint").default("legacy_unrecoverable"))
                     .col(text("provider_schema_fingerprint").default("legacy_unrecoverable"))
-                    .col(json("annotations_json").default("{}"))
+                    .col(text("annotations_json").default("{}"))
+                    .check(Expr::cust("annotations_json IS JSON"))
                     .col(text("annotations_digest").default("legacy_unrecoverable"))
                     .col(big_integer("effective_timeout_ms").default(0))
                     .col(big_integer("runtime_generation").default(0))
@@ -916,7 +921,8 @@ impl MigrationTrait for Migration {
                     .col(big_integer("agent_round_count").default(0))
                     .col(big_integer("tool_call_count").default(0))
                     .col(big_integer("provider_token_count").default(0))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .col(timestamp_with_time_zone("started_at"))
                     .col(timestamp_with_time_zone_null("completed_at"))
                     .col(
@@ -984,7 +990,8 @@ impl MigrationTrait for Migration {
                     .col(text("thread_id"))
                     .col(text("turn_id"))
                     .col(text("checkpoint_kind"))
-                    .col(json("payload_json"))
+                    .col(text("payload_json"))
+                    .check(Expr::cust("payload_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1049,7 +1056,7 @@ impl MigrationTrait for Migration {
                     .col(timestamp_with_time_zone("next_run_at"))
                     .col(text_null("claim_token"))
                     .col(timestamp_with_time_zone_null("claim_expires_at"))
-                    .col(json("projection_context_json").default("{}"))
+                    .col(text("projection_context_json").default("{}"))
                     .col(timestamp_with_time_zone_null("projected_at"))
                     .col(
                         timestamp_with_time_zone("created_at")
@@ -1059,6 +1066,7 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
+                    .check(Expr::cust("projection_context_json IS JSON"))
                     .to_owned(),
             )
             .await?;
@@ -1303,7 +1311,12 @@ impl MigrationTrait for Migration {
                     .col(text_null("cwd"))
                     .col(json_null("sandbox_json"))
                     .col(text_null("approval_policy"))
-                    .col(text("input_mapping_json").default("{}"))
+                    .col(binary("input_mapping_json").default(Expr::cust("decode('7b7d', 'hex')")))
+                    .col(small_integer("input_mapping_codec").default(0))
+                    .col(big_integer("input_mapping_bytes").default(2))
+                    .col(big_integer("input_mapping_chars").default(2))
+                    .col(binary("input_mapping_sha256").default(Expr::cust("sha256(decode('7b7d', 'hex'))")))
+                    .col(boolean("input_mapping_has_inline_history").default(false))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1326,7 +1339,13 @@ impl MigrationTrait for Migration {
                     .col(text_null("frozen_manifest_id").default(""))
                     .col(big_integer("portable_revision").default(0))
                     .col(text("portable_identity").default(""))
-                    .col(text_null("input_mapping_json_payload_id"))
+                    .check(Expr::cust(
+                        "input_mapping_codec IN (0, 1)
+                         AND input_mapping_chars BETWEEN 0 AND input_mapping_bytes
+                         AND octet_length(input_mapping_sha256) = 32
+                         AND ((input_mapping_codec = 0 AND octet_length(input_mapping_json) = input_mapping_bytes)
+                              OR (input_mapping_codec = 1 AND octet_length(input_mapping_json) + 2 < input_mapping_bytes))",
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -1431,13 +1450,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager.create_index(
-            Index::create().name("turn_cli_runtime_binding_input_mapping_json_portable_pending").table("turn_cli_runtime_binding")
-                .col("input_mapping_json_payload_id")
-                .col("turn_id")
-                .and_where(Expr::cust(r#""input_mapping_json_payload_id" IS NULL AND ("frozen_manifest_id" IS NULL OR "frozen_manifest_id" <> '')"#))
-                .to_owned(),
-        ).await?;
+        manager
+            .get_connection()
+            .execute_unprepared(include_str!(
+                "sql/m20261119_000004_conversations/input_mapping_storage.sql"
+            ))
+            .await?;
 
         manager
             .create_table(
@@ -1462,7 +1480,10 @@ impl MigrationTrait for Migration {
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
                     .col(text_null("projection_config_hash"))
-                    .col(json_null("projection_config_json"))
+                    .col(text_null("projection_config_json"))
+                    .check(Expr::cust(
+                        "projection_config_json IS NULL OR projection_config_json IS JSON",
+                    ))
                     .to_owned(),
             )
             .await?;
@@ -1481,7 +1502,8 @@ impl MigrationTrait for Migration {
                     .col(text_null("source_key"))
                     .col(timestamp_with_time_zone_null("started_at"))
                     .col(timestamp_with_time_zone_null("completed_at"))
-                    .col(json("metadata_json").default("{}"))
+                    .col(text("metadata_json").default("{}"))
+                    .check(Expr::cust("metadata_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1994,8 +2016,10 @@ impl MigrationTrait for Migration {
             Table::create().table("turn_message_revision")
                 .col(text("turn_id"))
                 .col(big_integer("revision"))
-                .col(json("input_json"))
-                .col(json("mentions_json"))
+                .col(text("input_json"))
+                .check(Expr::cust("input_json IS JSON"))
+                .col(text("mentions_json"))
+                .check(Expr::cust("mentions_json IS JSON"))
                 .col(text("changed_by_actor_kind"))
                 .col(text_null("changed_by_actor_id"))
                 .col(text("change_kind"))
@@ -2359,4 +2383,12 @@ impl MigrationTrait for Migration {
         )
         .await
     }
+}
+
+fn history_publication_xid() -> ColumnDef {
+    // Keep the full top-level transaction ID across row updates, unlike xmin.
+    // SeaORM 2.0 cannot generate a model column for the PostgreSQL xid8 type.
+    text("publication_xid")
+        .default(Expr::cust("pg_current_xact_id()::text"))
+        .take()
 }

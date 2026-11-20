@@ -7,26 +7,41 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "hook_audit_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub hook_run_id: String,
-    pub hook_run_attempt_id: Option<String>,
-    pub subscription_id: String,
-    pub hook_id: String,
-    pub phase: String,
-    pub event_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub contribution_hash: Option<String>,
-    pub workspace_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub task_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub actor_kind: Option<String>,
-    pub actor_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub phase: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub context_mode: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub subscription_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub hook_run_attempt_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub event_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
     pub safe_for_user: bool,
     #[sea_orm(column_type = "Text")]
     pub details_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub task_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub hook_run_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub agent_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub hook_id: String,
     pub created_at: DateTimeWithTimeZone,
 }
 

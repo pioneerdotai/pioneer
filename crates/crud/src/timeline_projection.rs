@@ -277,15 +277,16 @@ pub fn classify_turn_item_row_for_turn(
 }
 
 fn task_attachment_from_row(row: &turn_item::Model) -> Option<TaskAttachmentMode> {
-    let TurnItem::Task { item } = serde_json::from_str::<TurnItem>(row.payload.as_str()).ok()?
-    else {
+    let TurnItem::Task { item } = crate::repositories::turn_payload::decode_item(row).ok()? else {
         return None;
     };
     Some(item.attachment)
 }
 
-fn parse_turn_item_payload(row: &turn_item::Model) -> std::result::Result<JsonValue, String> {
-    serde_json::from_str::<JsonValue>(row.payload.as_str()).map_err(|error| error.to_string())
+fn parse_turn_item_payload(row: &turn_item::Model) -> std::result::Result<&JsonValue, String> {
+    row.payload
+        .as_ref()
+        .ok_or_else(|| "turn item payload was not loaded".to_owned())
 }
 
 fn invalid_payload(
@@ -760,6 +761,8 @@ mod tests {
     fn turn_item_row(item_type: &str, status: Option<&str>, payload: &str) -> turn_item::Model {
         let now = chrono::Utc::now().into();
         turn_item::Model {
+            insertion_ordinal: 1,
+            publication_xid: "1".to_owned(),
             portable_identity: String::new(),
             portable_revision: 0,
             payload_payload_id: None,
@@ -768,7 +771,7 @@ mod tests {
             item_id: "item_1".to_owned(),
             item_type: item_type.to_owned(),
             status: status.map(str::to_owned),
-            payload: payload.to_owned(),
+            payload: Some(serde_json::from_str(payload).unwrap()),
             active_attempt_number: 0,
             active_attempt_status: None,
             active_attempt_id: None,
@@ -782,6 +785,8 @@ mod tests {
     fn turn_row(turn_kind: &str) -> turn::Model {
         let now = chrono::Utc::now().into();
         turn::Model {
+            insertion_ordinal: 1,
+            publication_xid: "1".to_owned(),
             id: "turn_1".to_owned(),
             thread_id: "thread_1".to_owned(),
             package_selection_json: None,
@@ -853,7 +858,7 @@ mod tests {
 
     #[test]
     fn row_classification_uses_canonical_columns_for_user_message() {
-        let row = turn_item_row("user_message", Some("completed"), "not a turn item json");
+        let row = turn_item_row("user_message", Some("completed"), r#""not a turn item""#);
         let classified = classify_turn_item_row(&row);
 
         assert_eq!(

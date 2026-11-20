@@ -18,6 +18,18 @@ async fn fixture(
     fixture_with_store(store, suffix).await
 }
 
+async fn postgres_fixture(
+    database: &pioneer_postgres_test::TestDatabase,
+    suffix: &str,
+) -> (
+    CrudStore,
+    Turn,
+    pioneer_protocol::NativeTerminalEffectPreparation,
+) {
+    let store = postgres_store_with_workspace(database, &format!("ws_cancel_{suffix}")).await;
+    fixture_with_store(store, suffix).await
+}
+
 async fn fixture_with_store(
     store: CrudStore,
     suffix: &str,
@@ -85,186 +97,206 @@ async fn effect_row(
 
 #[tokio::test]
 async fn native_cancellation_original_context_cleanup_and_lost_ack_replay() {
-    let (store, turn, plan) = fixture("immutable").await;
-    let mut changed = plan.clone();
-    changed.batch_id.push_str("-changed");
-    changed.runtime_generation = 2;
-    changed.effects.clear();
-    // A restart/new configuration cannot replace the originating description.
-    store
-        .persist_native_cancellation_context(changed, OWNER, NOW + 1, false)
-        .await
-        .unwrap();
-    assert_eq!(
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, plan) = postgres_fixture(database, "immutable").await;
+        let mut changed = plan.clone();
+        changed.batch_id.push_str("-changed");
+        changed.runtime_generation = 2;
+        changed.effects.clear();
+        // A restart/new configuration cannot replace the originating description.
         store
-            .native_cancellation_context(&turn.id)
+            .persist_native_cancellation_context(changed, OWNER, NOW + 1, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .preparation,
+            plan
+        );
+        cancel(&store, &turn, &plan, "first accepted reason")
+            .await
+            .unwrap();
+        let first = effect_row(&store, &plan.effects[0].effect_id).await;
+        let receipt = store
+            .native_cancellation_receipt_owned(&turn.id, OWNER)
             .await
             .unwrap()
-            .unwrap()
-            .preparation,
-        plan
-    );
-    cancel(&store, &turn, &plan, "first accepted reason")
-        .await
-        .unwrap();
-    let first = effect_row(&store, &plan.effects[0].effect_id).await;
-    let receipt = store
-        .native_cancellation_receipt_owned(&turn.id, OWNER)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .native_cancellation_receipt_owned(&turn.id, "stale-owner")
+            .unwrap();
+        assert!(
+            store
+                .native_cancellation_receipt_owned(&turn.id, "stale-owner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let restarted = CrudStore::new(store.database_connection());
+        cancel(&restarted, &turn, &plan, "different retry payload")
+            .await
+            .unwrap();
+        let second = effect_row(&restarted, &plan.effects[0].effect_id).await;
+        assert_eq!(
+            first.payload_identity_sha256,
+            second.payload_identity_sha256
+        );
+        assert_eq!(first.terminal_committed_at, second.terminal_committed_at);
+        assert_eq!(first.attempt_count, second.attempt_count);
+        let accepted = turn_event::find_event_by_id(&store.connection, &receipt.canonical_event_id)
             .await
             .unwrap()
-            .is_none()
-    );
-    let restarted = CrudStore::new(store.database_connection());
-    cancel(&restarted, &turn, &plan, "different retry payload")
-        .await
-        .unwrap();
-    let second = effect_row(&restarted, &plan.effects[0].effect_id).await;
-    assert_eq!(
-        first.payload_identity_sha256,
-        second.payload_identity_sha256
-    );
-    assert_eq!(first.terminal_committed_at, second.terminal_committed_at);
-    assert_eq!(first.attempt_count, second.attempt_count);
-    let accepted = turn_event::find_event_by_id(&store.connection, &receipt.canonical_event_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(accepted.payload, CanonicalTurnEventPayload::TurnFailed(n)
-        if n.turn.error.as_deref() == Some("first accepted reason"))
-    );
-    let claims = restarted
-        .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
-        .await
-        .unwrap();
-    assert!(!claims.storage_failed);
-    let claims = claims.records;
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].payload, plan.effects[0].payload);
+            .unwrap();
+        assert!(
+            matches!(accepted.payload, CanonicalTurnEventPayload::TurnFailed(n)
+            if n.turn.error.as_deref() == Some("first accepted reason"))
+        );
+        let claims = restarted
+            .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
+            .await
+            .unwrap();
+        assert!(!claims.storage_failed);
+        let claims = claims.records;
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].payload, plan.effects[0].payload);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_cannot_drop_obligations_from_original_context() {
-    let (store, turn, mut plan) = fixture("empty").await;
-    plan.effects.clear();
-    // The fixture's original context intentionally has cleanup; passing an empty
-    // replacement must not be accepted as that context's cancellation plan.
-    let context = store
-        .native_cancellation_context(&turn.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .materialize_native_cancellation_owned(
-                interrupted(&turn, &plan, "cancel"),
-                NOW,
-                context,
-                plan,
-                OWNER
-            )
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, mut plan) = postgres_fixture(database, "empty").await;
+        plan.effects.clear();
+        // The fixture's original context intentionally has cleanup; passing an empty
+        // replacement must not be accepted as that context's cancellation plan.
+        let context = store
+            .native_cancellation_context(&turn.id)
             .await
-            .is_err()
-    );
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .materialize_native_cancellation_owned(
+                    interrupted(&turn, &plan, "cancel"),
+                    NOW,
+                    context,
+                    plan,
+                    OWNER
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_append_failure_rolls_back_effects_and_receipt() {
-    let (store, turn, plan) = fixture("rollback").await;
-    store.connection.execute_unprepared(
-        "CREATE TRIGGER reject_cancel_receipt BEFORE UPDATE OF accepted_event_id ON native_cancellation_context
-         BEGIN SELECT RAISE(ABORT, 'injected cancellation receipt failure'); END"
-    ).await.unwrap();
-    assert!(cancel(&store, &turn, &plan, "cancel").await.is_err());
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, plan) = postgres_fixture(database, "rollback").await;
+        store.connection.execute_unprepared(
+            "CREATE FUNCTION reject_cancel_receipt() RETURNS trigger LANGUAGE plpgsql AS $fault$
+                   BEGIN RAISE EXCEPTION 'injected cancellation receipt failure'; END $fault$;
+                   CREATE TRIGGER reject_cancel_receipt BEFORE UPDATE OF accepted_event_id ON native_cancellation_context
+                   FOR EACH ROW  EXECUTE FUNCTION reject_cancel_receipt()"
+        ).await.unwrap();
+        assert!(cancel(&store, &turn, &plan, "cancel").await.is_err());
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .native_terminal_effect_status(&plan.effects[0].effect_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repositories::turn_event_projection_stream_state::has_accepted_terminal(
+                &store.connection,
+                &turn.id
+            )
             .await
             .unwrap()
-    );
-    assert!(
+        );
         store
-            .native_terminal_effect_status(&plan.effects[0].effect_id)
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_cancel_receipt ON native_cancellation_context")
             .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        !repositories::turn_event_projection_stream_state::has_accepted_terminal(
-            &store.connection,
-            &turn.id
-        )
-        .await
-        .unwrap()
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_cancel_receipt")
-        .await
-        .unwrap();
-    cancel(&store, &turn, &plan, "cancel").await.unwrap();
+            .unwrap();
+        cancel(&store, &turn, &plan, "cancel").await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_accepted_append_recovers_projection_and_fences_old_preparation() {
-    let (store, turn, plan) = fixture("projection").await;
-    store.connection.execute_unprepared(
-        "CREATE TRIGGER reject_cancel_projection BEFORE UPDATE OF status ON turn
-         WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END"
-    ).await.unwrap();
-    let error = cancel(&store, &turn, &plan, "cancel").await.unwrap_err();
-    assert!(turn_event_was_appended_before_error(&error));
-    assert!(
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, plan) = postgres_fixture(database, "projection").await;
+        store.connection.execute_unprepared(
+            "CREATE FUNCTION reject_cancel_projection() RETURNS trigger LANGUAGE plpgsql AS $fault$
+                   BEGIN RAISE EXCEPTION 'injected projection failure'; END $fault$;
+                   CREATE TRIGGER reject_cancel_projection BEFORE UPDATE OF status ON turn
+                   FOR EACH ROW WHEN (NEW.status = 'interrupted') EXECUTE FUNCTION reject_cancel_projection()"
+        ).await.unwrap();
+        let error = cancel(&store, &turn, &plan, "cancel").await.unwrap_err();
+        assert!(turn_event_was_appended_before_error(&error));
+        assert!(
+            store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .native_terminal_effect_status(&plan.effects[0].effect_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        let mut old_success = plan.clone();
+        old_success.batch_id.push_str("-success");
+        assert!(
+            store
+                .prepare_native_terminal_effects(old_success, NOW + 2)
+                .await
+                .is_err()
+        );
+        // Lost ACK is accepted even while the projection remains deferred.
+        cancel(&store, &turn, &plan, "retry").await.unwrap();
         store
-            .native_cancellation_was_accepted(&turn.id)
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_cancel_projection ON turn")
             .await
-            .unwrap()
-    );
-    assert_eq!(
-        store
-            .native_terminal_effect_status(&plan.effects[0].effect_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "prepared"
-    );
-    let mut old_success = plan.clone();
-    old_success.batch_id.push_str("-success");
-    assert!(
-        store
-            .prepare_native_terminal_effects(old_success, NOW + 2)
-            .await
-            .is_err()
-    );
-    // Lost ACK is accepted even while the projection remains deferred.
-    cancel(&store, &turn, &plan, "retry").await.unwrap();
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_cancel_projection")
-        .await
-        .unwrap();
-    let restarted = CrudStore::new(store.database_connection());
-    restarted
-        .with_maintenance_access()
-        .replay_due_turn_event_projections(NOW + 100, 10)
-        .await
-        .unwrap();
-    assert_eq!(
+            .unwrap();
+        let restarted = CrudStore::new(store.database_connection());
         restarted
-            .native_terminal_effect_status(&plan.effects[0].effect_id)
+            .with_maintenance_access()
+            .replay_due_turn_event_projections(NOW + 100, 10)
             .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "ready"
-    );
+            .unwrap();
+        assert_eq!(
+            restarted
+                .native_terminal_effect_status(&plan.effects[0].effect_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
@@ -274,108 +306,128 @@ async fn native_cancellation_cannot_overlay_completed_failed_or_blocked_results(
         ("failed", TurnStatus::Failed),
         ("blocked", TurnStatus::Blocked),
     ] {
-        let (store, mut turn, plan) = fixture(suffix).await;
-        turn.status = status;
-        let event = match status {
-            TurnStatus::Completed => {
-                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
-                    workspace_id: plan.workspace_id.clone(),
-                    thread_id: plan.thread_id.clone(),
-                    turn: turn.clone(),
-                })
-            }
-            TurnStatus::Failed => CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
-                workspace_id: plan.workspace_id.clone(),
-                thread_id: plan.thread_id.clone(),
-                turn: turn.clone(),
-            }),
-            TurnStatus::Blocked => {
-                CanonicalTurnEventPayload::TurnBlocked(TurnBlockedNotification {
-                    workspace_id: plan.workspace_id.clone(),
-                    thread_id: plan.thread_id.clone(),
-                    turn: turn.clone(),
-                    resume: None,
-                })
-            }
-            _ => unreachable!(),
-        };
-        store
-            .materialize_native_agent_turn_event_owned(event, NOW + 1, None, OWNER)
-            .await
-            .unwrap();
-        assert!(cancel(&store, &turn, &plan, "late cancel").await.is_err());
-        assert!(
-            !store
-                .native_cancellation_was_accepted(&turn.id)
+        pioneer_postgres_test::with_database(async |database| {
+            let (store, mut turn, plan) = postgres_fixture(database, suffix).await;
+            turn.status = status;
+            let event = match status {
+                TurnStatus::Completed => {
+                    CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                        workspace_id: plan.workspace_id.clone(),
+                        thread_id: plan.thread_id.clone(),
+                        turn: turn.clone(),
+                    })
+                }
+                TurnStatus::Failed => {
+                    CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                        workspace_id: plan.workspace_id.clone(),
+                        thread_id: plan.thread_id.clone(),
+                        turn: turn.clone(),
+                    })
+                }
+                TurnStatus::Blocked => {
+                    CanonicalTurnEventPayload::TurnBlocked(TurnBlockedNotification {
+                        workspace_id: plan.workspace_id.clone(),
+                        thread_id: plan.thread_id.clone(),
+                        turn: turn.clone(),
+                        resume: None,
+                    })
+                }
+                _ => unreachable!(),
+            };
+            store
+                .materialize_native_agent_turn_event_owned(event, NOW + 1, None, OWNER)
                 .await
-                .unwrap()
-        );
+                .unwrap();
+            assert!(cancel(&store, &turn, &plan, "late cancel").await.is_err());
+            assert!(
+                !store
+                    .native_cancellation_was_accepted(&turn.id)
+                    .await
+                    .unwrap()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
 #[tokio::test]
 async fn native_cancellation_replaces_uncommitted_success_plan_and_rejects_later_success() {
-    let (store, mut turn, plan) = fixture("success_race").await;
-    let mut success_plan = plan.clone();
-    success_plan.batch_id.push_str("-success");
-    success_plan.effects[0].payload =
-        pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
-            reason: "success".to_owned(),
-            runtime_contract: "success-contract".to_owned(),
-        };
-    store
-        .prepare_native_terminal_effects(success_plan, NOW)
-        .await
-        .unwrap();
-    cancel(&store, &turn, &plan, "cancel").await.unwrap();
-    let row = effect_row(&store, &plan.effects[0].effect_id).await;
-    assert_eq!(
-        serde_json::from_str::<pioneer_protocol::NativeTerminalEffectPayload>(&row.payload_json)
-            .unwrap(),
-        plan.effects[0].payload
-    );
-    turn.status = TurnStatus::Completed;
-    assert!(
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, mut turn, plan) = postgres_fixture(database, "success_race").await;
+        let mut success_plan = plan.clone();
+        success_plan.batch_id.push_str("-success");
+        success_plan.effects[0].payload =
+            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: "success".to_owned(),
+                runtime_contract: "success-contract".to_owned(),
+            };
         store
-            .materialize_native_agent_turn_event_owned(
-                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
-                    workspace_id: plan.workspace_id,
-                    thread_id: plan.thread_id,
-                    turn,
-                }),
-                NOW + 2,
-                None,
-                OWNER
-            )
+            .prepare_native_terminal_effects(success_plan, NOW)
             .await
-            .is_err()
-    );
+            .unwrap();
+        cancel(&store, &turn, &plan, "cancel").await.unwrap();
+        let row = effect_row(&store, &plan.effects[0].effect_id).await;
+        assert_eq!(
+            serde_json::from_str::<pioneer_protocol::NativeTerminalEffectPayload>(
+                &row.payload_json
+            )
+            .unwrap(),
+            plan.effects[0].payload
+        );
+        turn.status = TurnStatus::Completed;
+        assert!(
+            store
+                .materialize_native_agent_turn_event_owned(
+                    CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                        workspace_id: plan.workspace_id,
+                        thread_id: plan.thread_id,
+                        turn,
+                    }),
+                    NOW + 2,
+                    None,
+                    OWNER
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_empty_originating_plan_is_accepted_and_replayed() {
-    let (store, _, turn) = test_store_with_started_turn(
-        "ws_empty_cancel",
-        "thread_empty_cancel",
-        "turn_empty_cancel",
-    )
-    .await;
-    let mut plan =
-        cleanup_effect_preparation("ws_empty_cancel", "thread_empty_cancel", &turn.id, "empty");
-    plan.effects.clear();
-    store
-        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
-        .await
-        .unwrap();
-    cancel(&store, &turn, &plan, "cancel").await.unwrap();
-    cancel(&store, &turn, &plan, "retry").await.unwrap();
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _, turn) = postgres_store_with_started_turn(
+            fixture,
+            "ws_empty_cancel",
+            "thread_empty_cancel",
+            "turn_empty_cancel",
+        )
+        .await;
+        let mut plan =
+            cleanup_effect_preparation("ws_empty_cancel", "thread_empty_cancel", &turn.id, "empty");
+        plan.effects.clear();
         store
-            .native_cancellation_was_accepted(&turn.id)
+            .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
             .await
-            .unwrap()
-    );
-    assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 0);
+            .unwrap();
+        cancel(&store, &turn, &plan, "cancel").await.unwrap();
+        cancel(&store, &turn, &plan, "retry").await.unwrap();
+        assert!(
+            store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 0);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -601,520 +653,558 @@ async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_re
 #[tokio::test]
 async fn native_cancellation_recovery_cannot_substitute_current_configuration_for_missing_history()
 {
-    let (store, _, turn) = test_store_with_started_turn(
-        "ws_missing_cancel",
-        "thread_missing_cancel",
-        "turn_missing_cancel",
-    )
-    .await;
-    let plan = cleanup_effect_preparation(
-        "ws_missing_cancel",
-        "thread_missing_cancel",
-        &turn.id,
-        "current-settings",
-    );
-    assert!(
-        store
-            .persist_native_cancellation_context(plan, OWNER, NOW, false)
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .native_cancellation_context(&turn.id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
-            .await
-            .unwrap()
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _, turn) = postgres_store_with_started_turn(
+            fixture,
+            "ws_missing_cancel",
+            "thread_missing_cancel",
+            "turn_missing_cancel",
+        )
+        .await;
+        let plan = cleanup_effect_preparation(
+            "ws_missing_cancel",
+            "thread_missing_cancel",
+            &turn.id,
+            "current-settings",
+        );
+        assert!(
+            store
+                .persist_native_cancellation_context(plan, OWNER, NOW, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_revalidates_execution_owner_and_immutable_plan_before_append() {
-    let (store, turn, mut plan) = fixture("revalidation").await;
-    let context = store
-        .native_cancellation_context(&turn.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .materialize_native_cancellation_owned(
-                interrupted(&turn, &plan, "cancel"),
-                NOW,
-                context.clone(),
-                plan.clone(),
-                "stale-owner"
-            )
-            .await
-            .is_err()
-    );
-    plan.runtime_generation += 1;
-    assert!(
-        store
-            .materialize_native_cancellation_owned(
-                interrupted(&turn, &plan, "cancel"),
-                NOW,
-                context,
-                plan,
-                OWNER
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, mut plan) = postgres_fixture(database, "revalidation").await;
+        let context = store
+            .native_cancellation_context(&turn.id)
             .await
             .unwrap()
-    );
+            .unwrap();
+        assert!(
+            store
+                .materialize_native_cancellation_owned(
+                    interrupted(&turn, &plan, "cancel"),
+                    NOW,
+                    context.clone(),
+                    plan.clone(),
+                    "stale-owner"
+                )
+                .await
+                .is_err()
+        );
+        plan.runtime_generation += 1;
+        assert!(
+            store
+                .materialize_native_cancellation_owned(
+                    interrupted(&turn, &plan, "cancel"),
+                    NOW,
+                    context,
+                    plan,
+                    OWNER
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_digest_is_checked_outside_writer_and_fence_has_no_json() {
-    use pioneer_entity::native_cancellation_context as entity;
-    let (store, turn, _) = fixture("digest").await;
-    let context = store
-        .native_cancellation_context(&turn.id)
-        .await
-        .unwrap()
-        .unwrap();
-    let fence = repositories::native_cancellation_context::prepare_revalidation(&context, OWNER);
-    let debug = format!("{fence:?}");
-    assert!(debug.contains("context_sha256"));
-    assert!(!debug.contains("context_json"));
-    assert!(debug.len() < 4096);
-    let row = entity::Entity::find_by_id(turn.id.clone())
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        row.context_sha256,
-        repositories::native_cancellation_context::digest(&row.context_json)
-    );
-    let _: sea_orm::prelude::DateTimeWithTimeZone = row.created_at;
-    entity::Entity::update_many()
-        .col_expr(entity::Column::ContextJson, Expr::value("{}"))
-        .filter(entity::Column::TurnId.eq(turn.id.clone()))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(store.native_cancellation_context(&turn.id).await.is_err());
-    // The damaged JSON cannot be parsed/admitted even though it is valid JSON.
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
+    pioneer_postgres_test::with_database(async |database| {
+        use pioneer_entity::native_cancellation_context as entity;
+        let (store, turn, _) = postgres_fixture(database, "digest").await;
+        let context = store
+            .native_cancellation_context(&turn.id)
             .await
             .unwrap()
-    );
+            .unwrap();
+        let fence =
+            repositories::native_cancellation_context::prepare_revalidation(&context, OWNER);
+        let debug = format!("{fence:?}");
+        assert!(debug.contains("context_sha256"));
+        assert!(!debug.contains("context_json"));
+        assert!(debug.len() < 4096);
+        let row = entity::Entity::find_by_id(turn.id.clone())
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.context_sha256,
+            repositories::native_cancellation_context::digest(&row.context_json)
+        );
+        let _: sea_orm::prelude::DateTimeWithTimeZone = row.created_at;
+        entity::Entity::update_many()
+            .col_expr(entity::Column::ContextJson, Expr::value("{}"))
+            .filter(entity::Column::TurnId.eq(turn.id.clone()))
+            .exec(&store.connection)
+            .await
+            .unwrap();
+        assert!(store.native_cancellation_context(&turn.id).await.is_err());
+        // The damaged JSON cannot be parsed/admitted even though it is valid JSON.
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_competing_terminal_append_before_projection_is_fenced() {
-    let (store, mut turn, plan) = fixture("terminal_gap").await;
-    store.connection.execute_unprepared("CREATE TRIGGER reject_completed_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END").await.unwrap();
-    turn.status = TurnStatus::Completed;
-    let event = CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
-        workspace_id: plan.workspace_id.clone(),
-        thread_id: plan.thread_id.clone(),
-        turn: turn.clone(),
-    });
-    let error = store
-        .materialize_native_agent_turn_event_owned(event, NOW, None, OWNER)
-        .await
-        .unwrap_err();
-    assert!(turn_event_was_appended_before_error(&error));
-    let marker =
-        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, mut turn, plan) = postgres_fixture(database, "terminal_gap").await;
+        store.connection.execute_unprepared("CREATE FUNCTION reject_completed_projection() RETURNS trigger LANGUAGE plpgsql AS $fault$
+                   BEGIN RAISE EXCEPTION 'injected projection failure'; END $fault$;
+                   CREATE TRIGGER reject_completed_projection BEFORE UPDATE OF status ON turn
+                   FOR EACH ROW WHEN (NEW.status = 'completed') EXECUTE FUNCTION reject_completed_projection()").await.unwrap();
+        turn.status = TurnStatus::Completed;
+        let event = CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+            workspace_id: plan.workspace_id.clone(),
+            thread_id: plan.thread_id.clone(),
+            turn: turn.clone(),
+        });
+        let error = store
+            .materialize_native_agent_turn_event_owned(event, NOW, None, OWNER)
             .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(
-        marker.accepted_terminal_event_type.as_deref(),
-        Some("turn/completed")
-    );
-    assert!(marker.accepted_terminal_sequence.unwrap() > marker.projected_through_sequence);
-    // The accepted terminal marker fences the pre-start ACK even while the
-    // projected Turn status is still running and its old context is present.
-    for initial_turn in [false, true] {
+            .unwrap_err();
+        assert!(turn_event_was_appended_before_error(&error));
+        let marker =
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            marker.accepted_terminal_event_type.as_deref(),
+            Some("turn/completed")
+        );
+        assert!(marker.accepted_terminal_sequence.unwrap() > marker.projected_through_sequence);
+        // The accepted terminal marker fences the pre-start ACK even while the
+        // projected Turn status is still running and its old context is present.
+        for initial_turn in [false, true] {
+            assert!(
+                store
+                    .persist_native_cancellation_context(plan.clone(), OWNER, NOW, initial_turn)
+                    .await
+                    .is_err()
+            );
+        }
+        turn.status = TurnStatus::InProgress;
+        assert!(cancel(&store, &turn, &plan, "too late").await.is_err());
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
         assert!(
             store
-                .persist_native_cancellation_context(plan.clone(), OWNER, NOW, initial_turn)
+                .native_terminal_effect_status(&plan.effects[0].effect_id)
                 .await
-                .is_err()
+                .unwrap()
+                .is_none()
         );
-    }
-    turn.status = TurnStatus::InProgress;
-    assert!(cancel(&store, &turn, &plan, "too late").await.is_err());
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .native_terminal_effect_status(&plan.effects[0].effect_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_marker_and_receipt_fence_both_append_paths_and_replay() {
-    let (store, mut turn, plan) = fixture("both_paths").await;
-    cancel(&store, &turn, &plan, "cancel").await.unwrap();
-    let original =
-        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
-            .await
-            .unwrap()
-            .unwrap();
-    let receipt = store
-        .native_cancellation_receipt_owned(&turn.id, OWNER)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        original.accepted_terminal_event_id.as_deref(),
-        Some(receipt.canonical_event_id.as_str())
-    );
-    turn.status = TurnStatus::Completed;
-    let event = CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
-        workspace_id: plan.workspace_id.clone(),
-        thread_id: plan.thread_id.clone(),
-        turn: turn.clone(),
-    });
-    assert!(
-        store
-            .materialize_native_agent_turn_event_owned(event.clone(), NOW, None, OWNER)
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .materialize_turn_events_atomically(vec![event], NOW)
-            .await
-            .is_err()
-    );
-    cancel(&store, &turn, &plan, "different retry")
-        .await
-        .unwrap();
-    let after = repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        original.accepted_terminal_event_id,
-        after.accepted_terminal_event_id
-    );
-    assert_eq!(
-        original.accepted_terminal_sequence,
-        after.accepted_terminal_sequence
-    );
-    assert_eq!(
-        receipt,
-        store
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, mut turn, plan) = postgres_fixture(database, "both_paths").await;
+        cancel(&store, &turn, &plan, "cancel").await.unwrap();
+        let original =
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+        let receipt = store
             .native_cancellation_receipt_owned(&turn.id, OWNER)
             .await
             .unwrap()
-            .unwrap()
-    );
+            .unwrap();
+        assert_eq!(
+            original.accepted_terminal_event_id.as_deref(),
+            Some(receipt.canonical_event_id.as_str())
+        );
+        turn.status = TurnStatus::Completed;
+        let event = CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+            workspace_id: plan.workspace_id.clone(),
+            thread_id: plan.thread_id.clone(),
+            turn: turn.clone(),
+        });
+        assert!(
+            store
+                .materialize_native_agent_turn_event_owned(event.clone(), NOW, None, OWNER)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .materialize_turn_events_atomically(vec![event], NOW)
+                .await
+                .is_err()
+        );
+        cancel(&store, &turn, &plan, "different retry")
+            .await
+            .unwrap();
+        let after =
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            original.accepted_terminal_event_id,
+            after.accepted_terminal_event_id
+        );
+        assert_eq!(
+            original.accepted_terminal_sequence,
+            after.accepted_terminal_sequence
+        );
+        assert_eq!(
+            receipt,
+            store
+                .native_cancellation_receipt_owned(&turn.id, OWNER)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_marker_failure_rolls_back_entire_append_boundary() {
-    let (store, turn, plan) = fixture("marker_rollback").await;
-    let before_sequence = turn_event::max_sequence_for_turn(&store.connection, &turn.id)
-        .await
-        .unwrap();
-    store.connection.execute_unprepared("CREATE TRIGGER reject_marker BEFORE UPDATE OF accepted_terminal_event_id ON turn_event_projection_stream_state BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END").await.unwrap();
-    assert!(cancel(&store, &turn, &plan, "cancel").await.is_err());
-    assert!(
-        !store
-            .native_cancellation_was_accepted(&turn.id)
+    pioneer_postgres_test::with_database(async |database| {
+        let (store, turn, plan) = postgres_fixture(database, "marker_rollback").await;
+        let before_sequence = turn_event::max_sequence_for_turn(&store.connection, &turn.id)
+            .await
+            .unwrap();
+        store.connection.execute_unprepared("CREATE FUNCTION reject_marker() RETURNS trigger LANGUAGE plpgsql AS $fault$
+                   BEGIN RAISE EXCEPTION 'injected marker failure'; END $fault$;
+                   CREATE TRIGGER reject_marker BEFORE UPDATE OF accepted_terminal_event_id ON turn_event_projection_stream_state
+                   FOR EACH ROW  EXECUTE FUNCTION reject_marker()").await.unwrap();
+        assert!(cancel(&store, &turn, &plan, "cancel").await.is_err());
+        assert!(
+            !store
+                .native_cancellation_was_accepted(&turn.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repositories::turn_event_projection_stream_state::has_accepted_terminal(
+                &store.connection,
+                &turn.id
+            )
             .await
             .unwrap()
-    );
-    assert!(
-        !repositories::turn_event_projection_stream_state::has_accepted_terminal(
-            &store.connection,
-            &turn.id
-        )
-        .await
-        .unwrap()
-    );
-    assert!(
+        );
+        assert!(
+            store
+                .native_terminal_effect_status(&plan.effects[0].effect_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            before_sequence,
+            turn_event::max_sequence_for_turn(&store.connection, &turn.id)
+                .await
+                .unwrap()
+        );
+        let (_, persisted) = store
+            .get_turn(&plan.thread_id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, TurnStatus::InProgress);
         store
-            .native_terminal_effect_status(&plan.effects[0].effect_id)
+            .connection
+            .execute_unprepared("DROP TRIGGER reject_marker ON turn_event_projection_stream_state")
             .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        before_sequence,
-        turn_event::max_sequence_for_turn(&store.connection, &turn.id)
-            .await
-            .unwrap()
-    );
-    let (_, persisted) = store
-        .get_turn(&plan.thread_id, &turn.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(persisted.status, TurnStatus::InProgress);
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_marker")
-        .await
-        .unwrap();
-    cancel(&store, &turn, &plan, "cancel").await.unwrap();
+            .unwrap();
+        cancel(&store, &turn, &plan, "cancel").await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn native_cancellation_blocked_lawful_resume_keeps_original_context_and_allows_interruption()
 {
-    use pioneer_protocol::{
-        NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
-        NativeTerminalEffectSpec,
-    };
-    let ws = "ws_blocked_obligations";
-    let thread = "thread_blocked_obligations";
-    let id = "turn_blocked_obligations";
-    let (store, _, mut turn) = test_store_with_started_turn(ws, thread, id).await;
-    let mut plan = cleanup_effect_preparation(ws, thread, id, "original");
-    plan.effects[0].effect_id = format!("{id}:cancellation-effect:attached-task-cleanup");
-    plan.effects.push(NativeTerminalEffectSpec {
-        effect_id: format!("{id}:cancellation-effect:post-turn"),
-        effect_kind: NativeTerminalEffectKind::PostTurnHook,
-        gate: NativeTerminalEffectGate::TerminalCommit,
-        payload: NativeTerminalEffectPayload::PostTurnHook {
-            request: serde_json::json!({"input":{"payload":{"value":{"status":"interrupted"}}}}),
-            runtime_snapshot: serde_json::json!({}),
-        },
-        max_attempts: 3,
-    });
-    store
-        .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
-        .await
-        .unwrap();
-    let mut blocked_plan = plan.clone();
-    blocked_plan.batch_id.push_str(":blocked");
-    for effect in &mut blocked_plan.effects {
-        effect.effect_id = effect
-            .effect_id
-            .replace(":cancellation-effect:", ":terminal-effect:");
-        match &mut effect.payload {
-            NativeTerminalEffectPayload::AttachedTaskCleanup { reason, .. } => {
-                *reason = "parent turn blocked".into()
+    pioneer_postgres_test::with_database(async |fixture| {
+        use pioneer_protocol::{
+            NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
+            NativeTerminalEffectSpec,
+        };
+        let ws = "ws_blocked_obligations";
+        let thread = "thread_blocked_obligations";
+        let id = "turn_blocked_obligations";
+        let (store, _, mut turn) = postgres_store_with_started_turn(fixture, ws, thread, id).await;
+        let mut plan = cleanup_effect_preparation(ws, thread, id, "original");
+        plan.effects[0].effect_id = format!("{id}:cancellation-effect:attached-task-cleanup");
+        plan.effects.push(NativeTerminalEffectSpec {
+            effect_id: format!("{id}:cancellation-effect:post-turn"),
+            effect_kind: NativeTerminalEffectKind::PostTurnHook,
+            gate: NativeTerminalEffectGate::TerminalCommit,
+            payload: NativeTerminalEffectPayload::PostTurnHook {
+                request: serde_json::json!({"input":{"payload":{"value":{"status":"interrupted"}}}}),
+                runtime_snapshot: serde_json::json!({}),
+            },
+            max_attempts: 3,
+        });
+        store
+            .persist_native_cancellation_context(plan.clone(), OWNER, NOW, true)
+            .await
+            .unwrap();
+        let mut blocked_plan = plan.clone();
+        blocked_plan.batch_id.push_str(":blocked");
+        for effect in &mut blocked_plan.effects {
+            effect.effect_id = effect
+                .effect_id
+                .replace(":cancellation-effect:", ":terminal-effect:");
+            match &mut effect.payload {
+                NativeTerminalEffectPayload::AttachedTaskCleanup { reason, .. } => {
+                    *reason = "parent turn blocked".into()
+                }
+                NativeTerminalEffectPayload::PostTurnHook { request, .. } => {
+                    request["input"]["payload"]["value"]["status"] = serde_json::json!("blocked")
+                }
+                _ => unreachable!(),
             }
-            NativeTerminalEffectPayload::PostTurnHook { request, .. } => {
-                request["input"]["payload"]["value"]["status"] = serde_json::json!("blocked")
-            }
-            _ => unreachable!(),
         }
-    }
-    store
-        .prepare_native_terminal_effects(blocked_plan.clone(), NOW)
-        .await
-        .unwrap();
-    turn.status = TurnStatus::Blocked;
-    let block = CanonicalTurnEventPayload::TurnBlocked(TurnBlockedNotification {
-        workspace_id: plan.workspace_id.clone(),
-        thread_id: plan.thread_id.clone(),
-        turn: turn.clone(),
-        resume: None,
-    });
-    store
-        .materialize_native_agent_turn_event_owned(block, NOW, None, OWNER)
-        .await
-        .unwrap();
-    assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 2);
-    // Claim old obligations and publish a real immutable handler checkpoint.
-    // Cancellation must preserve even in-flight worker identity and lease state.
-    // Allow the ready status quota to include both obligations in this wave.
-    let old_claims = store
-        .claim_due_native_terminal_effects_at(NOW, 30, 8)
-        .await
-        .unwrap();
-    assert!(!old_claims.storage_failed);
-    let old_claims = old_claims.records;
-    assert_eq!(old_claims.len(), 2);
-    for claim in &old_claims {
-        if claim.effect_id.ends_with(":post-turn") {
+        store
+            .prepare_native_terminal_effects(blocked_plan.clone(), NOW)
+            .await
+            .unwrap();
+        turn.status = TurnStatus::Blocked;
+        let block = CanonicalTurnEventPayload::TurnBlocked(TurnBlockedNotification {
+            workspace_id: plan.workspace_id.clone(),
+            thread_id: plan.thread_id.clone(),
+            turn: turn.clone(),
+            resume: None,
+        });
+        store
+            .materialize_native_agent_turn_event_owned(block, NOW, None, OWNER)
+            .await
+            .unwrap();
+        assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 2);
+        // Claim old obligations and publish a real immutable handler checkpoint.
+        // Cancellation must preserve even in-flight worker identity and lease state.
+        // Allow the ready status quota to include both obligations in this wave.
+        let old_claims = store
+            .claim_due_native_terminal_effects_at(NOW, 30, 8)
+            .await
+            .unwrap();
+        assert!(!old_claims.storage_failed);
+        let old_claims = old_claims.records;
+        assert_eq!(old_claims.len(), 2);
+        for claim in &old_claims {
+            if claim.effect_id.ends_with(":post-turn") {
+                store
+                    .store_native_terminal_effect_handler_checkpoint(
+                        &claim.effect_id,
+                        &claim.claim_token,
+                        "{\"checkpoint\":true}",
+                        NOW,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut old_rows = Vec::new();
+        for effect in &blocked_plan.effects {
+            old_rows.push(effect_row(&store, &effect.effect_id).await);
+        }
+        // An unconfirmed resume cannot bypass durable Blocked acceptance.
+        assert!(
+            cancel(&store, &turn, &plan, "without lawful resume")
+                .await
+                .is_err()
+        );
+        let job = store
+            .enqueue_recovery_job(
+                turn.id.clone(),
+                "reasoning_resume".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::BlockResumable,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                serde_json::json!({}),
+                serde_json::json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
+                NOW,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_recovery_job_terminal(&job.id, RecoveryJobStatus::Blocked, None, NOW)
+            .await
+            .unwrap();
+        assert!(matches!(
             store
-                .store_native_terminal_effect_handler_checkpoint(
-                    &claim.effect_id,
-                    &claim.claim_token,
-                    "{\"checkpoint\":true}",
-                    NOW,
+                .resume_blocked_turn_recovery(
+                    &plan.thread_id,
+                    &turn.id,
+                    Some(&job.id),
+                    NOW + 1,
+                    OWNER,
+                    NOW + 100
                 )
                 .await
-                .unwrap();
-        }
-    }
-    let mut old_rows = Vec::new();
-    for effect in &blocked_plan.effects {
-        old_rows.push(effect_row(&store, &effect.effect_id).await);
-    }
-    // An unconfirmed resume cannot bypass durable Blocked acceptance.
-    assert!(
-        cancel(&store, &turn, &plan, "without lawful resume")
-            .await
-            .is_err()
-    );
-    let job = store
-        .enqueue_recovery_job(
-            turn.id.clone(),
-            "reasoning_resume".to_owned(),
-            TurnItemType::Reasoning,
-            None,
-            RecoveryTrigger::Timeout,
-            RecoveryAction::BlockResumable,
-            None,
-            None,
-            None,
-            None,
-            0,
-            0,
-            serde_json::json!({}),
-            serde_json::json!({"base_backoff_secs":0,"max_wall_clock_secs":60}),
-            NOW,
-        )
-        .await
-        .unwrap();
-    store
-        .mark_recovery_job_terminal(&job.id, RecoveryJobStatus::Blocked, None, NOW)
-        .await
-        .unwrap();
-    assert!(matches!(
-        store
-            .resume_blocked_turn_recovery(
-                &plan.thread_id,
-                &turn.id,
-                Some(&job.id),
-                NOW + 1,
-                OWNER,
-                NOW + 100
+                .unwrap(),
+            BlockedTurnRecoveryResumeOutcome::Resumed(_)
+        ));
+        assert!(
+            !repositories::turn_event_projection_stream_state::has_accepted_terminal(
+                &store.connection,
+                &turn.id
             )
             .await
-            .unwrap(),
-        BlockedTurnRecoveryResumeOutcome::Resumed(_)
-    ));
-    assert!(
-        !repositories::turn_event_projection_stream_state::has_accepted_terminal(
-            &store.connection,
-            &turn.id
-        )
-        .await
-        .unwrap()
-    );
-    assert_eq!(
-        store
-            .native_cancellation_context(&turn.id)
-            .await
             .unwrap()
-            .unwrap()
-            .preparation,
-        plan
-    );
-    turn.status = TurnStatus::InProgress;
-    cancel(&store, &turn, &plan, "after lawful resume")
-        .await
-        .unwrap();
-    assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 2);
-    for before in &old_rows {
-        assert_eq!(&effect_row(&store, &before.effect_id).await, before);
-    }
-    let cancellation_claims = store
-        .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
-        .await
-        .unwrap();
-    assert!(!cancellation_claims.storage_failed);
-    let cancellation_claims = cancellation_claims.records;
-    assert_eq!(cancellation_claims.len(), 2);
-    assert!(
-        cancellation_claims
-            .iter()
-            .all(|c| c.effect_id.contains(":cancellation-effect:"))
-    );
-    let mut cancellation_rows = Vec::new();
-    for claim in &cancellation_claims {
-        cancellation_rows.push(effect_row(&store, &claim.effect_id).await);
-    }
-    let restarted = CrudStore::new(store.database_connection());
-    cancel(&restarted, &turn, &plan, "different replay reason")
-        .await
-        .unwrap();
-    for before in old_rows.iter().chain(&cancellation_rows) {
-        assert_eq!(&effect_row(&restarted, &before.effect_id).await, before);
-    }
-    let replay_claims = restarted
-        .claim_due_native_terminal_effects_at(NOW + 3, 30, 2)
-        .await
-        .unwrap();
-    assert!(!replay_claims.storage_failed);
-    assert_eq!(replay_claims.records.len(), 0);
-    // Complete the old worker wave through its real claim-token fence. Changes
-    // made by its own completion are legal; cancellation replay changes nothing.
-    for claim in &old_claims {
-        assert!(
-            restarted
-                .complete_native_terminal_effect(&claim.effect_id, &claim.claim_token, NOW + 3)
+        );
+        assert_eq!(
+            store
+                .native_cancellation_context(&turn.id)
                 .await
                 .unwrap()
+                .unwrap()
+                .preparation,
+            plan
         );
-    }
-    let mut completed_old = Vec::new();
-    for before in &old_rows {
-        let after = effect_row(&restarted, &before.effect_id).await;
-        assert_eq!(after.status, "succeeded");
+        turn.status = TurnStatus::InProgress;
+        cancel(&store, &turn, &plan, "after lawful resume")
+            .await
+            .unwrap();
+        assert_eq!(store.native_terminal_effect_stats().await.unwrap().ready, 2);
+        for before in &old_rows {
+            assert_eq!(&effect_row(&store, &before.effect_id).await, before);
+        }
+        let cancellation_claims = store
+            .claim_due_native_terminal_effects_at(NOW + 2, 30, 2)
+            .await
+            .unwrap();
+        assert!(!cancellation_claims.storage_failed);
+        let cancellation_claims = cancellation_claims.records;
+        assert_eq!(cancellation_claims.len(), 2);
+        assert!(
+            cancellation_claims
+                .iter()
+                .all(|c| c.effect_id.contains(":cancellation-effect:"))
+        );
+        let mut cancellation_rows = Vec::new();
+        for claim in &cancellation_claims {
+            cancellation_rows.push(effect_row(&store, &claim.effect_id).await);
+        }
+        let restarted = CrudStore::new(store.database_connection());
+        cancel(&restarted, &turn, &plan, "different replay reason")
+            .await
+            .unwrap();
+        for before in old_rows.iter().chain(&cancellation_rows) {
+            assert_eq!(&effect_row(&restarted, &before.effect_id).await, before);
+        }
+        let replay_claims = restarted
+            .claim_due_native_terminal_effects_at(NOW + 3, 30, 2)
+            .await
+            .unwrap();
+        assert!(!replay_claims.storage_failed);
+        assert_eq!(replay_claims.records.len(), 0);
+        // Complete the old worker wave through its real claim-token fence. Changes
+        // made by its own completion are legal; cancellation replay changes nothing.
+        for claim in &old_claims {
+            assert!(
+                restarted
+                    .complete_native_terminal_effect(&claim.effect_id, &claim.claim_token, NOW + 3)
+                    .await
+                    .unwrap()
+            );
+        }
+        let mut completed_old = Vec::new();
+        for before in &old_rows {
+            let after = effect_row(&restarted, &before.effect_id).await;
+            assert_eq!(after.status, "succeeded");
+            assert_eq!(
+                after.payload_identity_sha256,
+                before.payload_identity_sha256
+            );
+            assert_eq!(after.gate_kind, before.gate_kind);
+            assert_eq!(after.attempt_count, before.attempt_count);
+            assert_eq!(after.terminal_committed_at, before.terminal_committed_at);
+            completed_old.push(after);
+        }
+        cancel(&restarted, &turn, &plan, "retry after old worker")
+            .await
+            .unwrap();
+        for before in completed_old.iter().chain(&cancellation_rows) {
+            assert_eq!(&effect_row(&restarted, &before.effect_id).await, before);
+        }
         assert_eq!(
-            after.payload_identity_sha256,
-            before.payload_identity_sha256
+            pioneer_entity::native_terminal_effect_outbox::Entity::find()
+                .filter(pioneer_entity::native_terminal_effect_outbox::Column::TurnId.eq(id))
+                .all(&store.connection)
+                .await
+                .unwrap()
+                .len(),
+            4
         );
-        assert_eq!(after.gate_kind, before.gate_kind);
-        assert_eq!(after.attempt_count, before.attempt_count);
-        assert_eq!(after.terminal_committed_at, before.terminal_committed_at);
-        completed_old.push(after);
-    }
-    cancel(&restarted, &turn, &plan, "retry after old worker")
-        .await
-        .unwrap();
-    for before in completed_old.iter().chain(&cancellation_rows) {
-        assert_eq!(&effect_row(&restarted, &before.effect_id).await, before);
-    }
-    assert_eq!(
-        pioneer_entity::native_terminal_effect_outbox::Entity::find()
-            .filter(pioneer_entity::native_terminal_effect_outbox::Column::TurnId.eq(id))
-            .all(&store.connection)
-            .await
-            .unwrap()
-            .len(),
-        4
-    );
-    turn.status = TurnStatus::Completed;
-    assert!(
-        restarted
-            .materialize_native_agent_turn_event_owned(
-                CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
-                    workspace_id: ws.into(),
-                    thread_id: thread.into(),
-                    turn
-                }),
-                NOW + 4,
-                None,
-                OWNER
-            )
-            .await
-            .is_err()
-    );
+        turn.status = TurnStatus::Completed;
+        assert!(
+            restarted
+                .materialize_native_agent_turn_event_owned(
+                    CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                        workspace_id: ws.into(),
+                        thread_id: thread.into(),
+                        turn
+                    }),
+                    NOW + 4,
+                    None,
+                    OWNER
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
@@ -2430,57 +2520,66 @@ async fn native_cancellation_task_resume_clears_only_confirmed_blocked_and_rolls
 
 #[tokio::test]
 async fn native_cancellation_migration_down_rejects_marker_without_context() {
-    let (store, thread, mut turn) =
-        test_store_with_started_turn("ws_marker_down", "thread_marker_down", "turn_marker_down")
-            .await;
-    turn.status = TurnStatus::Completed;
-    store
-        .materialize_turn_events_atomically(
-            vec![CanonicalTurnEventPayload::TurnCompleted(
-                TurnCompletedNotification {
-                    workspace_id: thread.workspace_id,
-                    thread_id: thread.id,
-                    turn: turn.clone(),
-                },
-            )],
-            NOW,
+    pioneer_postgres_test::with_database(async |fixture| {
+        let (store, thread, mut turn) = postgres_store_with_started_turn(
+            fixture,
+            "ws_marker_down",
+            "thread_marker_down",
+            "turn_marker_down",
         )
-        .await
-        .unwrap();
-    assert!(
+        .await;
+        turn.status = TurnStatus::Completed;
         store
-            .native_cancellation_context(&turn.id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let before =
-        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+            .materialize_turn_events_atomically(
+                vec![CanonicalTurnEventPayload::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: thread.workspace_id,
+                        thread_id: thread.id,
+                        turn: turn.clone(),
+                    },
+                )],
+                NOW,
+            )
             .await
             .unwrap();
-    let error = rollback_cancellation_migration(&store.connection)
-        .await
-        .expect_err("accepted terminal marker must prevent rollback");
-    assert!(
-        error
-            .to_string()
-            .contains("projection stream contains accepted terminal markers"),
-        "{error}"
-    );
-    assert!(
-        repositories::turn_event_projection_stream_state::has_accepted_terminal(
-            &store.connection,
-            &turn.id
-        )
-        .await
-        .unwrap()
-    );
-    assert_eq!(
-        repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+        assert!(
+            store
+                .native_cancellation_context(&turn.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let before =
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap();
+        let error = rollback_cancellation_migration(&store.connection)
             .await
-            .unwrap(),
-        before,
-    );
+            .expect_err("accepted terminal marker must prevent rollback");
+        assert!(
+            error
+                .to_string()
+                .contains("projection stream contains accepted terminal markers"),
+            "{error}"
+        );
+        assert!(
+            repositories::turn_event_projection_stream_state::has_accepted_terminal(
+                &store.connection,
+                &turn.id
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            repositories::turn_event_projection_stream_state::find(&store.connection, &turn.id)
+                .await
+                .unwrap(),
+            before,
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

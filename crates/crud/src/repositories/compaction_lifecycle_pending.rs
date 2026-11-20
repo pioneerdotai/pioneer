@@ -50,10 +50,10 @@ fn pending_filter(row: &pending::Model) -> sea_orm::Condition {
         .add(pending::Column::RetryNotBefore.eq(row.retry_not_before))
         .add(pending::Column::DueAt.eq(row.due_at))
         .add(pending::Column::Attempts.eq(row.attempts))
-        .add(
-            Expr::col(pending::Column::ClaimToken)
-                .binary(BinOper::Is, Expr::val(row.claim_token.clone())),
-        )
+        .add(Expr::col(pending::Column::ClaimToken).binary(
+            BinOper::Custom("IS NOT DISTINCT FROM"),
+            Expr::val(row.claim_token.clone()),
+        ))
 }
 pub(crate) async fn owns<C: ConnectionTrait>(
     db: &C,
@@ -193,15 +193,18 @@ fn scope_filter(row: &scope::Model) -> sea_orm::Condition {
         .add(scope::Column::Generation.eq(row.generation))
         .add(scope::Column::DueAt.eq(row.due_at))
         .add(scope::Column::Attempts.eq(row.attempts))
-        .add(
-            Expr::col(scope::Column::ClaimToken)
-                .binary(BinOper::Is, Expr::val(row.claim_token.clone())),
-        )
-        .add(
-            Expr::col(scope::Column::CursorId)
-                .binary(BinOper::Is, Expr::val(row.cursor_id.clone())),
-        )
-        .add(Expr::col(scope::Column::UpperId).binary(BinOper::Is, Expr::val(row.upper_id.clone())))
+        .add(Expr::col(scope::Column::ClaimToken).binary(
+            BinOper::Custom("IS NOT DISTINCT FROM"),
+            Expr::val(row.claim_token.clone()),
+        ))
+        .add(Expr::col(scope::Column::CursorId).binary(
+            BinOper::Custom("IS NOT DISTINCT FROM"),
+            Expr::val(row.cursor_id.clone()),
+        ))
+        .add(Expr::col(scope::Column::UpperId).binary(
+            BinOper::Custom("IS NOT DISTINCT FROM"),
+            Expr::val(row.upper_id.clone()),
+        ))
 }
 fn operations(row: &scope::Model) -> sea_orm::Select<operation::Entity> {
     let query = operation::Entity::find();
@@ -305,10 +308,12 @@ pub(crate) async fn expand(
             .exec(&tx)
             .await?
             .rows_affected;
-        let claimed =
-            scope::Entity::find_by_id((row.kind.clone(), row.owner.clone(), row.turn_id.clone()))
-                .one(&tx)
-                .await?;
+        let claimed = scope::Entity::find()
+            .filter(scope::Column::Kind.eq(row.kind.clone()))
+            .filter(scope::Column::Owner.eq(row.owner.clone()))
+            .filter(scope::Column::TurnId.eq(row.turn_id.clone()))
+            .one(&tx)
+            .await?;
         tx.commit().await?;
         Ok::<_, sea_orm::DbErr>((count == 1).then_some(claimed).flatten())
     }

@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{thread, thread_read_cursor};
+use pioneer_entity::thread;
 use pioneer_protocol::{
-    PersistedActorRef, PrincipalId, Thread, ThreadOriginKind, ThreadReadCursor,
-    ThreadSidebarVisibility, ThreadStatus, TurnAuthorSnapshot,
+    PersistedActorRef, PrincipalId, Thread, ThreadOriginKind, ThreadSidebarVisibility,
+    ThreadStatus, TurnAuthorSnapshot,
 };
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -49,23 +49,11 @@ pub(crate) fn preview_author_from_json(json: Option<&str>) -> Result<Option<Turn
     Ok(Some(author))
 }
 
-pub async fn find_thread_read_cursor<C: ConnectionTrait>(
-    db: &C,
-    principal_id: &PrincipalId,
-    thread_id: &str,
-) -> Result<Option<thread_read_cursor::Model>> {
-    thread_read_cursor::Entity::find_by_id((principal_id.to_string(), thread_id.to_owned()))
-        .one(db)
-        .await
-        .context("failed to query thread read cursor")
-}
-
-pub fn thread_read_cursor_from_model(model: &thread_read_cursor::Model) -> ThreadReadCursor {
-    ThreadReadCursor {
-        through_turn_id: model.last_read_turn_id.clone(),
-        sort_key: model.last_read_sort_key.clone(),
-    }
-}
+use pioneer_crud_conversations::thread_state::{self, NativeThreadNameFence};
+pub use pioneer_crud_conversations::thread_state::{
+    ThreadReadPosition, advance_thread_read_cursor, find_thread_read_cursor, is_list_conversation,
+    list_read_candidates_page, list_threads_by_workspace, thread_read_cursor_from_model,
+};
 
 /// Replaces an automatically-derived thread preview without overwriting a
 /// preview that another committed operation has already changed.
@@ -130,53 +118,6 @@ pub(crate) async fn touch_thread_for_completed_message_prepared<C: ConnectionTra
         .context("failed to advance thread activity from Message")?;
 
     Ok(())
-}
-
-/// Atomically advances a cursor and never permits a concurrent older position
-/// to overwrite a newer one. Authorization and anchor validation remain with
-/// the caller's existing transaction owner.
-pub async fn advance_thread_read_cursor<C: ConnectionTrait>(
-    db: &C,
-    principal_id: &PrincipalId,
-    thread_id: &str,
-    last_read_sort_key: &str,
-    last_read_turn_id: &str,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
-    if last_read_sort_key.is_empty() || last_read_sort_key.len() > 128 {
-        anyhow::bail!("thread read sort key must contain between 1 and 128 bytes");
-    }
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        anyhow::bail!("thread read cursor persistence requires the SQLite store");
-    }
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            r#"
-                INSERT INTO thread_read_cursor (
-                    principal_id,
-                    thread_id,
-                    last_read_sort_key,
-                    last_read_turn_id,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(principal_id, thread_id) DO UPDATE SET
-                    last_read_sort_key = excluded.last_read_sort_key,
-                    last_read_turn_id = excluded.last_read_turn_id,
-                    updated_at = excluded.updated_at
-                WHERE excluded.last_read_sort_key > thread_read_cursor.last_read_sort_key
-            "#,
-            vec![
-                principal_id.to_string().into(),
-                thread_id.to_owned().into(),
-                last_read_sort_key.to_owned().into(),
-                last_read_turn_id.to_owned().into(),
-                updated_at.into(),
-            ],
-        ))
-        .await
-        .context("failed to advance thread read cursor")?;
-    Ok(result.rows_affected() > 0)
 }
 
 #[cfg(test)]
@@ -636,106 +577,6 @@ pub async fn update_user_thread_management(
     }))
 }
 
-/// Exact storage sort key, independent of the public second-resolution dates.
-/// Keep SQLite's timestamp text intact: parsing/reformatting it can change the
-/// equality boundary (including fractional precision and timezone spelling).
-#[derive(
-    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, sea_orm::FromQueryResult,
-)]
-#[serde(deny_unknown_fields)]
-pub struct ThreadReadPosition {
-    pub created_at: String,
-    pub id: String,
-}
-
-// Same ordinary-conversation boundary as user management: visibility and
-// origin/access semantics, independent of creator, lineage, archive state or ACL.
-fn list_conversation_condition() -> sea_orm::Condition {
-    sea_orm::Condition::all()
-        .add(thread::Column::SidebarVisibility.eq("visible"))
-        .add(thread::Column::AccessClass.is_in(["private", "workspace"]))
-        .add(thread::Column::OriginKind.is_not_in(["task_run", "taskRun", "system"]))
-}
-
-/// Revalidate list membership independently of read authorization, including
-/// when resuming metadata fragments and before disclosing a completed page.
-pub async fn is_list_conversation<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    thread_id: &str,
-) -> Result<bool> {
-    Ok(thread::Entity::find_by_id(thread_id.to_owned())
-        .select_only()
-        .column(thread::Column::Id)
-        .column(thread::Column::CreatedAt)
-        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(list_conversation_condition())
-        .into_model::<ThreadReadPosition>()
-        .one(db)
-        .await
-        .context("failed to revalidate thread list membership")?
-        .is_some())
-}
-
-/// Ordinary visible conversation candidates, including archived conversations.
-/// Authorization belongs to the caller. Advance by the last *candidate* key,
-/// including rows the caller cannot disclose; a filtered empty page is not EOF.
-pub async fn list_read_candidates_page<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    after: Option<&ThreadReadPosition>,
-    limit: u64,
-) -> Result<Vec<ThreadReadPosition>> {
-    anyhow::ensure!(
-        (1..=200).contains(&limit),
-        "thread candidate page limit must be 1..=200"
-    );
-    let mut query = thread::Entity::find()
-        .select_only()
-        .column(thread::Column::Id)
-        .column(thread::Column::CreatedAt)
-        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(list_conversation_condition());
-    if let Some(after) = after {
-        query = query
-            // Give the workspace/creation index an explicit range as well as
-            // the lexicographic tie-break predicate.
-            .filter(thread::Column::CreatedAt.lte(after.created_at.clone()))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(thread::Column::CreatedAt.lt(after.created_at.clone()))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(thread::Column::CreatedAt.eq(after.created_at.clone()))
-                            .add(thread::Column::Id.lt(after.id.clone())),
-                    ),
-            );
-    }
-    query
-        .order_by_desc(thread::Column::CreatedAt)
-        .order_by_desc(thread::Column::Id)
-        .limit(limit)
-        .into_model::<ThreadReadPosition>()
-        .all(db)
-        .await
-        .context("failed to list thread read candidates")
-}
-
-pub async fn list_threads_by_workspace<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    limit: u64,
-) -> Result<Vec<thread::Model>> {
-    thread::Entity::find()
-        .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(thread::Column::SidebarVisibility.eq("visible"))
-        .order_by_desc(thread::Column::UpdatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list threads by workspace")
-}
-
 pub async fn update_thread_status<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -826,39 +667,13 @@ pub async fn update_automatic_thread_name<C: ConnectionTrait>(
     binding: Option<&crate::CliRuntimeThreadBindingRecord>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
-    let mut sql = String::from(
-        "UPDATE thread SET name = ?, updated_at = ? WHERE id = ? \
-         AND (name IS NULL OR name = '' OR name = ?) AND (name IS NULL OR name != ?)",
-    );
-    let mut values: Vec<sea_orm::Value> = vec![
-        name.into(),
-        updated_at.into(),
-        thread_id.into(),
-        fallback.map(str::to_owned).into(),
-        name.into(),
-    ];
-    if let Some(binding) = binding {
-        sql.push_str(
-            " AND workspace_id = ? AND EXISTS (SELECT 1 FROM thread_cli_runtime_binding b \
-            WHERE b.thread_id = thread.id AND b.workspace_id = ? AND b.runtime_id = ? \
-            AND b.runtime_kind = 'codex' AND b.native_thread_id = ? AND b.status = 'active')",
-        );
-        values.extend([
-            binding.workspace_id.clone().into(),
-            binding.workspace_id.clone().into(),
-            binding.runtime_id.clone().into(),
-            binding.native_thread_id.clone().into(),
-        ]);
-    }
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            sql,
-            values,
-        ))
+    let binding = binding.map(|binding| NativeThreadNameFence {
+        workspace_id: &binding.workspace_id,
+        runtime_id: &binding.runtime_id,
+        native_thread_id: &binding.native_thread_id,
+    });
+    thread_state::update_automatic_thread_name(db, thread_id, name, fallback, binding, updated_at)
         .await
-        .context("failed to accept automatic thread name")?;
-    Ok(result.rows_affected() > 0)
 }
 
 pub async fn update_thread_summary<C: ConnectionTrait>(

@@ -56,130 +56,135 @@ async fn history(store: &CrudStore) {
 
 #[tokio::test]
 async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
-    let store = test_store_with_workspace("ws_active_page").await;
-    history(&store).await;
-    for status in [Starting, Running] {
-        binding::Entity::insert_many(
-            (0..145).map(|i| fixture(format!("{}_{i:03}", status.as_str()), status.as_str())),
-        )
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
-    }
-    let maintenance = store.with_maintenance_access();
-    for status in [Starting, Running] {
-        let through = maintenance
-            .active_cli_runtime_turn_binding_frontier(status)
-            .await
-            .unwrap()
-            .unwrap();
-        let first = maintenance
-            .list_active_cli_runtime_turn_binding_page(status, None)
-            .await
-            .unwrap();
-        assert_eq!(first.len(), 64);
-        let after = (first[63].created_at, first[63].turn_id.clone());
-        assert_eq!(first[0].turn_id, format!("{}_000", status.as_str()));
-        let second = maintenance
-            .list_active_cli_runtime_turn_binding_page(status, Some(&after))
-            .await
-            .unwrap();
-        assert_eq!(second.len(), 64);
-        assert_eq!(second[0].turn_id, format!("{}_064", status.as_str()));
-        assert!(second.iter().all(|row| row.status == status.as_str()));
-        let end = (second[63].created_at, second[63].turn_id.clone());
-        let last = maintenance
-            .list_active_cli_runtime_turn_binding_page(status, Some(&end))
-            .await
-            .unwrap();
-        assert_eq!(last.len(), 17);
-        assert_eq!(last[16].turn_id, format!("{}_144", status.as_str()));
-
-        // New suffix pages must not postpone EOF, while an ordinary fresh
-        // pass sees them. The captured frontier remains inclusive.
-        binding::Entity::insert_many((0..65).map(|i| {
-            let mut row = fixture(
-                format!("{}_suffix_{i:03}", status.as_str()),
-                status.as_str(),
-            );
-            row.created_at = Set(unix_to_datetime(1_700_000_001));
-            row
-        }))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
-        let bounded = maintenance
-            .list_active_cli_runtime_turn_binding_page_through(status, Some(&end), &through)
-            .await
-            .unwrap();
-        assert_eq!(bounded.len(), 17);
-        let boundary = (bounded[16].created_at, bounded[16].turn_id.clone());
-        assert!(
-            maintenance
-                .list_active_cli_runtime_turn_binding_page_through(
-                    status,
-                    Some(&boundary),
-                    &through,
-                )
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            maintenance
-                .list_active_cli_runtime_turn_binding_page(status, Some(&boundary),)
-                .await
-                .unwrap()
-                .len(),
-            64
-        );
-
-        let mut behind = fixture(format!("{}_behind", status.as_str()), status.as_str());
-        behind.created_at = Set(unix_to_datetime(1_699_999_999));
-        binding::Entity::insert(behind)
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws_active_page").await;
+        history(&store).await;
+        for status in [Starting, Running] {
+            binding::Entity::insert_many(
+                (0..145).map(|i| fixture(format!("{}_{i:03}", status.as_str()), status.as_str())),
+            )
             .exec(&store.database_connection())
             .await
             .unwrap();
-        assert!(
-            maintenance
-                .list_active_cli_runtime_turn_binding_page(status, Some(&end))
+        }
+        let maintenance = store.with_maintenance_access();
+        for status in [Starting, Running] {
+            let through = maintenance
+                .active_cli_runtime_turn_binding_frontier(status)
                 .await
                 .unwrap()
-                .iter()
-                .all(|row| !row.turn_id.ends_with("behind"))
-        );
-        let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
-        assert_eq!(
-            restarted
+                .unwrap();
+            let first = maintenance
                 .list_active_cli_runtime_turn_binding_page(status, None)
                 .await
-                .unwrap()[0]
-                .turn_id,
-            format!("{}_behind", status.as_str())
-        );
-    }
-    binding::Entity::update_many()
-        .col_expr(binding::Column::Status, Expr::value("running"))
-        .filter(binding::Column::TurnId.eq("starting_000"))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
-    let page = maintenance
-        .list_active_cli_runtime_turn_binding_page(Starting, None)
-        .await
-        .unwrap();
-    assert!(page.iter().all(|row| row.turn_id != "starting_000"));
-    // Existing foreground semantics still include terminal rows with its filter.
-    let foreground = store
-        .list_cli_runtime_turn_bindings(CliRuntimeTurnBindingListFilter {
-            workspace_id: Some("ws_active_page".into()),
-            statuses: vec!["completed".into()],
-            limit: Some(3),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(foreground.len(), 3);
+                .unwrap();
+            assert_eq!(first.len(), 64);
+            let after = (first[63].created_at, first[63].turn_id.clone());
+            assert_eq!(first[0].turn_id, format!("{}_000", status.as_str()));
+            let second = maintenance
+                .list_active_cli_runtime_turn_binding_page(status, Some(&after))
+                .await
+                .unwrap();
+            assert_eq!(second.len(), 64);
+            assert_eq!(second[0].turn_id, format!("{}_064", status.as_str()));
+            assert!(second.iter().all(|row| row.status == status.as_str()));
+            let end = (second[63].created_at, second[63].turn_id.clone());
+            let last = maintenance
+                .list_active_cli_runtime_turn_binding_page(status, Some(&end))
+                .await
+                .unwrap();
+            assert_eq!(last.len(), 17);
+            assert_eq!(last[16].turn_id, format!("{}_144", status.as_str()));
+
+            // New suffix pages must not postpone EOF, while an ordinary fresh
+            // pass sees them. The captured frontier remains inclusive.
+            binding::Entity::insert_many((0..65).map(|i| {
+                let mut row = fixture(
+                    format!("{}_suffix_{i:03}", status.as_str()),
+                    status.as_str(),
+                );
+                row.created_at = Set(unix_to_datetime(1_700_000_001));
+                row
+            }))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+            let bounded = maintenance
+                .list_active_cli_runtime_turn_binding_page_through(status, Some(&end), &through)
+                .await
+                .unwrap();
+            assert_eq!(bounded.len(), 17);
+            let boundary = (bounded[16].created_at, bounded[16].turn_id.clone());
+            assert!(
+                maintenance
+                    .list_active_cli_runtime_turn_binding_page_through(
+                        status,
+                        Some(&boundary),
+                        &through,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                maintenance
+                    .list_active_cli_runtime_turn_binding_page(status, Some(&boundary),)
+                    .await
+                    .unwrap()
+                    .len(),
+                64
+            );
+
+            let mut behind = fixture(format!("{}_behind", status.as_str()), status.as_str());
+            behind.created_at = Set(unix_to_datetime(1_699_999_999));
+            binding::Entity::insert(behind)
+                .exec(&store.database_connection())
+                .await
+                .unwrap();
+            assert!(
+                maintenance
+                    .list_active_cli_runtime_turn_binding_page(status, Some(&end))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|row| !row.turn_id.ends_with("behind"))
+            );
+            let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
+            assert_eq!(
+                restarted
+                    .list_active_cli_runtime_turn_binding_page(status, None)
+                    .await
+                    .unwrap()[0]
+                    .turn_id,
+                format!("{}_behind", status.as_str())
+            );
+        }
+        binding::Entity::update_many()
+            .col_expr(binding::Column::Status, Expr::value("running"))
+            .filter(binding::Column::TurnId.eq("starting_000"))
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+        let page = maintenance
+            .list_active_cli_runtime_turn_binding_page(Starting, None)
+            .await
+            .unwrap();
+        assert!(page.iter().all(|row| row.turn_id != "starting_000"));
+        // Existing foreground semantics still include terminal rows with its filter.
+        let foreground = store
+            .list_cli_runtime_turn_bindings(CliRuntimeTurnBindingListFilter {
+                workspace_id: Some("ws_active_page".into()),
+                statuses: vec!["completed".into()],
+                limit: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(foreground.len(), 3);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

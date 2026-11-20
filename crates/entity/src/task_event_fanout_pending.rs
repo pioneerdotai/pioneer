@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_event_fanout_pending")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub task_id: String,
     pub first_sequence: i64,
-    pub newest_sequence: i64,
-    #[sea_orm(unique)]
-    pub generation: i64,
     pub due_at: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
     pub attempts: i64,
+    pub newest_sequence: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(unique)]
+    pub generation: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

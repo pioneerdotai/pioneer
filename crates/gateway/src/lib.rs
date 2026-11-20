@@ -23,6 +23,10 @@ pub(crate) mod compaction;
 #[cfg(feature = "computer-use")]
 mod computer_use;
 mod database;
+#[cfg(windows)]
+mod windows_shutdown;
+#[cfg(windows)]
+pub use windows_shutdown::signal_windows_gateway_shutdown;
 mod epic5_observability;
 mod helpers;
 mod hook_run_store;
@@ -132,7 +136,7 @@ pub use crate::operations::{
     KeystoreEncryptionReport, McpSecretGarbageCollectionFailure, McpSecretGarbageCollectionReport,
     McpSecretOrphanStatusReport, SecretKindCounts, SecretPermissionHealthReport,
     SecretPermissionHealthStatus, SecretsStatusReport, artifact_gc_dry_run, artifact_gc_execute,
-    artifact_storage_usage, secrets_garbage_collection, secrets_status,
+    artifact_storage_usage, secrets_garbage_collection, secrets_status, task_runtime_invariants,
 };
 pub use crate::settings::{
     GatewayMemorySettings, GatewaySettings, GatewayThreadEpisodicSettings,
@@ -216,6 +220,9 @@ async fn run_gateway_until_shutdown_inner(
 
     let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimePrepare);
     let runtime_home = config.ensure_runtime_home_dir()?;
+    #[cfg(windows)]
+    let shutdown_event = windows_shutdown::ShutdownEvent::listen(&runtime_home)
+        .context("register Gateway shutdown event")?;
     info!(
         runtime_home = %runtime_home.display(),
         "runtime home directory is ready"
@@ -279,7 +286,7 @@ async fn run_gateway_until_shutdown_inner(
     let secrets_open_stage = startup.stage(pioneer_observability::GatewayStartupStage::SecretsOpen);
     let gateway_secrets = Arc::new(GatewaySecrets::open(&runtime_home)?);
     secrets_open_stage.succeed();
-    let database = initialize_database(&runtime_home, &config, startup).await?;
+    let (database, mut postgres) = initialize_database(&runtime_home, &config, startup).await?;
 
     let database_bootstrap_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::DatabaseBootstrap);
@@ -298,10 +305,6 @@ async fn run_gateway_until_shutdown_inner(
             .snapshot
             .gateway
             .identity_bootstrap_version,
-        principal_threads_backfilled = identity_bootstrap.backfill_counts.principal_threads,
-        system_threads_backfilled = identity_bootstrap.backfill_counts.system_threads,
-        principal_turns_backfilled = identity_bootstrap.backfill_counts.principal_turns,
-        system_turns_backfilled = identity_bootstrap.backfill_counts.system_turns,
         "stable Gateway identity is ready"
     );
     let identity_snapshot = Arc::new(identity_bootstrap.snapshot);
@@ -1086,7 +1089,27 @@ async fn run_gateway_until_shutdown_inner(
                     .await;
                 },
             ));
-            wait_for_shutdown_signal().await
+            let shutdown = async {
+                #[cfg(windows)]
+                {
+                    tokio::select! {
+                        result = wait_for_shutdown_signal() => result,
+                        result = shutdown_event.wait() => result.context("wait for Gateway shutdown event"),
+                    }
+                }
+                #[cfg(not(windows))]
+                wait_for_shutdown_signal().await
+            };
+            tokio::select! {
+                biased;
+                result = shutdown => result,
+                result = async {
+                    match postgres.as_mut() {
+                        Some(instance) => instance.wait_for_unexpected_exit().await,
+                        None => std::future::pending().await,
+                    }
+                } => result,
+            }
         }
         Err(error) => {
             drop(services_start_stage);
@@ -1144,6 +1167,10 @@ async fn run_gateway_until_shutdown_inner(
         .close()
         .await
         .context("failed to close gateway database connection");
+    let postgres_stop_result = match postgres {
+        Some(postgres) => postgres.stop().await,
+        None => Ok(()),
+    };
     match pioneer_observability::work::spawn_blocking(move || {
         pioneer_observability::shutdown_observability(telemetry_shutdown_timeout)
     })
@@ -1164,6 +1191,7 @@ async fn run_gateway_until_shutdown_inner(
     local_operations_shutdown_result?;
     server_shutdown_result?;
     database_close_result?;
+    postgres_stop_result?;
     Ok(())
 }
 
@@ -1220,19 +1248,35 @@ pub async fn create_device(
     config: &AppConfig,
     runtime_home: &Path,
 ) -> Result<AuthDeviceCreateResponse> {
-    let database = database::initialize_existing_for_operations(runtime_home, config).await;
-    let database = match database {
-        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {
-            return transport::local_operations::request(
+    let response = database::with_existing_database(
+        runtime_home,
+        config,
+        database::OperatorAccess::Write,
+        async |database| create_offline_device(config, runtime_home, database).await,
+    )
+    .await;
+    match response {
+        Err(error)
+            if error
+                .downcast_ref::<pioneer_postgres::ClusterBusy>()
+                .is_some() =>
+        {
+            transport::local_operations::request(
                 runtime_home,
                 config,
                 transport::local_operations::Operation::DeviceCreate,
             )
-            .await;
+            .await
         }
-        result => result?,
+        result => result?.context("Gateway database must exist before creating a device"),
     }
-    .context("Gateway database must exist before creating a device")?;
+}
+
+async fn create_offline_device(
+    config: &AppConfig,
+    runtime_home: &Path,
+    database: pioneer_sqlite::SqliteDatabase,
+) -> Result<AuthDeviceCreateResponse> {
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
     let identity = Arc::new(
         bootstrap_identity(&database)

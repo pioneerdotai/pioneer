@@ -131,340 +131,356 @@ fn mcp_audit(row: &McpServerInstallationRecord) -> McpAuditEventRecord {
 
 #[tokio::test]
 async fn package_update_retains_native_identity_policy_overrides_and_successful_sibling() {
-    let store = test_store_with_workspace("ws-update").await;
-    let id = "P".repeat(21);
-    store
-        .insert_plugin_installation(&parent(&id, "ws-update"))
-        .await
-        .unwrap();
-    let first = skill('A', "ws-update");
-    let sibling = skill('B', "ws-update");
-    for (row, key) in [(&first, "one"), (&sibling, "two")] {
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-update").await;
+        let id = "P".repeat(21);
         store
-            .install_skill_lifecycle_with_ownership(
-                row,
-                &policy(row),
-                &[skill_audit(row)],
-                None,
-                Some(&ownership(&id, row.skill_id.as_str(), key)),
+            .insert_plugin_installation(&parent(&id, "ws-update"))
+            .await
+            .unwrap();
+        let first = skill('A', "ws-update");
+        let sibling = skill('B', "ws-update");
+        for (row, key) in [(&first, "one"), (&sibling, "two")] {
+            store
+                .install_skill_lifecycle_with_ownership(
+                    row,
+                    &policy(row),
+                    &[skill_audit(row)],
+                    None,
+                    Some(&ownership(&id, row.skill_id.as_str(), key)),
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .settle_plugin_installation(&id, 1, "installed", None)
+            .await
+            .unwrap();
+        let native = store
+            .begin_plugin_mutation(
+                "ws-update",
+                &id,
                 1,
+                "updating",
+                true,
+                "{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}",
             )
             .await
             .unwrap();
-    }
-    store
-        .settle_plugin_installation(&id, 1, "installed", None)
-        .await
-        .unwrap();
-    let native = store
-        .begin_plugin_mutation(
-            "ws-update",
-            &id,
-            1,
-            "updating",
-            true,
-            "{\"kind\":\"native\",\"action\":\"policy\",\"native_committed\":false}",
-        )
-        .await
-        .unwrap();
-    let write = PluginNativeWrite {
-        kind: pioneer_protocol::PackageKind::Plugin,
-        plugin_id: id.clone(),
-        expected_revision: native.revision,
-        member_key: "one".into(),
-        child_id: first.skill_id.to_string(),
-        override_fields_json: "[\"enabled\",\"allow_implicit_invocation\"]".into(),
-        pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
-    };
-    store
-        .upsert_workspace_skill_policy_with_plugin_change(&policy(&first), Some(&write), 2)
-        .await
-        .unwrap();
-    store
-        .finish_plugin_mutation(&id, native.revision, "installed", None)
-        .await
-        .unwrap();
-    let gate = store
-        .begin_plugin_mutation(
-            "ws-update",
-            &id,
-            native.revision,
-            "updating",
-            true,
-            "{\"kind\":\"update\",\"children\":[]}",
-        )
-        .await
-        .unwrap();
-    let mut owned = ownership(&id, first.skill_id.as_str(), "one");
-    owned.expected_revision = gate.revision;
-    owned.package_fingerprint = "new-assets".into();
-    let patch = SkillInstallationPatch {
-        fingerprint: Some("new-markdown".into()),
-        trust_level: Some(first.trust_level.clone()),
-        ..Default::default()
-    };
-    assert!(
+        let write = PluginNativeWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
+            plugin_id: id.clone(),
+            expected_revision: native.revision,
+            member_key: "one".into(),
+            child_id: first.skill_id.to_string(),
+            override_fields_json: "[\"enabled\",\"allow_implicit_invocation\"]".into(),
+            pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
+        };
         store
-            .update_skill_lifecycle_with_plugin_change(
-                &first.skill_id,
-                &patch,
-                &[SkillAuditEventRecord {
-                    action: "update".into(),
-                    created_at_unix: 3,
-                    ..skill_audit(&first)
-                }],
-                None,
-                Some(&owned),
-                None,
-                3
+            .upsert_workspace_skill_policy_with_plugin_change(&policy(&first), Some(&write), 2)
+            .await
+            .unwrap();
+        store
+            .finish_plugin_mutation(&id, native.revision, "installed", None)
+            .await
+            .unwrap();
+        let gate = store
+            .begin_plugin_mutation(
+                "ws-update",
+                &id,
+                native.revision,
+                "updating",
+                true,
+                "{\"kind\":\"update\",\"children\":[]}",
             )
             .await
-            .unwrap()
-    );
-    let link = store
-        .find_skill_plugin_owner(&first.skill_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(link.skill_id.as_deref(), Some(first.skill_id.as_str()));
-    assert_eq!(link.package_fingerprint.as_deref(), Some("new-assets"));
-    assert_eq!(link.override_fields_json, write.override_fields_json);
-    let restrictions = store
-        .list_workspace_skill_policies("ws-update")
-        .await
-        .unwrap();
-    assert!(
-        restrictions
-            .iter()
-            .all(|row| row.enabled == Some(false) && row.allow_implicit_invocation == Some(false))
-    );
-    let untouched = store
-        .find_skill_installation(&sibling.skill_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(untouched.fingerprint, sibling.fingerprint);
-    assert_eq!(
-        store
-            .find_skill_plugin_owner(&sibling.skill_id)
+            .unwrap();
+        let mut owned = ownership(&id, first.skill_id.as_str(), "one");
+        owned.expected_revision = gate.revision;
+        owned.package_fingerprint = "new-assets".into();
+        let patch = SkillInstallationPatch {
+            fingerprint: Some("new-markdown".into()),
+            trust_level: Some(first.trust_level.clone()),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .update_skill_lifecycle_with_plugin_change(
+                    &first.skill_id,
+                    &patch,
+                    &[SkillAuditEventRecord {
+                        action: "update".into(),
+                        created_at_unix: 3,
+                        ..skill_audit(&first)
+                    }],
+                    None,
+                    Some(&owned),
+                    None,
+                    3
+                )
+                .await
+                .unwrap()
+        );
+        let link = store
+            .find_skill_plugin_owner(&first.skill_id)
             .await
             .unwrap()
-            .unwrap()
-            .package_fingerprint
-            .as_deref(),
-        Some("member-tree")
-    );
-    assert!(
-        !store
-            .plugin_child_available("skill", first.skill_id.as_str(), "ws-update")
+            .unwrap();
+        assert_eq!(link.skill_id.as_deref(), Some(first.skill_id.as_str()));
+        assert_eq!(link.package_fingerprint.as_deref(), Some("new-assets"));
+        assert_eq!(link.override_fields_json, write.override_fields_json);
+        let restrictions = store
+            .list_workspace_skill_policies("ws-update")
+            .await
+            .unwrap();
+        assert!(
+            restrictions
+                .iter()
+                .all(|row| row.enabled == Some(false)
+                    && row.allow_implicit_invocation == Some(false))
+        );
+        let untouched = store
+            .find_skill_installation(&sibling.skill_id)
             .await
             .unwrap()
-    );
+            .unwrap();
+        assert_eq!(untouched.fingerprint, sibling.fingerprint);
+        assert_eq!(
+            store
+                .find_skill_plugin_owner(&sibling.skill_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .package_fingerprint
+                .as_deref(),
+            Some("member-tree")
+        );
+        assert!(
+            !store
+                .plugin_child_available("skill", first.skill_id.as_str(), "ws-update")
+                .await
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn interrupted_package_removal_is_repairable_and_cannot_forget_a_live_native_child() {
-    let store = test_store_with_workspace("ws-package-remove").await;
-    let id = "P".repeat(21);
-    store
-        .insert_plugin_installation(&parent(&id, "ws-package-remove"))
-        .await
-        .unwrap();
-    let child = skill('A', "ws-package-remove");
-    store
-        .install_skill_lifecycle_with_ownership(
-            &child,
-            &policy(&child),
-            &[skill_audit(&child)],
-            None,
-            Some(&ownership(&id, child.skill_id.as_str(), "one")),
-            1,
-        )
-        .await
-        .unwrap();
-    // Uninstall revalidates the full stored record, including installer timestamps.
-    let child = store
-        .find_skill_installation(&child.skill_id)
-        .await
-        .unwrap()
-        .unwrap();
-    store
-        .settle_plugin_installation(&id, 1, "installed", None)
-        .await
-        .unwrap();
-    let gate = store
-        .begin_plugin_mutation(
-            "ws-package-remove",
-            &id,
-            1,
-            "updating",
-            true,
-            "{\"kind\":\"update\",\"children\":[]}",
-        )
-        .await
-        .unwrap();
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-package-remove").await;
+        let id = "P".repeat(21);
         store
-            .forget_plugin_component(&id, gate.revision, "skill", "one")
+            .insert_plugin_installation(&parent(&id, "ws-package-remove"))
             .await
-            .is_err()
-    );
-    let write = PluginNativeWrite {
-        kind: pioneer_protocol::PackageKind::Plugin,
-        plugin_id: id.clone(),
-        expected_revision: gate.revision,
-        member_key: "one".into(),
-        child_id: child.skill_id.to_string(),
-        override_fields_json: "[]".into(),
-        pending_after: gate.pending_json.clone().unwrap(),
-    };
-    assert!(
+            .unwrap();
+        let child = skill('A', "ws-package-remove");
         store
-            .uninstall_skill_installation_lifecycle_with_plugin_change(
+            .install_skill_lifecycle_with_ownership(
                 &child,
-                &[SkillAuditEventRecord {
-                    action: "uninstall".into(),
-                    created_at_unix: 2,
-                    ..skill_audit(&child)
-                }],
-                Some(&write),
-                2,
+                &policy(&child),
+                &[skill_audit(&child)],
+                None,
+                Some(&ownership(&id, child.skill_id.as_str(), "one")),
+                1,
             )
             .await
+            .unwrap();
+        // Uninstall revalidates the full stored record, including installer timestamps.
+        let child = store
+            .find_skill_installation(&child.skill_id)
+            .await
             .unwrap()
-    );
-    let removed = store
-        .list_plugin_components(&id)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(removed.skill_id.is_none());
-    assert_eq!(removed.status, "failed");
-    assert_eq!(
-        removed.diagnostic.as_deref(),
-        Some("component_removed_for_update")
-    );
-    store
-        .finish_plugin_mutation(&id, gate.revision, "interrupted", None)
-        .await
-        .unwrap();
-    let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
-    assert_eq!(current.pending_json, gate.pending_json);
-    let resumed = store
-        .resume_plugin_mutation(
-            "ws-package-remove",
-            &id,
-            current.revision,
-            current.pending_json.as_deref().unwrap(),
-            "{\"kind\":\"update\",\"children\":[]}",
-            "updating",
-        )
-        .await
-        .unwrap();
-    store
-        .forget_plugin_component(&id, resumed.revision, "skill", "one")
-        .await
-        .unwrap();
-    assert!(store.list_plugin_components(&id).await.unwrap().is_empty());
+            .unwrap();
+        store
+            .settle_plugin_installation(&id, 1, "installed", None)
+            .await
+            .unwrap();
+        let gate = store
+            .begin_plugin_mutation(
+                "ws-package-remove",
+                &id,
+                1,
+                "updating",
+                true,
+                "{\"kind\":\"update\",\"children\":[]}",
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .forget_plugin_component(&id, gate.revision, "skill", "one")
+                .await
+                .is_err()
+        );
+        let write = PluginNativeWrite {
+            kind: pioneer_protocol::PackageKind::Plugin,
+            plugin_id: id.clone(),
+            expected_revision: gate.revision,
+            member_key: "one".into(),
+            child_id: child.skill_id.to_string(),
+            override_fields_json: "[]".into(),
+            pending_after: gate.pending_json.clone().unwrap(),
+        };
+        assert!(
+            store
+                .uninstall_skill_installation_lifecycle_with_plugin_change(
+                    &child,
+                    &[SkillAuditEventRecord {
+                        action: "uninstall".into(),
+                        created_at_unix: 2,
+                        ..skill_audit(&child)
+                    }],
+                    Some(&write),
+                    2,
+                )
+                .await
+                .unwrap()
+        );
+        let removed = store
+            .list_plugin_components(&id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(removed.skill_id.is_none());
+        assert_eq!(removed.status, "failed");
+        assert_eq!(
+            removed.diagnostic.as_deref(),
+            Some("component_removed_for_update")
+        );
+        store
+            .finish_plugin_mutation(&id, gate.revision, "interrupted", None)
+            .await
+            .unwrap();
+        let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
+        assert_eq!(current.pending_json, gate.pending_json);
+        let resumed = store
+            .resume_plugin_mutation(
+                "ws-package-remove",
+                &id,
+                current.revision,
+                current.pending_json.as_deref().unwrap(),
+                "{\"kind\":\"update\",\"children\":[]}",
+                "updating",
+            )
+            .await
+            .unwrap();
+        store
+            .forget_plugin_component(&id, resumed.revision, "skill", "one")
+            .await
+            .unwrap();
+        assert!(store.list_plugin_components(&id).await.unwrap().is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn update_upload_consumption_and_repair_gate_share_one_authorized_write() {
-    let store = test_store_with_workspace("ws-upload-update").await;
-    let id = "P".repeat(21);
-    store
-        .insert_plugin_installation(&parent(&id, "ws-upload-update"))
-        .await
-        .unwrap();
-    store
-        .settle_plugin_installation(&id, 1, "installed", None)
-        .await
-        .unwrap();
-    let upload = SkillUploadSessionRecord {
-        purpose: "plugin".into(),
-        upload_id: "U".repeat(21),
-        workspace_id: "ws-upload-update".into(),
-        connection_id: 7,
-        status: "finalized".into(),
-        file_name: "package.tar.gz".into(),
-        archive_format: "tar_gz".into(),
-        compressed_size_bytes: 1,
-        received_bytes: 1,
-        sha256: "a".repeat(64),
-        payload_path: "/managed/upload".into(),
-        created_at_unix: 1,
-        expires_at_unix: 100,
-        finalized_at_unix: Some(2),
-        consumed_at_unix: None,
-        aborted_at_unix: None,
-    };
-    store.insert_skill_upload_session(&upload).await.unwrap();
-    let pending = "{\"kind\":\"update\",\"children\":[]}";
-    for (workspace, connection, now, revision) in [
-        ("foreign", 7, 3, 1),
-        ("ws-upload-update", 8, 3, 1),
-        ("ws-upload-update", 7, 100, 1),
-        ("ws-upload-update", 7, 3, 2),
-    ] {
-        assert!(
-            store
-                .begin_plugin_package_update(
-                    workspace,
-                    &id,
-                    revision,
-                    pending,
-                    &upload.upload_id,
-                    connection,
-                    now,
-                    None
-                )
-                .await
-                .is_err()
-        );
-        let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
-        assert_eq!(current.revision, 1);
-        assert!(current.pending_json.is_none());
-    }
-    let gate = store
-        .begin_plugin_package_update(
-            "ws-upload-update",
-            &id,
-            1,
-            pending,
-            &upload.upload_id,
-            7,
-            3,
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(gate.revision, 2);
-    assert_eq!(gate.pending_json.as_deref(), Some(pending));
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-upload-update").await;
+        let id = "P".repeat(21);
         store
+            .insert_plugin_installation(&parent(&id, "ws-upload-update"))
+            .await
+            .unwrap();
+        store
+            .settle_plugin_installation(&id, 1, "installed", None)
+            .await
+            .unwrap();
+        let upload = SkillUploadSessionRecord {
+            purpose: "plugin".into(),
+            upload_id: "U".repeat(21),
+            workspace_id: "ws-upload-update".into(),
+            connection_id: 7,
+            status: "finalized".into(),
+            file_name: "package.tar.gz".into(),
+            archive_format: "tar_gz".into(),
+            compressed_size_bytes: 1,
+            received_bytes: 1,
+            sha256: "a".repeat(64),
+            payload_path: "/managed/upload".into(),
+            created_at_unix: 1,
+            expires_at_unix: 100,
+            finalized_at_unix: Some(2),
+            consumed_at_unix: None,
+            aborted_at_unix: None,
+        };
+        store.insert_skill_upload_session(&upload).await.unwrap();
+        let pending = "{\"kind\":\"update\",\"children\":[]}";
+        for (workspace, connection, now, revision) in [
+            ("foreign", 7, 3, 1),
+            ("ws-upload-update", 8, 3, 1),
+            ("ws-upload-update", 7, 100, 1),
+            ("ws-upload-update", 7, 3, 2),
+        ] {
+            assert!(
+                store
+                    .begin_plugin_package_update(
+                        workspace,
+                        &id,
+                        revision,
+                        pending,
+                        &upload.upload_id,
+                        connection,
+                        now,
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+            let current = store.find_plugin_installation(&id).await.unwrap().unwrap();
+            assert_eq!(current.revision, 1);
+            assert!(current.pending_json.is_none());
+        }
+        let gate = store
             .begin_plugin_package_update(
                 "ws-upload-update",
                 &id,
-                2,
+                1,
                 pending,
                 &upload.upload_id,
                 7,
                 3,
-                Some(pending)
+                None,
             )
             .await
-            .is_err()
-    );
-    assert_eq!(
-        store
-            .find_plugin_installation(&id)
-            .await
-            .unwrap()
-            .unwrap()
-            .revision,
-        2
-    );
+            .unwrap();
+        assert_eq!(gate.revision, 2);
+        assert_eq!(gate.pending_json.as_deref(), Some(pending));
+        assert!(
+            store
+                .begin_plugin_package_update(
+                    "ws-upload-update",
+                    &id,
+                    2,
+                    pending,
+                    &upload.upload_id,
+                    7,
+                    3,
+                    Some(pending)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_plugin_installation(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 // B-02: native resolver output is supplied separately from durable bindings.
@@ -653,61 +669,66 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
 }
 #[tokio::test]
 async fn native_skill_policy_audit_and_ownership_commit_together_without_upload() {
-    let store = test_store_with_workspace("ws").await;
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    let row = skill('A', "ws");
-    let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws").await;
         store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&owner),
-                1
-            )
+            .insert_plugin_installation(&parent("plugin-a", "ws"))
             .await
-            .unwrap()
-    );
-    assert_eq!(
-        store
-            .find_skill_installation(&row.skill_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .skill_id,
-        row.skill_id
-    );
-    assert_eq!(
-        store
-            .find_skill_plugin_owner(&row.skill_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .package_id,
-        "plugin-a"
-    );
-    // Genuine settings remain in the native row/policy, not in plugin_component.
-    assert_eq!(
-        store
-            .list_plugin_components("plugin-a")
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    let restarted = CrudStore::new(store.database_connection());
-    assert!(
-        restarted
-            .find_skill_plugin_owner(&row.skill_id)
-            .await
-            .unwrap()
-            .is_some()
-    );
+            .unwrap();
+        let row = skill('A', "ws");
+        let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&owner),
+                    1
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .find_skill_installation(&row.skill_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .skill_id,
+            row.skill_id
+        );
+        assert_eq!(
+            store
+                .find_skill_plugin_owner(&row.skill_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .package_id,
+            "plugin-a"
+        );
+        // Genuine settings remain in the native row/policy, not in plugin_component.
+        assert_eq!(
+            store
+                .list_plugin_components("plugin-a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let restarted = CrudStore::new(store.database_connection());
+        assert!(
+            restarted
+                .find_skill_plugin_owner(&row.skill_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 #[tokio::test]
 async fn failed_ownership_insert_rolls_back_native_rows_policies_and_audits() {
@@ -792,78 +813,83 @@ async fn failed_ownership_insert_rolls_back_native_rows_policies_and_audits() {
 }
 #[tokio::test]
 async fn foreign_scope_stale_revision_and_native_name_collision_cannot_publish() {
-    let store = test_store_with_workspace("ws").await;
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    let row = skill('A', "foreign");
-    let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws").await;
         store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&owner),
-                1
-            )
+            .insert_plugin_installation(&parent("plugin-a", "ws"))
             .await
-            .is_err()
-    );
-    let row = skill('A', "ws");
-    let mut owner = ownership("plugin-a", row.skill_id.as_str(), "one");
-    owner.expected_revision = 2;
-    assert!(
+            .unwrap();
+        let row = skill('A', "foreign");
+        let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&owner),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        let row = skill('A', "ws");
+        let mut owner = ownership("plugin-a", row.skill_id.as_str(), "one");
+        owner.expected_revision = 2;
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&owner),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        let standalone = mcp("standalone", "ws", "same-name");
         store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&owner),
-                1
-            )
+            .upsert_mcp_server_installation_with_audit(&standalone, &mcp_audit(&standalone), 1)
             .await
-            .is_err()
-    );
-    let standalone = mcp("standalone", "ws", "same-name");
-    store
-        .upsert_mcp_server_installation_with_audit(&standalone, &mcp_audit(&standalone), 1)
-        .await
-        .unwrap();
-    let mut attempted = standalone.clone();
-    attempted.id = Some("owned".into());
-    attempted.transport_json = "changed".into();
-    let owner = ownership("plugin-a", "owned", "server");
-    assert!(
-        store
-            .upsert_mcp_server_installation_with_audit_and_ownership(
-                &attempted,
-                &mcp_audit(&attempted),
-                Some(&owner),
-                2
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        store
-            .find_mcp_server_installation("workspace", "ws", "same-name")
-            .await
-            .unwrap()
-            .unwrap()
-            .transport_json,
-        "{}"
-    );
-    assert!(
-        store
-            .list_plugin_components("plugin-a")
-            .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap();
+        let mut attempted = standalone.clone();
+        attempted.id = Some("owned".into());
+        attempted.transport_json = "changed".into();
+        let owner = ownership("plugin-a", "owned", "server");
+        assert!(
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &attempted,
+                    &mcp_audit(&attempted),
+                    Some(&owner),
+                    2
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_mcp_server_installation("workspace", "ws", "same-name")
+                .await
+                .unwrap()
+                .unwrap()
+                .transport_json,
+            "{}"
+        );
+        assert!(
+            store
+                .list_plugin_components("plugin-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 #[tokio::test]
 async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks_with_fk_off() {
@@ -923,36 +949,41 @@ async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks_with_
 }
 #[tokio::test]
 async fn ownership_does_not_reclassify_interactive_or_maintenance_access() {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
-    let store = test_store_with_workspace("ws").await;
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    let maintenance = store.with_maintenance_access();
-    assert!(
-        maintenance
-            .find_plugin_installation("plugin-a")
+    pioneer_postgres_test::with_database(async |fixture| {
+        use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+        let store = postgres_store_with_workspace(fixture, "ws").await;
+        store
+            .insert_plugin_installation(&parent("plugin-a", "ws"))
             .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        store.database_connection().read_class(),
-        SqliteReadClass::Interactive
-    );
-    assert_eq!(
-        store.database_connection().write_class(),
-        SqliteWriteClass::Interactive
-    );
-    assert_eq!(
-        maintenance.database_connection().read_class(),
-        SqliteReadClass::Maintenance
-    );
-    assert_eq!(
-        maintenance.database_connection().write_class(),
-        SqliteWriteClass::Maintenance
-    );
+            .unwrap();
+        let maintenance = store.with_maintenance_access();
+        assert!(
+            maintenance
+                .find_plugin_installation("plugin-a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.database_connection().read_class(),
+            SqliteReadClass::Interactive
+        );
+        assert_eq!(
+            store.database_connection().write_class(),
+            SqliteWriteClass::Interactive
+        );
+        assert_eq!(
+            maintenance.database_connection().read_class(),
+            SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            maintenance.database_connection().write_class(),
+            SqliteWriteClass::Maintenance
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1194,474 +1225,499 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
 
 #[tokio::test]
 async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
-    let store = test_store_with_workspace("ws").await;
-    let mut legacy = mcp("old", "ws", "custom");
-    // Seed the pre-plugin native record through the existing low-level operation.
-    store
-        .upsert_mcp_server_installation(&legacy, 1)
-        .await
-        .unwrap();
-    legacy.transport_json = "updated".into();
-    assert_eq!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws").await;
+        let mut legacy = mcp("old", "ws", "custom");
+        // Seed the pre-plugin native record through the existing low-level operation.
         store
-            .upsert_mcp_server_installation_with_audit(&legacy, &mcp_audit(&legacy), 2,)
+            .upsert_mcp_server_installation(&legacy, 1)
             .await
-            .unwrap(),
-        "old"
-    );
-    assert!(store.find_mcp_plugin_owner("old").await.unwrap().is_none());
-    assert_eq!(
-        store
-            .find_mcp_server_installation("workspace", "ws", "custom")
-            .await
-            .unwrap()
-            .unwrap()
-            .transport_json,
-        "updated"
-    );
+            .unwrap();
+        legacy.transport_json = "updated".into();
+        assert_eq!(
+            store
+                .upsert_mcp_server_installation_with_audit(&legacy, &mcp_audit(&legacy), 2,)
+                .await
+                .unwrap(),
+            "old"
+        );
+        assert!(store.find_mcp_plugin_owner("old").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .find_mcp_server_installation("workspace", "ws", "custom")
+                .await
+                .unwrap()
+                .unwrap()
+                .transport_json,
+            "updated"
+        );
 
-    let fresh = mcp("new", "ws", "new-server");
-    assert_eq!(
-        store
-            .upsert_mcp_server_installation_with_audit(&fresh, &mcp_audit(&fresh), 3,)
-            .await
-            .unwrap(),
-        "new"
-    );
+        let fresh = mcp("new", "ws", "new-server");
+        assert_eq!(
+            store
+                .upsert_mcp_server_installation_with_audit(&fresh, &mcp_audit(&fresh), 3,)
+                .await
+                .unwrap(),
+            "new"
+        );
 
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    let same_id = ownership("plugin-a", "old", "server");
-    assert!(
+        store
+            .insert_plugin_installation(&parent("plugin-a", "ws"))
+            .await
+            .unwrap();
+        let same_id = ownership("plugin-a", "old", "server");
+        assert!(
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &legacy,
+                    &mcp_audit(&legacy),
+                    Some(&same_id),
+                    3,
+                )
+                .await
+                .is_err(),
+            "a matching ID cannot adopt a standalone row"
+        );
+        let owned = mcp("child", "ws", "zenmoney");
+        let owner = ownership("plugin-a", "child", "server");
         store
             .upsert_mcp_server_installation_with_audit_and_ownership(
-                &legacy,
-                &mcp_audit(&legacy),
-                Some(&same_id),
+                &owned,
+                &mcp_audit(&owned),
+                Some(&owner),
                 3,
             )
             .await
-            .is_err(),
-        "a matching ID cannot adopt a standalone row"
-    );
-    let owned = mcp("child", "ws", "zenmoney");
-    let owner = ownership("plugin-a", "child", "server");
-    store
-        .upsert_mcp_server_installation_with_audit_and_ownership(
-            &owned,
-            &mcp_audit(&owned),
-            Some(&owner),
-            3,
-        )
-        .await
-        .unwrap();
-    let mut owned_update = owned.clone();
-    owned_update.transport_json = "owned-update".into();
-    assert_eq!(
+            .unwrap();
+        let mut owned_update = owned.clone();
+        owned_update.transport_json = "owned-update".into();
+        assert_eq!(
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &owned_update,
+                    &mcp_audit(&owned_update),
+                    Some(&owner),
+                    4,
+                )
+                .await
+                .unwrap(),
+            "child",
+            "the genuine owned update remains allowed"
+        );
+        let mut attempt = owned.clone();
+        attempt.transport_json = "foreign-change".into();
+        assert!(
+            store
+                .upsert_mcp_server_installation_with_audit(&attempt, &mcp_audit(&attempt), 4,)
+                .await
+                .is_err()
+        );
         store
-            .upsert_mcp_server_installation_with_audit_and_ownership(
-                &owned_update,
-                &mcp_audit(&owned_update),
-                Some(&owner),
-                4,
-            )
+            .insert_plugin_installation(&parent("plugin-b", "ws"))
             .await
-            .unwrap(),
-        "child",
-        "the genuine owned update remains allowed"
-    );
-    let mut attempt = owned.clone();
-    attempt.transport_json = "foreign-change".into();
-    assert!(
-        store
-            .upsert_mcp_server_installation_with_audit(&attempt, &mcp_audit(&attempt), 4,)
-            .await
-            .is_err()
-    );
-    store
-        .insert_plugin_installation(&parent("plugin-b", "ws"))
-        .await
-        .unwrap();
-    let foreign = ownership("plugin-b", "child", "server");
-    assert!(
-        store
-            .upsert_mcp_server_installation_with_audit_and_ownership(
-                &attempt,
-                &mcp_audit(&attempt),
-                Some(&foreign),
-                4,
-            )
-            .await
-            .is_err()
-    );
-    let mut name_collision = attempt.clone();
-    name_collision.id = Some("another-child".into());
-    let another_owner = ownership("plugin-b", "another-child", "server");
-    assert!(
-        store
-            .upsert_mcp_server_installation_with_audit_and_ownership(
-                &name_collision,
-                &mcp_audit(&name_collision),
-                Some(&another_owner),
-                4,
-            )
-            .await
-            .is_err(),
-        "a second plugin cannot overwrite the same ordinary MCP name"
-    );
-    assert_eq!(
-        store
-            .find_mcp_server_installation("workspace", "ws", "zenmoney")
-            .await
-            .unwrap()
-            .unwrap()
-            .transport_json,
-        "owned-update"
-    );
-    assert_eq!(
-        store
-            .find_mcp_plugin_owner("child")
-            .await
-            .unwrap()
-            .unwrap()
-            .package_id,
-        "plugin-a"
-    );
+            .unwrap();
+        let foreign = ownership("plugin-b", "child", "server");
+        assert!(
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &attempt,
+                    &mcp_audit(&attempt),
+                    Some(&foreign),
+                    4,
+                )
+                .await
+                .is_err()
+        );
+        let mut name_collision = attempt.clone();
+        name_collision.id = Some("another-child".into());
+        let another_owner = ownership("plugin-b", "another-child", "server");
+        assert!(
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &name_collision,
+                    &mcp_audit(&name_collision),
+                    Some(&another_owner),
+                    4,
+                )
+                .await
+                .is_err(),
+            "a second plugin cannot overwrite the same ordinary MCP name"
+        );
+        assert_eq!(
+            store
+                .find_mcp_server_installation("workspace", "ws", "zenmoney")
+                .await
+                .unwrap()
+                .unwrap()
+                .transport_json,
+            "owned-update"
+        );
+        assert_eq!(
+            store
+                .find_mcp_plugin_owner("child")
+                .await
+                .unwrap()
+                .unwrap()
+                .package_id,
+            "plugin-a"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 // Stage B sources: NOT_RUN / NOT_COMPILED.
 #[tokio::test]
 async fn plugin_reservation_consumes_only_its_finalized_owned_upload_atomically() {
-    let store = test_store_with_workspace("ws").await;
-    let mut reserved_parent = parent("P".repeat(21).as_str(), "ws");
-    reserved_parent.pending_json = Some("{\"children\":[]}".into());
-    let upload = SkillUploadSessionRecord {
-        purpose: "plugin".into(),
-        upload_id: reserved_parent.source_upload_id.clone(),
-        workspace_id: "ws".into(),
-        connection_id: 7,
-        status: "finalized".into(),
-        file_name: "plugin.tar.gz".into(),
-        archive_format: "tar_gz".into(),
-        compressed_size_bytes: 1,
-        received_bytes: 1,
-        sha256: "a".repeat(64),
-        payload_path: "/managed/upload.tar.gz".into(),
-        created_at_unix: 1,
-        expires_at_unix: 100,
-        finalized_at_unix: Some(2),
-        consumed_at_unix: None,
-        aborted_at_unix: None,
-    };
-    store.insert_skill_upload_session(&upload).await.unwrap();
-    assert!(
-        store
-            .reserve_plugin_installation(&reserved_parent, 8, 3)
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .find_plugin_by_upload(&upload.upload_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        store
-            .find_skill_upload_session(&upload.upload_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "finalized"
-    );
-    let maintenance = store.with_maintenance_access();
-    let (a, b) = tokio::join!(
-        store.reserve_plugin_installation(&reserved_parent, 7, 3),
-        maintenance.reserve_plugin_installation(&reserved_parent, 7, 3)
-    );
-    assert_ne!(a.is_ok(), b.is_ok());
-    assert_eq!(
-        store.list_plugin_installations("ws").await.unwrap().len(),
-        1
-    );
-    assert_eq!(
-        store
-            .find_skill_upload_session(&upload.upload_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "consumed"
-    );
-    assert!(
-        store
-            .reserve_plugin_installation(&reserved_parent, 7, 3)
-            .await
-            .is_err()
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws").await;
+        let mut reserved_parent = parent("P".repeat(21).as_str(), "ws");
+        reserved_parent.pending_json = Some("{\"children\":[]}".into());
+        let upload = SkillUploadSessionRecord {
+            purpose: "plugin".into(),
+            upload_id: reserved_parent.source_upload_id.clone(),
+            workspace_id: "ws".into(),
+            connection_id: 7,
+            status: "finalized".into(),
+            file_name: "plugin.tar.gz".into(),
+            archive_format: "tar_gz".into(),
+            compressed_size_bytes: 1,
+            received_bytes: 1,
+            sha256: "a".repeat(64),
+            payload_path: "/managed/upload.tar.gz".into(),
+            created_at_unix: 1,
+            expires_at_unix: 100,
+            finalized_at_unix: Some(2),
+            consumed_at_unix: None,
+            aborted_at_unix: None,
+        };
+        store.insert_skill_upload_session(&upload).await.unwrap();
+        assert!(
+            store
+                .reserve_plugin_installation(&reserved_parent, 8, 3)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .find_plugin_by_upload(&upload.upload_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_skill_upload_session(&upload.upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "finalized"
+        );
+        let maintenance = store.with_maintenance_access();
+        let (a, b) = tokio::join!(
+            store.reserve_plugin_installation(&reserved_parent, 7, 3),
+            maintenance.reserve_plugin_installation(&reserved_parent, 7, 3)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(
+            store.list_plugin_installations("ws").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .find_skill_upload_session(&upload.upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "consumed"
+        );
+        assert!(
+            store
+                .reserve_plugin_installation(&reserved_parent, 7, 3)
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn install_failure_preserves_native_sibling_and_closes_failed_child() {
-    let store = test_store_with_workspace("ws").await;
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    let good = skill('G', "ws");
-    let good_owner = ownership("plugin-a", good.skill_id.as_str(), "good");
-    store
-        .install_skill_lifecycle_with_ownership(
-            &good,
-            &policy(&good),
-            &[skill_audit(&good)],
-            None,
-            Some(&good_owner),
-            1,
-        )
-        .await
-        .unwrap();
-    let failed = ownership("plugin-a", &"F".repeat(21), "failed");
-    store
-        .record_plugin_component_failure(&failed, "skill", "component_install_failed")
-        .await
-        .unwrap();
-    assert!(
-        !store
-            .plugin_child_available("skill", good.skill_id.as_str(), "ws")
-            .await
-            .unwrap()
-    );
-    store
-        .settle_plugin_installation("plugin-a", 1, "installed", None)
-        .await
-        .unwrap();
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws").await;
         store
-            .plugin_child_available("skill", good.skill_id.as_str(), "ws")
+            .insert_plugin_installation(&parent("plugin-a", "ws"))
             .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .plugin_child_available("skill", good.skill_id.as_str(), "foreign")
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .plugin_turn_child_available("no-ready-turn", "skill", good.skill_id.as_str(), "ws")
-            .await
-            .unwrap()
-    );
-    assert!(
+            .unwrap();
+        let good = skill('G', "ws");
+        let good_owner = ownership("plugin-a", good.skill_id.as_str(), "good");
         store
-            .find_skill_installation(&good.skill_id)
+            .install_skill_lifecycle_with_ownership(
+                &good,
+                &policy(&good),
+                &[skill_audit(&good)],
+                None,
+                Some(&good_owner),
+                1,
+            )
             .await
-            .unwrap()
-            .is_some()
-    );
-    let links = store.list_plugin_components("plugin-a").await.unwrap();
-    assert_eq!(links.len(), 2);
-    assert!(
-        links
-            .iter()
-            .any(|c| c.member_key == "failed" && c.status == "failed" && c.skill_id.is_none())
-    );
-    // The original child restriction was not relaxed by parent settlement.
-    assert_eq!(
+            .unwrap();
+        let failed = ownership("plugin-a", &"F".repeat(21), "failed");
         store
-            .list_workspace_skill_policies("ws")
+            .record_plugin_component_failure(&failed, "skill", "component_install_failed")
             .await
-            .unwrap()
-            .iter()
-            .find(|p| p.skill_id == good.skill_id)
-            .unwrap()
-            .enabled,
-        Some(false)
-    );
+            .unwrap();
+        assert!(
+            !store
+                .plugin_child_available("skill", good.skill_id.as_str(), "ws")
+                .await
+                .unwrap()
+        );
+        store
+            .settle_plugin_installation("plugin-a", 1, "installed", None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .plugin_child_available("skill", good.skill_id.as_str(), "ws")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .plugin_child_available("skill", good.skill_id.as_str(), "foreign")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .plugin_turn_child_available("no-ready-turn", "skill", good.skill_id.as_str(), "ws")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .find_skill_installation(&good.skill_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let links = store.list_plugin_components("plugin-a").await.unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(
+            links
+                .iter()
+                .any(|c| c.member_key == "failed" && c.status == "failed" && c.skill_id.is_none())
+        );
+        // The original child restriction was not relaxed by parent settlement.
+        assert_eq!(
+            store
+                .list_workspace_skill_policies("ws")
+                .await
+                .unwrap()
+                .iter()
+                .find(|p| p.skill_id == good.skill_id)
+                .unwrap()
+                .enabled,
+            Some(false)
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn closed_gate_reconciliation_and_enable_preserve_native_restrictions() {
-    let store = test_store_with_workspace("ws-c1").await;
-    let id = "P".repeat(21);
-    store
-        .insert_plugin_installation(&parent(&id, "ws-c1"))
-        .await
-        .unwrap();
-    let child = skill('S', "ws-c1");
-    let write = ownership(&id, child.skill_id.as_str(), "one");
-    store
-        .install_skill_lifecycle_with_ownership(
-            &child,
-            &policy(&child),
-            &[skill_audit(&child)],
-            None,
-            Some(&write),
-            1,
-        )
-        .await
-        .unwrap();
-    store
-        .settle_plugin_installation(&id, 1, "installed", None)
-        .await
-        .unwrap();
-    let restrictions = store.list_workspace_skill_policies("ws-c1").await.unwrap();
-    let operation = store
-        .begin_plugin_mutation(
-            "ws-c1",
-            &id,
-            1,
-            "updating",
-            false,
-            "{\"kind\":\"set_enabled\",\"children\":[]}",
-        )
-        .await
-        .unwrap();
-    assert_eq!(operation.revision, 2);
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-c1").await;
+        let id = "P".repeat(21);
         store
+            .insert_plugin_installation(&parent(&id, "ws-c1"))
+            .await
+            .unwrap();
+        let child = skill('S', "ws-c1");
+        let write = ownership(&id, child.skill_id.as_str(), "one");
+        store
+            .install_skill_lifecycle_with_ownership(
+                &child,
+                &policy(&child),
+                &[skill_audit(&child)],
+                None,
+                Some(&write),
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .settle_plugin_installation(&id, 1, "installed", None)
+            .await
+            .unwrap();
+        let restrictions = store.list_workspace_skill_policies("ws-c1").await.unwrap();
+        let operation = store
             .begin_plugin_mutation(
                 "ws-c1",
                 &id,
-                2,
+                1,
                 "updating",
-                true,
-                "{\"kind\":\"replacement\"}"
+                false,
+                "{\"kind\":\"set_enabled\",\"children\":[]}",
             )
             .await
-            .is_err()
-    );
-    assert_eq!(
+            .unwrap();
+        assert_eq!(operation.revision, 2);
+        assert!(
+            store
+                .begin_plugin_mutation(
+                    "ws-c1",
+                    &id,
+                    2,
+                    "updating",
+                    true,
+                    "{\"kind\":\"replacement\"}"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .find_plugin_installation(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_json,
+            operation.pending_json
+        );
+        assert!(
+            !store
+                .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .begin_plugin_mutation("foreign", &id, 2, "updating", true, "{}")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .begin_plugin_mutation("ws-c1", &id, 1, "updating", true, "{}")
+                .await
+                .is_err()
+        );
         store
-            .find_plugin_installation(&id)
+            .with_maintenance_access()
+            .interrupt_unfinished_plugins()
             .await
-            .unwrap()
-            .unwrap()
-            .pending_json,
-        operation.pending_json
-    );
-    assert!(
-        !store
-            .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
-            .await
-            .unwrap()
-    );
-    assert!(
+            .unwrap();
+        let interrupted = store.find_plugin_installation(&id).await.unwrap().unwrap();
+        assert_eq!(interrupted.state, "interrupted");
+        assert_eq!(interrupted.pending_json, operation.pending_json);
         store
-            .begin_plugin_mutation("foreign", &id, 2, "updating", true, "{}")
+            .finish_plugin_mutation(&id, 2, "installed", None)
             .await
-            .is_err()
-    );
-    assert!(
+            .unwrap();
+        let enable = store
+            .begin_plugin_mutation("ws-c1", &id, 2, "updating", true, "{}")
+            .await
+            .unwrap();
         store
-            .begin_plugin_mutation("ws-c1", &id, 1, "updating", true, "{}")
+            .prepare_plugin_reload(&id, enable.revision)
             .await
-            .is_err()
-    );
-    store
-        .with_maintenance_access()
-        .interrupt_unfinished_plugins()
-        .await
-        .unwrap();
-    let interrupted = store.find_plugin_installation(&id).await.unwrap().unwrap();
-    assert_eq!(interrupted.state, "interrupted");
-    assert_eq!(interrupted.pending_json, operation.pending_json);
-    store
-        .finish_plugin_mutation(&id, 2, "installed", None)
-        .await
-        .unwrap();
-    let enable = store
-        .begin_plugin_mutation("ws-c1", &id, 2, "updating", true, "{}")
-        .await
-        .unwrap();
-    store
-        .prepare_plugin_reload(&id, enable.revision)
-        .await
-        .unwrap();
-    let reload = store.find_plugin_installation(&id).await.unwrap().unwrap();
-    assert_eq!(reload.state, "installed");
-    assert!(reload.pending_json.is_some());
-    assert!(
-        !store
-            .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
-            .await
-            .unwrap()
-    );
-    // Cancellation/restart during reload must retain an executable repair plan.
-    store
-        .with_maintenance_access()
-        .interrupt_unfinished_plugins()
-        .await
-        .unwrap();
-    assert_eq!(
+            .unwrap();
+        let reload = store.find_plugin_installation(&id).await.unwrap().unwrap();
+        assert_eq!(reload.state, "installed");
+        assert!(reload.pending_json.is_some());
+        assert!(
+            !store
+                .plugin_child_available("skill", child.skill_id.as_str(), "ws-c1")
+                .await
+                .unwrap()
+        );
+        // Cancellation/restart during reload must retain an executable repair plan.
         store
-            .find_plugin_installation(&id)
+            .with_maintenance_access()
+            .interrupt_unfinished_plugins()
             .await
-            .unwrap()
-            .unwrap()
-            .state,
-        "interrupted"
-    );
-    store
-        .finish_plugin_mutation(&id, enable.revision, "installed", None)
-        .await
-        .unwrap();
-    assert_eq!(
-        store.list_workspace_skill_policies("ws-c1").await.unwrap(),
-        restrictions
-    );
-    assert!(
+            .unwrap();
+        assert_eq!(
+            store
+                .find_plugin_installation(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "interrupted"
+        );
         store
-            .delete_plugin_parent(&id, enable.revision)
+            .finish_plugin_mutation(&id, enable.revision, "installed", None)
             .await
-            .is_err()
-    );
+            .unwrap();
+        assert_eq!(
+            store.list_workspace_skill_policies("ws-c1").await.unwrap(),
+            restrictions
+        );
+        assert!(
+            store
+                .delete_plugin_parent(&id, enable.revision)
+                .await
+                .is_err()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn failed_assets_only_update_preserves_the_last_committed_tree_for_retry() {
-    let store = test_store_with_workspace("ws-c1-assets").await;
-    let id = "P".repeat(21);
-    store
-        .insert_plugin_installation(&parent(&id, "ws-c1-assets"))
-        .await
-        .unwrap();
-    let child = skill('S', "ws-c1-assets");
-    let write = ownership(&id, child.skill_id.as_str(), "one");
-    store
-        .install_skill_lifecycle_with_ownership(
-            &child,
-            &policy(&child),
-            &[skill_audit(&child)],
-            None,
-            Some(&write),
-            1,
-        )
-        .await
-        .unwrap();
-    let mut failed = write.clone();
-    failed.package_fingerprint = "assets-only-new-tree".into();
-    store
-        .record_plugin_component_failure(&failed, "skill", "component_update_failed")
-        .await
-        .unwrap();
-    let link = store
-        .find_skill_plugin_owner(&child.skill_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(link.status, "failed");
-    assert_eq!(
-        link.package_fingerprint.as_deref(),
-        Some(write.package_fingerprint.as_str())
-    );
-    assert_eq!(link.skill_id.as_deref(), Some(child.skill_id.as_str()));
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-c1-assets").await;
+        let id = "P".repeat(21);
+        store
+            .insert_plugin_installation(&parent(&id, "ws-c1-assets"))
+            .await
+            .unwrap();
+        let child = skill('S', "ws-c1-assets");
+        let write = ownership(&id, child.skill_id.as_str(), "one");
+        store
+            .install_skill_lifecycle_with_ownership(
+                &child,
+                &policy(&child),
+                &[skill_audit(&child)],
+                None,
+                Some(&write),
+                1,
+            )
+            .await
+            .unwrap();
+        let mut failed = write.clone();
+        failed.package_fingerprint = "assets-only-new-tree".into();
+        store
+            .record_plugin_component_failure(&failed, "skill", "component_update_failed")
+            .await
+            .unwrap();
+        let link = store
+            .find_skill_plugin_owner(&child.skill_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.status, "failed");
+        assert_eq!(
+            link.package_fingerprint.as_deref(),
+            Some(write.package_fingerprint.as_str())
+        );
+        assert_eq!(link.skill_id.as_deref(), Some(child.skill_id.as_str()));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2083,41 +2139,46 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
 // NOT_RUN: this extends the existing project DB fixture, including FK=OFF.
 #[tokio::test]
 async fn startup_reconciliation_finishes_more_than_one_thousand_parents_and_is_idempotent() {
-    let store = test_store_with_workspace("ws-startup-batches").await;
-    for index in 0..1001 {
-        store
-            .insert_plugin_installation(&parent(&format!("{index:021}"), "ws-startup-batches"))
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        store
-            .list_plugin_installations("ws-startup-batches")
-            .await
-            .unwrap()
-            .len(),
-        1001
-    );
-    store.interrupt_unfinished_plugins().await.unwrap();
-    for index in 0..1001 {
-        let row = store
-            .find_plugin_installation(&format!("{index:021}"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.state, "interrupted");
-        assert_eq!(row.revision, 1);
-    }
-    store.interrupt_unfinished_plugins().await.unwrap();
-    assert_eq!(
-        store
-            .find_plugin_installation(&format!("{:021}", 1000))
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        "interrupted"
-    );
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-startup-batches").await;
+        for index in 0..1001 {
+            store
+                .insert_plugin_installation(&parent(&format!("{index:021}"), "ws-startup-batches"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .list_plugin_installations("ws-startup-batches")
+                .await
+                .unwrap()
+                .len(),
+            1001
+        );
+        store.interrupt_unfinished_plugins().await.unwrap();
+        for index in 0..1001 {
+            let row = store
+                .find_plugin_installation(&format!("{index:021}"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "interrupted");
+            assert_eq!(row.revision, 1);
+        }
+        store.interrupt_unfinished_plugins().await.unwrap();
+        assert_eq!(
+            store
+                .find_plugin_installation(&format!("{:021}", 1000))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "interrupted"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 // App storage regressions: source-only, NOT_RUN / NOT_COMPILED.
@@ -2139,284 +2200,311 @@ fn app_parent(id: &str, workspace: &str) -> crate::PackageRecord {
 
 #[tokio::test]
 async fn app_slug_is_workspace_scoped_and_failed_reservation_leaves_no_orphan_parent() {
-    use sea_orm::{EntityTrait, Set};
-    let store = test_store_with_workspace("ws-app-one").await;
-    store
-        .run_serialized_write(|| async {
-            for workspace in ["ws-app-two", "ws-app-three"] {
-                pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-                    id: Set(workspace.into()),
-                    name: Set(workspace.into()),
-                    is_active: Set(true),
-                    is_current: Set(false),
-                    created_at: Set(util::unix_to_datetime(1)),
-                    updated_at: Set(util::unix_to_datetime(1)),
-                })
-                .exec(&store.connection)
-                .await?;
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let first = app_parent("app-one", "ws-app-one");
-    let second = app_parent("app-two", "ws-app-two");
-    let (one, two) = tokio::join!(
-        store.insert_package_installation(&first),
-        store.insert_package_installation(&second)
-    );
-    one.unwrap();
-    two.unwrap();
-    let error = store
-        .insert_package_installation(&app_parent("duplicate", "ws-app-one"))
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("apps.slug_conflict"),
-        "wrong rejection: {error}"
-    );
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        use sea_orm::{EntityTrait, Set};
+        let store = postgres_store_with_workspace(fixture, "ws-app-one").await;
         store
-            .find_package_installation("duplicate")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .find_plugin_installation("app-one")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    for (workspace, expected) in [
-        ("ws-app-one", vec!["app-one"]),
-        ("ws-app-two", vec!["app-two"]),
-        ("ws-app-three", vec![]),
-    ] {
-        let apps = store
-            .list_package_installations(workspace, pioneer_protocol::PackageKind::App)
+            .run_serialized_write(|| async {
+                for workspace in ["ws-app-two", "ws-app-three"] {
+                    pioneer_entity::workspace::Entity::insert(
+                        pioneer_entity::workspace::ActiveModel {
+                            id: Set(workspace.into()),
+                            name: Set(workspace.into()),
+                            is_active: Set(true),
+                            is_current: Set(false),
+                            created_at: Set(util::unix_to_datetime(1)),
+                            updated_at: Set(util::unix_to_datetime(1)),
+                        },
+                    )
+                    .exec(&store.connection)
+                    .await?;
+                }
+                Ok(())
+            })
             .await
             .unwrap();
-        assert_eq!(
-            apps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            expected
+        let first = app_parent("app-one", "ws-app-one");
+        let second = app_parent("app-two", "ws-app-two");
+        let (one, two) = tokio::join!(
+            store.insert_package_installation(&first),
+            store.insert_package_installation(&second)
         );
-    }
-    assert!(
-        store
-            .list_plugin_installations("ws-app-one")
+        one.unwrap();
+        two.unwrap();
+        let error = store
+            .insert_package_installation(&app_parent("duplicate", "ws-app-one"))
             .await
-            .unwrap()
-            .is_empty()
-    );
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("apps.slug_conflict"),
+            "wrong rejection: {error}"
+        );
+        assert!(
+            store
+                .find_package_installation("duplicate")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_plugin_installation("app-one")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for (workspace, expected) in [
+            ("ws-app-one", vec!["app-one"]),
+            ("ws-app-two", vec!["app-two"]),
+            ("ws-app-three", vec![]),
+        ] {
+            let apps = store
+                .list_package_installations(workspace, pioneer_protocol::PackageKind::App)
+                .await
+                .unwrap();
+            assert_eq!(
+                apps.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(
+            store
+                .list_plugin_installations("ws-app-one")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn concurrent_same_workspace_app_reservations_publish_one_installation() {
-    let store = test_store_with_workspace("ws-app-race").await;
-    let first = app_parent("candidate-one", "ws-app-race");
-    let second = app_parent("candidate-two", "ws-app-race");
-    let (one, two) = tokio::join!(
-        store.insert_package_installation(&first),
-        store.insert_package_installation(&second)
-    );
-    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
-    let installed = store
-        .list_package_installations("ws-app-race", pioneer_protocol::PackageKind::App)
-        .await
-        .unwrap();
-    assert_eq!(installed.len(), 1);
-    for (id, result) in [("candidate-one", one), ("candidate-two", two)] {
-        let row = store.find_package_installation(id).await.unwrap();
-        if let Err(error) = result {
-            assert!(error.to_string().contains("apps.slug_conflict"));
-            assert!(row.is_none(), "rejected reservation leaked its parent");
-        } else {
-            assert_eq!(installed[0].id, id);
-            assert_eq!(row.unwrap().workspace_id, "ws-app-race");
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-app-race").await;
+        let first = app_parent("candidate-one", "ws-app-race");
+        let second = app_parent("candidate-two", "ws-app-race");
+        let (one, two) = tokio::join!(
+            store.insert_package_installation(&first),
+            store.insert_package_installation(&second)
+        );
+        assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+        let installed = store
+            .list_package_installations("ws-app-race", pioneer_protocol::PackageKind::App)
+            .await
+            .unwrap();
+        assert_eq!(installed.len(), 1);
+        for (id, result) in [("candidate-one", one), ("candidate-two", two)] {
+            let row = store.find_package_installation(id).await.unwrap();
+            if let Err(error) = result {
+                assert!(error.to_string().contains("apps.slug_conflict"));
+                assert!(row.is_none(), "rejected reservation leaked its parent");
+            } else {
+                assert_eq!(installed[0].id, id);
+                assert_eq!(row.unwrap().workspace_id, "ws-app-race");
+            }
         }
-    }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn app_owned_native_child_cannot_be_adopted_by_plugin_or_published_with_wrong_kind() {
-    let store = test_store_with_workspace("ws-app").await;
-    let mut declared_app = app_parent("app-parent", "ws-app");
-    let mut declared: serde_json::Value =
-        serde_json::from_str(declared_app.app_manifest_json.as_deref().unwrap()).unwrap();
-    declared["skills"] = serde_json::json!("skills");
-    declared_app.app_manifest_json = Some(declared.to_string());
-    store
-        .insert_package_installation(&declared_app)
-        .await
-        .unwrap();
-    store
-        .insert_plugin_installation(&parent("plugin-parent", "ws-app"))
-        .await
-        .unwrap();
-    let row = skill('A', "ws-app");
-    let mut app_owner = ownership("app-parent", row.skill_id.as_str(), "one");
-    // Same ID/revision with a forged kind must fail before any native write.
-    assert!(
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-app").await;
+        let mut declared_app = app_parent("app-parent", "ws-app");
+        let mut declared: serde_json::Value =
+            serde_json::from_str(declared_app.app_manifest_json.as_deref().unwrap()).unwrap();
+        declared["skills"] = serde_json::json!("skills");
+        declared_app.app_manifest_json = Some(declared.to_string());
         store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&app_owner),
-                1
-            )
+            .insert_package_installation(&declared_app)
             .await
-            .is_err()
-    );
-    assert!(
+            .unwrap();
         store
-            .find_skill_installation(&row.skill_id)
+            .insert_plugin_installation(&parent("plugin-parent", "ws-app"))
+            .await
+            .unwrap();
+        let row = skill('A', "ws-app");
+        let mut app_owner = ownership("app-parent", row.skill_id.as_str(), "one");
+        // Same ID/revision with a forged kind must fail before any native write.
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&app_owner),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .find_skill_installation(&row.skill_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        app_owner.kind = pioneer_protocol::PackageKind::App;
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&app_owner),
+                    1
+                )
+                .await
+                .unwrap()
+        );
+        let plugin_owner = ownership("plugin-parent", row.skill_id.as_str(), "one");
+        assert!(
+            store
+                .install_skill_lifecycle_with_ownership(
+                    &row,
+                    &policy(&row),
+                    &[skill_audit(&row)],
+                    None,
+                    Some(&plugin_owner),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        let owner = store
+            .find_skill_plugin_owner(&row.skill_id)
             .await
             .unwrap()
-            .is_none()
-    );
-    app_owner.kind = pioneer_protocol::PackageKind::App;
-    assert!(
-        store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&app_owner),
-                1
-            )
-            .await
-            .unwrap()
-    );
-    let plugin_owner = ownership("plugin-parent", row.skill_id.as_str(), "one");
-    assert!(
-        store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&plugin_owner),
-                1
-            )
-            .await
-            .is_err()
-    );
-    let owner = store
-        .find_skill_plugin_owner(&row.skill_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(owner.package_id, "app-parent");
-    assert!(
-        store
-            .list_plugin_components("plugin-parent")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !store
-            .plugin_child_available("skill", row.skill_id.as_str(), "other-workspace")
-            .await
-            .unwrap()
-    );
+            .unwrap();
+        assert_eq!(owner.package_id, "app-parent");
+        assert!(
+            store
+                .list_plugin_components("plugin-parent")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .plugin_child_available("skill", row.skill_id.as_str(), "other-workspace")
+                .await
+                .unwrap()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn package_reload_preserves_structured_legacy_operation_diagnostic() {
-    let store = test_store_with_workspace("ws-diagnostic").await;
-    let mut record = parent("diagnostic-parent", "ws-diagnostic");
-    let diagnostic = r#"{"legacy":"plugins.data_retained","detail":"preserved"}"#;
-    record.last_error = Some("plugins.data_retained".into());
-    record.operation_error_json = Some(diagnostic.into());
-    record.pending_json = Some("{}".into());
-    store.insert_plugin_installation(&record).await.unwrap();
-    store.prepare_plugin_reload(&record.id, 1).await.unwrap();
-    let reloaded = store
-        .find_package_installation(&record.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        reloaded.last_error.as_deref(),
-        Some("plugins.data_retained")
-    );
-    assert_eq!(reloaded.operation_error_json.as_deref(), Some(diagnostic));
-    assert_eq!(reloaded.state, "installed");
-    assert_eq!(reloaded.pending_json.as_deref(), Some("{}"));
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, "ws-diagnostic").await;
+        let mut record = parent("diagnostic-parent", "ws-diagnostic");
+        let diagnostic = r#"{"legacy":"plugins.data_retained","detail":"preserved"}"#;
+        record.last_error = Some("plugins.data_retained".into());
+        record.operation_error_json = Some(diagnostic.into());
+        record.pending_json = Some("{}".into());
+        store.insert_plugin_installation(&record).await.unwrap();
+        store.prepare_plugin_reload(&record.id, 1).await.unwrap();
+        let reloaded = store
+            .find_package_installation(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.last_error.as_deref(),
+            Some("plugins.data_retained")
+        );
+        assert_eq!(reloaded.operation_error_json.as_deref(), Some(diagnostic));
+        assert_eq!(reloaded.state, "installed");
+        assert_eq!(reloaded.pending_json.as_deref(), Some("{}"));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_row() {
-    use sea_orm::EntityTrait;
+    pioneer_postgres_test::with_database(async |fixture| {
+        use sea_orm::EntityTrait;
 
-    let store = test_store_with_workspace("ws-runtime").await;
-    for index in 0..66 {
-        let id = format!("app-{index:03}");
-        let mut row = app_parent(&id, "ws-runtime");
-        row.name = id.clone();
-        let mut manifest: serde_json::Value =
-            serde_json::from_str(row.app_manifest_json.as_deref().unwrap()).unwrap();
-        manifest["slug"] = id.into();
-        row.app_manifest_json = Some(manifest.to_string());
-        if index == 32 {
-            // Persist an interrupted parent-only aggregate. Ordinary CRUD
-            // publishes both rows atomically; extension deletion stays guarded.
-            pioneer_entity::package_installation::Entity::insert(row.operational())
-                .exec(&store.database_connection())
-                .await
-                .unwrap();
-        } else {
-            store.insert_package_installation(&row).await.unwrap();
+        let store = postgres_store_with_workspace(fixture, "ws-runtime").await;
+        for index in 0..66 {
+            let id = format!("app-{index:03}");
+            let mut row = app_parent(&id, "ws-runtime");
+            row.name = id.clone();
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(row.app_manifest_json.as_deref().unwrap()).unwrap();
+            manifest["slug"] = id.into();
+            row.app_manifest_json = Some(manifest.to_string());
+            if index == 32 {
+                // Persist an interrupted parent-only aggregate. Ordinary CRUD
+                // publishes both rows atomically; extension deletion stays guarded.
+                pioneer_entity::package_installation::Entity::insert(row.operational())
+                    .exec(&store.database_connection())
+                    .await
+                    .unwrap();
+            } else {
+                store.insert_package_installation(&row).await.unwrap();
+            }
         }
-    }
-    store
-        .insert_plugin_installation(&parent("zzz-plugin", "ws-runtime"))
-        .await
-        .unwrap();
-    let maintenance = store.with_maintenance_access();
-    let frontier = maintenance.app_runtime_frontier().await.unwrap().unwrap();
-    assert_eq!(frontier, "app-065");
-    let mut later = app_parent("zzz-app", "ws-runtime");
-    later.name = "later-app".into();
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(later.app_manifest_json.as_deref().unwrap()).unwrap();
-    manifest["slug"] = "later-app".into();
-    later.app_manifest_json = Some(manifest.to_string());
-    store.insert_package_installation(&later).await.unwrap();
-    let first = maintenance.app_runtime_page("", &frontier).await.unwrap();
-    assert_eq!(first.len(), 64);
-    assert!(
-        first
-            .iter()
-            .any(|(id, row)| id == "app-032" && row.is_none())
-    );
-    let second = maintenance
-        .app_runtime_page(&first.last().unwrap().0, &frontier)
-        .await
-        .unwrap();
-    assert_eq!(
-        second.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        vec!["app-064", "app-065"]
-    );
-    assert!(
-        maintenance
-            .app_runtime_page("app-065", &frontier)
+        store
+            .insert_plugin_installation(&parent("zzz-plugin", "ws-runtime"))
             .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        maintenance.app_runtime_frontier().await.unwrap().as_deref(),
-        Some("zzz-app")
-    );
-    assert_eq!(
-        maintenance.database_connection().read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
-    );
+            .unwrap();
+        let maintenance = store.with_maintenance_access();
+        let frontier = maintenance.app_runtime_frontier().await.unwrap().unwrap();
+        assert_eq!(frontier, "app-065");
+        let mut later = app_parent("zzz-app", "ws-runtime");
+        later.name = "later-app".into();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(later.app_manifest_json.as_deref().unwrap()).unwrap();
+        manifest["slug"] = "later-app".into();
+        later.app_manifest_json = Some(manifest.to_string());
+        store.insert_package_installation(&later).await.unwrap();
+        let first = maintenance.app_runtime_page("", &frontier).await.unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(
+            first
+                .iter()
+                .any(|(id, row)| id == "app-032" && row.is_none())
+        );
+        let second = maintenance
+            .app_runtime_page(&first.last().unwrap().0, &frontier)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["app-064", "app-065"]
+        );
+        assert!(
+            maintenance
+                .app_runtime_page("app-065", &frontier)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            maintenance.app_runtime_frontier().await.unwrap().as_deref(),
+            Some("zzz-app")
+        );
+        assert_eq!(
+            maintenance.database_connection().read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

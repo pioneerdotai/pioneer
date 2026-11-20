@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub principal_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub run_id: String,
     #[sea_orm(column_type = "Text")]
     pub read_at: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub run_id: String,
     #[sea_orm(
         belongs_to,
         from = "run_id",
@@ -20,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_run: HasOne<super::task_run::Entity>,
+    pub task_run: BelongsTo<super::task_run::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

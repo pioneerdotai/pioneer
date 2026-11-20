@@ -3245,13 +3245,6 @@ async fn capture_with_imports_prepared_using_renderer(
                 if let [full_source] = reference.sources.as_slice()
                     && let Some(turn) = full_source.scope.strip_prefix("item:")
                 {
-                    super::history::prepare_references(
-                        store,
-                        workspace,
-                        &reference.source_thread,
-                        std::slice::from_ref(full_source),
-                    )
-                    .await?;
                     let payload = super::history::reference_payload(
                         &store,
                         workspace,
@@ -3336,7 +3329,6 @@ async fn capture_with_imports_prepared_using_renderer(
             for (thread, sources) in context_sources {
                 let sources = sources.into_iter().collect::<Vec<_>>();
                 for page in bounded_context_source_pages(&sources)? {
-                    super::history::prepare_references(store, workspace, &thread, page).await?;
                     ensure!(
                         store
                             .compaction_model_context_sources_current(workspace, &thread, page)
@@ -6236,6 +6228,7 @@ fn source_turn(source: &SourceRef) -> Option<&str> {
 
 /// Verify a frozen rendering while its original canonical source still exists.
 /// Persist only the diagnostic wire hash; no HTML/image bytes are duplicated.
+#[cfg(test)]
 pub(crate) async fn prepare_html_preview_archive_witness(
     store: &CrudStore,
     witness: &pioneer_crud::HtmlPreviewArchiveWitness,
@@ -6720,6 +6713,7 @@ fn frozen_payload_batchable(reference: &FrozenMessageRef) -> bool {
 /// Count exact JSON-array bytes before copying an entry and stop at the first
 /// boundary. An oversized entry keeps its old preparation path instead of
 /// introducing a new history size limit.
+#[cfg(test)]
 fn bounded_preparation_group(references: &[FrozenMessageRef]) -> Result<(usize, Vec<SourceRef>)> {
     let Some(first) = references.first() else {
         return Ok((0, Vec::new()));
@@ -6838,47 +6832,21 @@ async fn restore_entries_page_with_projection(
             continue;
         }
         if !frozen_payload_batchable(reference) {
-            let (entries, sources) = bounded_preparation_group(&references[index..])?;
-            // A singleton cannot save a query. False retains legacy registration
-            // immediately before each restore; errors still abort the operation.
-            let prepared = entries > 1
-                && store
-                    .compaction_references_current(workspace, &reference.source_thread, &sources)
-                    .await?;
-            // The completed precheck has released all database capacity.
             #[cfg(test)]
-            if prepared {
-                pause_after_preparation_precheck().await;
-            }
-            for entry in &references[index..index + entries.max(1)] {
-                if !prepared {
-                    let mut sources = entry.sources.clone();
-                    sources.extend(entry.replay_source.iter().cloned());
-                    super::history::prepare_references(
-                        store,
-                        workspace,
-                        &entry.source_thread,
-                        &sources,
-                    )
-                    .await?;
-                }
-                // This precheck is only a metadata fast path, not an access
-                // grant or a snapshot. Keep exact payload reads and all restore
-                // proofs, including sequential execution-state updates.
-                result.push(
-                    restore_entry(
-                        store,
-                        workspace,
-                        allowed_threads,
-                        entry,
-                        checkpoint_graphs,
-                        projection,
-                        state,
-                    )
-                    .await?,
-                );
-            }
-            index += entries.max(1);
+            pause_after_preparation_precheck().await;
+            result.push(
+                restore_entry(
+                    store,
+                    workspace,
+                    allowed_threads,
+                    reference,
+                    checkpoint_graphs,
+                    projection,
+                    state,
+                )
+                .await?,
+            );
+            index += 1;
             continue;
         }
         let end = references[index..]
@@ -6892,8 +6860,6 @@ async fn restore_entries_page_with_projection(
             .iter()
             .map(|entry| entry.sources[0].clone())
             .collect::<Vec<_>>();
-        super::history::prepare_references(store, workspace, &reference.source_thread, &sources)
-            .await?;
         let (consumed, payloads) = store
             .compaction_reference_payload_batch(workspace, &reference.source_thread, &sources)
             .await?;

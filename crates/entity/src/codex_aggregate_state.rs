@@ -7,15 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "codex_aggregate_state")]
 pub struct Model {
+    pub revision: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub thread_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub turn_id: String,
-    pub revision: i64,
     pub final_state: i64,
+    pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub state_json: String,
-    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

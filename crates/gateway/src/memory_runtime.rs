@@ -4,7 +4,7 @@ use pioneer_crud::CrudStore;
 use pioneer_memory::hooks::MemoryTurnContext;
 use pioneer_memory::{
     MemoryMutationBoundary, MemoryOperationContext, MemoryReadPolicy, MemoryService,
-    MemoryServiceConfig, MemorySourceAccessPolicy, SqliteMemoryBackend,
+    MemoryServiceConfig, MemorySourceAccessPolicy, PostgresMemoryBackend,
 };
 use pioneer_protocol::{MemoryActor, MemoryScope, MemoryScopeKind};
 use std::sync::Arc;
@@ -37,7 +37,7 @@ impl GatewayMemoryRuntime {
             });
         }
 
-        let backend = Arc::new(SqliteMemoryBackend::new(store.clone()));
+        let backend = Arc::new(PostgresMemoryBackend::new(store.clone()));
         let service = Arc::new(MemoryService::new(
             store,
             backend,
@@ -170,9 +170,7 @@ mod scope_contract_tests {
 
     #[tokio::test]
     async fn scoped_turn_grants_stable_owners_but_not_global_or_foreign_memory() {
-        let store = Arc::new(CrudStore::new(
-            sea_orm::Database::connect("sqlite::memory:").await.unwrap(),
-        ));
+        let store = Arc::new(CrudStore::new(sea_orm::DatabaseConnection::default()));
         let runtime = GatewayMemoryRuntime::disabled(store);
         let turn = MemoryTurnContext {
             workspace_id: "workspace".to_owned(),

@@ -7,19 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_presentation_snapshot")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(column_type = "Text")]
+    pub display_name: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_presentation_snapshot_source"
+    )]
+    pub agent_identity_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_presentation_snapshot_source"
+    )]
+    pub source_fingerprint: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(unique_key = "uq_agent_presentation_snapshot_source")]
-    pub agent_identity_id: String,
-    #[sea_orm(unique_key = "uq_agent_presentation_snapshot_source")]
     pub source_revision: i64,
-    #[sea_orm(unique_key = "uq_agent_presentation_snapshot_source")]
-    pub source_fingerprint: String,
-    pub display_name: String,
-    pub nickname: String,
-    pub avatar_revision: Option<String>,
-    pub role_label: Option<String>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub avatar_revision: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub role_label: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub nickname: String,
     #[sea_orm(has_many)]
     pub agent_executions: HasMany<super::agent_execution::Entity>,
     #[sea_orm(
@@ -29,7 +39,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub agent_identity: HasOne<super::agent_identity::Entity>,
+    pub agent_identity: BelongsTo<super::agent_identity::Entity>,
     #[sea_orm(has_many)]
     pub agent_turn_response_executions: HasMany<super::agent_turn_response_execution::Entity>,
 }

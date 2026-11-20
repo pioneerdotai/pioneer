@@ -3,21 +3,24 @@
 These rules govern application implementation. For direct SQL inspection during
 debugging, see the root [diagnostics scope](../../AGENTS.md#diagnostics).
 
-- Put ordinary CRUD in the existing repositories and expose it through
-  `CrudStore`, using Entity/Model/ActiveModel and typed projections. Follow a
-  relevant existing method's structure, not a separate access path in a caller.
+- Put ordinary CRUD in the owning domain repository and expose it through
+  `CrudStore`, using Entity/Model/ActiveModel and typed projections. Pass the
+  facade's transaction to domain operations that commit together.
+- Prepare portable payload bytes before reserving writer capacity. Capture
+  encoded frames in one PostgreSQL snapshot and release the snapshot before
+  decompression or hashing. Use the persisted offsets for range reads.
 - Use SeaQuery expressions within the ORM path where needed. Building a typed
   `Query` and executing a `Statement` through `query_*_raw` does not by itself
   satisfy the Entity/Model pattern for ordinary CRUD.
 - Low-level/raw SQL is a local exception: document the specific gap in the
   installed API and bind values as parameters. JOINs, transactions or query
   complexity alone do not justify it; existing SQL is not blanket precedent.
-- Gateway SQLite uses `foreign_keys=OFF`; declarative FK/relations may describe
-  schema but do not enforce integrity or cascade deletion. Validate existence,
-  ownership and access explicitly, and perform necessary dependent cleanup in
-  the same atomic operation. PK/UNIQUE constraints remain effective.
-- Regressions must use project access paths and the runtime connection settings.
-  A cascade test with FK enabled does not establish behavior with FK disabled.
+- PostgreSQL enforces the foreign keys, checks, and unique constraints in its
+  schema. Use the declared cascade rules, validate domain ownership and access,
+  and perform the remaining dependent cleanup in the same transaction.
+- Regressions must use the project access paths and the runtime connection
+  settings. Use separate connections to the same test database for concurrency
+  and synchronize the connections where the operation locks or publishes.
 - Pass the operation's scoped database handle through helpers and repositories.
   Follow the root runtime, scheduling and transaction rules; do not create
   alternate connections or classify individual SQL calls here.

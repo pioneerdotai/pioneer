@@ -5,7 +5,7 @@ use pioneer_protocol::{
     TaskRunThreadBindingKind, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TaskThreadLineage,
     TaskValue, ThreadLineage,
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, EntityTrait, QuerySelect};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -1119,12 +1119,11 @@ impl TaskProjector {
                 // This point read and the projection share the Task event writer
                 // transaction. Existing deliveries must retain their original
                 // output binding, including an explicitly unknown legacy basis.
-                let is_new = db
-                    .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                        sea_orm::DbBackend::Sqlite,
-                        "SELECT id FROM task_delivery WHERE id=?",
-                        [delivery.id.clone().into()],
-                    ))
+                let is_new = pioneer_entity::task_delivery::Entity::find_by_id(&delivery.id)
+                    .select_only()
+                    .column(pioneer_entity::task_delivery::Column::Id)
+                    .into_tuple::<String>()
+                    .one(db)
                     .await?
                     .is_none();
                 project_task_delivery(

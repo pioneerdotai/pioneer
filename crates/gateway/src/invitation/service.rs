@@ -1731,1532 +1731,1782 @@ mod tests {
         database: &sea_orm::DatabaseConnection,
         secret: &str,
     ) {
-        let tables = database
+        let columns = database
             .query_all_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name".to_owned(),
+                DatabaseBackend::Postgres,
+                "SELECT c.table_name, c.column_name, c.data_type \
+                 FROM information_schema.columns c \
+                 JOIN information_schema.tables t USING (table_catalog, table_schema, table_name) \
+                 WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' \
+                 ORDER BY c.table_name, c.ordinal_position",
             ))
             .await
             .unwrap();
-        for table in tables {
-            let table_name = table.try_get::<String>("", "name").unwrap();
+        for column in columns {
+            let table_name = column.try_get::<String>("", "table_name").unwrap();
+            let column_name = column.try_get::<String>("", "column_name").unwrap();
             let quoted_table = table_name.replace('"', "\"\"");
-            let columns = database
-                .query_all_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    format!("PRAGMA table_info(\"{quoted_table}\")"),
+            let quoted_column = column_name.replace('"', "\"\"");
+            let data_type = column.try_get::<String>("", "data_type").unwrap();
+            let predicate = if data_type == "bytea" {
+                format!(r#"position(convert_to($1, 'UTF8') in "{quoted_column}") > 0"#)
+            } else {
+                format!(r#"position($1 in "{quoted_column}"::text) > 0"#)
+            };
+            let leak_count = database
+                .query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!(r#"SELECT COUNT(*) AS leak_count FROM public."{quoted_table}" WHERE {predicate}"#),
+                    [secret.into()],
                 ))
                 .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "leak_count")
                 .unwrap();
-            for column in columns {
-                let column_name = column.try_get::<String>("", "name").unwrap();
-                let quoted_column = column_name.replace('"', "\"\"");
-                let leak_count = database
-                    .query_one_raw(Statement::from_sql_and_values(
-                        DatabaseBackend::Sqlite,
-                        format!(
-                            "SELECT COUNT(*) AS leak_count FROM \"{quoted_table}\" \
-                             WHERE instr(CAST(\"{quoted_column}\" AS BLOB), CAST(? AS BLOB)) > 0"
-                        ),
-                        [secret.into()],
-                    ))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .try_get::<i64>("", "leak_count")
-                    .unwrap();
-                assert_eq!(
-                    leak_count, 0,
-                    "secret persisted in {table_name}.{column_name}"
-                );
-            }
+            assert_eq!(
+                leak_count, 0,
+                "secret persisted in {table_name}.{column_name}"
+            );
         }
     }
 
     #[tokio::test]
     async fn member_create_commits_hash_grants_and_audit_atomically() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let principal = member_a();
-        let workspace_ids = vec![
-            WorkspaceId::new(WORKSPACE_BLUE_ID).unwrap(),
-            WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
-        ];
-        let proof = authorized_grants(&store, &principal, &workspace_ids).await;
-        let service = InvitationService::new(
-            store,
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let principal = member_a();
+                let workspace_ids = vec![
+                    WorkspaceId::new(WORKSPACE_BLUE_ID).unwrap(),
+                    WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
+                ];
+                let proof = authorized_grants(&store, &principal, &workspace_ids).await;
+                let service = InvitationService::new(
+                    store,
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
 
-        let response = service
-            .create(
-                &principal,
-                &proof,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
+                let response = service
+                    .create(
+                        &principal,
+                        &proof,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        assert_eq!(response.invitation.status, InvitationStatus::Pending);
-        assert_eq!(
-            response.invitation.expires_at_unix - response.invitation.created_at_unix,
-            pioneer_protocol::INVITATION_TTL_SECONDS
-        );
-        assert_eq!(
-            response.presentation.gateway_base_url.as_str(),
-            "http://127.0.0.1:17878/"
-        );
-        let rows = invitation::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].token_hash.as_ref().map(Vec::len), Some(32));
-        let grants = invitation_workspace_grant::Entity::find()
-            .order_by_asc(invitation_workspace_grant::Column::WorkspaceId)
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            grants
-                .iter()
-                .map(|grant| grant.workspace_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
-        );
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(audits.len(), 1);
-        assert_eq!(audits[0].action, "invitation_created");
-        assert_eq!(audits[0].policy_generation, 1);
-        assert_eq!(audits[0].policy_role_key.as_deref(), Some("member"));
-        assert_eq!(audits[0].policy_fingerprint.len(), 64);
-        assert!(
-            audits[0]
-                .policy_fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        );
-        assert_ne!(audits[0].policy_fingerprint, "0".repeat(64));
-        assert!(
-            !audits[0]
-                .metadata_json
-                .contains(response.presentation.token())
-        );
-        assert_database_does_not_contain(&harness.database, response.presentation.token()).await;
-        assert_database_does_not_contain(&harness.database, response.presentation.deep_link())
+                assert_eq!(response.invitation.status, InvitationStatus::Pending);
+                assert_eq!(
+                    response.invitation.expires_at_unix - response.invitation.created_at_unix,
+                    pioneer_protocol::INVITATION_TTL_SECONDS
+                );
+                assert_eq!(
+                    response.presentation.gateway_base_url.as_str(),
+                    "http://127.0.0.1:17878/"
+                );
+                let rows = invitation::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].token_hash.as_ref().map(Vec::len), Some(32));
+                let grants = invitation_workspace_grant::Entity::find()
+                    .order_by_asc(invitation_workspace_grant::Column::WorkspaceId)
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    grants
+                        .iter()
+                        .map(|grant| grant.workspace_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
+                );
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(audits.len(), 1);
+                assert_eq!(audits[0].action, "invitation_created");
+                assert_eq!(audits[0].policy_generation, 1);
+                assert_eq!(audits[0].policy_role_key.as_deref(), Some("member"));
+                assert_eq!(audits[0].policy_fingerprint.len(), 64);
+                assert!(
+                    audits[0]
+                        .policy_fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                );
+                assert_ne!(audits[0].policy_fingerprint, "0".repeat(64));
+                assert!(
+                    !audits[0]
+                        .metadata_json
+                        .to_string()
+                        .contains(response.presentation.token())
+                );
+                assert_database_does_not_contain(&harness.database, response.presentation.token())
+                    .await;
+                assert_database_does_not_contain(
+                    &harness.database,
+                    response.presentation.deep_link(),
+                )
+                .await;
+            }
             .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn invitation_create_enforces_exact_live_pending_cap() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let principal = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let proof = authorized_grants(&store, &principal, &workspace_ids).await;
-        let now = chrono::Utc::now().fixed_offset();
-        let expires_at = now.checked_add_signed(chrono::Duration::days(7)).unwrap();
-        let transaction = harness.database.begin().await.unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let principal = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let proof = authorized_grants(&store, &principal, &workspace_ids).await;
+                let now = chrono::Utc::now().fixed_offset();
+                let expires_at = now.checked_add_signed(chrono::Duration::days(7)).unwrap();
+                let transaction = harness.database.begin().await.unwrap();
 
-        for index in 0..MAX_LIVE_PENDING_INVITATIONS_PER_CREATOR {
-            pioneer_crud::insert_invitation(
-                &transaction,
-                NewInvitationRow {
-                    invitation_id: InvitationId::new(format!("I{index:020}")).unwrap(),
-                    gateway_id: principal.gateway_id.clone(),
-                    created_by_principal_id: principal.principal_id.clone(),
-                    created_by_session_id: principal.session_id.clone(),
-                    target_role_key: RoleKey::member(),
-                    token_hash: [index as u8; 32],
-                    expires_at,
-                    now,
-                },
-            )
-            .await
-            .unwrap();
-        }
-        transaction.commit().await.unwrap();
+                for index in 0..MAX_LIVE_PENDING_INVITATIONS_PER_CREATOR {
+                    pioneer_crud::insert_invitation(
+                        &transaction,
+                        NewInvitationRow {
+                            invitation_id: InvitationId::new(format!("I{index:020}")).unwrap(),
+                            gateway_id: principal.gateway_id.clone(),
+                            created_by_principal_id: principal.principal_id.clone(),
+                            created_by_session_id: principal.session_id.clone(),
+                            target_role_key: RoleKey::member(),
+                            token_hash: [index as u8; 32],
+                            expires_at,
+                            now,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                transaction.commit().await.unwrap();
 
-        let service = InvitationService::new(
-            store,
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
-        let result = service
-            .create(
-                &principal,
-                &proof,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
+                let service = InvitationService::new(
+                    store,
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                let result = service
+                    .create(
+                        &principal,
+                        &proof,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await;
+
+                assert!(matches!(result, Err(InvitationServiceError::RateLimited)));
+                assert_eq!(
+                    invitation::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len() as u64,
+                    MAX_LIVE_PENDING_INVITATIONS_PER_CREATOR
+                );
+                assert!(
+                    audit_event::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
             .await;
-
-        assert!(matches!(result, Err(InvitationServiceError::RateLimited)));
-        assert_eq!(
-            invitation::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len() as u64,
-            MAX_LIVE_PENDING_INVITATIONS_PER_CREATOR
-        );
-        assert!(
-            audit_event::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn mixed_member_grants_fail_before_any_write() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let principal = member_a();
-        let workspace_ids = vec![
-            WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
-            WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap(),
-        ];
-        let gate = AuthorizationService::new().authorize_action(
-            principal.kind,
-            principal.role_key.as_ref(),
-            ResourceAction::InvitationCreate,
-        );
-        let resolution = AuthorizationResolver::new(store)
-            .authorize_invitation_grants(
-                &harness.database,
-                &principal,
-                &gate,
-                workspace_ids.as_slice(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(resolution, ProofResolution::Denied(_)));
-        assert!(
-            invitation::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            audit_event::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn superuser_create_requires_existent_active_grants_but_not_membership() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        seed_superuser_session(&harness.database).await;
-        let store = CrudStore::new(harness.database.clone());
-        let principal = superuser();
-        let green = WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap();
-        let proof = authorized_grants(&store, &principal, std::slice::from_ref(&green)).await;
-        let service = InvitationService::new(
-            store.clone(),
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
-        assert!(
-            service
-                .create(
-                    &principal,
-                    &proof,
-                    InvitationCreateParams::new_for_role(RoleKey::member(), vec![green.clone()])
-                        .unwrap(),
-                )
-                .await
-                .is_ok()
-        );
-
-        workspace::Entity::update_many()
-            .col_expr(workspace::Column::IsActive, Expr::value(false))
-            .filter(workspace::Column::Id.eq(green.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let gate = AuthorizationService::new().authorize_action(
-            principal.kind,
-            principal.role_key.as_ref(),
-            ResourceAction::InvitationCreate,
-        );
-        for denied in [green, WorkspaceId::new("W00000000000000000099").unwrap()] {
-            assert!(matches!(
-                AuthorizationResolver::new(store.clone())
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let principal = member_a();
+                let workspace_ids = vec![
+                    WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
+                    WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap(),
+                ];
+                let gate = AuthorizationService::new().authorize_action(
+                    principal.kind,
+                    principal.role_key.as_ref(),
+                    ResourceAction::InvitationCreate,
+                );
+                let resolution = AuthorizationResolver::new(store)
                     .authorize_invitation_grants(
                         &harness.database,
                         &principal,
                         &gate,
-                        std::slice::from_ref(&denied),
+                        workspace_ids.as_slice(),
                     )
                     .await
-                    .unwrap(),
-                ProofResolution::Denied(_)
-            ));
-        }
+                    .unwrap();
+                assert!(matches!(resolution, ProofResolution::Denied(_)));
+                assert!(
+                    invitation::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    audit_event::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn superuser_create_requires_existent_active_grants_but_not_membership() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                seed_superuser_session(&harness.database).await;
+                let store = CrudStore::new(harness.database.clone());
+                let principal = superuser();
+                let green = WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap();
+                let proof =
+                    authorized_grants(&store, &principal, std::slice::from_ref(&green)).await;
+                let service = InvitationService::new(
+                    store.clone(),
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                assert!(
+                    service
+                        .create(
+                            &principal,
+                            &proof,
+                            InvitationCreateParams::new_for_role(
+                                RoleKey::member(),
+                                vec![green.clone()]
+                            )
+                            .unwrap(),
+                        )
+                        .await
+                        .is_ok()
+                );
+
+                workspace::Entity::update_many()
+                    .col_expr(workspace::Column::IsActive, Expr::value(false))
+                    .filter(workspace::Column::Id.eq(green.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let gate = AuthorizationService::new().authorize_action(
+                    principal.kind,
+                    principal.role_key.as_ref(),
+                    ResourceAction::InvitationCreate,
+                );
+                for denied in [green, WorkspaceId::new("W00000000000000000099").unwrap()] {
+                    assert!(matches!(
+                        AuthorizationResolver::new(store.clone())
+                            .authorize_invitation_grants(
+                                &harness.database,
+                                &principal,
+                                &gate,
+                                std::slice::from_ref(&denied),
+                            )
+                            .await
+                            .unwrap(),
+                        ProofResolution::Denied(_)
+                    ));
+                }
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn invalid_actor_session_rolls_back_invitation_and_audit() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let mut principal = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let proof = authorized_grants(&store, &principal, &workspace_ids).await;
-        principal.session_id = AuthSessionId::new("S0000000000000000000Z").unwrap();
-        let service = InvitationService::new(
-            store,
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "http://127.0.0.1:17878",
-        )
-        .unwrap();
-
-        assert!(
-            service
-                .create(
-                    &principal,
-                    &proof,
-                    InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let mut principal = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let proof = authorized_grants(&store, &principal, &workspace_ids).await;
+                principal.session_id = AuthSessionId::new("S0000000000000000000Z").unwrap();
+                let service = InvitationService::new(
+                    store,
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "http://127.0.0.1:17878",
                 )
-                .await
-                .is_err()
-        );
-        assert!(
-            invitation::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            audit_event::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                .unwrap();
+
+                assert!(
+                    service
+                        .create(
+                            &principal,
+                            &proof,
+                            InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                                .unwrap(),
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    invitation::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    audit_event::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn member_list_is_scoped_before_pagination_and_revoke_is_idempotent() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service = InvitationService::new(store.clone(), secrets, "127.0.0.1:17878").unwrap();
-        let member_a = member_a();
-        let member_b = member_b();
-        let red = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let green = vec![WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap()];
-        let invitation_a = service
-            .create(
-                &member_a,
-                &authorized_grants(&store, &member_a, &red).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), red).unwrap(),
-            )
-            .await
-            .unwrap()
-            .invitation;
-        service
-            .create(
-                &member_b,
-                &authorized_grants(&store, &member_b, &green).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), green).unwrap(),
-            )
-            .await
-            .unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets, "127.0.0.1:17878").unwrap();
+                let member_a = member_a();
+                let member_b = member_b();
+                let red = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let green = vec![WorkspaceId::new(WORKSPACE_GREEN_ID).unwrap()];
+                let invitation_a = service
+                    .create(
+                        &member_a,
+                        &authorized_grants(&store, &member_a, &red).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), red).unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .invitation;
+                service
+                    .create(
+                        &member_b,
+                        &authorized_grants(&store, &member_b, &green).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), green).unwrap(),
+                    )
+                    .await
+                    .unwrap();
 
-        let page = service
-            .list(
-                &member_a,
-                &authorized_collection(&store, &member_a),
-                InvitationListParams {
-                    limit: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.invitations.len(), 1);
-        assert_eq!(
-            page.invitations[0].invitation_id,
-            invitation_a.invitation_id
-        );
-        assert!(page.next_cursor.is_none());
+                let page = service
+                    .list(
+                        &member_a,
+                        &authorized_collection(&store, &member_a),
+                        InvitationListParams {
+                            limit: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(page.invitations.len(), 1);
+                assert_eq!(
+                    page.invitations[0].invitation_id,
+                    invitation_a.invitation_id
+                );
+                assert!(page.next_cursor.is_none());
 
-        let proof = authorized_invitation(&store, &member_a, &invitation_a.invitation_id).await;
-        let response = service
-            .revoke(
-                &member_a,
-                &proof,
-                InvitationRevokeParams {
-                    invitation_id: invitation_a.invitation_id.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(response.changed);
-        assert!(response.notification_changed);
-        assert_eq!(response.invitation.status, InvitationStatus::Revoked);
-        assert_eq!(
-            response.invitation.revoke_reason,
-            Some(InvitationRevokeReason::InviterRevoked)
-        );
-        let replacement_workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let replacement = service
-            .create(
-                &member_a,
-                &authorized_grants(&store, &member_a, &replacement_workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), replacement_workspace_ids)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(
-            replacement.invitation.invitation_id,
-            response.invitation.invitation_id
-        );
+                let proof =
+                    authorized_invitation(&store, &member_a, &invitation_a.invitation_id).await;
+                let response = service
+                    .revoke(
+                        &member_a,
+                        &proof,
+                        InvitationRevokeParams {
+                            invitation_id: invitation_a.invitation_id.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.changed);
+                assert!(response.notification_changed);
+                assert_eq!(response.invitation.status, InvitationStatus::Revoked);
+                assert_eq!(
+                    response.invitation.revoke_reason,
+                    Some(InvitationRevokeReason::InviterRevoked)
+                );
+                let replacement_workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let replacement = service
+                    .create(
+                        &member_a,
+                        &authorized_grants(&store, &member_a, &replacement_workspace_ids).await,
+                        InvitationCreateParams::new_for_role(
+                            RoleKey::member(),
+                            replacement_workspace_ids,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    replacement.invitation.invitation_id,
+                    response.invitation.invitation_id
+                );
 
-        let terminal_proof =
-            authorized_invitation(&store, &member_a, &invitation_a.invitation_id).await;
-        assert!(
-            service
-                .revoke(
-                    &member_a,
-                    &terminal_proof,
-                    InvitationRevokeParams {
-                        invitation_id: invitation_a.invitation_id,
-                    },
-                )
-                .await
-                .is_err()
-        );
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|event| event.action == "invitation_revoked")
-                .count(),
-            1
-        );
+                let terminal_proof =
+                    authorized_invitation(&store, &member_a, &invitation_a.invitation_id).await;
+                assert!(
+                    service
+                        .revoke(
+                            &member_a,
+                            &terminal_proof,
+                            InvitationRevokeParams {
+                                invitation_id: invitation_a.invitation_id,
+                            },
+                        )
+                        .await
+                        .is_err()
+                );
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    audits
+                        .iter()
+                        .filter(|event| event.action == "invitation_revoked")
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn list_materializes_expiration_and_audits_only_the_transition() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let service = InvitationService::new(
-            store.clone(),
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
-        let member = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &member,
-                &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let now = chrono::Utc::now().fixed_offset();
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(now - chrono::Duration::seconds(2)),
-            )
-            .col_expr(
-                invitation::Column::ExpiresAt,
-                Expr::value(now - chrono::Duration::seconds(1)),
-            )
-            .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let proof = authorized_collection(&store, &member);
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let service = InvitationService::new(
+                    store.clone(),
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                let member = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &member,
+                        &authorized_grants(&store, &member, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let now = chrono::Utc::now().fixed_offset();
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(now - chrono::Duration::seconds(2)),
+                    )
+                    .col_expr(
+                        invitation::Column::ExpiresAt,
+                        Expr::value(now - chrono::Duration::seconds(1)),
+                    )
+                    .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let proof = authorized_collection(&store, &member);
 
-        let first = service
-            .list(&member, &proof, InvitationListParams::default())
-            .await
-            .unwrap();
-        assert!(first.invitations.is_empty());
-        assert_eq!(
-            first.changed_invitation_ids,
-            vec![created.invitation.invitation_id.clone()]
-        );
-        let second = service
-            .list(&member, &proof, InvitationListParams::default())
-            .await
-            .unwrap();
-        assert!(second.invitations.is_empty());
-        assert!(second.changed_invitation_ids.is_empty());
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|event| event.action == "invitation_expired")
-                .count(),
-            1
-        );
+                let first = service
+                    .list(&member, &proof, InvitationListParams::default())
+                    .await
+                    .unwrap();
+                assert!(first.invitations.is_empty());
+                assert_eq!(
+                    first.changed_invitation_ids,
+                    vec![created.invitation.invitation_id.clone()]
+                );
+                let second = service
+                    .list(&member, &proof, InvitationListParams::default())
+                    .await
+                    .unwrap();
+                assert!(second.invitations.is_empty());
+                assert!(second.changed_invitation_ids.is_empty());
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    audits
+                        .iter()
+                        .filter(|event| event.action == "invitation_expired")
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn list_reauthorizes_actor_before_materializing_expirations() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let service = InvitationService::new(
-            store.clone(),
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
-        let member = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &member,
-                &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let invitation_id = created.invitation.invitation_id;
-        let proof = authorized_collection(&store, &member);
-        let now = chrono::Utc::now().fixed_offset();
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(now - chrono::Duration::seconds(2)),
-            )
-            .col_expr(
-                invitation::Column::ExpiresAt,
-                Expr::value(now - chrono::Duration::seconds(1)),
-            )
-            .filter(invitation::Column::Id.eq(invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        gateway_principal::Entity::update_many()
-            .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
-            .filter(gateway_principal::Column::Id.eq(member.principal_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let service = InvitationService::new(
+                    store.clone(),
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                let member = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &member,
+                        &authorized_grants(&store, &member, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let invitation_id = created.invitation.invitation_id;
+                let proof = authorized_collection(&store, &member);
+                let now = chrono::Utc::now().fixed_offset();
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(now - chrono::Duration::seconds(2)),
+                    )
+                    .col_expr(
+                        invitation::Column::ExpiresAt,
+                        Expr::value(now - chrono::Duration::seconds(1)),
+                    )
+                    .filter(invitation::Column::Id.eq(invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                gateway_principal::Entity::update_many()
+                    .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
+                    .filter(gateway_principal::Column::Id.eq(member.principal_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
 
-        let error = service
-            .list(&member, &proof, InvitationListParams::default())
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            InvitationServiceError::Authorization(AuthorizationDecision::Deny {
-                reason: DenyReason::InactivePrincipal,
-                disclosure: DisclosurePolicy::AuthenticationTerminal,
-            })
-        ));
-        let persisted = invitation::Entity::find_by_id(invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.status, "pending");
-        assert!(persisted.expired_at.is_none());
-        assert_eq!(
-            audit_event::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.action == "invitation_expired")
-                .count(),
-            0
-        );
+                let error = service
+                    .list(&member, &proof, InvitationListParams::default())
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InvitationServiceError::Authorization(AuthorizationDecision::Deny {
+                        reason: DenyReason::InactivePrincipal,
+                        disclosure: DisclosurePolicy::AuthenticationTerminal,
+                    })
+                ));
+                let persisted = invitation::Entity::find_by_id(invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(persisted.status, "pending");
+                assert!(persisted.expired_at.is_none());
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .filter(|event| event.action == "invitation_expired")
+                        .count(),
+                    0
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn member_revoke_surfaces_a_hidden_committed_expiration_for_postcommit_publish() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let service = InvitationService::new(
-            store.clone(),
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
-        .unwrap();
-        let member = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &member,
-                &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let invitation_id = created.invitation.invitation_id;
-        let proof = authorized_invitation(&store, &member, &invitation_id).await;
-        let now = chrono::Utc::now().fixed_offset();
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(now - chrono::Duration::seconds(2)),
-            )
-            .col_expr(
-                invitation::Column::ExpiresAt,
-                Expr::value(now - chrono::Duration::seconds(1)),
-            )
-            .filter(invitation::Column::Id.eq(invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let service = InvitationService::new(
+                    store.clone(),
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                let member = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &member,
+                        &authorized_grants(&store, &member, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let invitation_id = created.invitation.invitation_id;
+                let proof = authorized_invitation(&store, &member, &invitation_id).await;
+                let now = chrono::Utc::now().fixed_offset();
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(now - chrono::Duration::seconds(2)),
+                    )
+                    .col_expr(
+                        invitation::Column::ExpiresAt,
+                        Expr::value(now - chrono::Duration::seconds(1)),
+                    )
+                    .filter(invitation::Column::Id.eq(invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
 
-        let error = service
-            .revoke(
-                &member,
-                &proof,
-                InvitationRevokeParams {
-                    invitation_id: invitation_id.clone(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            InvitationServiceError::CommittedTerminalHidden(id) if id == invitation_id
-        ));
-        assert_eq!(
-            audit_event::Entity::find()
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|event| event.action == "invitation_expired")
-                .count(),
-            1
-        );
+                let error = service
+                    .revoke(
+                        &member,
+                        &proof,
+                        InvitationRevokeParams {
+                            invitation_id: invitation_id.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InvitationServiceError::CommittedTerminalHidden(id) if id == invitation_id
+                ));
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .filter(|event| event.action == "invitation_expired")
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn revoke_reauthorizes_actor_status_inside_the_transaction() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let member = member_a();
-        let service = InvitationService::new(
-            store.clone(),
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-            "127.0.0.1:17878",
-        )
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let member = member_a();
+                let service = InvitationService::new(
+                    store.clone(),
+                    Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                    "127.0.0.1:17878",
+                )
+                .unwrap();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &member,
+                        &authorized_grants(&store, &member, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let invitation_id = created.invitation.invitation_id;
+                let proof = authorized_invitation(&store, &member, &invitation_id).await;
+
+                gateway_principal::Entity::update_many()
+                    .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
+                    .filter(gateway_principal::Column::Id.eq(member.principal_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+
+                let error = service
+                    .revoke(
+                        &member,
+                        &proof,
+                        InvitationRevokeParams {
+                            invitation_id: invitation_id.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InvitationServiceError::Authorization(AuthorizationDecision::Deny {
+                        reason: DenyReason::InactivePrincipal,
+                        disclosure: DisclosurePolicy::AuthenticationTerminal,
+                    })
+                ));
+                assert_eq!(
+                    invitation::Entity::find_by_id(invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "pending"
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_revoked"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    0
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
         .unwrap();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &member,
-                &authorized_grants(&store, &member, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let invitation_id = created.invitation.invitation_id;
-        let proof = authorized_invitation(&store, &member, &invitation_id).await;
-
-        gateway_principal::Entity::update_many()
-            .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
-            .filter(gateway_principal::Column::Id.eq(member.principal_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-
-        let error = service
-            .revoke(
-                &member,
-                &proof,
-                InvitationRevokeParams {
-                    invitation_id: invitation_id.clone(),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            InvitationServiceError::Authorization(AuthorizationDecision::Deny {
-                reason: DenyReason::InactivePrincipal,
-                disclosure: DisclosurePolicy::AuthenticationTerminal,
-            })
-        ));
-        assert_eq!(
-            invitation::Entity::find_by_id(invitation_id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "pending"
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_revoked"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
     }
 
     #[tokio::test]
     async fn restricted_preview_is_pinned_safe_and_non_consuming_over_remote_ws() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "198.51.100.8:17878").unwrap();
-        let principal = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &principal,
-                &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "198.51.100.8:17878")
+                        .unwrap();
+                let principal = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &principal,
+                        &authorized_grants(&store, &principal, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
 
-        assert!(
-            InvitationService::preview_restricted(
-                &database,
-                &credentials,
-                &GatewayId::new("G00000000000000000099").unwrap(),
-                raw_credential.as_str(),
-                InvitationTransportSecurity::InsecureWs,
-            )
-            .await
-            .is_err()
-        );
+                assert!(
+                    InvitationService::preview_restricted(
+                        &database,
+                        &credentials,
+                        &GatewayId::new("G00000000000000000099").unwrap(),
+                        raw_credential.as_str(),
+                        InvitationTransportSecurity::InsecureWs,
+                    )
+                    .await
+                    .is_err()
+                );
 
-        let preview = InvitationService::preview_restricted(
-            &database,
-            &credentials,
-            &principal.gateway_id,
-            raw_credential.as_str(),
-            InvitationTransportSecurity::InsecureWs,
-        )
+                let preview = InvitationService::preview_restricted(
+                    &database,
+                    &credentials,
+                    &principal.gateway_id,
+                    raw_credential.as_str(),
+                    InvitationTransportSecurity::InsecureWs,
+                )
+                .await
+                .unwrap();
+                assert_eq!(preview.gateway_id, principal.gateway_id);
+                assert_eq!(preview.gateway_display_name, None);
+                assert_eq!(preview.inviter, created.invitation.inviter);
+                assert_eq!(preview.workspaces, created.invitation.workspaces);
+                assert_eq!(preview.expires_at_unix, created.invitation.expires_at_unix);
+                assert_eq!(preview.transport, InvitationTransportSecurity::InsecureWs);
+
+                let persisted =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(persisted.status, "pending");
+                assert_eq!(persisted.token_hash.as_ref().map(Vec::len), Some(32));
+                assert!(persisted.accepted_at.is_none());
+            }
+            .await;
+            Ok(())
+        })
         .await
         .unwrap();
-        assert_eq!(preview.gateway_id, principal.gateway_id);
-        assert_eq!(preview.gateway_display_name, None);
-        assert_eq!(preview.inviter, created.invitation.inviter);
-        assert_eq!(preview.workspaces, created.invitation.workspaces);
-        assert_eq!(preview.expires_at_unix, created.invitation.expires_at_unix);
-        assert_eq!(preview.transport, InvitationTransportSecurity::InsecureWs);
-
-        let persisted =
-            invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(persisted.status, "pending");
-        assert_eq!(persisted.token_hash.as_ref().map(Vec::len), Some(32));
-        assert!(persisted.accepted_at.is_none());
     }
 
     #[tokio::test]
     async fn preview_materializes_lost_member_authority_only_once() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
-                .unwrap();
-        let principal = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &principal,
-                &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-
-        workspace_membership::Entity::delete_many()
-            .filter(workspace_membership::Column::PrincipalId.eq(MEMBER_A_ID))
-            .filter(workspace_membership::Column::WorkspaceId.eq(WORKSPACE_RED_ID))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            assert!(
-                InvitationService::preview_restricted(
-                    &database,
-                    &credentials,
-                    &principal.gateway_id,
-                    raw_credential.as_str(),
-                    InvitationTransportSecurity::SecureWss,
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service = InvitationService::new(
+                    store.clone(),
+                    secrets.clone(),
+                    "http://127.0.0.1:17878",
                 )
-                .await
-                .is_err()
-            );
-        }
-
-        let persisted =
-            invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
                 .unwrap();
-        assert_eq!(persisted.status, "revoked");
-        assert_eq!(
-            persisted.revoke_reason.as_deref(),
-            Some("grant_authority_lost")
-        );
-        assert!(persisted.token_hash.is_none());
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|event| event.action == "invitation_revoked")
-                .count(),
-            1
-        );
+                let principal = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &principal,
+                        &authorized_grants(&store, &principal, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+
+                workspace_membership::Entity::delete_many()
+                    .filter(workspace_membership::Column::PrincipalId.eq(MEMBER_A_ID))
+                    .filter(workspace_membership::Column::WorkspaceId.eq(WORKSPACE_RED_ID))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                for _ in 0..2 {
+                    assert!(
+                        InvitationService::preview_restricted(
+                            &database,
+                            &credentials,
+                            &principal.gateway_id,
+                            raw_credential.as_str(),
+                            InvitationTransportSecurity::SecureWss,
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+
+                let persisted =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(persisted.status, "revoked");
+                assert_eq!(
+                    persisted.revoke_reason.as_deref(),
+                    Some("grant_authority_lost")
+                );
+                assert!(persisted.token_hash.is_none());
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    audits
+                        .iter()
+                        .filter(|event| event.action == "invitation_revoked")
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn preview_materializes_expiration_without_exposing_the_invitation() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
-                .unwrap();
-        let principal = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &principal,
-                &authorized_grants(&store, &principal, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(2)),
-            )
-            .col_expr(
-                invitation::Column::ExpiresAt,
-                Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1)),
-            )
-            .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-
-        for _ in 0..2 {
-            assert!(
-                InvitationService::preview_restricted(
-                    &database,
-                    &credentials,
-                    &principal.gateway_id,
-                    raw_credential.as_str(),
-                    InvitationTransportSecurity::SecureWss,
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service = InvitationService::new(
+                    store.clone(),
+                    secrets.clone(),
+                    "http://127.0.0.1:17878",
                 )
-                .await
-                .is_err()
-            );
-        }
-        let persisted =
-            invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
                 .unwrap();
-        assert_eq!(persisted.status, "expired");
-        assert!(persisted.token_hash.is_none());
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|event| event.action == "invitation_expired")
-                .count(),
-            1
-        );
+                let principal = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &principal,
+                        &authorized_grants(&store, &principal, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(
+                            chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(2),
+                        ),
+                    )
+                    .col_expr(
+                        invitation::Column::ExpiresAt,
+                        Expr::value(
+                            chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(1),
+                        ),
+                    )
+                    .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+
+                for _ in 0..2 {
+                    assert!(
+                        InvitationService::preview_restricted(
+                            &database,
+                            &credentials,
+                            &principal.gateway_id,
+                            raw_credential.as_str(),
+                            InvitationTransportSecurity::SecureWss,
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+                let persisted =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(persisted.status, "expired");
+                assert!(persisted.token_hash.is_none());
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    audits
+                        .iter()
+                        .filter(|event| event.action == "invitation_expired")
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn accept_atomically_creates_exact_registered_role_grants_session_and_audit() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
-                .unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![
-            WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
-            WorkspaceId::new(WORKSPACE_BLUE_ID).unwrap(),
-        ];
-        let target_role = RoleKey::new("synthetic_executor").unwrap();
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(target_role.clone(), workspace_ids.clone())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // An invitation can be accepted long after it was issued. Access
-        // starts at the newly committed grants, not the old invitation date.
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60)),
-            )
-            .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
-        let commit_probe = Arc::new(InvitationAcceptCommitProbe {
-            database: harness.database.clone(),
-            accepted_calls: AtomicUsize::new(0),
-            observed_committed_state: AtomicBool::new(false),
-        });
-        auth_service.set_invitation_accept_post_commit_hook(commit_probe.clone());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database).await.unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![
+                    WorkspaceId::new(WORKSPACE_RED_ID).unwrap(),
+                    WorkspaceId::new(WORKSPACE_BLUE_ID).unwrap(),
+                ];
+                let target_role = RoleKey::new("synthetic_executor").unwrap();
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(target_role.clone(), workspace_ids.clone())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // An invitation can be accepted long after it was issued. Access
+                // starts at the newly committed grants, not the old invitation date.
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60)),
+                    )
+                    .filter(invitation::Column::Id.eq(created.invitation.invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+                let commit_probe = Arc::new(InvitationAcceptCommitProbe {
+                    database: harness.database.clone(),
+                    accepted_calls: AtomicUsize::new(0),
+                    observed_committed_state: AtomicBool::new(false),
+                });
+                auth_service.set_invitation_accept_post_commit_hook(commit_probe.clone());
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                raw_credential.as_str(),
-                accept_params("new-member"),
-            ),
-        )
-        .await
-        .expect("post-commit hook must not run while the accept transaction is open")
-        .unwrap();
-
-        // Unread starts from the actual saved acceptance grants, not from
-        // presenting an invitation or opening the first device. No read receipt
-        // is created by granting access.
-        let grants = pioneer_entity::workspace_membership::Entity::find()
-            .filter(
-                pioneer_entity::workspace_membership::Column::PrincipalId
-                    .eq(response.member.principal_id.to_string()),
-            )
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(grants.len(), workspace_ids.len());
-        assert!(
-            grants
-                .iter()
-                .all(|grant| grant.created_at.timestamp()
-                    >= created.invitation.created_at_unix as i64)
-        );
-        assert!(
-            pioneer_entity::thread_read_cursor::Entity::find()
-                .filter(
-                    pioneer_entity::thread_read_cursor::Column::PrincipalId
-                        .eq(response.member.principal_id.to_string())
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        raw_credential.as_str(),
+                        accept_params("new-member"),
+                    ),
                 )
-                .all(&harness.database)
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(response.workspace_ids, workspace_ids);
-        assert_eq!(response.member.principal_id, response.grant.principal.id);
-        assert_eq!(response.member.role_key.as_ref(), Some(&target_role));
-        assert_eq!(response.grant.refresh_generation, 0);
-        assert_eq!(
-            response.grant.credential_storage_order,
-            pioneer_protocol::CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
-        );
-        let accepted = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(accepted.status, "accepted");
-        assert_eq!(accepted.target_role_key, target_role.as_str());
-        assert!(accepted.token_hash.is_none());
-        assert_eq!(
-            accepted.accepted_principal_id.as_deref(),
-            Some(response.member.principal_id.as_str())
-        );
-        assert_eq!(
-            accepted.accepted_device_id.as_deref(),
-            Some(response.grant.device.id.as_str())
-        );
-        assert_eq!(
-            accepted.accepted_session_id.as_deref(),
-            Some(response.grant.session.id.as_str())
-        );
-        let accepted_principal =
-            gateway_principal::Entity::find_by_id(response.member.principal_id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
+                .expect("post-commit hook must not run while the accept transaction is open")
                 .unwrap();
-        assert_eq!(
-            accepted_principal.role_key.as_deref(),
-            Some(target_role.as_str())
-        );
-        let memberships = workspace_membership::Entity::find()
-            .filter(
-                workspace_membership::Column::PrincipalId
-                    .eq(response.member.principal_id.to_string()),
-            )
-            .order_by_asc(workspace_membership::Column::WorkspaceId)
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            memberships
-                .iter()
-                .map(|row| row.workspace_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
-        );
-        let inbox_clock = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            memberships.iter().all(|row| {
-                row.inbox_after_sequence == Some(inbox_clock.completion_sequence)
-                    && row.created_at == accepted_principal.created_at
-            }),
-            "invitation acceptance persists each access start with the principal/session grant"
-        );
-        assert!(
-            device::Entity::find_by_id(response.grant.device.id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            auth_session::Entity::find_by_id(response.grant.session.id.to_string())
-                .one(&harness.database)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            auth_refresh_credential::Entity::find()
-                .filter(
-                    auth_refresh_credential::Column::SessionId.eq(response
-                        .grant
-                        .session
-                        .id
-                        .to_string()),
-                )
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_accepted"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(commit_probe.accepted_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            commit_probe.observed_committed_state.load(Ordering::SeqCst),
-            "post-commit projection must observe both accepted state and its durable audit"
-        );
+
+                // Unread starts from the actual saved acceptance grants, not from
+                // presenting an invitation or opening the first device. No read receipt
+                // is created by granting access.
+                let grants = pioneer_entity::workspace_membership::Entity::find()
+                    .filter(
+                        pioneer_entity::workspace_membership::Column::PrincipalId
+                            .eq(response.member.principal_id.to_string()),
+                    )
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(grants.len(), workspace_ids.len());
+                assert!(
+                    grants
+                        .iter()
+                        .all(|grant| grant.created_at.timestamp()
+                            >= created.invitation.created_at_unix as i64)
+                );
+                assert!(
+                    pioneer_entity::thread_read_cursor::Entity::find()
+                        .filter(
+                            pioneer_entity::thread_read_cursor::Column::PrincipalId
+                                .eq(response.member.principal_id.to_string())
+                        )
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(response.workspace_ids, workspace_ids);
+                assert_eq!(response.member.principal_id, response.grant.principal.id);
+                assert_eq!(response.member.role_key.as_ref(), Some(&target_role));
+                assert_eq!(response.grant.refresh_generation, 0);
+                assert_eq!(
+                    response.grant.credential_storage_order,
+                    pioneer_protocol::CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
+                );
+                let accepted = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(accepted.status, "accepted");
+                assert_eq!(accepted.target_role_key, target_role.as_str());
+                assert!(accepted.token_hash.is_none());
+                assert_eq!(
+                    accepted.accepted_principal_id.as_deref(),
+                    Some(response.member.principal_id.as_str())
+                );
+                assert_eq!(
+                    accepted.accepted_device_id.as_deref(),
+                    Some(response.grant.device.id.as_str())
+                );
+                assert_eq!(
+                    accepted.accepted_session_id.as_deref(),
+                    Some(response.grant.session.id.as_str())
+                );
+                let accepted_principal =
+                    gateway_principal::Entity::find_by_id(response.member.principal_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    accepted_principal.role_key.as_deref(),
+                    Some(target_role.as_str())
+                );
+                let memberships = workspace_membership::Entity::find()
+                    .filter(
+                        workspace_membership::Column::PrincipalId
+                            .eq(response.member.principal_id.to_string()),
+                    )
+                    .order_by_asc(workspace_membership::Column::WorkspaceId)
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    memberships
+                        .iter()
+                        .map(|row| row.workspace_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![WORKSPACE_RED_ID, WORKSPACE_BLUE_ID]
+                );
+                let inbox_clock = pioneer_entity::task_inbox_activation::Entity::find_by_id(1)
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    memberships.iter().all(|row| {
+                        row.inbox_after_sequence == Some(inbox_clock.completion_sequence)
+                            && row.created_at == accepted_principal.created_at
+                    }),
+                    "invitation acceptance persists each access start with the principal/session grant"
+                );
+                assert!(
+                    device::Entity::find_by_id(response.grant.device.id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    auth_session::Entity::find_by_id(response.grant.session.id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(
+                    auth_refresh_credential::Entity::find()
+                        .filter(
+                            auth_refresh_credential::Column::SessionId.eq(response
+                                .grant
+                                .session
+                                .id
+                                .to_string()),
+                        )
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_accepted"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(commit_probe.accepted_calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    commit_probe.observed_committed_state.load(Ordering::SeqCst),
+                    "post-commit projection must observe both accepted state and its durable audit"
+                );
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn nickname_collision_is_corrective_and_leaves_invitation_pending() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
-        let error = InvitationService::accept_restricted(
-            &database,
-            &credentials,
-            &auth_service,
-            &inviter.gateway_id,
-            created.presentation.token(),
-            accept_params("member-a"),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            InvitationAcceptServiceError::Corrective(InvitationErrorReason::NicknameUnavailable)
-        ));
-        let pending = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, "pending");
-        assert_eq!(pending.token_hash.as_ref().map(Vec::len), Some(32));
-        assert_eq!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("member-a"))
-                .all(&harness.database)
+                let error = InvitationService::accept_restricted(
+                    &database,
+                    &credentials,
+                    &auth_service,
+                    &inviter.gateway_id,
+                    created.presentation.token(),
+                    accept_params("member-a"),
+                )
                 .await
-                .unwrap()
-                .len(),
-            1
-        );
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    InvitationAcceptServiceError::Corrective(
+                        InvitationErrorReason::NicknameUnavailable
+                    )
+                ));
+                let pending =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(pending.status, "pending");
+                assert_eq!(pending.token_hash.as_ref().map(Vec::len), Some(32));
+                assert_eq!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("member-a"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn corrective_profile_avatar_and_installation_errors_do_not_consume_invitation() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
-        let mut invalid_profile = accept_params("corrective-profile");
-        invalid_profile.profile.display_name = "bad\nname".to_owned();
-        let mut invalid_avatar = accept_params("corrective-avatar");
-        invalid_avatar.profile.avatar =
-            Some(ProfileAvatarInput::new(ProfileAvatarMediaType::Png, "not-base64").unwrap());
-        let mut invalid_installation = accept_params("corrective-installation");
-        invalid_installation.installation.installation_id = "\0".to_owned();
+                let mut invalid_profile = accept_params("corrective-profile");
+                invalid_profile.profile.display_name = "bad\nname".to_owned();
+                let mut invalid_avatar = accept_params("corrective-avatar");
+                invalid_avatar.profile.avatar = Some(
+                    ProfileAvatarInput::new(ProfileAvatarMediaType::Png, "not-base64").unwrap(),
+                );
+                let mut invalid_installation = accept_params("corrective-installation");
+                invalid_installation.installation.installation_id = "\0".to_owned();
 
-        for (params, expected) in [
-            (invalid_profile, InvitationErrorReason::InvalidProfile),
-            (invalid_avatar, InvitationErrorReason::AvatarInvalid),
-            (
-                invalid_installation,
-                InvitationErrorReason::InvalidInstallation,
-            ),
-        ] {
-            let error = InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                created.presentation.token(),
-                params,
-            )
-            .await
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                InvitationAcceptServiceError::Corrective(reason) if reason == expected
-            ));
-        }
+                for (params, expected) in [
+                    (invalid_profile, InvitationErrorReason::InvalidProfile),
+                    (invalid_avatar, InvitationErrorReason::AvatarInvalid),
+                    (
+                        invalid_installation,
+                        InvitationErrorReason::InvalidInstallation,
+                    ),
+                ] {
+                    let error = InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        created.presentation.token(),
+                        params,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        InvitationAcceptServiceError::Corrective(reason) if reason == expected
+                    ));
+                }
 
-        let pending = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, "pending");
-        assert_eq!(pending.token_hash.as_ref().map(Vec::len), Some(32));
-        assert!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.is_in([
-                    "corrective-profile",
-                    "corrective-avatar",
-                    "corrective-installation",
-                ]),)
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                let pending =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(pending.status, "pending");
+                assert_eq!(pending.token_hash.as_ref().map(Vec::len), Some(32));
+                assert!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.is_in([
+                            "corrective-profile",
+                            "corrective-avatar",
+                            "corrective-installation",
+                        ]),)
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn first_session_failure_rolls_back_every_accept_row() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
-        auth_service.set_activation_failpoint(3);
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+                auth_service.set_activation_failpoint(3);
 
-        assert!(
-            InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                created.presentation.token(),
-                accept_params("rollback-member"),
-            )
-            .await
-            .is_err()
-        );
-        let pending = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, "pending");
-        assert!(pending.token_hash.is_some());
-        assert!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("rollback-member"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_accepted"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                assert!(
+                    InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        created.presentation.token(),
+                        accept_params("rollback-member"),
+                    )
+                    .await
+                    .is_err()
+                );
+                let pending =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(pending.status, "pending");
+                assert!(pending.token_hash.is_some());
+                assert!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("rollback-member"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_accepted"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn accept_reauthorizes_all_grants_and_terminally_revokes_lost_authority() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        workspace_membership::Entity::delete_many()
-            .filter(workspace_membership::Column::PrincipalId.eq(MEMBER_A_ID))
-            .filter(workspace_membership::Column::WorkspaceId.eq(WORKSPACE_RED_ID))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                workspace_membership::Entity::delete_many()
+                    .filter(workspace_membership::Column::PrincipalId.eq(MEMBER_A_ID))
+                    .filter(workspace_membership::Column::WorkspaceId.eq(WORKSPACE_RED_ID))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
-        assert!(matches!(
-            InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                created.presentation.token(),
-                accept_params("lost-authority-member"),
-            )
-            .await,
-            Err(InvitationAcceptServiceError::Unavailable)
-        ));
-        let revoked = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(revoked.status, "revoked");
-        assert_eq!(
-            revoked.revoke_reason.as_deref(),
-            Some("grant_authority_lost")
-        );
-        assert!(revoked.token_hash.is_none());
-        assert!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("lost-authority-member"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_revoked"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+                assert!(matches!(
+                    InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        created.presentation.token(),
+                        accept_params("lost-authority-member"),
+                    )
+                    .await,
+                    Err(InvitationAcceptServiceError::Unavailable)
+                ));
+                let revoked =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(revoked.status, "revoked");
+                assert_eq!(
+                    revoked.revoke_reason.as_deref(),
+                    Some("grant_authority_lost")
+                );
+                assert!(revoked.token_hash.is_none());
+                assert!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("lost-authority-member"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_revoked"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn accept_reloads_inviter_status_and_cannot_commit_after_suspension() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        gateway_principal::Entity::update_many()
-            .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
-            .filter(gateway_principal::Column::Id.eq(inviter.principal_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                gateway_principal::Entity::update_many()
+                    .col_expr(gateway_principal::Column::Status, Expr::value("suspended"))
+                    .filter(gateway_principal::Column::Id.eq(inviter.principal_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
-        assert!(matches!(
-            InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                created.presentation.token(),
-                accept_params("suspended-inviter-member"),
-            )
-            .await,
-            Err(InvitationAcceptServiceError::Unavailable)
-        ));
-        let revoked = invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(revoked.status, "revoked");
-        assert_eq!(
-            revoked.revoke_reason.as_deref(),
-            Some("inviter_unavailable")
-        );
-        assert!(revoked.token_hash.is_none());
-        assert!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("suspended-inviter-member"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                assert!(matches!(
+                    InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        created.presentation.token(),
+                        accept_params("suspended-inviter-member"),
+                    )
+                    .await,
+                    Err(InvitationAcceptServiceError::Unavailable)
+                ));
+                let revoked =
+                    invitation::Entity::find_by_id(created.invitation.invitation_id.to_string())
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(revoked.status, "revoked");
+                assert_eq!(
+                    revoked.revoke_reason.as_deref(),
+                    Some("inviter_unavailable")
+                );
+                assert!(revoked.token_hash.is_none());
+                assert!(
+                    gateway_principal::Entity::find()
+                        .filter(
+                            gateway_principal::Column::NicknameKey.eq("suspended-inviter-member")
+                        )
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     async fn assert_one_concurrent_accept_winner(contenders: usize) {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials =
-            Arc::new(OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap());
-        let auth_service = Arc::new(invitation_auth_service(&harness, secrets.as_ref()));
-        let raw_credential = created.presentation.token().to_owned();
-        let gateway_id = inviter.gateway_id.clone();
-        let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..contenders {
-            let database = database.clone();
-            let credentials = credentials.clone();
-            let auth_service = auth_service.clone();
-            let raw_credential = raw_credential.clone();
-            let gateway_id = gateway_id.clone();
-            tasks.spawn(async move {
-                InvitationService::accept_restricted(
-                    &database,
-                    credentials.as_ref(),
-                    auth_service.as_ref(),
-                    &gateway_id,
-                    raw_credential.as_str(),
-                    accept_params("concurrent-member"),
-                )
-                .await
-            });
-        }
-        let mut successes = 0;
-        while let Some(result) = tasks.join_next().await {
-            if result.unwrap().is_ok() {
-                successes += 1;
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials =
+                    Arc::new(OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap());
+                let auth_service = Arc::new(invitation_auth_service(&harness, secrets.as_ref()));
+                let raw_credential = created.presentation.token().to_owned();
+                let gateway_id = inviter.gateway_id.clone();
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..contenders {
+                    let database = database.clone();
+                    let credentials = credentials.clone();
+                    let auth_service = auth_service.clone();
+                    let raw_credential = raw_credential.clone();
+                    let gateway_id = gateway_id.clone();
+                    tasks.spawn(async move {
+                        InvitationService::accept_restricted(
+                            &database,
+                            credentials.as_ref(),
+                            auth_service.as_ref(),
+                            &gateway_id,
+                            raw_credential.as_str(),
+                            accept_params("concurrent-member"),
+                        )
+                        .await
+                    });
+                }
+                let mut successes = 0;
+                while let Some(result) = tasks.join_next().await {
+                    if result.unwrap().is_ok() {
+                        successes += 1;
+                    }
+                }
+                assert_eq!(successes, 1, "contenders={contenders}");
+                let principals = gateway_principal::Entity::find()
+                    .filter(gateway_principal::Column::NicknameKey.eq("concurrent-member"))
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(principals.len(), 1, "contenders={contenders}");
+                let principal_id = principals[0].id.clone();
+                assert_eq!(
+                    workspace_membership::Entity::find()
+                        .filter(workspace_membership::Column::PrincipalId.eq(principal_id.clone()))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "contenders={contenders}"
+                );
+                assert_eq!(
+                    device::Entity::find()
+                        .filter(device::Column::PrincipalId.eq(principal_id.clone()))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "contenders={contenders}"
+                );
+                assert_eq!(
+                    auth_session::Entity::find()
+                        .filter(auth_session::Column::PrincipalId.eq(principal_id))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "contenders={contenders}"
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_accepted"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "contenders={contenders}"
+                );
             }
-        }
-        assert_eq!(successes, 1, "contenders={contenders}");
-        let principals = gateway_principal::Entity::find()
-            .filter(gateway_principal::Column::NicknameKey.eq("concurrent-member"))
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(principals.len(), 1, "contenders={contenders}");
-        let principal_id = principals[0].id.clone();
-        assert_eq!(
-            workspace_membership::Entity::find()
-                .filter(workspace_membership::Column::PrincipalId.eq(principal_id.clone()))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "contenders={contenders}"
-        );
-        assert_eq!(
-            device::Entity::find()
-                .filter(device::Column::PrincipalId.eq(principal_id.clone()))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "contenders={contenders}"
-        );
-        assert_eq!(
-            auth_session::Entity::find()
-                .filter(auth_session::Column::PrincipalId.eq(principal_id))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "contenders={contenders}"
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_accepted"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "contenders={contenders}"
-        );
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3268,448 +3518,518 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_accept_and_revoke_commit_exactly_one_terminal_outcome() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        seed_superuser_session(&harness.database).await;
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let invitation_id = created.invitation.invitation_id;
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
-        let actor = superuser();
-        let revoke_proof = authorized_invitation(&store, &actor, &invitation_id).await;
-
-        let accept = InvitationService::accept_restricted(
-            &database,
-            &credentials,
-            &auth_service,
-            &inviter.gateway_id,
-            raw_credential.as_str(),
-            accept_params("accept-revoke-race"),
-        );
-        let revoke = service.revoke(
-            &actor,
-            &revoke_proof,
-            InvitationRevokeParams {
-                invitation_id: invitation_id.clone(),
-            },
-        );
-        let (accepted, revoked) = tokio::join!(accept, revoke);
-        let accepted = accepted.ok();
-        let revoked = revoked.unwrap();
-        assert_eq!(
-            usize::from(accepted.is_some()) + usize::from(revoked.response.changed),
-            1
-        );
-
-        let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(terminal.token_hash.is_none());
-        assert_eq!(
-            terminal.status,
-            if accepted.is_some() {
-                "accepted"
-            } else {
-                "revoked"
-            }
-        );
-        assert_eq!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("accept-revoke-race"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            usize::from(accepted.is_some())
-        );
-        let audits = audit_event::Entity::find()
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(
-            audits
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event.action.as_str(),
-                        "invitation_accepted" | "invitation_revoked"
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                seed_superuser_session(&harness.database).await;
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
                     )
-                })
-                .count(),
-            1
-        );
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let invitation_id = created.invitation.invitation_id;
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+                let actor = superuser();
+                let revoke_proof = authorized_invitation(&store, &actor, &invitation_id).await;
+
+                let accept = InvitationService::accept_restricted(
+                    &database,
+                    &credentials,
+                    &auth_service,
+                    &inviter.gateway_id,
+                    raw_credential.as_str(),
+                    accept_params("accept-revoke-race"),
+                );
+                let revoke = service.revoke(
+                    &actor,
+                    &revoke_proof,
+                    InvitationRevokeParams {
+                        invitation_id: invitation_id.clone(),
+                    },
+                );
+                let (accepted, revoked) = tokio::join!(accept, revoke);
+                let accepted = accepted.ok();
+                let revoked = revoked.unwrap();
+                assert_eq!(
+                    usize::from(accepted.is_some()) + usize::from(revoked.response.changed),
+                    1
+                );
+
+                let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(terminal.token_hash.is_none());
+                assert_eq!(
+                    terminal.status,
+                    if accepted.is_some() {
+                        "accepted"
+                    } else {
+                        "revoked"
+                    }
+                );
+                assert_eq!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("accept-revoke-race"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(accepted.is_some())
+                );
+                let audits = audit_event::Entity::find()
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    audits
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event.action.as_str(),
+                                "invitation_accepted" | "invitation_revoked"
+                            )
+                        })
+                        .count(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_accept_and_inviter_access_loss_follow_commit_order() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        seed_superuser_session(&harness.database).await;
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let invitation_service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let member_service = MemberService::new(store.clone(), secrets.clone());
-        let inviter = member_a();
-        let workspace_id = WorkspaceId::new(WORKSPACE_RED_ID).unwrap();
-        let created = invitation_service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id)).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), vec![workspace_id.clone()])
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let invitation_id = created.invitation.invitation_id;
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
-        let actor = superuser();
-        let remove_proof = authorized_workspace(
-            &store,
-            &actor,
-            ResourceAction::WorkspaceMemberRemove,
-            &workspace_id,
-        )
-        .await;
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                seed_superuser_session(&harness.database).await;
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let invitation_service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let member_service = MemberService::new(store.clone(), secrets.clone());
+                let inviter = member_a();
+                let workspace_id = WorkspaceId::new(WORKSPACE_RED_ID).unwrap();
+                let created = invitation_service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id))
+                            .await,
+                        InvitationCreateParams::new_for_role(
+                            RoleKey::member(),
+                            vec![workspace_id.clone()],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let invitation_id = created.invitation.invitation_id;
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+                let actor = superuser();
+                let remove_proof = authorized_workspace(
+                    &store,
+                    &actor,
+                    ResourceAction::WorkspaceMemberRemove,
+                    &workspace_id,
+                )
+                .await;
 
-        let accept = InvitationService::accept_restricted(
-            &database,
-            &credentials,
-            &auth_service,
-            &inviter.gateway_id,
-            raw_credential.as_str(),
-            accept_params("access-loss-race"),
-        );
-        let remove = member_service.workspace_remove(
-            &actor,
-            &remove_proof,
-            WorkspaceMemberRemoveParams {
-                workspace_id: workspace_id.clone(),
-                principal_id: inviter.principal_id.clone(),
-            },
-        );
-        let (accepted, removed) = tokio::join!(accept, remove);
-        let accepted = accepted.ok();
-        let removed = removed.unwrap();
-        assert!(removed.response.changed);
+                let accept = InvitationService::accept_restricted(
+                    &database,
+                    &credentials,
+                    &auth_service,
+                    &inviter.gateway_id,
+                    raw_credential.as_str(),
+                    accept_params("access-loss-race"),
+                );
+                let remove = member_service.workspace_remove(
+                    &actor,
+                    &remove_proof,
+                    WorkspaceMemberRemoveParams {
+                        workspace_id: workspace_id.clone(),
+                        principal_id: inviter.principal_id.clone(),
+                    },
+                );
+                let (accepted, removed) = tokio::join!(accept, remove);
+                let accepted = accepted.ok();
+                let removed = removed.unwrap();
+                assert!(removed.response.changed);
 
-        let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(terminal.token_hash.is_none());
-        assert_eq!(
-            terminal.status,
-            if accepted.is_some() {
-                "accepted"
-            } else {
-                "revoked"
+                let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(terminal.token_hash.is_none());
+                assert_eq!(
+                    terminal.status,
+                    if accepted.is_some() {
+                        "accepted"
+                    } else {
+                        "revoked"
+                    }
+                );
+                if accepted.is_none() {
+                    assert_eq!(
+                        terminal.revoke_reason.as_deref(),
+                        Some("grant_authority_lost")
+                    );
+                }
+                let accepted_members = gateway_principal::Entity::find()
+                    .filter(gateway_principal::Column::NicknameKey.eq("access-loss-race"))
+                    .all(&harness.database)
+                    .await
+                    .unwrap();
+                assert_eq!(accepted_members.len(), usize::from(accepted.is_some()));
+                if let Some(member) = accepted_members.first() {
+                    assert!(
+                        workspace_membership::Entity::find()
+                            .filter(
+                                workspace_membership::Column::WorkspaceId
+                                    .eq(workspace_id.to_string())
+                            )
+                            .filter(workspace_membership::Column::PrincipalId.eq(&member.id))
+                            .one(&harness.database)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                assert!(
+                    workspace_membership::Entity::find()
+                        .filter(
+                            workspace_membership::Column::WorkspaceId.eq(workspace_id.to_string())
+                        )
+                        .filter(
+                            workspace_membership::Column::PrincipalId
+                                .eq(inviter.principal_id.to_string())
+                        )
+                        .one(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("workspace_member_removed"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_accepted"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(accepted.is_some())
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_revoked"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(accepted.is_none())
+                );
             }
-        );
-        if accepted.is_none() {
-            assert_eq!(
-                terminal.revoke_reason.as_deref(),
-                Some("grant_authority_lost")
-            );
-        }
-        let accepted_members = gateway_principal::Entity::find()
-            .filter(gateway_principal::Column::NicknameKey.eq("access-loss-race"))
-            .all(&harness.database)
-            .await
-            .unwrap();
-        assert_eq!(accepted_members.len(), usize::from(accepted.is_some()));
-        if let Some(member) = accepted_members.first() {
-            assert!(
-                workspace_membership::Entity::find_by_id((
-                    member.id.clone(),
-                    workspace_id.to_string(),
-                ))
-                .one(&harness.database)
-                .await
-                .unwrap()
-                .is_some()
-            );
-        }
-        assert!(
-            workspace_membership::Entity::find_by_id((
-                inviter.principal_id.to_string(),
-                workspace_id.to_string(),
-            ))
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .is_none()
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("workspace_member_removed"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_accepted"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            usize::from(accepted.is_some())
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_revoked"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            usize::from(accepted.is_none())
-        );
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_accept_and_inviter_removal_follow_commit_order() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        seed_superuser_session(&harness.database).await;
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let invitation_service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let member_service = MemberService::new(store.clone(), secrets.clone());
-        let inviter = member_a();
-        let workspace_id = WorkspaceId::new(WORKSPACE_RED_ID).unwrap();
-        let created = invitation_service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id)).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), vec![workspace_id.clone()])
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let raw_credential = created.presentation.token().to_owned();
-        let invitation_id = created.invitation.invitation_id;
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
-        let actor = superuser();
-        let remove_proof = authorized_member_principal(
-            &store,
-            &actor,
-            ResourceAction::MemberRemove,
-            &inviter.principal_id,
-        )
-        .await;
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                seed_superuser_session(&harness.database).await;
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let invitation_service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let member_service = MemberService::new(store.clone(), secrets.clone());
+                let inviter = member_a();
+                let workspace_id = WorkspaceId::new(WORKSPACE_RED_ID).unwrap();
+                let created = invitation_service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, std::slice::from_ref(&workspace_id))
+                            .await,
+                        InvitationCreateParams::new_for_role(
+                            RoleKey::member(),
+                            vec![workspace_id.clone()],
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let raw_credential = created.presentation.token().to_owned();
+                let invitation_id = created.invitation.invitation_id;
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+                let actor = superuser();
+                let remove_proof = authorized_member_principal(
+                    &store,
+                    &actor,
+                    ResourceAction::MemberRemove,
+                    &inviter.principal_id,
+                )
+                .await;
 
-        let accept = InvitationService::accept_restricted(
-            &database,
-            &credentials,
-            &auth_service,
-            &inviter.gateway_id,
-            raw_credential.as_str(),
-            accept_params("inviter-removal-race"),
-        );
-        let remove = member_service.remove(
-            &actor,
-            &remove_proof,
-            MemberRemoveParams {
-                principal_id: inviter.principal_id.clone(),
-                expected_status: None,
-            },
-        );
-        let (accepted, removed) = tokio::join!(accept, remove);
-        let accepted = accepted.ok();
-        let removed = removed.unwrap();
-        assert!(removed.response.changed);
-        assert_eq!(removed.response.member.status, PrincipalStatus::Removed);
-        assert_eq!(
-            removed.changed_invitation_ids,
-            if accepted.is_some() {
-                Vec::new()
-            } else {
-                vec![invitation_id.clone()]
-            }
-        );
+                let accept = InvitationService::accept_restricted(
+                    &database,
+                    &credentials,
+                    &auth_service,
+                    &inviter.gateway_id,
+                    raw_credential.as_str(),
+                    accept_params("inviter-removal-race"),
+                );
+                let remove = member_service.remove(
+                    &actor,
+                    &remove_proof,
+                    MemberRemoveParams {
+                        principal_id: inviter.principal_id.clone(),
+                        expected_status: None,
+                    },
+                );
+                let (accepted, removed) = tokio::join!(accept, remove);
+                let accepted = accepted.ok();
+                let removed = removed.unwrap();
+                assert!(removed.response.changed);
+                assert_eq!(removed.response.member.status, PrincipalStatus::Removed);
+                assert_eq!(
+                    removed.changed_invitation_ids,
+                    if accepted.is_some() {
+                        Vec::new()
+                    } else {
+                        vec![invitation_id.clone()]
+                    }
+                );
 
-        let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(terminal.token_hash.is_none());
-        assert_eq!(
-            terminal.status,
-            if accepted.is_some() {
-                "accepted"
-            } else {
-                "revoked"
+                let terminal = invitation::Entity::find_by_id(invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(terminal.token_hash.is_none());
+                assert_eq!(
+                    terminal.status,
+                    if accepted.is_some() {
+                        "accepted"
+                    } else {
+                        "revoked"
+                    }
+                );
+                if accepted.is_none() {
+                    assert_eq!(
+                        terminal.revoke_reason.as_deref(),
+                        Some("inviter_unavailable")
+                    );
+                }
+                assert_eq!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("inviter-removal-race"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(accepted.is_some())
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("member_removed"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_accepted"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    usize::from(accepted.is_some())
+                );
             }
-        );
-        if accepted.is_none() {
-            assert_eq!(
-                terminal.revoke_reason.as_deref(),
-                Some("inviter_unavailable")
-            );
-        }
-        assert_eq!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("inviter-removal-race"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            usize::from(accepted.is_some())
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("member_removed"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_accepted"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            usize::from(accepted.is_some())
-        );
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn accept_loses_to_committed_expiry_without_partial_identity() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let database = store.database_connection();
-        let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
-        let service =
-            InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
-        let inviter = member_a();
-        let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
-        let created = service
-            .create(
-                &inviter,
-                &authorized_grants(&store, &inviter, &workspace_ids).await,
-                InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids).unwrap(),
-            )
-            .await
-            .unwrap();
-        let invitation_id = created.invitation.invitation_id;
-        let raw_credential = created.presentation.token().to_owned();
-        let now = chrono::Utc::now().fixed_offset();
-        invitation::Entity::update_many()
-            .col_expr(
-                invitation::Column::CreatedAt,
-                Expr::value(now - chrono::Duration::seconds(2)),
-            )
-            .col_expr(
-                invitation::Column::ExpiresAt,
-                Expr::value(now - chrono::Duration::seconds(1)),
-            )
-            .filter(invitation::Column::Id.eq(invitation_id.to_string()))
-            .exec(&harness.database)
-            .await
-            .unwrap();
-        let credential_key = secrets
-            .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
-            .unwrap();
-        let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
-        let auth_service = invitation_auth_service(&harness, secrets.as_ref());
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let database = store.database_connection();
+                let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
+                let service =
+                    InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878")
+                        .unwrap();
+                let inviter = member_a();
+                let workspace_ids = vec![WorkspaceId::new(WORKSPACE_RED_ID).unwrap()];
+                let created = service
+                    .create(
+                        &inviter,
+                        &authorized_grants(&store, &inviter, &workspace_ids).await,
+                        InvitationCreateParams::new_for_role(RoleKey::member(), workspace_ids)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let invitation_id = created.invitation.invitation_id;
+                let raw_credential = created.presentation.token().to_owned();
+                let now = chrono::Utc::now().fixed_offset();
+                invitation::Entity::update_many()
+                    .col_expr(
+                        invitation::Column::CreatedAt,
+                        Expr::value(now - chrono::Duration::seconds(2)),
+                    )
+                    .col_expr(
+                        invitation::Column::ExpiresAt,
+                        Expr::value(now - chrono::Duration::seconds(1)),
+                    )
+                    .filter(invitation::Column::Id.eq(invitation_id.to_string()))
+                    .exec(&harness.database)
+                    .await
+                    .unwrap();
+                let credential_key = secrets
+                    .load_or_create_auth_credential_hmac_key(INVITATION_CREDENTIAL_KEY_MIN_BYTES)
+                    .unwrap();
+                let credentials = OpaqueCredentialFactory::new(credential_key.as_bytes()).unwrap();
+                let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
-        assert!(matches!(
-            InvitationService::accept_restricted(
-                &database,
-                &credentials,
-                &auth_service,
-                &inviter.gateway_id,
-                raw_credential.as_str(),
-                accept_params("expired-accept"),
-            )
-            .await,
-            Err(InvitationAcceptServiceError::Unavailable)
-        ));
-        let expired = invitation::Entity::find_by_id(invitation_id.to_string())
-            .one(&harness.database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(expired.status, "expired");
-        assert!(expired.token_hash.is_none());
-        assert!(
-            gateway_principal::Entity::find()
-                .filter(gateway_principal::Column::NicknameKey.eq("expired-accept"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            audit_event::Entity::find()
-                .filter(audit_event::Column::Action.eq("invitation_expired"))
-                .all(&harness.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+                assert!(matches!(
+                    InvitationService::accept_restricted(
+                        &database,
+                        &credentials,
+                        &auth_service,
+                        &inviter.gateway_id,
+                        raw_credential.as_str(),
+                        accept_params("expired-accept"),
+                    )
+                    .await,
+                    Err(InvitationAcceptServiceError::Unavailable)
+                ));
+                let expired = invitation::Entity::find_by_id(invitation_id.to_string())
+                    .one(&harness.database)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(expired.status, "expired");
+                assert!(expired.token_hash.is_none());
+                assert!(
+                    gateway_principal::Entity::find()
+                        .filter(gateway_principal::Column::NicknameKey.eq("expired-accept"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    audit_event::Entity::find()
+                        .filter(audit_event::Column::Action.eq("invitation_expired"))
+                        .all(&harness.database)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn malformed_unknown_and_terminal_credentials_share_unavailable_preview() {
-        let harness = IsolatedEpic4Harness::populated().await.unwrap();
-        let database = SqliteDatabase::from_single_connection(harness.database.clone());
-        let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
-        let credentials = OpaqueCredentialFactory::new(key.as_bytes()).unwrap();
-        let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
-        for credential in [
-            "not-an-invitation".to_owned(),
-            credentials.generate_invitation().expose_secret().to_owned(),
-        ] {
-            assert!(
-                InvitationService::preview_restricted(
-                    &database,
-                    &credentials,
-                    &gateway_id,
-                    credential.as_str(),
-                    InvitationTransportSecurity::SecureWss,
-                )
-                .await
-                .is_err()
-            );
-        }
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::populated(test_database)
+                    .await
+                    .unwrap();
+                let database = SqliteDatabase::from_single_connection(harness.database.clone());
+                let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
+                let credentials = OpaqueCredentialFactory::new(key.as_bytes()).unwrap();
+                let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
+                for credential in [
+                    "not-an-invitation".to_owned(),
+                    credentials.generate_invitation().expose_secret().to_owned(),
+                ] {
+                    assert!(
+                        InvitationService::preview_restricted(
+                            &database,
+                            &credentials,
+                            &gateway_id,
+                            credential.as_str(),
+                            InvitationTransportSecurity::SecureWss,
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

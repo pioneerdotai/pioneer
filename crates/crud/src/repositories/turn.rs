@@ -9,9 +9,11 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
-    JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, JoinType,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
 };
+#[cfg(test)]
+use sea_orm::{DatabaseBackend, Statement};
 
 use crate::convention::{
     PersistedTurnSendMode, canonical_turn_mentions_json, input_type_and_text,
@@ -32,163 +34,12 @@ pub struct TurnMessageGuard {
     pub message_deleted_at: Option<DateTimeWithTimeZone>,
 }
 
-/// Metadata only: no command arguments, tool output or provider prompt.
-pub struct PostTurnToolSummary {
-    pub item_id: String,
-    pub item_type: pioneer_protocol::TurnItemType,
-    pub tool_name: String,
-    pub attempt_number: u32,
-    pub success: bool,
-    pub outcome_status: Option<pioneer_protocol::ToolOutcomeStatus>,
-    pub error_class: Option<pioneer_protocol::ToolErrorClass>,
-}
+pub use pioneer_crud_conversations::tool_summary::{
+    PostTurnToolSummary, list as post_turn_tool_summaries,
+};
 
-#[derive(FromQueryResult)]
-struct PostTurnToolCandidate {
-    #[sea_orm(nested)]
-    row: turn_item::Model,
-    cursor_created_at: String,
-}
+pub use pioneer_crud_conversations::turn_input::post_turn_user_text;
 
-pub async fn post_turn_tool_summaries(
-    db: &pioneer_sqlite::SqliteDatabase,
-    turn_id: &str,
-    limit: usize,
-) -> Result<Vec<PostTurnToolSummary>> {
-    let limit = limit.clamp(1, 129);
-    // The former SQL projection retained only small fields. Hydrate one body
-    // at a time so large portable results cannot accumulate while filtering.
-    const PAGE_ROWS: u64 = 1;
-    let mut result = Vec::new();
-    // SQLite orders the stored TEXT. Re-encoding its timestamp through chrono
-    // can change that text (for example T/Z to spaces/+00:00) and repeat a page.
-    let mut after: Option<(String, String)> = None;
-    loop {
-        let mut query = turn_item::Entity::find()
-            .filter(turn_item::Column::TurnId.eq(turn_id))
-            .filter(turn_item::Column::Status.is_in(["completed", "failed"]))
-            .order_by_asc(turn_item::Column::CreatedAt)
-            .order_by_asc(turn_item::Column::ItemId)
-            .limit(PAGE_ROWS);
-        if let Some((time, id)) = &after {
-            query = query.filter(
-                Condition::any()
-                    .add(turn_item::Column::CreatedAt.gt(time.clone()))
-                    .add(
-                        Condition::all()
-                            .add(turn_item::Column::CreatedAt.eq(time.clone()))
-                            .add(turn_item::Column::ItemId.gt(id)),
-                    ),
-            );
-        }
-        let (rows, cursor) = crate::CrudStore::new(db.clone())
-            .run_scoped_database_quantum(|| async {
-                let candidates = query
-                    .clone()
-                    .expr_as(
-                        Expr::col((turn_item::Entity, turn_item::Column::CreatedAt))
-                            .cast_as(Alias::new("TEXT")),
-                        "cursor_created_at",
-                    )
-                    .into_model::<PostTurnToolCandidate>()
-                    .all(db)
-                    .await?;
-                let cursor = candidates
-                    .last()
-                    .map(|c| (c.cursor_created_at.clone(), c.row.item_id.clone()));
-                let rows = super::turn_payload::hydrate_items(
-                    db,
-                    candidates.into_iter().map(|c| c.row).collect(),
-                )
-                .await?;
-                Ok((rows, cursor))
-            })
-            .await?;
-        let eof = rows.len() < PAGE_ROWS as usize;
-        after = cursor;
-        for row in rows {
-            let value = super::turn_payload::json1_value(&row.payload)?;
-            let Some(tool) = value.get("toolName").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(success) = value.get("success").and_then(|v| v.as_bool()) else {
-                continue;
-            };
-            result.push(PostTurnToolSummary {
-                item_id: row.item_id,
-                item_type: crate::convention::turn_item_type_from_db(&row.item_type)
-                    .context("unknown post-turn tool item type")?,
-                tool_name: tool
-                    .split('\0')
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(160)
-                    .collect(),
-                attempt_number: u32::try_from(row.active_attempt_number)?,
-                success,
-                outcome_status: value
-                    .pointer("/outcome/status")
-                    .filter(|v| !v.is_null())
-                    .map(|v| serde_json::from_value(v.clone()))
-                    .transpose()?,
-                error_class: value
-                    .pointer("/outcome/errorClass")
-                    .filter(|v| !v.is_null())
-                    .map(|v| serde_json::from_value(v.clone()))
-                    .transpose()?,
-            });
-            if result.len() == limit {
-                return Ok(result);
-            }
-        }
-        if eof {
-            return Ok(result);
-        }
-    }
-}
-
-/// Bounded original user messages for post-turn processing. Read the canonical
-/// turn input, never a CLI prompt with injected instructions/history. Text extraction
-/// in SQLite avoids loading attachments and unbounded message payloads.
-pub async fn post_turn_user_text<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    max_chars: usize,
-) -> Result<(String, bool)> {
-    let max_chars = max_chars.clamp(1, 32_768);
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT substr(text, 1, ?) AS text, length(text) AS char_count \
-         FROM turn_input WHERE turn_id = ? AND input_type = 'text' \
-         ORDER BY input_index ASC LIMIT 65",
-            [(max_chars as i64).into(), turn_id.into()],
-        ))
-        .await
-        .context("failed to read bounded post-turn user messages")?;
-    let mut truncated = rows.len() > 64;
-    let mut text = String::new();
-    let mut remaining = max_chars;
-    for row in rows.into_iter().take(64) {
-        let part: String = row.try_get("", "text")?;
-        let char_count: i64 = row.try_get("", "char_count")?;
-        if !text.is_empty() && !part.is_empty() {
-            if remaining > 0 {
-                text.push('\n');
-                remaining -= 1;
-            } else {
-                truncated = true;
-            }
-        }
-        let kept: String = part.chars().take(remaining).collect();
-        let count = kept.chars().count();
-        truncated |= char_count > count as i64;
-        text.push_str(&kept);
-        remaining -= count;
-    }
-    Ok((text, truncated))
-}
 const TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES: usize = 1_048_576;
 const TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES: usize = 4_096;
 
@@ -330,71 +181,10 @@ pub async fn find_turn_work_owner<C: ConnectionTrait>(
         .transpose()
 }
 
-/// Durable facts used by execution binding checks, without presentation or
-/// permission snapshots. Unknown authority enums must never become defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnExecutionBinding {
-    pub id: String,
-    pub turn_kind: TurnKind,
-    pub origin: pioneer_protocol::TurnOrigin,
-    pub work_owner: TurnWorkOwner,
-}
-
-pub async fn find_turn_execution_binding<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<Option<TurnExecutionBinding>> {
-    let row = turn::Entity::find_by_id(turn_id.to_owned())
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .select_only()
-        .columns([
-            turn::Column::Id,
-            turn::Column::Status,
-            turn::Column::TurnKind,
-            turn::Column::Origin,
-            turn::Column::WorkOwner,
-        ])
-        .into_tuple::<(String, String, String, String, String)>()
-        .one(db)
-        .await
-        .context("failed to query turn execution binding")?;
-    row.map(|(id, status, kind, origin, work_owner)| {
-        // Preserve the full Turn decoder's rejection of an unknown status even
-        // for ancestor bindings, whose liveness is not otherwise required.
-        crate::convention::turn_status_from_db(&status)
-            .context("unknown execution binding turn status")?;
-        Ok(TurnExecutionBinding {
-            id,
-            turn_kind: crate::convention::turn_kind_from_db(&kind)
-                .context("unknown execution binding turn kind")?,
-            origin: crate::convention::turn_origin_from_db(&origin)
-                .context("unknown execution binding turn origin")?,
-            work_owner: TurnWorkOwner::from_db_str(&work_owner).map_err(anyhow::Error::msg)?,
-        })
-    })
-    .transpose()
-}
-
-pub async fn find_turn_execution_status<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<Option<TurnStatus>> {
-    let status = turn::Entity::find_by_id(turn_id.to_owned())
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .select_only()
-        .column(turn::Column::Status)
-        .into_tuple::<String>()
-        .one(db)
-        .await
-        .context("failed to query turn execution status")?;
-    status
-        .map(|status| {
-            crate::convention::turn_status_from_db(&status).context("unknown execution turn status")
-        })
-        .transpose()
-}
+pub use pioneer_crud_access::turn_execution::{
+    TurnExecutionBinding, find_turn_execution_authorization_context, find_turn_execution_binding,
+    find_turn_execution_status, find_turn_initiator,
+};
 
 pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
     db: &C,
@@ -568,27 +358,6 @@ pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
         updated_at,
     )
     .await
-}
-
-pub async fn find_turn_initiator<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-) -> Result<Option<PersistedActorRef>> {
-    let Some((actor_kind, actor_id)) = turn::Entity::find_by_id(turn_id.to_owned())
-        .select_only()
-        .columns([
-            turn::Column::InitiatedByActorKind,
-            turn::Column::InitiatedByActorId,
-        ])
-        .into_tuple::<(Option<String>, Option<String>)>()
-        .one(db)
-        .await
-        .context("failed to query turn by id")?
-    else {
-        return Ok(None);
-    };
-    actor_ref_from_db(actor_kind.as_deref(), actor_id.as_deref())
-        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -797,6 +566,8 @@ async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
     };
 
     let row = turn::ActiveModel {
+        insertion_ordinal: Default::default(),
+        publication_xid: Default::default(),
         package_selection_json: Set(None),
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
@@ -1100,8 +871,7 @@ pub async fn set_turn_execution_security_snapshot<C: ConnectionTrait>(
     turn_id: &str,
     snapshot: &TurnExecutionSecuritySnapshot,
 ) -> Result<bool> {
-    let version = i32::try_from(snapshot.version)
-        .context("turn execution security snapshot version exceeds database integer range")?;
+    let version = i64::from(snapshot.version);
     let snapshot_json = serde_json::to_string(snapshot)
         .context("failed to serialize turn execution security snapshot to json")?;
 
@@ -1128,14 +898,9 @@ pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
     snapshot: &TurnExecutionSecuritySnapshot,
     authorization_context_json: &str,
 ) -> Result<bool> {
-    let version = i32::try_from(snapshot.version)
-        .context("turn execution security snapshot version exceeds database integer range")?;
+    let version = i64::from(snapshot.version);
     let snapshot_json = serde_json::to_string(snapshot)
         .context("failed to serialize turn execution security snapshot to json")?;
-    let authorization_context_json = authorization_context_json.trim();
-    if authorization_context_json.is_empty() {
-        anyhow::bail!("execution authorization context must not be empty");
-    }
     let update_result = turn::Entity::update_many()
         .filter(turn::Column::Id.eq(turn_id.to_owned()))
         .col_expr(
@@ -1148,51 +913,14 @@ pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
         )
         .col_expr(
             turn::Column::ExecutionAuthorizationContextJson,
-            Expr::value(authorization_context_json.to_owned()),
+            pioneer_crud_execution::turn_envelope::authorization_context_value(
+                authorization_context_json,
+            )?,
         )
         .exec(db)
         .await
         .context("failed to update turn execution envelope")?;
     Ok(update_result.rows_affected > 0)
-}
-
-/// Initialize only the missing Native/API financial cap in an existing owned
-/// execution snapshot. JSON functions are SeaQuery expressions inside Entity
-/// update; the condition makes concurrent legacy recovery initialization first-wins.
-/// No other security fields or versions are replaced by a stale caller.
-pub(crate) async fn pin_turn_native_context<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    turn_id: &str,
-    budget_json: &str,
-    summary_json: &str,
-) -> Result<bool> {
-    let result = turn::Entity::update_many()
-        .filter(turn::Column::Id.eq(turn_id))
-        .filter(turn::Column::ThreadId.in_subquery(
-            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
-                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
-        ))
-        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_type(execution_security_snapshot_json)='object' AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NULL"))
-        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
-            Expr::cust_with_values("json_set(execution_security_snapshot_json,'$.native_context',json(?),'$.native_summary',json(?))",
-                [budget_json.to_owned(), summary_json.to_owned()]))
-        .exec(db).await?;
-    // Legacy context-tier snapshots already have a pinned cap. Fill only the
-    // missing service plan; never replace that cap or any authorization fields.
-    // Values were serialized before writer acquisition by CrudStore.
-    let mode_result = turn::Entity::update_many()
-        .filter(turn::Column::Id.eq(turn_id))
-        .filter(turn::Column::ThreadId.in_subquery(
-            pioneer_entity::thread::Entity::find().select_only().column(pioneer_entity::thread::Column::Id)
-                .filter(pioneer_entity::thread::Column::WorkspaceId.eq(workspace)).into_query(),
-        ))
-        .filter(Expr::cust("json_valid(execution_security_snapshot_json) AND json_extract(execution_security_snapshot_json,'$.backend.execution_backend')='native' AND json_extract(execution_security_snapshot_json,'$.native_context') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.service_mode') IS NULL"))
-        .filter(Expr::cust_with_values("json_extract(?,'$.service_mode') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_context.instance')=json_extract(?,'$.instance') AND json_extract(execution_security_snapshot_json,'$.native_context.model')=json_extract(?,'$.model') AND json_extract(execution_security_snapshot_json,'$.native_context.authority') IS json_extract(?,'$.authority')", [budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned(),budget_json.to_owned()]))
-        .col_expr(turn::Column::ExecutionSecuritySnapshotJson,
-            Expr::cust_with_values("CASE WHEN json_extract(execution_security_snapshot_json,'$.native_summary') IS NOT NULL AND json_extract(execution_security_snapshot_json,'$.native_summary.budget.service_mode') IS NULL THEN json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode'),'$.native_summary.budget.service_mode',json_extract(?,'$.budget.service_mode')) ELSE json_set(execution_security_snapshot_json,'$.native_context.service_mode',json_extract(?,'$.service_mode')) END", [budget_json.to_owned(),summary_json.to_owned(),budget_json.to_owned()]))
-        .exec(db).await?;
-    Ok(result.rows_affected > 0 || mode_result.rows_affected > 0)
 }
 
 pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
@@ -1231,35 +959,16 @@ pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
     turn_id: &str,
     context_json: &str,
 ) -> Result<bool> {
-    let context_json = context_json.trim();
-    if context_json.is_empty() {
-        anyhow::bail!("execution authorization context must not be empty");
-    }
     let update_result = turn::Entity::update_many()
         .filter(turn::Column::Id.eq(turn_id.to_owned()))
         .col_expr(
             turn::Column::ExecutionAuthorizationContextJson,
-            Expr::value(context_json.to_owned()),
+            pioneer_crud_execution::turn_envelope::authorization_context_value(context_json)?,
         )
         .exec(db)
         .await
         .context("failed to update turn execution authorization context")?;
     Ok(update_result.rows_affected > 0)
-}
-
-pub async fn find_turn_execution_authorization_context<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-) -> Result<Option<String>> {
-    Ok(turn::Entity::find_by_id(turn_id.to_owned())
-        .select_only()
-        .column(turn::Column::ExecutionAuthorizationContextJson)
-        .into_tuple::<Option<String>>()
-        .one(db)
-        .await
-        .context("failed to query turn by id")?
-        .flatten()
-        .filter(|json| !json.trim().is_empty()))
 }
 
 fn build_turn_permission_profile_columns(
@@ -1397,6 +1106,8 @@ pub(crate) fn prepare_turn_input_projection(
         }
         let (input_type, text) = input_type_and_text(item);
         rows.push(turn_input::ActiveModel {
+            insertion_ordinal: Default::default(),
+            publication_xid: Default::default(),
             id: Set(generate_id(DB_ID_LEN)),
             turn_id: Set(turn_id.to_owned()),
             input_index: Set(i64::try_from(index).unwrap_or(i64::MAX)),
@@ -1548,6 +1259,7 @@ pub(crate) struct PreparedTurnItemProjection {
     item_type: String,
     status: Option<String>,
     payload_json: String,
+    body: pioneer_crud_payloads::storage::PreparedPayload,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 }
@@ -1586,149 +1298,41 @@ pub(crate) fn prepare_turn_item_projection(
     updated_at: DateTimeWithTimeZone,
 ) -> Result<PreparedTurnItemProjection> {
     let (item_id, item_type) = turn_item_id_and_type_to_db(item);
+    let payload_json =
+        serde_json::to_string(item).context("failed to serialize turn item payload")?;
+    let body = pioneer_crud_payloads::storage::PreparedPayload::new(&payload_json)?;
     Ok(PreparedTurnItemProjection {
         row_id: generate_id(DB_ID_LEN),
         turn_id: turn_id.to_owned(),
         item_id: item_id.to_owned(),
         item_type: item_type.to_owned(),
         status: status.map(str::to_owned),
-        payload_json: serde_json::to_string(item)
-            .context("failed to serialize turn item payload")?,
+        payload_json,
+        body,
         created_at,
         updated_at,
     })
 }
 
-pub(crate) async fn upsert_prepared_turn_item<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn upsert_prepared_turn_item(
+    db: &sea_orm::DatabaseTransaction,
     prepared: PreparedTurnItemProjection,
 ) -> Result<()> {
-    if db.get_database_backend() == DatabaseBackend::Sqlite {
-        return upsert_turn_item_sqlite_compatible(db, prepared).await;
-    }
-
-    turn_item::Entity::insert(turn_item::ActiveModel {
-        id: Set(prepared.row_id),
-        turn_id: Set(prepared.turn_id),
-        item_id: Set(prepared.item_id),
-        item_type: Set(prepared.item_type),
-        status: Set(prepared.status),
-        payload: Set(prepared.payload_json),
-        active_attempt_number: Set(0),
-        active_attempt_status: Set(None),
-        active_attempt_id: Set(None),
-        last_heartbeat_at: Set(None),
-        lease_expires_at: Set(None),
-        created_at: Set(prepared.created_at),
-        updated_at: Set(prepared.updated_at),
-        ..Default::default()
-    })
-    .on_conflict(
-        OnConflict::columns([turn_item::Column::TurnId, turn_item::Column::ItemId])
-            .update_columns([
-                turn_item::Column::ItemType,
-                turn_item::Column::Status,
-                turn_item::Column::Payload,
-                turn_item::Column::UpdatedAt,
-            ])
-            .to_owned(),
+    use pioneer_crud_conversations::turn_item::{ItemWrite, upsert};
+    upsert(
+        db,
+        ItemWrite {
+            id: prepared.row_id,
+            turn_id: prepared.turn_id,
+            item_id: prepared.item_id,
+            item_type: prepared.item_type,
+            status: prepared.status,
+            created_at: prepared.created_at,
+            updated_at: prepared.updated_at,
+        },
+        &prepared.body,
     )
-    .exec(db)
     .await
-    .context("failed to upsert turn item")?;
-
-    Ok(())
-}
-
-async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
-    db: &C,
-    prepared: PreparedTurnItemProjection,
-) -> Result<()> {
-    if sqlite_turn_item_exists(db, prepared.turn_id.as_str(), prepared.item_id.as_str()).await? {
-        db.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            r#"
-                UPDATE turn_item
-                SET
-                    item_type = ?,
-                    status = ?,
-                    payload = ?,
-                    updated_at = ?
-                WHERE turn_id = ? AND item_id = ?
-            "#,
-            vec![
-                prepared.item_type.into(),
-                prepared.status.into(),
-                prepared.payload_json.into(),
-                prepared.updated_at.into(),
-                prepared.turn_id.into(),
-                prepared.item_id.into(),
-            ],
-        ))
-        .await
-        .context("failed to update turn item")?;
-        return Ok(());
-    }
-
-    db.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        r#"
-            INSERT INTO turn_item (
-                id,
-                turn_id,
-                item_id,
-                item_type,
-                status,
-                payload,
-                active_attempt_number,
-                active_attempt_status,
-                active_attempt_id,
-                last_heartbeat_at,
-                lease_expires_at,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)
-        "#,
-        vec![
-            prepared.row_id.into(),
-            prepared.turn_id.into(),
-            prepared.item_id.into(),
-            prepared.item_type.into(),
-            prepared.status.into(),
-            prepared.payload_json.into(),
-            prepared.created_at.into(),
-            prepared.updated_at.into(),
-        ],
-    ))
-    .await
-    .context("failed to insert turn item")?;
-
-    Ok(())
-}
-
-async fn sqlite_turn_item_exists<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    item_id: &str,
-) -> Result<bool> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            r#"
-                SELECT COUNT(*) AS value
-                FROM turn_item
-                WHERE turn_id = ? AND item_id = ?
-            "#,
-            [turn_id.to_owned().into(), item_id.to_owned().into()],
-        ))
-        .await
-        .context("failed to query turn item before upsert")?
-        .context("turn item existence query unexpectedly returned no rows")?;
-    let count = row
-        .try_get::<i64>("", "value")
-        .context("failed to decode turn item existence count")?;
-    Ok(count > 0)
 }
 
 pub async fn find_turn_item_type<C: ConnectionTrait>(
@@ -1800,6 +1404,8 @@ pub(crate) struct TimelineAssistantItemRow {
     pub turn_id: String,
     pub item_id: String,
     pub item_type: String,
+    inline_payload: Option<String>,
+    #[sea_orm(skip)]
     pub payload: String,
     pub status: Option<String>,
     pub is_last_final: bool,
@@ -1812,6 +1418,7 @@ pub(crate) async fn timeline_assistant_items(
     targets: &[(String, String)],
 ) -> Result<Vec<TimelineAssistantItemRow>> {
     use pioneer_entity::{thread, thread_timeline_block as block};
+    let reader = db.begin_read().await?;
     let mut result = Vec::with_capacity(targets.len());
     for targets in targets.chunks(64) {
         let mut exact = Condition::any();
@@ -1887,10 +1494,13 @@ pub(crate) async fn timeline_assistant_items(
                 turn_item::Column::TurnId,
                 turn_item::Column::ItemId,
                 turn_item::Column::ItemType,
-                turn_item::Column::Payload,
                 turn_item::Column::PayloadPayloadId,
                 turn_item::Column::Status,
             ])
+            .expr_as(
+                Expr::col(turn_item::Column::Payload).cast_as("text"),
+                "inline_payload",
+            )
             .column_as(Expr::exists(newer).not(), "is_last_final")
             .join(
                 JoinType::InnerJoin,
@@ -1910,34 +1520,24 @@ pub(crate) async fn timeline_assistant_items(
             .filter(turn::Column::ThreadId.eq(thread_id))
             .filter(exact)
             .into_model::<TimelineAssistantItemRow>()
-            .all(db)
+            .all(&reader)
             .await
             .context("failed to load exact timeline assistant items")?;
         result.extend(rows);
     }
-    let holds = result
-        .iter()
-        .map(|row| {
-            row.payload_payload_id
-                .as_deref()
-                .map(|id| {
-                    super::portable_payload::PayloadReadHold::capture(
-                        id,
-                        super::portable_payload::Family::TurnItem,
-                    )
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (row, hold) in result.iter_mut().zip(holds) {
-        row.payload = super::portable_payload::hydrate_with_hold(
-            db,
-            super::portable_payload::Family::TurnItem,
-            row.payload_payload_id.as_deref(),
-            std::mem::take(&mut row.payload),
-            hold.as_ref(),
-        )
-        .await?;
+    let mut captured = Vec::with_capacity(result.len());
+    for row in &result {
+        captured.push(capture_item_text(&reader, row.payload_payload_id.as_deref()).await?);
+    }
+    reader.commit().await?;
+    for (row, body) in result.iter_mut().zip(captured) {
+        row.payload = match body {
+            Some(body) => body.into_text()?,
+            None => row
+                .inline_payload
+                .take()
+                .context("missing inline turn item")?,
+        };
     }
     Ok(result)
 }
@@ -1949,6 +1549,8 @@ pub(crate) struct ExactAgentMessageRow {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    inline_payload: Option<String>,
+    #[sea_orm(skip)]
     pub payload: String,
 }
 
@@ -1958,6 +1560,7 @@ pub(crate) async fn exact_agent_messages(
     targets: &[(String, String, String)],
 ) -> Result<Vec<ExactAgentMessageRow>> {
     use pioneer_entity::thread;
+    let reader = db.begin_read().await?;
     let mut rows = Vec::new();
     for targets in targets.chunks(64) {
         let mut exact = Condition::any();
@@ -1976,9 +1579,12 @@ pub(crate) async fn exact_agent_messages(
                 .columns([
                     turn_item::Column::TurnId,
                     turn_item::Column::ItemId,
-                    turn_item::Column::Payload,
                     turn_item::Column::PayloadPayloadId,
                 ])
+                .expr_as(
+                    Expr::col(turn_item::Column::Payload).cast_as("text"),
+                    "inline_payload",
+                )
                 .join(
                     JoinType::InnerJoin,
                     turn_item::Entity::belongs_to(turn::Entity)
@@ -1997,36 +1603,41 @@ pub(crate) async fn exact_agent_messages(
                 .filter(turn_item::Column::ItemType.eq("agent_message"))
                 .filter(exact)
                 .into_model::<ExactAgentMessageRow>()
-                .all(db)
+                .all(&reader)
                 .await
                 .context("failed to load exact source messages")?,
         );
     }
-    let holds = rows
-        .iter()
-        .map(|row| {
-            row.payload_payload_id
-                .as_deref()
-                .map(|id| {
-                    super::portable_payload::PayloadReadHold::capture(
-                        id,
-                        super::portable_payload::Family::TurnItem,
-                    )
-                })
-                .transpose()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (row, hold) in rows.iter_mut().zip(holds) {
-        row.payload = super::portable_payload::hydrate_with_hold(
-            db,
-            super::portable_payload::Family::TurnItem,
-            row.payload_payload_id.as_deref(),
-            std::mem::take(&mut row.payload),
-            hold.as_ref(),
-        )
-        .await?;
+    let mut captured = Vec::with_capacity(rows.len());
+    for row in &rows {
+        captured.push(capture_item_text(&reader, row.payload_payload_id.as_deref()).await?);
+    }
+    reader.commit().await?;
+    for (row, body) in rows.iter_mut().zip(captured) {
+        row.payload = match body {
+            Some(body) => body.into_text()?,
+            None => row
+                .inline_payload
+                .take()
+                .context("missing inline turn item")?,
+        };
     }
     Ok(rows)
+}
+
+async fn capture_item_text<C: ConnectionTrait>(
+    db: &C,
+    id: Option<&str>,
+) -> Result<Option<pioneer_crud_payloads::storage::CapturedPayload>> {
+    use pioneer_crud_payloads::storage::{self, Selection};
+    match id {
+        Some(id) => Ok(Some(
+            storage::capture(db, id, Selection::Full)
+                .await?
+                .context("turn item payload disappeared")?,
+        )),
+        None => Ok(None),
+    }
 }
 
 pub async fn list_turn_items_by_ids(
@@ -2151,292 +1762,11 @@ pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
         .context("failed to query latest turn for thread")
 }
 
-pub(crate) const THREAD_TURN_SNAPSHOT_BATCH_SIZE: usize = 128;
-
-/// Only the already selected thread IDs are visited. Each correlated seek
-/// walks the existing history index backwards and stops at its first match;
-/// the outer primary-key lookup fetches at most one model per selected ID.
-/// CROSS JOIN keeps selected IDs as the outer loop in SQLite.
-/// This is deliberately not a ranking/aggregation over the turn catalogue.
-pub(crate) async fn find_latest_turns_for_threads<C: ConnectionTrait>(
-    db: &C,
-    thread_ids: &[&str],
-    conversation_only: bool,
-) -> Result<Vec<turn::Model>> {
-    anyhow::ensure!(
-        thread_ids.len() <= THREAD_TURN_SNAPSHOT_BATCH_SIZE,
-        "thread turn snapshot batch exceeds its limit"
-    );
-    if thread_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let placeholders = vec!["(?)"; thread_ids.len()].join(", ");
-    let kind_filter = if conversation_only {
-        "AND candidate.turn_kind = ?"
-    } else {
-        ""
-    };
-    let mut values = thread_ids
-        .iter()
-        .map(|id| (*id).into())
-        .collect::<Vec<sea_orm::Value>>();
-    if conversation_only {
-        values.push(turn_kind_to_db(TurnKind::Conversation).into());
-    }
-    let statement = Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        format!(
-            "WITH selected(thread_id) AS (VALUES {placeholders}) \
-             SELECT latest.* FROM selected CROSS JOIN turn AS latest \
-             WHERE latest.id = (\
-                 SELECT candidate.id FROM turn AS candidate \
-                 INDEXED BY idx_turn_thread_created_id \
-                 WHERE candidate.thread_id = selected.thread_id {kind_filter} \
-                 ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1\
-             )"
-        ),
-        values,
-    );
-    let rows = db
-        .query_all_raw(statement)
-        .await
-        .context("failed to query latest thread turn snapshot batch")?;
-    // query_all_raw returns the bounded rows and releases reader capacity
-    // before model decoding or any snapshot/JSON transformation.
-    rows.iter()
-        .map(|row| turn::Model::from_query_result(row, ""))
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to decode latest thread turn snapshot batch")
-}
-
-/// The shared history order is timestamp, durable creation sequence, legacy
-/// rowid, then ID. The existing (thread_id, created_at, id) index finds a
-/// timestamp bucket; only that bucket needs the sequence/rowid tie-breaker.
-/// This avoids ranking all turns merely to find one boundary.
-struct CliTurnOrderKey {
-    created_at: String,
-    sequence: i64,
-    rowid: i64,
-    id: String,
-}
-
-async fn cli_turn_order_key<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<Option<CliTurnOrderKey>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT t.created_at AS created_at, COALESCE(c.sequence,0) AS sequence, \
-             t.rowid AS legacy_rowid, t.id AS id FROM turn t \
-             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
-             WHERE t.thread_id=? AND t.id=?",
-            vec![thread_id.into(), turn_id.into()],
-        ))
-        .await?;
-    row.map(|row| {
-        Ok(CliTurnOrderKey {
-            created_at: row.try_get("", "created_at")?,
-            sequence: row.try_get("", "sequence")?,
-            rowid: row.try_get("", "legacy_rowid")?,
-            id: row.try_get("", "id")?,
-        })
-    })
-    .transpose()
-}
-
-async fn cli_bucket_ids<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    timestamp: &str,
-    after: Option<&CliTurnOrderKey>,
-    descending: bool,
-    limit: usize,
-) -> Result<Vec<String>> {
-    let relation = if after.is_some() {
-        "AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?)"
-    } else {
-        ""
-    };
-    let direction = if descending { "DESC" } else { "ASC" };
-    let sql = format!(
-        "SELECT t.id AS id FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
-         WHERE t.thread_id=? AND t.created_at=? {relation} \
-         ORDER BY COALESCE(c.sequence,0) {direction}, t.rowid {direction}, t.id {direction} LIMIT ?"
-    );
-    let mut values = vec![thread_id.into(), timestamp.into()];
-    if let Some(after) = after {
-        values.extend([
-            after.sequence.into(),
-            after.rowid.into(),
-            after.id.clone().into(),
-        ]);
-    }
-    values.push(i64::try_from(limit)?.into());
-    db.query_all_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await?
-    .into_iter()
-    .map(|row| row.try_get::<String>("", "id").map_err(Into::into))
-    .collect()
-}
-
-async fn cli_adjacent_timestamp<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    timestamp: Option<&str>,
-    descending: bool,
-) -> Result<Option<String>> {
-    let relation = match (timestamp, descending) {
-        (Some(_), true) => "AND created_at < ?",
-        (Some(_), false) => "AND created_at > ?",
-        (None, _) => "",
-    };
-    let direction = if descending { "DESC" } else { "ASC" };
-    let sql = format!(
-        "SELECT created_at FROM turn WHERE thread_id=? {relation} \
-         ORDER BY created_at {direction} LIMIT 1"
-    );
-    let mut values = vec![thread_id.into()];
-    if let Some(timestamp) = timestamp {
-        values.push(timestamp.into());
-    }
-    db.query_one_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await?
-    .map(|row| row.try_get::<String>("", "created_at").map_err(Into::into))
-    .transpose()
-}
-
-pub async fn latest_turn_id_by_creation_order<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-) -> Result<Option<String>> {
-    let Some(timestamp) = cli_adjacent_timestamp(db, thread_id, None, true).await? else {
-        return Ok(None);
-    };
-    Ok(cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
-        .await?
-        .into_iter()
-        .next())
-}
-
-pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    launch_turn_id: &str,
-    allowed_task_run_turn_id: &str,
-) -> Result<Option<(Option<String>, bool)>> {
-    let Some(launch) = cli_turn_order_key(db, thread_id, launch_turn_id).await? else {
-        return Ok(None);
-    };
-    let previous_in_bucket = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT t.id AS id FROM turn t \
-             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
-             WHERE t.thread_id=? AND t.created_at=? \
-               AND (COALESCE(c.sequence,0),t.rowid,t.id) < (?,?,?) \
-             ORDER BY COALESCE(c.sequence,0) DESC,t.rowid DESC,t.id DESC LIMIT 1",
-            vec![
-                thread_id.into(),
-                launch.created_at.clone().into(),
-                launch.sequence.into(),
-                launch.rowid.into(),
-                launch.id.clone().into(),
-            ],
-        ))
-        .await?;
-    let previous = if let Some(row) = previous_in_bucket {
-        Some(row.try_get::<String>("", "id")?)
-    } else if let Some(timestamp) =
-        cli_adjacent_timestamp(db, thread_id, Some(&launch.created_at), true).await?
-    {
-        cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
-            .await?
-            .into_iter()
-            .next()
-    } else {
-        None
-    };
-    let intervening = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT (EXISTS(SELECT 1 FROM turn t WHERE t.thread_id=? \
-                AND t.created_at>? AND t.id<>?) OR \
-              EXISTS(SELECT 1 FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
-                WHERE t.thread_id=? AND t.created_at=? AND t.id<>? \
-                AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?))) AS intervening",
-            vec![
-                thread_id.into(),
-                launch.created_at.clone().into(),
-                allowed_task_run_turn_id.into(),
-                thread_id.into(),
-                launch.created_at.into(),
-                allowed_task_run_turn_id.into(),
-                launch.sequence.into(),
-                launch.rowid.into(),
-                launch.id.into(),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("CLI intervening-turn query returned no row"))?
-        .try_get::<i64>("", "intervening")?
-        != 0;
-    Ok(Some((previous, intervening)))
-}
-
-pub async fn turn_ids_after_by_creation_order<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    source_turn_id: &str,
-) -> Result<Vec<String>> {
-    const MAX_FORK_RETRY_ATTEMPTS: usize = 128;
-    let Some(source) = cli_turn_order_key(db, thread_id, source_turn_id).await? else {
-        return Ok(Vec::new());
-    };
-    let mut rows = cli_bucket_ids(
-        db,
-        thread_id,
-        &source.created_at,
-        Some(&source),
-        false,
-        MAX_FORK_RETRY_ATTEMPTS + 1,
-    )
-    .await?;
-    let mut timestamp = source.created_at;
-    while rows.len() <= MAX_FORK_RETRY_ATTEMPTS {
-        let Some(next) = cli_adjacent_timestamp(db, thread_id, Some(&timestamp), false).await?
-        else {
-            break;
-        };
-        rows.extend(
-            cli_bucket_ids(
-                db,
-                thread_id,
-                &next,
-                None,
-                false,
-                MAX_FORK_RETRY_ATTEMPTS + 1 - rows.len(),
-            )
-            .await?,
-        );
-        timestamp = next;
-    }
-    anyhow::ensure!(
-        rows.len() <= MAX_FORK_RETRY_ATTEMPTS,
-        "CLI fork retry exceeds the bounded attempt scan"
-    );
-    Ok(rows)
-}
+pub(crate) use pioneer_crud_conversations::turn_order::{
+    THREAD_TURN_SNAPSHOT_BATCH_SIZE, find_latest_turns_for_threads,
+    latest_turn_id_by_creation_order, turn_before_launch_and_intervening_by_creation_order,
+    turn_ids_after_by_creation_order,
+};
 
 pub async fn find_latest_conversation_turn_for_thread<C: ConnectionTrait>(
     db: &C,
@@ -2976,6 +2306,8 @@ mod tests {
     ) -> turn::Model {
         let now = fixed_test_datetime();
         turn::Model {
+            insertion_ordinal: 1,
+            publication_xid: "1".to_owned(),
             id: "T00000000000000000001".to_owned(),
             thread_id: "H00000000000000000001".to_owned(),
             package_selection_json: None,

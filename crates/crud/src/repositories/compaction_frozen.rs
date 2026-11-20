@@ -5,8 +5,11 @@ use super::compaction_frozen_views::message as compaction_frozen_message;
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
-use pioneer_entity::{compaction_frozen_history, compaction_frozen_message_data, thread};
-use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
+use pioneer_entity::{
+    compaction_frozen_history, compaction_frozen_layout as layout, compaction_frozen_message_data,
+    thread,
+};
+use sea_orm::sea_query::{Expr, ExprTrait, LockType, OnConflict, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
@@ -252,20 +255,114 @@ pub(crate) async fn compaction_append_frozen_history(
     Ok(())
 }
 
-/// Ready is published only after the bounded writer has filled all exact
-/// ordinals. The content digest is checked by the caller before this CAS.
+pub(crate) struct ReadyLayoutCheck {
+    header: compaction_frozen_history::Model,
+    revisions: [i64; 2],
+    layouts: Vec<layout::Model>,
+}
+
+impl ReadyLayoutCheck {
+    pub(crate) async fn prepare(store: &CrudStore, manifest: &str) -> Result<Option<Self>> {
+        let Some(header) = compaction_frozen_history::Entity::find_by_id(manifest)
+            .filter(compaction_frozen_history::Column::Ready.eq(0))
+            .one(&store.connection)
+            .await?
+        else {
+            return Ok(None);
+        };
+        crate::frozen_lifetime::logical_bounds(&header)?;
+        use super::compaction_frozen_storage::span_revision;
+        let revisions = [
+            span_revision(&store.connection, manifest, 0).await?,
+            span_revision(&store.connection, manifest, 1).await?,
+        ];
+        let layouts = layout::Entity::find()
+            .filter(layout::Column::ManifestId.eq(manifest))
+            .order_by_asc(layout::Column::Kind)
+            .all(&store.connection)
+            .await?;
+        let mut scan = crate::frozen_lifetime::LayoutScan::new(header.clone(), 0, 2)?;
+        while !scan.done() {
+            scan.step(store).await?;
+        }
+        Ok(Some(Self {
+            header,
+            revisions,
+            layouts,
+        }))
+    }
+
+    async fn stamp<C: ConnectionTrait>(&self, db: &C) -> Result<()> {
+        use super::compaction_frozen_storage::span_revision;
+        let manifest = &self.header.id;
+        let ids = std::iter::once(manifest.as_str()).chain(
+            self.layouts
+                .iter()
+                .filter_map(|state| state.candidate.as_deref()),
+        );
+        let headers = compaction_frozen_history::Entity::find()
+            .filter(compaction_frozen_history::Column::Id.is_in(ids))
+            .order_by_asc(compaction_frozen_history::Column::Id)
+            .lock(LockType::NoKeyUpdate)
+            .all(db)
+            .await?;
+        let current = headers
+            .iter()
+            .find(|header| &header.id == manifest)
+            .ok_or_else(|| anyhow::anyhow!("frozen publication header disappeared"))?;
+        if current.ready == 1 {
+            return Ok(());
+        }
+        ensure!(
+            current == &self.header,
+            "frozen header changed before publication"
+        );
+        let layouts = layout::Entity::find()
+            .filter(layout::Column::ManifestId.eq(manifest))
+            .order_by_asc(layout::Column::Kind)
+            .all(db)
+            .await?;
+        ensure!(
+            layouts == self.layouts,
+            "frozen layouts changed before publication"
+        );
+        for (kind, expected) in self.revisions.into_iter().enumerate() {
+            let kind = i64::try_from(kind)?;
+            ensure!(
+                span_revision(db, manifest, kind).await? == expected,
+                "frozen span revision changed before publication"
+            );
+            layout::Entity::update_many()
+                .col_expr(layout::Column::VerifiedSpanRevision, Expr::val(expected))
+                .filter(layout::Column::ManifestId.eq(manifest))
+                .filter(layout::Column::Kind.eq(kind))
+                .filter(layout::Column::Active.eq(1))
+                .exec(db)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Publish with the header and span generations checked before the bounded scan.
 pub(crate) async fn compaction_finish_frozen_history<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
     owner_thread: &str,
     descriptor: &FrozenHistoryRef,
+    layout_check: Option<&ReadyLayoutCheck>,
 ) -> Result<bool> {
-    // Constant-size publication: next_ordinal advances atomically with each
-    // sequential batch, so finalization never scans the whole manifest.
+    if let Some(check) = layout_check {
+        ensure!(
+            check.header.id == descriptor.manifest_id,
+            "frozen layout check scope mismatch"
+        );
+        check.stamp(db).await?;
+    }
     Ok(compaction_frozen_history::Entity::update_many()
         .col_expr(compaction_frozen_history::Column::Ready, Expr::val(1_i64))
         .filter(compaction_frozen_history::Column::Expired.eq(0))
-        .filter(compaction_frozen_history::Column::Ready.is_in([0_i64, 1]))
+        .filter(compaction_frozen_history::Column::Ready.gte(i64::from(layout_check.is_none())))
         .filter(compaction_frozen_history::Column::MessageCount.gte(0))
         .filter(compaction_frozen_history::Column::ImportCount.gte(0))
         .filter(
@@ -345,12 +442,10 @@ pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
         .await?
     {
         crate::frozen_lifetime::logical_bounds(&h)?;
-        if let Some(layout) = pioneer_entity::compaction_frozen_layout::Entity::find_by_id((
-            manifest.to_owned(),
-            0_i64,
-        ))
-        .one(db)
-        .await?
+        if let Some(layout) =
+            pioneer_crud_compaction::frozen::find_layout(manifest.to_owned(), 0_i64)
+                .one(db)
+                .await?
         {
             ensure!(layout.failed == 0, "invalid frozen layout state");
         }
@@ -399,7 +494,7 @@ pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
         .select_only()
         .column(compaction_frozen_message::Column::ReferenceJson)
         .filter(compaction_frozen_message::Column::Ordinal.lt(end))
-        .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes BETWEEN 0 AND 262144"))
+        .filter(Expr::cust("octet_length(compaction_frozen_message.reference_json)=compaction_frozen_message.bytes AND compaction_frozen_message.bytes BETWEEN 0 AND 262144"))
         .order_by_asc(compaction_frozen_message::Column::Ordinal)
         .into_tuple::<String>()
         .all(db)

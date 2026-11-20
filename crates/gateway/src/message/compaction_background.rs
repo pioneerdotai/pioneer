@@ -403,8 +403,7 @@ impl MessageProcessor {
                 };
                 let mut diagnostic = claimed
                     .diagnostic
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<HistoryCheckDiagnostic>(value).ok())
+                    .and_then(|value| serde_json::from_value::<HistoryCheckDiagnostic>(value).ok())
                     .unwrap_or_default();
                 diagnostic.legacy_reason_unknown |=
                     row.managed == 0 && row.outcome.as_deref() == Some("failed");

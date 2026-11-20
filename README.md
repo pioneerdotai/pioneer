@@ -81,7 +81,11 @@ Agents retrieve relevant context within workspace and thread permissions and a b
 
 ## Under the hood
 
-Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by SQLite. Clients connect over a JSON-RPC WebSocket API.
+Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by PostgreSQL. Clients connect over a JSON-RPC WebSocket API.
+
+Gateway releases include PostgreSQL 18 and pgvector. Starting a local Gateway initializes its private database in the Gateway data directory. The same database is opened on later starts and application updates. Desktop installs the same database runtime when it sets up a local Gateway.
+
+On Windows ARM64, the bundled PostgreSQL and pgvector run through Windows 11's built-in x64 emulation.
 
 ```mermaid
 flowchart TB

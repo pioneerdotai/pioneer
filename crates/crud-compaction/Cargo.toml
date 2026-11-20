@@ -1,0 +1,19 @@
+[package]
+name = "pioneer-crud-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pioneer-compaction.workspace = true
+pioneer-crud-payloads.workspace = true
+pioneer-entity.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+pioneer-crud-tasks.workspace = true
+pioneer-postgres-test.workspace = true
+tokio.workspace = true

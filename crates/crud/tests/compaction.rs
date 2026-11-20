@@ -8633,7 +8633,7 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
             .unwrap();
         assert_eq!(saved.failures, failure as i64 + 1);
         assert_eq!(
-            serde_json::from_str::<D>(saved.diagnostic.as_ref().unwrap()).unwrap(),
+            serde_json::from_value::<D>(saved.diagnostic.unwrap()).unwrap(),
             d
         );
         assert!(saved.attempt_deadline_ms.is_none());

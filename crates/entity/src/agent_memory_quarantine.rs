@@ -7,21 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_quarantine")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique)]
-    pub memory_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub workspace_id: Option<String>,
-    pub reason_code: String,
-    pub actor_kind: String,
-    pub actor_id: Option<String>,
-    pub created_at: Option<DateTimeWithTimeZone>,
-    pub resolved_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_reason_code: Option<String>,
-    pub resolved_actor_kind: Option<String>,
+    pub created_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub reason_code: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_id: Option<String>,
+    pub resolved_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
+    pub actor_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_actor_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
+    pub resolved_actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub details_json: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub memory_id: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

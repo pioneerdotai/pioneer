@@ -7,17 +7,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "auth_refresh_credential")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique)]
-    pub session_id: String,
-    #[sea_orm(unique)]
-    pub token_family_id: String,
-    pub generation: i64,
-    #[sea_orm(column_type = "Binary(1)", unique)]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)", unique)]
     pub token_hash: Vec<u8>,
-    pub issued_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", unique)]
+    pub session_id: String,
+    #[sea_orm(column_type = "Text", unique)]
+    pub token_family_id: String,
     pub expires_at: DateTimeWithTimeZone,
+    pub generation: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    pub issued_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub exchange_request_id: Option<String>,
     #[sea_orm(
         belongs_to,
@@ -26,7 +27,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub auth_session: HasOne<super::auth_session::Entity>,
+    pub auth_session: BelongsTo<super::auth_session::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

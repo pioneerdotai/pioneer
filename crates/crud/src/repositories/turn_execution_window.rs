@@ -468,13 +468,20 @@ pub(crate) async fn window_metadata_string_matches<C: ConnectionTrait>(
     key: &'static str,
     expected: &str,
 ) -> Result<bool> {
-    let json_path = format!("$.{key}");
+    use pioneer_crud_payloads::json_projection::{json_path_text, queryable_json};
+    use sea_orm::sea_query::{Expr, ExprTrait};
     Ok(
         turn_execution_window::Entity::find_by_id(window_id.to_owned())
-            .filter(sea_orm::sea_query::Expr::cust_with_values(
-                "json_extract(metadata_json, ?) = ?",
-                vec![json_path, expected.to_owned()],
-            ))
+            .select_only()
+            .column(turn_execution_window::Column::Id)
+            .filter(
+                json_path_text(
+                    queryable_json(Expr::col(turn_execution_window::Column::MetadataJson)),
+                    &[key],
+                )
+                .eq(expected),
+            )
+            .into_tuple::<String>()
             .one(db)
             .await
             .with_context(|| format!("failed to validate execution-window metadata key `{key}`"))?
@@ -487,13 +494,21 @@ pub(crate) async fn window_metadata_string_is_present<C: ConnectionTrait>(
     window_id: &str,
     key: &'static str,
 ) -> Result<bool> {
-    let json_path = format!("$.{key}");
+    use pioneer_crud_payloads::json_projection::{json_path_value, queryable_json};
+    use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func};
     Ok(
         turn_execution_window::Entity::find_by_id(window_id.to_owned())
-            .filter(sea_orm::sea_query::Expr::cust_with_values(
-                "json_type(metadata_json, ?) = 'text'",
-                vec![json_path],
-            ))
+            .select_only()
+            .column(turn_execution_window::Column::Id)
+            .filter(
+                Func::cust(Alias::new("json_typeof"))
+                    .arg(json_path_value(
+                        queryable_json(Expr::col(turn_execution_window::Column::MetadataJson)),
+                        &[key],
+                    ))
+                    .eq("string"),
+            )
+            .into_tuple::<String>()
             .one(db)
             .await
             .with_context(|| format!("failed to validate execution-window metadata key `{key}`"))?
@@ -931,19 +946,19 @@ pub async fn list_turn_execution_window_items(
     turn_id: &str,
     started_at: DateTimeWithTimeZone,
 ) -> Result<Vec<TurnItem>> {
-    let rows = turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_item::Column::CreatedAt.gte(started_at))
-        .order_by_asc(turn_item::Column::CreatedAt)
-        .order_by_asc(turn_item::Column::ItemId)
-        .all(db)
-        .await
-        .context("failed to list turn_item rows for execution-window checkpoint")?;
-
-    let rows = super::turn_payload::hydrate_items(db, rows).await?;
+    let rows = super::turn_payload::items(
+        db,
+        turn_item::Entity::find()
+            .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(turn_item::Column::CreatedAt.gte(started_at))
+            .order_by_asc(turn_item::Column::CreatedAt)
+            .order_by_asc(turn_item::Column::ItemId),
+    )
+    .await
+    .context("failed to list turn items for the execution-window checkpoint")?;
     rows.into_iter()
         .map(|row| {
-            serde_json::from_str::<TurnItem>(row.payload.as_str()).with_context(|| {
+            super::turn_payload::decode_item(&row).with_context(|| {
                 format!(
                     "failed to decode turn_item payload for execution-window checkpoint on turn `{turn_id}` item `{}`",
                     row.item_id

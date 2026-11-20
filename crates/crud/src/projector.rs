@@ -11,8 +11,8 @@ use std::pin::Pin;
 use crate::convention::{TURN_ITEM_STATUS_IN_PROGRESS, turn_item_type_to_db};
 use crate::events::{AppendedTurnEvent, TurnEventPayload, TurnStartedEventPayload};
 use crate::repositories::{
-    identity, policy, self_improvement_source_turn, thread, turn, turn_finalization,
-    turn_item_attempt, turn_liveness,
+    policy, self_improvement_source_turn, thread, turn, turn_finalization, turn_item_attempt,
+    turn_liveness,
 };
 use crate::turn_item_terminal::{
     attempt_status_from_payload, terminal_turn_item_status_from_payload,
@@ -69,9 +69,9 @@ pub struct TurnProjector;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PreparedTurnProjection {
-    pub(crate) inline_item: Option<crate::repositories::turn_payload::PreparedInlineItem>,
     liveness: Option<turn_liveness::TurnLivenessObservation>,
     item: Option<turn::PreparedTurnItemProjection>,
+    pub(crate) timeline_item: Option<serde_json::Value>,
     item_attempt_payload_json: Option<String>,
     item_attempt_id: Option<String>,
     item_attempt_failure_reason: Option<String>,
@@ -87,7 +87,6 @@ pub(crate) struct PreparedTurnProjection {
     task_run_parent_thread: Option<pioneer_protocol::Thread>,
     self_improvement_source:
         Option<self_improvement_source_turn::PreparedSelfImprovementSourceTurn>,
-    legacy_superuser_id: Option<Option<pioneer_protocol::PrincipalId>>,
     status_history: Option<turn::PreparedTurnStatusHistory>,
     append_status_history: bool,
 }
@@ -124,9 +123,7 @@ impl TurnProjector {
                     parent.status = ThreadStatus::Idle;
                     prepared.task_run_parent_thread = Some(parent);
                 }
-                if payload.actor.is_none() {
-                    prepared.legacy_superuser_id = Some(legacy_backfill_superuser_id(db).await?);
-                }
+                anyhow::ensure!(payload.actor.is_some(), "turn/start requires an actor");
                 prepared.status_history = Some(turn::prepare_turn_status_history(
                     payload.turn.id.as_str(),
                     payload.turn.status,
@@ -354,12 +351,17 @@ impl TurnProjector {
             }
             _ => {}
         }
+        prepared.timeline_item = prepared
+            .item
+            .as_ref()
+            .map(|item| serde_json::from_str(item.payload_json()))
+            .transpose()?;
         Ok(prepared)
     }
 
-    pub async fn project_prepared<C: ConnectionTrait + Sync>(
+    pub async fn project_prepared(
         &self,
-        db: &C,
+        db: &sea_orm::DatabaseTransaction,
         event: &AppendedTurnEvent,
         prepared: PreparedTurnProjection,
     ) -> Result<()> {
@@ -372,9 +374,6 @@ impl TurnProjector {
         .await?
         {
             return Ok(());
-        }
-        if let Some(inline) = &prepared.inline_item {
-            inline.apply(db).await?;
         }
         if let Some(mut observation) = prepared.liveness {
             observation.activity_sequence = event.sequence;
@@ -395,7 +394,6 @@ impl TurnProjector {
         let message_thread_preview = prepared.message_thread_preview;
         let task_run_parent_thread = prepared.task_run_parent_thread;
         let self_improvement_source = prepared.self_improvement_source;
-        let legacy_superuser_id = prepared.legacy_superuser_id;
         let status_history = prepared.status_history;
         let append_status_history = prepared.append_status_history;
         let future: ProjectFuture<'_> = match &event.payload {
@@ -413,7 +411,6 @@ impl TurnProjector {
                     message_thread_preview
                         .context("turn/start derived preview was not prepared")?,
                     task_run_parent_thread,
-                    legacy_superuser_id,
                     status_history.context("turn/start status history was not prepared")?,
                 ),
             ),
@@ -616,7 +613,7 @@ impl TurnProjector {
     }
 
     #[cfg(test)]
-    pub async fn project<C: ConnectionTrait + Sync>(
+    pub async fn project<C: ConnectionTrait + sea_orm::TransactionTrait + Sync>(
         &self,
         db: &C,
         event: &AppendedTurnEvent,
@@ -624,7 +621,10 @@ impl TurnProjector {
         let prepared = self
             .prepare(db, event.id.as_str(), &event.payload, event.created_at)
             .await?;
-        self.project_prepared(db, event, prepared).await
+        let tx = db.begin().await?;
+        self.project_prepared(&tx, event, prepared).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn prepare_turn_message_mutation<C: ConnectionTrait>(
@@ -856,63 +856,12 @@ impl TurnProjector {
         message_preview_author_json: Option<String>,
         message_thread_preview: String,
         task_run_parent_thread: Option<pioneer_protocol::Thread>,
-        legacy_superuser_id: Option<Option<pioneer_protocol::PrincipalId>>,
         status_history: turn::PreparedTurnStatusHistory,
     ) -> Result<()> {
-        match payload.actor.as_ref() {
-            Some(actor) => {
-                self.project_attributed_turn_started(
-                    db,
-                    payload,
-                    actor,
-                    event_sequence,
-                    turn_upsert,
-                    thread_preview_author_json,
-                    message_preview_author_json,
-                    message_thread_preview,
-                    task_run_parent_thread,
-                )
-                .await?;
-            }
-            None => {
-                self.project_legacy_turn_started(
-                    db,
-                    payload,
-                    event_sequence,
-                    turn_upsert,
-                    thread_preview_author_json,
-                    message_preview_author_json,
-                    message_thread_preview,
-                    task_run_parent_thread,
-                    legacy_superuser_id
-                        .context("legacy turn/start Superuser projection was not prepared")?,
-                )
-                .await?;
-            }
-        }
-        self.project_turn_started_input_and_status(
-            db,
-            payload,
-            input_projection,
-            unix_to_datetime(payload.thread.updated_at),
-            payload.turn.turn_kind == TurnKind::TaskRun,
-            status_history,
-        )
-        .await
-    }
-
-    async fn project_attributed_turn_started<C: ConnectionTrait + Sync>(
-        &self,
-        db: &C,
-        payload: &TurnStartedEventPayload,
-        actor: &PersistedActorRef,
-        event_sequence: i64,
-        turn_upsert: turn::PreparedTurnUpsert,
-        thread_preview_author_json: Option<String>,
-        message_preview_author_json: Option<String>,
-        message_thread_preview: String,
-        task_run_parent_thread: Option<pioneer_protocol::Thread>,
-    ) -> Result<()> {
+        let actor = payload
+            .actor
+            .as_ref()
+            .context("turn/start requires an actor")?;
         self.project_turn_started_inner(
             db,
             payload,
@@ -924,45 +873,16 @@ impl TurnProjector {
             message_thread_preview,
             task_run_parent_thread,
         )
-        .await
-    }
-
-    /// Compatibility seam for append-only turn/start events written before actor attribution.
-    /// Normal materialization rejects this shape before append.
-    async fn project_legacy_turn_started<C: ConnectionTrait + Sync>(
-        &self,
-        db: &C,
-        payload: &TurnStartedEventPayload,
-        event_sequence: i64,
-        turn_upsert: turn::PreparedTurnUpsert,
-        thread_preview_author_json: Option<String>,
-        message_preview_author_json: Option<String>,
-        message_thread_preview: String,
-        task_run_parent_thread: Option<pioneer_protocol::Thread>,
-        legacy_superuser_id: Option<pioneer_protocol::PrincipalId>,
-    ) -> Result<()> {
-        self.project_turn_started_inner(
+        .await?;
+        self.project_turn_started_input_and_status(
             db,
             payload,
-            None,
-            event_sequence,
-            turn_upsert,
-            thread_preview_author_json,
-            message_preview_author_json,
-            message_thread_preview,
-            task_run_parent_thread,
+            input_projection,
+            unix_to_datetime(payload.thread.updated_at),
+            payload.turn.turn_kind == TurnKind::TaskRun,
+            status_history,
         )
-        .await?;
-        if let Some(superuser_id) = legacy_superuser_id {
-            identity::backfill_legacy_actor_references_for_turn(
-                db,
-                payload.thread.id.as_str(),
-                payload.turn.id.as_str(),
-                &superuser_id,
-            )
-            .await?;
-        }
-        Ok(())
+        .await
     }
 
     async fn project_turn_started_inner<C: ConnectionTrait + Sync>(
@@ -1008,12 +928,8 @@ impl TurnProjector {
         event_sequence: i64,
     ) -> ProjectFuture<'a> {
         project_future(async move {
-            // Sequence 1 may legitimately be replayed after projection-state loss,
-            // and the explicit legacy seam may revisit an actorless in-progress
-            // row to perform its idempotent actor backfill. A second TurnStarted is
-            // necessarily later in the same canonical stream. Fence that identity
-            // reuse before touching Thread/input projections. A terminal read model
-            // is also monotonic even when imported legacy history has no event row.
+            // Sequence 1 can replay an in-progress projection after state loss.
+            // A later TurnStarted would reuse the identity of the existing turn.
             if let Some(existing) = turn::find_turn_by_id(db, payload.turn.id.as_str()).await?
                 && (event_sequence != 1 || existing.status != "in_progress")
             {
@@ -1194,45 +1110,6 @@ impl TurnProjector {
         };
         thread::update_thread_status(db, thread_id, status, updated_at).await
     }
-}
-
-async fn legacy_backfill_superuser_id<C: ConnectionTrait>(
-    db: &C,
-) -> Result<Option<pioneer_protocol::PrincipalId>> {
-    let principals = identity::list_gateway_principals(db).await?;
-    let gateway = identity::load_gateway_singleton(db).await?;
-    let mut superusers = principals.iter().filter(|principal| {
-        principal.kind == identity::principal_kind_to_db(pioneer_protocol::PrincipalKind::Superuser)
-    });
-    let superuser = superusers.next();
-    match (gateway.as_ref(), superuser) {
-        (None, None) if principals.is_empty() => return Ok(None),
-        (None, _) => anyhow::bail!(
-            "legacy replay found persisted principals without a Gateway identity singleton"
-        ),
-        (Some(_), None) => {
-            anyhow::bail!("legacy replay found a Gateway identity without a Superuser principal")
-        }
-        (Some(_), Some(_)) => {}
-    };
-    if superusers.next().is_some() {
-        anyhow::bail!("legacy replay found multiple persisted Superuser principals");
-    }
-    let gateway =
-        gateway.context("Gateway identity disappeared during legacy replay validation")?;
-    let superuser = superuser.context("Superuser disappeared during legacy replay validation")?;
-    if superuser.gateway_id != gateway.id.as_ref()
-        || superuser.role_key.is_some()
-        || superuser.status
-            != identity::principal_status_to_db(pioneer_protocol::PrincipalStatus::Active)
-        || superuser.removed_at.is_some()
-    {
-        anyhow::bail!("legacy replay found an invalid persisted Superuser principal");
-    }
-    Ok(Some(
-        pioneer_protocol::PrincipalId::new(superuser.id.clone())
-            .context("legacy replay found an invalid persisted Superuser principal id")?,
-    ))
 }
 
 fn liveness_observation_from_payload(

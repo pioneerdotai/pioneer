@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_task_output")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub task_run_turn_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_thread: String,
     #[sea_orm(column_type = "Text")]
     pub task_id: String,
     #[sea_orm(column_type = "Text")]
     pub run_id: String,
     #[sea_orm(column_type = "Text")]
-    pub workspace_id: String,
+    pub manifest_id: String,
     #[sea_orm(column_type = "Text")]
-    pub source_thread: String,
+    pub workspace_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub task_run_turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub source_turn: String,
-    #[sea_orm(column_type = "Text")]
-    pub manifest_id: String,
     #[sea_orm(has_many)]
     pub compaction_delivery_outputs: HasMany<super::compaction_delivery_output::Entity>,
     #[sea_orm(
@@ -30,7 +30,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "NoAction"
     )]
-    pub compaction_frozen_history: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history: BelongsTo<super::compaction_frozen_history::Entity>,
     #[sea_orm(
         belongs_to,
         from = "task_id",
@@ -38,7 +38,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task: HasOne<super::task::Entity>,
+    pub task: BelongsTo<super::task::Entity>,
     #[sea_orm(
         belongs_to,
         from = "run_id",
@@ -46,7 +46,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_run: HasOne<super::task_run::Entity>,
+    pub task_run: BelongsTo<super::task_run::Entity>,
     #[sea_orm(
         belongs_to,
         from = "task_run_turn_id",
@@ -54,7 +54,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_run_turn: HasOne<super::task_run_turn::Entity>,
+    pub task_run_turn: BelongsTo<super::task_run_turn::Entity>,
     #[sea_orm(
         belongs_to,
         from = "source_thread",
@@ -62,7 +62,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(
         belongs_to,
         from = "source_turn",
@@ -70,7 +70,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",
@@ -78,7 +78,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,22 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "audit_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub gateway_id: String,
-    pub actor_principal_id: Option<String>,
-    pub actor_session_id: Option<String>,
-    pub action: String,
-    pub domain: String,
-    pub target_kind: String,
-    pub target_id: String,
-    pub workspace_id: Option<String>,
-    pub metadata_version: i64,
     #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
-    pub created_at: DateTimeWithTimeZone,
-    pub policy_generation: i64,
+    pub domain: String,
+    #[sea_orm(column_type = "Text")]
+    pub target_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub target_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub policy_role_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_principal_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_session_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub gateway_id: String,
+    pub metadata_version: i64,
+    pub created_at: DateTimeWithTimeZone,
+    pub metadata_json: Json,
+    #[sea_orm(column_type = "Text")]
+    pub action: String,
+    pub policy_generation: i64,
+    #[sea_orm(column_type = "Text")]
     pub policy_fingerprint: String,
     #[sea_orm(
         belongs_to,
@@ -31,7 +40,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub auth_session: HasOne<super::auth_session::Entity>,
+    pub auth_session: BelongsTo<Option<super::auth_session::Entity>>,
     #[sea_orm(
         belongs_to,
         from = "gateway_id",
@@ -39,7 +48,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    pub gateway_identity: BelongsTo<super::gateway_identity::Entity>,
     #[sea_orm(
         belongs_to,
         from = "actor_principal_id",
@@ -47,7 +56,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal: BelongsTo<Option<super::gateway_principal::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

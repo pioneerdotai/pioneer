@@ -7,27 +7,33 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_operation")]
 pub struct Model {
+    pub deadline_ms: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub expected_head: Option<String>,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
-    pub owner: String,
-    #[sea_orm(column_type = "Text")]
-    pub fingerprint: String,
-    #[sea_orm(column_type = "Text")]
     pub status: String,
-    #[sea_orm(column_type = "Text")]
-    pub snapshot: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub expected_head: Option<String>,
+    pub attempts: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_turn: Option<String>,
-    pub deadline_ms: i64,
-    pub attempts: i64,
-    pub transient_retries: i64,
-    pub correction: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_operation_owner_fingerprint_key"
+    )]
+    pub fingerprint: String,
     pub next_portion: i64,
+    pub transient_retries: i64,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_operation_owner_fingerprint_key"
+    )]
+    pub owner: String,
+    pub correction: i64,
     #[sea_orm(column_type = "Text", nullable)]
     pub outcome: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub snapshot: String,
     #[sea_orm(has_many)]
     pub compaction_attempt_observations: HasMany<super::compaction_attempt_observation::Entity>,
     #[sea_orm(has_many)]
@@ -39,7 +45,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_context: HasOne<super::compaction_context::Entity>,
+    pub compaction_context: BelongsTo<super::compaction_context::Entity>,
     #[sea_orm(has_many)]
     pub compaction_manifests: HasMany<super::compaction_manifest::Entity>,
     #[sea_orm(has_one)]

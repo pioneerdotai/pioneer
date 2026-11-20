@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 #[sea_orm(table_name = "compaction_coverage")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub checkpoint_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub source_scope: String,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub source_id: String,
     #[sea_orm(column_type = "Text")]
     pub source_version: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub checkpoint_id: String,
     #[sea_orm(
         belongs_to,
         from = "checkpoint_id",
@@ -22,7 +22,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_checkpoint: HasOne<super::compaction_checkpoint::Entity>,
+    pub compaction_checkpoint: BelongsTo<super::compaction_checkpoint::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

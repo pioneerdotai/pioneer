@@ -1147,7 +1147,7 @@ async fn load_terminal_state<C: ConnectionTrait>(
     };
     // Preparation and the writer both read these same bounded allocation and
     // completion facts. No sibling list or unbounded history is materialized.
-    let completion = crate::util::optional_typed_json_from_db::<
+    let completion = crate::util::optional_json_value_from_db::<
         pioneer_protocol::TaskLifecyclePolicy,
     >(task.lifecycle_policy_json.clone())?
     .map(|policy| policy.completion)
@@ -1286,7 +1286,7 @@ fn same_after_webhook_progress(expected: &TerminalState, current: &TerminalState
         source,
         event_type: None,
         filter: None,
-    }) = serde_json::from_str::<pioneer_protocol::TaskTriggerSpec>(&before.spec_json)
+    }) = serde_json::from_value::<pioneer_protocol::TaskTriggerSpec>(before.spec_json.clone())
     else {
         return false;
     };

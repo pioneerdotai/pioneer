@@ -7,18 +7,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_input")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_turn_input_turn_id_input_index")]
-    pub turn_id: String,
-    #[sea_orm(unique_key = "uq_turn_input_turn_id_input_index")]
-    pub input_index: i64,
-    pub input_type: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub text: Option<String>,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
+    pub created_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text")]
     pub payload: String,
-    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub input_type: String,
+    #[sea_orm(column_type = "Text")]
+    pub publication_xid: String,
+    #[sea_orm(unique_key = "uq_turn_input_turn_id_input_index")]
+    pub input_index: i64,
+    #[sea_orm(column_type = "Text", unique_key = "uq_turn_input_turn_id_input_index")]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub text: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

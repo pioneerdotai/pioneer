@@ -717,82 +717,87 @@ async fn rollback_retry_and_second_resolution_boundaries() {
 
 #[tokio::test]
 async fn owner_without_invitation_excludes_history_before_principal_creation() {
-    let store = test_store_with_workspace(WS).await;
-    let mut thread = sample_thread(WS, THREAD, NOW);
-    thread.visibility = Some(ThreadVisibility::Workspace);
-    let turn = sample_turn("A00000000000000000001");
-    store
-        .materialize_turn_start(
-            &thread,
-            SandboxMode::FullAccess,
-            &turn,
-            &[UserInput::Text {
-                text: "imported history".into(),
-                text_elements: vec![],
-            }],
-            PersistedActorRef::System,
+    pioneer_postgres_test::with_database(async |fixture| {
+        let store = postgres_store_with_workspace(fixture, WS).await;
+        let mut thread = sample_thread(WS, THREAD, NOW);
+        thread.visibility = Some(ThreadVisibility::Workspace);
+        let turn = sample_turn("A00000000000000000001");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Text {
+                    text: "imported history".into(),
+                    text_elements: vec![],
+                }],
+                PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let reply = |id: &str| pioneer_protocol::ItemCompletedNotification {
+            workspace_id: WS.into(),
+            thread_id: THREAD.into(),
+            turn_id: turn.id.clone(),
+            item: TurnItem::AgentMessage {
+                id: id.into(),
+                text: "answer".into(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        store
+            .materialize_item_completed(reply("old"), NOW + 1)
+            .await
+            .unwrap();
+        let gateway = GatewayId::new("G00000000000000000001").unwrap();
+        let owner = PrincipalId::new("P00000000000000000001").unwrap();
+        let tx = store.connection.begin().await.unwrap();
+        create_gateway_singleton(&tx, &gateway, 0, unix_to_datetime(NOW + 10))
+            .await
+            .unwrap();
+        create_superuser(
+            &tx,
+            &owner,
+            &gateway,
+            "Owner",
+            "owner",
+            "owner",
+            unix_to_datetime(NOW + 10),
         )
         .await
         .unwrap();
-    let reply = |id: &str| pioneer_protocol::ItemCompletedNotification {
-        workspace_id: WS.into(),
-        thread_id: THREAD.into(),
-        turn_id: turn.id.clone(),
-        item: TurnItem::AgentMessage {
-            id: id.into(),
-            text: "answer".into(),
-            phase: AgentMessagePhase::FinalAnswer,
-            markdown: None,
-            markdown_version: None,
-        },
-    };
-    store
-        .materialize_item_completed(reply("old"), NOW + 1)
-        .await
-        .unwrap();
-    let gateway = GatewayId::new("G00000000000000000001").unwrap();
-    let owner = PrincipalId::new("P00000000000000000001").unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    create_gateway_singleton(&tx, &gateway, 0, unix_to_datetime(NOW + 10))
-        .await
-        .unwrap();
-    create_superuser(
-        &tx,
-        &owner,
-        &gateway,
-        "Owner",
-        "owner",
-        "owner",
-        unix_to_datetime(NOW + 10),
-    )
+        tx.commit().await.unwrap();
+        assert!(
+            store
+                .unread_counts_for_threads(&owner, &[THREAD.into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .materialize_item_completed(reply("after-owner-access"), NOW + 11)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .unread_counts_for_threads(&owner, &[THREAD.into()])
+                .await
+                .unwrap()
+                .get(THREAD),
+            Some(&1)
+        );
+        assert!(
+            crate::find_thread_read_cursor(&store.connection, &owner, THREAD)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Ok(())
+    })
     .await
     .unwrap();
-    tx.commit().await.unwrap();
-    assert!(
-        store
-            .unread_counts_for_threads(&owner, &[THREAD.into()])
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .materialize_item_completed(reply("after-owner-access"), NOW + 11)
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .unread_counts_for_threads(&owner, &[THREAD.into()])
-            .await
-            .unwrap()
-            .get(THREAD),
-        Some(&1)
-    );
-    assert!(
-        crate::find_thread_read_cursor(&store.connection, &owner, THREAD)
-            .await
-            .unwrap()
-            .is_none()
-    );
 }
 
 #[tokio::test]

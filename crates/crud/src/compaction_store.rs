@@ -14,6 +14,19 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
+    pub async fn compaction_assert_history_scope(
+        &self,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<()> {
+        pioneer_crud_compaction::source_payloads::require_history_scope(
+            &self.connection,
+            workspace,
+            thread,
+        )
+        .await
+    }
+
     /// Canonical ownership and disclosure metadata, independent of full result
     /// payload size. Every canonical tool item is visible in timeline projection;
     /// non-tool/hidden system records are excluded in the repository query.
@@ -871,13 +884,11 @@ impl CrudStore {
             )
         });
         let maintenance = self.with_maintenance_access();
-        let result = repositories::portable_payload::after_database_owners(
-            repositories::compaction::lifecycle::repair_lifecycle(
-                &maintenance,
-                prepared,
-                event,
-                timestamp_secs,
-            ),
+        let result = repositories::compaction::lifecycle::repair_lifecycle(
+            &maintenance,
+            prepared,
+            event,
+            timestamp_secs,
         )
         .await;
         if let Ok((_, changed)) = &result {
@@ -1074,12 +1085,26 @@ impl CrudStore {
         owner_thread: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<bool> {
-        repositories::compaction::frozen::compaction_finish_frozen_history(
-            &self.connection,
-            workspace,
-            owner_thread,
-            descriptor,
-        )
+        use repositories::compaction::frozen;
+        use sea_orm::TransactionTrait;
+        let layout_check = frozen::ReadyLayoutCheck::prepare(self, &descriptor.manifest_id).await?;
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let finished = frozen::compaction_finish_frozen_history(
+                &tx,
+                workspace,
+                owner_thread,
+                descriptor,
+                layout_check.as_ref(),
+            )
+            .await?;
+            if finished {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            Ok(finished)
+        })
         .await
     }
     /// Finish and register the capture handoff before releasing the writer.
@@ -1089,6 +1114,11 @@ impl CrudStore {
         owner: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<crate::FrozenReadHold> {
+        let layout_check = repositories::compaction::frozen::ReadyLayoutCheck::prepare(
+            self,
+            &descriptor.manifest_id,
+        )
+        .await?;
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let maintenance_result = async {
@@ -1097,7 +1127,11 @@ impl CrudStore {
                 let tx = self.connection.begin().await?;
                 anyhow::ensure!(
                     repositories::compaction::frozen::compaction_finish_frozen_history(
-                        &tx, workspace, owner, descriptor
+                        &tx,
+                        workspace,
+                        owner,
+                        descriptor,
+                        layout_check.as_ref()
                     )
                     .await?,
                     "frozen history publication failed"
@@ -1619,14 +1653,12 @@ impl CrudStore {
                     .collect::<Vec<_>>(),
             )
         });
-        let result = repositories::portable_payload::after_database_owners(
-            repositories::compaction::lifecycle::compaction_materialize_lifecycle(
-                self,
-                operation,
-                generation,
-                event,
-                timestamp_secs,
-            ),
+        let result = repositories::compaction::lifecycle::compaction_materialize_lifecycle(
+            self,
+            operation,
+            generation,
+            event,
+            timestamp_secs,
         )
         .await;
         if let Ok(changed) = &result {

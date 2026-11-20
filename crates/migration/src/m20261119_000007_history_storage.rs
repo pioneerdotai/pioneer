@@ -14,7 +14,8 @@ impl MigrationTrait for Migration {
                     .table("compaction_history_check")
                     .col(text("turn_id").primary_key())
                     .col(text("state").default("pending"))
-                    .col(json_null("descriptor"))
+                    .col(text_null("descriptor"))
+                    .check(Expr::cust("descriptor IS NULL OR descriptor IS JSON"))
                     .col(text_null("outcome"))
                     .col(big_integer("revision").default(0))
                     .col(big_integer("failures").default(0))
@@ -978,7 +979,7 @@ impl MigrationTrait for Migration {
                         ColumnDef::new("insertion_ordinal")
                             .big_integer()
                             .not_null()
-                            .unique_key()
+                            .primary_key()
                             .extra("GENERATED ALWAYS AS IDENTITY"),
                     )
                     .to_owned(),
@@ -1100,30 +1101,6 @@ impl MigrationTrait for Migration {
                     .and_where(Expr::cust(
                         r#"expired=0 AND ready=1 AND (complete<>1 OR unknown=1)"#,
                     ))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
-                    .table("html_preview_index_backfill")
-                    .col(big_integer("singleton").primary_key())
-                    .col(big_integer("complete"))
-                    .col(big_integer("inputs_complete").default(0))
-                    .check(Expr::cust(r#""singleton" = 1"#))
-                    .check(Expr::cust(r#""complete" IN ( 0 , 1 )"#))
-                    .check(Expr::cust(r#""inputs_complete" IN ( 0 , 1 )"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("html_preview_index_backfill")
-                    .columns(["singleton", "complete", "inputs_complete"])
-                    .values_panic([1_i64.into(), 0_i64.into(), 0_i64.into()])
                     .to_owned(),
             )
             .await?;
@@ -1382,69 +1359,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("html_preview_io_work")
-                    .columns([
-                        "family",
-                        "object_id",
-                        "incarnation",
-                        "requested_revision",
-                        "pass_revision",
-                        "state",
-                        "workspace_id",
-                        "ordinal",
-                        "due_at",
-                        "seed_version",
-                    ])
-                    .values_panic([
-                        "seed_witness".into(),
-                        "".into(),
-                        "seed_witness".into(),
-                        "initial".into(),
-                        "".into(),
-                        "ready".into(),
-                        "".into(),
-                        0_i64.into(),
-                        0_i64.into(),
-                        0_i64.into(),
-                    ])
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("html_preview_io_work")
-                    .columns([
-                        "family",
-                        "object_id",
-                        "incarnation",
-                        "requested_revision",
-                        "pass_revision",
-                        "state",
-                        "workspace_id",
-                        "ordinal",
-                        "due_at",
-                        "seed_version",
-                    ])
-                    .values_panic([
-                        "seed_copies".into(),
-                        "".into(),
-                        "seed_copies".into(),
-                        "initial".into(),
-                        "".into(),
-                        "ready".into(),
-                        "".into(),
-                        0_i64.into(),
-                        0_i64.into(),
-                        0_i64.into(),
-                    ])
-                    .to_owned(),
-            )
-            .await?;
         Ok(())
     }
 
@@ -1460,7 +1374,6 @@ impl MigrationTrait for Migration {
                 "compaction_frozen_sweep_work",
                 "html_preview_frozen_result",
                 "html_preview_frozen_turn",
-                "html_preview_index_backfill",
                 "html_preview_frozen_index",
                 "compaction_checkpoint_import",
                 "compaction_checkpoint_event_input",

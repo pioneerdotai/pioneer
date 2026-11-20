@@ -1129,8 +1129,6 @@ impl MigrationTrait for Migration {
                         timestamp_with_time_zone("updated_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
                     )
-                    .col(text_null("history_backfill_after_event_id"))
-                    .col(boolean("history_backfill_complete").default(false))
                     .check(Expr::cust(
                         r#"activation_epoch >= 0 AND cursor_source_id >= 0"#,
                     ))
@@ -1157,8 +1155,10 @@ impl MigrationTrait for Migration {
                 .col(text("reviewer_provider"))
                 .col(text("reviewer_model"))
                 .col(text("pipeline_contract_version"))
-                .col(json_null("analysis_cursor_json"))
-                .col(json_null("analysis_digest_json"))
+                .col(text_null("analysis_cursor_json"))
+                .check(Expr::cust("analysis_cursor_json IS NULL OR analysis_cursor_json IS JSON"))
+                .col(text_null("analysis_digest_json"))
+                .check(Expr::cust("analysis_digest_json IS NULL OR analysis_digest_json IS JSON"))
                 .col(text_null("outcome"))
                 .col(text_null("applied_action"))
                 .col(text_null("skill_id"))

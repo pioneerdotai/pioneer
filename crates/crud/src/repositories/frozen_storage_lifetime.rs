@@ -1,19 +1,18 @@
 //! Bounded progress for the existing frozen-storage worker. Physical eligibility
 //! is durable; no connection or capacity permit is retained between quanta.
 use super::{checkpoint_proofs, compaction, frozen_sweep_work};
-use crate::{
-    CrudStore,
-    frozen_lifetime::{FrozenRootStream, PreparedFrozenRoot},
-};
+use crate::CrudStore;
+#[cfg(test)]
+use crate::frozen_lifetime::{FrozenRootStream, PreparedFrozenRoot};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
+use pioneer_crud_compaction::frozen_expiry::{pre_runner_failure, unknown_predicate};
 use pioneer_entity::{
     compaction_checkpoint as checkpoint, compaction_context as context,
     compaction_coverage as coverage, compaction_frozen_history as history,
     compaction_frozen_layout as layout, compaction_frozen_span as span,
     compaction_operation as operation, compaction_operation_projection as projection,
-    compaction_runner_plan as plan, compaction_runner_state as runner, task,
-    task_run_conversation_snapshot as task_input,
+    compaction_runner_state as runner, task, task_run_conversation_snapshot as task_input,
 };
 use pioneer_observability::portable_payload as observe;
 use sea_orm::sea_query::{
@@ -58,12 +57,18 @@ pub struct FrozenStorageLifetimeProgress {
     // Periodic admission for already completed cleanup, independent of active
     // continuations and of the worker's separate conversion discovery EOF.
     cleanup_revisit_at: Option<Instant>,
+    #[cfg(test)]
     locator_done: [bool; 4],
     scope: ScopeDiscovery,
+    #[cfg(test)]
     locators: [String; 4],
+    #[cfg(test)]
     locator_kind: usize,
+    #[cfg(test)]
     locator_pending: [VecDeque<(String, String, i64)>; 4],
+    #[cfg(test)]
     locator_upper: [Option<String>; 4],
+    #[cfg(test)]
     locator: Option<LocatorRead>,
     proof_after: String,
     proof_upper: Option<String>,
@@ -89,6 +94,7 @@ pub struct FrozenStorageLifetimeProgress {
     pub(super) conversion_after: [String; 2],
     pub(super) conversion_register_after: String,
 }
+#[cfg(test)]
 const ROOTS: [(&str, &str, &str); 4] = [
     ("task_run_conversation_snapshot", "run_id", "history_json"),
     ("turn_runtime_snapshot", "turn_id", "history_json"),
@@ -99,6 +105,7 @@ const ROOTS: [(&str, &str, &str); 4] = [
     ),
     ("turn_cli_runtime_binding", "turn_id", "input_mapping_json"),
 ];
+#[cfg(test)]
 struct LocatorRead {
     kind: usize,
     id: String,
@@ -108,6 +115,7 @@ struct LocatorRead {
     stream: Option<FrozenRootStream>,
     prepared: Option<PreparedFrozenRoot>,
 }
+#[cfg(test)]
 impl LocatorRead {
     fn new(kind: usize, id: String, workspace: String, size: i64) -> Self {
         let stream = match kind {
@@ -528,62 +536,6 @@ fn terminal(status: &str, generation: Option<i64>, state: Option<&str>) -> Resul
         _ => false,
     })
 }
-// Failed admission can finish before activation creates a runner. Activation
-// requires running; both failed-operation resume paths require a saved state.
-// Supported writers cannot revive this failed operation without a saved state
-// or replace its admitted projection. Recheck current facts in the expiry
-// writer, without caching bindings or deriving a generation. CASE fails closed
-// for missing/corrupt nullable joins. Closed portions still need the ordinary
-// checkpoint proof/reachability checks; their count is not a lifecycle root.
-fn pre_runner_failure(header: &history::Model) -> SimpleExpr {
-    Expr::case(
-        Condition::all()
-            .add(Expr::col((operation::Entity, operation::Column::Status)).eq("failed"))
-            .add(Expr::col((operation::Entity, operation::Column::Owner)).ne(""))
-            .add(
-                Expr::col((operation::Entity, operation::Column::Outcome))
-                    .is_in(["invalid_source_manifest", "deadline"]),
-            )
-            .add(Expr::col((operation::Entity, operation::Column::Attempts)).eq(0))
-            .add(Expr::col((operation::Entity, operation::Column::TransientRetries)).eq(0))
-            .add(Expr::col((operation::Entity, operation::Column::Correction)).eq(0))
-            .add(Expr::col((operation::Entity, operation::Column::NextPortion)).gte(0))
-            .add(Expr::col((runner::Entity, runner::Column::OperationId)).is_null())
-            .add(Expr::col((projection::Entity, projection::Column::TerminalGeneration)).is_null())
-            .add(
-                Expr::col((context::Entity, context::Column::WorkspaceId)).eq(&header.workspace_id),
-            )
-            .add(Expr::col((context::Entity, context::Column::FormatVersion)).eq(1))
-            .add(Expr::col((context::Entity, context::Column::ThreadId)).ne(""))
-            .add(Expr::col((projection::Entity, projection::Column::ManifestId)).eq(&header.id))
-            .add(
-                Expr::col((projection::Entity, projection::Column::IdentitySha256))
-                    .eq(&header.identity_sha256),
-            )
-            .add(
-                Expr::col((projection::Entity, projection::Column::ImportsSha256))
-                    .eq(&header.imports_sha256),
-            )
-            .add(
-                Expr::col((projection::Entity, projection::Column::ImportCount))
-                    .eq(header.import_count),
-            )
-            .add(Expr::exists(
-                Query::select()
-                    .expr(Expr::val(1))
-                    .from(plan::Entity)
-                    .and_where(
-                        Expr::col((plan::Entity, plan::Column::OperationId))
-                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                    )
-                    .and_where(Expr::col((plan::Entity, plan::Column::Ready)).eq(0))
-                    .to_owned(),
-            )),
-        true,
-    )
-    .finally(false)
-    .into()
-}
 struct ExpiryPreparation {
     header: history::Model,
     roots_checked: bool,
@@ -642,7 +594,7 @@ impl ExpiryPreparation {
                 .columns([operation::Column::Owner,operation::Column::Status].map(|c| (operation::Entity,c)))
                 .column((runner::Entity,runner::Column::Generation)).column((context::Entity,context::Column::WorkspaceId))
                 .expr_as(pre_runner_failure(&self.header),Alias::new("pre_runner_failure"))
-                .expr_as(Expr::cust("CASE WHEN length(CAST(compaction_runner_state.state AS BLOB))<=262144 THEN compaction_runner_state.state END"),Alias::new("state"))
+                .expr_as(Expr::cust("CASE WHEN octet_length(compaction_runner_state.state::text)<=262144 THEN compaction_runner_state.state::text END"),Alias::new("state"))
                 .join(JoinType::LeftJoin,operation::Entity,
                     Expr::col((operation::Entity,operation::Column::Id)).eq(Expr::col((projection::Entity,projection::Column::OperationId))))
                 .join(JoinType::LeftJoin,context::Entity,
@@ -798,31 +750,6 @@ impl ExpiryPreparation {
 // Releasing inputs do not retain even an inconsistent old snapshot scope;
 // unresolved checkpoint ownership is a separate prerequisite. Retaining
 // unknown Task inputs block both known workspace interpretations.
-fn unknown_predicate(alias: &str) -> String {
-    format!(
-        r#"
-EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR t.workspace_id={alias}.workspace_id OR s.workspace_id='' OR t.workspace_id='') AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
-OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
-OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
-OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
-OR EXISTS(SELECT 1 FROM compaction_context x JOIN compaction_operation o ON o.owner=x.owner JOIN compaction_runner_plan p ON p.operation_id=o.id LEFT JOIN compaction_operation_projection b ON b.operation_id=o.id WHERE x.workspace_id={alias}.workspace_id AND b.operation_id IS NULL AND NOT EXISTS(SELECT 1 FROM compaction_checkpoint c WHERE c.operation_id=o.id AND c.proof_version=1))
-OR EXISTS(SELECT 1 FROM compaction_context x JOIN compaction_checkpoint c ON c.owner=x.owner LEFT JOIN compaction_operation_projection b ON b.operation_id=c.operation_id WHERE x.workspace_id={alias}.workspace_id AND c.proof_version=0 AND b.operation_id IS NULL)
-"#
-    )
-}
-fn root_predicate(alias: &str) -> String {
-    format!(
-        r#"{}
-OR EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id={alias}.id AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
-OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id={alias}.id)
-OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id={alias}.id)
-OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id={alias}.id)
-OR EXISTS(SELECT 1 FROM compaction_task_output s WHERE s.manifest_id={alias}.id)
-"#,
-        unknown_predicate(alias)
-    )
-}
-
 fn healthy(alias: &str) -> String {
     format!(
         "{alias}.ready IN (0,1) AND {alias}.expired IN (0,1) AND {alias}.message_count>=0 AND {alias}.import_count>=0 AND {alias}.next_ordinal BETWEEN 0 AND {alias}.message_count AND {alias}.next_import BETWEEN 0 AND {alias}.import_count AND ({alias}.ready=0 OR ({alias}.next_ordinal={alias}.message_count AND {alias}.next_import={alias}.import_count))"
@@ -839,199 +766,16 @@ async fn expire(store: &CrudStore, header: &history::Model) -> Result<bool> {
     let result = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
-            let h = history::Entity::find_by_id(&header.id)
-                .one(&tx)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
-            crate::frozen_lifetime::logical_bounds(&h)?;
-            ensure!(h.ready == 1 && h == *header, "expiry header changed");
-            if crate::frozen_lifetime::cleanup_blocked(
-                &store.frozen_readers,
-                &h.id,
-                &store.connection.work_signal("maintenance.frozen.release"),
-            ) {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let guard = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from_as(history::Entity, Alias::new("h"))
-                        .and_where(Expr::col((Alias::new("h"), history::Column::Id)).eq(&h.id))
-                        .and_where(Expr::cust(root_predicate("h")))
-                        .limit(1)
-                        .to_owned(),
+            let changed = pioneer_crud_compaction::frozen_expiry::expire(&tx, header, |id| {
+                crate::frozen_lifetime::cleanup_blocked(
+                    &store.frozen_readers,
+                    id,
+                    &store.connection.work_signal("maintenance.frozen.release"),
                 )
-                .await?;
-            if guard.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            // Saved runners retain the derived generation guard. Absent-runner
-            // failures instead recheck their current durable facts in this writer.
-            // Activation requires running; state insertion invalidates the marker.
-            let active = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from(projection::Entity)
-                        .join(
-                            JoinType::LeftJoin,
-                            operation::Entity,
-                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
-                                projection::Entity,
-                                projection::Column::OperationId,
-                            ))),
-                        )
-                        .join(
-                            JoinType::LeftJoin,
-                            runner::Entity,
-                            Expr::col((runner::Entity, runner::Column::OperationId))
-                                .eq(Expr::col((operation::Entity, operation::Column::Id))),
-                        )
-                        .join(
-                            JoinType::LeftJoin,
-                            context::Entity,
-                            Expr::col((context::Entity, context::Column::Owner))
-                                .eq(Expr::col((operation::Entity, operation::Column::Owner))),
-                        )
-                        .and_where(
-                            Expr::col((projection::Entity, projection::Column::ManifestId))
-                                .eq(&h.id),
-                        )
-                        .cond_where(
-                            Condition::any()
-                                .add(
-                                    Expr::col((operation::Entity, operation::Column::Id)).is_null(),
-                                )
-                                .add(
-                                    Expr::col((operation::Entity, operation::Column::Status))
-                                        .is_not_in(["completed", "failed", "cancelled", "stale"]),
-                                )
-                                .add(
-                                    Expr::col((runner::Entity, runner::Column::OperationId))
-                                        .is_null(),
-                                )
-                                .add(
-                                    Expr::col((
-                                        projection::Entity,
-                                        projection::Column::TerminalGeneration,
-                                    ))
-                                    .is_null(),
-                                )
-                                .add(
-                                    Expr::col((
-                                        projection::Entity,
-                                        projection::Column::TerminalGeneration,
-                                    ))
-                                    .ne(Expr::col((runner::Entity, runner::Column::Generation))),
-                                )
-                                .add(
-                                    Expr::col((context::Entity, context::Column::WorkspaceId))
-                                        .is_null(),
-                                )
-                                .add(
-                                    Expr::col((context::Entity, context::Column::WorkspaceId))
-                                        .ne(&h.workspace_id),
-                                ),
-                        )
-                        .and_where(pre_runner_failure(&h).eq(false))
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if active.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let unsealed_public = tx
-                .query_one(
-                    &Query::select()
-                        .expr(Expr::val(1))
-                        .from(projection::Entity)
-                        .join(
-                            JoinType::InnerJoin,
-                            checkpoint::Entity,
-                            Expr::col((checkpoint::Entity, checkpoint::Column::OperationId)).eq(
-                                Expr::col((projection::Entity, projection::Column::OperationId)),
-                            ),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            operation::Entity,
-                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
-                                projection::Entity,
-                                projection::Column::OperationId,
-                            ))),
-                        )
-                        .and_where(
-                            Expr::col((projection::Entity, projection::Column::ManifestId))
-                                .eq(&h.id),
-                        )
-                        .and_where(
-                            Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion)).ne(1),
-                        )
-                        .and_where(
-                            Expr::col((checkpoint::Entity, checkpoint::Column::Status))
-                                .eq("applied")
-                                .or(Expr::col((checkpoint::Entity, checkpoint::Column::Status))
-                                    .eq("retained")
-                                    .and(
-                                        Expr::col((operation::Entity, operation::Column::Status))
-                                            .eq("completed"),
-                                    )),
-                        )
-                        .limit(1)
-                        .to_owned(),
-                )
-                .await?;
-            if unsealed_public.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let transitions = layout::Entity::find()
-                .select_only()
-                .column(layout::Column::ManifestId)
-                .filter(
-                    Condition::any()
-                        .add(layout::Column::ManifestId.eq(&h.id))
-                        .add(layout::Column::Candidate.eq(&h.id)),
-                )
-                .filter(
-                    Condition::any()
-                        .add(layout::Column::Active.ne(1))
-                        .add(layout::Column::Pending.ne(0))
-                        .add(layout::Column::Failed.ne(0))
-                        .add(Expr::col(layout::Column::CopyNext).lt(Func::coalesce([
-                            Expr::col(layout::Column::CopyTo),
-                            Expr::val(0),
-                        ]))),
-                )
-                .into_tuple::<String>()
-                .one(&tx)
-                .await?;
-            if transitions.is_some() {
-                tx.commit().await?;
-                return Ok(false);
-            }
-            let expired = history::Entity::update_many()
-                .col_expr(history::Column::Expired, Expr::val(1))
-                .filter(history::Column::Id.eq(&h.id))
-                .filter(history::Column::Expired.eq(0))
-                .filter(history::Column::Ready.eq(1))
-                .filter(
-                    Expr::col(history::Column::NextOrdinal)
-                        .eq(Expr::col(history::Column::MessageCount)),
-                )
-                .filter(
-                    Expr::col(history::Column::NextImport)
-                        .eq(Expr::col(history::Column::ImportCount)),
-                )
-                .exec(&tx)
-                .await?;
+            })
+            .await?;
             tx.commit().await?;
-            Ok(expired.rows_affected > 0)
+            Ok(changed)
         })
         .await;
     if let Ok(changed) = &result {
@@ -1188,19 +932,18 @@ impl SweepPreparation {
     }
     async fn prepare(&mut self, store: &CrudStore) -> Result<bool> {
         if self.span_until.is_none() {
-            // Span writers insert/extend metadata; they never delete/reinsert
-            // it. Freeze the rowid insertion frontier as well as the logical
-            // keyset so consumers arriving behind the cursor cannot extend a
-            // visit indefinitely. This is an indexed single-row seek.
-            let row = store
-                .connection
-                .query_one_raw(Statement::from_string(
-                    DbBackend::Sqlite,
-                    "SELECT COALESCE(MAX(rowid),0) AS span_until FROM compaction_frozen_span",
-                ))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("span insertion frontier missing"))?;
-            self.span_until = Some(row.try_get("", "span_until")?);
+            // The immutable insertion ordinal freezes the indexed frontier
+            // for this visit. New consumers are checked again before deletion.
+            self.span_until = Some(
+                span::Entity::find()
+                    .select_only()
+                    .column(span::Column::InsertionOrdinal)
+                    .order_by_desc(span::Column::InsertionOrdinal)
+                    .into_tuple::<i64>()
+                    .one(&store.connection)
+                    .await?
+                    .unwrap_or(0),
+            );
             return Ok(false);
         }
         if let Some((check, _)) = self.current.as_mut() {
@@ -1217,7 +960,7 @@ impl SweepPreparation {
                     .one(&store.connection)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("physical backing scope missing"))?;
-                let l = layout::Entity::find_by_id((id, self.kind))
+                let l = pioneer_crud_compaction::frozen::find_layout(id, self.kind)
                     .one(&store.connection)
                     .await?;
                 let scan =
@@ -1233,10 +976,7 @@ impl SweepPreparation {
                 .columns([span::Column::Start, span::Column::ManifestId])
                 .filter(span::Column::SourceManifest.eq(&self.manifest))
                 .filter(span::Column::Kind.eq(self.kind))
-                .filter(Expr::cust_with_values(
-                    "rowid<=?",
-                    [self.span_until.expect("span frontier")],
-                ))
+                .filter(span::Column::InsertionOrdinal.lte(self.span_until.expect("span frontier")))
                 .order_by_desc(span::Column::Start)
                 .order_by_desc(span::Column::ManifestId)
                 .into_tuple::<(i64, String)>()
@@ -1251,10 +991,7 @@ impl SweepPreparation {
             let page = span::Entity::find()
                 .filter(span::Column::SourceManifest.eq(&self.manifest))
                 .filter(span::Column::Kind.eq(self.kind))
-                .filter(Expr::cust_with_values(
-                    "rowid<=?",
-                    [self.span_until.expect("span frontier")],
-                ))
+                .filter(span::Column::InsertionOrdinal.lte(self.span_until.expect("span frontier")))
                 .filter(
                     Expr::tuple([
                         Expr::col(span::Column::Start),
@@ -1316,7 +1053,7 @@ impl SweepPreparation {
         if next <= self.until {
             self.free.push_back((next, self.until.saturating_add(1)));
         }
-        self.prepared = Some(geometry_values(self.checked.values()));
+        self.prepared = Some(geometry_values(self.checked.values())?);
         self.checked.clear();
         self.reverse = Vec::new();
         Ok(true)
@@ -1340,10 +1077,10 @@ impl SweepPreparation {
         let import_key = if self.kind == 1 {
             "message_ordinal"
         } else {
-            "0"
+            "0::bigint"
         };
-        let page = store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            format!("SELECT ordinal, bytes, length(CAST({payload} AS BLOB)) AS actual, {import_key} AS target FROM {data} WHERE manifest_id=?1 AND ordinal>=?2 AND ordinal<?3 ORDER BY ordinal LIMIT ?4"),
+        let page = store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            format!("SELECT ordinal, bytes, octet_length({payload})::bigint AS actual, {import_key} AS target FROM {data} WHERE manifest_id=$1 AND ordinal>=$2 AND ordinal<$3 ORDER BY ordinal LIMIT $4"),
             [self.manifest.clone().into(), std::cmp::max(self.next, start).into(), end.into(), SWEEP_ROWS.into()])).await?;
         let mut keys = Vec::with_capacity(page.len());
         let mut total = 0;
@@ -1396,7 +1133,17 @@ impl SweepPreparation {
                             return Ok(None);
                         }
                     }
-                    if tx.query_one_raw(guard).await?.is_none() {
+                    // A new retaining FK or layout publication must follow
+                    // the backing header lock. Check current geometry only
+                    // after PostgreSQL has granted that lock.
+                    let backing = history::Entity::find_by_id(&self.manifest)
+                        .select_only()
+                        .column(history::Column::Id)
+                        .lock_exclusive()
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?;
+                    if backing.is_none() || tx.query_one_raw(guard).await?.is_none() {
                         tx.commit().await?;
                         return Ok(None);
                     }
@@ -1483,68 +1230,44 @@ const GEOMETRY_LAYOUT_FIELDS: [&str; 10] = [
     "failed",
 ];
 
-// Prepare a VALUES relation once, using the SQL builder, outside DB capacity.
-// Literal metadata avoids both SQLite's variable limit for large consumer sets
-// and reparsing/serializing a full JSON inventory under the writer. Text is a
-// hex literal so even unusual database identifiers remain data, including NUL.
-fn geometry_values<'a>(geometries: impl IntoIterator<Item = &'a CheckedGeometry>) -> String {
-    let columns = GEOMETRY_HEADER_FIELDS
-        .iter()
-        .map(|f| format!("h_{f}"))
-        .chain(GEOMETRY_LAYOUT_FIELDS.iter().map(|f| format!("l_{f}")))
+// Prepare the bounded row projections before reserving a writer. The final
+// guard uses PostgreSQL's typed json_to_recordset to bind all witnesses as one
+// parameter even when independently prepared pages contain many references.
+fn geometry_values<'a>(
+    geometries: impl IntoIterator<Item = &'a CheckedGeometry>,
+) -> Result<String> {
+    let rows = geometries
+        .into_iter()
+        .map(|g| {
+            let h = &g.h;
+            let l = g.l.as_ref();
+            serde_json::json!({
+                "h_id": h.id,
+                "h_workspace_id": h.workspace_id,
+                "h_owner_thread": h.owner_thread,
+                "h_identity_sha256": h.identity_sha256,
+                "h_imports_sha256": h.imports_sha256,
+                "h_message_count": h.message_count,
+                "h_import_count": h.import_count,
+                "h_next_ordinal": h.next_ordinal,
+                "h_next_import": h.next_import,
+                "h_ready": h.ready,
+                "h_expired": h.expired,
+                "h_storage_registered": h.storage_registered,
+                "l_manifest_id": l.map(|l| &l.manifest_id),
+                "l_kind": l.map(|l| l.kind),
+                "l_active": l.map(|l| l.active),
+                "l_pending": l.map(|l| l.pending),
+                "l_candidate": l.and_then(|l| l.candidate.as_deref()),
+                "l_compared": l.map(|l| l.compared),
+                "l_copy_to": l.and_then(|l| l.copy_to),
+                "l_copy_next": l.map(|l| l.copy_next),
+                "l_cleanup_to": l.map(|l| l.cleanup_to),
+                "l_failed": l.map(|l| l.failed),
+            })
+        })
         .collect::<Vec<_>>();
-    let mut query = Query::insert();
-    query
-        .into_table(Alias::new("checked"))
-        .columns(columns.iter().map(Alias::new));
-    for g in geometries {
-        let h = &g.h;
-        let mut values: Vec<sea_orm::Value> = vec![
-            h.id.clone().into(),
-            h.workspace_id.clone().into(),
-            h.owner_thread.clone().into(),
-            h.identity_sha256.clone().into(),
-            h.imports_sha256.clone().into(),
-            h.message_count.into(),
-            h.import_count.into(),
-            h.next_ordinal.into(),
-            h.next_import.into(),
-            h.ready.into(),
-            h.expired.into(),
-            h.storage_registered.into(),
-        ];
-        if let Some(l) = &g.l {
-            values.extend([
-                l.manifest_id.clone().into(),
-                l.kind.into(),
-                l.active.into(),
-                l.pending.into(),
-                l.candidate.clone().into(),
-                l.compared.into(),
-                l.copy_to.into(),
-                l.copy_next.into(),
-                l.cleanup_to.into(),
-                l.failed.into(),
-            ]);
-        } else {
-            values.extend(std::iter::repeat_n(
-                sea_orm::Value::Int(None),
-                GEOMETRY_LAYOUT_FIELDS.len(),
-            ));
-        }
-        query.values_panic(values.into_iter().map(|value| match value {
-            sea_orm::Value::String(Some(text)) => {
-                Expr::cust(format!("CAST(X'{}' AS TEXT)", hex::encode(text.as_bytes())))
-            }
-            value => Expr::val(value),
-        }));
-    }
-    let sql = query.to_string(sea_orm::sea_query::SqliteQueryBuilder);
-    let (_, values) = sql.split_once("VALUES ").expect("geometry VALUES");
-    format!(
-        "WITH checked({}) AS MATERIALIZED (VALUES {values})",
-        columns.join(",")
-    )
+    Ok(serde_json::to_string(&rows)?)
 }
 
 // One common guard for the whole selected free interval, never a predicate
@@ -1567,14 +1290,14 @@ fn sweep_validation(
     let l_fields = GEOMETRY_LAYOUT_FIELDS;
     let same_h = h_fields
         .iter()
-        .map(|f| format!("h.{f} IS e.h_{f}"))
+        .map(|f| format!("h.{f} IS NOT DISTINCT FROM e.h_{f}"))
         .collect::<Vec<_>>()
         .join(" AND ");
     // Cleanup cursor movement cannot change published geometry. Validate its
     // current bounds without invalidating a continuing visit on every advance.
     let same_l = l_fields
         .iter()
-        .map(|f| format!("l.{f} IS e.l_{f}"))
+        .map(|f| format!("l.{f} IS NOT DISTINCT FROM e.l_{f}"))
         .collect::<Vec<_>>()
         .join(" AND ");
     let health = healthy("h");
@@ -1590,26 +1313,41 @@ fn sweep_validation(
         "next_import"
     };
     Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         format!(
             r#"
-{prepared}
+WITH checked AS MATERIALIZED (
+ SELECT * FROM json_to_recordset($5::json) AS geometry(
+  h_id text, h_workspace_id text, h_owner_thread text,
+  h_identity_sha256 text, h_imports_sha256 text,
+  h_message_count bigint, h_import_count bigint, h_next_ordinal bigint, h_next_import bigint,
+  h_ready bigint, h_expired bigint, h_storage_registered bigint,
+  l_manifest_id text, l_kind bigint, l_active bigint, l_pending bigint, l_candidate text,
+  l_compared bigint, l_copy_to bigint, l_copy_next bigint, l_cleanup_to bigint, l_failed bigint
+ )
+)
 SELECT 1 WHERE
-NOT EXISTS(SELECT 1 FROM checked e LEFT JOIN compaction_frozen_history h ON h.id=e.h_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=e.h_id AND l.kind=?2 WHERE h.id IS NULL OR NOT ({same_h}) OR (l.manifest_id IS NOT NULL AND (l.cleanup_next<0 OR l.cleanup_next>l.cleanup_to)) OR NOT ((e.l_manifest_id IS NULL AND l.manifest_id IS NULL) OR (e.l_manifest_id IS NOT NULL AND l.manifest_id IS NOT NULL AND {same_l})))
-AND EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1)
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=?1 AND ({unknown}))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND (NOT ({health}) OR ({deleting}=1 AND h.expired=0 AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2 AND l.active=1))))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=?1 AND s.kind=?2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR ({deleting}=1 AND h.expired=0 AND s.start<=?4 AND ?3<s.end AND ?3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=?2 AND (l.manifest_id=?1 OR l.candidate=?1) AND (l.failed<>0 OR (({deleting}=1 OR l.manifest_id<>?1) AND l.active<>1) OR l.copy_next<COALESCE(l.copy_to,0)))
-AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND h.storage_registered<>0 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=?2))
+NOT EXISTS(SELECT 1 FROM checked e LEFT JOIN compaction_frozen_history h ON h.id=e.h_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=e.h_id AND l.kind=$2 WHERE h.id IS NULL OR NOT ({same_h}) OR (l.manifest_id IS NOT NULL AND (l.cleanup_next<0 OR l.cleanup_next>l.cleanup_to)) OR NOT ((e.l_manifest_id IS NULL AND l.manifest_id IS NULL) OR (e.l_manifest_id IS NOT NULL AND l.manifest_id IS NOT NULL AND {same_l})))
+AND EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=$1)
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history p WHERE p.id=$1 AND ({unknown}))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=$1 AND (NOT ({health}) OR ({deleting}=1 AND h.expired=0 AND $3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=$2 AND l.active=1))))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s LEFT JOIN checked e ON e.h_id=s.manifest_id LEFT JOIN compaction_frozen_history h ON h.id=s.manifest_id LEFT JOIN compaction_frozen_layout l ON l.manifest_id=s.manifest_id AND l.kind=s.kind WHERE s.source_manifest=$1 AND s.kind=$2 AND (e.h_id IS NULL OR h.id IS NULL OR NOT ({health}) OR l.manifest_id IS NULL OR l.failed<>0 OR l.active<>1 OR l.copy_next<COALESCE(l.copy_to,0) OR (h.storage_registered<>0 AND l.manifest_id IS NULL) OR ({deleting}=1 AND h.expired=0 AND s.start<=$4 AND $3<s."end" AND $3<CASE h.ready WHEN 1 THEN h.{hk} ELSE h.{nk} END)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.kind=$2 AND (l.manifest_id=$1 OR l.candidate=$1) AND (l.failed<>0 OR (({deleting}=1 OR l.manifest_id<>$1) AND l.active<>1) OR l.copy_next<COALESCE(l.copy_to,0)))
+AND NOT EXISTS(SELECT 1 FROM compaction_frozen_history h WHERE h.id=$1 AND h.storage_registered<>0 AND NOT EXISTS(SELECT 1 FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.kind=$2))
 "#
         ),
-        [manifest.into(), kind.into(), first.into(), last.into()],
+        [
+            manifest.into(),
+            kind.into(),
+            first.into(),
+            last.into(),
+            prepared.into(),
+        ],
     )
 }
 
-// Repository-only SQLite bulk physical deletion. Its caller supplies the
-// container guard in the same serialized write transaction.
+// The installed builders do not expose DELETE joined to a typed VALUES
+// relation with RETURNING. Match the bounded page's byte counts under lock.
 fn physical_delete(manifest: &str, kind: i64, keys: &[(i64, i64)]) -> Result<Statement> {
     ensure!(
         matches!(kind, 0 | 1) && !keys.is_empty() && keys.len() <= SWEEP_ROWS as usize,
@@ -1624,7 +1362,11 @@ fn physical_delete(manifest: &str, kind: i64, keys: &[(i64, i64)]) -> Result<Sta
             "invalid physical key"
         );
         bytes += size;
-        tuples.push(format!("(?{},?{})", values.len() + 1, values.len() + 2));
+        tuples.push(format!(
+            "(${}::bigint,${}::bigint)",
+            values.len() + 1,
+            values.len() + 2
+        ));
         values.extend([ordinal.into(), size.into()]);
     }
     ensure!(bytes <= SWEEP_BYTES, "physical batch byte limit exceeded");
@@ -1635,9 +1377,9 @@ fn physical_delete(manifest: &str, kind: i64, keys: &[(i64, i64)]) -> Result<Sta
         ""
     };
     Ok(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         format!(
-            "WITH selected(ordinal,bytes) AS (VALUES {}) DELETE FROM {data} AS d WHERE d.manifest_id=?1 AND d.ordinal IN (SELECT ordinal FROM selected) AND EXISTS(SELECT 1 FROM selected k WHERE k.ordinal=d.ordinal AND k.bytes=d.bytes) AND length(CAST(d.{payload} AS BLOB))=d.bytes {import_key} RETURNING bytes",
+            "WITH selected(ordinal,bytes) AS (VALUES {}) DELETE FROM {data} AS d WHERE d.manifest_id=$1 AND d.ordinal IN (SELECT ordinal FROM selected) AND EXISTS(SELECT 1 FROM selected k WHERE k.ordinal=d.ordinal AND k.bytes=d.bytes) AND octet_length(d.{payload})=d.bytes {import_key} RETURNING bytes",
             tuples.join(",")
         ),
         values,
@@ -1655,7 +1397,7 @@ pub(super) fn duplicate_cleanup_statements(
     let prepared = geometry_values(&[CheckedGeometry {
         h: h.clone(),
         l: Some(l.clone()),
-    }]);
+    }])?;
     Ok(Some((
         sweep_guard(
             &h.id,
@@ -2043,7 +1785,10 @@ impl FrozenStorageLifetimeProgress {
         let phase =
             selected.ok_or_else(|| anyhow::anyhow!("lifetime pass has no eligible phase"))?;
         let result = match phase {
+            #[cfg(test)]
             0 => self.locator_quantum(&store).await,
+            #[cfg(not(test))]
+            0 => Ok(false),
             1 => self.proof_quantum(&store).await,
             2 => self.expiry_quantum(&store).await,
             3 => self.sweep_quantum(&store).await,
@@ -2085,6 +1830,7 @@ impl FrozenStorageLifetimeProgress {
                 // Data/authority refusal ends this object's visit. The indexed
                 // cursor already advanced; other families continue immediately.
                 match phase {
+                    #[cfg(test)]
                     0 => self.locator = None,
                     1 => {
                         if self.proof.is_none() {
@@ -2105,7 +1851,10 @@ impl FrozenStorageLifetimeProgress {
         }
         if self.pass_done.iter().all(|done| *done) {
             self.pass_done = self.discovery_phases();
-            self.locator_done = [false; 4];
+            #[cfg(test)]
+            {
+                self.locator_done = [false; 4];
+            }
             self.sweep_round = Default::default();
             tracing::debug!(
                 message_rows = self.accounting.rows[0],
@@ -2166,6 +1915,7 @@ impl FrozenStorageLifetimeProgress {
         }
         Ok(true)
     }
+    #[cfg(test)]
     async fn locator_quantum(&mut self, store: &CrudStore) -> Result<bool> {
         if let Some(read) = self.locator.as_mut() {
             if read.step(store).await? {
@@ -2638,10 +2388,6 @@ impl FrozenStorageLifetimeProgress {
             .query_one(
                 &Query::select()
                     .column(Alias::new("ordinal"))
-                    .expr_as(
-                        Func::cust(Alias::new("typeof")).arg(Expr::col(Alias::new("ordinal"))),
-                        Alias::new("ordinal_type"),
-                    )
                     .from(Alias::new(data))
                     .and_where(Expr::col(Alias::new("manifest_id")).eq(&work.manifest))
                     .order_by(Alias::new("ordinal"), Order::Desc)
@@ -2650,12 +2396,6 @@ impl FrozenStorageLifetimeProgress {
             )
             .await?;
         if let Some(last) = last {
-            if last.try_get::<String>("", "ordinal_type")? != "integer" {
-                self.accounting.poison += 1;
-                work.finish(store, frozen_sweep_work::Completion::Retry)
-                    .await?;
-                return Ok(true);
-            }
             let until: i64 = last.try_get("", "ordinal")?;
             if until < 0 {
                 self.accounting.poison += 1;
@@ -2681,7 +2421,7 @@ impl FrozenStorageLifetimeProgress {
             work.finish(
                 store,
                 frozen_sweep_work::Completion::Complete(
-                    DbBackend::Sqlite.build(&Query::select().expr(Expr::val(1)).to_owned()),
+                    DbBackend::Postgres.build(&Query::select().expr(Expr::val(1)).to_owned()),
                 ),
             )
             .await?;
@@ -2889,17 +2629,16 @@ async fn prepare_discard_candidate(
     id: &str,
 ) -> Result<Option<DiscardPreparation>> {
     let row = store.connection.query_one_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "SELECT c.operation_id,c.owner,c.status AS checkpoint_status,p.manifest_id,o.status,r.generation,CAST(r.state AS BLOB) AS state \
+        DbBackend::Postgres,
+        "SELECT c.operation_id,c.owner,c.status AS checkpoint_status,p.manifest_id,o.status,r.generation,r.state::text AS state \
          FROM compaction_checkpoint c \
          JOIN compaction_operation o ON o.id=c.operation_id AND o.owner=c.owner \
          JOIN compaction_operation_projection p ON p.operation_id=o.id \
          JOIN compaction_frozen_history h ON h.id=p.manifest_id \
          JOIN compaction_runner_state r ON r.operation_id=o.id \
-         WHERE c.id=?1 AND c.status<>'applied' AND h.expired=1 \
+         WHERE c.id=$1 AND c.status<>'applied' AND h.expired=1 \
          AND o.status IN ('failed','cancelled','stale') \
-         AND typeof(r.state)='text' AND typeof(r.generation)='integer' \
-         AND length(CAST(r.state AS BLOB))<=262144 LIMIT 1",
+         AND octet_length(r.state::text)<=262144 LIMIT 1",
         [id.into()],
     )).await?;
     let Some(row) = row else {
@@ -2911,15 +2650,10 @@ async fn prepare_discard_candidate(
     let manifest: String = row.try_get("", "manifest_id")?;
     let status: String = row.try_get("", "status")?;
     let generation: Option<i64> = row.try_get("", "generation")?;
-    let state: Vec<u8> = row.try_get("", "state")?;
-    // Corrupt legacy TEXT may contain invalid UTF-8. Read bytes so this is a
-    // successful data refusal, rather than a driver decode error stuck on ID.
-    let Ok(state) = std::str::from_utf8(&state) else {
-        return Ok(None);
-    };
+    let state: String = row.try_get("", "state")?;
     // Parse only after reader release. Invalid JSON/generation/phase is a
     // conservative refusal, never a fabricated terminal proof or a stuck key.
-    if !terminal(&status, generation, Some(state)).unwrap_or(false) {
+    if !terminal(&status, generation, Some(&state)).unwrap_or(false) {
         return Ok(None);
     }
     let Some(scope) = compaction::checkpoint_row(&store.connection, id).await? else {
@@ -2966,18 +2700,21 @@ impl DiscardPreparation {
         // At most three exact keys and 1 MiB of logical row bytes per quantum.
         let mut keys = Vec::new();
         let mut total = 0_i64;
-        for (table, size) in [
+        for (table, ordinal, size) in [
             (
                 "compaction_checkpoint_import",
-                "length(CAST(proof_json AS BLOB))+COALESCE(length(CAST(target_checkpoint_json AS BLOB)),0)+length(CAST(target_source_thread AS BLOB))+length(CAST(context_thread AS BLOB))",
+                "import_ordinal",
+                "octet_length(proof_json::text)::bigint+COALESCE(octet_length(target_checkpoint_json::text)::bigint,0)+octet_length(target_source_thread::text)::bigint+octet_length(context_thread::text)::bigint",
             ),
             (
                 "compaction_checkpoint_replay_alias",
-                "length(CAST(covered_thread AS BLOB))+length(CAST(covered_scope AS BLOB))+length(CAST(covered_id AS BLOB))+length(CAST(covered_version AS BLOB))+length(CAST(replay_thread AS BLOB))+length(CAST(replay_scope AS BLOB))+length(CAST(replay_id AS BLOB))+length(CAST(replay_version AS BLOB))+COALESCE(length(CAST(tool_item_id AS BLOB)),0)",
+                "insertion_ordinal",
+                "octet_length(covered_thread::text)::bigint+octet_length(covered_scope::text)::bigint+octet_length(covered_id::text)::bigint+octet_length(covered_version::text)::bigint+octet_length(replay_thread::text)::bigint+octet_length(replay_scope::text)::bigint+octet_length(replay_id::text)::bigint+octet_length(replay_version::text)::bigint+COALESCE(octet_length(tool_item_id::text)::bigint,0)",
             ),
             (
                 "compaction_checkpoint_event_input",
-                "length(CAST(source_thread AS BLOB))+length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))+length(CAST(role AS BLOB))",
+                "insertion_ordinal",
+                "octet_length(source_thread::text)::bigint+octet_length(source_scope::text)::bigint+octet_length(source_id::text)::bigint+octet_length(source_version::text)::bigint+octet_length(role::text)::bigint",
             ),
         ] {
             let row = store
@@ -2985,10 +2722,10 @@ impl DiscardPreparation {
                 .query_one(
                     &Query::select()
                         .from(Alias::new(table))
-                        .expr_as(Expr::col(Alias::new("rowid")), Alias::new("key"))
+                        .expr_as(Expr::col(Alias::new(ordinal)), Alias::new("key"))
                         .expr_as(Expr::cust(size), Alias::new("bytes"))
                         .and_where(Expr::col(Alias::new("checkpoint_id")).eq(&self.id))
-                        .order_by(Alias::new("rowid"), Order::Asc)
+                        .order_by(Alias::new(ordinal), Order::Asc)
                         .limit(1)
                         .to_owned(),
                 )
@@ -3001,7 +2738,7 @@ impl DiscardPreparation {
                 );
                 if total + bytes <= 1024 * 1024 {
                     total += bytes;
-                    keys.push((table, row.try_get::<i64>("", "key")?, size, bytes));
+                    keys.push((table, ordinal, row.try_get::<i64>("", "key")?, size, bytes));
                 }
             }
         }
@@ -3017,6 +2754,18 @@ impl DiscardPreparation {
                     &self.manifest,
                     &store.connection.work_signal("maintenance.frozen.release"),
                 ) {
+                    tx.commit().await?;
+                    return Ok(false);
+                }
+                if checkpoint::Entity::find_by_id(&self.id)
+                    .select_only()
+                    .column(checkpoint::Column::Id)
+                    .lock_exclusive()
+                    .into_tuple::<String>()
+                    .one(&tx)
+                    .await?
+                    .is_none()
+                {
                     tx.commit().await?;
                     return Ok(false);
                 }
@@ -3130,12 +2879,12 @@ impl DiscardPreparation {
                         .filter(checkpoint::Column::ProofVersion.eq(1))
                         .exec(&tx)
                         .await?;
-                    for (table, key, size, bytes) in &keys {
+                    for (table, ordinal, key, size, bytes) in &keys {
                         tx.execute(
                             &Query::delete()
                                 .from_table(Alias::new(*table))
                                 .and_where(Expr::col(Alias::new("checkpoint_id")).eq(&self.id))
-                                .and_where(Expr::col(Alias::new("rowid")).eq(*key))
+                                .and_where(Expr::col(Alias::new(*ordinal)).eq(*key))
                                 .and_where(Expr::cust(*size).eq(*bytes))
                                 .to_owned(),
                         )
@@ -3180,9 +2929,7 @@ impl ScopeDiscovery {
         if page {
             query.expr_as(
                 Expr::case(
-                    Expr::cust(format!(
-                        "length(CAST({key} AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
-                    )),
+                    Expr::cust(format!("octet_length({key}) <= {SCOPE_PAGE_KEY_BYTES}")),
                     Expr::col(Alias::new(key)),
                 )
                 .finally(Expr::val(Option::<String>::None)),
@@ -3191,21 +2938,10 @@ impl ScopeDiscovery {
         } else {
             query.expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
         }
-        if self.family == 1 && page {
-            // INTEGER affinity alone does not bound malformed legacy TEXT.
-            // Return NULL (decode error), never an unbounded kind value.
-            query.expr_as(
-                Expr::case(
-                    Expr::cust("typeof(kind) = 'integer'"),
-                    Expr::col(Alias::new("kind")),
-                )
-                .finally(Expr::val(Option::<i64>::None)),
-                Alias::new("kind"),
-            );
-        } else if self.family == 1 {
+        if self.family == 1 {
             query.column(Alias::new("kind"));
         } else {
-            query.expr_as(Expr::val(0), Alias::new("kind"));
+            query.expr_as(Expr::val(0_i64).cast_as("bigint"), Alias::new("kind"));
         }
         if self.started {
             let mut after = Expr::col(Alias::new(key)).gt(&self.after);
@@ -3406,8 +3142,8 @@ pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatemen
         .and_where(history::Column::Id.eq(id))
         .and_where(history::Column::WorkspaceId.ne(""));
     known
-        .expr_as(Expr::val(0), Alias::new("scope_via"))
-        .expr_as(Expr::val(0), Alias::new("scope_row"));
+        .expr_as(Expr::val(0_i64), Alias::new("scope_via"))
+        .expr_as(Expr::val(0_i64), Alias::new("scope_row"));
     for reverse in [false, true] {
         let (to, predicate) = if reverse {
             (layout::Column::Candidate, layout::Column::ManifestId)
@@ -3417,11 +3153,11 @@ pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatemen
         let branch = Query::select()
             .column((history::Entity, history::Column::WorkspaceId))
             .expr_as(
-                Expr::val(if reverse { 2 } else { 1 }),
+                Expr::val(if reverse { 2_i64 } else { 1_i64 }),
                 Alias::new("scope_via"),
             )
             .expr_as(
-                Expr::col((layout::Entity, Alias::new("rowid"))),
+                Expr::col((layout::Entity, layout::Column::InsertionOrdinal)),
                 Alias::new("scope_row"),
             )
             .from(layout::Entity)
@@ -3445,11 +3181,11 @@ pub(super) fn frozen_scope_query(id: &str) -> sea_orm::sea_query::SelectStatemen
         let branch = Query::select()
             .column((history::Entity, history::Column::WorkspaceId))
             .expr_as(
-                Expr::val(if reverse { 4 } else { 3 }),
+                Expr::val(if reverse { 4_i64 } else { 3_i64 }),
                 Alias::new("scope_via"),
             )
             .expr_as(
-                Expr::col((span::Entity, Alias::new("rowid"))),
+                Expr::col((span::Entity, span::Column::InsertionOrdinal)),
                 Alias::new("scope_row"),
             )
             .from(span::Entity)
@@ -3799,11 +3535,12 @@ mod tests {
             );
             assert_eq!(progress.accounting.rows, [0, 0]);
             assert_eq!(progress.accounting.bytes, [0, 0]);
-            let rolled_back = layout::Entity::find_by_id(("batch-physical".to_owned(), kind))
-                .one(&duplicate.connection)
-                .await
-                .unwrap()
-                .unwrap();
+            let rolled_back =
+                pioneer_crud_compaction::frozen::find_layout("batch-physical".to_owned(), kind)
+                    .one(&duplicate.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(
                 (
                     rolled_back.failed,
@@ -3827,11 +3564,12 @@ mod tests {
                         .await
                         .unwrap()
                 );
-                let l = layout::Entity::find_by_id(("batch-physical".to_owned(), kind))
-                    .one(&duplicate.connection)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let l =
+                    pioneer_crud_compaction::frozen::find_layout("batch-physical".to_owned(), kind)
+                        .one(&duplicate.connection)
+                        .await
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(
                     (l.failed, l.cleanup_next, l.pending),
                     (0, next, i64::from(next < 6))

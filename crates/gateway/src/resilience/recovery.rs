@@ -4647,23 +4647,6 @@ impl RecoveryCoordinator {
             .get_turn_location(turn_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("retained history scope is missing"))?;
-        let mut preparation_after = 0;
-        while let Some(next) = store
-            .compaction_prepare_turn_context_quantum(
-                &workspace,
-                &thread,
-                turn_id,
-                preparation_after,
-            )
-            .await?
-        {
-            anyhow::ensure!(
-                next > preparation_after,
-                "retained history preparation made no progress"
-            );
-            preparation_after = next;
-            tokio::task::yield_now().await;
-        }
         let high_water = store
             .compaction_source_high_water(
                 &workspace,
@@ -9399,14 +9382,14 @@ mod tests {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.to_owned(),
-                mode_json: "{invalid".to_owned(),
+                mode: pioneer_protocol::ThreadMode::Agent,
                 model: "test-model".to_owned(),
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
-                input_json: "[]".to_owned(),
+                input_json: r#"{"invalid":"expected a list"}"#.to_owned(),
                 capabilities_json: "[]".to_owned(),
                 resolved_artifacts_json: "[]".to_owned(),
                 runtime_environment_json: "{}".to_owned(),

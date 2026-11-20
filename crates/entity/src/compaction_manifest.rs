@@ -7,20 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_manifest")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub operation_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub ordinal: i64,
-    pub unit_ordinal: i64,
-    pub reference_only: i64,
     #[sea_orm(column_type = "Text")]
     pub source_thread: String,
-    #[sea_orm(column_type = "Text")]
-    pub source_scope: String,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub ordinal: i64,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub operation_id: String,
+    pub reference_only: i64,
     #[sea_orm(column_type = "Text")]
     pub source_id: String,
+    pub unit_ordinal: i64,
     #[sea_orm(column_type = "Text")]
     pub source_version: String,
+    #[sea_orm(column_type = "Text")]
+    pub source_scope: String,
     #[sea_orm(
         belongs_to,
         from = "operation_id",
@@ -28,7 +28,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

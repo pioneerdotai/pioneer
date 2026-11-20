@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_projection_epoch")]
 pub struct Model {
+    pub version: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub thread_id: String,
-    pub version: i64,
     #[sea_orm(
         belongs_to,
         from = "thread_id",
@@ -17,7 +17,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

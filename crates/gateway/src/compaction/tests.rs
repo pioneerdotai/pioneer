@@ -12070,26 +12070,6 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         legacy[0].provenance.is_none(),
         "legacy text must not acquire invented source coverage"
     );
-    // A view-only fixture misses the production failure: the background worker
-    // physically compresses sources AFTER the immutable snapshot was captured.
-    let epoch = f
-        .store
-        .compaction_projection_version("ws", "thread")
-        .await
-        .unwrap();
-    assert!(
-        crate::database::compress_history_payloads_for_test(&f.store)
-            .await
-            .unwrap()
-            > 0
-    );
-    assert_eq!(
-        f.store
-            .compaction_projection_version("ws", "thread")
-            .await
-            .unwrap(),
-        epoch
-    );
     let restored = super::frozen::restore(&f.store, "ws", &allowed, &snapshot)
         .await
         .unwrap();
@@ -22413,12 +22393,6 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
     let frozen = super::frozen::capture(&store, "ws", "thread", &allowed, &messages)
         .await
         .unwrap();
-    assert!(
-        crate::database::compress_history_payloads_for_test(&store)
-            .await
-            .unwrap()
-            > 0
-    );
     assert_eq!(
         super::frozen::restore(&store, "ws", &allowed, &frozen)
             .await

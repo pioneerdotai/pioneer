@@ -794,12 +794,14 @@ mod tests {
     use super::*;
     use pioneer_observability::live::{WaitKind, WorkState};
 
-    async fn fixture() -> (
+    async fn review_fixture(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> (
         crate::TaskRuntime,
         TaskResultCandidate,
         pioneer_protocol::TaskRun,
     ) {
-        let runtime = crate::tests::runtime_with_review_config().await;
+        let runtime = crate::tests::postgres_runtime_with_review(db).await;
         let (_, run, candidate) = crate::tests::create_waiting_review_agent_task(
             &runtime,
             2,
@@ -845,364 +847,379 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_publication_fences_late_candidates_and_stale_recovery() {
-        pioneer_observability::set_telemetry_enabled(true);
-        let (_runtime, candidate, run) = fixture().await;
-        let parent = source("66666666666666666666666666666666");
-        parent.run(|| {
-            let mut observer = ClosingObserver::default();
-            observer.committed(
-                &TaskEventPayload::RunCancelled {
-                    task_id: candidate.task_id.clone(),
-                    run_id: run.id.clone(),
-                    reason: None,
-                    cancelled_at: 20,
-                },
-                20,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateCreated {
-                    candidate: candidate.clone(),
-                },
-                10,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::TaskRunEnteredReview {
-                    task_id: candidate.task_id.clone(),
-                    run_id: run.id.clone(),
-                    candidate_id: candidate.id.clone(),
-                    entered_at: 11,
-                },
-                11,
-                parent.clone(),
-            );
-            observer.recover_review(&candidate, &run);
-            assert_eq!(active(), 0);
-            // Another run of the same task is not fenced by a run terminal.
-            let mut next_run = run.clone();
-            next_run.id.push_str("-next");
-            let mut next = candidate.clone();
-            next.run_id = next_run.id.clone();
-            next.id.push_str("-next");
-            observer.recover_review(&next, &next_run);
-            assert_eq!(active(), 1);
-            observer.committed(
-                &TaskEventPayload::TaskCancelled {
-                    task_id: candidate.task_id.clone(),
-                    reason: None,
-                    completed_at: 30,
-                },
-                30,
-                parent.clone(),
-            );
-            assert_eq!(active(), 0);
-            next_run.id.push_str("-late");
-            next.run_id = next_run.id.clone();
-            next.id.push_str("-late");
-            observer.recover_review(&next, &next_run);
-            assert_eq!(active(), 0);
-        });
-    }
-    #[tokio::test]
-    async fn exact_source_terminal_meaning_is_independent_of_handoff_time() {
-        pioneer_observability::set_telemetry_enabled(true);
-        let (_runtime, c0, run) = fixture().await;
-        let parent = source("67676767676767676767676767676767");
-        parent.run(|| {
-            for early in [true, false] {
+        pioneer_postgres_test::with_database(async |fixture| {
+            pioneer_observability::set_telemetry_enabled(true);
+            let (_runtime, candidate, run) = review_fixture(fixture).await;
+            let parent = source("66666666666666666666666666666666");
+            parent.run(|| {
                 let mut observer = ClosingObserver::default();
-                let mut c1 = c0.clone();
-                c1.id.push_str("-next");
-                c1.task_run_turn_id.push_str("-next");
-                c1.round += 1;
                 observer.committed(
-                    &TaskEventPayload::TaskResultCandidateCreated {
-                        candidate: c0.clone(),
-                    },
-                    10,
-                    parent.clone(),
-                );
-                let mut first = Some(Closing::start(Phase::ChildResult, &parent));
-                if early {
-                    observer.handoff_result(
-                        &run.id,
-                        &c0.task_run_turn_id,
-                        first.take().unwrap(),
-                        None,
-                    );
-                }
-                observer.committed(
-                    &TaskEventPayload::TaskRevisionRequested {
-                        task_id: c0.task_id.clone(),
+                    &TaskEventPayload::RunCancelled {
+                        task_id: candidate.task_id.clone(),
                         run_id: run.id.clone(),
-                        previous_candidate_id: c0.id.clone(),
-                        requested_by_review_event_id: "review".to_owned(),
-                        task_run_turn_id: c1.task_run_turn_id.clone(),
-                        thread_id: "thread".to_owned(),
-                        turn_id: "turn".to_owned(),
-                        round: c1.round,
-                        feedback: String::new(),
-                        requested_at: 12,
-                    },
-                    12,
-                    parent.clone(),
-                );
-                observer.committed(
-                    &TaskEventPayload::TaskResultCandidateCreated {
-                        candidate: c1.clone(),
-                    },
-                    13,
-                    parent.clone(),
-                );
-                c1.status = TaskResultCandidateStatus::Accepted;
-                observer.committed(
-                    &TaskEventPayload::TaskResultCandidateAccepted {
-                        candidate: c1.clone(),
-                        review_event_id: "accepted".to_owned(),
-                    },
-                    14,
-                    parent.clone(),
-                );
-                let mut second = Some(Closing::start(Phase::ChildResult, &parent));
-                if early {
-                    observer.handoff_result(
-                        &run.id,
-                        &c1.task_run_turn_id,
-                        second.take().unwrap(),
-                        None,
-                    );
-                }
-                observer.committed(
-                    &TaskEventPayload::RunCompleted {
-                        task_id: c0.task_id.clone(),
-                        run_id: run.id.clone(),
-                        result: None,
-                        completed_at: 20,
+                        reason: None,
+                        cancelled_at: 20,
                     },
                     20,
                     parent.clone(),
                 );
-                if let Some(first) = first {
-                    observer.handoff_result(&run.id, &c0.task_run_turn_id, first, None);
-                }
-                if let Some(second) = second {
-                    observer.handoff_result(&run.id, &c1.task_run_turn_id, second, None);
-                }
-                let old = observer
-                    .runs
-                    .iter()
-                    .find(|row| row.candidate == c0.id)
-                    .unwrap();
-                assert!(
-                    matches!(old.result_fact, Some(Fact::Superseded))
-                        && old.result_observed
-                        && old.result.is_none()
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: candidate.clone(),
+                    },
+                    10,
+                    parent.clone(),
                 );
-                let current = observer
-                    .runs
-                    .iter()
-                    .find(|row| row.candidate == c1.id)
-                    .unwrap();
-                assert!(
-                    matches!(current.result_fact, Some(Fact::ExecutionSucceeded))
-                        && current.result_observed
-                        && current.result.is_none()
+                observer.committed(
+                    &TaskEventPayload::TaskRunEnteredReview {
+                        task_id: candidate.task_id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id.clone(),
+                        entered_at: 11,
+                    },
+                    11,
+                    parent.clone(),
                 );
-                assert!(
-                    !pioneer_observability::live::snapshot()
-                        .unwrap()
-                        .active
+                observer.recover_review(&candidate, &run);
+                assert_eq!(active(), 0);
+                // Another run of the same task is not fenced by a run terminal.
+                let mut next_run = run.clone();
+                next_run.id.push_str("-next");
+                let mut next = candidate.clone();
+                next.run_id = next_run.id.clone();
+                next.id.push_str("-next");
+                observer.recover_review(&next, &next_run);
+                assert_eq!(active(), 1);
+                observer.committed(
+                    &TaskEventPayload::TaskCancelled {
+                        task_id: candidate.task_id.clone(),
+                        reason: None,
+                        completed_at: 30,
+                    },
+                    30,
+                    parent.clone(),
+                );
+                assert_eq!(active(), 0);
+                next_run.id.push_str("-late");
+                next.run_id = next_run.id.clone();
+                next.id.push_str("-late");
+                observer.recover_review(&next, &next_run);
+                assert_eq!(active(), 0);
+            });
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn exact_source_terminal_meaning_is_independent_of_handoff_time() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            pioneer_observability::set_telemetry_enabled(true);
+            let (_runtime, c0, run) = review_fixture(fixture).await;
+            let parent = source("67676767676767676767676767676767");
+            parent.run(|| {
+                for early in [true, false] {
+                    let mut observer = ClosingObserver::default();
+                    let mut c1 = c0.clone();
+                    c1.id.push_str("-next");
+                    c1.task_run_turn_id.push_str("-next");
+                    c1.round += 1;
+                    observer.committed(
+                        &TaskEventPayload::TaskResultCandidateCreated {
+                            candidate: c0.clone(),
+                        },
+                        10,
+                        parent.clone(),
+                    );
+                    let mut first = Some(Closing::start(Phase::ChildResult, &parent));
+                    if early {
+                        observer.handoff_result(
+                            &run.id,
+                            &c0.task_run_turn_id,
+                            first.take().unwrap(),
+                            None,
+                        );
+                    }
+                    observer.committed(
+                        &TaskEventPayload::TaskRevisionRequested {
+                            task_id: c0.task_id.clone(),
+                            run_id: run.id.clone(),
+                            previous_candidate_id: c0.id.clone(),
+                            requested_by_review_event_id: "review".to_owned(),
+                            task_run_turn_id: c1.task_run_turn_id.clone(),
+                            thread_id: "thread".to_owned(),
+                            turn_id: "turn".to_owned(),
+                            round: c1.round,
+                            feedback: String::new(),
+                            requested_at: 12,
+                        },
+                        12,
+                        parent.clone(),
+                    );
+                    observer.committed(
+                        &TaskEventPayload::TaskResultCandidateCreated {
+                            candidate: c1.clone(),
+                        },
+                        13,
+                        parent.clone(),
+                    );
+                    c1.status = TaskResultCandidateStatus::Accepted;
+                    observer.committed(
+                        &TaskEventPayload::TaskResultCandidateAccepted {
+                            candidate: c1.clone(),
+                            review_event_id: "accepted".to_owned(),
+                        },
+                        14,
+                        parent.clone(),
+                    );
+                    let mut second = Some(Closing::start(Phase::ChildResult, &parent));
+                    if early {
+                        observer.handoff_result(
+                            &run.id,
+                            &c1.task_run_turn_id,
+                            second.take().unwrap(),
+                            None,
+                        );
+                    }
+                    observer.committed(
+                        &TaskEventPayload::RunCompleted {
+                            task_id: c0.task_id.clone(),
+                            run_id: run.id.clone(),
+                            result: None,
+                            completed_at: 20,
+                        },
+                        20,
+                        parent.clone(),
+                    );
+                    if let Some(first) = first {
+                        observer.handoff_result(&run.id, &c0.task_run_turn_id, first, None);
+                    }
+                    if let Some(second) = second {
+                        observer.handoff_result(&run.id, &c1.task_run_turn_id, second, None);
+                    }
+                    let old = observer
+                        .runs
                         .iter()
-                        .any(|row| row.context.trace_id == Some([0x67; 16]))
-                );
-            }
-        });
+                        .find(|row| row.candidate == c0.id)
+                        .unwrap();
+                    assert!(
+                        matches!(old.result_fact, Some(Fact::Superseded))
+                            && old.result_observed
+                            && old.result.is_none()
+                    );
+                    let current = observer
+                        .runs
+                        .iter()
+                        .find(|row| row.candidate == c1.id)
+                        .unwrap();
+                    assert!(
+                        matches!(current.result_fact, Some(Fact::ExecutionSucceeded))
+                            && current.result_observed
+                            && current.result.is_none()
+                    );
+                    assert!(
+                        !pioneer_observability::live::snapshot()
+                            .unwrap()
+                            .active
+                            .iter()
+                            .any(|row| row.context.trace_id == Some([0x67; 16]))
+                    );
+                }
+            });
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test]
     async fn accepted_lifecycle_survives_history_eviction_and_same_run_reopen() {
-        pioneer_observability::set_telemetry_enabled(true);
-        let (_runtime, candidate, run) = fixture().await;
-        let parent = source("68686868686868686868686868686868");
-        parent.run(|| {
-            let mut observer = ClosingObserver::default();
-            // Model committed terminal receipts, with no retained active waits.
-            for index in 0..=SLOTS {
+        pioneer_postgres_test::with_database(async |fixture| {
+            pioneer_observability::set_telemetry_enabled(true);
+            let (_runtime, candidate, run) = review_fixture(fixture).await;
+            let parent = source("68686868686868686868686868686868");
+            parent.run(|| {
+                let mut observer = ClosingObserver::default();
+                // Model committed terminal receipts, with no retained active waits.
+                for index in 0..=SLOTS {
+                    observer.committed(
+                        &TaskEventPayload::RunCancelled {
+                            task_id: format!("past-task-{index}"),
+                            run_id: format!("past-run-{index}"),
+                            reason: None,
+                            cancelled_at: 2,
+                        },
+                        2,
+                        parent.clone(),
+                    );
+                }
+                let mut old = candidate.clone();
+                old.task_id = "past-task-0".into();
+                old.run_id = "past-run-0".into();
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: old.clone(),
+                    },
+                    1,
+                    parent.clone(),
+                );
+                assert!(!observer.runs.iter().any(|row| row.candidate == old.id));
+                // Oversized historical identity also cannot disable a fresh receipt.
                 observer.committed(
                     &TaskEventPayload::RunCancelled {
-                        task_id: format!("past-task-{index}"),
-                        run_id: format!("past-run-{index}"),
+                        task_id: "unknown".into(),
+                        run_id: "x".repeat(ID_BYTES + 1),
                         reason: None,
                         cancelled_at: 2,
                     },
                     2,
                     parent.clone(),
                 );
-            }
-            let mut old = candidate.clone();
-            old.task_id = "past-task-0".into();
-            old.run_id = "past-run-0".into();
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateCreated {
-                    candidate: old.clone(),
-                },
-                1,
-                parent.clone(),
-            );
-            assert!(!observer.runs.iter().any(|row| row.candidate == old.id));
-            // Oversized historical identity also cannot disable a fresh receipt.
-            observer.committed(
-                &TaskEventPayload::RunCancelled {
-                    task_id: "unknown".into(),
-                    run_id: "x".repeat(ID_BYTES + 1),
-                    reason: None,
-                    cancelled_at: 2,
-                },
-                2,
-                parent.clone(),
-            );
-            let ticket = observer.ticket();
-            observer.admit(ticket, &run.task_id, &run.id, 10, false);
-            let first_generation = observer.generation(&run.id);
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateCreated {
-                    candidate: candidate.clone(),
-                },
-                11,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::TaskRunEnteredReview {
-                    task_id: run.task_id.clone(),
-                    run_id: run.id.clone(),
-                    candidate_id: candidate.id.clone(),
-                    entered_at: 12,
-                },
-                12,
-                parent.clone(),
-            );
-            assert!(
-                pioneer_observability::live::snapshot()
-                    .unwrap()
-                    .active
-                    .iter()
-                    .any(|row| row.context.trace_id == Some([0x68; 16])
-                        && matches!(row.state, WorkState::Waiting(WaitKind::UserOrProvider)))
-            );
-            observer.committed(
-                &TaskEventPayload::RunBlocked {
-                    task_id: run.task_id.clone(),
-                    run_id: run.id.clone(),
-                    error: None,
-                    blocked_at: 20,
-                },
-                20,
-                parent.clone(),
-            );
-            let ticket = observer.ticket();
-            observer.admit(ticket, &run.task_id, &run.id, 30, true);
-            assert_ne!(observer.generation(&run.id), first_generation);
-            observer.recover_review(&candidate, &run); // pre-block DTO, no sequence proof
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateCreated {
-                    candidate: candidate.clone(),
-                },
-                11,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::RunBlocked {
-                    task_id: run.task_id.clone(),
-                    run_id: run.id.clone(),
-                    error: None,
-                    blocked_at: 20,
-                },
-                20,
-                parent.clone(),
-            );
-            assert!(
-                !observer
-                    .runs
-                    .iter()
-                    .any(|row| row.candidate == candidate.id)
-            );
-            let mut resumed = candidate.clone();
-            resumed.id.push_str("-resumed");
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateCreated {
-                    candidate: resumed.clone(),
-                },
-                31,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::TaskRunEnteredReview {
-                    task_id: run.task_id.clone(),
-                    run_id: run.id.clone(),
-                    candidate_id: resumed.id.clone(),
-                    entered_at: 32,
-                },
-                32,
-                parent.clone(),
-            );
-            observer.handoff_result(
-                &run.id,
-                &resumed.task_run_turn_id,
-                Closing::start(Phase::ChildResult, &parent),
-                first_generation,
-            );
-            assert!(
-                observer
+                let ticket = observer.ticket();
+                observer.admit(ticket, &run.task_id, &run.id, 10, false);
+                let first_generation = observer.generation(&run.id);
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: candidate.clone(),
+                    },
+                    11,
+                    parent.clone(),
+                );
+                observer.committed(
+                    &TaskEventPayload::TaskRunEnteredReview {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id.clone(),
+                        entered_at: 12,
+                    },
+                    12,
+                    parent.clone(),
+                );
+                assert!(
+                    pioneer_observability::live::snapshot()
+                        .unwrap()
+                        .active
+                        .iter()
+                        .any(|row| row.context.trace_id == Some([0x68; 16])
+                            && matches!(row.state, WorkState::Waiting(WaitKind::UserOrProvider)))
+                );
+                observer.committed(
+                    &TaskEventPayload::RunBlocked {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        error: None,
+                        blocked_at: 20,
+                    },
+                    20,
+                    parent.clone(),
+                );
+                let ticket = observer.ticket();
+                observer.admit(ticket, &run.task_id, &run.id, 30, true);
+                assert_ne!(observer.generation(&run.id), first_generation);
+                observer.recover_review(&candidate, &run); // pre-block DTO, no sequence proof
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: candidate.clone(),
+                    },
+                    11,
+                    parent.clone(),
+                );
+                observer.committed(
+                    &TaskEventPayload::RunBlocked {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        error: None,
+                        blocked_at: 20,
+                    },
+                    20,
+                    parent.clone(),
+                );
+                assert!(
+                    !observer
+                        .runs
+                        .iter()
+                        .any(|row| row.candidate == candidate.id)
+                );
+                let mut resumed = candidate.clone();
+                resumed.id.push_str("-resumed");
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateCreated {
+                        candidate: resumed.clone(),
+                    },
+                    31,
+                    parent.clone(),
+                );
+                observer.committed(
+                    &TaskEventPayload::TaskRunEnteredReview {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: resumed.id.clone(),
+                        entered_at: 32,
+                    },
+                    32,
+                    parent.clone(),
+                );
+                observer.handoff_result(
+                    &run.id,
+                    &resumed.task_run_turn_id,
+                    Closing::start(Phase::ChildResult, &parent),
+                    first_generation,
+                );
+                assert!(
+                    observer
+                        .runs
+                        .iter()
+                        .find(|row| row.candidate == resumed.id)
+                        .unwrap()
+                        .result
+                        .is_none()
+                );
+                let generation = observer.generation(&run.id);
+                observer.handoff_result(
+                    &run.id,
+                    &resumed.task_run_turn_id,
+                    Closing::start(Phase::ChildResult, &parent),
+                    generation,
+                );
+                resumed.status = TaskResultCandidateStatus::Accepted;
+                observer.committed(
+                    &TaskEventPayload::TaskResultCandidateAccepted {
+                        candidate: resumed.clone(),
+                        review_event_id: "review".into(),
+                    },
+                    33,
+                    parent.clone(),
+                );
+                observer.committed(
+                    &TaskEventPayload::RunCompleted {
+                        task_id: run.task_id.clone(),
+                        run_id: run.id.clone(),
+                        result: None,
+                        completed_at: 34,
+                    },
+                    34,
+                    parent.clone(),
+                );
+                let slot = observer
                     .runs
                     .iter()
                     .find(|row| row.candidate == resumed.id)
-                    .unwrap()
-                    .result
-                    .is_none()
-            );
-            let generation = observer.generation(&run.id);
-            observer.handoff_result(
-                &run.id,
-                &resumed.task_run_turn_id,
-                Closing::start(Phase::ChildResult, &parent),
-                generation,
-            );
-            resumed.status = TaskResultCandidateStatus::Accepted;
-            observer.committed(
-                &TaskEventPayload::TaskResultCandidateAccepted {
-                    candidate: resumed.clone(),
-                    review_event_id: "review".into(),
-                },
-                33,
-                parent.clone(),
-            );
-            observer.committed(
-                &TaskEventPayload::RunCompleted {
-                    task_id: run.task_id.clone(),
-                    run_id: run.id.clone(),
-                    result: None,
-                    completed_at: 34,
-                },
-                34,
-                parent.clone(),
-            );
-            let slot = observer
-                .runs
-                .iter()
-                .find(|row| row.candidate == resumed.id)
-                .unwrap();
-            assert!(
-                matches!(slot.result_fact, Some(Fact::ExecutionSucceeded))
-                    && slot.result_observed
-                    && slot.result.is_none()
-            );
-            assert!(
-                !pioneer_observability::live::snapshot()
-                    .unwrap()
-                    .active
-                    .iter()
-                    .any(|row| row.context.trace_id == Some([0x68; 16]))
-            );
-        });
+                    .unwrap();
+                assert!(
+                    matches!(slot.result_fact, Some(Fact::ExecutionSucceeded))
+                        && slot.result_observed
+                        && slot.result.is_none()
+                );
+                assert!(
+                    !pioneer_observability::live::snapshot()
+                        .unwrap()
+                        .active
+                        .iter()
+                        .any(|row| row.context.trace_id == Some([0x68; 16]))
+                );
+            });
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

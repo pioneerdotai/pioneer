@@ -6,7 +6,7 @@ use pioneer_protocol::{TaskWriteLock, TaskWriteLockStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::convention::{
@@ -135,67 +135,7 @@ pub async fn list_all_active_locks_for_workspace<C: ConnectionTrait>(
         .context("failed to list complete active task write lock set")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskWriteLockConflict {
-    pub id: String,
-    pub task_id: String,
-    pub run_id: String,
-}
-
-/// Finds one active lock whose path overlaps a lock owned by `run_id`.
-///
-/// Path overlap is evaluated by SQLite using exact component boundaries. The
-/// query is bounded to one row so ownership transitions never load an
-/// unbounded workspace lock set while holding the writer.
-pub async fn find_active_conflict_for_run<C: ConnectionTrait>(
-    db: &C,
-    workspace_id: &str,
-    run_id: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<TaskWriteLockConflict>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "SELECT candidate.id, candidate.task_id, candidate.run_id \
-             FROM task_write_lock AS owned \
-             JOIN task_write_lock AS candidate \
-               ON candidate.workspace_id = ? \
-              AND candidate.run_id <> ? \
-              AND candidate.status = ? \
-              AND (candidate.expires_at IS NULL OR candidate.expires_at > ?) \
-              AND ( \
-                    owned.scope_path = '.' \
-                 OR candidate.scope_path = '.' \
-                 OR owned.scope_path = candidate.scope_path \
-                 OR substr(owned.scope_path, 1, length(candidate.scope_path) + 1) \
-                        = candidate.scope_path || '/' \
-                 OR substr(candidate.scope_path, 1, length(owned.scope_path) + 1) \
-                        = owned.scope_path || '/' \
-              ) \
-             WHERE owned.run_id = ? \
-             ORDER BY candidate.created_at ASC, candidate.id ASC \
-             LIMIT 1"
-                .to_owned(),
-            [
-                workspace_id.into(),
-                run_id.into(),
-                task_write_lock_status_to_db(TaskWriteLockStatus::Acquired).into(),
-                now.into(),
-                run_id.into(),
-            ],
-        ))
-        .await
-        .context("failed to find conflicting active task write lock")?;
-
-    row.map(|row| {
-        Ok(TaskWriteLockConflict {
-            id: row.try_get("", "id")?,
-            task_id: row.try_get("", "task_id")?,
-            run_id: row.try_get("", "run_id")?,
-        })
-    })
-    .transpose()
-}
+pub use pioneer_crud_tasks::write_lock::find_active_conflict_for_run;
 
 /// Reopens every lock belonging to a run with one bounded SQL statement.
 pub async fn reopen_locks_for_run<C: ConnectionTrait>(

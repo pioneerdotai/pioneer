@@ -159,13 +159,6 @@ impl crate::CrudStore {
         &self,
         now: i64,
     ) -> anyhow::Result<Option<i64>> {
-        if self.occurrence_compatibility_cursors[1]
-            .lock()
-            .await
-            .has_more()
-        {
-            return Ok(Some(now));
-        }
         crate::repositories::task_occurrence_reconcile::next_deadline(&self.connection, now).await
     }
 }
@@ -268,14 +261,7 @@ impl crate::CrudStore {
     /// Errors remain errors; a saturated quantum can additionally continue
     /// immediately before consulting these durable deadlines.
     pub async fn next_task_lifecycle_deadline(&self, now: i64) -> anyhow::Result<Option<i64>> {
-        if self.occurrence_compatibility_cursors[0]
-            .lock()
-            .await
-            .has_more()
-        {
-            return Ok(Some(now));
-        }
-        let child = self.next_task_child_work_deadline(now).await?;
+        let child = self.next_task_child_work_deadline().await?;
         let parent =
             crate::repositories::task_run_occurrence_reconcile::next_deadline(&self.connection)
                 .await?;

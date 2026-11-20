@@ -1,0 +1,21 @@
+[package]
+name = "pioneer-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fs4.workspace = true
+pioneer-migration.workspace = true
+process-wrap = { workspace = true, features = ["tokio1"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+tempfile.workspace = true
+thiserror = "2"
+tokio.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -28,7 +28,6 @@ pioneer-cli-mcp-bridge.workspace = true
 pioneer-gateway.workspace = true
 pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
-pioneer-tasks.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

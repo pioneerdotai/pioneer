@@ -7,12 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_runner_plan")]
 pub struct Model {
+    pub reference_count: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
+    pub descriptor: Json,
     pub source_count: i64,
-    pub reference_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub descriptor: String,
     pub ready: i64,
     #[sea_orm(
         belongs_to,
@@ -21,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -8043,7 +8043,7 @@ mod prepared_snapshot_tests {
                     turn_id: turn.into(),
                     thread_id: thread.into(),
                     workspace_id: "legacy-affinity".into(),
-                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    mode: pioneer_protocol::ThreadMode::Agent,
                     model: "m".into(),
                     provider_name: "p".into(),
                     reasoning_effort: None,
@@ -8120,7 +8120,7 @@ mod prepared_snapshot_tests {
         row.created_by_thread_id = Set(Some("parent".into()));
         row.created_by_turn_id = Set(Some("own-turn".into()));
         row.lifecycle_policy_json = Set(Some(
-            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+            serde_json::to_value(&pioneer_protocol::TaskLifecyclePolicy {
                 attachment: TaskAttachmentMode::Attached,
                 on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
                 on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
@@ -8202,7 +8202,7 @@ mod prepared_snapshot_tests {
         child.parent_task_id = Set(Some("own-task".into()));
         child.root_task_id = Set(Some("own-task".into()));
         child.lifecycle_policy_json = Set(Some(
-            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+            serde_json::to_value(&pioneer_protocol::TaskLifecyclePolicy {
                 attachment: TaskAttachmentMode::Attached,
                 on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
                 on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
@@ -13220,6 +13220,8 @@ mod tests {
         assert_eq!(repeated.artifacts.len(), 2);
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         pioneer_entity::thread_lineage::ActiveModel {
+            insertion_ordinal: Default::default(),
+            publication_xid: Default::default(),
             child_thread_id: Set(lineage.child_thread_id.clone()),
             parent_thread_id: Set(lineage.parent_thread_id.clone()),
             root_thread_id: Set(lineage.root_thread_id.clone()),
@@ -13282,7 +13284,7 @@ mod tests {
                 item_id: Set(item.item_id().into()),
                 item_type: Set("agent_message".into()),
                 status: Set(Some("completed".into())),
-                payload: Set(serde_json::to_string(&item).expect("item payload")),
+                payload: Set(Some(serde_json::to_value(&item).expect("item payload"))),
                 active_attempt_number: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -13344,7 +13346,7 @@ mod tests {
             status: Set("delivered".into()),
             attempt_count: Set(1),
             max_attempts: Set(3),
-            result_snapshot_json: Set(Some(serde_json::to_string(&legacy_result).unwrap())),
+            result_snapshot_json: Set(Some(serde_json::to_value(&legacy_result).unwrap())),
             delivered_turn_id: Set(Some(execution.run_id.clone())),
             created_at: Set(now),
             updated_at: Set(now),
@@ -13459,7 +13461,7 @@ mod tests {
                 .is_empty()
         );
         let mut delivery: pioneer_entity::task_delivery::ActiveModel = delivery.into();
-        delivery.result_snapshot_json = Set(Some(serde_json::to_string(&normalized).unwrap()));
+        delivery.result_snapshot_json = Set(Some(serde_json::to_value(&normalized).unwrap()));
         let delivered = delivery.update(&db).await.expect("fresh result snapshot");
         assert_eq!(
             restored,
@@ -13481,14 +13483,14 @@ mod tests {
         modern.delivery_key = Set(modern_id.into());
         let mut partial_result = normalized.clone();
         partial_result.artifacts.truncate(1);
-        modern.result_snapshot_json = Set(Some(serde_json::to_string(&partial_result).unwrap()));
+        modern.result_snapshot_json = Set(Some(serde_json::to_value(&partial_result).unwrap()));
         modern.insert(&db).await.unwrap();
         let modern_item = pioneer_protocol::task_delivery_result_item_id(modern_id);
         let legacy_id = "html-legacy-delivery";
         let mut legacy: pioneer_entity::task_delivery::ActiveModel = delivered.clone().into();
         legacy.id = Set(legacy_id.into());
         legacy.delivery_key = Set(legacy_id.into());
-        legacy.result_snapshot_json = Set(Some(serde_json::to_string(&legacy_result).unwrap()));
+        legacy.result_snapshot_json = Set(Some(serde_json::to_value(&legacy_result).unwrap()));
         legacy.insert(&db).await.unwrap();
         let legacy_item = pioneer_protocol::task_delivery_result_item_id(legacy_id);
         for id in [&modern_item, &legacy_item] {
@@ -13566,7 +13568,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut modern: pioneer_entity::task_delivery::ActiveModel = modern.into();
-        modern.result_snapshot_json = Set(Some(serde_json::to_string(&wrong_pin).unwrap()));
+        modern.result_snapshot_json = Set(Some(serde_json::to_value(&wrong_pin).unwrap()));
         modern.update(&db).await.unwrap();
         assert!(
             processor
@@ -13582,7 +13584,7 @@ mod tests {
         );
         let mut failed: pioneer_entity::task_delivery::ActiveModel = delivered.into();
         failed.error_snapshot_json = Set(Some(
-            serde_json::to_string(&TaskError {
+            serde_json::to_value(&TaskError {
                 recovery_diagnostic: None,
                 code: "failed_execution".into(),
                 message: "Execution failed".into(),
@@ -14195,7 +14197,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .into_active_model();
-        spec_row.review_policy_json = Set(Some(serde_json::to_string(&policy).unwrap()));
+        spec_row.review_policy_json = Set(Some(serde_json::to_value(&policy).unwrap()));
         spec_row.update(&db).await.unwrap();
         let parent = resolve_parent_context(processor, &response.task)
             .await

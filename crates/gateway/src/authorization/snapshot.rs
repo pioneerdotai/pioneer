@@ -659,311 +659,362 @@ mod tests {
 
     #[tokio::test]
     async fn member_snapshot_projects_creator_and_workspace_capabilities() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let snapshot = service
-            .snapshot(
-                &principal(MEMBER_A_ID, PrincipalKind::User),
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
-                },
-                17,
-            )
-            .await
-            .expect("member snapshot");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let snapshot = service
+                    .snapshot(
+                        &principal(MEMBER_A_ID, PrincipalKind::User),
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+                        },
+                        17,
+                    )
+                    .await
+                    .expect("member snapshot");
 
-        assert_eq!(
-            snapshot.schema_version,
-            AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION
-        );
-        assert_eq!(snapshot.authorization_revision, 17);
-        assert_eq!(snapshot.role_key, "member");
-        assert!(!snapshot.global.can_create_workspace);
-        assert!(!snapshot.global.can_manage_gateway_settings);
-        assert!(snapshot.global.can_create_invitation);
-        assert_eq!(
-            snapshot
-                .global
-                .invitation_role_options
-                .iter()
-                .filter(|option| option.is_default)
-                .count(),
-            1
-        );
-        assert!(snapshot.global.can_manage_own_sessions);
-        let workspace = snapshot.workspace.expect("workspace capabilities");
-        assert!(workspace.capabilities.can_create_thread);
-        assert!(!workspace.capabilities.can_manage);
-        assert!(workspace.capabilities.can_use_providers);
-        assert!(workspace.capabilities.can_use_cli_runtimes);
-        assert!(workspace.capabilities.can_use_skills);
-        assert!(workspace.capabilities.can_use_mcp);
-        assert!(workspace.capabilities.can_run_tasks);
-        assert_eq!(
-            workspace
-                .capabilities
-                .agent_permission_options
-                .iter()
-                .map(|option| option.mode)
-                .collect::<Vec<_>>(),
-            vec![TurnPermissionMode::Supervised]
-        );
-        assert_eq!(
-            workspace.capabilities.thread_visibility_options,
-            vec![ThreadVisibility::Private, ThreadVisibility::Workspace]
-        );
-        let thread = snapshot.thread.expect("thread capabilities");
-        assert!(thread.capabilities.can_read);
-        assert!(thread.capabilities.can_write);
-        assert!(thread.capabilities.can_start_turn);
-        assert!(thread.capabilities.can_respond_to_agent_requests);
-        assert!(thread.capabilities.can_control_cli_runtime);
-        assert!(thread.capabilities.can_create_task);
-        assert!(thread.capabilities.can_read_artifacts);
-        assert!(thread.capabilities.can_write_artifacts);
-        assert!(thread.capabilities.can_manage);
-        assert!(thread.capabilities.can_manage_private_participants);
-        assert!(!thread.capabilities.can_move);
+                assert_eq!(
+                    snapshot.schema_version,
+                    AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION
+                );
+                assert_eq!(snapshot.authorization_revision, 17);
+                assert_eq!(snapshot.role_key, "member");
+                assert!(!snapshot.global.can_create_workspace);
+                assert!(!snapshot.global.can_manage_gateway_settings);
+                assert!(snapshot.global.can_create_invitation);
+                assert_eq!(
+                    snapshot
+                        .global
+                        .invitation_role_options
+                        .iter()
+                        .filter(|option| option.is_default)
+                        .count(),
+                    1
+                );
+                assert!(snapshot.global.can_manage_own_sessions);
+                let workspace = snapshot.workspace.expect("workspace capabilities");
+                assert!(workspace.capabilities.can_create_thread);
+                assert!(!workspace.capabilities.can_manage);
+                assert!(workspace.capabilities.can_use_providers);
+                assert!(workspace.capabilities.can_use_cli_runtimes);
+                assert!(workspace.capabilities.can_use_skills);
+                assert!(workspace.capabilities.can_use_mcp);
+                assert!(workspace.capabilities.can_run_tasks);
+                assert_eq!(
+                    workspace
+                        .capabilities
+                        .agent_permission_options
+                        .iter()
+                        .map(|option| option.mode)
+                        .collect::<Vec<_>>(),
+                    vec![TurnPermissionMode::Supervised]
+                );
+                assert_eq!(
+                    workspace.capabilities.thread_visibility_options,
+                    vec![ThreadVisibility::Private, ThreadVisibility::Workspace]
+                );
+                let thread = snapshot.thread.expect("thread capabilities");
+                assert!(thread.capabilities.can_read);
+                assert!(thread.capabilities.can_write);
+                assert!(thread.capabilities.can_start_turn);
+                assert!(thread.capabilities.can_respond_to_agent_requests);
+                assert!(thread.capabilities.can_control_cli_runtime);
+                assert!(thread.capabilities.can_create_task);
+                assert!(thread.capabilities.can_read_artifacts);
+                assert!(thread.capabilities.can_write_artifacts);
+                assert!(thread.capabilities.can_manage);
+                assert!(thread.capabilities.can_manage_private_participants);
+                assert!(!thread.capabilities.can_move);
 
-        let snapshot = service
-            .snapshot(
-                &principal(MEMBER_A_ID, PrincipalKind::User),
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
-                },
-                17,
-            )
-            .await
-            .expect("member parity snapshot");
-        assert_shell_projection_parity(&snapshot);
+                let snapshot = service
+                    .snapshot(
+                        &principal(MEMBER_A_ID, PrincipalKind::User),
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+                        },
+                        17,
+                    )
+                    .await
+                    .expect("member parity snapshot");
+                assert_shell_projection_parity(&snapshot);
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn draft_policy_fingerprint_ignores_unrelated_authorization_generation_changes() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let params = AuthorizationCapabilitiesParams {
-            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-            thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
-        };
-        let first = service
-            .snapshot(
-                &principal(MEMBER_A_ID, PrincipalKind::User),
-                params.clone(),
-                17,
-            )
-            .await
-            .expect("first member snapshot");
-        let next = service
-            .snapshot(&principal(MEMBER_A_ID, PrincipalKind::User), params, 18)
-            .await
-            .expect("next member snapshot");
-        let first_workspace = first.workspace.expect("first workspace policy");
-        let next_workspace = next.workspace.expect("next workspace policy");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let params = AuthorizationCapabilitiesParams {
+                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                    thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+                };
+                let first = service
+                    .snapshot(
+                        &principal(MEMBER_A_ID, PrincipalKind::User),
+                        params.clone(),
+                        17,
+                    )
+                    .await
+                    .expect("first member snapshot");
+                let next = service
+                    .snapshot(&principal(MEMBER_A_ID, PrincipalKind::User), params, 18)
+                    .await
+                    .expect("next member snapshot");
+                let first_workspace = first.workspace.expect("first workspace policy");
+                let next_workspace = next.workspace.expect("next workspace policy");
 
-        assert_ne!(
-            first_workspace.operational_resources.fingerprint,
-            next_workspace.operational_resources.fingerprint
-        );
-        assert_eq!(
-            first_workspace.execution_draft_policy.fingerprint,
-            next_workspace.execution_draft_policy.fingerprint
-        );
+                assert_ne!(
+                    first_workspace.operational_resources.fingerprint,
+                    next_workspace.operational_resources.fingerprint
+                );
+                assert_eq!(
+                    first_workspace.execution_draft_policy.fingerprint,
+                    next_workspace.execution_draft_policy.fingerprint
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn snapshot_omits_an_inaccessible_private_thread_without_leaking_it() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let snapshot = service
-            .snapshot(
-                &principal(MEMBER_A_ID, PrincipalKind::User),
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
-                },
-                18,
-            )
-            .await
-            .expect("bounded snapshot");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let snapshot = service
+                    .snapshot(
+                        &principal(MEMBER_A_ID, PrincipalKind::User),
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
+                        },
+                        18,
+                    )
+                    .await
+                    .expect("bounded snapshot");
 
-        assert!(snapshot.workspace.is_some());
-        assert!(snapshot.thread.is_none());
+                assert!(snapshot.workspace.is_some());
+                assert!(snapshot.thread.is_none());
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn snapshot_rejects_an_unregistered_role_instead_of_emitting_unknown_policy() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let mut unsupported = principal(MEMBER_A_ID, PrincipalKind::User);
-        unsupported.role_key = Some(RoleKey::new("unregistered_role").expect("valid role key"));
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let mut unsupported = principal(MEMBER_A_ID, PrincipalKind::User);
+                unsupported.role_key =
+                    Some(RoleKey::new("unregistered_role").expect("valid role key"));
 
-        let error = service
-            .snapshot(&unsupported, AuthorizationCapabilitiesParams::default(), 18)
-            .await
-            .expect_err("an unsupported role must fail closed");
+                let error = service
+                    .snapshot(&unsupported, AuthorizationCapabilitiesParams::default(), 18)
+                    .await
+                    .expect_err("an unsupported role must fail closed");
 
-        assert!(error.to_string().contains("no registered role"));
+                assert!(error.to_string().contains("no registered role"));
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_attachment_projection_intersects_create_and_bind_actions() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        harness
-            .database
-            .execute_unprepared(&format!(
-                "UPDATE gateway_principal SET role_key='synthetic_executor' \
-                 WHERE id='{MEMBER_A_ID}'"
-            ))
-            .await
-            .expect("assign synthetic executor");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let mut executor = principal(MEMBER_A_ID, PrincipalKind::User);
-        executor.role_key = Some(RoleKey::new("synthetic_executor").expect("valid role key"));
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                harness
+                    .database
+                    .execute_unprepared(&format!(
+                        "UPDATE gateway_principal SET role_key='synthetic_executor' \
+                         WHERE id='{MEMBER_A_ID}'"
+                    ))
+                    .await
+                    .expect("assign synthetic executor");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let mut executor = principal(MEMBER_A_ID, PrincipalKind::User);
+                executor.role_key =
+                    Some(RoleKey::new("synthetic_executor").expect("valid role key"));
 
-        let snapshot = service
-            .snapshot(
-                &executor,
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
-                },
-                19,
-            )
-            .await
-            .expect("synthetic executor snapshot");
-        let capabilities = &snapshot
-            .thread
-            .as_ref()
-            .expect("thread projection")
-            .capabilities;
-        assert!(capabilities.can_write_artifacts);
-        assert!(!capabilities.can_bind_artifacts);
-        assert!(
-            snapshot
-                .workspace
-                .as_ref()
-                .expect("workspace projection")
-                .capabilities
-                .can_write_artifacts
-        );
-        assert!(
-            !snapshot
-                .workspace
-                .as_ref()
-                .expect("workspace projection")
-                .execution_draft_policy
-                .can_attach_artifacts
-        );
-        let workspace = snapshot.workspace.as_ref().expect("workspace projection");
-        assert!(workspace.capabilities.can_use_providers);
-        assert!(!workspace.capabilities.can_use_cli_runtimes);
-        assert!(!workspace.capabilities.can_use_skills);
-        assert!(!workspace.capabilities.can_use_mcp);
-        assert_eq!(
-            workspace.operational_resources.providers.ids,
-            ["allowed-provider"]
-        );
-        assert!(workspace.operational_resources.cli_runtimes.ids.is_empty());
-        assert!(!workspace.operational_resources.cli_runtimes.all);
-        assert!(workspace.operational_resources.cli_models.is_empty());
-        assert!(!workspace.operational_resources.cli_models_all);
-        assert!(workspace.operational_resources.skills.ids.is_empty());
-        assert!(!workspace.operational_resources.skills.all);
-        assert!(workspace.operational_resources.mcp_servers.ids.is_empty());
-        assert!(!workspace.operational_resources.mcp_servers.all);
-        assert_eq!(
-            workspace.execution_draft_policy.resources,
-            workspace.operational_resources
-        );
-        let presentation = pioneer_client::artifacts::presentation::artifact_presentation_policy(
-            capabilities.can_read_artifacts,
-            capabilities.can_write_artifacts && capabilities.can_bind_artifacts,
-            true,
-        );
-        assert!(!presentation.can_attach);
+                let snapshot = service
+                    .snapshot(
+                        &executor,
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+                        },
+                        19,
+                    )
+                    .await
+                    .expect("synthetic executor snapshot");
+                let capabilities = &snapshot
+                    .thread
+                    .as_ref()
+                    .expect("thread projection")
+                    .capabilities;
+                assert!(capabilities.can_write_artifacts);
+                assert!(!capabilities.can_bind_artifacts);
+                assert!(
+                    snapshot
+                        .workspace
+                        .as_ref()
+                        .expect("workspace projection")
+                        .capabilities
+                        .can_write_artifacts
+                );
+                assert!(
+                    !snapshot
+                        .workspace
+                        .as_ref()
+                        .expect("workspace projection")
+                        .execution_draft_policy
+                        .can_attach_artifacts
+                );
+                let workspace = snapshot.workspace.as_ref().expect("workspace projection");
+                assert!(workspace.capabilities.can_use_providers);
+                assert!(!workspace.capabilities.can_use_cli_runtimes);
+                assert!(!workspace.capabilities.can_use_skills);
+                assert!(!workspace.capabilities.can_use_mcp);
+                assert_eq!(
+                    workspace.operational_resources.providers.ids,
+                    ["allowed-provider"]
+                );
+                assert!(workspace.operational_resources.cli_runtimes.ids.is_empty());
+                assert!(!workspace.operational_resources.cli_runtimes.all);
+                assert!(workspace.operational_resources.cli_models.is_empty());
+                assert!(!workspace.operational_resources.cli_models_all);
+                assert!(workspace.operational_resources.skills.ids.is_empty());
+                assert!(!workspace.operational_resources.skills.all);
+                assert!(workspace.operational_resources.mcp_servers.ids.is_empty());
+                assert!(!workspace.operational_resources.mcp_servers.all);
+                assert_eq!(
+                    workspace.execution_draft_policy.resources,
+                    workspace.operational_resources
+                );
+                let presentation =
+                    pioneer_client::artifacts::presentation::artifact_presentation_policy(
+                        capabilities.can_read_artifacts,
+                        capabilities.can_write_artifacts && capabilities.can_bind_artifacts,
+                        true,
+                    );
+                assert!(!presentation.can_attach);
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn superuser_snapshot_projects_gateway_wide_management() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("authorization fixture");
-        let service = AuthorizationCapabilitySnapshotService::new(AuthorizationResolver::new(
-            CrudStore::new(harness.database.clone()),
-        ));
-        let snapshot = service
-            .snapshot(
-                &principal("P00000000000000000001", PrincipalKind::Superuser),
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
-                },
-                19,
-            )
-            .await
-            .expect("superuser snapshot");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("authorization fixture");
+                let service = AuthorizationCapabilitySnapshotService::new(
+                    AuthorizationResolver::new(CrudStore::new(harness.database.clone())),
+                );
+                let snapshot = service
+                    .snapshot(
+                        &principal("P00000000000000000001", PrincipalKind::Superuser),
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
+                        },
+                        19,
+                    )
+                    .await
+                    .expect("superuser snapshot");
 
-        assert_eq!(snapshot.role_key, "superuser");
-        assert!(snapshot.global.can_create_workspace);
-        assert!(snapshot.global.can_manage_gateway_settings);
-        assert!(snapshot.global.can_manage_capabilities);
-        assert!(snapshot.global.can_manage_all_threads);
-        assert!(snapshot.global.can_manage_member_lifecycle);
-        let workspace = snapshot.workspace.expect("workspace capabilities");
-        assert!(workspace.capabilities.can_manage);
-        assert!(workspace.capabilities.can_remove_member);
-        assert_eq!(
-            workspace
-                .capabilities
-                .agent_permission_options
-                .iter()
-                .map(|option| option.mode)
-                .collect::<Vec<_>>(),
-            vec![
-                TurnPermissionMode::FullAccess,
-                TurnPermissionMode::AutoAcceptEdits,
-                TurnPermissionMode::Supervised,
-            ]
-        );
-        let thread = snapshot.thread.expect("thread capabilities");
-        assert!(thread.capabilities.can_manage);
-        assert!(thread.capabilities.can_manage_private_participants);
-        assert!(thread.capabilities.can_move);
+                assert_eq!(snapshot.role_key, "superuser");
+                assert!(snapshot.global.can_create_workspace);
+                assert!(snapshot.global.can_manage_gateway_settings);
+                assert!(snapshot.global.can_manage_capabilities);
+                assert!(snapshot.global.can_manage_all_threads);
+                assert!(snapshot.global.can_manage_member_lifecycle);
+                let workspace = snapshot.workspace.expect("workspace capabilities");
+                assert!(workspace.capabilities.can_manage);
+                assert!(workspace.capabilities.can_remove_member);
+                assert_eq!(
+                    workspace
+                        .capabilities
+                        .agent_permission_options
+                        .iter()
+                        .map(|option| option.mode)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        TurnPermissionMode::FullAccess,
+                        TurnPermissionMode::AutoAcceptEdits,
+                        TurnPermissionMode::Supervised,
+                    ]
+                );
+                let thread = snapshot.thread.expect("thread capabilities");
+                assert!(thread.capabilities.can_manage);
+                assert!(thread.capabilities.can_manage_private_participants);
+                assert!(thread.capabilities.can_move);
 
-        let snapshot = service
-            .snapshot(
-                &principal("P00000000000000000001", PrincipalKind::Superuser),
-                AuthorizationCapabilitiesParams {
-                    workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
-                    thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
-                },
-                19,
-            )
-            .await
-            .expect("superuser parity snapshot");
-        assert_shell_projection_parity(&snapshot);
+                let snapshot = service
+                    .snapshot(
+                        &principal("P00000000000000000001", PrincipalKind::Superuser),
+                        AuthorizationCapabilitiesParams {
+                            workspace_id: Some(WORKSPACE_RED_ID.to_owned()),
+                            thread_id: Some(THREAD_RED_PRIVATE_B_ID.to_owned()),
+                        },
+                        19,
+                    )
+                    .await
+                    .expect("superuser parity snapshot");
+                assert_shell_projection_parity(&snapshot);
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

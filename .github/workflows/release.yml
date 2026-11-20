@@ -74,40 +74,8 @@ jobs:
         run: python scripts/packaging/release-preflight.py --signing
 
   generate-model-catalog:
-    name: generate-model-catalog
     needs: preflight
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
-
-      - name: setup-rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.99.0"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-model-catalog-v1
-
-      - name: generate-and-validate-model-catalog
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
-            release-model-catalog/catalog.json
-
-      - name: upload-model-catalog
-        uses: actions/upload-artifact@v6
-        with:
-          name: pioneer-release-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
-          path: release-model-catalog/catalog.json
-          if-no-files-found: error
+    uses: ./.github/workflows/release-model-catalog.yml
 
   platforms:
     name: release-${{ matrix.target }}
@@ -118,14 +86,14 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: pioneer-gateway-linux-x86_64.gz
+            asset: pioneer-gateway-linux-x86_64.zip
             cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip
             asset_name: pioneer-linux-x86_64.AppImage
             update_asset_name: pioneer-linux-x86_64.AppImage
             appimagetool_arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: pioneer-gateway-linux-aarch64.gz
+            asset: pioneer-gateway-linux-aarch64.zip
             cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip
             asset_name: pioneer-linux-aarch64.AppImage
             update_asset_name: pioneer-linux-aarch64.AppImage
@@ -138,7 +106,7 @@ jobs:
             update_asset_name: Pioneer-x86_64.app.zip
           - os: macos-15
             target: aarch64-apple-darwin
-            asset: pioneer-gateway-macos-aarch64.gz
+            asset: pioneer-gateway-macos-aarch64.zip
             cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip
             asset_name: Pioneer-aarch64.dmg
             update_asset_name: Pioneer-aarch64.app.zip

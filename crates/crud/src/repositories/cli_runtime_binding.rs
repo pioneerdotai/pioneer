@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use pioneer_crud_execution::input_mapping::InputMapping;
 use pioneer_entity::{
     cli_runtime_native_event, cli_runtime_pending_request, thread_cli_runtime_binding,
     turn_cli_runtime_attempt, turn_cli_runtime_binding, turn_cli_runtime_execution_segment,
@@ -7,7 +8,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Iterable,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -190,9 +191,9 @@ pub const CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX: u64 = 64;
 pub struct CliRuntimeTurnBindingRecord {
     /// Storage provenance used only by CRUD. Callers receive logical JSON.
     #[doc(hidden)]
-    pub input_mapping_payload_id: Option<String>,
+    pub input_mapping_frame: Option<InputMapping>,
     #[doc(hidden)]
-    pub input_mapping_read_hold: Option<super::portable_payload::PayloadReadHold>,
+    pub input_mapping_has_inline_history: bool,
     #[doc(hidden)]
     pub input_mapping_revision: i64,
     #[doc(hidden)]
@@ -589,7 +590,7 @@ pub async fn upsert_thread_binding<C: ConnectionTrait>(
 ) -> Result<CliRuntimeThreadBindingRecord> {
     root.verify(db, &binding.workspace_id).await?;
     let thread_id = binding.thread_id.clone();
-    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding, root))
+    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding, root)?)
         .on_conflict(
             OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
                 .update_columns([
@@ -628,7 +629,7 @@ pub async fn insert_fork_intent_if_absent<C: ConnectionTrait>(
         "CLI fork intent must be pending"
     );
     let result =
-        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending, root))
+        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending, root)?)
             .on_conflict(
                 OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
                     .do_nothing()
@@ -830,7 +831,9 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
             active.native_root_thread_id = Set(request.thread_binding.native_root_thread_id);
             active.native_cwd = Set(request.thread_binding.native_cwd);
             active.native_model = Set(request.thread_binding.native_model);
-            active.resume_cursor_json = Set(request.thread_binding.resume_cursor_json);
+            active.resume_cursor_json = Set(serde_json::from_str(
+                &request.thread_binding.resume_cursor_json,
+            )?);
             active.frozen_manifest_id = Set(root.locator());
             active.provider_session_id = Set(Some(proposed_provider_session_id));
             active.provider_session_lifecycle_state = Set(Some(
@@ -875,7 +878,7 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
     root.verify(db, &request.thread_binding.workspace_id)
         .await?;
     let proposed_provider_session_id = request.proposed_provider_session_id;
-    let mut active = active_thread_binding_from_new(request.thread_binding, root);
+    let mut active = active_thread_binding_from_new(request.thread_binding, root)?;
     active.native_thread_id = Set(proposed_provider_session_id.clone());
     active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
     active.provider_session_id = Set(Some(proposed_provider_session_id));
@@ -1111,11 +1114,12 @@ pub async fn list_thread_bindings_for_runtime<C: ConnectionTrait>(
 pub async fn upsert_turn_binding<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeTurnBinding,
+    mapping: InputMapping,
     root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     root.verify(db, &binding.workspace_id).await?;
     let turn_id = binding.turn_id.clone();
-    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding, root))
+    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding, mapping, root)?)
         .on_conflict(
             OnConflict::column(turn_cli_runtime_binding::Column::TurnId)
                 .update_columns([
@@ -1133,6 +1137,11 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
                     turn_cli_runtime_binding::Column::SandboxJson,
                     turn_cli_runtime_binding::Column::ApprovalPolicy,
                     turn_cli_runtime_binding::Column::InputMappingJson,
+                    turn_cli_runtime_binding::Column::InputMappingCodec,
+                    turn_cli_runtime_binding::Column::InputMappingBytes,
+                    turn_cli_runtime_binding::Column::InputMappingChars,
+                    turn_cli_runtime_binding::Column::InputMappingSha256,
+                    turn_cli_runtime_binding::Column::InputMappingHasInlineHistory,
                     turn_cli_runtime_binding::Column::FrozenManifestId,
                     turn_cli_runtime_binding::Column::UpdatedAt,
                 ])
@@ -1216,7 +1225,7 @@ fn turn_control_query(
     query
         .select_only()
         .columns(Column::iter().filter(|column| !matches!(column, Column::InputMappingJson)))
-        .column_as(Expr::val(""), "input_mapping_json")
+        .column_as(Expr::val(Vec::<u8>::new()), "input_mapping_json")
 }
 
 pub(crate) async fn find_turn_binding_projection<C: ConnectionTrait>(
@@ -1994,7 +2003,7 @@ pub async fn create_pending_request<C: ConnectionTrait>(
     }
 
     let request_id = request.request_id.clone();
-    cli_runtime_pending_request::Entity::insert(active_pending_request_from_new(request))
+    cli_runtime_pending_request::Entity::insert(active_pending_request_from_new(request)?)
         .exec(db)
         .await
         .context("failed to insert CLI runtime pending request")?;
@@ -2151,61 +2160,29 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
         .collect()
 }
 
-/// Loads open requests for the complete descendant-thread subtree in one
-/// bounded query. The recursive relation is traversed by SQLite rather than by
-/// issuing one pending-request query per descendant.
 pub async fn list_open_pending_requests_for_descendant_threads<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     thread_id: &str,
 ) -> Result<Vec<CliRuntimePendingRequestRecord>> {
-    let limit = i64::try_from(CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX)
-        .context("pending request page limit exceeds SQLite integer range")?;
-    let statement = Statement::from_sql_and_values(
-        db.get_database_backend(),
-        r#"
-WITH RECURSIVE descendant_threads(thread_id) AS (
-    SELECT child_thread_id
-    FROM thread_lineage
-    WHERE parent_thread_id = ?
-    UNION
-    SELECT lineage.child_thread_id
-    FROM thread_lineage AS lineage
-    INNER JOIN descendant_threads AS descendant
-        ON lineage.parent_thread_id = descendant.thread_id
-)
-SELECT pending.*
-FROM cli_runtime_pending_request AS pending
-INNER JOIN descendant_threads AS descendant
-    ON descendant.thread_id = pending.thread_id
-WHERE pending.workspace_id = ?
-  AND pending.status IN (?, ?, ?, ?)
-ORDER BY pending.created_at ASC, pending.request_id ASC
-LIMIT ?
-"#,
-        [
-            thread_id.into(),
-            workspace_id.into(),
-            CliRuntimePendingRequestStatus::Pending.as_str().into(),
-            CliRuntimePendingRequestStatus::ResponseAccepted
-                .as_str()
-                .into(),
-            CliRuntimePendingRequestStatus::Delivering.as_str().into(),
-            CliRuntimePendingRequestStatus::DeliveryFailed
-                .as_str()
-                .into(),
-            limit.into(),
-        ],
-    );
-
-    cli_runtime_pending_request::Entity::find()
-        .from_raw_sql(statement)
-        .all(db)
-        .await
-        .context("failed to list open CLI runtime pending requests for descendant threads")?
-        .into_iter()
-        .map(pending_request_record_from_model)
-        .collect()
+    let statuses = [
+        CliRuntimePendingRequestStatus::Pending,
+        CliRuntimePendingRequestStatus::ResponseAccepted,
+        CliRuntimePendingRequestStatus::Delivering,
+        CliRuntimePendingRequestStatus::DeliveryFailed,
+    ]
+    .map(|status| status.as_str());
+    pioneer_crud_execution::pending_requests::list_open_descendants(
+        db,
+        workspace_id,
+        thread_id,
+        statuses,
+        CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX,
+    )
+    .await?
+    .into_iter()
+    .map(pending_request_record_from_model)
+    .collect()
 }
 
 pub async fn resolve_pending_request<C: ConnectionTrait>(
@@ -2232,7 +2209,11 @@ pub async fn resolve_pending_request<C: ConnectionTrait>(
     cli_runtime_pending_request::Entity::update(cli_runtime_pending_request::ActiveModel {
         request_id: Set(resolution.request_id.clone()),
         status: Set(resolution.status.as_str().to_owned()),
-        response_json: Set(resolution.response_json),
+        response_json: Set(resolution
+            .response_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?),
         updated_at: Set(resolution.updated_at),
         resolved_at: Set(Some(resolution.resolved_at)),
         ..Default::default()
@@ -2578,7 +2559,7 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
         native_turn_id: Set(request.native_turn_id),
         native_item_id: Set(request.native_item_id),
         request_kind: Set(request.request_kind),
-        payload_json: Set(request.payload_json),
+        payload_json: Set(serde_json::from_str(&request.payload_json)?),
         status: Set(CliRuntimePendingRequestStatus::Pending.as_str().to_owned()),
         response_json: Set(None),
         responding_principal_id: Set(None),
@@ -2603,8 +2584,8 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
 fn active_thread_binding_from_new(
     binding: NewCliRuntimeThreadBinding,
     root: &crate::frozen_lifetime::PreparedFrozenRoot,
-) -> thread_cli_runtime_binding::ActiveModel {
-    thread_cli_runtime_binding::ActiveModel {
+) -> Result<thread_cli_runtime_binding::ActiveModel> {
+    Ok(thread_cli_runtime_binding::ActiveModel {
         thread_id: Set(binding.thread_id),
         workspace_id: Set(binding.workspace_id),
         runtime_id: Set(binding.runtime_id),
@@ -2614,20 +2595,21 @@ fn active_thread_binding_from_new(
         native_root_thread_id: Set(binding.native_root_thread_id),
         native_cwd: Set(binding.native_cwd),
         native_model: Set(binding.native_model),
-        resume_cursor_json: Set(binding.resume_cursor_json),
+        resume_cursor_json: Set(serde_json::from_str(&binding.resume_cursor_json)?),
         frozen_manifest_id: Set(root.locator()),
         status: Set(binding.status),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
         ..Default::default()
-    }
+    })
 }
 
 fn active_turn_binding_from_new(
     binding: NewCliRuntimeTurnBinding,
+    mapping: InputMapping,
     root: &crate::frozen_lifetime::PreparedFrozenRoot,
-) -> turn_cli_runtime_binding::ActiveModel {
-    turn_cli_runtime_binding::ActiveModel {
+) -> Result<turn_cli_runtime_binding::ActiveModel> {
+    let mut model = turn_cli_runtime_binding::ActiveModel {
         turn_id: Set(binding.turn_id),
         thread_id: Set(binding.thread_id),
         continuation_thread_id: Set(binding.continuation_thread_id),
@@ -2640,14 +2622,19 @@ fn active_turn_binding_from_new(
         status: Set(binding.status),
         model: Set(binding.model),
         cwd: Set(binding.cwd),
-        sandbox_json: Set(binding.sandbox_json),
+        sandbox_json: Set(binding
+            .sandbox_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?),
         approval_policy: Set(binding.approval_policy),
-        input_mapping_json: Set(binding.input_mapping_json),
         frozen_manifest_id: Set(root.locator()),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
         ..Default::default()
-    }
+    };
+    mapping.set(&mut model)?;
+    Ok(model)
 }
 
 fn active_turn_attempt_from_new(
@@ -2756,8 +2743,8 @@ fn validate_new_execution_segment(segment: &NewCliRuntimeExecutionSegment) -> Re
 
 fn active_pending_request_from_new(
     request: NewCliRuntimePendingRequest,
-) -> cli_runtime_pending_request::ActiveModel {
-    cli_runtime_pending_request::ActiveModel {
+) -> Result<cli_runtime_pending_request::ActiveModel> {
+    Ok(cli_runtime_pending_request::ActiveModel {
         request_id: Set(request.request_id),
         runtime_id: Set(request.runtime_id),
         runtime_kind: Set(request.runtime_kind),
@@ -2768,7 +2755,7 @@ fn active_pending_request_from_new(
         native_turn_id: Set(request.native_turn_id),
         native_item_id: Set(request.native_item_id),
         request_kind: Set(request.request_kind),
-        payload_json: Set(request.payload_json),
+        payload_json: Set(serde_json::from_str(&request.payload_json)?),
         status: Set(CliRuntimePendingRequestStatus::Pending.as_str().to_owned()),
         response_json: Set(None),
         initiating_principal_id: Set(None),
@@ -2784,7 +2771,7 @@ fn active_pending_request_from_new(
         created_at: Set(request.created_at),
         updated_at: Set(request.updated_at),
         resolved_at: Set(None),
-    }
+    })
 }
 
 pub async fn bind_pending_request_authorization<C: ConnectionTrait>(
@@ -2875,7 +2862,7 @@ fn thread_binding_record_from_model(
         native_root_thread_id: model.native_root_thread_id,
         native_cwd: model.native_cwd,
         native_model: model.native_model,
-        resume_cursor_json: model.resume_cursor_json,
+        resume_cursor_json: model.resume_cursor_json.to_string(),
         status: model.status,
         mcp,
         provider_session,
@@ -2934,24 +2921,16 @@ fn turn_binding_record_from_model(
 }
 
 fn turn_binding_record_from_model_inner(
-    model: turn_cli_runtime_binding::Model,
+    mut model: turn_cli_runtime_binding::Model,
     capture_mapping: bool,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     let mcp = turn_mcp_metadata_from_model(&model);
-    let read_hold = model
-        .input_mapping_json_payload_id
-        .as_deref()
-        .filter(|_| capture_mapping)
-        .map(|id| {
-            super::portable_payload::PayloadReadHold::capture(
-                id,
-                super::portable_payload::Family::CliMapping,
-            )
-        })
+    let input_mapping_frame = capture_mapping
+        .then(|| InputMapping::take(&mut model))
         .transpose()?;
     Ok(CliRuntimeTurnBindingRecord {
-        input_mapping_payload_id: model.input_mapping_json_payload_id,
-        input_mapping_read_hold: read_hold,
+        input_mapping_frame,
+        input_mapping_has_inline_history: model.input_mapping_has_inline_history,
         input_mapping_revision: model.portable_revision,
         input_mapping_identity: model.portable_identity,
         turn_id: model.turn_id,
@@ -2966,9 +2945,9 @@ fn turn_binding_record_from_model_inner(
         status: model.status,
         model: model.model,
         cwd: model.cwd,
-        sandbox_json: model.sandbox_json,
+        sandbox_json: model.sandbox_json.map(|value| value.to_string()),
         approval_policy: model.approval_policy,
-        input_mapping_json: model.input_mapping_json,
+        input_mapping_json: String::new(),
         mcp,
         native_goal_status: model.native_goal_status,
         native_goal_turn_id: model.native_goal_turn_id,
@@ -3104,9 +3083,9 @@ fn pending_request_record_from_model(
         native_turn_id: model.native_turn_id,
         native_item_id: model.native_item_id,
         request_kind: model.request_kind,
-        payload_json: model.payload_json,
+        payload_json: model.payload_json.to_string(),
         status: CliRuntimePendingRequestStatus::from_db(model.status.as_str())?,
-        response_json: model.response_json,
+        response_json: model.response_json.map(|value| value.to_string()),
         authorization_binding,
         responding_principal_id: model.responding_principal_id,
         responding_session_id: model.responding_session_id,
@@ -3139,22 +3118,14 @@ fn native_event_record_from_model(
     })
 }
 
-/// Restore logical bytes only on a released reader boundary or after commit.
-/// Keep provenance for later short writer CAS; never use a reloaded mapping
-/// that could belong to a newer UPSERT in place of the captured record.
+/// Decode a body captured by the source query after releasing database capacity.
 pub(crate) async fn hydrate_record(
-    db: &pioneer_sqlite::SqliteDatabase,
+    _db: &pioneer_sqlite::SqliteDatabase,
     mut record: CliRuntimeTurnBindingRecord,
 ) -> Result<CliRuntimeTurnBindingRecord> {
-    record.input_mapping_json = super::portable_payload::hydrate_with_hold(
-        db,
-        super::portable_payload::Family::CliMapping,
-        record.input_mapping_payload_id.as_deref(),
-        record.input_mapping_json,
-        record.input_mapping_read_hold.as_ref(),
-    )
-    .await?;
-    record.input_mapping_read_hold = None;
+    if let Some(mapping) = record.input_mapping_frame.take() {
+        record.input_mapping_json = mapping.decode()?;
+    }
     Ok(record)
 }
 

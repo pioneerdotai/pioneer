@@ -18,7 +18,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_context: HasOne<super::compaction_context::Entity>,
+    pub compaction_context: BelongsTo<super::compaction_context::Entity>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
@@ -26,7 +26,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

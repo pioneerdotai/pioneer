@@ -7,32 +7,47 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_skill_version")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uq_agent_skill_version_number")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_skill_version_fingerprint"
+    )]
     pub skill_id: String,
-    #[sea_orm(unique_key = "uq_agent_skill_version_number")]
-    pub version_number: i64,
-    #[sea_orm(unique_key = "uq_agent_skill_version_run_candidate")]
-    pub source_run_id: Option<String>,
-    pub parent_version_id: Option<String>,
-    #[sea_orm(unique_key = "uq_agent_skill_version_run_candidate")]
-    pub candidate_key: String,
-    pub display_name: String,
-    #[sea_orm(column_type = "Text")]
-    pub skill_markdown: String,
-    #[sea_orm(column_type = "Text")]
-    pub instruction_body: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_skill_version_fingerprint"
+    )]
+    pub fingerprint: String,
     #[sea_orm(column_type = "Text")]
     pub when_to_use: String,
     #[sea_orm(column_type = "Text")]
     pub when_not_to_use: String,
-    #[sea_orm(unique_key = "uq_agent_skill_version_fingerprint")]
-    pub fingerprint: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub parent_version_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub source_turn_ids_json: String,
-    pub created_at: DateTimeWithTimeZone,
     pub evidence_latest_at_unix: Option<i64>,
+    #[sea_orm(column_type = "Text")]
+    pub skill_markdown: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_skill_version_run_candidate"
+    )]
+    pub candidate_key: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uq_agent_skill_version_run_candidate"
+    )]
+    pub source_run_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub display_name: String,
+    #[sea_orm(column_type = "Text")]
+    pub instruction_body: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(unique_key = "uq_agent_skill_version_number")]
+    pub version_number: i64,
     #[sea_orm(
         belongs_to,
         from = "skill_id",
@@ -40,7 +55,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_skill: HasOne<super::agent_skill::Entity>,
+    pub agent_skill: BelongsTo<super::agent_skill::Entity>,
     #[sea_orm(
         self_ref,
         relation_enum = "SelfRef",
@@ -49,7 +64,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "SetNull"
     )]
-    pub agent_skill_version: HasOne<Entity>,
+    pub agent_skill_version: BelongsTo<Option<Entity>>,
     #[sea_orm(
         belongs_to,
         from = "source_run_id",
@@ -57,7 +72,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "SetNull"
     )]
-    pub self_improvement_run: HasOne<super::self_improvement_run::Entity>,
+    pub self_improvement_run: BelongsTo<Option<super::self_improvement_run::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -7,28 +7,38 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_episodic_thread_directory")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_thread_directory_thread")]
-    pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_thread_episodic_thread_directory_thread")]
-    pub thread_id: String,
-    pub title: Option<String>,
+    pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub summary_hash: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub summary_ref: Option<String>,
-    pub thread_created_at: Option<DateTimeWithTimeZone>,
-    pub thread_updated_at: Option<DateTimeWithTimeZone>,
-    pub last_indexed_at: Option<DateTimeWithTimeZone>,
-    pub indexed_item_count: i64,
+    pub project_affinity_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub task_affinity_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub project_affinity_json: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub visibility: String,
-    pub status: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_thread_episodic_thread_directory_thread"
+    )]
+    pub workspace_id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_thread_episodic_thread_directory_thread"
+    )]
+    pub thread_id: String,
     pub created_at: DateTimeWithTimeZone,
-    pub updated_at: DateTimeWithTimeZone,
+    pub last_indexed_at: Option<DateTimeWithTimeZone>,
+    pub thread_created_at: Option<DateTimeWithTimeZone>,
+    pub indexed_item_count: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub title: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub summary_ref: Option<String>,
+    pub thread_updated_at: Option<DateTimeWithTimeZone>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

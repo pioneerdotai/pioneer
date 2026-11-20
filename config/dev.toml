@@ -24,3 +24,8 @@ service_name = "pioneer_gateway_dev"
 
 [desktop.mcp_oauth]
 callback_port = 37644
+
+[gateway.database]
+# Give development its own PostgreSQL application database with pgvector.
+# Put the connection URL in your local override file.
+# development_url = "postgresql://pioneer_dev@127.0.0.1:5432/pioneer_dev"

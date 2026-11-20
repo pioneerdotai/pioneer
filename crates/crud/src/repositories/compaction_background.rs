@@ -25,7 +25,7 @@ pub struct CompletedHistoryCheck {
     pub revision: i64,
     pub failures: i64,
     pub attempt_deadline_ms: Option<i64>,
-    pub diagnostic: Option<String>,
+    pub diagnostic: Option<serde_json::Value>,
     pub config_hash: Option<String>,
     pub outcome: Option<String>,
     pub managed: i64,
@@ -146,7 +146,7 @@ enum HistoryAlias {
 }
 
 // Constants that define an expression/partial index are literal AST nodes.
-// Binding these as parameters would prevent SQLite from matching that index.
+// Keep partial-index predicates visible to the PostgreSQL planner.
 fn literal(value: impl Into<sea_orm::Value>) -> Expr {
     Expr::Constant(value.into())
 }
@@ -175,21 +175,16 @@ fn human_conversation(alias: HistoryAlias) -> Condition {
         .add(Expr::col((alias, turn::Column::InitiatedByActorKind)).eq(literal("principal")))
 }
 
-// A single SQL scope for busy detection and foreground binding.
-// JSON functions are ordinary function-call ASTs; CASE guards malformed legacy
-// metadata. The snake_case launch keys are the TurnStartParams wire contract.
+// A single SQL scope for busy detection and foreground binding. The
+// snake_case launch keys are the TurnStartParams wire contract.
 fn composer_task_scope() -> SelectStatement {
     use HistoryAlias::{Composer as K, Human as U, Root as H};
-    let metadata = Expr::col((K, task::Column::MetadataJson));
-    let valid: Expr = Func::cust(Alias::new("json_valid"))
-        .arg(metadata.clone())
-        .into();
-    let safe: Expr = Expr::case(valid, metadata).finally(literal("{}")).into();
-    let field = |path: &str| -> Expr {
-        Func::cust(Alias::new("json_extract"))
-            .args([safe.clone(), Expr::val(path)])
-            .into()
-    };
+    use pioneer_crud_payloads::json_projection::{json_path_text, json_path_value, queryable_json};
+
+    let metadata = queryable_json(Expr::col((K, task::Column::MetadataJson)));
+    let version = json_path_value(metadata.clone(), &["composerWork", "version"]);
+    let version_kind = Func::cust(Alias::new("json_typeof")).arg(version.clone());
+    let launch = |key| json_path_text(metadata.clone(), &["composerWork", "launch", key]);
     Query::select()
         .from_as(task::Entity, K)
         .join_as(
@@ -216,9 +211,14 @@ fn composer_task_scope() -> SelectStatement {
                 .add(human_conversation(U))
                 .add(Expr::col((U, turn::Column::WorkOwner)).eq(literal("detached_task"))),
         )
-        .and_where(field("$.composerWork.version").eq(pioneer_protocol::TASK_COMPOSER_WORK_VERSION))
-        .and_where(field("$.composerWork.launch.thread_id").eq(Expr::col((H, thread::Column::Id))))
-        .and_where(field("$.composerWork.launch.turn_id").eq(Expr::col((U, turn::Column::Id))))
+        .and_where(version_kind.eq("number"))
+        .and_where(
+            version
+                .cast_as(Alias::new("text"))
+                .eq(pioneer_protocol::TASK_COMPOSER_WORK_VERSION.to_string()),
+        )
+        .and_where(launch("thread_id").eq(Expr::col((H, thread::Column::Id))))
+        .and_where(launch("turn_id").eq(Expr::col((U, turn::Column::Id))))
         .to_owned()
 }
 
@@ -723,6 +723,7 @@ pub(crate) async fn record_history_result(
     use compaction_history_check::{ActiveModel as A, Column as C, Entity as E};
     use sea_orm::Set;
     ensure!(diagnostic.len() <= 4096, "history diagnostic exceeds bound");
+    let diagnostic: serde_json::Value = serde_json::from_str(diagnostic)?;
     use sea_orm::TransactionTrait;
     store
         .run_serialized_write(|| async {
@@ -746,7 +747,7 @@ pub(crate) async fn record_history_result(
                     outcome: Set(Some(label.into())),
                     failures: Set(failures),
                     next_attempt_ms: Set(due),
-                    diagnostic: Set(Some(diagnostic.into())),
+                    diagnostic: Set(Some(diagnostic.clone())),
                     attempt_deadline_ms: Set(None),
                     revision: Set(revision + 1),
                     ..Default::default()

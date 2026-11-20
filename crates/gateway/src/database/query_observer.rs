@@ -4,6 +4,27 @@ use super::query_fingerprint::QueryFingerprintLimiter;
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 
+type PoolSnapshot = Box<dyn Fn() -> pioneer_observability::DatabasePoolSnapshot + Send + Sync>;
+
+fn observe_pool<DB: sea_orm::sqlx::Database>(
+    pool: &sea_orm::sqlx::Pool<DB>,
+) -> (Arc<dyn Send + Sync>, PoolSnapshot) {
+    let lifetime = Arc::new(pool.clone());
+    let observed = Arc::downgrade(&lifetime);
+    (
+        lifetime,
+        Box::new(move || {
+            let Some(pool) = observed.upgrade() else {
+                return pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 };
+            };
+            pioneer_observability::DatabasePoolSnapshot {
+                size: u64::from(pool.size()),
+                idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
+            }
+        }),
+    )
+}
+
 /// Installs the callback and returns the weak pool observer for the caller to
 /// register. The callback alone owns the strong lifetime anchor, as before.
 pub(super) fn install_query_observer(
@@ -14,15 +35,14 @@ pub(super) fn install_query_observer(
     // SeaORM's callback belongs to the connection wrapper, not the SQLx pool.
     // Keep this anchor there; the global metrics registry must not own a pool
     // (and hence its native writer ownership) after bootstrap is discarded.
-    let pool_lifetime = Arc::new(connection.get_sqlite_connection_pool().clone());
-    let observed_pool = Arc::downgrade(&pool_lifetime);
+    let (pool_lifetime, observed_pool) = observe_pool(connection.get_postgres_connection_pool());
     connection.set_metric_callback(move |info| {
         let _pool_lifetime = &pool_lifetime;
         let (enabled, generation) = pioneer_observability::telemetry_consent_snapshot();
         if !enabled {
             return;
         }
-        let operation = sqlite_operation(info.statement.sql.as_str());
+        let operation = classify_operation(info.statement.sql.as_str());
         let workload = current_database_workload();
         let workload_name =
             workload.unwrap_or(pioneer_observability::DatabaseWorkload::Unclassified);
@@ -56,15 +76,7 @@ pub(super) fn install_query_observer(
             Some(generation),
         );
     });
-    move || {
-        let Some(pool) = observed_pool.upgrade() else {
-            return pioneer_observability::DatabasePoolSnapshot { size: 0, idle: 0 };
-        };
-        pioneer_observability::DatabasePoolSnapshot {
-            size: u64::from(pool.size()),
-            idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
-        }
-    }
+    observed_pool
 }
 
 fn database_query_kind(
@@ -84,7 +96,7 @@ fn database_query_kind(
     }
 }
 
-pub(super) fn sqlite_operation(sql: &str) -> pioneer_observability::DatabaseOperation {
+pub(super) fn classify_operation(sql: &str) -> pioneer_observability::DatabaseOperation {
     use pioneer_observability::DatabaseOperation;
 
     let token = sql

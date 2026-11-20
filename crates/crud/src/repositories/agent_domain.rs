@@ -9,6 +9,7 @@ use crate::GatewayControlConnection;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use futures_util::FutureExt;
+use pioneer_crud_execution::agent_queue::load_fair_queued_candidate;
 use pioneer_entity::{
     actor_nickname_index, agent_action, agent_action_outbox, agent_action_receipt,
     agent_action_timeline_target, agent_delegation_route, agent_delegation_route_event,
@@ -54,13 +55,14 @@ pub const NICKNAME_TOMBSTONED: &str = "tombstoned";
 pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
-const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
 // Keep the existing partial-index predicate intact; the additional exclusion
 // closes corrupt detached bindings without ACKing or retrying them forever.
 // Pin these existing ordered ranges so the retention status index cannot
 // replace them with a broad status scan and temporary sort. SeaQuery does not
 // expose SQLite INDEXED BY; these statements keep values bound as parameters.
+#[cfg(test)]
 const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
+#[cfg(test)]
 const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_timed WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
@@ -71,6 +73,7 @@ pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliati
 // terminal generation/resources and never redelivers an exhausted model start.
 // The immutable payload kind narrows the index; missing/invalid kind remains a
 // candidate. The action join remains authoritative, never payload authorization.
+#[cfg(test)]
 const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND NOT (o.status='failed' AND o.next_attempt_at IS NULL AND COALESCE(o.last_error,'')='outbox_detached_binding_rejected') AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
 
 const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 6] = [
@@ -871,11 +874,12 @@ pub async fn claim_actor_nickname<C: ConnectionTrait>(
     {
         bail!("invalid actor nickname key");
     }
-    if let Some(existing) =
-        actor_nickname_index::Entity::find_by_id((workspace_id.to_owned(), normalized.clone()))
-            .one(db)
-            .await
-            .context("failed to inspect actor nickname claim")?
+    if let Some(existing) = actor_nickname_index::Entity::find()
+        .filter(actor_nickname_index::Column::WorkspaceId.eq(workspace_id))
+        .filter(actor_nickname_index::Column::NicknameKey.eq(&normalized))
+        .one(db)
+        .await
+        .context("failed to inspect actor nickname claim")?
     {
         if existing.status != NICKNAME_ACTIVE
             || existing.owner_kind != owner_kind
@@ -927,7 +931,9 @@ pub async fn claim_actor_nickname<C: ConnectionTrait>(
     .on_conflict(OnConflict::new().do_nothing().to_owned())
     .exec(db)
     .await;
-    let row = actor_nickname_index::Entity::find_by_id((workspace_id.to_owned(), normalized))
+    let row = actor_nickname_index::Entity::find()
+        .filter(actor_nickname_index::Column::WorkspaceId.eq(workspace_id))
+        .filter(actor_nickname_index::Column::NicknameKey.eq(normalized))
         .one(db)
         .await
         .context("failed to reload actor nickname claim")?
@@ -2648,46 +2654,8 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
     if execution_ids.len() > AGENT_PROJECTION_BATCH_LIMIT {
         bail!("Agent author projection batch exceeds its bounded limit");
     }
-    // A CLI occurrence's provider is an execution fact, not its avatar or label.
-    // DISTINCT bounds the result by execution/provider pairs, including retries.
-    let placeholders = vec!["?"; execution_ids.len()].join(",");
-    let runtime_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            format!(
-                "SELECT DISTINCT e.id AS execution_id, b.runtime_kind \
-                 FROM agent_execution e \
-                 JOIN agent_identity i ON i.id = e.agent_identity_id \
-                 JOIN task_run_execution r ON r.id = e.id AND r.task_id = e.parent_task_id \
-                 JOIN task_run_turn t ON t.run_id = r.task_run_id AND t.execution_id = r.id \
-                 JOIN turn_cli_runtime_binding b ON b.turn_id = t.turn_id \
-                 WHERE i.source_kind = 'cli_runtime_instance' \
-                 AND b.workspace_id = e.workspace_id AND b.runtime_id = i.source_id \
-                 AND e.id IN ({placeholders}) LIMIT ?"
-            ),
-            execution_ids
-                .iter()
-                .cloned()
-                .map(sea_orm::Value::from)
-                .chain(std::iter::once(sea_orm::Value::from(
-                    execution_ids.len() as i64 * 3 + 1,
-                ))),
-        ))
-        .await?;
-    let mut runtime_kinds = BTreeMap::new();
-    for row in runtime_rows {
-        let execution_id: String = row.try_get("", "execution_id")?;
-        let kind: String = row.try_get("", "runtime_kind")?;
-        let kind: pioneer_protocol::CLIAgentRuntimeKind =
-            serde_json::from_value(serde_json::Value::String(kind))
-                .context("invalid CLI provider kind in Agent execution binding")?;
-        if runtime_kinds
-            .insert(execution_id, kind)
-            .is_some_and(|old| old != kind)
-        {
-            bail!("Agent execution has conflicting CLI provider identities");
-        }
-    }
+    let runtime_kinds =
+        pioneer_crud_execution::author_snapshot::cli_author_kinds(db, execution_ids).await?;
     let executions = agent_execution::Entity::find()
         .filter(agent_execution::Column::Id.is_in(execution_ids.iter().cloned()))
         .all(db)
@@ -3116,57 +3084,7 @@ pub async fn promote_queued_agent_executions(
     if idle_timeout_secs < 1 || hard_timeout_secs < idle_timeout_secs {
         bail!("queued execution promotion requires valid liveness windows");
     }
-    let candidate_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "WITH branch_heads AS (\
-               SELECT q.id, q.root_execution_id, q.branch_key, q.created_at, \
-                      q.enqueue_sequence, branch.last_scheduled_sequence, \
-                      branch.created_at AS branch_created_at, \
-                      ROW_NUMBER() OVER (\
-                        PARTITION BY q.root_execution_id, q.branch_key \
-                        ORDER BY q.created_at, q.enqueue_sequence, q.id\
-                      ) AS branch_rank \
-               FROM agent_work_queue q \
-               JOIN agent_work_branch_schedule branch \
-                 ON branch.root_execution_id = q.root_execution_id \
-                AND branch.branch_key = q.branch_key \
-               WHERE q.state = 'queued' \
-                 AND (q.eligible_at IS NULL OR q.eligible_at <= ?)\
-             ), root_heads AS (\
-               SELECT id, root_execution_id, created_at, enqueue_sequence, \
-                      ROW_NUMBER() OVER (\
-                        PARTITION BY root_execution_id \
-                        ORDER BY last_scheduled_sequence, \
-                                 created_at, enqueue_sequence, id\
-                      ) AS root_rank \
-               FROM branch_heads WHERE branch_rank = 1\
-             ) \
-             SELECT candidate.id FROM root_heads candidate \
-             JOIN agent_work_resource_scope scope \
-               ON scope.root_execution_id = candidate.root_execution_id \
-             WHERE candidate.root_rank = 1 AND scope.status = 'active' \
-               AND (SELECT COUNT(*) FROM agent_running_permit permit \
-                    WHERE permit.root_execution_id = candidate.root_execution_id \
-                      AND permit.status = 'held') < scope.max_concurrency \
-             ORDER BY scope.last_scheduled_sequence, \
-                      candidate.created_at, candidate.enqueue_sequence, candidate.id \
-             LIMIT ?"
-                .to_owned(),
-            [
-                now.clone().into(),
-                i64::try_from(limit).unwrap_or(i64::MAX).into(),
-            ],
-        ))
-        .await
-        .context("failed to list queued agent domain executions")?;
-    let candidate_ids = candidate_rows
-        .into_iter()
-        .map(|row| {
-            String::try_get(&row, "", "id")
-                .map_err(|error| anyhow!("invalid queued execution ID row: {error:?}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let candidate_ids = pioneer_crud_execution::agent_queue::candidates(db, now, limit).await?;
     if candidate_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -3294,47 +3212,6 @@ pub async fn promote_queued_agent_executions(
         });
     }
     Ok(promoted)
-}
-
-async fn load_fair_queued_candidate<C: ConnectionTrait>(
-    db: &C,
-    root_execution_id: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<agent_work_queue::Model>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "WITH branch_heads AS (\
-               SELECT q.id, q.branch_key, q.created_at, q.enqueue_sequence, \
-                      branch.last_scheduled_sequence, branch.created_at AS branch_created_at, \
-                      ROW_NUMBER() OVER (\
-                        PARTITION BY q.branch_key \
-                        ORDER BY q.created_at, q.enqueue_sequence, q.id\
-                      ) AS branch_rank \
-               FROM agent_work_queue q \
-               JOIN agent_work_branch_schedule branch \
-                 ON branch.root_execution_id = q.root_execution_id \
-                AND branch.branch_key = q.branch_key \
-               WHERE q.root_execution_id = ? AND q.state = 'queued' \
-                 AND (q.eligible_at IS NULL OR q.eligible_at <= ?)\
-             ) \
-             SELECT id FROM branch_heads WHERE branch_rank = 1 \
-             ORDER BY last_scheduled_sequence, \
-                      created_at, enqueue_sequence, id LIMIT 1"
-                .to_owned(),
-            [root_execution_id.into(), now.into()],
-        ))
-        .await
-        .context("failed to select fair queued branch candidate")?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let id = String::try_get(&row, "", "id")
-        .map_err(|error| anyhow!("invalid fair queued execution ID row: {error:?}"))?;
-    agent_work_queue::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("failed to load fair queued branch candidate")
 }
 
 pub async fn insert_agent_action_idempotent<C: ConnectionTrait>(
@@ -5392,51 +5269,13 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-#[derive(FromQueryResult)]
-struct AgentActionOutboxDeadline {
-    next_attempt_at: DateTimeWithTimeZone,
-}
-
-/// Future hints only; claims and delivery/reconciliation stay authoritative.
-/// SeaQuery 1.0.2 exposes MySQL index hints but no SQLite INDEXED BY
-/// (query/select.rs, extension/mysql/select.rs, backend/sqlite/query.rs).
-/// Keep this exception limited to two scalar repository reads on the supplied
-/// connection. Literal predicates match the installed partial indexes exactly;
-/// only the full-precision clock is bound. No JSON evaluation over delivered
-/// history, canonical lookup only within the exhausted future range.
-pub async fn next_agent_action_outbox_deadline<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-) -> Result<Option<i64>> {
-    const ORDINARY: &str = "SELECT next_attempt_at FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_timed WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at>? ORDER BY next_attempt_at,created_at,id LIMIT 1";
-    const EXHAUSTED: &str = "SELECT o.next_attempt_at FROM agent_action_outbox o INDEXED BY idx_agent_action_outbox_exhausted WHERE o.status IN ('pending','failed') AND o.attempts=8 AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND COALESCE(o.next_attempt_at,'')>? AND EXISTS (SELECT 1 FROM agent_action a WHERE a.id=o.action_id AND a.action_kind='start_agent') ORDER BY COALESCE(o.next_attempt_at,''),o.created_at,o.id LIMIT 1";
-    // Merge at most two heads using SQLite's original stored-clock order.
-    // This tiny outer sort is independent of journal size. A Rust DateTime min
-    // would change legacy timestamp ordering when offsets/spellings differ.
-    let sql = format!(
-        "SELECT next_attempt_at FROM (SELECT next_attempt_at FROM ({ORDINARY}) UNION ALL SELECT next_attempt_at FROM ({EXHAUSTED})) ORDER BY next_attempt_at LIMIT 1"
-    );
-    Ok(
-        AgentActionOutboxDeadline::find_by_statement(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            [now.into(), now.into()],
-        ))
-        .one(db)
-        .await?
-        .map(|row| crate::util::deadline_unix_seconds(row.next_attempt_at)),
-    )
-}
-
-#[derive(FromQueryResult)]
-struct AgentActionOutboxId {
-    id: String,
-}
+pub use pioneer_crud_execution::outbox_discovery::next_deadline as next_agent_action_outbox_deadline;
 
 // Predicates and ordering match the existing due indexes and the exhausted
 // expression index added by m20261026_000001_agent_start_reconciliation_index.
 // SeaORM/SeaQuery do not expose SQLite INDEXED BY on the bounded UNION arm;
 // keep that discovery statement here, with only clocks and limits as binds.
+#[cfg(test)]
 fn agent_action_outbox_timed_discovery_sql() -> String {
     // Empty text sorts before every stored timestamp. This makes NULL and timed
     // exhausted deadlines one searchable range with the unchanged input quota.
@@ -5455,48 +5294,6 @@ fn agent_action_outbox_timed_discovery_sql() -> String {
         ),
         exhausted,
     )
-}
-
-async fn discover_agent_action_outbox<C: ConnectionTrait>(
-    db: &C,
-    now: DateTimeWithTimeZone,
-    limit: u64,
-) -> Result<Vec<AgentActionOutboxId>> {
-    let immediate_limit = std::cmp::min(limit.div_ceil(2), AGENT_ACTION_OUTBOX_RANGE_LIMIT);
-    let timed_limit = std::cmp::min(limit / 2, AGENT_ACTION_OUTBOX_RANGE_LIMIT);
-    let mut ids = AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
-        db.get_database_backend(),
-        AGENT_ACTION_OUTBOX_IMMEDIATE_SQL,
-        [immediate_limit.into()],
-    ))
-    .all(db)
-    .await
-    .context("failed to list immediate agent action outbox IDs")?;
-    // The original timed predicate retains its partial-index access. A second
-    // bounded range supplies exhausted StartAgent reconciliation; their merged
-    // due order shares the existing timed quantum, including limit=2 callers.
-    let timed_sql = agent_action_outbox_timed_discovery_sql();
-    ids.extend(
-        AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            timed_sql,
-            [
-                now.clone().into(),
-                timed_limit.into(),
-                now.into(),
-                timed_limit.into(),
-                timed_limit.into(),
-            ],
-        ))
-        .all(db)
-        .await
-        .context("failed to list timed agent start delivery/reconciliation IDs")?,
-    );
-    // A concurrent source transition can move an ID between these two reads.
-    // Retain range order but never transition the same input twice per quantum.
-    let mut seen = std::collections::BTreeSet::new();
-    ids.retain(|row| seen.insert(row.id.clone()));
-    Ok(ids)
 }
 
 /// Known-committed claims and independent candidate failures from one input quantum.
@@ -5541,7 +5338,7 @@ async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTr
     if !(2..=AGENT_ACTION_OUTBOX_BATCH_LIMIT).contains(&limit) {
         bail!("Agent action outbox nonzero batch limit must be 2..=64");
     }
-    let ids = discover_agent_action_outbox(db, clock(), limit).await?;
+    let ids = pioneer_crud_execution::outbox_discovery::discover(db, clock(), limit).await?;
     let mut batch = AgentActionOutboxClaimBatch {
         has_more: ids.len() as u64 >= limit / 2,
         ..Default::default()
@@ -5564,7 +5361,8 @@ async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTr
             let now = clock(); // after serialized writer admission, for each row
             // Original source payload is authoritative. Do not decode it under capacity.
             let mut candidate =
-                match agent_action_outbox::Entity::find_by_id(id.id)
+                match agent_action_outbox::Entity::find_by_id(id)
+                    .lock_exclusive()
                     .one(&transaction)
                     .await
                 {
@@ -7941,11 +7739,7 @@ pub async fn heartbeat_agent_execution<C: ConnectionTrait>(
     if let Some(idle_deadline) = idle_deadline {
         update = update.col_expr(
             agent_execution_resource_state::Column::IdleDeadline,
-            sea_orm::sea_query::Expr::cust_with_values(
-                "CASE WHEN hard_deadline IS NOT NULL AND hard_deadline <= ? THEN hard_deadline \
-                 WHEN idle_deadline IS NULL OR idle_deadline < ? THEN ? ELSE idle_deadline END",
-                [idle_deadline.clone(), idle_deadline.clone(), idle_deadline],
-            ),
+            pioneer_crud_execution::agent_queue::extend_idle_deadline(idle_deadline),
         );
     }
     let result = update
@@ -8025,11 +7819,7 @@ pub async fn record_agent_execution_progress<C: GatewayControlConnection>(
         if let Some(idle_deadline) = idle_deadline {
             update = update.col_expr(
                 agent_execution_resource_state::Column::IdleDeadline,
-                sea_orm::sea_query::Expr::cust_with_values(
-                    "CASE WHEN hard_deadline IS NOT NULL AND hard_deadline <= ? THEN hard_deadline \
-                 WHEN idle_deadline IS NULL OR idle_deadline < ? THEN ? ELSE idle_deadline END",
-                    [idle_deadline.clone(), idle_deadline.clone(), idle_deadline],
-                ),
+                pioneer_crud_execution::agent_queue::extend_idle_deadline(idle_deadline),
             );
         }
         let result = update
@@ -8167,11 +7957,7 @@ async fn bind_running_state<C: ConnectionTrait>(
     Ok(())
 }
 
-pub fn canonical_agent_id(prefix: char, key: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(key.as_bytes());
-    format!("{prefix}{}", &hex::encode(digest.finalize())[..20])
-}
+pub use pioneer_crud_execution::canonical_id::canonical_agent_id;
 
 pub fn utc_now() -> DateTimeWithTimeZone {
     DateTime::<Utc>::from(Utc::now()).into()

@@ -1521,7 +1521,6 @@ mod tests {
         use pioneer_entity::{
             compaction_frozen_history as history, html_preview_frozen_index as index,
             html_preview_frozen_result as receipt, html_preview_frozen_turn as preview_turn,
-            html_preview_index_backfill as backfill,
         };
         use sea_orm::sea_query::Expr;
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -1537,12 +1536,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fk.try_get::<i64>("", "foreign_keys").unwrap(), 0);
-        let seed = backfill::Entity::find_by_id(1_i64)
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((seed.complete, seed.inputs_complete), (0, 0));
         let marker = index::Entity::find_by_id("metadata-0000")
             .one(&tx)
             .await
@@ -1605,7 +1598,9 @@ mod tests {
             .is_some()
         );
         assert!(
-            receipt::Entity::find_by_id(("metadata-0000".to_owned(), 0_i64))
+            receipt::Entity::find()
+                .filter(receipt::Column::ManifestId.eq("metadata-0000"))
+                .filter(receipt::Column::Ordinal.eq(0_i64))
                 .one(&tx)
                 .await
                 .unwrap()
@@ -1638,7 +1633,9 @@ mod tests {
             .is_none()
         );
         assert!(
-            receipt::Entity::find_by_id(("metadata-0000".to_owned(), 0_i64))
+            receipt::Entity::find()
+                .filter(receipt::Column::ManifestId.eq("metadata-0000"))
+                .filter(receipt::Column::Ordinal.eq(0_i64))
                 .one(&db)
                 .await
                 .unwrap()

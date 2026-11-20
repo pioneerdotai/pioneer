@@ -6,6 +6,7 @@ use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_compaction::SourceRef;
 use pioneer_compaction::frozen::FrozenHistoryRef;
+use pioneer_crud_compaction::delivery_sources::{self, DeliveredOutputRow};
 use pioneer_entity::{
     compaction_delivery_output, compaction_frozen_history, compaction_task_output, task,
     task_delivery, task_result_candidate, task_run, task_run_turn, thread, turn,
@@ -821,95 +822,6 @@ pub struct DeliveredTaskOutputPage {
 
 const DELIVERED_OUTPUT_EVENT_ROWS: usize = 127;
 
-/// The scoped delivery index is the starting point. Both existing Turn fence
-/// components exclude newly created Turns, including IDs inserted below the
-/// lexical high water. NULL creation metadata is the existing legacy case.
-/// The scalar sequence seek reads one index endpoint, not the event history.
-const DELIVERY_TURN_SQL: &str = r#"SELECT d.delivered_turn_id AS turn_id,
-    (SELECT e.sequence FROM turn_event e WHERE e.turn_id=t.id
-     ORDER BY e.sequence DESC LIMIT 1) AS event_high_water
-FROM task_delivery d INDEXED BY compaction_delivery_turn
-CROSS JOIN turn t ON t.id=d.delivered_turn_id AND t.thread_id=d.target_thread_id
-CROSS JOIN thread h ON h.id=t.thread_id AND h.workspace_id=d.workspace_id
-LEFT JOIN compaction_turn_creation ct ON ct.turn_id=t.id
-WHERE d.workspace_id=? AND d.target_thread_id=? AND d.delivered_turn_id>?
-  AND d.delivered_turn_id<=? AND (ct.sequence IS NULL OR ct.sequence<=?)
-  AND d.status='delivered'
-ORDER BY d.delivered_turn_id LIMIT 1"#;
-
-/// Capture eligibility is checked BEFORE LIMIT: late events cannot fill a
-/// page or alter its continuation. The fixed per-Turn upper seek bound also
-/// prevents a continuing append from extending the SQL's inspected tail.
-/// CROSS JOIN keeps revisions as point lookups from scoped canonical events.
-const DELIVERY_EVENT_QUANTUM_SQL: &str = r#"
-WITH quantum AS MATERIALIZED (
-    SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
-           r.revision AS selected_revision,r.capture_order AS selected_order
-    FROM turn t CROSS JOIN thread h ON h.id=t.thread_id
-    CROSS JOIN turn_event e ON e.turn_id=t.id AND e.thread_id=t.thread_id
-    CROSS JOIN compaction_event_revision r ON r.source_id=e.id
-    WHERE t.id=? AND t.thread_id=? AND h.workspace_id=? AND e.sequence>?
-      AND e.sequence<=? AND r.turn_id=e.turn_id AND r.present=1
-      AND r.capture_order<=?
-    ORDER BY e.sequence LIMIT 127
-)
-"#;
-
-/// A refreshed page is resolved by exact source keys and expected revisions.
-/// No Turn/event pagination predicate is reused here. Any edit, deletion,
-/// sequence/scope change, or replacement removes a row and fails validation.
-const DELIVERY_RECHECK_QUANTUM_SQL: &str = r#"
-WITH quantum AS MATERIALIZED (
-    SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
-           r.revision AS selected_revision,r.capture_order AS selected_order
-    FROM json_each(?) w
-    CROSS JOIN turn_event e ON e.id=json_extract(w.value,'$.source.id')
-    CROSS JOIN turn t ON t.id=e.turn_id AND t.thread_id=e.thread_id
-    CROSS JOIN thread h ON h.id=t.thread_id
-    CROSS JOIN compaction_event_revision r ON r.source_id=e.id
-    WHERE h.workspace_id=? AND t.thread_id=? AND r.turn_id=e.turn_id
-      AND 'event:'||e.turn_id=json_extract(w.value,'$.source.scope')
-      AND 'event-revision:'||r.revision=json_extract(w.value,'$.source.version')
-      AND e.sequence=json_extract(w.value,'$.sequence')
-      AND r.capture_order=json_extract(w.value,'$.capture_order')
-      AND r.present=1 AND r.capture_order<=?
-)
-"#;
-
-const DELIVERY_BINDINGS_SQL: &str = r#"
-SELECT q.id AS event_id,q.turn_id AS event_turn,q.sequence,q.event_type,
-       r.revision,r.capture_order,r.projection_revision,
-       d.id AS delivery_id,b.candidate_id,b.task_run_turn_id,
-       s.source_thread,s.source_turn,c.id AS bound_candidate
-FROM quantum q
-CROSS JOIN compaction_event_revision r ON r.source_id=q.id
-    AND r.turn_id=q.turn_id AND r.revision=q.selected_revision
-    AND r.capture_order=q.selected_order AND r.present=1
-LEFT JOIN task_delivery d
-    ON d.id=substr(r.item_id,length(?)+1) AND r.item_id=(? || d.id)
-   AND q.event_type=? AND r.projection_revision=r.revision
-   AND d.workspace_id=? AND d.target_thread_id=q.thread_id
-   AND d.delivered_turn_id=q.turn_id AND d.status='delivered'
-LEFT JOIN compaction_delivery_output b ON b.delivery_id=d.id
-LEFT JOIN compaction_task_output s
-    ON s.task_run_turn_id=b.task_run_turn_id AND s.task_id=d.task_id
-   AND s.run_id=d.run_id AND s.workspace_id=d.workspace_id
-LEFT JOIN task_result_candidate c
-    ON c.id=b.candidate_id AND c.task_run_turn_id=s.task_run_turn_id
-   AND c.task_id=s.task_id AND c.run_id=s.run_id
-   AND c.thread_id=s.source_thread AND c.turn_id=s.source_turn
-ORDER BY q.sequence
-"#;
-
-fn delivery_binding_values(workspace: &str) -> [sea_orm::Value; 4] {
-    [
-        pioneer_protocol::task_delivery_result_item_id("").into(),
-        pioneer_protocol::task_delivery_result_item_id("").into(),
-        pioneer_protocol::constants::events::ITEM_COMPLETED.into(),
-        workspace.into(),
-    ]
-}
-
 pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
@@ -938,26 +850,16 @@ pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
     let (selected_turn, high_water) = if let Some(turn) = &cursor.active_turn {
         (turn.clone(), cursor.event_high_water)
     } else {
-        let mut turn_sql = DELIVERY_TURN_SQL.to_owned();
-        let mut values = vec![
-            workspace.into(),
-            thread.into(),
-            cursor.after_turn.clone().into(),
-            fence.turn_id.clone().into(),
-            fence.turn_order.into(),
-        ];
-        if let Some(before) = fence.before {
-            let timestamp =
-                super::compaction_history::HISTORY_WHOLE_SECOND_SQL.replace("?", "t.created_at");
-            turn_sql = turn_sql.replace(
-                "  AND d.status=",
-                &format!("  AND {timestamp}<? AND d.status="),
-            );
-            values.push(before.timestamp().into());
-        }
-        let row = DeliveryTurnRow::find_by_statement(sqlite_specific_sql(&turn_sql, values))
-            .one(db)
-            .await?;
+        let row = delivery_sources::next_delivery_turn(
+            db,
+            workspace,
+            thread,
+            &cursor.after_turn,
+            &fence.turn_id,
+            fence.turn_order,
+            fence.before.map(|before| before.timestamp()),
+        )
+        .await?;
         let Some(row) = row else {
             page.done = true;
             return Ok(page);
@@ -972,36 +874,19 @@ pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
         };
         return Ok(page);
     };
-    let mut quantum = if cursor.after_sequence.is_some() {
-        DELIVERY_EVENT_QUANTUM_SQL.to_owned()
-    } else {
-        DELIVERY_EVENT_QUANTUM_SQL.replace(" AND e.sequence>?", "")
-    };
-    if fence.before.is_some() {
-        let timestamp =
-            super::compaction_history::HISTORY_WHOLE_SECOND_SQL.replace("?", "e.created_at");
-        quantum = quantum.replace(
-            "AND r.capture_order<=?",
-            &format!("AND r.capture_order<=? AND {timestamp}<?"),
-        );
-    }
-    let sql = quantum + DELIVERY_BINDINGS_SQL;
-    let mut values = vec![
-        selected_turn.clone().into(),
-        thread.into(),
-        workspace.into(),
-    ];
-    if let Some(sequence) = cursor.after_sequence {
-        values.push(sequence.into());
-    }
-    values.extend([high_water.into(), fence.event_order.into()]);
-    if let Some(before) = fence.before {
-        values.push(before.timestamp().into());
-    }
-    values.extend(delivery_binding_values(workspace));
-    let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(&sql, values))
-        .all(db)
-        .await?;
+    let rows = delivery_sources::delivery_events(
+        db,
+        &selected_turn,
+        thread,
+        workspace,
+        cursor.after_sequence,
+        high_water,
+        fence.event_order,
+        fence.before.map(|before| before.timestamp()),
+        &pioneer_protocol::task_delivery_result_item_id(""),
+        pioneer_protocol::constants::events::ITEM_COMPLETED,
+    )
+    .await?;
     // all() releases DB capacity before transforming or retaining metadata.
     page.next_cursor = if rows.len() == DELIVERED_OUTPUT_EVENT_ROWS {
         DeliveredTaskOutputCursor {
@@ -1037,17 +922,16 @@ pub(crate) async fn compaction_recheck_delivered_output_page<C: ConnectionTrait>
         selected.len() <= SOURCE_PAGE_BYTES,
         "delivery refresh exceeds metadata byte budget"
     );
-    let sql = DELIVERY_RECHECK_QUANTUM_SQL.to_owned() + DELIVERY_BINDINGS_SQL;
-    let mut values = vec![
-        selected.into(),
-        workspace.into(),
-        thread.into(),
-        fence.event_order.into(),
-    ];
-    values.extend(delivery_binding_values(workspace));
-    let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(&sql, values))
-        .all(db)
-        .await?;
+    let rows = delivery_sources::recheck_delivery_events(
+        db,
+        &selected,
+        workspace,
+        thread,
+        fence.event_order,
+        &pioneer_protocol::task_delivery_result_item_id(""),
+        pioneer_protocol::constants::events::ITEM_COMPLETED,
+    )
+    .await?;
     let mut refreshed = DeliveredTaskOutputPage {
         entries: Vec::new(),
         unprojected_events: Vec::new(),
@@ -1139,26 +1023,3 @@ struct TaskOutputRow {
 }
 
 use sea_orm::QueryTrait;
-
-#[derive(sea_orm::FromQueryResult)]
-struct DeliveryTurnRow {
-    turn_id: String,
-    event_high_water: Option<i64>,
-}
-
-#[derive(sea_orm::FromQueryResult)]
-struct DeliveredOutputRow {
-    event_id: String,
-    event_turn: String,
-    sequence: i64,
-    event_type: String,
-    revision: i64,
-    capture_order: i64,
-    projection_revision: Option<i64>,
-    delivery_id: Option<String>,
-    candidate_id: Option<String>,
-    task_run_turn_id: Option<String>,
-    source_thread: Option<String>,
-    source_turn: Option<String>,
-    bound_candidate: Option<String>,
-}

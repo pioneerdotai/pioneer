@@ -18,7 +18,7 @@ use pioneer_crud::{
 use pioneer_protocol::{ProviderFailureClass, SKILL_ID_LEN, SkillId, generate_id};
 use pioneer_provider::ProviderRegistry;
 use pioneer_skills::AgentSkillRuntimeEntry;
-use pioneer_sqlite::is_anyhow_sqlite_lock;
+use pioneer_sqlite::is_retryable_database_conflict;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -706,18 +706,6 @@ impl SelfImprovementSupervisor {
     }
 
     async fn process_workspace(&self, workspace_id: &str, now_unix: i64) -> Result<()> {
-        // At most 1,024 historical completion events per wake; the existing daily worker
-        // gradually discovers old history without a new job system or user-facing action.
-        for _ in 0..32 {
-            if self
-                .maintenance_store
-                .backfill_self_improvement_history(workspace_id)
-                .await?
-                == 0
-            {
-                break;
-            }
-        }
         self.maintenance_store
             .reconcile_self_improvement_history_cursor(workspace_id)
             .await?;
@@ -1648,7 +1636,7 @@ fn classify_execution_failure(error: &anyhow::Error) -> RunExecutionFailure {
     {
         return *failure;
     }
-    if is_anyhow_sqlite_lock(error) {
+    if is_retryable_database_conflict(error) {
         return RunExecutionFailure {
             disposition: RunFailureDisposition::RetryInfrastructure,
             error_class: "sqlite_busy",
@@ -1756,7 +1744,6 @@ mod tests {
     use anyhow::{Result as AnyhowResult, bail};
     use async_trait::async_trait;
     use futures_util::{StreamExt, stream::BoxStream};
-    use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
         AgentManager, SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig, ToolLoopConfig,
@@ -1778,7 +1765,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
 
@@ -2158,21 +2145,22 @@ mod tests {
         }
     }
 
-    async fn test_store() -> (
+    async fn test_store(
+        fixture: &pioneer_postgres_test::TestDatabase,
+    ) -> (
         sea_orm::DatabaseConnection,
         Arc<CrudStore>,
         Arc<WorkspaceManager>,
     ) {
-        let database = Database::connect("sqlite::memory:")
+        let database = fixture.connection().clone();
+        database
+            .execute_unprepared("DELETE FROM workspace")
             .await
-            .expect("in-memory SQLite must open");
-        Migrator::up(&database, None)
-            .await
-            .expect("migrations must apply");
+            .unwrap();
         database
             .execute_unprepared(
                 "INSERT INTO workspace (id, name, is_active, is_current) VALUES \
-                 ('ws_self_improvement_e2e', 'Self improvement E2E', 1, 1)",
+                 ('ws_self_improvement_e2e', 'Self improvement E2E', TRUE, TRUE)",
             )
             .await
             .expect("workspace fixture must insert");
@@ -2309,98 +2297,103 @@ mod tests {
 
     #[tokio::test]
     async fn frozen_range_keeps_exact_terminal_boundary_per_thread() {
-        let (_database, store, _workspace_manager) = test_store().await;
-        let state = store
-            .activate_self_improvement_workspace(WORKSPACE, ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_boundary_a",
-            "turn_boundary_a_one",
-            FIRST_TEXT,
-            ENABLED_AT + 1,
-        )
-        .await;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_boundary_b",
-            "turn_boundary_b",
-            SECOND_TEXT,
-            ENABLED_AT + 2,
-        )
-        .await;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_boundary_a",
-            "turn_boundary_a_two",
-            SECOND_TEXT,
-            ENABLED_AT + 3,
-        )
-        .await;
-        let anchors = store
-            .list_self_improvement_source_turns_after(
-                WORKSPACE,
-                state.cursor_source_id,
-                state.effective_enabled_at_unix.unwrap(),
-                MAX_NEW_SOURCE_TURNS_PER_RUN,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, _workspace_manager) = test_store(fixture).await;
+            let state = store
+                .activate_self_improvement_workspace(WORKSPACE, ENABLED_AT)
+                .await
+                .expect("workspace must activate");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_boundary_a",
+                "turn_boundary_a_one",
+                FIRST_TEXT,
+                ENABLED_AT + 1,
             )
-            .await
-            .expect("source anchors must load");
-        let run = store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: WORKSPACE.to_owned(),
-                    activation_epoch: state.activation_epoch,
-                    scheduled_date_utc: "2030-03-19".to_owned(),
-                    source_lower_exclusive: state.cursor_source_id,
-                    source_upper_inclusive: anchors.last().unwrap().id,
-                    learner_provider: "learning".to_owned(),
-                    learner_model: "learner".to_owned(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "learning".to_owned(),
-                    reviewer_model: "reviewer".to_owned(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
-                },
-                ENABLED_AT + 4,
+            .await;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_boundary_b",
+                "turn_boundary_b",
+                SECOND_TEXT,
+                ENABLED_AT + 2,
             )
-            .await
-            .expect("run must freeze the selected range");
-        let frozen = SelfImprovementFrozenSourceRange::new(
-            run.workspace_id.clone(),
-            run.source_lower_exclusive,
-            run.source_upper_inclusive,
-            anchors.clone(),
-        )
-        .expect("range must validate");
+            .await;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_boundary_a",
+                "turn_boundary_a_two",
+                SECOND_TEXT,
+                ENABLED_AT + 3,
+            )
+            .await;
+            let anchors = store
+                .list_self_improvement_source_turns_after(
+                    WORKSPACE,
+                    state.cursor_source_id,
+                    state.effective_enabled_at_unix.unwrap(),
+                    MAX_NEW_SOURCE_TURNS_PER_RUN,
+                )
+                .await
+                .expect("source anchors must load");
+            let run = store
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: WORKSPACE.to_owned(),
+                        activation_epoch: state.activation_epoch,
+                        scheduled_date_utc: "2030-03-19".to_owned(),
+                        source_lower_exclusive: state.cursor_source_id,
+                        source_upper_inclusive: anchors.last().unwrap().id,
+                        learner_provider: "learning".to_owned(),
+                        learner_model: "learner".to_owned(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "learning".to_owned(),
+                        reviewer_model: "reviewer".to_owned(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
+                    },
+                    ENABLED_AT + 4,
+                )
+                .await
+                .expect("run must freeze the selected range");
+            let frozen = SelfImprovementFrozenSourceRange::new(
+                run.workspace_id.clone(),
+                run.source_lower_exclusive,
+                run.source_upper_inclusive,
+                anchors.clone(),
+            )
+            .expect("range must validate");
 
-        assert_eq!(frozen.anchors, anchors);
-        assert_eq!(frozen.source_lower_exclusive, state.cursor_source_id);
-        assert_eq!(frozen.source_upper_inclusive, run.source_upper_inclusive);
-        assert_eq!(
-            frozen
-                .thread_terminal_boundaries
-                .iter()
-                .map(|boundary| (
-                    boundary.thread_id.as_str(),
-                    boundary.turn_id.as_str(),
-                    boundary.terminal_event_id.as_str(),
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "thread_boundary_a",
-                    "turn_boundary_a_two",
-                    anchors[2].terminal_event_id.as_str(),
-                ),
-                (
-                    "thread_boundary_b",
-                    "turn_boundary_b",
-                    anchors[1].terminal_event_id.as_str(),
-                ),
-            ]
-        );
+            assert_eq!(frozen.anchors, anchors);
+            assert_eq!(frozen.source_lower_exclusive, state.cursor_source_id);
+            assert_eq!(frozen.source_upper_inclusive, run.source_upper_inclusive);
+            assert_eq!(
+                frozen
+                    .thread_terminal_boundaries
+                    .iter()
+                    .map(|boundary| (
+                        boundary.thread_id.as_str(),
+                        boundary.turn_id.as_str(),
+                        boundary.terminal_event_id.as_str(),
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        "thread_boundary_a",
+                        "turn_boundary_a_two",
+                        anchors[2].terminal_event_id.as_str(),
+                    ),
+                    (
+                        "thread_boundary_b",
+                        "turn_boundary_b",
+                        anchors[1].terminal_event_id.as_str(),
+                    ),
+                ]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn agent_tool_loop_config() -> ToolLoopConfig {
@@ -2772,1591 +2765,416 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_start_and_shutdown_own_exactly_one_joined_task() {
-        let (_database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = Arc::new(test_supervisor(
-            store,
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig::default(),
-            1024 * 1024,
-        ));
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
+            let supervisor = Arc::new(test_supervisor(
+                store,
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig::default(),
+                1024 * 1024,
+            ));
 
-        supervisor
-            .start()
-            .await
-            .expect("owned supervisor task must start");
-        assert!(supervisor.task.lock().await.is_some());
-        assert!(
-            supervisor.start().await.is_err(),
-            "a second owned task must be rejected"
-        );
-        timeout(Duration::from_secs(2), supervisor.shutdown())
-            .await
-            .expect("shutdown must join the owned task");
-        assert!(supervisor.task.lock().await.is_none());
-        assert!(supervisor.cancellation.is_cancelled());
-        supervisor.shutdown().await;
+            supervisor
+                .start()
+                .await
+                .expect("owned supervisor task must start");
+            assert!(supervisor.task.lock().await.is_some());
+            assert!(
+                supervisor.start().await.is_err(),
+                "a second owned task must be rejected"
+            );
+            timeout(Duration::from_secs(2), supervisor.shutdown())
+                .await
+                .expect("shutdown must join the owned task");
+            assert!(supervisor.task.lock().await.is_none());
+            assert!(supervisor.cancellation.is_cancelled());
+            supervisor.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn production_walking_skeleton_reaches_native_prompt_and_exact_read_skill() {
-        let (database, store, workspace_manager) = test_store().await;
-        let learning_provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            learning_provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry.clone(),
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner-model".to_owned(),
-                    reasoning_effort: Some("high".to_owned()),
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let learning_provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                learning_provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry.clone(),
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner-model".to_owned(),
+                        reasoning_effort: Some("high".to_owned()),
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
 
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("enabled setting must establish the source baseline");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_source_one",
-            "turn_source_one",
-            FIRST_TEXT,
-            ENABLED_AT + 1,
-        )
-        .await;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_source_two",
-            "turn_source_two",
-            SECOND_TEXT,
-            ENABLED_AT + 2,
-        )
-        .await;
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("enabled setting must establish the source baseline");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_source_one",
+                "turn_source_one",
+                FIRST_TEXT,
+                ENABLED_AT + 1,
+            )
+            .await;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_source_two",
+                "turn_source_two",
+                SECOND_TEXT,
+                ENABLED_AT + 2,
+            )
+            .await;
 
-        let sources = store
-            .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
-            .await
-            .expect("projected source range must load");
-        assert_eq!(sources.len(), 2);
-        let frozen_range = SelfImprovementFrozenSourceRange::new(
-            WORKSPACE,
-            0,
-            sources.last().unwrap().id,
-            sources.clone(),
-        )
-        .expect("source range must freeze");
-        let canonical = store
-            .list_canonical_turn_events_for_self_improvement(&frozen_range)
-            .await
-            .expect("canonical source history must load");
-        let first_event_id = canonical
-            .iter()
-            .find(|record| record.turn_id == "turn_source_one")
-            .expect("first turn event must exist")
-            .event_id
-            .clone();
-        let second_event_id = canonical
-            .iter()
-            .find(|record| record.turn_id == "turn_source_two")
-            .expect("second turn event must exist")
-            .event_id
-            .clone();
-        learning_provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": [{
-                    "observationKey": "verify-checksum",
-                    "summary": "Successful releases verify their artifact checksum.",
-                    "evidence": [
-                        {
-                            "turnId": "turn_source_one",
-                            "eventId": first_event_id,
-                            "excerpt": "Always verify the checksum"
-                        },
-                        {
-                            "turnId": "turn_source_two",
-                            "eventId": second_event_id,
-                            "excerpt": "Always verify the checksum"
+            let sources = store
+                .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
+                .await
+                .expect("projected source range must load");
+            assert_eq!(sources.len(), 2);
+            let frozen_range = SelfImprovementFrozenSourceRange::new(
+                WORKSPACE,
+                0,
+                sources.last().unwrap().id,
+                sources.clone(),
+            )
+            .expect("source range must freeze");
+            let canonical = store
+                .list_canonical_turn_events_for_self_improvement(&frozen_range)
+                .await
+                .expect("canonical source history must load");
+            let first_event_id = canonical
+                .iter()
+                .find(|record| record.turn_id == "turn_source_one")
+                .expect("first turn event must exist")
+                .event_id
+                .clone();
+            let second_event_id = canonical
+                .iter()
+                .find(|record| record.turn_id == "turn_source_two")
+                .expect("second turn event must exist")
+                .event_id
+                .clone();
+            learning_provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": [{
+                        "observationKey": "verify-checksum",
+                        "summary": "Successful releases verify their artifact checksum.",
+                        "evidence": [
+                            {
+                                "turnId": "turn_source_one",
+                                "eventId": first_event_id,
+                                "excerpt": "Always verify the checksum"
+                            },
+                            {
+                                "turnId": "turn_source_two",
+                                "eventId": second_event_id,
+                                "excerpt": "Always verify the checksum"
+                            }
+                        ],
+                        "kind": "success_pattern"
+                    }]
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidate": {
+                        "action": "create",
+                        "candidateKey": "verify-checksum-before-publish",
+                        "observationKeys": ["verify-checksum"],
+                        "name": "Verify release checksum",
+                        "slug": "verify-release-checksum",
+                        "whenToUse": "Publishing a release build",
+                        "whenNotToUse": "No build artifact is being published",
+                        "instructions": SKILL_BODY
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidateKey": "candidate-1feca80ff4895b7c3aa4adda2212300c4b88adbe0de96686ab4569c9500b9bd1",
+                    "decision": "accept",
+                    "reasonCodes": []
+                })
+                .to_string(),
+            ]);
+
+            supervisor
+                .wake_once(ENABLED_AT + 10)
+                .await
+                .expect("production supervisor wake must complete");
+            supervisor
+                .wake_once(ENABLED_AT + 11)
+                .await
+                .expect("a repeated same-day wake must be idempotent");
+
+            let learning_requests = learning_provider.requests();
+            assert_eq!(learning_requests.len(), 3, "exactly three typed calls");
+            for request in &learning_requests {
+                let input = request
+                    .messages
+                    .iter()
+                    .find(|message| message.role == Role::User)
+                    .expect("typed call must contain its untrusted data message");
+                assert!(input.content.contains("turn_source_one"));
+                assert!(input.content.contains("turn_source_two"));
+            }
+            let state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("state query must succeed")
+                .expect("state must exist");
+            assert_eq!(state.cursor_source_id, sources[1].id);
+            let run_row = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT status, learner_provider, learner_model, reviewer_provider, \
+                     reviewer_model FROM self_improvement_run"
+                        .to_owned(),
+                ))
+                .await
+                .expect("run status query must execute")
+                .expect("one run must exist");
+            let run_status = run_row
+                .try_get::<String>("", "status")
+                .expect("run status must decode");
+            assert_eq!(run_status, "completed");
+            assert_eq!(
+                run_row
+                    .try_get::<String>("", "learner_provider")
+                    .expect("frozen learner provider must decode"),
+                "learning"
+            );
+            assert_eq!(
+                run_row
+                    .try_get::<String>("", "learner_model")
+                    .expect("frozen learner model must decode"),
+                "learner-model"
+            );
+            assert_eq!(
+                run_row
+                    .try_get::<String>("", "reviewer_provider")
+                    .expect("frozen reviewer provider must decode"),
+                "learning"
+            );
+            assert_eq!(
+                run_row
+                    .try_get::<String>("", "reviewer_model")
+                    .expect("frozen reviewer model must decode"),
+                "learner-model"
+            );
+            let run_count = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                ))
+                .await
+                .expect("run count query must execute")
+                .expect("run count must exist")
+                .try_get::<i64>("", "value")
+                .expect("run count must decode");
+            assert_eq!(run_count, 1, "repeated wakes must reuse one logical row");
+
+            assert!(
+                learning_provider
+                    .requests()
+                    .iter()
+                    .all(|request| request.model == "learner-model"
+                        && request.temperature.is_none()
+                        && request.max_tokens.is_none()
+                        && request.reasoning
+                            == Some(pioneer_provider::ReasoningConfig::effort(
+                                pioneer_protocol::ReasoningEffort::High
+                            )))
+            );
+            let active = store
+                .list_active_agent_skill_versions(WORKSPACE)
+                .await
+                .expect("active skill must load");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].version.instruction_body, SKILL_BODY);
+            assert_eq!(
+                active[0].version.source_turn_ids,
+                vec!["turn_source_one", "turn_source_two"]
+            );
+            let overlay = load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
+                .await
+                .expect("production overlay must load");
+            assert_eq!(overlay.len(), 1);
+            let skill_id = overlay[0].skill_id.clone();
+            let version_id = overlay[0].version_id.clone();
+
+            let native_provider = Arc::new(NativeReadSkillProvider::new(skill_id.clone()));
+            registry
+                .insert("native", native_provider.clone())
+                .expect("native provider should fit the bounded test registry");
+            let manager = AgentManager::new(registry, agent_tool_loop_config());
+            manager
+                .ensure_thread("thread_native", WORKSPACE)
+                .await
+                .expect("native thread must initialize");
+            let mut events = manager
+                .take_durable_receiver("thread_native")
+                .await
+                .expect("native durable receiver must exist");
+            manager
+                .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+                    "thread_native",
+                    "turn_native",
+                    ThreadMode::Agent,
+                    "native-model",
+                    "native",
+                    HashMap::new(),
+                    SkillCatalogSnapshot {
+                        version: 0,
+                        generated_at_unix: ENABLED_AT + 11,
+                        skills: Vec::new(),
+                    },
+                    overlay,
+                    vec![UserInput::Text {
+                        text: "Apply the learned release procedure.".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    Vec::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                    Vec::new(),
+                    None,
+                    default_turn_permission_profile_snapshot(),
+                    TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                        "/workspace",
+                        (ENABLED_AT + 11) * 1000,
+                    ),
+                    None,
+                )
+                .await
+                .expect("native Agent turn must start");
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let Some(event) = events.recv().await else {
+                        panic!("native durable event lane closed");
+                    };
+                    events.acknowledge_last(Ok(()));
+                    match event {
+                        AgentDurableEvent::TurnCompleted { .. } => return,
+                        AgentDurableEvent::TurnFailed { error, .. } => {
+                            panic!("native Agent turn failed: {error}")
                         }
-                    ],
-                    "kind": "success_pattern"
-                }]
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidate": {
-                    "action": "create",
-                    "candidateKey": "verify-checksum-before-publish",
-                    "observationKeys": ["verify-checksum"],
-                    "name": "Verify release checksum",
-                    "slug": "verify-release-checksum",
-                    "whenToUse": "Publishing a release build",
-                    "whenNotToUse": "No build artifact is being published",
-                    "instructions": SKILL_BODY
+                        _ => {}
+                    }
                 }
             })
-            .to_string(),
-            serde_json::json!({
-                "candidateKey": "candidate-1feca80ff4895b7c3aa4adda2212300c4b88adbe0de96686ab4569c9500b9bd1",
-                "decision": "accept",
-                "reasonCodes": []
-            })
-            .to_string(),
-        ]);
-
-        supervisor
-            .wake_once(ENABLED_AT + 10)
             .await
-            .expect("production supervisor wake must complete");
-        supervisor
-            .wake_once(ENABLED_AT + 11)
-            .await
-            .expect("a repeated same-day wake must be idempotent");
+            .expect("native Agent turn must terminate");
 
-        let learning_requests = learning_provider.requests();
-        assert_eq!(learning_requests.len(), 3, "exactly three typed calls");
-        for request in &learning_requests {
-            let input = request
+            let native_requests = native_provider
+                .requests()
+                .into_iter()
+                .filter(|request| request.compiled_prompt.is_some())
+                .collect::<Vec<_>>();
+            assert!(native_requests.len() >= 2);
+            let first = &native_requests[0];
+            assert!(
+                first.compiled_prompt.is_some(),
+                "native request must use production prompt compiler"
+            );
+            let prepared_input = first
                 .messages
                 .iter()
-                .find(|message| message.role == Role::User)
-                .expect("typed call must contain its untrusted data message");
-            assert!(input.content.contains("turn_source_one"));
-            assert!(input.content.contains("turn_source_two"));
-        }
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("state query must succeed")
-            .expect("state must exist");
-        assert_eq!(state.cursor_source_id, sources[1].id);
-        let run_row = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT status, learner_provider, learner_model, reviewer_provider, \
-                 reviewer_model FROM self_improvement_run"
-                    .to_owned(),
-            ))
-            .await
-            .expect("run status query must execute")
-            .expect("one run must exist");
-        let run_status = run_row
-            .try_get::<String>("", "status")
-            .expect("run status must decode");
-        assert_eq!(run_status, "completed");
-        assert_eq!(
-            run_row
-                .try_get::<String>("", "learner_provider")
-                .expect("frozen learner provider must decode"),
-            "learning"
-        );
-        assert_eq!(
-            run_row
-                .try_get::<String>("", "learner_model")
-                .expect("frozen learner model must decode"),
-            "learner-model"
-        );
-        assert_eq!(
-            run_row
-                .try_get::<String>("", "reviewer_provider")
-                .expect("frozen reviewer provider must decode"),
-            "learning"
-        );
-        assert_eq!(
-            run_row
-                .try_get::<String>("", "reviewer_model")
-                .expect("frozen reviewer model must decode"),
-            "learner-model"
-        );
-        let run_count = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
-            ))
-            .await
-            .expect("run count query must execute")
-            .expect("run count must exist")
-            .try_get::<i64>("", "value")
-            .expect("run count must decode");
-        assert_eq!(run_count, 1, "repeated wakes must reuse one logical row");
-
-        assert!(
-            learning_provider
-                .requests()
-                .iter()
-                .all(|request| request.model == "learner-model"
-                    && request.temperature.is_none()
-                    && request.max_tokens.is_none()
-                    && request.reasoning
-                        == Some(pioneer_provider::ReasoningConfig::effort(
-                            pioneer_protocol::ReasoningEffort::High
-                        )))
-        );
-        let active = store
-            .list_active_agent_skill_versions(WORKSPACE)
-            .await
-            .expect("active skill must load");
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].version.instruction_body, SKILL_BODY);
-        assert_eq!(
-            active[0].version.source_turn_ids,
-            vec!["turn_source_one", "turn_source_two"]
-        );
-        let overlay = load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
-            .await
-            .expect("production overlay must load");
-        assert_eq!(overlay.len(), 1);
-        let skill_id = overlay[0].skill_id.clone();
-        let version_id = overlay[0].version_id.clone();
-
-        let native_provider = Arc::new(NativeReadSkillProvider::new(skill_id.clone()));
-        registry
-            .insert("native", native_provider.clone())
-            .expect("native provider should fit the bounded test registry");
-        let manager = AgentManager::new(registry, agent_tool_loop_config());
-        manager
-            .ensure_thread("thread_native", WORKSPACE)
-            .await
-            .expect("native thread must initialize");
-        let mut events = manager
-            .take_durable_receiver("thread_native")
-            .await
-            .expect("native durable receiver must exist");
-        manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
-                "thread_native",
-                "turn_native",
-                ThreadMode::Agent,
-                "native-model",
-                "native",
-                HashMap::new(),
-                SkillCatalogSnapshot {
-                    version: 0,
-                    generated_at_unix: ENABLED_AT + 11,
-                    skills: Vec::new(),
-                },
-                overlay,
-                vec![UserInput::Text {
-                    text: "Apply the learned release procedure.".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-                Vec::new(),
-                Vec::new(),
-                HashMap::new(),
-                Vec::new(),
-                None,
-                default_turn_permission_profile_snapshot(),
-                TurnExecutionSecuritySnapshot::unrestricted_full_access(
-                    "/workspace",
-                    (ENABLED_AT + 11) * 1000,
-                ),
-                None,
-            )
-            .await
-            .expect("native Agent turn must start");
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let Some(event) = events.recv().await else {
-                    panic!("native durable event lane closed");
-                };
-                events.acknowledge_last(Ok(()));
-                match event {
-                    AgentDurableEvent::TurnCompleted { .. } => return,
-                    AgentDurableEvent::TurnFailed { error, .. } => {
-                        panic!("native Agent turn failed: {error}")
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("native Agent turn must terminate");
-
-        let native_requests = native_provider
-            .requests()
-            .into_iter()
-            .filter(|request| request.compiled_prompt.is_some())
-            .collect::<Vec<_>>();
-        assert!(native_requests.len() >= 2);
-        let first = &native_requests[0];
-        assert!(
-            first.compiled_prompt.is_some(),
-            "native request must use production prompt compiler"
-        );
-        let prepared_input = first
-            .messages
-            .iter()
-            .find(|message| {
-                message
-                    .application_context
+                .find(|message| {
+                    message
+                        .application_context
+                        .as_ref()
+                        .is_some_and(|metadata| metadata["kind"] == "turn_input")
+                })
+                .expect("native request must carry prepared turn input");
+            assert!(
+                prepared_input
+                    .content
+                    .contains(&format!("skill:{skill_id}"))
+            );
+            assert!(prepared_input.content.contains(version_id.as_str()));
+            assert!(prepared_input.content.contains("Verify release checksum"));
+            assert!(
+                first
+                    .tools
                     .as_ref()
-                    .is_some_and(|metadata| metadata["kind"] == "turn_input")
-            })
-            .expect("native request must carry prepared turn input");
-        assert!(
-            prepared_input
-                .content
-                .contains(&format!("skill:{skill_id}"))
-        );
-        assert!(prepared_input.content.contains(version_id.as_str()));
-        assert!(prepared_input.content.contains("Verify release checksum"));
-        assert!(
-            first
-                .tools
-                .as_ref()
-                .is_some_and(|tools| tools.iter().any(|tool| tool.name == "read_skill"))
-        );
-        let read_result = native_requests[1]
-            .messages
-            .iter()
-            .find(|message| {
-                message.role == Role::Tool && message.name.as_deref() == Some("read_skill")
-            })
-            .expect("second native request must contain real read_skill output");
-        assert!(read_result.content.contains(SKILL_BODY));
-        assert!(read_result.content.contains(version_id.as_str()));
-        assert!(
-            read_result
-                .content
-                .contains(&format!("\"skill_id\":\"{skill_id}\""))
-        );
-        assert!(!read_result.content.contains("skill_asset_root"));
+                    .is_some_and(|tools| tools.iter().any(|tool| tool.name == "read_skill"))
+            );
+            let read_result = native_requests[1]
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == Role::Tool && message.name.as_deref() == Some("read_skill")
+                })
+                .expect("second native request must contain real read_skill output");
+            assert!(read_result.content.contains(SKILL_BODY));
+            assert!(read_result.content.contains(version_id.as_str()));
+            assert!(
+                read_result
+                    .content
+                    .contains(&format!("\"skill_id\":\"{skill_id}\""))
+            );
+            assert!(!read_result.content.contains("skill_asset_root"));
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn production_supervisor_executes_create_update_and_exact_parent_rollback() {
-        async fn range_events(
-            store: &CrudStore,
-            lower: i64,
-            turn_ids: &[&str],
-        ) -> (i64, Vec<String>) {
-            let sources = store
-                .list_self_improvement_source_turns_after(
-                    WORKSPACE,
-                    lower,
-                    ENABLED_AT,
-                    MAX_NEW_SOURCE_TURNS_PER_RUN,
-                )
-                .await
-                .expect("lifecycle source range");
-            let upper = sources.last().expect("lifecycle source").id;
-            let range = SelfImprovementFrozenSourceRange::new(WORKSPACE, lower, upper, sources)
-                .expect("lifecycle frozen range");
-            let canonical = store
-                .list_canonical_turn_events_for_self_improvement(&range)
-                .await
-                .expect("lifecycle canonical history");
-            let event_ids = turn_ids
-                .iter()
-                .map(|turn_id| {
-                    canonical
-                        .iter()
-                        .find(|record| record.turn_id == *turn_id)
-                        .unwrap_or_else(|| panic!("missing canonical event for {turn_id}"))
-                        .event_id
-                        .clone()
-                })
-                .collect();
-            (upper, event_ids)
-        }
-
-        let (_database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace activation");
-
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_lifecycle_create_one",
-            "turn_lifecycle_create_one",
-            "Verify checksum before the first release.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_lifecycle_create_two",
-            "turn_lifecycle_create_two",
-            "Verify checksum before the second release.",
-            ENABLED_AT + 2,
-        )
-        .await;
-        let (create_upper, create_events) = range_events(
-            store.as_ref(),
-            0,
-            &["turn_lifecycle_create_one", "turn_lifecycle_create_two"],
-        )
-        .await;
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": [{
-                    "observationKey": "checksum-procedure",
-                    "summary": "Releases verify checksums.",
-                    "evidence": [
-                        {
-                            "turnId": "turn_lifecycle_create_one",
-                            "eventId": create_events[0],
-                            "excerpt": "Verify checksum"
-                        },
-                        {
-                            "turnId": "turn_lifecycle_create_two",
-                            "eventId": create_events[1],
-                            "excerpt": "Verify checksum"
-                        }
-                    ],
-                    "kind": "success_pattern"
-                }]
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidate": {
-                    "action": "create",
-                    "candidateKey": "checksum-create",
-                    "observationKeys": ["checksum-procedure"],
-                    "name": "Verify checksum",
-                    "slug": "verify-checksum",
-                    "whenToUse": "Publishing a release",
-                    "whenNotToUse": "No artifact is published",
-                    "instructions": "Verify the artifact checksum before publishing."
-                }
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidateKey": "candidate-f493585583e0cfa5700aadd9a60c5cc50f25c37ed62c0067f00b8886a743e967",
-                "decision": "accept",
-                "reasonCodes": []
-            })
-            .to_string(),
-        ]);
-        supervisor
-            .wake_once(ENABLED_AT + 10)
-            .await
-            .expect("production create wake");
-        let created = store
-            .list_active_agent_skill_versions(WORKSPACE)
-            .await
-            .expect("created active skill");
-        assert_eq!(created.len(), 1);
-        let skill_id = created[0].skill_id.clone();
-        let version_one = created[0].version.id.clone();
-
-        let update_day = ENABLED_AT + 24 * 60 * 60;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_lifecycle_update",
-            "turn_lifecycle_update",
-            "Double-check the checksum before publishing.",
-            update_day + 1,
-        )
-        .await;
-        let (update_upper, update_events) =
-            range_events(store.as_ref(), create_upper, &["turn_lifecycle_update"]).await;
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": [{
-                    "observationKey": "checksum-update",
-                    "summary": "The procedure now double-checks the checksum.",
-                    "evidence": [{
-                        "turnId": "turn_lifecycle_update",
-                        "eventId": update_events[0],
-                        "excerpt": "Double-check the checksum"
-                    }],
-                    "kind": "correction"
-                }]
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidate": {
-                    "action": "update",
-                    "candidateKey": "checksum-update",
-                    "targetSkillId": skill_id.to_string(),
-                    "observationKeys": ["checksum-update"],
-                    "name": "Double-check checksum",
-                    "slug": "verify-checksum",
-                    "whenToUse": "Publishing a release",
-                    "whenNotToUse": "No artifact is published",
-                    "instructions": "Calculate and double-check the artifact checksum before publishing."
-                }
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidateKey": "candidate-a693ee600f72ff7d800b648629d3c21d99dfe9f181544a3cc9a5a6c255eb2d62",
-                "decision": "accept",
-                "reasonCodes": []
-            })
-            .to_string(),
-        ]);
-        supervisor
-            .wake_once(update_day + 10)
-            .await
-            .expect("production update wake");
-        let updated = store
-            .list_active_agent_skill_versions(WORKSPACE)
-            .await
-            .expect("updated active skill");
-        assert_eq!(updated.len(), 1);
-        assert_eq!(updated[0].skill_id, skill_id);
-        assert_eq!(
-            updated[0].version.parent_version_id.as_deref(),
-            Some(version_one.as_str())
-        );
-        assert_eq!(updated[0].version.display_name, "Double-check checksum");
-        let version_two = updated[0].version.id.clone();
-
-        let rollback_day = update_day + 24 * 60 * 60;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_lifecycle_rollback",
-            "turn_lifecycle_rollback",
-            "Return to the earlier verified checksum procedure.",
-            rollback_day + 1,
-        )
-        .await;
-        let (_rollback_upper, rollback_events) =
-            range_events(store.as_ref(), update_upper, &["turn_lifecycle_rollback"]).await;
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": [{
-                    "observationKey": "checksum-rollback",
-                    "summary": "The earlier procedure is required again.",
-                    "evidence": [{
-                        "turnId": "turn_lifecycle_rollback",
-                        "eventId": rollback_events[0],
-                        "excerpt": "earlier verified checksum procedure"
-                    }],
-                    "kind": "correction"
-                }]
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidate": {
-                    "action": "rollback",
-                    "candidateKey": "checksum-rollback",
-                    "targetSkillId": skill_id.to_string(),
-                    "targetVersionId": version_one,
-                    "observationKeys": ["checksum-rollback"]
-                }
-            })
-            .to_string(),
-            serde_json::json!({
-                "candidateKey": "candidate-84562f8e4aaa754d15d288d1ad02b3de5de582f61f170440ddc5732c7cda48f1",
-                "decision": "accept",
-                "reasonCodes": []
-            })
-            .to_string(),
-        ]);
-        supervisor
-            .wake_once(rollback_day + 10)
-            .await
-            .expect("production rollback wake");
-        let restored = store
-            .list_active_agent_skill_versions(WORKSPACE)
-            .await
-            .expect("restored active skill");
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].skill_id, skill_id);
-        assert_eq!(
-            restored[0].version.id, created[0].version.id,
-            "rollback must restore the exact immutable parent"
-        );
-        assert_eq!(restored[0].version.display_name, "Verify checksum");
-        assert_eq!(
-            store
-                .get_agent_skill_version(WORKSPACE, version_two.as_str())
-                .await
-                .expect("updated version lookup")
-                .expect("updated version remains historical")
-                .version
-                .id,
-            version_two
-        );
-        assert_eq!(provider.requests().len(), 9);
-    }
-
-    #[tokio::test]
-    async fn bounded_dispatch_starts_other_workspaces_without_detached_workers() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(BlockingLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "blocking-learning",
-            provider.clone(),
-        ));
-        let enabled = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "blocking-learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let mut workspace_ids = vec![WORKSPACE.to_owned()];
-        for index in 1..(MAX_CONCURRENT_WORKSPACES + 2) {
-            let workspace_id = format!("ws_bounded_{index}");
-            let workspace_name = format!("Bounded {index}");
-            let workspace = workspace_manager
-                .create_workspace(workspace_id.as_str(), Some(workspace_name.as_str()))
-                .await
-                .expect("bounded workspace fixture must create");
-            workspace_ids.push(workspace.id);
-        }
-        let workspace_configs = workspace_ids
-            .iter()
-            .map(|workspace_id| (workspace_id.clone(), enabled.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let supervisor = Arc::new(test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager.clone(),
-            workspace_configs,
-            1024 * 1024,
-        ));
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("all bounded workspace fixtures must activate");
-        for (index, workspace_id) in workspace_ids.iter().enumerate() {
-            let thread_id = format!("thread_bounded_{index}");
-            let turn_id = format!("turn_bounded_{index}");
-            project_completed_source_turn_for_workspace(
-                store.as_ref(),
-                workspace_id,
-                thread_id.as_str(),
-                turn_id.as_str(),
-                "A repeated procedure should be considered.",
-                ENABLED_AT + 1,
-            )
-            .await;
-        }
-
-        let wake = {
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
-        };
-        timeout(Duration::from_secs(2), async {
-            while provider.request_count() < MAX_CONCURRENT_WORKSPACES {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("bounded peers must begin while the first provider call is blocked");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            provider.request_count(),
-            MAX_CONCURRENT_WORKSPACES,
-            "the owned stream must not poll more than the configured workspace bound"
-        );
-
-        supervisor
-            .apply_desired_for_workspace(
-                WORKSPACE,
-                GatewaySelfImprovementConfig {
-                    enabled: false,
-                    ..enabled.clone()
-                },
-                ENABLED_AT + 3,
-            )
-            .await
-            .expect("one workspace disable must cancel only its dispatch branch");
-        timeout(Duration::from_secs(2), async {
-            while provider.request_count() == MAX_CONCURRENT_WORKSPACES {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelling one branch must let the next workspace enter the bounded stream");
-        assert_eq!(
-            provider.request_count(),
-            MAX_CONCURRENT_WORKSPACES + 1,
-            "one freed slot must start exactly one queued workspace"
-        );
-        assert!(
-            !wake.is_finished(),
-            "changing one workspace must not cancel peer workspace executions"
-        );
-
-        for workspace_id in workspace_ids.iter().filter(|id| id.as_str() != WORKSPACE) {
-            supervisor
-                .apply_desired_for_workspace(
-                    workspace_id,
-                    GatewaySelfImprovementConfig {
-                        enabled: false,
-                        ..enabled.clone()
-                    },
-                    ENABLED_AT + 3,
-                )
-                .await
-                .expect("workspace disable must cancel its owned dispatch branch");
-        }
-        timeout(Duration::from_secs(2), wake)
-            .await
-            .expect("bounded dispatch must join after cancellation")
-            .expect("bounded dispatch task must join")
-            .expect("bounded dispatch wake must finish");
-        let cancelled_count = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS value FROM self_improvement_run WHERE status = 'cancelled'"
-                    .to_owned(),
-            ))
-            .await
-            .expect("cancelled run count must query")
-            .expect("cancelled run count must exist")
-            .try_get::<i64>("", "value")
-            .expect("cancelled run count must decode");
-        let created = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS total, COUNT(DISTINCT workspace_id) AS workspaces FROM self_improvement_run".to_owned(),
-            ))
-            .await.expect("created runs must query").expect("aggregate must exist");
-        let total = created.try_get::<i64>("", "total").unwrap();
-        assert_eq!(
-            cancelled_count, total,
-            "every created run must be cancelled when its owned branch is joined"
-        );
-        assert_eq!(
-            total,
-            created.try_get::<i64>("", "workspaces").unwrap(),
-            "bounded dispatch must not create duplicate workspace runs"
-        );
-        assert!(
-            (provider.request_count() as i64..=workspace_ids.len() as i64).contains(&total),
-            "every started provider call needs a run; a workspace disabled during discovery may have none"
-        );
-    }
-
-    #[tokio::test]
-    async fn oldest_unresolved_run_blocks_only_its_workspace() {
-        let (database, store, workspace_manager) = test_store().await;
-        let other_workspace = workspace_manager
-            .create_workspace("ws_unblocked_peer", Some("Unblocked peer"))
-            .await
-            .expect("peer workspace must create");
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": []
-            })
-            .to_string(),
-            serde_json::json!({ "candidate": null }).to_string(),
-        ]);
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let enabled = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            BTreeMap::from([
-                (WORKSPACE.to_owned(), enabled.clone()),
-                (other_workspace.id.clone(), enabled),
-            ]),
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("both workspaces must activate");
-        project_completed_source_turn_for_workspace(
-            store.as_ref(),
-            WORKSPACE,
-            "thread_blocked_workspace",
-            "turn_blocked_workspace",
-            "Blocked workspace evidence.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        project_completed_source_turn_for_workspace(
-            store.as_ref(),
-            other_workspace.id.as_str(),
-            "thread_unblocked_workspace",
-            "turn_unblocked_workspace",
-            "Unblocked workspace evidence.",
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let blocked_state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("blocked workspace state must query")
-            .expect("blocked workspace state must exist");
-        let blocked_sources = store
-            .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
-            .await
-            .expect("blocked workspace sources must query");
-        let scheduled_date_utc = DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
-            .expect("fixture timestamp must be valid")
-            .format("%Y-%m-%d")
-            .to_string();
-        let blocked_run = store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: WORKSPACE.to_owned(),
-                    activation_epoch: blocked_state.activation_epoch,
-                    scheduled_date_utc,
-                    source_lower_exclusive: blocked_state.cursor_source_id,
-                    source_upper_inclusive: blocked_sources[0].id,
-                    learner_provider: "learning".to_owned(),
-                    learner_model: "learner".to_owned(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "learning".to_owned(),
-                    reviewer_model: "learner".to_owned(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
-                },
-                ENABLED_AT + 2,
-            )
-            .await
-            .expect("blocked workspace run must freeze");
-        store
-            .claim_available_self_improvement_run(
-                WORKSPACE,
-                blocked_run.id.as_str(),
-                blocked_state.activation_epoch,
-                "other-live-owner",
-                ENABLED_AT + 2,
-                ENABLED_AT + 600,
-            )
-            .await
-            .expect("blocked workspace claim must execute")
-            .expect("blocked workspace claim must win");
-
-        supervisor
-            .wake_once(ENABLED_AT + 3)
-            .await
-            .expect("peer workspace must progress despite the unresolved run");
-        assert_eq!(
-            provider.requests().len(),
-            1,
-            "only the unblocked peer chunk analyzer should run; an empty digest skips synthesis"
-        );
-        let blocked_after = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("blocked state must query")
-            .expect("blocked state must exist");
-        assert_eq!(blocked_after.cursor_source_id, 0);
-        let peer_after = store
-            .get_self_improvement_workspace_state(other_workspace.id.as_str())
-            .await
-            .expect("peer state must query")
-            .expect("peer state must exist");
-        assert!(
-            peer_after.cursor_source_id > 0,
-            "the peer range must complete independently"
-        );
-        let blocked_run_count = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                format!(
-                    "SELECT COUNT(*) AS value FROM self_improvement_run WHERE workspace_id = \
-                     '{WORKSPACE}'"
-                ),
-            ))
-            .await
-            .expect("blocked run count must query")
-            .expect("blocked run count must exist")
-            .try_get::<i64>("", "value")
-            .expect("blocked run count must decode");
-        assert_eq!(
-            blocked_run_count, 1,
-            "the unresolved workspace must not freeze another source range"
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_failure_and_history_remain_isolated_to_one_workspace() {
-        let (_database, store, workspace_manager) = test_store().await;
-        let peer = workspace_manager
-            .create_workspace("ws_provider_peer", Some("Provider peer"))
-            .await
-            .expect("peer workspace must create");
-        let provider = Arc::new(WorkspaceSelectiveLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "workspace-selective-learning",
-            provider.clone(),
-        ));
-        let enabled = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "workspace-selective-learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            BTreeMap::from([
-                (WORKSPACE.to_owned(), enabled.clone()),
-                (peer.id.clone(), enabled),
-            ]),
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("both workspace baselines must reconcile");
-        project_completed_source_turn_for_workspace(
-            store.as_ref(),
-            WORKSPACE,
-            "thread_provider_failure",
-            "turn_provider_failure",
-            "FAIL_WORKSPACE_SENTINEL",
-            ENABLED_AT + 1,
-        )
-        .await;
-        project_completed_source_turn_for_workspace(
-            store.as_ref(),
-            peer.id.as_str(),
-            "thread_provider_peer",
-            "turn_provider_peer",
-            "READY_WORKSPACE_SENTINEL",
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("one workspace failure must not fail the owned wake");
-
-        let failed_state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("failed workspace state must query")
-            .expect("failed workspace state must exist");
-        assert_eq!(
-            failed_state.cursor_source_id, 0,
-            "provider failure must not advance its workspace cursor"
-        );
-        let failed_run = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, failed_state.activation_epoch)
-            .await
-            .expect("failed workspace run must query")
-            .expect("failed workspace run must remain retryable");
-        assert_eq!(failed_run.status, RUN_STATUS_PENDING);
-        assert!(failed_run.next_attempt_at_unix.is_some());
-
-        let peer_state = store
-            .get_self_improvement_workspace_state(peer.id.as_str())
-            .await
-            .expect("peer workspace state must query")
-            .expect("peer workspace state must exist");
-        assert!(
-            peer_state.cursor_source_id > 0,
-            "ready peer must complete independently"
-        );
-        assert!(
-            store
-                .get_oldest_unresolved_self_improvement_run(
-                    peer.id.as_str(),
-                    peer_state.activation_epoch,
-                )
-                .await
-                .expect("peer unresolved run lookup must succeed")
-                .is_none()
-        );
-
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        let failed_payload = requests
-            .iter()
-            .find(|request| {
-                request
-                    .messages
+        pioneer_postgres_test::with_database(async |fixture| {
+            async fn range_events(
+                store: &CrudStore,
+                lower: i64,
+                turn_ids: &[&str],
+            ) -> (i64, Vec<String>) {
+                let sources = store
+                    .list_self_improvement_source_turns_after(
+                        WORKSPACE,
+                        lower,
+                        ENABLED_AT,
+                        MAX_NEW_SOURCE_TURNS_PER_RUN,
+                    )
+                    .await
+                    .expect("lifecycle source range");
+                let upper = sources.last().expect("lifecycle source").id;
+                let range = SelfImprovementFrozenSourceRange::new(WORKSPACE, lower, upper, sources)
+                    .expect("lifecycle frozen range");
+                let canonical = store
+                    .list_canonical_turn_events_for_self_improvement(&range)
+                    .await
+                    .expect("lifecycle canonical history");
+                let event_ids = turn_ids
                     .iter()
-                    .any(|message| message.content.contains("FAIL_WORKSPACE_SENTINEL"))
-            })
-            .expect("failing workspace request must be observed");
-        assert!(
-            !failed_payload
-                .messages
-                .iter()
-                .any(|message| message.content.contains("READY_WORKSPACE_SENTINEL")),
-            "peer history must not enter the failing workspace request"
-        );
-        let peer_payload = requests
-            .iter()
-            .find(|request| {
-                request
-                    .messages
-                    .iter()
-                    .any(|message| message.content.contains("READY_WORKSPACE_SENTINEL"))
-            })
-            .expect("peer workspace request must be observed");
-        assert!(
-            !peer_payload
-                .messages
-                .iter()
-                .any(|message| message.content.contains("FAIL_WORKSPACE_SENTINEL")),
-            "failing workspace history must not enter the peer request"
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .expect("failed workspace skill lookup must succeed")
-                .is_empty()
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(peer.id.as_str())
-                .await
-                .expect("peer workspace skill lookup must succeed")
-                .is_empty()
-        );
-    }
+                    .map(|turn_id| {
+                        canonical
+                            .iter()
+                            .find(|record| record.turn_id == *turn_id)
+                            .unwrap_or_else(|| panic!("missing canonical event for {turn_id}"))
+                            .event_id
+                            .clone()
+                    })
+                    .collect();
+                (upper, event_ids)
+            }
 
-    #[tokio::test]
-    async fn provider_output_after_lease_takeover_is_discarded() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ReleasableLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "releasable-learning",
-            provider.clone(),
-        ));
-        let supervisor = Arc::new(test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "releasable-learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        ));
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_stale_post_call",
-            "turn_stale_post_call",
-            "Repeated evidence must not outlive lease authority.",
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let started = provider.started.notified();
-        let wake = {
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
-        };
-        timeout(Duration::from_secs(2), started)
-            .await
-            .expect("provider call must begin");
-        let running = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
-            .await
-            .expect("running row must query")
-            .expect("running row must exist");
-        let stale_fence = running.fence().expect("running row must have a fence");
-
-        database
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE self_improvement_run SET lease_expires_at = datetime(?, 'unixepoch') \
-                 WHERE id = ?",
-                [(ENABLED_AT + 2).into(), running.id.clone().into()],
-            ))
-            .await
-            .expect("lease takeover fixture must expire the first owner");
-        let takeover_store = CrudStore::new(database.clone());
-        let takeover = takeover_store
-            .claim_available_self_improvement_run(
-                WORKSPACE,
-                running.id.as_str(),
-                running.activation_epoch,
-                "gateway-takeover",
-                ENABLED_AT + 3,
-                ENABLED_AT + RUN_LEASE_SECONDS,
-            )
-            .await
-            .expect("takeover claim must execute")
-            .expect("expired provider call owner must be reclaimed");
-        assert_ne!(
-            takeover.claim_token.as_deref(),
-            Some(stale_fence.claim_token.as_str())
-        );
-
-        provider.release.notify_one();
-        timeout(Duration::from_secs(2), wake)
-            .await
-            .expect("stale wake must terminate")
-            .expect("stale wake task must join")
-            .expect("workspace dispatch reports failures without failing the wake");
-        assert_eq!(
-            provider.request_count(),
-            1,
-            "stale output must be rejected before synthesis"
-        );
-        let persisted = takeover_store
-            .get_self_improvement_run(WORKSPACE, running.id.as_str())
-            .await
-            .expect("takeover run must query")
-            .expect("takeover run must exist");
-        assert_eq!(persisted.status, "running");
-        assert_eq!(persisted.claimed_by.as_deref(), Some("gateway-takeover"));
-        assert_eq!(persisted.analysis_cursor_json, None);
-        assert_eq!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("workspace state must query")
-                .expect("workspace state must exist")
-                .cursor_source_id,
-            0
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .expect("skill rows must query")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn frozen_range_load_failure_enters_bounded_retry_instead_of_timer_spin() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        let state = supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        assert_eq!(state, vec![WORKSPACE.to_owned()]);
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_missing_frozen_anchor",
-            "turn_missing_frozen_anchor",
-            "Evidence whose source ledger row becomes unavailable.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        let workspace_state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("workspace state must query")
-            .expect("workspace state must exist");
-        let sources = store
-            .list_self_improvement_source_turns_after(
-                WORKSPACE,
-                workspace_state.cursor_source_id,
-                ENABLED_AT,
-                10,
-            )
-            .await
-            .expect("source range must query");
-        let source_upper = sources.last().expect("source anchor must exist").id;
-        let wake_at = ENABLED_AT + 2;
-        let scheduled_date_utc = DateTime::<Utc>::from_timestamp(wake_at, 0)
-            .expect("fixture timestamp")
-            .format("%Y-%m-%d")
-            .to_string();
-        let run = store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: WORKSPACE.to_owned(),
-                    activation_epoch: workspace_state.activation_epoch,
-                    scheduled_date_utc,
-                    source_lower_exclusive: workspace_state.cursor_source_id,
-                    source_upper_inclusive: source_upper,
-                    learner_provider: "learning".to_owned(),
-                    learner_model: "learner".to_owned(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "learning".to_owned(),
-                    reviewer_model: "learner".to_owned(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
-                },
-                wake_at,
-            )
-            .await
-            .expect("run must freeze");
-        database
-            .execute_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                format!("DELETE FROM self_improvement_source_turn WHERE id = {source_upper}"),
-            ))
-            .await
-            .expect("corrupt frozen anchor fixture must delete");
-
-        supervisor
-            .wake_once(wake_at)
-            .await
-            .expect("frozen-range failure must be handled by the claimed retry path");
-
-        let persisted = store
-            .get_self_improvement_run(WORKSPACE, run.id.as_str())
-            .await
-            .expect("run must query")
-            .expect("run must remain durable");
-        assert_eq!(persisted.status, RUN_STATUS_PENDING);
-        assert_eq!(persisted.attempt_count, 1);
-        assert_eq!(
-            persisted.next_attempt_at_unix,
-            Some(wake_at + RETRY_BACKOFF_BASE_SECONDS)
-        );
-        assert_eq!(
-            persisted.last_error.as_deref(),
-            Some("infrastructure:internal_operation_failed")
-        );
-        assert_eq!(provider.requests().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn infrastructure_retries_exhaust_and_next_daily_wake_reuses_the_same_range() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_retry_initial",
-            "turn_retry_initial",
-            "Initial retry range evidence.",
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("first infrastructure failure must be handled");
-        let first = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
-            .await
-            .expect("first retry row must query")
-            .expect("first retry row must exist");
-        assert_eq!(first.status, RUN_STATUS_PENDING);
-        assert_eq!(first.attempt_count, 1);
-        assert_eq!(
-            first.next_attempt_at_unix,
-            Some(ENABLED_AT + 2 + RETRY_BACKOFF_BASE_SECONDS)
-        );
-        assert_eq!(
-            first.last_error.as_deref(),
-            Some("unknown:provider_transport_failed")
-        );
-        assert_eq!(
-            store
-                .get_next_self_improvement_retry_at()
-                .await
-                .expect("retry timer must query"),
-            first.next_attempt_at_unix
-        );
-        let frozen_run_id = first.id.clone();
-        let frozen_upper = first.source_upper_inclusive;
-
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_retry_later",
-            "turn_retry_later",
-            "Later evidence must not change the frozen retry range.",
-            ENABLED_AT + 3,
-        )
-        .await;
-        supervisor
-            .wake_once(ENABLED_AT + 4)
-            .await
-            .expect("wake before next_attempt_at must be harmless");
-        assert_eq!(
-            provider.requests().len(),
-            1,
-            "a pending run must not claim before its durable due time"
-        );
-
-        let second_attempt_at = ENABLED_AT + 2 + RETRY_BACKOFF_BASE_SECONDS;
-        supervisor
-            .wake_once(second_attempt_at)
-            .await
-            .expect("second infrastructure failure must be handled");
-        let second = store
-            .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
-            .await
-            .expect("second retry row must query")
-            .expect("second retry row must exist");
-        assert_eq!(second.status, RUN_STATUS_PENDING);
-        assert_eq!(second.attempt_count, 2);
-        assert_eq!(second.source_upper_inclusive, frozen_upper);
-
-        let third_attempt_at = second
-            .next_attempt_at_unix
-            .expect("second failure must schedule a third attempt");
-        supervisor
-            .wake_once(third_attempt_at)
-            .await
-            .expect("retry exhaustion must be handled");
-        let failed = store
-            .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
-            .await
-            .expect("failed row must query")
-            .expect("failed row must exist");
-        assert_eq!(failed.status, RUN_STATUS_FAILED);
-        assert_eq!(failed.attempt_count, MAX_INFRASTRUCTURE_ATTEMPTS);
-        assert_eq!(failed.source_upper_inclusive, frozen_upper);
-        assert_eq!(failed.next_attempt_at_unix, None);
-        assert_eq!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("retry workspace state must query")
-                .expect("retry workspace state must exist")
-                .cursor_source_id,
-            0
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .expect("retry skill rows must query")
-                .is_empty()
-        );
-
-        supervisor
-            .wake_once(third_attempt_at + 60)
-            .await
-            .expect("same-day failed wake must remain blocked");
-        assert_eq!(
-            provider.requests().len(),
-            MAX_INFRASTRUCTURE_ATTEMPTS as usize
-        );
-
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": []
-            })
-            .to_string(),
-            serde_json::json!({ "candidate": null }).to_string(),
-        ]);
-        let next_day = third_attempt_at + 24 * 60 * 60;
-        supervisor
-            .wake_once(next_day)
-            .await
-            .expect("next daily wake must requeue and finish the same row");
-        let completed = store
-            .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
-            .await
-            .expect("completed retry row must query")
-            .expect("completed retry row must exist");
-        assert_eq!(completed.status, "completed");
-        assert_eq!(completed.id, frozen_run_id);
-        assert_eq!(completed.source_upper_inclusive, frozen_upper);
-        assert_eq!(completed.attempt_count, 1);
-        assert_eq!(
-            database
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
-                ))
-                .await
-                .expect("run count must query")
-                .expect("run count must exist")
-                .try_get::<i64>("", "value")
-                .expect("run count must decode"),
-            1
-        );
-        assert_eq!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("completed retry state must query")
-                .expect("completed retry state must exist")
-                .cursor_source_id,
-            frozen_upper
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_chunk_exhaustion_fails_without_advancing_workspace_cursor() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        provider.set_responses([
-            "{malformed".to_owned(),
-            "{malformed".to_owned(),
-            "{malformed".to_owned(),
-        ]);
-        let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_contract_failure",
-            "turn_contract_failure",
-            "Contract failures remain distinct from infrastructure.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("contract failure must be durably classified");
-
-        let completed = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT status, outcome, analysis_cursor_json, analysis_digest_json \
-                 FROM self_improvement_run"
-                    .to_owned(),
-            ))
-            .await
-            .expect("contract-exhausted run must query")
-            .expect("contract-exhausted run must exist");
-        assert_eq!(
-            completed
-                .try_get::<String>("", "status")
-                .expect("status must decode"),
-            "failed"
-        );
-        assert!(
-            completed
-                .try_get::<Option<String>>("", "outcome")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            completed
-                .try_get::<Option<String>>("", "analysis_cursor_json")
-                .expect("cursor must decode")
-                .is_none()
-        );
-        assert!(
-            completed
-                .try_get::<Option<String>>("", "analysis_digest_json")
-                .expect("digest must decode")
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("contract-exhausted state must query")
-                .expect("contract-exhausted state must exist")
-                .cursor_source_id,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn synthesis_review_errors_preserve_progress_while_reviewer_rejection_is_no_change() {
-        for mode in ["synthesis_contract", "review_contract", "reviewer_reject"] {
-            let (database, store, workspace_manager) = test_store().await;
+            let (_database, store, workspace_manager) = test_store(fixture).await;
             let provider = Arc::new(ScriptedLearningProvider::new());
             let registry = Arc::new(ProviderRegistry::with_provider(
                 "learning",
@@ -4381,194 +3199,398 @@ mod tests {
                 .reconcile_all(ENABLED_AT)
                 .await
                 .expect("workspace activation");
+
             project_completed_source_turn(
                 store.as_ref(),
-                "thread_contract_one",
-                "turn_contract_one",
-                "Verify checksum before publishing one.",
+                "thread_lifecycle_create_one",
+                "turn_lifecycle_create_one",
+                "Verify checksum before the first release.",
                 ENABLED_AT + 1,
             )
             .await;
             project_completed_source_turn(
                 store.as_ref(),
-                "thread_contract_two",
-                "turn_contract_two",
-                "Verify checksum before publishing two.",
+                "thread_lifecycle_create_two",
+                "turn_lifecycle_create_two",
+                "Verify checksum before the second release.",
                 ENABLED_AT + 2,
             )
             .await;
-            let sources = store
-                .list_self_improvement_source_turns_after(
-                    WORKSPACE,
-                    0,
-                    ENABLED_AT,
-                    MAX_NEW_SOURCE_TURNS_PER_RUN,
-                )
-                .await
-                .expect("contract source range");
-            let upper = sources.last().expect("contract source").id;
-            let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
-                .expect("contract frozen range");
-            let canonical = store
-                .list_canonical_turn_events_for_self_improvement(&frozen)
-                .await
-                .expect("contract canonical history");
-            let event = |turn_id: &str| {
-                canonical
-                    .iter()
-                    .find(|record| record.turn_id == turn_id)
-                    .unwrap_or_else(|| panic!("missing contract event for {turn_id}"))
-                    .event_id
-                    .clone()
-            };
-            let analysis = serde_json::json!({
-                "digestRevision": 1,
-                "observations": [{
-                    "observationKey": "contract-observation",
-                    "summary": "Releases verify checksums.",
-                    "evidence": [
-                        {
-                            "turnId": "turn_contract_one",
-                            "eventId": event("turn_contract_one"),
-                            "excerpt": "Verify checksum"
-                        },
-                        {
-                            "turnId": "turn_contract_two",
-                            "eventId": event("turn_contract_two"),
-                            "excerpt": "Verify checksum"
-                        }
-                    ],
-                    "kind": "success_pattern"
-                }]
-            })
-            .to_string();
-            let candidate = serde_json::json!({
-                "candidate": {
-                    "action": "create",
-                    "candidateKey": "contract-candidate",
-                    "observationKeys": ["contract-observation"],
-                    "name": "Verify checksum",
-                    "slug": "verify-checksum",
-                    "whenToUse": "Publishing a release",
-                    "whenNotToUse": "No artifact is published",
-                    "instructions": "Verify the checksum before publishing."
-                }
-            })
-            .to_string();
-            let (responses, expected_reason, expected_requests) = match mode {
-                "synthesis_contract" => (
-                    vec![analysis, "{malformed".to_owned(), "{malformed".to_owned()],
-                    "model_contract_rejected",
-                    3,
-                ),
-                "review_contract" => (
-                    vec![
-                        analysis,
-                        candidate,
-                        "{malformed".to_owned(),
-                        "{malformed".to_owned(),
-                    ],
-                    "model_contract_rejected",
-                    4,
-                ),
-                "reviewer_reject" => (
-                    vec![
-                        analysis,
-                        candidate,
-                        serde_json::json!({
-                            "candidateKey": "candidate-733ae3bf97038400036ad29d7f210cfb801016d0f5598c90b0bc2e0286479ab7",
-                            "decision": "reject",
-                            "reasonCodes": ["not_general_enough"]
-                        })
-                        .to_string(),
-                    ],
-                    "reviewer_rejected",
-                    3,
-                ),
-                _ => unreachable!(),
-            };
-            provider.set_responses(responses);
+            let (create_upper, create_events) = range_events(
+                store.as_ref(),
+                0,
+                &["turn_lifecycle_create_one", "turn_lifecycle_create_two"],
+            )
+            .await;
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": [{
+                        "observationKey": "checksum-procedure",
+                        "summary": "Releases verify checksums.",
+                        "evidence": [
+                            {
+                                "turnId": "turn_lifecycle_create_one",
+                                "eventId": create_events[0],
+                                "excerpt": "Verify checksum"
+                            },
+                            {
+                                "turnId": "turn_lifecycle_create_two",
+                                "eventId": create_events[1],
+                                "excerpt": "Verify checksum"
+                            }
+                        ],
+                        "kind": "success_pattern"
+                    }]
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidate": {
+                        "action": "create",
+                        "candidateKey": "checksum-create",
+                        "observationKeys": ["checksum-procedure"],
+                        "name": "Verify checksum",
+                        "slug": "verify-checksum",
+                        "whenToUse": "Publishing a release",
+                        "whenNotToUse": "No artifact is published",
+                        "instructions": "Verify the artifact checksum before publishing."
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidateKey": "candidate-f493585583e0cfa5700aadd9a60c5cc50f25c37ed62c0067f00b8886a743e967",
+                    "decision": "accept",
+                    "reasonCodes": []
+                })
+                .to_string(),
+            ]);
             supervisor
                 .wake_once(ENABLED_AT + 10)
                 .await
-                .expect("terminal no-change wake");
-
-            assert_eq!(provider.requests().len(), expected_requests);
-            assert_eq!(
-                store
-                    .get_self_improvement_workspace_state(WORKSPACE)
-                    .await
-                    .expect("contract workspace state")
-                    .expect("contract workspace row")
-                    .cursor_source_id,
-                if mode == "reviewer_reject" { upper } else { 0 }
-            );
-            assert!(
-                store
-                    .list_active_agent_skill_versions(WORKSPACE)
-                    .await
-                    .expect("contract skill rows")
-                    .is_empty()
-            );
-            let row = database
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT status, outcome, result_summary FROM self_improvement_run".to_owned(),
-                ))
+                .expect("production create wake");
+            let created = store
+                .list_active_agent_skill_versions(WORKSPACE)
                 .await
-                .expect("contract run query")
-                .expect("contract run row");
-            assert_eq!(
-                row.try_get::<String>("", "status").expect("status"),
-                if mode == "reviewer_reject" {
-                    "completed"
-                } else {
-                    "failed"
-                }
-            );
-            if mode != "reviewer_reject" {
-                assert!(
-                    row.try_get::<Option<String>>("", "outcome")
-                        .unwrap()
-                        .is_none()
-                );
-                let failed = store
-                    .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(failed.analysis_cursor_json.is_some());
-                assert!(failed.analysis_digest_json.is_some());
-                assert_eq!(
-                    failed.last_error.as_deref(),
-                    Some("model_contract:malformed_model_json")
-                );
-                continue;
-            }
-            assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "no_change");
-            let summary: serde_json::Value = serde_json::from_str(
-                row.try_get::<String>("", "result_summary")
-                    .expect("result summary")
-                    .as_str(),
+                .expect("created active skill");
+            assert_eq!(created.len(), 1);
+            let skill_id = created[0].skill_id.clone();
+            let version_one = created[0].version.id.clone();
+
+            let update_day = ENABLED_AT + 24 * 60 * 60;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_lifecycle_update",
+                "turn_lifecycle_update",
+                "Double-check the checksum before publishing.",
+                update_day + 1,
             )
-            .expect("summary JSON");
-            assert_eq!(summary["reason"], expected_reason);
-        }
+            .await;
+            let (update_upper, update_events) =
+                range_events(store.as_ref(), create_upper, &["turn_lifecycle_update"]).await;
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": [{
+                        "observationKey": "checksum-update",
+                        "summary": "The procedure now double-checks the checksum.",
+                        "evidence": [{
+                            "turnId": "turn_lifecycle_update",
+                            "eventId": update_events[0],
+                            "excerpt": "Double-check the checksum"
+                        }],
+                        "kind": "correction"
+                    }]
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidate": {
+                        "action": "update",
+                        "candidateKey": "checksum-update",
+                        "targetSkillId": skill_id.to_string(),
+                        "observationKeys": ["checksum-update"],
+                        "name": "Double-check checksum",
+                        "slug": "verify-checksum",
+                        "whenToUse": "Publishing a release",
+                        "whenNotToUse": "No artifact is published",
+                        "instructions": "Calculate and double-check the artifact checksum before publishing."
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidateKey": "candidate-a693ee600f72ff7d800b648629d3c21d99dfe9f181544a3cc9a5a6c255eb2d62",
+                    "decision": "accept",
+                    "reasonCodes": []
+                })
+                .to_string(),
+            ]);
+            supervisor
+                .wake_once(update_day + 10)
+                .await
+                .expect("production update wake");
+            let updated = store
+                .list_active_agent_skill_versions(WORKSPACE)
+                .await
+                .expect("updated active skill");
+            assert_eq!(updated.len(), 1);
+            assert_eq!(updated[0].skill_id, skill_id);
+            assert_eq!(
+                updated[0].version.parent_version_id.as_deref(),
+                Some(version_one.as_str())
+            );
+            assert_eq!(updated[0].version.display_name, "Double-check checksum");
+            let version_two = updated[0].version.id.clone();
+
+            let rollback_day = update_day + 24 * 60 * 60;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_lifecycle_rollback",
+                "turn_lifecycle_rollback",
+                "Return to the earlier verified checksum procedure.",
+                rollback_day + 1,
+            )
+            .await;
+            let (_rollback_upper, rollback_events) =
+                range_events(store.as_ref(), update_upper, &["turn_lifecycle_rollback"]).await;
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": [{
+                        "observationKey": "checksum-rollback",
+                        "summary": "The earlier procedure is required again.",
+                        "evidence": [{
+                            "turnId": "turn_lifecycle_rollback",
+                            "eventId": rollback_events[0],
+                            "excerpt": "earlier verified checksum procedure"
+                        }],
+                        "kind": "correction"
+                    }]
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidate": {
+                        "action": "rollback",
+                        "candidateKey": "checksum-rollback",
+                        "targetSkillId": skill_id.to_string(),
+                        "targetVersionId": version_one,
+                        "observationKeys": ["checksum-rollback"]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "candidateKey": "candidate-84562f8e4aaa754d15d288d1ad02b3de5de582f61f170440ddc5732c7cda48f1",
+                    "decision": "accept",
+                    "reasonCodes": []
+                })
+                .to_string(),
+            ]);
+            supervisor
+                .wake_once(rollback_day + 10)
+                .await
+                .expect("production rollback wake");
+            let restored = store
+                .list_active_agent_skill_versions(WORKSPACE)
+                .await
+                .expect("restored active skill");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].skill_id, skill_id);
+            assert_eq!(
+                restored[0].version.id, created[0].version.id,
+                "rollback must restore the exact immutable parent"
+            );
+            assert_eq!(restored[0].version.display_name, "Verify checksum");
+            assert_eq!(
+                store
+                    .get_agent_skill_version(WORKSPACE, version_two.as_str())
+                    .await
+                    .expect("updated version lookup")
+                    .expect("updated version remains historical")
+                    .version
+                    .id,
+                version_two
+            );
+            assert_eq!(provider.requests().len(), 9);
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
-    async fn multi_chunk_driver_retries_failed_middle_without_losing_prefix_or_tail() {
-        let (_database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
+    async fn bounded_dispatch_starts_other_workspaces_without_detached_workers() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(BlockingLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "blocking-learning",
+                provider.clone(),
+            ));
+            let enabled = GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "blocking-learning".to_owned(),
+                    model: "learner".to_owned(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            };
+            let mut workspace_ids = vec![WORKSPACE.to_owned()];
+            for index in 1..(MAX_CONCURRENT_WORKSPACES + 2) {
+                let workspace_id = format!("ws_bounded_{index}");
+                let workspace_name = format!("Bounded {index}");
+                let workspace = workspace_manager
+                    .create_workspace(workspace_id.as_str(), Some(workspace_name.as_str()))
+                    .await
+                    .expect("bounded workspace fixture must create");
+                workspace_ids.push(workspace.id);
+            }
+            let workspace_configs = workspace_ids
+                .iter()
+                .map(|workspace_id| (workspace_id.clone(), enabled.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let supervisor = Arc::new(test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager.clone(),
+                workspace_configs,
+                1024 * 1024,
+            ));
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("all bounded workspace fixtures must activate");
+            for (index, workspace_id) in workspace_ids.iter().enumerate() {
+                let thread_id = format!("thread_bounded_{index}");
+                let turn_id = format!("turn_bounded_{index}");
+                project_completed_source_turn_for_workspace(
+                    store.as_ref(),
+                    workspace_id,
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    "A repeated procedure should be considered.",
+                    ENABLED_AT + 1,
+                )
+                .await;
+            }
+
+            let wake = {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
+            };
+            timeout(Duration::from_secs(2), async {
+                while provider.request_count() < MAX_CONCURRENT_WORKSPACES {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("bounded peers must begin while the first provider call is blocked");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(
+                provider.request_count(),
+                MAX_CONCURRENT_WORKSPACES,
+                "the owned stream must not poll more than the configured workspace bound"
+            );
+
+            supervisor
+                .apply_desired_for_workspace(
+                    WORKSPACE,
+                    GatewaySelfImprovementConfig {
+                        enabled: false,
+                        ..enabled.clone()
+                    },
+                    ENABLED_AT + 3,
+                )
+                .await
+                .expect("one workspace disable must cancel only its dispatch branch");
+            timeout(Duration::from_secs(2), async {
+                while provider.request_count() == MAX_CONCURRENT_WORKSPACES {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelling one branch must let the next workspace enter the bounded stream");
+            assert_eq!(
+                provider.request_count(),
+                MAX_CONCURRENT_WORKSPACES + 1,
+                "one freed slot must start exactly one queued workspace"
+            );
+            assert!(
+                !wake.is_finished(),
+                "changing one workspace must not cancel peer workspace executions"
+            );
+
+            for workspace_id in workspace_ids.iter().filter(|id| id.as_str() != WORKSPACE) {
+                supervisor
+                    .apply_desired_for_workspace(
+                        workspace_id,
+                        GatewaySelfImprovementConfig {
+                            enabled: false,
+                            ..enabled.clone()
+                        },
+                        ENABLED_AT + 3,
+                    )
+                    .await
+                    .expect("workspace disable must cancel its owned dispatch branch");
+            }
+            timeout(Duration::from_secs(2), wake)
+                .await
+                .expect("bounded dispatch must join after cancellation")
+                .expect("bounded dispatch task must join")
+                .expect("bounded dispatch wake must finish");
+            let cancelled_count = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS value FROM self_improvement_run WHERE status = 'cancelled'"
+                        .to_owned(),
+                ))
+                .await
+                .expect("cancelled run count must query")
+                .expect("cancelled run count must exist")
+                .try_get::<i64>("", "value")
+                .expect("cancelled run count must decode");
+            let created = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS total, COUNT(DISTINCT workspace_id) AS workspaces FROM self_improvement_run".to_owned(),
+                ))
+                .await.expect("created runs must query").expect("aggregate must exist");
+            let total = created.try_get::<i64>("", "total").unwrap();
+            assert_eq!(
+                cancelled_count, total,
+                "every created run must be cancelled when its owned branch is joined"
+            );
+            assert_eq!(
+                total,
+                created.try_get::<i64>("", "workspaces").unwrap(),
+                "bounded dispatch must not create duplicate workspace runs"
+            );
+            assert!(
+                (provider.request_count() as i64..=workspace_ids.len() as i64).contains(&total),
+                "every started provider call needs a run; a workspace disabled during discovery may have none"
+            );
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oldest_unresolved_run_blocks_only_its_workspace() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let other_workspace = workspace_manager
+                .create_workspace("ws_unblocked_peer", Some("Unblocked peer"))
+                .await
+                .expect("peer workspace must create");
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": []
+                })
+                .to_string(),
+                serde_json::json!({ "candidate": null }).to_string(),
+            ]);
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let enabled = GatewaySelfImprovementConfig {
                 enabled: true,
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
@@ -4576,197 +3598,521 @@ mod tests {
                     reasoning_effort: None,
                 }),
                 reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-
-        const FINAL_TAIL: &str = "VERY_LONG_FINAL_FRAGMENT_SENTINEL";
-        let long_history = format!(
-            "{}{FINAL_TAIL}",
-            "x".repeat(super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(4))
-        );
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_long_resume",
-            "turn_long_resume",
-            long_history.as_str(),
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("workspace state must query")
-            .expect("workspace state must exist");
-        let sources = store
-            .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
-            .await
-            .expect("long source range must query");
-        let upper = sources.last().expect("long source must exist").id;
-        let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
-            .expect("long source range must freeze");
-        let canonical = store
-            .list_canonical_turn_events_for_self_improvement(&frozen)
-            .await
-            .expect("long canonical history must load");
-        let snapshot = build_model_safe_full_thread_snapshot(&frozen, canonical.as_slice())
-            .expect("long canonical snapshot must build");
-        let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())
-            .expect("long history must plan");
-        assert!(
-            chunks.len() > usize::try_from(MAX_CHUNK_STEPS_PER_WAKE).unwrap_or(usize::MAX),
-            "fixture must require more than one bounded wake"
-        );
-        assert!(
-            chunks
-                .last()
-                .and_then(|chunk| serde_json::to_string(chunk).ok())
-                .is_some_and(|chunk| chunk.contains(FINAL_TAIL)),
-            "the final planned fragment must contain the tail sentinel"
-        );
-
-        let mut responses = Vec::new();
-        responses.push(serde_json::json!({"digestRevision": 1, "observations": []}).to_string());
-        responses.extend([
-            "{malformed-middle".to_owned(),
-            "{malformed-middle".to_owned(),
-            "{malformed-middle".to_owned(),
-        ]);
-        for chunk_index in 1..chunks.len() {
-            responses.push(
-                serde_json::json!({
-                    "digestRevision": u32::try_from(chunk_index + 1)
-                        .expect("fixture revision must fit u32"),
-                    "observations": []
-                })
-                .to_string(),
+            };
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                BTreeMap::from([
+                    (WORKSPACE.to_owned(), enabled.clone()),
+                    (other_workspace.id.clone(), enabled),
+                ]),
+                1024 * 1024,
             );
-        }
-        provider.set_responses(responses);
-
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("first bounded wake must checkpoint its exact prefix");
-        let pending = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
-            .await
-            .expect("pending run must query")
-            .expect("pending run must remain");
-        assert_eq!(pending.status, RUN_STATUS_FAILED);
-        assert_eq!(
-            pending.last_error.as_deref(),
-            Some("model_contract:malformed_model_json")
-        );
-        let cursor = pending
-            .analysis_cursor_json
-            .as_deref()
-            .expect("budget yield must preserve its exact cursor");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(cursor).expect("cursor must be valid JSON")["nextChunkIndex"],
-            serde_json::json!(1)
-        );
-        let digest = pending
-            .analysis_digest_json
-            .as_deref()
-            .expect("budget yield must preserve its bounded digest");
-        let checkpoint = ResumableHistoryAnalysis::restore(&pending, chunks.as_slice())
-            .expect("bounded checkpoint and exact deterministic plan must restore");
-        assert_eq!(checkpoint.next_chunk_index(), 1);
-
-        assert!(!digest.contains("malformed-middle"));
-        assert!(!digest.contains(FINAL_TAIL));
-        assert_eq!(
-            provider.requests().len(),
-            1 + MAX_CHUNK_CONTRACT_ATTEMPTS as usize
-        );
-
-        let run_id = pending.id.clone();
-        // The next daily attempt resumes the same failed range, not a new run.
-        let mut wake_at = ENABLED_AT + 24 * 60 * 60;
-        for _ in 0..chunks.len() {
             supervisor
-                .wake_once(wake_at)
+                .reconcile_all(ENABLED_AT)
                 .await
-                .expect("resumed bounded wake must execute");
-            let current = store
-                .get_self_improvement_run(WORKSPACE, run_id.as_str())
-                .await
-                .expect("resumed run must query")
-                .expect("resumed run must exist");
-            if current.status == "completed" {
-                assert_eq!(current.analysis_cursor_json, None);
-                assert_eq!(current.analysis_digest_json, None);
-                break;
-            }
-            assert_eq!(current.status, RUN_STATUS_PENDING);
-            wake_at = current
-                .next_attempt_at_unix
-                .expect("continued run must schedule its next bounded wake");
-        }
+                .expect("both workspaces must activate");
+            project_completed_source_turn_for_workspace(
+                store.as_ref(),
+                WORKSPACE,
+                "thread_blocked_workspace",
+                "turn_blocked_workspace",
+                "Blocked workspace evidence.",
+                ENABLED_AT + 1,
+            )
+            .await;
+            project_completed_source_turn_for_workspace(
+                store.as_ref(),
+                other_workspace.id.as_str(),
+                "thread_unblocked_workspace",
+                "turn_unblocked_workspace",
+                "Unblocked workspace evidence.",
+                ENABLED_AT + 1,
+            )
+            .await;
 
-        let completed = store
-            .get_self_improvement_run(WORKSPACE, run_id.as_str())
-            .await
-            .expect("completed long run must query")
-            .expect("completed long run must exist");
-        assert_eq!(completed.status, "completed");
-        assert_eq!(completed.outcome.as_deref(), Some("no_change"));
-        assert_eq!(
-            store
+            let blocked_state = store
                 .get_self_improvement_workspace_state(WORKSPACE)
                 .await
-                .expect("completed state must query")
-                .expect("completed state must exist")
-                .cursor_source_id,
-            upper
-        );
-        let requests = provider.requests();
-        assert_eq!(requests.len(), chunks.len() + 3);
-        let requested_chunk_indexes = requests
-            .iter()
-            .map(|request| {
-                let data = serde_json::from_str::<serde_json::Value>(
-                    request
-                        .messages
-                        .get(1)
-                        .expect("chunk request must contain data")
-                        .content
-                        .as_str(),
+                .expect("blocked workspace state must query")
+                .expect("blocked workspace state must exist");
+            let blocked_sources = store
+                .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
+                .await
+                .expect("blocked workspace sources must query");
+            let scheduled_date_utc = DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
+                .expect("fixture timestamp must be valid")
+                .format("%Y-%m-%d")
+                .to_string();
+            let blocked_run = store
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: WORKSPACE.to_owned(),
+                        activation_epoch: blocked_state.activation_epoch,
+                        scheduled_date_utc,
+                        source_lower_exclusive: blocked_state.cursor_source_id,
+                        source_upper_inclusive: blocked_sources[0].id,
+                        learner_provider: "learning".to_owned(),
+                        learner_model: "learner".to_owned(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "learning".to_owned(),
+                        reviewer_model: "learner".to_owned(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
+                    },
+                    ENABLED_AT + 2,
                 )
-                .expect("chunk request data must be JSON");
-                data["history"]["chunk_index"]
-                    .as_u64()
-                    .expect("chunk index must be present")
-            })
-            .collect::<Vec<_>>();
-        let mut expected_indexes = vec![0, 1, 1, 1, 1];
-        expected_indexes.extend(
-            (2..chunks.len()).map(|index| u64::try_from(index).expect("fixture index must fit")),
-        );
-        assert_eq!(
-            requested_chunk_indexes, expected_indexes,
-            "resume may only repeat the contract-retried chunk, never a committed prefix"
-        );
-        let last_input = requests
-            .last()
-            .and_then(|request| request.messages.get(1))
-            .expect("last chunk request must contain untrusted data");
-        assert!(
-            last_input.content.contains(FINAL_TAIL),
-            "the final fragment must reach the provider after resume"
-        );
+                .await
+                .expect("blocked workspace run must freeze");
+            store
+                .claim_available_self_improvement_run(
+                    WORKSPACE,
+                    blocked_run.id.as_str(),
+                    blocked_state.activation_epoch,
+                    "other-live-owner",
+                    ENABLED_AT + 2,
+                    ENABLED_AT + 600,
+                )
+                .await
+                .expect("blocked workspace claim must execute")
+                .expect("blocked workspace claim must win");
+
+            supervisor
+                .wake_once(ENABLED_AT + 3)
+                .await
+                .expect("peer workspace must progress despite the unresolved run");
+            assert_eq!(
+                provider.requests().len(),
+                1,
+                "only the unblocked peer chunk analyzer should run; an empty digest skips synthesis"
+            );
+            let blocked_after = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("blocked state must query")
+                .expect("blocked state must exist");
+            assert_eq!(blocked_after.cursor_source_id, 0);
+            let peer_after = store
+                .get_self_improvement_workspace_state(other_workspace.id.as_str())
+                .await
+                .expect("peer state must query")
+                .expect("peer state must exist");
+            assert!(
+                peer_after.cursor_source_id > 0,
+                "the peer range must complete independently"
+            );
+            let blocked_run_count = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT COUNT(*) AS value FROM self_improvement_run WHERE workspace_id = \
+                         '{WORKSPACE}'"
+                    ),
+                ))
+                .await
+                .expect("blocked run count must query")
+                .expect("blocked run count must exist")
+                .try_get::<i64>("", "value")
+                .expect("blocked run count must decode");
+            assert_eq!(
+                blocked_run_count, 1,
+                "the unresolved workspace must not freeze another source range"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn restart_after_checkpoint_repeats_only_the_uncommitted_chunk() {
-        for failure in ["transport", "length", "provider_error", "malformed"] {
-            let (database, store, workspace_manager) = test_store().await;
+    async fn provider_failure_and_history_remain_isolated_to_one_workspace() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let peer = workspace_manager
+                .create_workspace("ws_provider_peer", Some("Provider peer"))
+                .await
+                .expect("peer workspace must create");
+            let provider = Arc::new(WorkspaceSelectiveLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "workspace-selective-learning",
+                provider.clone(),
+            ));
+            let enabled = GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "workspace-selective-learning".to_owned(),
+                    model: "learner".to_owned(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            };
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                BTreeMap::from([
+                    (WORKSPACE.to_owned(), enabled.clone()),
+                    (peer.id.clone(), enabled),
+                ]),
+                1024 * 1024,
+            );
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("both workspace baselines must reconcile");
+            project_completed_source_turn_for_workspace(
+                store.as_ref(),
+                WORKSPACE,
+                "thread_provider_failure",
+                "turn_provider_failure",
+                "FAIL_WORKSPACE_SENTINEL",
+                ENABLED_AT + 1,
+            )
+            .await;
+            project_completed_source_turn_for_workspace(
+                store.as_ref(),
+                peer.id.as_str(),
+                "thread_provider_peer",
+                "turn_provider_peer",
+                "READY_WORKSPACE_SENTINEL",
+                ENABLED_AT + 1,
+            )
+            .await;
+
+            supervisor
+                .wake_once(ENABLED_AT + 2)
+                .await
+                .expect("one workspace failure must not fail the owned wake");
+
+            let failed_state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("failed workspace state must query")
+                .expect("failed workspace state must exist");
+            assert_eq!(
+                failed_state.cursor_source_id, 0,
+                "provider failure must not advance its workspace cursor"
+            );
+            let failed_run = store
+                .get_oldest_unresolved_self_improvement_run(
+                    WORKSPACE,
+                    failed_state.activation_epoch,
+                )
+                .await
+                .expect("failed workspace run must query")
+                .expect("failed workspace run must remain retryable");
+            assert_eq!(failed_run.status, RUN_STATUS_PENDING);
+            assert!(failed_run.next_attempt_at_unix.is_some());
+
+            let peer_state = store
+                .get_self_improvement_workspace_state(peer.id.as_str())
+                .await
+                .expect("peer workspace state must query")
+                .expect("peer workspace state must exist");
+            assert!(
+                peer_state.cursor_source_id > 0,
+                "ready peer must complete independently"
+            );
+            assert!(
+                store
+                    .get_oldest_unresolved_self_improvement_run(
+                        peer.id.as_str(),
+                        peer_state.activation_epoch,
+                    )
+                    .await
+                    .expect("peer unresolved run lookup must succeed")
+                    .is_none()
+            );
+
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 2);
+            let failed_payload = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("FAIL_WORKSPACE_SENTINEL"))
+                })
+                .expect("failing workspace request must be observed");
+            assert!(
+                !failed_payload
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("READY_WORKSPACE_SENTINEL")),
+                "peer history must not enter the failing workspace request"
+            );
+            let peer_payload = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("READY_WORKSPACE_SENTINEL"))
+                })
+                .expect("peer workspace request must be observed");
+            assert!(
+                !peer_payload
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("FAIL_WORKSPACE_SENTINEL")),
+                "failing workspace history must not enter the peer request"
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .expect("failed workspace skill lookup must succeed")
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(peer.id.as_str())
+                    .await
+                    .expect("peer workspace skill lookup must succeed")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_output_after_lease_takeover_is_discarded() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ReleasableLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "releasable-learning",
+                provider.clone(),
+            ));
+            let supervisor = Arc::new(test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "releasable-learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            ));
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("workspace must activate");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_stale_post_call",
+                "turn_stale_post_call",
+                "Repeated evidence must not outlive lease authority.",
+                ENABLED_AT + 1,
+            )
+            .await;
+
+            let started = provider.started.notified();
+            let wake = {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
+            };
+            timeout(Duration::from_secs(2), started)
+                .await
+                .expect("provider call must begin");
+            let running = store
+                .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                .await
+                .expect("running row must query")
+                .expect("running row must exist");
+            let stale_fence = running.fence().expect("running row must have a fence");
+
+            database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE self_improvement_run SET lease_expires_at = to_timestamp($1::double precision) \
+                     WHERE id = $2",
+                    [((ENABLED_AT + 2) as f64).into(), running.id.clone().into()],
+                ))
+                .await
+                .expect("lease takeover fixture must expire the first owner");
+            let takeover_store = CrudStore::new(database.clone());
+            let takeover = takeover_store
+                .claim_available_self_improvement_run(
+                    WORKSPACE,
+                    running.id.as_str(),
+                    running.activation_epoch,
+                    "gateway-takeover",
+                    ENABLED_AT + 3,
+                    ENABLED_AT + RUN_LEASE_SECONDS,
+                )
+                .await
+                .expect("takeover claim must execute")
+                .expect("expired provider call owner must be reclaimed");
+            assert_ne!(
+                takeover.claim_token.as_deref(),
+                Some(stale_fence.claim_token.as_str())
+            );
+
+            provider.release.notify_one();
+            timeout(Duration::from_secs(2), wake)
+                .await
+                .expect("stale wake must terminate")
+                .expect("stale wake task must join")
+                .expect("workspace dispatch reports failures without failing the wake");
+            assert_eq!(
+                provider.request_count(),
+                1,
+                "stale output must be rejected before synthesis"
+            );
+            let persisted = takeover_store
+                .get_self_improvement_run(WORKSPACE, running.id.as_str())
+                .await
+                .expect("takeover run must query")
+                .expect("takeover run must exist");
+            assert_eq!(persisted.status, "running");
+            assert_eq!(persisted.claimed_by.as_deref(), Some("gateway-takeover"));
+            assert_eq!(persisted.analysis_cursor_json, None);
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("workspace state must query")
+                    .expect("workspace state must exist")
+                    .cursor_source_id,
+                0
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .expect("skill rows must query")
+                    .is_empty()
+            );
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frozen_range_load_failure_enters_bounded_retry_instead_of_timer_spin() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
+            let state = supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("workspace must activate");
+            assert_eq!(state, vec![WORKSPACE.to_owned()]);
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_missing_frozen_anchor",
+                "turn_missing_frozen_anchor",
+                "Evidence whose source ledger row becomes unavailable.",
+                ENABLED_AT + 1,
+            )
+            .await;
+            let workspace_state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("workspace state must query")
+                .expect("workspace state must exist");
+            let sources = store
+                .list_self_improvement_source_turns_after(
+                    WORKSPACE,
+                    workspace_state.cursor_source_id,
+                    ENABLED_AT,
+                    10,
+                )
+                .await
+                .expect("source range must query");
+            let source_upper = sources.last().expect("source anchor must exist").id;
+            let wake_at = ENABLED_AT + 2;
+            let scheduled_date_utc = DateTime::<Utc>::from_timestamp(wake_at, 0)
+                .expect("fixture timestamp")
+                .format("%Y-%m-%d")
+                .to_string();
+            let run = store
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: WORKSPACE.to_owned(),
+                        activation_epoch: workspace_state.activation_epoch,
+                        scheduled_date_utc,
+                        source_lower_exclusive: workspace_state.cursor_source_id,
+                        source_upper_inclusive: source_upper,
+                        learner_provider: "learning".to_owned(),
+                        learner_model: "learner".to_owned(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "learning".to_owned(),
+                        reviewer_model: "learner".to_owned(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
+                    },
+                    wake_at,
+                )
+                .await
+                .expect("run must freeze");
+            database
+                .execute_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    format!("DELETE FROM self_improvement_source_turn WHERE id = {source_upper}"),
+                ))
+                .await
+                .expect("corrupt frozen anchor fixture must delete");
+
+            supervisor
+                .wake_once(wake_at)
+                .await
+                .expect("frozen-range failure must be handled by the claimed retry path");
+
+            let persisted = store
+                .get_self_improvement_run(WORKSPACE, run.id.as_str())
+                .await
+                .expect("run must query")
+                .expect("run must remain durable");
+            assert_eq!(persisted.status, RUN_STATUS_PENDING);
+            assert_eq!(persisted.attempt_count, 1);
+            assert_eq!(
+                persisted.next_attempt_at_unix,
+                Some(wake_at + RETRY_BACKOFF_BASE_SECONDS)
+            );
+            assert_eq!(
+                persisted.last_error.as_deref(),
+                Some("infrastructure:internal_operation_failed")
+            );
+            assert_eq!(provider.requests().len(), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn infrastructure_retries_exhaust_and_next_daily_wake_reuses_the_same_range() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
             let provider = Arc::new(ScriptedLearningProvider::new());
             let registry = Arc::new(ProviderRegistry::with_provider(
                 "learning",
@@ -4791,13 +4137,506 @@ mod tests {
                 .reconcile_all(ENABLED_AT)
                 .await
                 .expect("workspace must activate");
-            let long_history = "checkpoint-crash ".repeat(
-                super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(3) / 17,
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_retry_initial",
+                "turn_retry_initial",
+                "Initial retry range evidence.",
+                ENABLED_AT + 1,
+            )
+            .await;
+
+            supervisor
+                .wake_once(ENABLED_AT + 2)
+                .await
+                .expect("first infrastructure failure must be handled");
+            let first = store
+                .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                .await
+                .expect("first retry row must query")
+                .expect("first retry row must exist");
+            assert_eq!(first.status, RUN_STATUS_PENDING);
+            assert_eq!(first.attempt_count, 1);
+            assert_eq!(
+                first.next_attempt_at_unix,
+                Some(ENABLED_AT + 2 + RETRY_BACKOFF_BASE_SECONDS)
+            );
+            assert_eq!(
+                first.last_error.as_deref(),
+                Some("unknown:provider_transport_failed")
+            );
+            assert_eq!(
+                store
+                    .get_next_self_improvement_retry_at()
+                    .await
+                    .expect("retry timer must query"),
+                first.next_attempt_at_unix
+            );
+            let frozen_run_id = first.id.clone();
+            let frozen_upper = first.source_upper_inclusive;
+
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_retry_later",
+                "turn_retry_later",
+                "Later evidence must not change the frozen retry range.",
+                ENABLED_AT + 3,
+            )
+            .await;
+            supervisor
+                .wake_once(ENABLED_AT + 4)
+                .await
+                .expect("wake before next_attempt_at must be harmless");
+            assert_eq!(
+                provider.requests().len(),
+                1,
+                "a pending run must not claim before its durable due time"
+            );
+
+            let second_attempt_at = ENABLED_AT + 2 + RETRY_BACKOFF_BASE_SECONDS;
+            supervisor
+                .wake_once(second_attempt_at)
+                .await
+                .expect("second infrastructure failure must be handled");
+            let second = store
+                .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
+                .await
+                .expect("second retry row must query")
+                .expect("second retry row must exist");
+            assert_eq!(second.status, RUN_STATUS_PENDING);
+            assert_eq!(second.attempt_count, 2);
+            assert_eq!(second.source_upper_inclusive, frozen_upper);
+
+            let third_attempt_at = second
+                .next_attempt_at_unix
+                .expect("second failure must schedule a third attempt");
+            supervisor
+                .wake_once(third_attempt_at)
+                .await
+                .expect("retry exhaustion must be handled");
+            let failed = store
+                .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
+                .await
+                .expect("failed row must query")
+                .expect("failed row must exist");
+            assert_eq!(failed.status, RUN_STATUS_FAILED);
+            assert_eq!(failed.attempt_count, MAX_INFRASTRUCTURE_ATTEMPTS);
+            assert_eq!(failed.source_upper_inclusive, frozen_upper);
+            assert_eq!(failed.next_attempt_at_unix, None);
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("retry workspace state must query")
+                    .expect("retry workspace state must exist")
+                    .cursor_source_id,
+                0
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .expect("retry skill rows must query")
+                    .is_empty()
+            );
+
+            supervisor
+                .wake_once(third_attempt_at + 60)
+                .await
+                .expect("same-day failed wake must remain blocked");
+            assert_eq!(
+                provider.requests().len(),
+                MAX_INFRASTRUCTURE_ATTEMPTS as usize
+            );
+
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": []
+                })
+                .to_string(),
+                serde_json::json!({ "candidate": null }).to_string(),
+            ]);
+            let next_day = third_attempt_at + 24 * 60 * 60;
+            supervisor
+                .wake_once(next_day)
+                .await
+                .expect("next daily wake must requeue and finish the same row");
+            let completed = store
+                .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
+                .await
+                .expect("completed retry row must query")
+                .expect("completed retry row must exist");
+            assert_eq!(completed.status, "completed");
+            assert_eq!(completed.id, frozen_run_id);
+            assert_eq!(completed.source_upper_inclusive, frozen_upper);
+            assert_eq!(completed.attempt_count, 1);
+            assert_eq!(
+                database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("run count must query")
+                    .expect("run count must exist")
+                    .try_get::<i64>("", "value")
+                    .expect("run count must decode"),
+                1
+            );
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("completed retry state must query")
+                    .expect("completed retry state must exist")
+                    .cursor_source_id,
+                frozen_upper
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_chunk_exhaustion_fails_without_advancing_workspace_cursor() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            provider.set_responses([
+                "{malformed".to_owned(),
+                "{malformed".to_owned(),
+                "{malformed".to_owned(),
+            ]);
+            let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("workspace must activate");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_contract_failure",
+                "turn_contract_failure",
+                "Contract failures remain distinct from infrastructure.",
+                ENABLED_AT + 1,
+            )
+            .await;
+            supervisor
+                .wake_once(ENABLED_AT + 2)
+                .await
+                .expect("contract failure must be durably classified");
+
+            let completed = database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT status, outcome, analysis_cursor_json, analysis_digest_json \
+                     FROM self_improvement_run"
+                        .to_owned(),
+                ))
+                .await
+                .expect("contract-exhausted run must query")
+                .expect("contract-exhausted run must exist");
+            assert_eq!(
+                completed
+                    .try_get::<String>("", "status")
+                    .expect("status must decode"),
+                "failed"
+            );
+            assert!(
+                completed
+                    .try_get::<Option<String>>("", "outcome")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                completed
+                    .try_get::<Option<String>>("", "analysis_cursor_json")
+                    .expect("cursor must decode")
+                    .is_none()
+            );
+            assert!(
+                completed
+                    .try_get::<Option<String>>("", "analysis_digest_json")
+                    .expect("digest must decode")
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("contract-exhausted state must query")
+                    .expect("contract-exhausted state must exist")
+                    .cursor_source_id,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn synthesis_review_errors_preserve_progress_while_reviewer_rejection_is_no_change() {
+        for mode in ["synthesis_contract", "review_contract", "reviewer_reject"] {
+            pioneer_postgres_test::with_database(async |fixture| {
+                let (database, store, workspace_manager) = test_store(fixture).await;
+                let provider = Arc::new(ScriptedLearningProvider::new());
+                let registry = Arc::new(ProviderRegistry::with_provider(
+                    "learning",
+                    provider.clone(),
+                ));
+                let supervisor = test_supervisor(
+                    store.clone(),
+                    registry,
+                    workspace_manager,
+                    GatewaySelfImprovementConfig {
+                        enabled: true,
+                        default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                            provider: "learning".to_owned(),
+                            model: "learner".to_owned(),
+                            reasoning_effort: None,
+                        }),
+                        reviewer_model: None,
+                    },
+                    1024 * 1024,
+                );
+                supervisor
+                    .reconcile_all(ENABLED_AT)
+                    .await
+                    .expect("workspace activation");
+                project_completed_source_turn(
+                    store.as_ref(),
+                    "thread_contract_one",
+                    "turn_contract_one",
+                    "Verify checksum before publishing one.",
+                    ENABLED_AT + 1,
+                )
+                .await;
+                project_completed_source_turn(
+                    store.as_ref(),
+                    "thread_contract_two",
+                    "turn_contract_two",
+                    "Verify checksum before publishing two.",
+                    ENABLED_AT + 2,
+                )
+                .await;
+                let sources = store
+                    .list_self_improvement_source_turns_after(
+                        WORKSPACE,
+                        0,
+                        ENABLED_AT,
+                        MAX_NEW_SOURCE_TURNS_PER_RUN,
+                    )
+                    .await
+                    .expect("contract source range");
+                let upper = sources.last().expect("contract source").id;
+                let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
+                    .expect("contract frozen range");
+                let canonical = store
+                    .list_canonical_turn_events_for_self_improvement(&frozen)
+                    .await
+                    .expect("contract canonical history");
+                let event = |turn_id: &str| {
+                    canonical
+                        .iter()
+                        .find(|record| record.turn_id == turn_id)
+                        .unwrap_or_else(|| panic!("missing contract event for {turn_id}"))
+                        .event_id
+                        .clone()
+                };
+                let analysis = serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": [{
+                        "observationKey": "contract-observation",
+                        "summary": "Releases verify checksums.",
+                        "evidence": [
+                            {
+                                "turnId": "turn_contract_one",
+                                "eventId": event("turn_contract_one"),
+                                "excerpt": "Verify checksum"
+                            },
+                            {
+                                "turnId": "turn_contract_two",
+                                "eventId": event("turn_contract_two"),
+                                "excerpt": "Verify checksum"
+                            }
+                        ],
+                        "kind": "success_pattern"
+                    }]
+                })
+                .to_string();
+                let candidate = serde_json::json!({
+                    "candidate": {
+                        "action": "create",
+                        "candidateKey": "contract-candidate",
+                        "observationKeys": ["contract-observation"],
+                        "name": "Verify checksum",
+                        "slug": "verify-checksum",
+                        "whenToUse": "Publishing a release",
+                        "whenNotToUse": "No artifact is published",
+                        "instructions": "Verify the checksum before publishing."
+                    }
+                })
+                .to_string();
+                let (responses, expected_reason, expected_requests) = match mode {
+                    "synthesis_contract" => (
+                        vec![analysis, "{malformed".to_owned(), "{malformed".to_owned()],
+                        "model_contract_rejected",
+                        3,
+                    ),
+                    "review_contract" => (
+                        vec![
+                            analysis,
+                            candidate,
+                            "{malformed".to_owned(),
+                            "{malformed".to_owned(),
+                        ],
+                        "model_contract_rejected",
+                        4,
+                    ),
+                    "reviewer_reject" => (
+                        vec![
+                            analysis,
+                            candidate,
+                            serde_json::json!({
+                                "candidateKey": "candidate-733ae3bf97038400036ad29d7f210cfb801016d0f5598c90b0bc2e0286479ab7",
+                                "decision": "reject",
+                                "reasonCodes": ["not_general_enough"]
+                            })
+                            .to_string(),
+                        ],
+                        "reviewer_rejected",
+                        3,
+                    ),
+                    _ => unreachable!(),
+                };
+                provider.set_responses(responses);
+                supervisor
+                    .wake_once(ENABLED_AT + 10)
+                    .await
+                    .expect("terminal no-change wake");
+
+                assert_eq!(provider.requests().len(), expected_requests);
+                assert_eq!(
+                    store
+                        .get_self_improvement_workspace_state(WORKSPACE)
+                        .await
+                        .expect("contract workspace state")
+                        .expect("contract workspace row")
+                        .cursor_source_id,
+                    if mode == "reviewer_reject" { upper } else { 0 }
+                );
+                assert!(
+                    store
+                        .list_active_agent_skill_versions(WORKSPACE)
+                        .await
+                        .expect("contract skill rows")
+                        .is_empty()
+                );
+                let row = database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT status, outcome, result_summary FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("contract run query")
+                    .expect("contract run row");
+                assert_eq!(
+                    row.try_get::<String>("", "status").expect("status"),
+                    if mode == "reviewer_reject" {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                );
+                if mode != "reviewer_reject" {
+                    assert!(
+                        row.try_get::<Option<String>>("", "outcome")
+                            .unwrap()
+                            .is_none()
+                    );
+                    let failed = store
+                        .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(failed.analysis_cursor_json.is_some());
+                    assert!(failed.analysis_digest_json.is_some());
+                    assert_eq!(
+                        failed.last_error.as_deref(),
+                        Some("model_contract:malformed_model_json")
+                    );
+                    return Ok(());
+                }
+                assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "no_change");
+                let summary: serde_json::Value = serde_json::from_str(
+                    row.try_get::<String>("", "result_summary")
+                        .expect("result summary")
+                        .as_str(),
+                )
+                .expect("summary JSON");
+                assert_eq!(summary["reason"], expected_reason);
+                Ok(())
+            }).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_driver_retries_failed_middle_without_losing_prefix_or_tail() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("workspace must activate");
+
+            const FINAL_TAIL: &str = "VERY_LONG_FINAL_FRAGMENT_SENTINEL";
+            let long_history = format!(
+                "{}{FINAL_TAIL}",
+                "x".repeat(
+                    super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(4)
+                )
             );
             project_completed_source_turn(
                 store.as_ref(),
-                "thread_checkpoint_crash",
-                "turn_checkpoint_crash",
+                "thread_long_resume",
+                "turn_long_resume",
                 long_history.as_str(),
                 ENABLED_AT + 1,
             )
@@ -4811,174 +4650,119 @@ mod tests {
             let sources = store
                 .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
                 .await
-                .expect("checkpoint sources must query");
-            let upper = sources.last().expect("checkpoint source must exist").id;
+                .expect("long source range must query");
+            let upper = sources.last().expect("long source must exist").id;
             let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
-                .expect("checkpoint range must freeze");
+                .expect("long source range must freeze");
             let canonical = store
                 .list_canonical_turn_events_for_self_improvement(&frozen)
                 .await
-                .expect("checkpoint canonical history must load");
+                .expect("long canonical history must load");
             let snapshot = build_model_safe_full_thread_snapshot(&frozen, canonical.as_slice())
-                .expect("checkpoint snapshot must build");
+                .expect("long canonical snapshot must build");
             let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())
-                .expect("checkpoint chunks must plan");
-            assert!(chunks.len() > 1, "fixture must create multiple chunks");
+                .expect("long history must plan");
+            assert!(
+                chunks.len() > usize::try_from(MAX_CHUNK_STEPS_PER_WAKE).unwrap_or(usize::MAX),
+                "fixture must require more than one bounded wake"
+            );
+            assert!(
+                chunks
+                    .last()
+                    .and_then(|chunk| serde_json::to_string(chunk).ok())
+                    .is_some_and(|chunk| chunk.contains(FINAL_TAIL)),
+                "the final planned fragment must contain the tail sentinel"
+            );
 
-            provider.set_responses([serde_json::json!({
-                "digestRevision": 1,
-                "observations": []
-            })
-            .to_string()]);
-
-            if failure != "transport" {
-                let mut responses =
-                    vec![serde_json::json!({"digestRevision":1,"observations":[]}).to_string()];
-                if failure == "malformed" {
-                    responses.extend(vec!["{malformed".to_owned(); 3]);
-                } else {
-                    responses.push(
-                        serde_json::json!({"digestRevision":2,"observations":[]}).to_string(),
-                    );
-                    provider.terminations.lock().unwrap().extend([
-                        pioneer_provider::ProviderTermination::Complete,
-                        if failure == "length" {
-                            pioneer_provider::ProviderTermination::Length
-                        } else {
-                            pioneer_provider::ProviderTermination::ProviderError
-                        },
-                    ]);
-                }
-                provider.set_responses(responses);
+            let mut responses = Vec::new();
+            responses
+                .push(serde_json::json!({"digestRevision": 1, "observations": []}).to_string());
+            responses.extend([
+                "{malformed-middle".to_owned(),
+                "{malformed-middle".to_owned(),
+                "{malformed-middle".to_owned(),
+            ]);
+            for chunk_index in 1..chunks.len() {
+                responses.push(
+                    serde_json::json!({
+                        "digestRevision": u32::try_from(chunk_index + 1)
+                            .expect("fixture revision must fit u32"),
+                        "observations": []
+                    })
+                    .to_string(),
+                );
             }
+            provider.set_responses(responses);
+
             supervisor
                 .wake_once(ENABLED_AT + 2)
                 .await
-                .expect("provider interruption must remain contained to the workspace");
+                .expect("first bounded wake must checkpoint its exact prefix");
             let pending = store
                 .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
                 .await
-                .expect("interrupted run must query")
-                .expect("interrupted run must remain retryable");
+                .expect("pending run must query")
+                .expect("pending run must remain");
+            assert_eq!(pending.status, RUN_STATUS_FAILED);
             assert_eq!(
-                pending.status,
-                if matches!(failure, "length" | "malformed") {
-                    RUN_STATUS_FAILED
-                } else {
-                    RUN_STATUS_PENDING
-                }
+                pending.last_error.as_deref(),
+                Some("model_contract:malformed_model_json")
             );
-            if failure == "length" {
-                let count = provider.requests().len();
-                supervisor
-                    .wake_once(ENABLED_AT + 24 * 60 * 60)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    provider.requests().len(),
-                    count,
-                    "token exhaustion must not blindly retry next day"
-                );
-                assert_eq!(
-                    pending.last_error.as_deref(),
-                    Some("provider_termination:model_output_token_limit")
-                );
-            }
-            if matches!(failure, "length" | "malformed") {
-                // Explicit retry models operator recovery; it must retain the completed prefix.
-                assert_eq!(
-                    store
-                        .requeue_failed_self_improvement_run(&pending, ENABLED_AT + 3)
-                        .await
-                        .unwrap(),
-                    SelfImprovementRunMutationResult::Applied
-                );
-            }
+            let cursor = pending
+                .analysis_cursor_json
+                .as_deref()
+                .expect("budget yield must preserve its exact cursor");
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(
-                    pending
-                        .analysis_cursor_json
-                        .as_deref()
-                        .expect("first committed chunk must be checkpointed")
-                )
-                .expect("checkpoint cursor must decode")["nextChunkIndex"],
+                serde_json::from_str::<serde_json::Value>(cursor)
+                    .expect("cursor must be valid JSON")["nextChunkIndex"],
                 serde_json::json!(1)
             );
-            let first_attempt = provider.requests();
-            assert_eq!(
-                first_attempt.len(),
-                if failure == "malformed" { 4 } else { 2 },
-                "the second provider call is the simulated uncommitted interruption"
-            );
-            let request_payload = |request: &ChatRequest| {
-                request
-                    .messages
-                    .iter()
-                    .map(|message| message.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let committed_chunk_payload = request_payload(&first_attempt[0]);
-            let interrupted_chunk_payload = request_payload(&first_attempt[1]);
-            assert_ne!(committed_chunk_payload, interrupted_chunk_payload);
+            let digest = pending
+                .analysis_digest_json
+                .as_deref()
+                .expect("budget yield must preserve its bounded digest");
+            let checkpoint = ResumableHistoryAnalysis::restore(&pending, chunks.as_slice())
+                .expect("bounded checkpoint and exact deterministic plan must restore");
+            assert_eq!(checkpoint.next_chunk_index(), 1);
 
-            provider.set_responses((1..chunks.len()).map(|revision| {
-                serde_json::json!({
-                    "digestRevision": u32::try_from(revision + 1)
-                        .expect("fixture revision must fit u32"),
-                    "observations": []
-                })
-                .to_string()
-            }));
+            assert!(!digest.contains("malformed-middle"));
+            assert!(!digest.contains(FINAL_TAIL));
+            assert_eq!(
+                provider.requests().len(),
+                1 + MAX_CHUNK_CONTRACT_ATTEMPTS as usize
+            );
+
             let run_id = pending.id.clone();
-            for _ in 0..=chunks.len() {
+            // The next daily attempt resumes the same failed range, not a new run.
+            let mut wake_at = ENABLED_AT + 24 * 60 * 60;
+            for _ in 0..chunks.len() {
+                supervisor
+                    .wake_once(wake_at)
+                    .await
+                    .expect("resumed bounded wake must execute");
                 let current = store
                     .get_self_improvement_run(WORKSPACE, run_id.as_str())
                     .await
                     .expect("resumed run must query")
                     .expect("resumed run must exist");
                 if current.status == "completed" {
+                    assert_eq!(current.analysis_cursor_json, None);
+                    assert_eq!(current.analysis_digest_json, None);
                     break;
                 }
-                supervisor
-                    .wake_once(
-                        current
-                            .next_attempt_at_unix
-                            .unwrap_or(current.updated_at_unix.saturating_add(1)),
-                    )
-                    .await
-                    .expect("resumed checkpoint wake must execute");
+                assert_eq!(current.status, RUN_STATUS_PENDING);
+                wake_at = current
+                    .next_attempt_at_unix
+                    .expect("continued run must schedule its next bounded wake");
             }
 
             let completed = store
                 .get_self_improvement_run(WORKSPACE, run_id.as_str())
                 .await
-                .expect("completed run must query")
-                .expect("completed run must exist");
+                .expect("completed long run must query")
+                .expect("completed long run must exist");
             assert_eq!(completed.status, "completed");
-            let all_requests = provider.requests();
-            assert_eq!(
-                all_requests.len(),
-                chunks.len() + if failure == "malformed" { 3 } else { 1 },
-                "only the uncommitted provider call may repeat"
-            );
-            let all_payloads = all_requests.iter().map(request_payload).collect::<Vec<_>>();
-            assert_eq!(
-                all_payloads
-                    .iter()
-                    .filter(|payload| **payload == committed_chunk_payload)
-                    .count(),
-                1,
-                "the committed prefix must never replay"
-            );
-            assert_eq!(
-                all_payloads
-                    .iter()
-                    .filter(|payload| **payload == interrupted_chunk_payload)
-                    .count(),
-                if failure == "malformed" { 4 } else { 2 },
-                "only the last uncommitted chunk may be retried"
-            );
+            assert_eq!(completed.outcome.as_deref(), Some("no_change"));
             assert_eq!(
                 store
                     .get_self_improvement_workspace_state(WORKSPACE)
@@ -4988,1002 +4772,1312 @@ mod tests {
                     .cursor_source_id,
                 upper
             );
-            assert_eq!(
-                database
-                    .query_one_raw(Statement::from_string(
-                        DatabaseBackend::Sqlite,
-                        "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
-                    ))
-                    .await
-                    .expect("run count must query")
-                    .expect("run count must exist")
-                    .try_get::<i64>("", "value")
-                    .expect("run count must decode"),
-                1,
-                "restart must reuse the same frozen daily run"
+            let requests = provider.requests();
+            assert_eq!(requests.len(), chunks.len() + 3);
+            let requested_chunk_indexes = requests
+                .iter()
+                .map(|request| {
+                    let data = serde_json::from_str::<serde_json::Value>(
+                        request
+                            .messages
+                            .get(1)
+                            .expect("chunk request must contain data")
+                            .content
+                            .as_str(),
+                    )
+                    .expect("chunk request data must be JSON");
+                    data["history"]["chunk_index"]
+                        .as_u64()
+                        .expect("chunk index must be present")
+                })
+                .collect::<Vec<_>>();
+            let mut expected_indexes = vec![0, 1, 1, 1, 1];
+            expected_indexes.extend(
+                (2..chunks.len())
+                    .map(|index| u64::try_from(index).expect("fixture index must fit")),
             );
+            assert_eq!(
+                requested_chunk_indexes, expected_indexes,
+                "resume may only repeat the contract-retried chunk, never a committed prefix"
+            );
+            let last_input = requests
+                .last()
+                .and_then(|request| request.messages.get(1))
+                .expect("last chunk request must contain untrusted data");
+            assert!(
+                last_input.content.contains(FINAL_TAIL),
+                "the final fragment must reach the provider after resume"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_after_checkpoint_repeats_only_the_uncommitted_chunk() {
+        for failure in ["transport", "length", "provider_error", "malformed"] {
+            pioneer_postgres_test::with_database(async |fixture| {
+                let (database, store, workspace_manager) = test_store(fixture).await;
+                let provider = Arc::new(ScriptedLearningProvider::new());
+                let registry = Arc::new(ProviderRegistry::with_provider(
+                    "learning",
+                    provider.clone(),
+                ));
+                let supervisor = test_supervisor(
+                    store.clone(),
+                    registry,
+                    workspace_manager,
+                    GatewaySelfImprovementConfig {
+                        enabled: true,
+                        default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                            provider: "learning".to_owned(),
+                            model: "learner".to_owned(),
+                            reasoning_effort: None,
+                        }),
+                        reviewer_model: None,
+                    },
+                    1024 * 1024,
+                );
+                supervisor
+                    .reconcile_all(ENABLED_AT)
+                    .await
+                    .expect("workspace must activate");
+                let long_history = "checkpoint-crash ".repeat(
+                    super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(3)
+                        / 17,
+                );
+                project_completed_source_turn(
+                    store.as_ref(),
+                    "thread_checkpoint_crash",
+                    "turn_checkpoint_crash",
+                    long_history.as_str(),
+                    ENABLED_AT + 1,
+                )
+                .await;
+
+                let state = store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("workspace state must query")
+                    .expect("workspace state must exist");
+                let sources = store
+                    .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
+                    .await
+                    .expect("checkpoint sources must query");
+                let upper = sources.last().expect("checkpoint source must exist").id;
+                let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
+                    .expect("checkpoint range must freeze");
+                let canonical = store
+                    .list_canonical_turn_events_for_self_improvement(&frozen)
+                    .await
+                    .expect("checkpoint canonical history must load");
+                let snapshot = build_model_safe_full_thread_snapshot(&frozen, canonical.as_slice())
+                    .expect("checkpoint snapshot must build");
+                let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())
+                    .expect("checkpoint chunks must plan");
+                assert!(chunks.len() > 1, "fixture must create multiple chunks");
+
+                provider.set_responses([serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": []
+                })
+                .to_string()]);
+
+                if failure != "transport" {
+                    let mut responses =
+                        vec![serde_json::json!({"digestRevision":1,"observations":[]}).to_string()];
+                    if failure == "malformed" {
+                        responses.extend(vec!["{malformed".to_owned(); 3]);
+                    } else {
+                        responses.push(
+                            serde_json::json!({"digestRevision":2,"observations":[]}).to_string(),
+                        );
+                        provider.terminations.lock().unwrap().extend([
+                            pioneer_provider::ProviderTermination::Complete,
+                            if failure == "length" {
+                                pioneer_provider::ProviderTermination::Length
+                            } else {
+                                pioneer_provider::ProviderTermination::ProviderError
+                            },
+                        ]);
+                    }
+                    provider.set_responses(responses);
+                }
+                supervisor
+                    .wake_once(ENABLED_AT + 2)
+                    .await
+                    .expect("provider interruption must remain contained to the workspace");
+                let pending = store
+                    .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
+                    .await
+                    .expect("interrupted run must query")
+                    .expect("interrupted run must remain retryable");
+                assert_eq!(
+                    pending.status,
+                    if matches!(failure, "length" | "malformed") {
+                        RUN_STATUS_FAILED
+                    } else {
+                        RUN_STATUS_PENDING
+                    }
+                );
+                if failure == "length" {
+                    let count = provider.requests().len();
+                    supervisor
+                        .wake_once(ENABLED_AT + 24 * 60 * 60)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        provider.requests().len(),
+                        count,
+                        "token exhaustion must not blindly retry next day"
+                    );
+                    assert_eq!(
+                        pending.last_error.as_deref(),
+                        Some("provider_termination:model_output_token_limit")
+                    );
+                }
+                if matches!(failure, "length" | "malformed") {
+                    // Explicit retry models operator recovery; it must retain the completed prefix.
+                    assert_eq!(
+                        store
+                            .requeue_failed_self_improvement_run(&pending, ENABLED_AT + 3)
+                            .await
+                            .unwrap(),
+                        SelfImprovementRunMutationResult::Applied
+                    );
+                }
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        pending
+                            .analysis_cursor_json
+                            .as_deref()
+                            .expect("first committed chunk must be checkpointed")
+                    )
+                    .expect("checkpoint cursor must decode")["nextChunkIndex"],
+                    serde_json::json!(1)
+                );
+                let first_attempt = provider.requests();
+                assert_eq!(
+                    first_attempt.len(),
+                    if failure == "malformed" { 4 } else { 2 },
+                    "the second provider call is the simulated uncommitted interruption"
+                );
+                let request_payload = |request: &ChatRequest| {
+                    request
+                        .messages
+                        .iter()
+                        .map(|message| message.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let committed_chunk_payload = request_payload(&first_attempt[0]);
+                let interrupted_chunk_payload = request_payload(&first_attempt[1]);
+                assert_ne!(committed_chunk_payload, interrupted_chunk_payload);
+
+                provider.set_responses((1..chunks.len()).map(|revision| {
+                    serde_json::json!({
+                        "digestRevision": u32::try_from(revision + 1)
+                            .expect("fixture revision must fit u32"),
+                        "observations": []
+                    })
+                    .to_string()
+                }));
+                let run_id = pending.id.clone();
+                for _ in 0..=chunks.len() {
+                    let current = store
+                        .get_self_improvement_run(WORKSPACE, run_id.as_str())
+                        .await
+                        .expect("resumed run must query")
+                        .expect("resumed run must exist");
+                    if current.status == "completed" {
+                        break;
+                    }
+                    supervisor
+                        .wake_once(
+                            current
+                                .next_attempt_at_unix
+                                .unwrap_or(current.updated_at_unix.saturating_add(1)),
+                        )
+                        .await
+                        .expect("resumed checkpoint wake must execute");
+                }
+
+                let completed = store
+                    .get_self_improvement_run(WORKSPACE, run_id.as_str())
+                    .await
+                    .expect("completed run must query")
+                    .expect("completed run must exist");
+                assert_eq!(completed.status, "completed");
+                let all_requests = provider.requests();
+                assert_eq!(
+                    all_requests.len(),
+                    chunks.len() + if failure == "malformed" { 3 } else { 1 },
+                    "only the uncommitted provider call may repeat"
+                );
+                let all_payloads = all_requests.iter().map(request_payload).collect::<Vec<_>>();
+                assert_eq!(
+                    all_payloads
+                        .iter()
+                        .filter(|payload| **payload == committed_chunk_payload)
+                        .count(),
+                    1,
+                    "the committed prefix must never replay"
+                );
+                assert_eq!(
+                    all_payloads
+                        .iter()
+                        .filter(|payload| **payload == interrupted_chunk_payload)
+                        .count(),
+                    if failure == "malformed" { 4 } else { 2 },
+                    "only the last uncommitted chunk may be retried"
+                );
+                assert_eq!(
+                    store
+                        .get_self_improvement_workspace_state(WORKSPACE)
+                        .await
+                        .expect("completed state must query")
+                        .expect("completed state must exist")
+                        .cursor_source_id,
+                    upper
+                );
+                assert_eq!(
+                    database
+                        .query_one_raw(Statement::from_string(
+                            DatabaseBackend::Postgres,
+                            "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                        ))
+                        .await
+                        .expect("run count must query")
+                        .expect("run count must exist")
+                        .try_get::<i64>("", "value")
+                        .expect("run count must decode"),
+                    1,
+                    "restart must reuse the same frozen daily run"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_preserves_disabled_history()
     {
-        let (_database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let workspace_manager_for_new_workspace = workspace_manager.clone();
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig::default(),
-            1024 * 1024,
-        );
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
+            let workspace_manager_for_new_workspace = workspace_manager.clone();
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig::default(),
+                1024 * 1024,
+            );
 
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_before_enable",
-            "turn_before_enable",
-            FIRST_TEXT,
-            ENABLED_AT - 1,
-        )
-        .await;
-        supervisor
-            .wake_once(ENABLED_AT)
-            .await
-            .expect("disabled startup reconciliation must succeed");
-        let inactive = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("inactive state lookup must succeed")
-            .expect("inactive state must exist");
-        assert_eq!(inactive.activation_epoch, 0);
-        assert_eq!(inactive.cursor_source_id, 0);
-        assert!(inactive.effective_enabled_at_unix.is_none());
-
-        let enabled = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        supervisor
-            .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 1)
-            .await
-            .expect("live activation must reconcile before returning");
-        let first_epoch = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("active state lookup must succeed")
-            .expect("active state must exist");
-        assert_eq!(first_epoch.activation_epoch, 1);
-        assert_eq!(first_epoch.cursor_source_id, 0);
-        assert_eq!(first_epoch.effective_enabled_at_unix, Some(ENABLED_AT + 1));
-
-        let new_workspace = workspace_manager_for_new_workspace
-            .create_workspace("ws_created_while_enabled", Some("Created while enabled"))
-            .await
-            .expect("workspace creation must succeed");
-        assert!(
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_before_enable",
+                "turn_before_enable",
+                FIRST_TEXT,
+                ENABLED_AT - 1,
+            )
+            .await;
             supervisor
-                .load_overlay_for_new_turn(new_workspace.id.as_str())
+                .wake_once(ENABLED_AT)
                 .await
-                .expect("first-turn reconciliation must succeed")
-                .is_empty()
-        );
-        assert!(
-            store
+                .expect("disabled startup reconciliation must succeed");
+            let inactive = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("inactive state lookup must succeed")
+                .expect("inactive state must exist");
+            assert_eq!(inactive.activation_epoch, 0);
+            assert_eq!(inactive.cursor_source_id, 0);
+            assert!(inactive.effective_enabled_at_unix.is_none());
+
+            let enabled = GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "learning".to_owned(),
+                    model: "learner".to_owned(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            };
+            supervisor
+                .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 1)
+                .await
+                .expect("live activation must reconcile before returning");
+            let first_epoch = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("active state lookup must succeed")
+                .expect("active state must exist");
+            assert_eq!(first_epoch.activation_epoch, 1);
+            assert_eq!(first_epoch.cursor_source_id, 0);
+            assert_eq!(first_epoch.effective_enabled_at_unix, Some(ENABLED_AT + 1));
+
+            let new_workspace = workspace_manager_for_new_workspace
+                .create_workspace("ws_created_while_enabled", Some("Created while enabled"))
+                .await
+                .expect("workspace creation must succeed");
+            assert!(
+                supervisor
+                    .load_overlay_for_new_turn(new_workspace.id.as_str())
+                    .await
+                    .expect("first-turn reconciliation must succeed")
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .get_self_improvement_workspace_state(new_workspace.id.as_str())
+                    .await
+                    .expect("new workspace state query must succeed")
+                    .is_none(),
+                "a workspace without its own setting must remain untouched"
+            );
+            supervisor
+                .apply_desired_for_workspace(
+                    new_workspace.id.as_str(),
+                    enabled.clone(),
+                    ENABLED_AT + 2,
+                )
+                .await
+                .expect("the new workspace must be independently activatable");
+            let new_workspace_state = store
                 .get_self_improvement_workspace_state(new_workspace.id.as_str())
                 .await
                 .expect("new workspace state query must succeed")
-                .is_none(),
-            "a workspace without its own setting must remain untouched"
-        );
-        supervisor
-            .apply_desired_for_workspace(new_workspace.id.as_str(), enabled.clone(), ENABLED_AT + 2)
-            .await
-            .expect("the new workspace must be independently activatable");
-        let new_workspace_state = store
-            .get_self_improvement_workspace_state(new_workspace.id.as_str())
-            .await
-            .expect("new workspace state query must succeed")
-            .expect("new workspace must activate after its own setting changes");
-        assert_eq!(new_workspace_state.activation_epoch, 1);
-        assert_eq!(new_workspace_state.cursor_source_id, 0);
-        assert!(new_workspace_state.effective_enabled_at_unix.is_some());
+                .expect("new workspace must activate after its own setting changes");
+            assert_eq!(new_workspace_state.activation_epoch, 1);
+            assert_eq!(new_workspace_state.cursor_source_id, 0);
+            assert!(new_workspace_state.effective_enabled_at_unix.is_some());
 
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_active",
-            "turn_active",
-            SECOND_TEXT,
-            ENABLED_AT + 2,
-        )
-        .await;
-        supervisor
-            .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 3)
-            .await
-            .expect("idempotent activation must reconcile");
-        let still_first_epoch = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("idempotent state lookup must succeed")
-            .expect("idempotent state must exist");
-        assert_eq!(still_first_epoch.activation_epoch, 1);
-        assert_eq!(
-            still_first_epoch.cursor_source_id, 0,
-            "already-active reconciliation must not move the cursor"
-        );
-
-        supervisor
-            .apply_desired_for_workspace(
-                WORKSPACE,
-                GatewaySelfImprovementConfig {
-                    enabled: false,
-                    ..enabled.clone()
-                },
-                ENABLED_AT + 4,
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_active",
+                "turn_active",
+                SECOND_TEXT,
+                ENABLED_AT + 2,
             )
-            .await
-            .expect("disable must reconcile before returning");
-        let disabled = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("disabled state lookup must succeed")
-            .expect("disabled state must exist");
-        assert_eq!(disabled.activation_epoch, 1);
-        assert!(disabled.effective_enabled_at_unix.is_none());
+            .await;
+            supervisor
+                .apply_desired_for_workspace(WORKSPACE, enabled.clone(), ENABLED_AT + 3)
+                .await
+                .expect("idempotent activation must reconcile");
+            let still_first_epoch = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("idempotent state lookup must succeed")
+                .expect("idempotent state must exist");
+            assert_eq!(still_first_epoch.activation_epoch, 1);
+            assert_eq!(
+                still_first_epoch.cursor_source_id, 0,
+                "already-active reconciliation must not move the cursor"
+            );
 
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_while_disabled",
-            "turn_while_disabled",
-            FIRST_TEXT,
-            ENABLED_AT + 5,
-        )
-        .await;
-        supervisor
-            .apply_desired_for_workspace(WORKSPACE, enabled, ENABLED_AT + 6)
-            .await
-            .expect("re-enable must reconcile before returning");
-        let second_epoch = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("re-enabled state lookup must succeed")
-            .expect("re-enabled state must exist");
-        assert_eq!(second_epoch.activation_epoch, 2);
-        assert_eq!(
-            second_epoch.cursor_source_id, 0,
-            "active and disabled-window history must remain available on re-enable"
-        );
-
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_projected_late",
-            "turn_projected_late",
-            "This turn belongs to the disabled window despite late projection.",
-            ENABLED_AT + 5,
-        )
-        .await;
-        assert_eq!(
-            store
-                .list_self_improvement_source_turns_after(
+            supervisor
+                .apply_desired_for_workspace(
                     WORKSPACE,
-                    second_epoch.cursor_source_id,
-                    second_epoch
-                        .effective_enabled_at_unix
-                        .expect("re-enabled state must carry an effective timestamp"),
-                    10,
+                    GatewaySelfImprovementConfig {
+                        enabled: false,
+                        ..enabled.clone()
+                    },
+                    ENABLED_AT + 4,
                 )
                 .await
-                .expect("late-projected source lookup must succeed")
-                .len(),
-            4,
-            "late-projected history and disabled-window history must be included"
-        );
+                .expect("disable must reconcile before returning");
+            let disabled = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("disabled state lookup must succeed")
+                .expect("disabled state must exist");
+            assert_eq!(disabled.activation_epoch, 1);
+            assert!(disabled.effective_enabled_at_unix.is_none());
 
-        supervisor
-            .apply_desired_for_workspace(
-                WORKSPACE,
-                GatewaySelfImprovementConfig {
-                    enabled: true,
-                    default_model: None,
-                    reviewer_model: None,
-                },
-                ENABLED_AT + 7,
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_while_disabled",
+                "turn_while_disabled",
+                FIRST_TEXT,
+                ENABLED_AT + 5,
             )
-            .await
-            .expect("incomplete desired state must reconcile inactive");
-        let incomplete = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("incomplete state lookup must succeed")
-            .expect("incomplete state must exist");
-        assert_eq!(incomplete.activation_epoch, 2);
-        assert!(incomplete.effective_enabled_at_unix.is_none());
+            .await;
+            supervisor
+                .apply_desired_for_workspace(WORKSPACE, enabled, ENABLED_AT + 6)
+                .await
+                .expect("re-enable must reconcile before returning");
+            let second_epoch = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("re-enabled state lookup must succeed")
+                .expect("re-enabled state must exist");
+            assert_eq!(second_epoch.activation_epoch, 2);
+            assert_eq!(
+                second_epoch.cursor_source_id, 0,
+                "active and disabled-window history must remain available on re-enable"
+            );
+
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_projected_late",
+                "turn_projected_late",
+                "This turn belongs to the disabled window despite late projection.",
+                ENABLED_AT + 5,
+            )
+            .await;
+            assert_eq!(
+                store
+                    .list_self_improvement_source_turns_after(
+                        WORKSPACE,
+                        second_epoch.cursor_source_id,
+                        second_epoch
+                            .effective_enabled_at_unix
+                            .expect("re-enabled state must carry an effective timestamp"),
+                        10,
+                    )
+                    .await
+                    .expect("late-projected source lookup must succeed")
+                    .len(),
+                4,
+                "late-projected history and disabled-window history must be included"
+            );
+
+            supervisor
+                .apply_desired_for_workspace(
+                    WORKSPACE,
+                    GatewaySelfImprovementConfig {
+                        enabled: true,
+                        default_model: None,
+                        reviewer_model: None,
+                    },
+                    ENABLED_AT + 7,
+                )
+                .await
+                .expect("incomplete desired state must reconcile inactive");
+            let incomplete = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("incomplete state lookup must succeed")
+                .expect("incomplete state must exist");
+            assert_eq!(incomplete.activation_epoch, 2);
+            assert!(incomplete.effective_enabled_at_unix.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn late_old_history_receives_recent_completed_tasks_as_context_not_new_anchors() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        provider.set_responses([
-            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
-            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
-        ]);
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".into(),
-                    model: "learner".into(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor.reconcile_all(ENABLED_AT).await.unwrap();
-        project_completed_source_turn(
-            &store,
-            "recent_thread",
-            "recent_turn",
-            "Deploy through CI.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'recent_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'recent_turn' AND event_type != 'turn/completed'", ENABLED_AT, ENABLED_AT)).await.unwrap();
-        supervisor.wake_once(ENABLED_AT + 10).await.unwrap();
-        assert_eq!(provider.requests().len(), 1);
-        assert_eq!(
-            store
-                .self_improvement_processed_history_date(WORKSPACE)
-                .await
-                .unwrap(),
-            Some(ENABLED_AT)
-        );
-        project_completed_source_turn(
-            &store,
-            "old_thread",
-            "old_turn",
-            "Deploy manually.",
-            ENABLED_AT - 31_536_000,
-        )
-        .await;
-        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'old_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'old_turn' AND event_type != 'turn/completed'", ENABLED_AT - 31_536_001, ENABLED_AT - 31_536_001)).await.unwrap();
-        supervisor.wake_once(ENABLED_AT + 86_400).await.unwrap();
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 2);
-        let input: serde_json::Value = serde_json::from_str(
-            &requests[1]
-                .messages
-                .iter()
-                .find(|message| message.role == Role::User)
-                .unwrap()
-                .content,
-        )
-        .unwrap();
-        let threads = input["history"]["threads"].as_array().unwrap();
-        let turns = threads
-            .iter()
-            .flat_map(|thread| thread["turns"].as_array().unwrap())
-            .collect::<Vec<_>>();
-        for (turn_id, role, date) in [
-            ("old_turn", "new_anchor", ENABLED_AT - 31_536_001),
-            ("recent_turn", "context_only", ENABLED_AT),
-        ] {
-            let turn = turns
-                .iter()
-                .find(|turn| turn["turn_id"] == turn_id)
-                .unwrap();
-            assert!(turn["blocks"].as_array().unwrap().iter().all(|block| {
-                block["evidence_role"] == role
-                    && block["event_created_at_unix"]
-                        .as_i64()
-                        .is_some_and(|value| (date..=date + 1).contains(&value))
-            }));
-        }
-        assert_eq!(
-            store
-                .self_improvement_processed_history_date(WORKSPACE)
-                .await
-                .unwrap(),
-            Some(ENABLED_AT)
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn enabled_startup_automatically_learns_pre_activation_history() {
-        let (database, store, workspace_manager) = test_store().await;
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_uncertain_startup",
-            "turn_uncertain_startup",
-            "Persisted Settings may have committed before the previous process stopped.",
-            ENABLED_AT,
-        )
-        .await;
-        // The old private-thread filter never indexed this otherwise valid completion.
-        database
-            .execute_unprepared("DELETE FROM self_improvement_source_turn")
-            .await
-            .expect("legacy missing source fixture must apply");
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                    reasoning_effort: None,
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-
-        supervisor
-            .reconcile_all(ENABLED_AT + 1)
-            .await
-            .expect("enabled startup reconciliation must complete before dispatch");
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("startup state must query")
-            .expect("startup state must exist");
-        assert_eq!(state.activation_epoch, 1);
-        assert_eq!(
-            state.cursor_source_id, 0,
-            "startup must preserve previously unprocessed workspace history"
-        );
-        assert_eq!(state.effective_enabled_at_unix, Some(ENABLED_AT + 1));
-
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("post-reconciliation wake must be safe");
-        assert!(
-            !provider.requests().is_empty(),
-            "old history must be learned without a separate user action"
-        );
-        assert!(
-            store
-                .get_latest_self_improvement_run(WORKSPACE, state.activation_epoch)
-                .await
-                .expect("startup run lookup must succeed")
-                .is_some(),
-            "historical learning must create a normal run"
-        );
-        assert!(
-            supervisor
-                .load_overlay_for_new_turn(WORKSPACE)
-                .await
-                .expect("startup-gated overlay lookup must succeed")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn background_startup_reconciliation_uses_the_live_settings_transition_gate() {
-        let (_database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = Arc::new(test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig::default(),
-            1024 * 1024,
-        ));
-
-        let overlay_transition = supervisor.transition_gate.read().await;
-        timeout(Duration::from_secs(1), supervisor.start())
-            .await
-            .expect("worker registration must not wait for reconciliation")
-            .expect("self-improvement worker must start");
-        assert!(
-            store
-                .get_self_improvement_workspace_state(WORKSPACE)
-                .await
-                .expect("workspace state query must succeed")
-                .is_none(),
-            "startup reconciliation must wait for the same transition gate as new-turn overlays"
-        );
-
-        drop(overlay_transition);
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if store
-                    .get_self_improvement_workspace_state(WORKSPACE)
-                    .await
-                    .expect("workspace state query must succeed")
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("background reconciliation must resume after the transition finishes");
-        supervisor.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn disabled_startup_reconciliation_closes_a_stale_active_db_state() {
-        let (_database, store, workspace_manager) = test_store().await;
-        let stale_active = store
-            .activate_self_improvement_workspace(WORKSPACE, ENABLED_AT - 1)
-            .await
-            .expect("stale active state fixture must commit");
-        assert_eq!(stale_active.activation_epoch, 1);
-        assert!(stale_active.effective_enabled_at_unix.is_some());
-
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig::default(),
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("disabled startup reconciliation must succeed");
-
-        let reconciled = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("reconciled state lookup must succeed")
-            .expect("reconciled state must exist");
-        assert_eq!(
-            reconciled.activation_epoch, 1,
-            "deactivation must not invent an activation epoch"
-        );
-        assert!(reconciled.effective_enabled_at_unix.is_none());
-        assert!(
-            load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
-                .await
-                .expect("startup-gated overlay lookup must succeed")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn disable_cancels_an_inflight_provider_call_and_its_durable_run() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(BlockingLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "blocking-learning",
-            provider.clone(),
-        ));
-        let enabled = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "blocking-learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let supervisor = Arc::new(test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            enabled.clone(),
-            1024 * 1024,
-        ));
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("initial activation must reconcile");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_inflight",
-            "turn_inflight",
-            FIRST_TEXT,
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let started = provider.started.notified();
-        let wake = {
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
-        };
-        timeout(Duration::from_secs(5), started)
-            .await
-            .expect("learner provider call must start");
-        let old_fence = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
-            .await
-            .expect("inflight run must query")
-            .expect("inflight run must exist")
-            .fence()
-            .expect("inflight run must expose its old fence");
-
-        supervisor
-            .apply_desired_for_workspace(
-                WORKSPACE,
-                GatewaySelfImprovementConfig {
-                    enabled: false,
-                    ..enabled
-                },
-                ENABLED_AT + 3,
-            )
-            .await
-            .expect("disable must cancel and reconcile");
-        timeout(Duration::from_secs(5), wake)
-            .await
-            .expect("cancelled wake must terminate")
-            .expect("wake task must join")
-            .expect("cancelled wake must exit cleanly");
-
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("disabled state must load")
-            .expect("disabled state must exist");
-        assert!(state.effective_enabled_at_unix.is_none());
-        assert_eq!(
-            state.cursor_source_id, 0,
-            "disable during a provider call must not advance the source cursor"
-        );
-        assert!(
-            supervisor
-                .load_overlay_for_new_turn(WORKSPACE)
-                .await
-                .expect("disabled overlay lookup must succeed")
-                .is_empty()
-        );
-        let run = database
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT status, claim_token, lease_expires_at, last_error \
-                 FROM self_improvement_run"
-                    .to_owned(),
-            ))
-            .await
-            .expect("cancelled run query must execute")
-            .expect("cancelled run must exist");
-        assert_eq!(
-            run.try_get::<String>("", "status")
-                .expect("cancelled status must decode"),
-            "cancelled"
-        );
-        assert!(
-            run.try_get::<Option<String>>("", "claim_token")
-                .expect("cancelled claim token must decode")
-                .is_none()
-        );
-        assert!(
-            run.try_get::<Option<String>>("", "lease_expires_at")
-                .expect("cancelled lease must decode")
-                .is_none()
-        );
-        assert_eq!(
-            run.try_get::<Option<String>>("", "last_error")
-                .expect("cancel reason must decode")
-                .as_deref(),
-            Some("self_improvement_disabled")
-        );
-        assert_eq!(
-            store
-                .heartbeat_self_improvement_run(
-                    &old_fence,
-                    ENABLED_AT + 4,
-                    ENABLED_AT + 4 + RUN_LEASE_SECONDS,
-                )
-                .await
-                .expect("old worker heartbeat must report authority"),
-            SelfImprovementRunMutationResult::LostAuthority
-        );
-        assert_eq!(
-            store
-                .save_self_improvement_run_checkpoint(
-                    &old_fence,
-                    r#"{"nextChunkIndex":1}"#,
-                    r#"{"digestRevision":1,"observations":[]}"#,
-                    ENABLED_AT + 4,
-                )
-                .await
-                .expect("old worker checkpoint must report authority"),
-            SelfImprovementRunMutationResult::LostAuthority
-        );
-        assert_eq!(
-            store
-                .return_self_improvement_run_to_pending(
-                    &old_fence,
-                    ENABLED_AT + 4,
-                    ENABLED_AT + 5,
-                    "stale_after_disable",
-                )
-                .await
-                .expect("old worker status transition must report authority"),
-            SelfImprovementRunMutationResult::LostAuthority
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .expect("disabled skill lookup must succeed")
-                .is_empty(),
-            "stale provider output must not create an Agent version"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_day_model_change_reuses_the_exact_run_and_rejects_the_old_fence() {
-        let (database, store, workspace_manager) = test_store().await;
-        let old_provider = Arc::new(ReleasableLearningProvider::new());
-        let new_provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning-old",
-            old_provider.clone(),
-        ));
-        registry
-            .insert("learning-new", new_provider.clone())
-            .expect("replacement provider should fit the bounded test registry");
-        let old_config = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "learning-old".to_owned(),
-                model: "old-model".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let supervisor = Arc::new(test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            old_config,
-            1024 * 1024,
-        ));
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("old model state must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_model_change",
-            "turn_model_change",
-            "The frozen range must survive a same-day model replacement.",
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let started = old_provider.started.notified();
-        let old_wake = {
-            let supervisor = supervisor.clone();
-            tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
-        };
-        timeout(Duration::from_secs(5), started)
-            .await
-            .expect("old model call must start");
-        let running = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
-            .await
-            .expect("old-model run must query")
-            .expect("old-model run must exist");
-        let old_fence = running
-            .fence()
-            .expect("old-model run must expose its fence");
-        let frozen_run_id = running.id.clone();
-        let frozen_lower = running.source_lower_exclusive;
-        let frozen_upper = running.source_upper_inclusive;
-        let state_before = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("pre-change state must query")
-            .expect("pre-change state must exist");
-
-        supervisor
-            .apply_desired_for_workspace(
-                WORKSPACE,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            provider.set_responses([
+                r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+                r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+            ]);
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
                 GatewaySelfImprovementConfig {
                     enabled: true,
                     default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                        provider: "learning-new".to_owned(),
-                        model: "new-model".to_owned(),
+                        provider: "learning".into(),
+                        model: "learner".into(),
                         reasoning_effort: None,
                     }),
                     reviewer_model: None,
                 },
-                ENABLED_AT + 3,
+                1024 * 1024,
+            );
+            supervisor.reconcile_all(ENABLED_AT).await.unwrap();
+            project_completed_source_turn(
+                &store,
+                "recent_thread",
+                "recent_turn",
+                "Deploy through CI.",
+                ENABLED_AT + 1,
             )
-            .await
-            .expect("model replacement must reconcile");
-        timeout(Duration::from_secs(5), old_wake)
-            .await
-            .expect("old-model wake must stop")
-            .expect("old-model wake task must join")
-            .expect("old-model wake must exit cleanly");
-
-        let reset = store
-            .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
-            .await
-            .expect("reset run must query")
-            .expect("reset run must exist");
-        assert_eq!(reset.status, RUN_STATUS_PENDING);
-        assert_eq!(reset.id, frozen_run_id);
-        assert_eq!(reset.source_lower_exclusive, frozen_lower);
-        assert_eq!(reset.source_upper_inclusive, frozen_upper);
-        assert_eq!(reset.activation_epoch, state_before.activation_epoch);
-        assert_eq!(reset.learner_provider, "learning-new");
-        assert_eq!(reset.learner_model, "new-model");
-        assert_eq!(reset.reviewer_provider, "learning-new");
-        assert_eq!(reset.reviewer_model, "new-model");
-        assert_eq!(reset.pipeline_contract_version, PIPELINE_CONTRACT_VERSION);
-        assert_eq!(reset.attempt_count, 0);
-        assert_eq!(reset.claim_token, None);
-        assert_eq!(reset.analysis_cursor_json, None);
-        assert_eq!(reset.analysis_digest_json, None);
-        assert_eq!(
-            store
-                .heartbeat_self_improvement_run(
-                    &old_fence,
-                    ENABLED_AT + 4,
-                    ENABLED_AT + 4 + RUN_LEASE_SECONDS,
-                )
-                .await
-                .expect("old-model heartbeat must report authority"),
-            SelfImprovementRunMutationResult::LostAuthority
-        );
-        let state_after_reset = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("post-change state must query")
-            .expect("post-change state must exist");
-        assert_eq!(
-            state_after_reset.activation_epoch,
-            state_before.activation_epoch
-        );
-        assert_eq!(
-            state_after_reset.cursor_source_id,
-            state_before.cursor_source_id
-        );
-
-        new_provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": []
-            })
-            .to_string(),
-            serde_json::json!({ "candidate": null }).to_string(),
-        ]);
-        supervisor
-            .wake_once(ENABLED_AT + 5)
-            .await
-            .expect("new model must finish the reset run");
-        let completed = store
-            .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
-            .await
-            .expect("completed model-change run must query")
-            .expect("completed model-change run must exist");
-        assert_eq!(completed.status, "completed");
-        assert_eq!(completed.id, frozen_run_id);
-        assert_eq!(completed.source_upper_inclusive, frozen_upper);
-        assert_eq!(
-            database
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
-                ))
-                .await
-                .expect("model-change run count must query")
-                .expect("model-change run count must exist")
-                .try_get::<i64>("", "value")
-                .expect("model-change run count must decode"),
-            1
-        );
-        assert!(
-            store
-                .list_active_agent_skill_versions(WORKSPACE)
-                .await
-                .expect("model-change skill rows must query")
-                .is_empty(),
-            "discarded old output and no-change new output must create no version"
-        );
+            .await;
+            database.execute_unprepared(&format!("UPDATE turn SET created_at = to_timestamp({}) WHERE id = 'recent_turn'; UPDATE turn_event SET created_at = to_timestamp({}) WHERE turn_id = 'recent_turn' AND event_type != 'turn/completed'", ENABLED_AT, ENABLED_AT)).await.unwrap();
+            supervisor.wake_once(ENABLED_AT + 10).await.unwrap();
+            assert_eq!(provider.requests().len(), 1);
+            assert_eq!(
+                store
+                    .self_improvement_processed_history_date(WORKSPACE)
+                    .await
+                    .unwrap(),
+                Some(ENABLED_AT)
+            );
+            project_completed_source_turn(
+                &store,
+                "old_thread",
+                "old_turn",
+                "Deploy manually.",
+                ENABLED_AT - 31_536_000,
+            )
+            .await;
+            database.execute_unprepared(&format!("UPDATE turn SET created_at = to_timestamp({}) WHERE id = 'old_turn'; UPDATE turn_event SET created_at = to_timestamp({}) WHERE turn_id = 'old_turn' AND event_type != 'turn/completed'", ENABLED_AT - 31_536_001, ENABLED_AT - 31_536_001)).await.unwrap();
+            supervisor.wake_once(ENABLED_AT + 86_400).await.unwrap();
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 2);
+            let input: serde_json::Value = serde_json::from_str(
+                &requests[1]
+                    .messages
+                    .iter()
+                    .find(|message| message.role == Role::User)
+                    .unwrap()
+                    .content,
+            )
+            .unwrap();
+            let threads = input["history"]["threads"].as_array().unwrap();
+            let turns = threads
+                .iter()
+                .flat_map(|thread| thread["turns"].as_array().unwrap())
+                .collect::<Vec<_>>();
+            for (turn_id, role, date) in [
+                ("old_turn", "new_anchor", ENABLED_AT - 31_536_001),
+                ("recent_turn", "context_only", ENABLED_AT),
+            ] {
+                let turn = turns
+                    .iter()
+                    .find(|turn| turn["turn_id"] == turn_id)
+                    .unwrap();
+                assert!(turn["blocks"].as_array().unwrap().iter().all(|block| {
+                    block["evidence_role"] == role
+                        && block["event_created_at_unix"]
+                            .as_i64()
+                            .is_some_and(|value| (date..=date + 1).contains(&value))
+                }));
+            }
+            assert_eq!(
+                store
+                    .self_improvement_processed_history_date(WORKSPACE)
+                    .await
+                    .unwrap(),
+                Some(ENABLED_AT)
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
-    async fn deploy_contract_mismatch_resets_checkpoint_and_reuses_the_frozen_range() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
+    async fn enabled_startup_automatically_learns_pre_activation_history() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_uncertain_startup",
+                "turn_uncertain_startup",
+                "Persisted Settings may have committed before the previous process stopped.",
+                ENABLED_AT,
+            )
+            .await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
+
+            supervisor
+                .reconcile_all(ENABLED_AT + 1)
+                .await
+                .expect("enabled startup reconciliation must complete before dispatch");
+            let state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("startup state must query")
+                .expect("startup state must exist");
+            assert_eq!(state.activation_epoch, 1);
+            assert_eq!(
+                state.cursor_source_id, 0,
+                "startup must preserve previously unprocessed workspace history"
+            );
+            assert_eq!(state.effective_enabled_at_unix, Some(ENABLED_AT + 1));
+
+            supervisor
+                .wake_once(ENABLED_AT + 2)
+                .await
+                .expect("post-reconciliation wake must be safe");
+            assert!(
+                !provider.requests().is_empty(),
+                "old history must be learned without a separate user action"
+            );
+            assert!(
+                store
+                    .get_latest_self_improvement_run(WORKSPACE, state.activation_epoch)
+                    .await
+                    .expect("startup run lookup must succeed")
+                    .is_some(),
+                "historical learning must create a normal run"
+            );
+            assert!(
+                supervisor
+                    .load_overlay_for_new_turn(WORKSPACE)
+                    .await
+                    .expect("startup-gated overlay lookup must succeed")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_startup_reconciliation_uses_the_live_settings_transition_gate() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
+            let supervisor = Arc::new(test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig::default(),
+                1024 * 1024,
+            ));
+
+            let overlay_transition = supervisor.transition_gate.read().await;
+            timeout(Duration::from_secs(1), supervisor.start())
+                .await
+                .expect("worker registration must not wait for reconciliation")
+                .expect("self-improvement worker must start");
+            assert!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("workspace state query must succeed")
+                    .is_none(),
+                "startup reconciliation must wait for the same transition gate as new-turn overlays"
+            );
+
+            drop(overlay_transition);
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if store
+                        .get_self_improvement_workspace_state(WORKSPACE)
+                        .await
+                        .expect("workspace state query must succeed")
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("background reconciliation must resume after the transition finishes");
+            supervisor.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_startup_reconciliation_closes_a_stale_active_db_state() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspace_manager) = test_store(fixture).await;
+            let stale_active = store
+                .activate_self_improvement_workspace(WORKSPACE, ENABLED_AT - 1)
+                .await
+                .expect("stale active state fixture must commit");
+            assert_eq!(stale_active.activation_epoch, 1);
+            assert!(stale_active.effective_enabled_at_unix.is_some());
+
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider("learning", provider));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig::default(),
+                1024 * 1024,
+            );
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("disabled startup reconciliation must succeed");
+
+            let reconciled = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("reconciled state lookup must succeed")
+                .expect("reconciled state must exist");
+            assert_eq!(
+                reconciled.activation_epoch, 1,
+                "deactivation must not invent an activation epoch"
+            );
+            assert!(reconciled.effective_enabled_at_unix.is_none());
+            assert!(
+                load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
+                    .await
+                    .expect("startup-gated overlay lookup must succeed")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disable_cancels_an_inflight_provider_call_and_its_durable_run() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(BlockingLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "blocking-learning",
+                provider.clone(),
+            ));
+            let enabled = GatewaySelfImprovementConfig {
                 enabled: true,
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
+                    provider: "blocking-learning".to_owned(),
                     model: "learner".to_owned(),
                     reasoning_effort: None,
                 }),
                 reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("contract fixture must activate");
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_contract_reset",
-            "turn_contract_reset",
-            "A deploy contract change must restart the same frozen range.",
-            ENABLED_AT + 1,
-        )
-        .await;
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("contract state must query")
-            .expect("contract state must exist");
-        let sources = store
-            .list_self_improvement_source_turns_after(
-                WORKSPACE,
-                state.cursor_source_id,
-                state
-                    .effective_enabled_at_unix
-                    .expect("state must be active"),
-                10,
+            };
+            let supervisor = Arc::new(test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                enabled.clone(),
+                1024 * 1024,
+            ));
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("initial activation must reconcile");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_inflight",
+                "turn_inflight",
+                FIRST_TEXT,
+                ENABLED_AT + 1,
             )
-            .await
-            .expect("contract sources must query");
-        let old_contract_run = store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: WORKSPACE.to_owned(),
-                    activation_epoch: state.activation_epoch,
-                    scheduled_date_utc: DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
-                        .expect("fixture timestamp must be valid")
-                        .format("%Y-%m-%d")
-                        .to_string(),
-                    source_lower_exclusive: state.cursor_source_id,
-                    source_upper_inclusive: sources[0].id,
-                    learner_provider: "learning".to_owned(),
-                    learner_model: "learner".to_owned(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "learning".to_owned(),
-                    reviewer_model: "learner".to_owned(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: "self-improvement-v0".to_owned(),
-                },
-                ENABLED_AT + 2,
-            )
-            .await
-            .expect("old-contract run must freeze");
-        let claimed = store
-            .claim_available_self_improvement_run(
-                WORKSPACE,
-                old_contract_run.id.as_str(),
-                state.activation_epoch,
-                "old-deploy",
-                ENABLED_AT + 3,
-                ENABLED_AT + 600,
-            )
-            .await
-            .expect("old-contract run claim must execute")
-            .expect("old-contract run claim must win");
-        let old_fence = claimed
-            .fence()
-            .expect("old-contract claim must expose a fence");
-        assert_eq!(
-            store
-                .save_self_improvement_run_checkpoint(
-                    &old_fence,
-                    r#"{"nextChunk":1}"#,
-                    r#"{"digestRevision":1,"observations":[]}"#,
-                    ENABLED_AT + 4,
+            .await;
+
+            let started = provider.started.notified();
+            let wake = {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
+            };
+            timeout(Duration::from_secs(5), started)
+                .await
+                .expect("learner provider call must start");
+            let old_fence = store
+                .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                .await
+                .expect("inflight run must query")
+                .expect("inflight run must exist")
+                .fence()
+                .expect("inflight run must expose its old fence");
+
+            supervisor
+                .apply_desired_for_workspace(
+                    WORKSPACE,
+                    GatewaySelfImprovementConfig {
+                        enabled: false,
+                        ..enabled
+                    },
+                    ENABLED_AT + 3,
                 )
                 .await
-                .expect("old-contract checkpoint must save"),
-            SelfImprovementRunMutationResult::Applied
-        );
-
-        supervisor
-            .reconcile_all(ENABLED_AT + 5)
-            .await
-            .expect("new deploy contract must reconcile");
-        let reset = store
-            .get_self_improvement_run(WORKSPACE, old_contract_run.id.as_str())
-            .await
-            .expect("contract-reset run must query")
-            .expect("contract-reset run must exist");
-        assert_eq!(reset.status, RUN_STATUS_PENDING);
-        assert_eq!(reset.id, old_contract_run.id);
-        assert_eq!(
-            reset.source_upper_inclusive,
-            old_contract_run.source_upper_inclusive
-        );
-        assert_eq!(reset.activation_epoch, state.activation_epoch);
-        assert_eq!(reset.pipeline_contract_version, PIPELINE_CONTRACT_VERSION);
-        assert_eq!(reset.analysis_cursor_json, None);
-        assert_eq!(reset.analysis_digest_json, None);
-        assert_eq!(reset.claim_token, None);
-        assert_eq!(reset.attempt_count, 0);
-        assert_eq!(
-            store
-                .save_self_improvement_run_checkpoint(
-                    &old_fence,
-                    r#"{"nextChunk":2}"#,
-                    r#"{"digestRevision":2,"observations":[]}"#,
-                    ENABLED_AT + 6,
-                )
+                .expect("disable must cancel and reconcile");
+            timeout(Duration::from_secs(5), wake)
                 .await
-                .expect("old-contract checkpoint must report authority"),
-            SelfImprovementRunMutationResult::LostAuthority
-        );
+                .expect("cancelled wake must terminate")
+                .expect("wake task must join")
+                .expect("cancelled wake must exit cleanly");
 
-        provider.set_responses([
-            serde_json::json!({
-                "digestRevision": 1,
-                "observations": []
-            })
-            .to_string(),
-            serde_json::json!({ "candidate": null }).to_string(),
-        ]);
-        supervisor
-            .wake_once(ENABLED_AT + 7)
-            .await
-            .expect("current contract must finish the reset range");
-        let completed = store
-            .get_self_improvement_run(WORKSPACE, old_contract_run.id.as_str())
-            .await
-            .expect("completed contract run must query")
-            .expect("completed contract run must exist");
-        assert_eq!(completed.status, "completed");
-        assert_eq!(
-            completed.pipeline_contract_version,
-            PIPELINE_CONTRACT_VERSION
-        );
-        assert_eq!(
-            database
+            let state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("disabled state must load")
+                .expect("disabled state must exist");
+            assert!(state.effective_enabled_at_unix.is_none());
+            assert_eq!(
+                state.cursor_source_id, 0,
+                "disable during a provider call must not advance the source cursor"
+            );
+            assert!(
+                supervisor
+                    .load_overlay_for_new_turn(WORKSPACE)
+                    .await
+                    .expect("disabled overlay lookup must succeed")
+                    .is_empty()
+            );
+            let run = database
                 .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                    DatabaseBackend::Postgres,
+                    "SELECT status, claim_token, lease_expires_at, last_error \
+                     FROM self_improvement_run"
+                        .to_owned(),
                 ))
                 .await
-                .expect("contract run count must query")
-                .expect("contract run count must exist")
-                .try_get::<i64>("", "value")
-                .expect("contract run count must decode"),
-            1
-        );
+                .expect("cancelled run query must execute")
+                .expect("cancelled run must exist");
+            assert_eq!(
+                run.try_get::<String>("", "status")
+                    .expect("cancelled status must decode"),
+                "cancelled"
+            );
+            assert!(
+                run.try_get::<Option<String>>("", "claim_token")
+                    .expect("cancelled claim token must decode")
+                    .is_none()
+            );
+            assert!(
+                run.try_get::<Option<String>>("", "lease_expires_at")
+                    .expect("cancelled lease must decode")
+                    .is_none()
+            );
+            assert_eq!(
+                run.try_get::<Option<String>>("", "last_error")
+                    .expect("cancel reason must decode")
+                    .as_deref(),
+                Some("self_improvement_disabled")
+            );
+            assert_eq!(
+                store
+                    .heartbeat_self_improvement_run(
+                        &old_fence,
+                        ENABLED_AT + 4,
+                        ENABLED_AT + 4 + RUN_LEASE_SECONDS,
+                    )
+                    .await
+                    .expect("old worker heartbeat must report authority"),
+                SelfImprovementRunMutationResult::LostAuthority
+            );
+            assert_eq!(
+                store
+                    .save_self_improvement_run_checkpoint(
+                        &old_fence,
+                        r#"{"nextChunkIndex":1}"#,
+                        r#"{"digestRevision":1,"observations":[]}"#,
+                        ENABLED_AT + 4,
+                    )
+                    .await
+                    .expect("old worker checkpoint must report authority"),
+                SelfImprovementRunMutationResult::LostAuthority
+            );
+            assert_eq!(
+                store
+                    .return_self_improvement_run_to_pending(
+                        &old_fence,
+                        ENABLED_AT + 4,
+                        ENABLED_AT + 5,
+                        "stale_after_disable",
+                    )
+                    .await
+                    .expect("old worker status transition must report authority"),
+                SelfImprovementRunMutationResult::LostAuthority
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .expect("disabled skill lookup must succeed")
+                    .is_empty(),
+                "stale provider output must not create an Agent version"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_day_model_change_reuses_the_exact_run_and_rejects_the_old_fence() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let old_provider = Arc::new(ReleasableLearningProvider::new());
+            let new_provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning-old",
+                old_provider.clone(),
+            ));
+            registry
+                .insert("learning-new", new_provider.clone())
+                .expect("replacement provider should fit the bounded test registry");
+            let old_config = GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "learning-old".to_owned(),
+                    model: "old-model".to_owned(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            };
+            let supervisor = Arc::new(test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                old_config,
+                1024 * 1024,
+            ));
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("old model state must activate");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_model_change",
+                "turn_model_change",
+                "The frozen range must survive a same-day model replacement.",
+                ENABLED_AT + 1,
+            )
+            .await;
+
+            let started = old_provider.started.notified();
+            let old_wake = {
+                let supervisor = supervisor.clone();
+                tokio::spawn(async move { supervisor.wake_once(ENABLED_AT + 2).await })
+            };
+            timeout(Duration::from_secs(5), started)
+                .await
+                .expect("old model call must start");
+            let running = store
+                .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                .await
+                .expect("old-model run must query")
+                .expect("old-model run must exist");
+            let old_fence = running
+                .fence()
+                .expect("old-model run must expose its fence");
+            let frozen_run_id = running.id.clone();
+            let frozen_lower = running.source_lower_exclusive;
+            let frozen_upper = running.source_upper_inclusive;
+            let state_before = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("pre-change state must query")
+                .expect("pre-change state must exist");
+
+            supervisor
+                .apply_desired_for_workspace(
+                    WORKSPACE,
+                    GatewaySelfImprovementConfig {
+                        enabled: true,
+                        default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                            provider: "learning-new".to_owned(),
+                            model: "new-model".to_owned(),
+                            reasoning_effort: None,
+                        }),
+                        reviewer_model: None,
+                    },
+                    ENABLED_AT + 3,
+                )
+                .await
+                .expect("model replacement must reconcile");
+            timeout(Duration::from_secs(5), old_wake)
+                .await
+                .expect("old-model wake must stop")
+                .expect("old-model wake task must join")
+                .expect("old-model wake must exit cleanly");
+
+            let reset = store
+                .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
+                .await
+                .expect("reset run must query")
+                .expect("reset run must exist");
+            assert_eq!(reset.status, RUN_STATUS_PENDING);
+            assert_eq!(reset.id, frozen_run_id);
+            assert_eq!(reset.source_lower_exclusive, frozen_lower);
+            assert_eq!(reset.source_upper_inclusive, frozen_upper);
+            assert_eq!(reset.activation_epoch, state_before.activation_epoch);
+            assert_eq!(reset.learner_provider, "learning-new");
+            assert_eq!(reset.learner_model, "new-model");
+            assert_eq!(reset.reviewer_provider, "learning-new");
+            assert_eq!(reset.reviewer_model, "new-model");
+            assert_eq!(reset.pipeline_contract_version, PIPELINE_CONTRACT_VERSION);
+            assert_eq!(reset.attempt_count, 0);
+            assert_eq!(reset.claim_token, None);
+            assert_eq!(reset.analysis_cursor_json, None);
+            assert_eq!(reset.analysis_digest_json, None);
+            assert_eq!(
+                store
+                    .heartbeat_self_improvement_run(
+                        &old_fence,
+                        ENABLED_AT + 4,
+                        ENABLED_AT + 4 + RUN_LEASE_SECONDS,
+                    )
+                    .await
+                    .expect("old-model heartbeat must report authority"),
+                SelfImprovementRunMutationResult::LostAuthority
+            );
+            let state_after_reset = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("post-change state must query")
+                .expect("post-change state must exist");
+            assert_eq!(
+                state_after_reset.activation_epoch,
+                state_before.activation_epoch
+            );
+            assert_eq!(
+                state_after_reset.cursor_source_id,
+                state_before.cursor_source_id
+            );
+
+            new_provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": []
+                })
+                .to_string(),
+                serde_json::json!({ "candidate": null }).to_string(),
+            ]);
+            supervisor
+                .wake_once(ENABLED_AT + 5)
+                .await
+                .expect("new model must finish the reset run");
+            let completed = store
+                .get_self_improvement_run(WORKSPACE, frozen_run_id.as_str())
+                .await
+                .expect("completed model-change run must query")
+                .expect("completed model-change run must exist");
+            assert_eq!(completed.status, "completed");
+            assert_eq!(completed.id, frozen_run_id);
+            assert_eq!(completed.source_upper_inclusive, frozen_upper);
+            assert_eq!(
+                database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("model-change run count must query")
+                    .expect("model-change run count must exist")
+                    .try_get::<i64>("", "value")
+                    .expect("model-change run count must decode"),
+                1
+            );
+            assert!(
+                store
+                    .list_active_agent_skill_versions(WORKSPACE)
+                    .await
+                    .expect("model-change skill rows must query")
+                    .is_empty(),
+                "discarded old output and no-change new output must create no version"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_contract_mismatch_resets_checkpoint_and_reuses_the_frozen_range() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (database, store, workspace_manager) = test_store(fixture).await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
+            supervisor
+                .reconcile_all(ENABLED_AT)
+                .await
+                .expect("contract fixture must activate");
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_contract_reset",
+                "turn_contract_reset",
+                "A deploy contract change must restart the same frozen range.",
+                ENABLED_AT + 1,
+            )
+            .await;
+            let state = store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .expect("contract state must query")
+                .expect("contract state must exist");
+            let sources = store
+                .list_self_improvement_source_turns_after(
+                    WORKSPACE,
+                    state.cursor_source_id,
+                    state
+                        .effective_enabled_at_unix
+                        .expect("state must be active"),
+                    10,
+                )
+                .await
+                .expect("contract sources must query");
+            let old_contract_run = store
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: WORKSPACE.to_owned(),
+                        activation_epoch: state.activation_epoch,
+                        scheduled_date_utc: DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
+                            .expect("fixture timestamp must be valid")
+                            .format("%Y-%m-%d")
+                            .to_string(),
+                        source_lower_exclusive: state.cursor_source_id,
+                        source_upper_inclusive: sources[0].id,
+                        learner_provider: "learning".to_owned(),
+                        learner_model: "learner".to_owned(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "learning".to_owned(),
+                        reviewer_model: "learner".to_owned(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: "self-improvement-v0".to_owned(),
+                    },
+                    ENABLED_AT + 2,
+                )
+                .await
+                .expect("old-contract run must freeze");
+            let claimed = store
+                .claim_available_self_improvement_run(
+                    WORKSPACE,
+                    old_contract_run.id.as_str(),
+                    state.activation_epoch,
+                    "old-deploy",
+                    ENABLED_AT + 3,
+                    ENABLED_AT + 600,
+                )
+                .await
+                .expect("old-contract run claim must execute")
+                .expect("old-contract run claim must win");
+            let old_fence = claimed
+                .fence()
+                .expect("old-contract claim must expose a fence");
+            assert_eq!(
+                store
+                    .save_self_improvement_run_checkpoint(
+                        &old_fence,
+                        r#"{"nextChunk":1}"#,
+                        r#"{"digestRevision":1,"observations":[]}"#,
+                        ENABLED_AT + 4,
+                    )
+                    .await
+                    .expect("old-contract checkpoint must save"),
+                SelfImprovementRunMutationResult::Applied
+            );
+
+            supervisor
+                .reconcile_all(ENABLED_AT + 5)
+                .await
+                .expect("new deploy contract must reconcile");
+            let reset = store
+                .get_self_improvement_run(WORKSPACE, old_contract_run.id.as_str())
+                .await
+                .expect("contract-reset run must query")
+                .expect("contract-reset run must exist");
+            assert_eq!(reset.status, RUN_STATUS_PENDING);
+            assert_eq!(reset.id, old_contract_run.id);
+            assert_eq!(
+                reset.source_upper_inclusive,
+                old_contract_run.source_upper_inclusive
+            );
+            assert_eq!(reset.activation_epoch, state.activation_epoch);
+            assert_eq!(reset.pipeline_contract_version, PIPELINE_CONTRACT_VERSION);
+            assert_eq!(reset.analysis_cursor_json, None);
+            assert_eq!(reset.analysis_digest_json, None);
+            assert_eq!(reset.claim_token, None);
+            assert_eq!(reset.attempt_count, 0);
+            assert_eq!(
+                store
+                    .save_self_improvement_run_checkpoint(
+                        &old_fence,
+                        r#"{"nextChunk":2}"#,
+                        r#"{"digestRevision":2,"observations":[]}"#,
+                        ENABLED_AT + 6,
+                    )
+                    .await
+                    .expect("old-contract checkpoint must report authority"),
+                SelfImprovementRunMutationResult::LostAuthority
+            );
+
+            provider.set_responses([
+                serde_json::json!({
+                    "digestRevision": 1,
+                    "observations": []
+                })
+                .to_string(),
+                serde_json::json!({ "candidate": null }).to_string(),
+            ]);
+            supervisor
+                .wake_once(ENABLED_AT + 7)
+                .await
+                .expect("current contract must finish the reset range");
+            let completed = store
+                .get_self_improvement_run(WORKSPACE, old_contract_run.id.as_str())
+                .await
+                .expect("completed contract run must query")
+                .expect("completed contract run must exist");
+            assert_eq!(completed.status, "completed");
+            assert_eq!(
+                completed.pipeline_contract_version,
+                PIPELINE_CONTRACT_VERSION
+            );
+            assert_eq!(
+                database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("contract run count must query")
+                    .expect("contract run count must exist")
+                    .try_get::<i64>("", "value")
+                    .expect("contract run count must decode"),
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -6014,168 +6108,179 @@ mod tests {
                 reviewer_model: None,
             },
         ] {
-            let (database, store, workspace_manager) = test_store().await;
-            project_completed_source_turn(
-                store.as_ref(),
-                "thread_disabled",
-                "turn_disabled",
-                FIRST_TEXT,
-                ENABLED_AT + 1,
-            )
-            .await;
-            let provider = Arc::new(ScriptedLearningProvider::new());
-            let registry = Arc::new(ProviderRegistry::with_provider(
-                "learning",
-                provider.clone(),
-            ));
-            let supervisor = test_supervisor(
-                store.clone(),
-                registry,
-                workspace_manager,
-                config,
-                1024 * 1024,
-            );
-            supervisor
-                .wake_once(ENABLED_AT + 2)
-                .await
-                .expect("disabled reconciliation must succeed");
-
-            assert!(provider.requests().is_empty());
-            assert!(
-                load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
+            pioneer_postgres_test::with_database(async |fixture| {
+                let (database, store, workspace_manager) = test_store(fixture).await;
+                project_completed_source_turn(
+                    store.as_ref(),
+                    "thread_disabled",
+                    "turn_disabled",
+                    FIRST_TEXT,
+                    ENABLED_AT + 1,
+                )
+                .await;
+                let provider = Arc::new(ScriptedLearningProvider::new());
+                let registry = Arc::new(ProviderRegistry::with_provider(
+                    "learning",
+                    provider.clone(),
+                ));
+                let supervisor = test_supervisor(
+                    store.clone(),
+                    registry,
+                    workspace_manager,
+                    config,
+                    1024 * 1024,
+                );
+                supervisor
+                    .wake_once(ENABLED_AT + 2)
                     .await
-                    .expect("disabled overlay lookup must succeed")
-                    .is_empty()
-            );
-            let run_count = database
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT COUNT(*) AS count FROM self_improvement_run".to_owned(),
-                ))
-                .await
-                .expect("run count query must execute")
-                .expect("run count row must exist")
-                .try_get::<i64>("", "count")
-                .expect("run count must decode");
-            assert_eq!(run_count, 0);
+                    .expect("disabled reconciliation must succeed");
+
+                assert!(provider.requests().is_empty());
+                assert!(
+                    load_active_agent_skill_overlay(store.as_ref(), WORKSPACE)
+                        .await
+                        .expect("disabled overlay lookup must succeed")
+                        .is_empty()
+                );
+                let run_count = database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT COUNT(*) AS count FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("run count query must execute")
+                    .expect("run count row must exist")
+                    .try_get::<i64>("", "count")
+                    .expect("run count must decode");
+                assert_eq!(run_count, 0);
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
     #[tokio::test]
     async fn provider_timeout_preserves_checkpoint_and_reports_stage() {
-        let (_database, store, workspaces) = test_store().await;
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            Arc::new(ScriptedLearningProvider::new()),
-        ));
-        let desired = GatewaySelfImprovementConfig {
-            enabled: true,
-            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                provider: "learning".to_owned(),
-                model: "learner".to_owned(),
-                reasoning_effort: None,
-            }),
-            reviewer_model: None,
-        };
-        let supervisor = test_supervisor(store.clone(), registry, workspaces, desired, 1024 * 1024);
-        supervisor.reconcile_all(ENABLED_AT).await.unwrap();
-        project_completed_source_turn(
-            &store,
-            "timeout-thread",
-            "timeout-turn",
-            "Completed source",
-            ENABLED_AT + 1,
-        )
-        .await;
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .unwrap()
-            .unwrap();
-        let run = store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: WORKSPACE.to_owned(),
-                    activation_epoch: state.activation_epoch,
-                    scheduled_date_utc: DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
-                        .unwrap()
-                        .format("%Y-%m-%d")
-                        .to_string(),
-                    source_lower_exclusive: 0,
-                    source_upper_inclusive: 1,
-                    learner_provider: "learning".to_owned(),
-                    learner_model: "learner".to_owned(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "learning".to_owned(),
-                    reviewer_model: "learner".to_owned(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
-                },
-                ENABLED_AT + 2,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_database, store, workspaces) = test_store(fixture).await;
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                Arc::new(ScriptedLearningProvider::new()),
+            ));
+            let desired = GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "learning".to_owned(),
+                    model: "learner".to_owned(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            };
+            let supervisor =
+                test_supervisor(store.clone(), registry, workspaces, desired, 1024 * 1024);
+            supervisor.reconcile_all(ENABLED_AT).await.unwrap();
+            project_completed_source_turn(
+                &store,
+                "timeout-thread",
+                "timeout-turn",
+                "Completed source",
+                ENABLED_AT + 1,
             )
-            .await
-            .unwrap();
-        let claimed = store
-            .claim_available_self_improvement_run(
-                WORKSPACE,
-                &run.id,
-                state.activation_epoch,
-                "timeout-worker",
-                ENABLED_AT + 2,
-                ENABLED_AT + RUN_LEASE_SECONDS,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let fence = claimed.fence().unwrap();
-        let cursor = r#"{"nextChunkIndex":1}"#;
-        let digest = r#"{"validated":{"observations":[]}}"#;
-        store
-            .save_self_improvement_run_checkpoint(&fence, cursor, digest, ENABLED_AT + 2)
-            .await
-            .unwrap();
-        let clock = RunLeaseClock::new(ENABLED_AT + 2);
-        let entered = Notify::new();
-        let call = supervisor.provider_call_with_lease(&fence, &clock, "review", async {
-            entered.notify_one();
-            std::future::pending::<Result<()>>().await
-        });
-        tokio::pin!(call);
-        tokio::select! {
-            _ = entered.notified() => {},
-            _ = &mut call => panic!("provider must remain pending"),
-        }
-        tokio::time::pause();
-        tokio::time::advance(PROVIDER_CALL_TIMEOUT + Duration::from_secs(1)).await;
-        let error = call.await.unwrap_err();
-        tokio::time::resume();
-        assert_eq!(
-            classify_execution_failure(&error).reason_code,
-            "review_timeout"
-        );
-        supervisor
-            .handle_execution_failure(&claimed, error, ENABLED_AT + 2, PROVIDER_CALL_TIMEOUT)
-            .await
-            .unwrap();
-        let pending = store
-            .get_self_improvement_run(WORKSPACE, &run.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, RUN_STATUS_PENDING);
-        assert_eq!(
-            pending.last_error.as_deref(),
-            Some("provider_timeout:review_timeout")
-        );
-        assert_eq!(pending.analysis_cursor_json.as_deref(), Some(cursor));
-        assert_eq!(pending.analysis_digest_json.as_deref(), Some(digest));
-        assert_eq!(
-            store
+            .await;
+            let state = store
                 .get_self_improvement_workspace_state(WORKSPACE)
                 .await
                 .unwrap()
+                .unwrap();
+            let run = store
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: WORKSPACE.to_owned(),
+                        activation_epoch: state.activation_epoch,
+                        scheduled_date_utc: DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
+                            .unwrap()
+                            .format("%Y-%m-%d")
+                            .to_string(),
+                        source_lower_exclusive: 0,
+                        source_upper_inclusive: 1,
+                        learner_provider: "learning".to_owned(),
+                        learner_model: "learner".to_owned(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "learning".to_owned(),
+                        reviewer_model: "learner".to_owned(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
+                    },
+                    ENABLED_AT + 2,
+                )
+                .await
+                .unwrap();
+            let claimed = store
+                .claim_available_self_improvement_run(
+                    WORKSPACE,
+                    &run.id,
+                    state.activation_epoch,
+                    "timeout-worker",
+                    ENABLED_AT + 2,
+                    ENABLED_AT + RUN_LEASE_SECONDS,
+                )
+                .await
                 .unwrap()
-                .cursor_source_id,
-            0
-        );
+                .unwrap();
+            let fence = claimed.fence().unwrap();
+            let cursor = r#"{"nextChunkIndex":1}"#;
+            let digest = r#"{"validated":{"observations":[]}}"#;
+            store
+                .save_self_improvement_run_checkpoint(&fence, cursor, digest, ENABLED_AT + 2)
+                .await
+                .unwrap();
+            let clock = RunLeaseClock::new(ENABLED_AT + 2);
+            let entered = Notify::new();
+            let call = supervisor.provider_call_with_lease(&fence, &clock, "review", async {
+                entered.notify_one();
+                std::future::pending::<Result<()>>().await
+            });
+            tokio::pin!(call);
+            tokio::select! {
+                _ = entered.notified() => {},
+                _ = &mut call => panic!("provider must remain pending"),
+            }
+            tokio::time::pause();
+            tokio::time::advance(PROVIDER_CALL_TIMEOUT + Duration::from_secs(1)).await;
+            let error = call.await.unwrap_err();
+            tokio::time::resume();
+            assert_eq!(
+                classify_execution_failure(&error).reason_code,
+                "review_timeout"
+            );
+            supervisor
+                .handle_execution_failure(&claimed, error, ENABLED_AT + 2, PROVIDER_CALL_TIMEOUT)
+                .await
+                .unwrap();
+            let pending = store
+                .get_self_improvement_run(WORKSPACE, &run.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.status, RUN_STATUS_PENDING);
+            assert_eq!(
+                pending.last_error.as_deref(),
+                Some("provider_timeout:review_timeout")
+            );
+            assert_eq!(pending.analysis_cursor_json.as_deref(), Some(cursor));
+            assert_eq!(pending.analysis_digest_json.as_deref(), Some(digest));
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor_source_id,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

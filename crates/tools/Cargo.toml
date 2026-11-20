@@ -51,3 +51,4 @@ nono.workspace = true
 
 [dev-dependencies]
 pioneer-migration.workspace = true
+pioneer-postgres-test.workspace = true

@@ -81,7 +81,9 @@
 
 ## Как всё устроено
 
-Pioneer организован как Rust workspace и включает нативное приложение на GPUI и gateway с базой SQLite. Клиенты подключаются через JSON-RPC API по WebSocket.
+Pioneer организован как Rust workspace и включает нативное приложение на GPUI и Gateway с базой PostgreSQL. Клиенты подключаются через JSON-RPC API по WebSocket.
+
+В пакет Gateway входят PostgreSQL 18 и pgvector. При первом запуске Gateway создаёт каталог базы и сохраняет его при перезапуске и обновлении. Desktop устанавливает тот же комплект для локального Gateway.
 
 ```mermaid
 flowchart TB

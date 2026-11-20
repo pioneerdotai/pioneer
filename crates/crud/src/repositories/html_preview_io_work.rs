@@ -1,8 +1,8 @@
 //! Durable locators only. No payloads, database permits or domain ownership leases.
 //! due_at is Unix milliseconds: eligibility for ready/timed, expiry for running.
 //! Ordinals and seed_version are nonnegative i64; revisions/incarnations/tokens
-//! are opaque tokens (runtime UUIDs), never arithmetic generations. Empty object IDs are reserved
-//! for the two global seed families; workspace resync IDs live in those families.
+//! are opaque tokens (runtime UUIDs). Workspace repair uses a separate family
+//! for each source kind.
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
@@ -12,7 +12,7 @@ use pioneer_entity::{
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set, TransactionTrait,
+    QueryTrait, Set, TransactionTrait,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +22,17 @@ pub enum HtmlPreviewIoFamily {
     SeedWitness,
     SeedCopies,
 }
+fn find_work(
+    family: impl AsRef<str>,
+    object_id: impl AsRef<str>,
+    ordinal: i64,
+) -> sea_orm::Select<work::Entity> {
+    work::Entity::find()
+        .filter(work::Column::Family.eq(family.as_ref()))
+        .filter(work::Column::ObjectId.eq(object_id.as_ref()))
+        .filter(work::Column::Ordinal.eq(ordinal))
+}
+
 impl HtmlPreviewIoFamily {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -229,7 +240,7 @@ pub(crate) async fn request_at<C: sea_orm::ConnectionTrait>(
     } else {
         locator.key.as_str()
     };
-    let existing = work::Entity::find_by_id((name.to_owned(), queue_id.to_owned(), ordinal))
+    let existing = find_work(name.to_owned(), queue_id.to_owned(), ordinal)
         .one(db)
         .await?;
     if let Some(row) = existing {
@@ -322,10 +333,9 @@ pub(crate) async fn ack<C: sea_orm::ConnectionTrait>(
     claim: &HtmlPreviewIoClaim,
 ) -> Result<bool> {
     let row = &claim.row;
-    let current =
-        work::Entity::find_by_id((row.family.clone(), row.object_id.clone(), row.ordinal))
-            .one(db)
-            .await?;
+    let current = find_work(row.family.clone(), row.object_id.clone(), row.ordinal)
+        .one(db)
+        .await?;
     let Some(current) = current else {
         return Ok(false);
     };
@@ -456,11 +466,11 @@ impl CrudStore {
                 tx.rollback().await?;
                 anyhow::bail!("HTML IO claim contention requires fresh discovery");
             }
-            let row = work::Entity::find_by_id((
+            let row = find_work(
                 candidate.family.clone(),
                 candidate.object_id.clone(),
                 candidate.ordinal,
-            ))
+            )
             .one(&tx)
             .await?
             .expect("claimed row");
@@ -469,6 +479,7 @@ impl CrudStore {
         })
         .await
     }
+    #[cfg(test)]
     pub async fn html_preview_io_seed_startup_quantum(&self) -> Result<bool> {
         if self.html_preview_io_seed_complete().await? {
             return Ok(false);
@@ -574,9 +585,10 @@ impl CrudStore {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub async fn html_preview_io_seed_complete(&self) -> Result<bool> {
         for family in ["seed_witness", "seed_copies"] {
-            let marker = work::Entity::find_by_id((family.to_owned(), String::new(), 0_i64))
+            let marker = find_work(family.to_owned(), String::new(), 0_i64)
                 .select_only()
                 .column(work::Column::SeedVersion)
                 .column(work::Column::State)
@@ -699,6 +711,16 @@ impl CrudStore {
         let witness = claim.row.family == "seed_witness";
         ensure!(witness || claim.row.family == "seed_copies", "not a seed");
         let mut row = claim.row.clone();
+        let scope = row.workspace_id.clone();
+        ensure!(
+            !scope.is_empty(),
+            "HTML preview repair requires a workspace"
+        );
+        let manifests = history::Entity::find()
+            .select_only()
+            .column(history::Column::Id)
+            .filter(history::Column::WorkspaceId.eq(&scope))
+            .into_query();
         if row.upper_id.is_none() {
             let initialized = self
                 .run_serialized_write(|| async {
@@ -718,6 +740,7 @@ impl CrudStore {
                             .select_only()
                             .column(result_row::Column::ManifestId)
                             .column(result_row::Column::Ordinal)
+                            .filter(result_row::Column::ManifestId.in_subquery(manifests.clone()))
                             .order_by_desc(result_row::Column::ManifestId)
                             .order_by_desc(result_row::Column::Ordinal)
                             .into_tuple::<(String, i64)>()
@@ -729,6 +752,7 @@ impl CrudStore {
                             artifact::Entity::find()
                                 .select_only()
                                 .column(artifact::Column::Id)
+                                .filter(artifact::Column::WorkspaceId.eq(&scope))
                                 .order_by_desc(artifact::Column::Id)
                                 .into_tuple::<String>()
                                 .one(&tx)
@@ -776,6 +800,7 @@ impl CrudStore {
                 .select_only()
                 .column(result_row::Column::ManifestId)
                 .column(result_row::Column::Ordinal)
+                .filter(result_row::Column::ManifestId.in_subquery(manifests.clone()))
                 .filter(
                     Condition::any()
                         .add(result_row::Column::ManifestId.gt(&after))
@@ -810,12 +835,13 @@ impl CrudStore {
                     .into_tuple::<(String, i64)>()
                     .one(&self.connection)
                     .await?;
-                let digest = result_row::Entity::find_by_id((id.clone(), n))
-                    .select_only()
-                    .column(result_row::Column::ArchiveWireSha256)
-                    .into_tuple::<Option<String>>()
-                    .one(&self.connection)
-                    .await?;
+                let digest =
+                    pioneer_crud_artifacts::html_preview::find_frozen_result(id.clone(), n)
+                        .select_only()
+                        .column(result_row::Column::ArchiveWireSha256)
+                        .into_tuple::<Option<String>>()
+                        .one(&self.connection)
+                        .await?;
                 let pending = digest.is_some_and(|hash| hash.is_none())
                     && header.as_ref().is_none_or(|(_, expired)| *expired == 0);
                 source = Some(SeedSource {
@@ -831,6 +857,7 @@ impl CrudStore {
             let id = artifact::Entity::find()
                 .select_only()
                 .column(artifact::Column::Id)
+                .filter(artifact::Column::WorkspaceId.eq(&scope))
                 .filter(artifact::Column::Id.gt(&after))
                 .filter(artifact::Column::Id.lte(upper))
                 .order_by_asc(artifact::Column::Id)
@@ -905,9 +932,7 @@ impl CrudStore {
                 "seed cursor fence lost"
             );
             if let Some(source) = &source {
-                if source.obligation
-                    && (row.workspace_id.is_empty() || row.workspace_id == source.workspace)
-                {
+                if source.obligation && scope == source.workspace {
                     if let Some(metadata) = &source.metadata {
                         ensure!(
                             artifact::Entity::find_by_id(&source.id)
@@ -935,15 +960,18 @@ impl CrudStore {
                         ensure!(current == source.workspace, "seed witness identity changed");
                     }
                     let still_pending = if witness {
-                        result_row::Entity::find_by_id((source.id.clone(), source.ordinal))
-                            .select_only()
-                            .column(result_row::Column::ManifestId)
-                            .filter(result_row::Column::ArchiveWireSha256.is_null())
-                            .lock_exclusive()
-                            .into_tuple::<String>()
-                            .one(&tx)
-                            .await?
-                            .is_some()
+                        pioneer_crud_artifacts::html_preview::find_frozen_result(
+                            source.id.clone(),
+                            source.ordinal,
+                        )
+                        .select_only()
+                        .column(result_row::Column::ManifestId)
+                        .filter(result_row::Column::ArchiveWireSha256.is_null())
+                        .lock_exclusive()
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?
+                        .is_some()
                             && history::Entity::find_by_id(&source.id)
                                 .select_only()
                                 .column(history::Column::Expired)
@@ -1021,13 +1049,13 @@ impl ObsoleteProof {
     async fn revalidate<C: sea_orm::ConnectionTrait>(&self, db: &C) -> Result<bool> {
         Ok(match self {
             Self::MissingWitness(id, ordinal) => {
-                result_row::Entity::find_by_id((id.clone(), *ordinal))
+                pioneer_crud_artifacts::html_preview::find_frozen_result(id.clone(), *ordinal)
                     .one(db)
                     .await?
                     .is_none()
             }
             Self::Witness(id, ordinal, hash) => {
-                result_row::Entity::find_by_id((id.clone(), *ordinal))
+                pioneer_crud_artifacts::html_preview::find_frozen_result(id.clone(), *ordinal)
                     .select_only()
                     .column(result_row::Column::ManifestId)
                     .filter(result_row::Column::ArchiveWireSha256.eq(hash))
@@ -1066,13 +1094,15 @@ impl CrudStore {
     ) -> Result<ObsoleteProof> {
         let row = &claim.row;
         if row.family == "witness" {
-            let source =
-                result_row::Entity::find_by_id((claim.source_id().to_owned(), row.ordinal))
-                    .select_only()
-                    .column(result_row::Column::ArchiveWireSha256)
-                    .into_tuple::<Option<String>>()
-                    .one(&self.connection)
-                    .await?;
+            let source = pioneer_crud_artifacts::html_preview::find_frozen_result(
+                claim.source_id().to_owned(),
+                row.ordinal,
+            )
+            .select_only()
+            .column(result_row::Column::ArchiveWireSha256)
+            .into_tuple::<Option<String>>()
+            .one(&self.connection)
+            .await?;
             let Some(hash) = source else {
                 return Ok(ObsoleteProof::MissingWitness(
                     claim.source_id().to_owned(),
@@ -1201,7 +1231,7 @@ pub(crate) async fn callback_ticket<C: ConnectionTrait>(
     locator: &HtmlPreviewIoLocator,
     ordinal: i64,
 ) -> Result<Option<work::Model>> {
-    let row = work::Entity::find_by_id((family.to_owned(), locator.key.clone(), ordinal))
+    let row = find_work(family.to_owned(), locator.key.clone(), ordinal)
         .one(db)
         .await?;
     ensure!(

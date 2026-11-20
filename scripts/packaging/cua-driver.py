@@ -379,7 +379,7 @@ def zip_tree(root, archive):
                 output.write(path, path.relative_to(root).as_posix())
 
 
-def package(target, binary, prepared, archive, notary_log_dir=None):
+def package(target, binary, prepared, archive, notary_log_dir=None, postgres=None):
     if target not in TARGETS:
         raise ValueError(f"Unsupported CUA target: {target}")
     selected = release()
@@ -391,6 +391,8 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
         raise ValueError("macOS packaging requires persistent --notary-log-dir")
     macos = "apple-darwin" in target
     inputs = dict(target=target, gateway_sha256=digest(binary), prepared=metadata)
+    if postgres is not None:
+        inputs["postgres"] = file_inventory(postgres)
     identity = os.environ.get("MACOS_DESKTOP_SIGN_IDENTITY", "") if macos else ""
     if macos:
         if not identity:
@@ -436,6 +438,17 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
         root.mkdir()
         payload = root / "cua"
         shutil.copytree(prepared / "runtime", payload)
+        postgres_executables = []
+        if postgres is not None:
+            staged_postgres = payload / "postgres"
+            shutil.copytree(postgres, staged_postgres)
+            for program in (staged_postgres / "bin").iterdir():
+                program.chmod(0o755)
+                postgres_executables.append(program)
+            postgres_executables.extend(
+                library for library in (staged_postgres / "lib").iterdir()
+                if library.suffix in (".so", ".dylib", ".dll")
+            )
         suffix = ".exe" if "windows" in target else ""
         daemon = payload / daemon_name(target)
         if macos:
@@ -466,6 +479,9 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
                 options = ["--entitlements", str(entitlements)] if executable.suffix != ".dylib" else []
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 *options, "--sign", identity, str(executable)], check=True)
+            for executable in postgres_executables:
+                subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
+                                "--sign", identity, str(executable)], check=True)
             subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                             "--entitlements", str(entitlements), "--sign", identity,
                             str(contents.parent)], check=True)

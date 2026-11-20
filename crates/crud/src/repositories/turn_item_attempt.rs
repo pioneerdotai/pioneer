@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use pioneer_crud_payloads::storage::{self, PreparedPayload, Selection};
 use pioneer_entity::{turn, turn_item, turn_item_attempt};
 use pioneer_protocol::{
     TurnItem, TurnItemAttemptStatus, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType,
@@ -68,8 +69,9 @@ pub struct PreparedRunningAttemptTimeout {
     attempt: RunningAttemptSnapshot,
     timeout_reason: TurnItemTimeoutReason,
     timeout_reason_db: String,
-    expected_item_payload: String,
-    terminal_item_payload: String,
+    expected_item_identity: String,
+    expected_item_revision: i64,
+    terminal_item_payload: PreparedPayload,
     updated_at: DateTimeWithTimeZone,
 }
 
@@ -80,7 +82,7 @@ pub struct PreparedTimedOutAttemptReactivation {
     item_id: String,
     expected_attempt_payload: String,
     expected_attempt_updated_at: DateTimeWithTimeZone,
-    item_payload: String,
+    item_payload: PreparedPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +90,9 @@ pub(crate) struct PreparedTerminalRunningAttempt {
     attempt_id: String,
     turn_id: String,
     item_id: String,
-    expected_item_payload: String,
-    terminal_item_payload: String,
+    expected_item_identity: String,
+    expected_item_revision: i64,
+    terminal_item_payload: PreparedPayload,
     terminal_item_status: String,
     updated_at: DateTimeWithTimeZone,
 }
@@ -542,6 +545,23 @@ pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>
     ))
 }
 
+async fn decode_item_for_preparation<C: ConnectionTrait>(
+    db: &C,
+    item: &turn_item::Model,
+) -> Result<TurnItem> {
+    if let Some(id) = &item.payload_payload_id {
+        let captured = storage::capture(db, id, Selection::Full)
+            .await?
+            .ok_or(crate::util::PreflightRace)?;
+        return Ok(serde_json::from_slice(&captured.into_bytes()?)?);
+    }
+    let payload = item
+        .payload
+        .as_ref()
+        .context("turn item payload unavailable")?;
+    Ok(serde::Deserialize::deserialize(payload)?)
+}
+
 pub async fn prepare_running_attempt_timeout<C: ConnectionTrait>(
     db: &C,
     attempt: &RunningAttemptSnapshot,
@@ -564,8 +584,9 @@ pub async fn prepare_running_attempt_timeout<C: ConnectionTrait>(
         .await
         .context("failed to load turn_item row for timeout terminalization")?
         .context("timed out attempt missing turn_item row")?;
-    let mut item: TurnItem =
-        serde_json::from_str(item_row.payload.as_str()).with_context(|| {
+    let mut item = decode_item_for_preparation(db, &item_row)
+        .await
+        .with_context(|| {
             format!(
                 "failed to decode timed out turn_item payload for turn `{}` item `{}`",
                 attempt.turn_id, attempt.item_id
@@ -583,14 +604,15 @@ pub async fn prepare_running_attempt_timeout<C: ConnectionTrait>(
         attempt: attempt.clone(),
         timeout_reason,
         timeout_reason_db: turn_item_timeout_reason_to_db(timeout_reason).to_owned(),
-        expected_item_payload: item_row.payload,
-        terminal_item_payload,
+        expected_item_identity: item_row.portable_identity,
+        expected_item_revision: item_row.portable_revision,
+        terminal_item_payload: PreparedPayload::new(&terminal_item_payload)?,
         updated_at,
     }))
 }
 
-pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait>(
-    db: &C,
+pub async fn transition_prepared_running_attempt_to_timed_out(
+    db: &sea_orm::DatabaseTransaction,
     prepared: PreparedRunningAttemptTimeout,
 ) -> Result<bool> {
     let attempt = &prepared.attempt;
@@ -683,7 +705,8 @@ pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait
 
     let turn_item_status = Some(TURN_ITEM_STATUS_TIMED_OUT);
 
-    let terminal_item_payload = prepared.terminal_item_payload.clone();
+    let terminal_item_payload = prepared.terminal_item_payload;
+    terminal_item_payload.insert(db).await?;
     turn_item::Entity::update_many()
         .col_expr(turn_item::Column::Status, Expr::value(turn_item_status))
         .col_expr(
@@ -692,7 +715,11 @@ pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait
         )
         .col_expr(
             turn_item::Column::Payload,
-            Expr::value(terminal_item_payload.clone()),
+            Expr::val(Option::<String>::None).cast_as("json"),
+        )
+        .col_expr(
+            turn_item::Column::PayloadPayloadId,
+            Expr::val(terminal_item_payload.id()),
         )
         .col_expr(
             turn_item::Column::UpdatedAt,
@@ -702,16 +729,13 @@ pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait
         .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
         .filter(turn_item::Column::ActiveAttemptId.eq(attempt.id.clone()))
         .filter(turn_item::Column::ActiveAttemptStatus.eq(running_status))
-        .filter(turn_item::Column::Payload.eq(prepared.expected_item_payload))
+        .filter(turn_item::Column::PortableIdentity.eq(prepared.expected_item_identity))
+        .filter(turn_item::Column::PortableRevision.eq(prepared.expected_item_revision))
         .exec(db)
         .await
         .context("failed to mark turn_item timed_out")?;
 
-    // sqlite-zstd exposes turn_item through an INSTEAD OF-triggered view.
-    // SQLite reports zero affected rows for updates through that view even
-    // when the backing row changed, so changes()/rows_affected cannot prove
-    // whether the conditional update won. Verify the exact stored CAS result
-    // while the caller's transaction still owns the writer instead.
+    // The item and its attempt publish the same terminal result atomically.
     let item_updated = crate::repositories::turn::find_turn_item_metadata(
         db,
         attempt.turn_id.as_str(),
@@ -723,7 +747,7 @@ pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait
         item.status.as_deref() == Some(TURN_ITEM_STATUS_TIMED_OUT)
             && item.active_attempt_id.as_deref() == Some(attempt.id.as_str())
             && item.active_attempt_status.as_deref() == Some(timed_out_status)
-            && item.payload == terminal_item_payload
+            && item.payload_payload_id.as_deref() == Some(terminal_item_payload.id())
             && item.updated_at == updated_at
     });
     if !item_updated {
@@ -799,7 +823,7 @@ pub async fn prepare_timed_out_attempt_reactivation<C: ConnectionTrait>(
         return Ok(None);
     }
 
-    let item: TurnItem = serde_json::from_str(attempt.payload.as_str()).with_context(|| {
+    let item: TurnItem = serde_json::from_str(&attempt.payload).with_context(|| {
         format!(
             "failed to decode source payload for timed_out attempt `{}`",
             attempt.id
@@ -821,12 +845,12 @@ pub async fn prepare_timed_out_attempt_reactivation<C: ConnectionTrait>(
         item_id: attempt.item_id,
         expected_attempt_payload: attempt.payload,
         expected_attempt_updated_at: attempt.updated_at,
-        item_payload,
+        item_payload: PreparedPayload::new(&item_payload)?,
     }))
 }
 
-pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
-    db: &C,
+pub async fn reactivate_prepared_timed_out_attempt(
+    db: &sea_orm::DatabaseTransaction,
     prepared: PreparedTimedOutAttemptReactivation,
     heartbeat_at: DateTimeWithTimeZone,
     deadlines: AttemptDeadlines,
@@ -904,7 +928,8 @@ pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
         return Ok(false);
     }
 
-    let item_payload = prepared.item_payload.clone();
+    let item_payload = prepared.item_payload;
+    item_payload.insert(db).await?;
     turn_item::Entity::update_many()
         .col_expr(
             turn_item::Column::Status,
@@ -916,7 +941,11 @@ pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
         )
         .col_expr(
             turn_item::Column::Payload,
-            Expr::value(item_payload.clone()),
+            Expr::val(Option::<String>::None).cast_as("json"),
+        )
+        .col_expr(
+            turn_item::Column::PayloadPayloadId,
+            Expr::val(item_payload.id()),
         )
         .col_expr(
             turn_item::Column::LastHeartbeatAt,
@@ -950,7 +979,7 @@ pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
         item.status.as_deref() == Some(TURN_ITEM_STATUS_IN_PROGRESS)
             && item.active_attempt_id.as_deref() == Some(prepared.attempt_id.as_str())
             && item.active_attempt_status.as_deref() == Some(running_status)
-            && item.payload == item_payload
+            && item.payload_payload_id.as_deref() == Some(item_payload.id())
             && item.last_heartbeat_at.as_ref() == Some(&heartbeat_at)
             && item.lease_expires_at == deadlines.lease_expires_at
             && item.updated_at == heartbeat_at
@@ -1021,85 +1050,103 @@ pub(crate) async fn prepare_terminal_running_attempts<C: ConnectionTrait>(
         .map(|item| (item.item_id.clone(), item))
         .collect::<HashMap<_, _>>();
 
-    attempts
-        .into_iter()
-        .map(|attempt| {
-            let item = items.get(attempt.item_id.as_str()).with_context(|| {
-                format!(
-                    "running attempt `{}` is missing its turn_item row",
-                    attempt.id
-                )
-            })?;
-            if item.active_attempt_id.as_deref() != Some(attempt.id.as_str()) {
-                anyhow::bail!(
-                    "running attempt `{}` does not own turn item `{}`",
-                    attempt.id,
-                    attempt.item_id
-                );
-            }
-            let mut terminal_item = serde_json::from_str::<TurnItem>(item.payload.as_str())
+    let mut prepared = Vec::with_capacity(attempts.len());
+    for attempt in attempts {
+        let item = items.get(attempt.item_id.as_str()).with_context(|| {
+            format!(
+                "running attempt `{}` is missing its turn_item row",
+                attempt.id
+            )
+        })?;
+        if item.active_attempt_id.as_deref() != Some(attempt.id.as_str()) {
+            anyhow::bail!(
+                "running attempt `{}` does not own turn item `{}`",
+                attempt.id,
+                attempt.item_id
+            );
+        }
+        let mut terminal_item = decode_item_for_preparation(db, item).await
                 .with_context(|| {
                     format!(
                         "failed to decode running turn_item payload for terminal Turn `{turn_id}` item `{}`",
                         attempt.item_id
                     )
                 })?;
-            let terminal_state = TurnItemTerminalState::Failed {
-                reason: Some("turn_terminal_before_item_completed".to_owned()),
+        let terminal_state = TurnItemTerminalState::Failed {
+            reason: Some("turn_terminal_before_item_completed".to_owned()),
+        };
+        let managed_mcp = crate::is_managed_cli_mcp_item(&terminal_item);
+        terminalize_turn_item_payload(&mut terminal_item, terminal_state.clone());
+        if managed_mcp
+            && let TurnItem::DynamicToolCall {
+                success,
+                outcome,
+                display,
+                storage,
+                ..
+            } = &mut terminal_item
+        {
+            // Turn closure proves neither execution failure nor accepted
+            // cancellation. Retain an explicit unknown, non-retryable gap.
+            *success = None;
+            *outcome = Some(pioneer_protocol::ToolOutcome {
+                status: pioneer_protocol::ToolOutcomeStatus::FatalError,
+                error_class: Some(pioneer_protocol::ToolErrorClass::Unknown),
+                should_retry: false,
+                retry_hint: None,
+                incomplete: true,
+                incomplete_reason: Some("cli_mcp_result_unconfirmed".to_owned()),
+            });
+            let mark_metadata = |metadata: &mut pioneer_protocol::ToolMetadata| {
+                metadata.insert(
+                    "status",
+                    pioneer_protocol::ToolMetadataValue::from_json(serde_json::json!(
+                        "unconfirmed"
+                    )),
+                );
+                metadata.insert("success", pioneer_protocol::ToolMetadataValue::Null);
+                metadata.insert(
+                    "responseDelivery",
+                    pioneer_protocol::ToolMetadataValue::from_json(serde_json::json!(
+                        "unconfirmed"
+                    )),
+                );
             };
-            let managed_mcp = crate::is_managed_cli_mcp_item(&terminal_item);
-            terminalize_turn_item_payload(&mut terminal_item, terminal_state.clone());
-            if managed_mcp
-                && let TurnItem::DynamicToolCall { success, outcome, display, storage, .. } = &mut terminal_item
-            {
-                // Turn closure proves neither execution failure nor accepted
-                // cancellation. Retain an explicit unknown, non-retryable gap.
-                *success = None;
-                *outcome = Some(pioneer_protocol::ToolOutcome {
-                    status: pioneer_protocol::ToolOutcomeStatus::FatalError,
-                    error_class: Some(pioneer_protocol::ToolErrorClass::Unknown),
-                    should_retry: false,
-                    retry_hint: None,
-                    incomplete: true,
-                    incomplete_reason: Some("cli_mcp_result_unconfirmed".to_owned()),
-                });
-                let mark_metadata = |metadata: &mut pioneer_protocol::ToolMetadata| {
-                    metadata.insert("status", pioneer_protocol::ToolMetadataValue::from_json(
-                        serde_json::json!("unconfirmed")));
-                    metadata.insert("success", pioneer_protocol::ToolMetadataValue::Null);
-                    metadata.insert("responseDelivery", pioneer_protocol::ToolMetadataValue::from_json(
-                        serde_json::json!("unconfirmed")));
-                };
-                if let pioneer_protocol::ToolDisplayPayload::Summary(summary) = display {
-                    mark_metadata(&mut summary.metadata);
-                }
-                match storage {
-                    pioneer_protocol::ToolStoragePayload::Summary(summary) => mark_metadata(&mut summary.metadata),
-                    pioneer_protocol::ToolStoragePayload::Metadata { metadata } => mark_metadata(metadata),
-                    _ => {}
-                }
+            if let pioneer_protocol::ToolDisplayPayload::Summary(summary) = display {
+                mark_metadata(&mut summary.metadata);
             }
-            let terminal_item_payload = serde_json::to_string(&terminal_item)
-                .context("failed to encode terminalized turn item")?;
-            Ok(PreparedTerminalRunningAttempt {
-                attempt_id: attempt.id,
-                turn_id: attempt.turn_id,
-                item_id: attempt.item_id,
-                expected_item_payload: item.payload.clone(),
-                terminal_item_payload,
-                terminal_item_status: terminal_state.to_turn_item_status().to_owned(),
-                updated_at,
-            })
-        })
-        .collect()
+            match storage {
+                pioneer_protocol::ToolStoragePayload::Summary(summary) => {
+                    mark_metadata(&mut summary.metadata)
+                }
+                pioneer_protocol::ToolStoragePayload::Metadata { metadata } => {
+                    mark_metadata(metadata)
+                }
+                _ => {}
+            }
+        }
+        let terminal_item_payload = serde_json::to_string(&terminal_item)
+            .context("failed to encode terminalized turn item")?;
+        prepared.push(PreparedTerminalRunningAttempt {
+            attempt_id: attempt.id,
+            turn_id: attempt.turn_id,
+            item_id: attempt.item_id,
+            expected_item_identity: item.portable_identity.clone(),
+            expected_item_revision: item.portable_revision,
+            terminal_item_payload: PreparedPayload::new(&terminal_item_payload)?,
+            terminal_item_status: terminal_state.to_turn_item_status().to_owned(),
+            updated_at,
+        });
+    }
+    Ok(prepared)
 }
 
 /// Applies a reader-prepared terminalization plan. All work here is bounded
 /// and consists only of SQLite reads/conditional updates. A newly-created
 /// running attempt that was absent from the reader snapshot rejects the whole
 /// transaction rather than leaving a terminal Turn with live work.
-pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn close_prepared_terminal_running_attempts(
+    db: &sea_orm::DatabaseTransaction,
     turn_id: &str,
     prepared: Vec<PreparedTerminalRunningAttempt>,
 ) -> Result<()> {
@@ -1160,7 +1207,8 @@ pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>
         }
 
         let terminal_item_status = attempt.terminal_item_status.clone();
-        let terminal_item_payload = attempt.terminal_item_payload.clone();
+        let terminal_item_payload = attempt.terminal_item_payload;
+        terminal_item_payload.insert(db).await?;
         turn_item::Entity::update_many()
             .col_expr(
                 turn_item::Column::Status,
@@ -1168,7 +1216,11 @@ pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>
             )
             .col_expr(
                 turn_item::Column::Payload,
-                Expr::value(terminal_item_payload.clone()),
+                Expr::val(Option::<String>::None).cast_as("json"),
+            )
+            .col_expr(
+                turn_item::Column::PayloadPayloadId,
+                Expr::val(terminal_item_payload.id()),
             )
             .col_expr(
                 turn_item::Column::ActiveAttemptStatus,
@@ -1182,7 +1234,8 @@ pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>
             .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
             .filter(turn_item::Column::ActiveAttemptId.eq(attempt.attempt_id.clone()))
             .filter(turn_item::Column::ActiveAttemptStatus.eq(running_status))
-            .filter(turn_item::Column::Payload.eq(attempt.expected_item_payload.clone()))
+            .filter(turn_item::Column::PortableIdentity.eq(&attempt.expected_item_identity))
+            .filter(turn_item::Column::PortableRevision.eq(attempt.expected_item_revision))
             .exec(db)
             .await
             .context("failed to terminalize running turn item")?;
@@ -1198,7 +1251,7 @@ pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>
             item.status.as_deref() == Some(terminal_item_status.as_str())
                 && item.active_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
                 && item.active_attempt_status.as_deref() == Some(interrupted_status.as_str())
-                && item.payload == terminal_item_payload
+                && item.payload_payload_id.as_deref() == Some(terminal_item_payload.id())
                 && item.updated_at == attempt.updated_at
         });
         if !item_updated {

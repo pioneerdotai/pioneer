@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
+use pioneer_crud_conversations::turn_event as event_store;
+use pioneer_crud_payloads::storage::{self, PreparedPayload};
 use pioneer_entity::{compaction_event_revision, turn_event};
 use pioneer_protocol::TurnItem;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait, TransactionTrait,
 };
 
 use crate::events::{AppendedTurnEvent, TurnEventPayload};
@@ -66,14 +69,15 @@ pub(crate) async fn find_accepted_item_completion<C: ConnectionTrait>(
 
 /// CPU-only representation of an append. Serialization, idempotency-key
 /// derivation and ID generation happen before a caller begins a write
-/// transaction; the transaction then performs only SQLite work.
+/// transaction. The PostgreSQL write uses only the prepared storage representation.
 #[derive(Clone, Debug)]
 pub struct PreparedTurnEvent {
     id: String,
     thread_id: String,
     turn_id: String,
     event_type: String,
-    payload_json: String,
+    body: PreparedPayload,
+    inline_payload: serde_json::Value,
     context_item_id: Option<String>,
     context_projection_kind: &'static str,
     idempotency_key: String,
@@ -108,7 +112,8 @@ impl PreparedTurnEvent {
             thread_id,
             turn_id,
             event_type,
-            payload_json,
+            body: PreparedPayload::new(&payload_json)?,
+            inline_payload: serde_json::from_str(&payload_json)?,
             idempotency_key,
             legacy_idempotency_key,
             payload,
@@ -177,12 +182,16 @@ impl PreparedTurnEvent {
     }
 }
 
-fn validate_existing_prepared_event(
+async fn validate_existing_prepared_event<C: ConnectionTrait>(
+    db: &C,
     existing: &turn_event::Model,
     prepared: &PreparedTurnEvent,
 ) -> Result<()> {
-    let canonical_payload_matches =
-        existing.payload_payload_id.is_none() && existing.payload == prepared.payload_json;
+    let canonical_payload_matches = if let Some(id) = &existing.payload_payload_id {
+        storage::metadata(db, id).await? == Some(prepared.body.metadata())
+    } else {
+        existing.payload.as_ref() == Some(&prepared.inline_payload)
+    };
     let preflight_fence_matches = prepared
         .semantically_matching_existing_id
         .as_ref()
@@ -222,7 +231,7 @@ pub async fn prepared_event_already_exists<C: ConnectionTrait>(
     let Some(existing) = existing else {
         return Ok(false);
     };
-    validate_existing_prepared_event(&existing, prepared)?;
+    validate_existing_prepared_event(db, &existing, prepared).await?;
     Ok(true)
 }
 
@@ -235,14 +244,18 @@ pub async fn append_event(
     let prepared = PreparedTurnEvent::prepare(payload.clone())?
         .preflight_idempotency(db)
         .await?;
-    append_prepared_event(db, prepared, created_at).await
+    let tx = db.begin().await?;
+    let appended = append_prepared_event(&tx, prepared, created_at).await?;
+    tx.commit().await?;
+    Ok(appended)
 }
 
-pub async fn append_prepared_event<C: ConnectionTrait>(
-    db: &C,
+pub async fn append_prepared_event(
+    db: &DatabaseTransaction,
     prepared: PreparedTurnEvent,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {
+    event_store::lock_stream(db, &prepared.turn_id).await?;
     if let Some(existing) = turn_event::Entity::find()
         .filter(turn_event::Column::TurnId.eq(prepared.turn_id.clone()))
         .filter(
@@ -256,7 +269,7 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
         .await
         .context("failed to query idempotent turn event")?
     {
-        validate_existing_prepared_event(&existing, &prepared)?;
+        validate_existing_prepared_event(db, &existing, &prepared).await?;
         return Ok(AppendedTurnEvent {
             id: existing.id,
             thread_id: existing.thread_id,
@@ -269,36 +282,21 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
         });
     }
 
-    let sequence = next_sequence_for_turn(db, prepared.turn_id.as_str()).await?;
-
-    let mut insert = Query::insert();
-
-    insert
-        .into_table(Alias::new("turn_event"))
-        .columns([
-            Alias::new("id"),
-            Alias::new("thread_id"),
-            Alias::new("turn_id"),
-            Alias::new("sequence"),
-            Alias::new("event_type"),
-            Alias::new("payload"),
-            Alias::new("idempotency_key"),
-            Alias::new("created_at"),
-        ])
-        .values_panic([
-            prepared.id.clone().into(),
-            prepared.thread_id.clone().into(),
-            prepared.turn_id.clone().into(),
-            sequence.into(),
-            prepared.event_type.into(),
-            prepared.payload_json.into(),
-            prepared.idempotency_key.clone().into(),
-            created_at.into(),
-        ]);
-
-    db.execute(&insert)
-        .await
-        .context("failed to append turn event")?;
+    let sequence = event_store::next_sequence(db, &prepared.turn_id).await?;
+    event_store::insert(
+        db,
+        event_store::NewEvent {
+            id: &prepared.id,
+            thread_id: &prepared.thread_id,
+            turn_id: &prepared.turn_id,
+            sequence,
+            event_type: &prepared.event_type,
+            idempotency_key: &prepared.idempotency_key,
+            created_at,
+        },
+        &prepared.body,
+    )
+    .await?;
 
     // Prepared metadata reads only the immutable typed payload inserted above.
     // Production callers hold the same serialized append transaction, so an
@@ -334,8 +332,9 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
 }
 
 pub fn appended_event_from_model(model: turn_event::Model) -> Result<AppendedTurnEvent> {
-    let payload: TurnEventPayload = serde_json::from_str(model.payload.as_str())
-        .with_context(|| format!("failed to deserialize turn_event `{}` payload", model.id))?;
+    let payload: TurnEventPayload =
+        serde_json::from_value(model.payload.context("turn event payload was not loaded")?)
+            .with_context(|| format!("failed to deserialize turn_event `{}` payload", model.id))?;
 
     Ok(AppendedTurnEvent {
         id: model.id,
@@ -435,8 +434,12 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
         );
     }
 
-    let mut payload = serde_json::from_str::<TurnEventPayload>(model.payload.as_str())
-        .with_context(|| format!("failed to decode legacy agent diff event `{event_id}`"))?;
+    let mut payload = serde_json::from_value::<TurnEventPayload>(
+        model
+            .payload
+            .context("legacy turn event has no inline payload")?,
+    )
+    .with_context(|| format!("failed to decode legacy agent diff event `{event_id}`"))?;
     let TurnEventPayload::ItemCompleted(notification) = &mut payload else {
         anyhow::bail!("cross-thread event `{event_id}` is not an item/completed payload");
     };
@@ -479,7 +482,7 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
         );
     }
 
-    let original_payload = model.payload;
+    let original_revision = model.portable_revision;
     let original_idempotency_key = model.idempotency_key;
     let mut update = turn_event::Entity::update_many()
         .col_expr(
@@ -488,7 +491,9 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
         )
         .col_expr(
             turn_event::Column::Payload,
-            Expr::value(repaired_payload.clone()),
+            Expr::value(repaired_payload.clone())
+                .cast_as("text")
+                .cast_as("json"),
         )
         .col_expr(
             turn_event::Column::IdempotencyKey,
@@ -497,7 +502,7 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
         .filter(turn_event::Column::Id.eq(event_id.to_owned()))
         .filter(turn_event::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_event::Column::ThreadId.eq(legacy_thread_id.to_owned()))
-        .filter(turn_event::Column::Payload.eq(original_payload));
+        .filter(turn_event::Column::PortableRevision.eq(original_revision));
     update = match original_idempotency_key {
         Some(idempotency_key) => {
             update.filter(turn_event::Column::IdempotencyKey.eq(idempotency_key))
@@ -525,7 +530,7 @@ pub async fn repair_legacy_agent_diff_thread_owner<C: ConnectionTrait>(
         .with_context(|| format!("failed to verify repaired agent diff event `{event_id}`"))?
         .with_context(|| format!("repaired agent diff event `{event_id}` disappeared"))?;
     if repaired.thread_id != canonical_thread_id
-        || repaired.payload != repaired_payload
+        || repaired.payload != Some(serde_json::from_str(&repaired_payload)?)
         || repaired.idempotency_key.as_deref() != Some(repaired_idempotency_key.as_str())
     {
         anyhow::bail!("legacy agent diff event `{event_id}` changed during ownership repair");
@@ -572,10 +577,6 @@ pub async fn max_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) ->
         .unwrap_or(0);
 
     Ok(max_sequence)
-}
-
-async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
-    Ok(max_sequence_for_turn(db, turn_id).await? + 1)
 }
 
 pub async fn list_events_for_turn(

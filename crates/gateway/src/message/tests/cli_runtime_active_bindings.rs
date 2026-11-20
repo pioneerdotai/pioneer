@@ -5,7 +5,7 @@ use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
 use crate::message::turn_handlers::CliRuntimeLaunchSpecRestore;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait};
 
 // Real persisted Turns make the healthy prefix exercise the validator rather
 // than its missing-Turn shortcut. Equal timestamps exercise the turn_id tie.
@@ -96,8 +96,9 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
         .unwrap()
         .unwrap();
     let owner = "E00000000000000000008";
+    let tx = database.begin().await.unwrap();
     pioneer_crud::insert_agent_execution(
-        &database,
+        &tx,
         &pioneer_crud::AgentExecutionInput {
             id: owner.into(),
             workspace_id: workspace.clone(),
@@ -122,6 +123,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     // Persist invalid detached envelopes: dispatch rejects them locally,
     // with no provider or runtime needed. Twelve raw claim quanta keep the
     // real outbox runnable throughout the observations below.
@@ -5514,7 +5516,6 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
 // its attempt running, or its retained admission lease occupied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrated() {
-    use pioneer_entity::portable_payload;
     use sea_orm::Set;
 
     let temp = tempfile::tempdir().unwrap();
@@ -5543,27 +5544,11 @@ async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrat
     // Deliberately damaged content, with valid control/attempt authority. The
     // invalid length/digest fail the real hydration path, not an unrelated
     // owner fence or a test replacement for the completion handler.
-    portable_payload::Entity::insert(portable_payload::ActiveModel {
-        id: Set("damaged-cli-mapping".into()),
-        family: Set("cli.mapping".into()),
-        original_bytes: Set(2),
-        original_chars: Set(2),
-        sha256: Set(vec![0; 32]),
-        raw: Set(1),
-        retired: Set(0),
-        dictionary_id: Set(None),
-    })
-    .exec(&store.database_connection())
-    .await
-    .unwrap();
     binding::Entity::update_many()
-        .col_expr(
-            binding::Column::InputMappingJsonPayloadId,
-            Expr::value(Some("damaged-cli-mapping".to_owned())),
-        )
+        .col_expr(binding::Column::InputMappingCodec, Expr::val(1_i16))
         .col_expr(
             binding::Column::InputMappingJson,
-            Expr::value(String::new()),
+            Expr::val(vec![0_u8, 1, 2]),
         )
         .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
         .exec(&store.database_connection())

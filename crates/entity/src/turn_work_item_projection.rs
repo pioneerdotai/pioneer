@@ -7,27 +7,40 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_work_item_projection")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub work_item_id: String,
-    pub workspace_id: String,
-    pub thread_id: String,
-    #[sea_orm(unique_key = "uq_turn_work_item_projection_turn_item")]
-    pub turn_id: String,
-    #[sea_orm(unique_key = "uq_turn_work_item_projection_turn_item")]
-    pub item_id: String,
-    pub source_event_id: Option<String>,
-    pub source_sequence: i64,
-    pub order_key: String,
-    pub item_type: String,
-    pub visibility: String,
-    pub classification: String,
-    pub status: String,
     pub started_at: Option<DateTimeWithTimeZone>,
-    pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_work_item_projection_turn_item"
+    )]
+    pub item_id: String,
+    pub metadata_json: Json,
     #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
-    pub created_at: DateTimeWithTimeZone,
+    pub visibility: String,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub classification: String,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub item_type: String,
+    pub source_sequence: i64,
+    #[sea_orm(column_type = "Text")]
+    pub thread_id: String,
+    pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub work_item_id: String,
+    pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_work_item_projection_turn_item"
+    )]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_event_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub order_key: String,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

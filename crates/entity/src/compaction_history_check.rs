@@ -7,25 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_history_check")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub turn_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub descriptor: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub outcome: Option<String>,
     pub revision: i64,
-    pub failures: i64,
-    pub next_attempt_ms: i64,
-    pub attempt_deadline_ms: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub diagnostic: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub config_hash: Option<String>,
-    pub managed: i64,
     #[sea_orm(column_type = "Text")]
     pub purpose: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub config_hash: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub state: String,
+    pub managed: i64,
+    pub diagnostic: Option<Json>,
+    pub next_attempt_ms: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub descriptor: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub outcome: Option<String>,
+    pub failures: i64,
+    pub attempt_deadline_ms: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
@@ -33,7 +32,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

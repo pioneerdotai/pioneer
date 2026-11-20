@@ -81,7 +81,9 @@ Agenten rufen passenden Kontext ab, sofern die Zugriffsrechte für Arbeitsbereic
 
 ## Technischer Aufbau
 
-Pioneer ist ein Rust-Workspace mit einer nativen GPUI-Desktop-App und einem Gateway mit SQLite-Datenbank. Clients verbinden sich über eine JSON-RPC-API via WebSocket.
+Pioneer ist ein Rust-Workspace mit einer nativen GPUI-Desktop-App und einem Gateway mit PostgreSQL-Datenbank. Clients verbinden sich über eine JSON-RPC-API via WebSocket.
+
+Gateway-Pakete enthalten PostgreSQL 18 und pgvector. Beim ersten Start legt das Gateway sein Datenverzeichnis an. Bei Neustarts und Updates verwendet es dieselben Daten. Desktop richtet für sein lokales Gateway dieselbe Datenbank ein.
 
 ```mermaid
 flowchart TB

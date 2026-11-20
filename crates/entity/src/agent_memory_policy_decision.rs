@@ -7,25 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_policy_decision")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    pub memory_id: Option<String>,
-    pub candidate_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub action: String,
-    pub decision: String,
-    pub reason_code: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub reason: Option<String>,
-    pub policy_version: String,
-    pub actor_kind: Option<String>,
-    pub actor_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
     pub item_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub details_json: Option<String>,
+    pub candidate_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reason_code: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub policy_version: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(column_type = "Text")]
+    pub decision: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reason: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub details_json: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub action: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub memory_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub thread_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

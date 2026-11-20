@@ -374,7 +374,7 @@ async fn fixture_with_principal_probe(
             turn_id: context.turn_id.clone(),
             thread_id: context.thread_id.clone(),
             workspace_id: workspace,
-            mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             model: if cli_parent { "test-model" } else { "gpt-5.4" }.into(),
             provider_name: if cli_parent {
                 "cli_runtime:codex"
@@ -1411,7 +1411,7 @@ async fn source_at_max_depth_can_start_only_an_independent_root() {
                     turn_id: context.turn_id.clone(),
                     thread_id: context.thread_id.clone(),
                     workspace_id: context.workspace_id.clone(),
-                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    mode: pioneer_protocol::ThreadMode::Agent,
                     model: child_params.model.clone().unwrap(),
                     provider_name: child_params.model_provider.clone().unwrap(),
                     reasoning_effort: child_params

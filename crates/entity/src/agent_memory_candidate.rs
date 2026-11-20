@@ -7,43 +7,69 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_candidate")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
-    #[sea_orm(unique_key = "uidx_agent_memory_candidate_dedupe")]
-    pub scope_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub scope_key: String,
-    #[sea_orm(unique_key = "uidx_agent_memory_candidate_dedupe")]
-    pub scope_key_hash: String,
-    pub workspace_id: Option<String>,
-    #[sea_orm(unique_key = "uidx_agent_memory_candidate_dedupe")]
-    pub namespace: String,
-    pub category: String,
-    pub key: Option<String>,
-    #[sea_orm(column_type = "Text")]
-    pub candidate_text: String,
-    #[sea_orm(column_type = "Double")]
-    pub confidence: f64,
-    #[sea_orm(column_type = "Text")]
-    pub reason: String,
-    pub source_thread_id: Option<String>,
-    pub source_turn_id: Option<String>,
-    pub source_item_id: Option<String>,
-    pub created_by_kind: Option<String>,
-    pub created_by_id: Option<String>,
-    pub status: String,
-    #[sea_orm(unique_key = "uidx_agent_memory_candidate_dedupe")]
-    pub dedupe_key: Option<String>,
     pub created_at: DateTimeWithTimeZone,
-    pub decided_at: Option<DateTimeWithTimeZone>,
-    pub decided_by_kind: Option<String>,
-    pub decided_by_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub decision_reason: Option<String>,
     pub promoted_memory_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub metadata_json: Option<String>,
+    pub created_by_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub decided_by_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub status: String,
+    #[sea_orm(column_type = "Text")]
+    pub reason: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_agent_memory_candidate_dedupe"
+    )]
+    pub scope_kind: String,
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_agent_memory_candidate_dedupe"
+    )]
+    pub dedupe_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_thread_id: Option<String>,
+    #[sea_orm(column_type = "Double")]
+    pub confidence: f64,
+    pub decided_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_context_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub metadata_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub source_item_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub scope_key: String,
+    #[sea_orm(column_type = "Text")]
+    pub category: String,
+    #[sea_orm(column_type = "Text")]
+    pub candidate_text: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub decision_reason: Option<String>,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_agent_memory_candidate_dedupe"
+    )]
+    pub scope_key_hash: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub created_by_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub decided_by_id: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub id: String,
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_agent_memory_candidate_dedupe"
+    )]
+    pub namespace: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub key: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

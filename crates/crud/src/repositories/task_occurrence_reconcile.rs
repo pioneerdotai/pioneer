@@ -1,10 +1,10 @@
 //! Persistent dirty locators for Task occurrence contracts. No domain payloads
 //! or historical discovery. All bookkeeping inherits Maintenance scope.
 use anyhow::Result;
+use pioneer_crud_tasks::task_occurrence_producers::next_generation;
 use pioneer_entity::{
     task_occurrence_reconcile_pending as pending, task_occurrence_reconcile_scope as scope,
-    task_occurrence_reconcile_seed as seed, task_occurrence_reconcile_sequence as sequence,
-    task_run,
+    task_occurrence_reconcile_seed as seed, task_run,
 };
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::{Expr, OnConflict, Order, Query, SelectStatement};
@@ -95,21 +95,13 @@ pub(crate) async fn has_pending<C: ConnectionTrait>(db: &C) -> Result<bool> {
     {
         return Ok(true);
     }
-    if scope::Entity::find()
+    Ok(scope::Entity::find()
         .select_only()
         .column(scope::Column::TaskId)
         .into_tuple::<String>()
         .one(db)
         .await?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    let seed = seed::Entity::find_by_id(1)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("task occurrence seed missing"))?;
-    Ok(seed.status_index < 5)
+        .is_some())
 }
 
 pub(crate) fn due_query(now: i64, limit: u64) -> SelectStatement {
@@ -288,28 +280,6 @@ pub const TASK_OCCURRENCE_SCOPE_QUOTA: u64 = 16;
 pub const TASK_OCCURRENCE_SEED_QUOTA: u64 = 16;
 pub const TASK_OCCURRENCE_RUN_QUOTA: u64 = 32;
 const UNFINISHED: [&str; 5] = ["queued", "starting", "running", "waiting", "waiting_review"];
-
-pub(crate) async fn next_generation<C: ConnectionTrait>(db: &C) -> Result<i64> {
-    let row = sequence::Entity::find_by_id(1)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("task occurrence sequence missing"))?;
-    let generation = row
-        .generation
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("task occurrence generation exhausted"))?;
-    let updated = sequence::Entity::update_many()
-        .col_expr(sequence::Column::Generation, Expr::val(generation))
-        .filter(sequence::Column::Singleton.eq(1))
-        .filter(sequence::Column::Generation.eq(row.generation))
-        .exec(db)
-        .await?;
-    if updated.rows_affected != 1 {
-        // Escape the owning transaction; its caller retries from a fresh snapshot.
-        return Err(super::portable_payload::PreflightRace.into());
-    }
-    Ok(generation)
-}
 
 async fn enqueue<C: ConnectionTrait>(db: &C, ids: &[String], now: i64) -> Result<()> {
     for id in ids {
@@ -524,8 +494,7 @@ pub(crate) async fn seed_unfinished(
     Ok(1 + ids.len() as u64)
 }
 
-/// Existing durable obligations determine whether the owner can park. Scope
-/// expansion and bootstrap are bounded work, so their continuation is immediate.
+/// Existing durable obligations determine whether the owner can park.
 pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C, now: i64) -> Result<Option<i64>> {
     if scope::Entity::find()
         .select_only()
@@ -534,10 +503,6 @@ pub(crate) async fn next_deadline<C: ConnectionTrait>(db: &C, now: i64) -> Resul
         .one(db)
         .await?
         .is_some()
-        || seed::Entity::find_by_id(1)
-            .one(db)
-            .await?
-            .is_none_or(|row| row.status_index < 5)
     {
         return Ok(Some(now));
     }

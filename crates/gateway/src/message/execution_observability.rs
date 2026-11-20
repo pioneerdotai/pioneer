@@ -20,7 +20,7 @@ fn overlay_live_usage(facts: &Value, usage: &Value) -> bool {
         _ => false,
     }
 }
-fn source_fingerprint(json: &str) -> String {
+pub(super) fn source_fingerprint(json: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(json.as_bytes()))
 }
@@ -443,11 +443,9 @@ impl MessageProcessor {
                 if !summary_view {next_after=Some(after);break;}
                 tokio::task::yield_now().await;
             }
-            let legacy=self.crud_store.execution_observation_backfill_progress().await?;
-            let auxiliary=self.crud_store.execution_aux_observation_backfill_progress().await?;
             Ok(pioneer_protocol::WorkspaceExecutionObservabilityResponse {workspace_id:proof.workspace_id().into(),through,next_after,records,
                 summary:summary_view.then(||summary.value()),coverage:json!({"scope":"verified_workspace_owned_operations_only_no_thread_data",
-                    "legacy_backfill":{"complete":legacy.complete && auxiliary.complete,"main_complete":legacy.complete,"auxiliary_complete":auxiliary.complete,"basis":"global_migration_status_no_cross_scope_counts"},
+                    "legacy_backfill":{"complete":true,"main_complete":true,"auxiliary_complete":true,"basis":"pioneer_1_0_fresh_database"},
                     "frontier_basis":"immutable_metadata_revisions_live_usage_explicitly_revisioned","full_prompts_exported":false,
                     "query_scope":{"view":p.view,"operation_id":p.operation_id,"parent_operation_id":p.parent_operation_id},
                     "interpretation_versions":{"calculator":1,"normalizer":1,"resolver":1,"manifest":1}})})
@@ -1257,14 +1255,6 @@ impl MessageProcessor {
                 owner_turns.into_iter().take(100).collect(),
             )
             .await?;
-        let backfill = self
-            .crud_store
-            .execution_observation_backfill_progress()
-            .await?;
-        let auxiliary_backfill = self
-            .crud_store
-            .execution_aux_observation_backfill_progress()
-            .await?;
         Ok(Response {
             workspace_id: proof.workspace_id().into(),
             thread_id: proof.thread_id().into(),
@@ -1274,7 +1264,7 @@ impl MessageProcessor {
             summary: summary_value,
             owners,
             coverage: json!({"version":1,"frontier_basis":"immutable_metadata_revisions_live_usage_explicitly_revisioned",
-                "legacy_backfill":{"complete":backfill.complete && auxiliary_backfill.complete,"main_complete":backfill.complete,"auxiliary_complete":auxiliary_backfill.complete,"basis":"global_migration_status_no_cross_scope_counts"},"running":"latest_observed_not_confirmed_alive",
+                "legacy_backfill":{"complete":true,"main_complete":true,"auxiliary_complete":true,"basis":"pioneer_1_0_fresh_database"},"running":"latest_observed_not_confirmed_alive",
                 "scope":"authorized_thread","diagnostics":"bounded_milestones_with_explicit_loss_and_legacy_gaps","financial":"native_and_gateway_auxiliary_attempts_external_cli_statistics_nonadditive",
                 "period_basis":"half_open_source_start_wall_ms_untimed_excluded_no_recorded_time_substitution",
                 "period_unplaced_operations_in_scanned_scope":unplaced_period_operations,

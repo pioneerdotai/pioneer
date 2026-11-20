@@ -8,8 +8,7 @@ use pioneer_protocol::{
 };
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set, Statement,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
@@ -199,7 +198,7 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
             ])
             .value(
                 task_occurrence_contract::Column::UpdatedAt,
-                Expr::cust("MAX(task_occurrence_contract.updated_at, excluded.updated_at)"),
+                Expr::cust("GREATEST(task_occurrence_contract.updated_at, excluded.updated_at)"),
             )
             .action_and_where(Expr::cust(
                 "excluded.retry_attempt > task_occurrence_contract.retry_attempt \
@@ -238,190 +237,10 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTaskOccurrenceMismatch {
-    pub task_id: String,
-    pub run_id: String,
-    pub execution_id: String,
-    pub run_status: String,
-    pub execution_status: String,
-    pub occurrence_status: String,
-    pub expected_occurrence_status: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTaskOccurrenceMismatchPage {
-    pub mismatches: Vec<TerminalTaskOccurrenceMismatch>,
-    pub scanned_occurrences: usize,
-    pub next_cursor: Option<String>,
-}
-
-const TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT: u64 = 512;
-
-/// Scans a bounded primary-key page, then checks only those occurrence ids for
-/// an exact terminal authority chain. The cursor advances across poison or
-/// ambiguous rows, so either can be skipped without starving later records.
-pub async fn scan_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
-    db: &C,
-    after_occurrence_id: Option<&str>,
-    limit: u64,
-) -> Result<TerminalTaskOccurrenceMismatchPage> {
-    if limit == 0 {
-        return Ok(TerminalTaskOccurrenceMismatchPage {
-            mismatches: Vec::new(),
-            scanned_occurrences: 0,
-            next_cursor: None,
-        });
-    }
-    let scan_limit = limit.min(TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT);
-    let mut occurrence_query = task_occurrence_contract::Entity::find()
-        .select_only()
-        .column(task_occurrence_contract::Column::OccurrenceId)
-        .order_by_asc(task_occurrence_contract::Column::OccurrenceId)
-        .limit(scan_limit.saturating_add(1));
-    if let Some(after_occurrence_id) = after_occurrence_id {
-        occurrence_query = occurrence_query.filter(
-            task_occurrence_contract::Column::OccurrenceId.gt(after_occurrence_id.to_owned()),
-        );
-    }
-    let mut occurrence_ids = occurrence_query
-        .into_tuple::<String>()
-        .all(db)
-        .await
-        .context("failed to scan bounded Task occurrence page")?;
-    let page_size = usize::try_from(scan_limit).expect("hard scan limit fits usize");
-    let next_cursor = if occurrence_ids.len() > page_size {
-        occurrence_ids.truncate(page_size);
-        occurrence_ids.last().cloned()
-    } else {
-        None
-    };
-    let scanned_occurrences = occurrence_ids.len();
-    let mismatches = list_terminal_task_occurrence_mismatches_for_ids(db, &occurrence_ids).await?;
-    Ok(TerminalTaskOccurrenceMismatchPage {
-        mismatches,
-        scanned_occurrences,
-        next_cursor,
-    })
-}
-
-/// Completes an explicit diagnostic scan through bounded primary-key pages.
-/// Used by the explicit runtime invariant scanner. Periodic maintenance uses
-/// persistent dirty locators and must never call this diagnostic scan.
-pub async fn list_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<TerminalTaskOccurrenceMismatch>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut after_occurrence_id = None;
-    let mut mismatches = Vec::new();
-    loop {
-        let page = scan_terminal_task_occurrence_mismatches(
-            db,
-            after_occurrence_id.as_deref(),
-            TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT,
-        )
-        .await?;
-        mismatches.extend(page.mismatches);
-        if u64::try_from(mismatches.len()).unwrap_or(u64::MAX) >= limit {
-            mismatches.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            break;
-        }
-        let Some(next_cursor) = page.next_cursor else {
-            break;
-        };
-        after_occurrence_id = Some(next_cursor);
-    }
-    Ok(mismatches)
-}
-
-async fn list_terminal_task_occurrence_mismatches_for_ids<C: ConnectionTrait>(
-    db: &C,
-    occurrence_ids: &[String],
-) -> Result<Vec<TerminalTaskOccurrenceMismatch>> {
-    if occurrence_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = vec!["?"; occurrence_ids.len()].join(", ");
-    let sql = format!(
-        r#"SELECT occurrence.task_id AS task_id,
-                  occurrence.run_id AS run_id,
-                  run_execution.id AS execution_id,
-                  run.status AS run_status,
-                  run_execution.status AS execution_status,
-                  occurrence.status AS occurrence_status,
-                  CASE run.status
-                      WHEN 'succeeded' THEN 'delivered'
-                      WHEN 'cancelled' THEN 'cancelled'
-                      ELSE 'failed'
-                  END AS expected_occurrence_status
-           FROM task_occurrence_contract occurrence
-           INNER JOIN task_run run ON run.id = occurrence.run_id
-           INNER JOIN task task_row ON task_row.id = run.task_id
-           INNER JOIN task_run_execution run_execution
-                   ON run_execution.task_run_id = run.id
-           LEFT JOIN agent_execution agent ON agent.id = run_execution.id
-           WHERE occurrence.occurrence_id IN ({placeholders})
-             AND occurrence.task_id = run.task_id
-             AND task_row.executor_kind = run.executor_kind
-             AND run_execution.task_id = run.task_id
-             AND run_execution.executor_kind = run.executor_kind
-             AND run.completed_at IS NOT NULL
-             AND run_execution.completed_at IS NOT NULL
-             AND ((run.status = 'succeeded' AND run_execution.status = 'succeeded')
-               OR (run.status = 'failed' AND run_execution.status = 'failed')
-               OR (run.status = 'blocked' AND run_execution.status = 'blocked')
-               OR (run.status = 'timed_out' AND run_execution.status = 'timed_out')
-               OR (run.status = 'cancelled' AND run_execution.status = 'cancelled'))
-             AND ((run_execution.executor_kind = 'agent'
-                   AND occurrence.agent_execution_id = run_execution.id
-                   AND agent.id = run_execution.id
-                   AND agent.workspace_id = task_row.workspace_id
-                   AND agent.parent_task_id = run.task_id
-                   AND agent.execution_generation = occurrence.execution_generation
-                   AND agent.status = run_execution.status
-                   AND agent.finished_at IS NOT NULL
-                   AND occurrence.work_graph_root_execution_id = agent.work_graph_root_execution_id
-                   AND occurrence.root_resource_scope_id = agent.work_graph_root_execution_id)
-               OR (run_execution.executor_kind = 'system'
-                   AND occurrence.agent_execution_id IS NULL
-                   AND occurrence.work_graph_root_execution_id IS NULL
-                   AND occurrence.root_resource_scope_id IS NULL))
-             AND occurrence.status <> CASE run.status
-                     WHEN 'succeeded' THEN 'delivered'
-                     WHEN 'cancelled' THEN 'cancelled'
-                     ELSE 'failed'
-                 END
-           ORDER BY occurrence.occurrence_id ASC"#,
-    );
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            occurrence_ids
-                .iter()
-                .cloned()
-                .map(sea_orm::Value::from)
-                .collect::<Vec<_>>(),
-        ))
-        .await
-        .context("failed to list terminal Task occurrence mismatches")?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(TerminalTaskOccurrenceMismatch {
-                task_id: row.try_get("", "task_id")?,
-                run_id: row.try_get("", "run_id")?,
-                execution_id: row.try_get("", "execution_id")?,
-                run_status: row.try_get("", "run_status")?,
-                execution_status: row.try_get("", "execution_status")?,
-                occurrence_status: row.try_get("", "occurrence_status")?,
-                expected_occurrence_status: row.try_get("", "expected_occurrence_status")?,
-            })
-        })
-        .collect()
-}
+pub use pioneer_crud_tasks::occurrence_scan::{
+    TerminalTaskOccurrenceMismatch, TerminalTaskOccurrenceMismatchPage,
+    list_terminal_task_occurrence_mismatches, scan_terminal_task_occurrence_mismatches,
+};
 
 // Only predicate/CAS metadata. Background reconciliation never selects task
 // spec, result/error JSON, route/delivery payloads or execution history.
@@ -956,7 +775,12 @@ pub(crate) async fn finalize_task_occurrence<C: ConnectionTrait>(
         )
         .col_expr(
             task_occurrence_contract::Column::UpdatedAt,
-            Expr::cust_with_values("MAX(updated_at, ?)", [now]),
+            sea_orm::sea_query::Func::cust(sea_orm::sea_query::Alias::new("greatest"))
+                .args([
+                    Expr::col(task_occurrence_contract::Column::UpdatedAt),
+                    Expr::val(now),
+                ])
+                .into(),
         )
         .exec(db)
         .await?;

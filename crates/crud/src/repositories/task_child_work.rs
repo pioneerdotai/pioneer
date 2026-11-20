@@ -6,7 +6,7 @@ use pioneer_entity::{task_child_reconcile_pending as point, task_child_reconcile
 use pioneer_protocol::generate_id;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     TransactionTrait,
 };
 
@@ -61,45 +61,7 @@ impl ChildScope {
     }
 }
 
-pub async fn enqueue_point<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-    now: i64,
-) -> Result<()> {
-    let revision = token();
-    if let Some(old) = point::Entity::find_by_id(turn_id).one(db).await? {
-        let changed = point::Entity::update_many()
-            .col_expr(point::Column::ThreadId, Expr::value(thread_id))
-            .col_expr(point::Column::Revision, Expr::value(revision))
-            .col_expr(point::Column::NextAttemptAt, Expr::value(now))
-            .col_expr(point::Column::AttemptCount, Expr::value(0i64))
-            .col_expr(
-                point::Column::ClaimToken,
-                Expr::value(Option::<String>::None),
-            )
-            .filter(point::Column::TurnId.eq(turn_id))
-            .filter(point::Column::Revision.eq(old.revision))
-            .exec(db)
-            .await?;
-        if changed.rows_affected != 1 {
-            return Err(super::portable_payload::PreflightRace.into());
-        }
-    } else {
-        point::Entity::insert(point::ActiveModel {
-            turn_id: Set(turn_id.into()),
-            thread_id: Set(thread_id.into()),
-            revision: Set(revision),
-            next_attempt_at: Set(Some(now)),
-            attempt_count: Set(0),
-            claim_token: Set(None),
-        })
-        .exec_without_returning(db)
-        .await
-        .map_err(insert_race)?;
-    }
-    Ok(())
-}
+pub use pioneer_crud_tasks::child_work::enqueue_point;
 
 // Discovery is not a new domain revision. Repeated compatibility/seed pages
 // must not steal a live claim or wake an unchanged parked dependency. A legacy
@@ -123,44 +85,7 @@ async fn ensure_discovered_point<C: ConnectionTrait>(
 
 pub async fn enqueue_scope<C: ConnectionTrait>(db: &C, input: ChildScope, now: i64) -> Result<()> {
     let (kind, key) = input.locator();
-    let revision = token();
-    if let Some(old) = scope::Entity::find_by_id((kind.to_owned(), key.clone()))
-        .one(db)
-        .await?
-    {
-        // New invalidations preserve an active pass, cursor and lease. EOF sees
-        // the new request and starts another pass, including behind-cursor rows.
-        let mut update = scope::Entity::update_many()
-            .col_expr(scope::Column::RequestedRevision, Expr::value(revision))
-            .filter(scope_fence(&old))
-            .filter(scope::Column::RequestedRevision.eq(&old.requested_revision));
-        if old.claim_token.is_none() {
-            // A newer request may wake deferred work, never postpone a due
-            // pass while a continuous producer keeps moving wall time ahead.
-            let due = old.next_attempt_at.map_or(now, |due| due.min(now));
-            update = update.col_expr(scope::Column::NextAttemptAt, Expr::value(due));
-        }
-        if update.exec(db).await?.rows_affected != 1 {
-            return Err(super::portable_payload::PreflightRace.into());
-        }
-    } else {
-        scope::Entity::insert(scope::ActiveModel {
-            scope_kind: Set(kind.into()),
-            scope_key: Set(key),
-            incarnation_token: Set(token()),
-            requested_revision: Set(revision),
-            pass_revision: Set(None),
-            cursor: Set(None),
-            upper_watermark: Set(None),
-            next_attempt_at: Set(Some(now)),
-            attempt_count: Set(0),
-            claim_token: Set(None),
-        })
-        .exec_without_returning(db)
-        .await
-        .map_err(insert_race)?;
-    }
-    Ok(())
+    pioneer_crud_tasks::child_work::enqueue_scope(db, kind, &key, now).await
 }
 
 fn point_fence(row: &point::Model) -> sea_orm::Condition {
@@ -818,13 +743,12 @@ impl CrudStore {
                     tx.rollback().await?;
                     return Ok(true);
                 }
-                let mut current = scope::Entity::find_by_id((
-                    candidate.scope_kind.clone(),
-                    candidate.scope_key.clone(),
-                ))
-                .one(&tx)
-                .await?
-                .expect("claimed scope exists");
+                let mut current = scope::Entity::find()
+                    .filter(scope::Column::ScopeKind.eq(candidate.scope_kind.clone()))
+                    .filter(scope::Column::ScopeKey.eq(candidate.scope_key.clone()))
+                    .one(&tx)
+                    .await?
+                    .expect("claimed scope exists");
                 let claimed = current.clone();
                 if current.pass_revision.is_none() {
                     current.pass_revision = Some(current.requested_revision.clone());
@@ -873,7 +797,7 @@ impl CrudStore {
                             .rows_affected
                             == 1)
                         {
-                            return Err(super::portable_payload::PreflightRace.into());
+                            return Err(crate::util::PreflightRace.into());
                         }
                         tx.commit().await?;
                         return Ok(true);
@@ -915,7 +839,7 @@ impl CrudStore {
                     .rows_affected
                     == 1)
                 {
-                    return Err(super::portable_payload::PreflightRace.into());
+                    return Err(crate::util::PreflightRace.into());
                 }
                 tx.commit().await?;
                 Ok(true)
@@ -1003,7 +927,7 @@ impl CrudStore {
                         .await?
                         .rows_affected;
                     if changed != 1 {
-                        return Err(super::portable_payload::PreflightRace.into());
+                        return Err(crate::util::PreflightRace.into());
                     }
                 }
                 tx.commit().await?;
@@ -1238,7 +1162,7 @@ impl CrudStore {
                 .rows_affected
                 == 1)
             {
-                return Err(super::portable_payload::PreflightRace.into());
+                return Err(crate::util::PreflightRace.into());
             }
             tx.commit().await?;
             Ok(true)
@@ -1247,16 +1171,6 @@ impl CrudStore {
     }
 }
 
-fn insert_race(error: sea_orm::DbErr) -> anyhow::Error {
-    if matches!(
-        error.sql_err(),
-        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
-    ) {
-        super::portable_payload::PreflightRace.into()
-    } else {
-        error.into()
-    }
-}
 /// SQLSTATE/engine conditions that require restarting the entire transaction.
 /// Other errors, including ambiguous transport/commit failures, are not races.
 pub(crate) fn is_transaction_retry(error: &anyhow::Error) -> bool {
@@ -1287,18 +1201,11 @@ pub(crate) fn is_transaction_retry(error: &anyhow::Error) -> bool {
 }
 
 impl CrudStore {
-    /// Cutover requires BOTH committed bootstrap completion and the recognized
-    /// typed producer generation. Unknown legacy trigger generations keep the
-    /// historical compatibility reader; a storage error is never empty/ready.
     pub async fn child_work_queues_ready(&self) -> Result<bool> {
-        if self
+        Ok(self
             .child_seed_outcome(chrono::Utc::now().timestamp())
             .await?
-            != ChildSeedOutcome::CommittedDone
-        {
-            return Ok(false);
-        }
-        super::task_occurrence_producers::typed(&self.connection).await
+            == ChildSeedOutcome::CommittedDone)
     }
     pub async fn discover_legacy_child_work(&self, limit: u64) -> Result<()> {
         let rows = self
@@ -1368,7 +1275,9 @@ fn seed_outcome(row: Option<&scope::Model>, now: i64) -> Result<ChildSeedOutcome
 }
 impl CrudStore {
     pub async fn child_seed_outcome(&self, now: i64) -> Result<ChildSeedOutcome> {
-        let row = scope::Entity::find_by_id(("historical-seed".to_owned(), "v1".to_owned()))
+        let row = scope::Entity::find()
+            .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
+            .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
             .one(&self.connection)
             .await?;
         seed_outcome(row.as_ref(), now)
@@ -1379,7 +1288,9 @@ impl CrudStore {
         &self,
         clock: &F,
     ) -> Result<ChildSeedOutcome> {
-        let row = scope::Entity::find_by_id(("historical-seed".to_owned(), "v1".to_owned()))
+        let row = scope::Entity::find()
+            .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
+            .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
             .one(&self.connection)
             .await?;
         let outcome = seed_outcome(row.as_ref(), clock())?;
@@ -1395,10 +1306,11 @@ impl CrudStore {
             Err(error) => {
                 // A committed deferral or an unknown successful claim remains
                 // owned by this runner until its deadline, never reported done.
-                let observed =
-                    scope::Entity::find_by_id(("historical-seed".to_owned(), "v1".to_owned()))
-                        .one(&self.connection)
-                        .await;
+                let observed = scope::Entity::find()
+                    .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
+                    .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
+                    .one(&self.connection)
+                    .await;
                 match observed {
                     Ok(fresh) => match seed_outcome(fresh.as_ref(), clock()) {
                         Ok(ChildSeedOutcome::Progress) if fresh.as_ref() != Some(&row) => {
@@ -1420,13 +1332,7 @@ impl CrudStore {
 }
 
 impl CrudStore {
-    pub async fn next_task_child_work_deadline(&self, now: i64) -> Result<Option<i64>> {
-        let seed = match self.child_seed_outcome(now).await? {
-            ChildSeedOutcome::CommittedDone => None,
-            ChildSeedOutcome::Deferred { retry_at } => Some(retry_at),
-            ChildSeedOutcome::Claimed { expires_at } => Some(expires_at),
-            ChildSeedOutcome::Progress | ChildSeedOutcome::Missing => Some(now),
-        };
+    pub async fn next_task_child_work_deadline(&self) -> Result<Option<i64>> {
         let point = point::Entity::find()
             .select_only()
             .column(point::Column::NextAttemptAt)
@@ -1445,6 +1351,6 @@ impl CrudStore {
             .into_tuple::<i64>()
             .one(&self.connection)
             .await?;
-        Ok(seed.into_iter().chain(point).chain(scope).min())
+        Ok(point.into_iter().chain(scope).min())
     }
 }

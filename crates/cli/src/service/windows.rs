@@ -57,12 +57,24 @@ pub fn start_gateway_service(
 
 pub fn stop_gateway_service(settings: &ServiceSettings) -> Result<()> {
     let query = root_task_query(&settings.service_name);
+    #[cfg(windows)]
+    let requested = is_gateway_service_active(settings)?
+        && pioneer_gateway::signal_windows_gateway_shutdown(&settings.runtime_home)
+            .context("request graceful Gateway shutdown")?;
+    #[cfg(not(windows))]
+    let requested = false;
+    let force_stop = if requested {
+        ""
+    } else {
+        "Stop-ScheduledTask -InputObject $task[0] -ErrorAction Stop | Out-Null"
+    };
+    let timeout = if requested { 90 } else { 10 };
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
         $task = {query}
         if ($task.Count -eq 0) {{ exit 0 }}
-        Stop-ScheduledTask -InputObject $task[0] -ErrorAction Stop | Out-Null
-        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        {force_stop}
+        $deadline = [DateTime]::UtcNow.AddSeconds({timeout})
         do {{
             $task = {query}
             if ($task.Count -eq 0) {{ exit 0 }}
@@ -271,6 +283,8 @@ mod tests {
             #[cfg(target_os = "macos")]
             macos_associated_bundle_identifier: "ai.pioneer.test".to_owned(),
             managed_by,
+            #[cfg(windows)]
+            runtime_home: std::path::PathBuf::new(),
         }
     }
 }

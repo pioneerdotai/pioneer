@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_turn_response_execution")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub execution_id: String,
-    pub presentation_snapshot_id: String,
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    pub turn_id: String,
     pub created_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
+    pub presentation_snapshot_id: String,
     #[sea_orm(
         belongs_to,
         from = "execution_id",
@@ -19,7 +21,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
     #[sea_orm(
         belongs_to,
         from = "presentation_snapshot_id",
@@ -27,7 +29,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub agent_presentation_snapshot: HasOne<super::agent_presentation_snapshot::Entity>,
+    pub agent_presentation_snapshot: BelongsTo<super::agent_presentation_snapshot::Entity>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
@@ -35,7 +37,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use pioneer_entity::{task, task_event, task_event_fanout_cursor};
+use pioneer_crud_tasks::event_log::{self, EventPayload};
+use pioneer_entity::task_event;
 use pioneer_protocol::{TaskEvent, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -29,7 +30,7 @@ pub struct PreparedTaskEvent {
     turn_id: Option<String>,
     event_type: String,
     idempotency_key: Option<String>,
-    payload_json: String,
+    encoded_payload: EventPayload,
     payload: TaskEventPayload,
     semantically_matching_existing: Option<SemanticallyMatchingExistingTaskEvent>,
     batch_existing: Vec<PreparedBatchExisting>,
@@ -53,16 +54,30 @@ struct SemanticallyMatchingExistingTaskEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskEventIdentity {
     id: String,
-    portable_identity: String,
-    portable_revision: i64,
+    task_id: String,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    event_type: String,
+    idempotency_key: Option<String>,
+    sequence: i64,
+    created_at: DateTimeWithTimeZone,
+    sha256: Vec<u8>,
 }
 
 impl From<&task_event::Model> for TaskEventIdentity {
     fn from(row: &task_event::Model) -> Self {
         Self {
             id: row.id.clone(),
-            portable_identity: row.portable_identity.clone(),
-            portable_revision: row.portable_revision,
+            task_id: row.task_id.clone(),
+            run_id: row.run_id.clone(),
+            thread_id: row.thread_id.clone(),
+            turn_id: row.turn_id.clone(),
+            event_type: row.event_type.clone(),
+            idempotency_key: row.idempotency_key.clone(),
+            sequence: row.sequence,
+            created_at: row.created_at,
+            sha256: row.payload_json_sha256.clone(),
         }
     }
 }
@@ -139,7 +154,7 @@ impl PreparedTaskEvent {
             turn_id,
             event_type,
             idempotency_key,
-            payload_json,
+            encoded_payload: EventPayload::prepare(&payload_json)?,
             payload,
             semantically_matching_existing: None,
             batch_existing: Vec::new(),
@@ -171,10 +186,9 @@ impl PreparedTaskEvent {
             let query = task_event::Entity::find()
                 .filter(task_event::Column::TaskId.eq(&self.task_id))
                 .filter(task_event::Column::IdempotencyKey.eq(key));
-            if let Some(row) = load_rows(db, query).await?.pop() {
+            if let Some(mut row) = load_rows(db, query).await?.pop() {
                 let identity = TaskEventIdentity::from(&row);
-                let payload: TaskEventPayload = serde_json::from_str(&row.payload_json)
-                    .context("failed to decode existing Task event payload")?;
+                let payload = decode_event(&mut row)?;
                 let equivalent = equivalent_payloads(&payload, &self.payload);
                 // Defer a semantic conflict until the writer validates this
                 // exact row: an earlier event may change the terminal key.
@@ -374,9 +388,10 @@ pub async fn append_event(
     let mut prepared = PreparedTaskEvent::prepare(payload.clone())?;
     prepared.idempotency_key = idempotency_key.map(str::to_owned);
     let prepared = prepared.preflight_idempotency(db).await?;
-    Ok(append_prepared_event(db, prepared, created_at)
-        .await?
-        .into_owned())
+    let transaction = db.begin().await?;
+    let event = append_prepared_event(&transaction, prepared, created_at).await?;
+    transaction.commit().await?;
+    Ok(event.into_owned())
 }
 
 pub(crate) async fn append_prepared_event<C: ConnectionTrait>(
@@ -399,6 +414,7 @@ pub(crate) async fn append_prepared_event_with_batch<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     batch: &mut TaskEventBatchIdentities,
 ) -> Result<DeferredAppendedTaskEvent> {
+    event_log::lock_task(db, &prepared.task_id).await?;
     // Keep database-dependent key selection sequential: event N sees event N-1.
     if prepared.idempotency_key == prepared.payload.idempotency_key() {
         prepared.idempotency_key = terminal_idempotency_key(db, &prepared.payload).await?;
@@ -447,10 +463,10 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
         turn_id,
         event_type,
         idempotency_key,
-        payload_json,
+        encoded_payload,
         payload,
-        mut semantically_matching_existing,
-        mut batch_existing,
+        semantically_matching_existing: _,
+        batch_existing: _,
         gate_payloads: _,
         candidate_gate_resolution,
         candidate_projection,
@@ -459,51 +475,23 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
         projection,
         delivery_boundary: _,
     } = prepared;
-    let sequence = next_sequence_for_task(db, task_id.as_str()).await?;
-
-    let mut insert = Query::insert();
-    insert
-        .into_table(Alias::new("task_event"))
-        .columns([
-            Alias::new("id"),
-            Alias::new("task_id"),
-            Alias::new("run_id"),
-            Alias::new("thread_id"),
-            Alias::new("turn_id"),
-            Alias::new("sequence"),
-            Alias::new("event_type"),
-            Alias::new("idempotency_key"),
-            Alias::new("payload_json"),
-            Alias::new("created_at"),
-        ])
-        .values_panic([
-            id.clone().into(),
-            task_id.clone().into(),
-            run_id.clone().into(),
-            thread_id.clone().into(),
-            turn_id.clone().into(),
-            sequence.into(),
-            event_type.clone().into(),
-            idempotency_key.clone().into(),
-            payload_json.into(),
-            created_at.into(),
-        ]);
-
-    if let Err(error) = db.execute(&insert).await {
-        if let Some(idempotency_key) = idempotency_key.as_deref()
-            && let Some(existing) =
-                find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
-        {
-            let cached = take_matching_preflight(
-                &mut semantically_matching_existing,
-                &mut batch_existing,
-                batch,
-                &existing,
-            );
-            return existing_event_outcome_after_preflight(existing, cached, idempotency_key);
-        }
-        return Err(error).context("failed to append task event");
-    }
+    let sequence = event_log::next_sequence(db, &task_id).await?;
+    event_log::append(
+        db,
+        event_log::NewEvent {
+            id: &id,
+            task_id: &task_id,
+            run_id: run_id.as_deref(),
+            thread_id: thread_id.as_deref(),
+            turn_id: turn_id.as_deref(),
+            event_type: &event_type,
+            idempotency_key: idempotency_key.as_deref(),
+            sequence,
+            created_at,
+        },
+        encoded_payload,
+    )
+    .await?;
 
     Ok(DeferredAppendedTaskEvent {
         id,
@@ -628,7 +616,7 @@ pub(crate) async fn find_event_by_idempotency_key<C: ConnectionTrait>(
 }
 
 /// Typed Model projection for identity/control checks under the writer. Never
-/// materialize the legacy/raw body just to decide whether preflight is current.
+/// fetch the body just to decide whether preflight is current.
 fn task_event_metadata_query() -> sea_orm::Select<task_event::Entity> {
     use task_event::Column as Col;
     task_event::Entity::find()
@@ -643,11 +631,12 @@ fn task_event_metadata_query() -> sea_orm::Select<task_event::Entity> {
             Col::EventType,
             Col::CreatedAt,
             Col::IdempotencyKey,
-            Col::PortableRevision,
-            Col::PortableIdentity,
-            Col::PayloadJsonPayloadId,
+            Col::PayloadJsonCodec,
+            Col::PayloadJsonBytes,
+            Col::PayloadJsonChars,
+            Col::PayloadJsonSha256,
         ])
-        .expr_as(Expr::val(""), Col::PayloadJson)
+        .expr_as(Expr::val(Vec::<u8>::new()), Col::PayloadJson)
 }
 
 fn equivalent_payloads(existing: &TaskEventPayload, attempted: &TaskEventPayload) -> bool {
@@ -796,55 +785,11 @@ pub(crate) async fn find_queued_delivery_for_run<C: ConnectionTrait>(
     Ok(rows.pop())
 }
 
-/// Run only on an ordinary scoped database handle, after source SELECT release.
-/// Capture all backing holds before the first hydration await. A late capture
-/// causes the caller's selected source query to be retried, never a stale decode.
-pub(crate) async fn hydrate_rows(
-    db: &pioneer_sqlite::SqliteDatabase,
-    rows: Vec<task_event::Model>,
-) -> Result<Vec<task_event::Model>> {
-    let captured = rows
-        .into_iter()
-        .map(|row| {
-            let hold = row
-                .payload_json_payload_id
-                .as_deref()
-                .map(|id| {
-                    super::portable_payload::PayloadReadHold::capture(
-                        id,
-                        super::portable_payload::Family::TaskEvent,
-                    )
-                })
-                .transpose()?;
-            Ok((row, hold))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut hydrated = Vec::with_capacity(captured.len());
-    for (mut row, hold) in captured {
-        row.payload_json = super::portable_payload::hydrate_with_hold(
-            db,
-            super::portable_payload::Family::TaskEvent,
-            row.payload_json_payload_id.as_deref(),
-            row.payload_json,
-            hold.as_ref(),
-        )
-        .await?;
-        hydrated.push(row);
-    }
-    Ok(hydrated)
-}
-
 pub(crate) async fn load_rows(
     db: &pioneer_sqlite::SqliteDatabase,
     query: sea_orm::Select<task_event::Entity>,
 ) -> Result<Vec<task_event::Model>> {
-    // This store inherits the exact supplied reader/writer scheduling classes;
-    // its retry boundary owns no database capacity and opens no connection.
-    crate::CrudStore::new(db.clone())
-        .run_scoped_database_quantum(|| async {
-            hydrate_rows(db, query.clone().all(db).await?).await
-        })
-        .await
+    Ok(query.all(db).await?)
 }
 
 pub async fn list_events_for_task(
@@ -891,7 +836,7 @@ pub(crate) fn fanout_metadata_query(
     task_event::Entity::find()
         .select_only()
         .columns([task_event::Column::Id, task_event::Column::Sequence])
-        .column_as(Expr::cust("CASE WHEN payload_json_payload_id IS NULL THEN octet_length(payload_json) ELSE (SELECT p.original_bytes FROM portable_payload p WHERE p.id=task_event.payload_json_payload_id) END"), "payload_bytes")
+        .column_as(task_event::Column::PayloadJsonBytes, "payload_bytes")
         .filter(task_event::Column::TaskId.eq(task_id))
         .filter(task_event::Column::Sequence.gt(after))
         .order_by_asc(task_event::Column::Sequence)
@@ -957,97 +902,9 @@ pub(crate) async fn fanout_page(
     })
 }
 
-pub async fn find_fanout_cursor<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<Option<i64>> {
-    Ok(
-        task_event_fanout_cursor::Entity::find_by_id(task_id.to_owned())
-            .one(db)
-            .await
-            .with_context(|| format!("failed to load task event fanout cursor for `{task_id}`"))?
-            .map(|cursor| cursor.last_sequence),
-    )
-}
-
-pub async fn initialize_fanout_cursor<C: ConnectionTrait>(
-    db: &C,
-    task_id: &str,
-    sequence: i64,
-    initialized_at: DateTimeWithTimeZone,
-) -> Result<()> {
-    if sequence < 0 {
-        anyhow::bail!("task event fanout sequence must be non-negative");
-    }
-
-    if task_event_fanout_cursor::Entity::find_by_id(task_id.to_owned())
-        .one(db)
-        .await
-        .with_context(|| format!("failed to check task event fanout cursor for `{task_id}`"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-    if task::Entity::find_by_id(task_id.to_owned())
-        .select_only()
-        .column(task::Column::Id)
-        .into_tuple::<String>()
-        .one(db)
-        .await
-        .with_context(|| format!("failed to check task read model for fanout cursor `{task_id}`"))?
-        .is_none()
-    {
-        return Ok(());
-    }
-
-    task_event_fanout_cursor::Entity::insert(task_event_fanout_cursor::ActiveModel {
-        task_id: Set(task_id.to_owned()),
-        last_sequence: Set(sequence),
-        created_at: Set(initialized_at),
-        updated_at: Set(initialized_at),
-    })
-    .on_conflict(
-        OnConflict::column(task_event_fanout_cursor::Column::TaskId)
-            .do_nothing()
-            .to_owned(),
-    )
-    .exec_without_returning(db)
-    .await
-    .with_context(|| {
-        format!("failed to initialize task event fanout cursor for `{task_id}` at {sequence}")
-    })?;
-
-    Ok(())
-}
-
-pub async fn advance_fanout_cursor<C: ConnectionTrait>(
-    db: &C,
-    task_id: &str,
-    sequence: i64,
-    advanced_at: DateTimeWithTimeZone,
-) -> Result<()> {
-    if sequence < 0 {
-        anyhow::bail!("task event fanout sequence must be non-negative");
-    }
-
-    initialize_fanout_cursor(db, task_id, sequence, advanced_at).await?;
-
-    task_event_fanout_cursor::Entity::update_many()
-        .col_expr(
-            task_event_fanout_cursor::Column::LastSequence,
-            sea_orm::sea_query::Expr::value(sequence),
-        )
-        .col_expr(
-            task_event_fanout_cursor::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(advanced_at),
-        )
-        .filter(task_event_fanout_cursor::Column::TaskId.eq(task_id.to_owned()))
-        .filter(task_event_fanout_cursor::Column::LastSequence.lt(sequence))
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!("failed to advance task event fanout cursor for `{task_id}` to {sequence}")
-        })?;
-
-    Ok(())
-}
+pub use pioneer_crud_tasks::event_fanout::{
+    advance_fanout_cursor, find_fanout_cursor, initialize_fanout_cursor,
+};
 
 pub async fn list_events_for_run(
     db: &pioneer_sqlite::SqliteDatabase,
@@ -1082,9 +939,13 @@ pub async fn list_events_for_thread_turn(
         .context("failed to query task events for thread/turn")
 }
 
-pub fn task_event_from_model(model: task_event::Model) -> Result<TaskEvent> {
-    let payload: TaskEventPayload = serde_json::from_str(model.payload_json.as_str())
-        .context("failed to decode task_event payload_json")?;
+fn decode_event(row: &mut task_event::Model) -> Result<TaskEventPayload> {
+    let json = EventPayload::read(row)?;
+    serde_json::from_str(&json).context("failed to decode task event JSON")
+}
+
+pub fn task_event_from_model(mut model: task_event::Model) -> Result<TaskEvent> {
+    let payload = decode_event(&mut model)?;
     Ok(TaskEvent {
         id: model.id,
         task_id: model.task_id,
@@ -1100,11 +961,10 @@ pub fn task_event_from_model(model: task_event::Model) -> Result<TaskEvent> {
 }
 
 pub(crate) fn appended_task_event_from_model(
-    model: task_event::Model,
+    mut model: task_event::Model,
     append_status: TaskEventAppendStatus,
 ) -> Result<AppendedTaskEvent> {
-    let payload: TaskEventPayload = serde_json::from_str(model.payload_json.as_str())
-        .context("failed to decode task_event payload_json")?;
+    let payload = decode_event(&mut model)?;
     Ok(AppendedTaskEvent {
         id: model.id,
         task_id: model.task_id,
@@ -1121,30 +981,6 @@ pub(crate) fn appended_task_event_from_model(
         created_at: model.created_at,
         append_status,
     })
-}
-
-async fn next_sequence_for_task<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<i64> {
-    let max_sequence = db
-        .query_one(
-            &Query::select()
-                .expr_as(
-                    Expr::cust("COALESCE(MAX(sequence), 0)"),
-                    Alias::new("max_sequence"),
-                )
-                .from(Alias::new("task_event"))
-                .and_where(Expr::col(Alias::new("task_id")).eq(task_id.to_owned()))
-                .to_owned(),
-        )
-        .await
-        .context("failed to query max task_event sequence")?
-        .and_then(|row| {
-            row.try_get::<Option<i64>>("", "max_sequence")
-                .ok()
-                .flatten()
-        })
-        .unwrap_or(0);
-
-    Ok(max_sequence + 1)
 }
 
 #[cfg(test)]
