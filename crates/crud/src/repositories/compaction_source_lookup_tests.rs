@@ -1,5 +1,6 @@
 use super::*;
 use crate::CrudStore;
+use crate::repositories::compaction_plan_test_support::{assert_exact_branch_search, explain};
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
@@ -24,6 +25,10 @@ impl Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_portable_sources(false).await
+}
+
+async fn fixture_with_portable_sources(portable: bool) -> Fixture {
     let database = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = database.connection().clone();
     let reader = database.connect_read_only().await.unwrap();
@@ -50,11 +55,7 @@ async fn fixture() -> Fixture {
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('other-turn','other-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','root-thread','root-thread','root-turn','agent','running','Task','fixture')",
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,1,'succeeded','agent')",
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at)
-          VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,created_at) VALUES ('context-source','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item-source','source-turn','item-source','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('event-source','source-thread','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input-source','source-turn',0,'text','fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('foreign-event','foreign-thread','foreign-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('other-event','other-thread','other-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
@@ -67,6 +68,17 @@ async fn fixture() -> Fixture {
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
+    if portable {
+        seed_compressed_sources(&db).await;
+    } else {
+        for sql in [
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item-source','source-turn','item-source','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('event-source','source-thread','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+    }
+    seed_task_basis(&db).await;
     db.execute_unprepared("DELETE FROM compaction_task_basis_revision WHERE run_id='basis-run'")
         .await
         .unwrap();
@@ -645,13 +657,7 @@ async fn update_task_basis_history(
     history_json: &str,
     expected_revision: i64,
 ) {
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "UPDATE task_run_conversation_snapshot SET history_json=$1 WHERE run_id='basis-run'",
-        [history_json.into()],
-    ))
-    .await
-    .unwrap();
+    replace_task_basis(db, history_json).await;
     let revision = db
         .query_one_raw(Statement::from_string(
             DbBackend::Postgres,
@@ -667,7 +673,7 @@ async fn update_task_basis_history(
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn task_basis_revision_and_original_json_array_semantics_match_legacy() {
+async fn task_basis_revision_and_original_json_array_prefix() {
     let fixture = fixture().await;
     let db = fixture.db();
     let mut basis = branches().remove(5).source;
@@ -1372,50 +1378,19 @@ async fn published_checkpoint_lookup_does_not_traverse_large_historical_graph() 
     .await;
 }
 
-async fn enable_zstd(db: &SqliteDatabase) {
-    for table in ["turn_llm_context", "turn_item", "turn_event", "turn_input"] {
-        db.query_one_write_raw(Statement::from_sql_and_values(
+#[pioneer_postgres_test::postgres_test]
+async fn source_lookup_queries_match_indexed_sources_with_compressed_payloads() {
+    let fixture = fixture_with_portable_sources(true).await;
+    let db = fixture.db();
+    let count = db
+        .query_one_raw(Statement::from_string(
             DbBackend::Postgres,
-            "SELECT zstd_enable_transparent($1)",
-            [serde_json::json!({"table":table,"column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+            "SELECT count(DISTINCT payload_id) AS n FROM portable_payload_part WHERE codec=1",
         ))
         .await
+        .unwrap()
         .unwrap();
-    }
-}
-
-async fn compress_canonical_payloads(db: &SqliteDatabase) {
-    for table in ["turn_llm_context", "turn_item", "turn_event", "turn_input"] {
-        let rows = db
-            .query_all_raw(Statement::from_string(
-                DbBackend::Postgres,
-                format!("SELECT id,payload FROM _{table}_zstd WHERE _payload_dict IS NULL"),
-            ))
-            .await
-            .unwrap();
-        let values = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.try_get::<String>("", "id").unwrap(),
-                    row.try_get::<String>("", "payload").unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (id, payload) in values {
-            let compressed =
-                pioneer_sqlite::zstd::compress_column_value(payload.as_bytes(), 3, None).unwrap();
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres, format!("UPDATE _{table}_zstd SET payload=$1,_payload_dict=-1 WHERE id=$2 AND _payload_dict IS NULL"), [compressed.into(), id.into()])).await.unwrap();
-        }
-    }
-}
-
-#[pioneer_postgres_test::postgres_test]
-async fn source_lookup_queries_match_legacy_with_real_zstd_payload_rows() {
-    let fixture = fixture().await;
-    let db = fixture.db();
-    enable_zstd(&db).await;
-    compress_canonical_payloads(&db).await;
+    assert_eq!(count.try_get::<i64>("", "n").unwrap(), 2);
     for canonical in canonical_branches() {
         assert_all(
             &db,
@@ -1427,71 +1402,9 @@ async fn source_lookup_queries_match_legacy_with_real_zstd_payload_rows() {
     }
 }
 
-fn plan_operation_targets_subject(detail: &str, operation: &str, subject: &str) -> bool {
-    let prefix = format!("{operation} {subject}");
-    detail.strip_prefix(&prefix).is_some_and(|suffix| {
-        suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
-    })
-}
-
-fn search_has_exact_equality(detail: &str, column: &str) -> bool {
-    let Some((_, constraints)) = detail.rsplit_once('(') else {
-        return false;
-    };
-    let Some(constraints) = constraints.trim_end().strip_suffix(')') else {
-        return false;
-    };
-    constraints.split("AND").any(|constraint| {
-        let Some((lhs, rhs)) = constraint.split_once('=') else {
-            return false;
-        };
-        rhs.trim() == "?"
-            && lhs
-                .trim()
-                .rsplit('.')
-                .next()
-                .unwrap_or_default()
-                .trim_matches(|character| matches!(character, '"' | '`' | '[' | ']'))
-                == column
-    })
-}
-
-fn assert_exact_search(plan: &[String], subjects: &[&str], column: &str) {
-    assert!(
-        plan.iter().any(|detail| subjects
-            .iter()
-            .any(
-                |subject| plan_operation_targets_subject(detail, "SEARCH", subject)
-                    && search_has_exact_equality(detail, column)
-            )),
-        "expected exact {column} lookup for {subjects:?}: {plan:#?}"
-    );
-    assert!(
-        !plan.iter().any(|detail| subjects
-            .iter()
-            .any(|subject| plan_operation_targets_subject(detail, "SCAN", subject))),
-        "unexpected scan of {subjects:?}: {plan:#?}"
-    );
-}
-
-async fn explain(db: &SqliteDatabase, mut statement: Statement) -> Vec<String> {
-    assert!(!statement.sql.contains("compaction_live_sources"));
-    statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
-    db.query_all_raw(statement)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get("", "QUERY PLAN").unwrap())
-        .collect()
-}
-
 async fn assert_production_plans(compressed: bool) {
-    let fixture = fixture().await;
+    let fixture = fixture_with_portable_sources(compressed).await;
     let db = fixture.db();
-    if compressed {
-        enable_zstd(&db).await;
-        compress_canonical_payloads(&db).await;
-    }
     let sources = branches()
         .into_iter()
         .map(|branch| branch.source)
@@ -1505,62 +1418,33 @@ async fn assert_production_plans(compressed: bool) {
         ),
     )
     .await;
-    for alias in [
-        "context_revision",
-        "item_revision",
-        "event_revision",
-        "input_revision",
+    for (revision, canonical) in [
+        ("context_revision", "context_source"),
+        ("item_revision", "item_source"),
+        ("event_revision", "event_source"),
+        ("input_revision", "input_source"),
     ] {
-        assert_exact_search(&source_plan, &[alias], "source_id");
+        assert_exact_branch_search(&source_plan, revision, "source_id", true);
+        assert_exact_branch_search(&source_plan, canonical, "id", true);
     }
-    if compressed {
-        for subjects in [
-            &["context_source", "_turn_llm_context_zstd"][..],
-            &["item_source", "_turn_item_zstd"][..],
-            &["event_source", "_turn_event_zstd"][..],
-            &["input_source", "_turn_input_zstd"][..],
-        ] {
-            assert_exact_search(&source_plan, subjects, "id");
-        }
-    } else {
-        for alias in [
-            "context_source",
-            "item_source",
-            "event_source",
-            "input_source",
-        ] {
-            assert_exact_search(&source_plan, &[alias], "id");
-        }
-    }
-    assert_exact_search(&source_plan, &["basis"], "run_id");
+    assert_exact_branch_search(&source_plan, "basis", "run_id", true);
 
-    for plan in [
-        explain(
-            &db,
-            compaction_checkpoint_source_statement("ws", "root-thread", "root-checkpoint"),
-        )
-        .await,
-        explain(
-            &db,
-            compaction_reference_checkpoint_payload_statement(
-                "ws",
-                "root-thread",
-                &root_reference(),
-            ),
-        )
-        .await,
+    for query in [
+        compaction_checkpoint_source_statement("ws", "root-thread", "root-checkpoint"),
+        compaction_reference_checkpoint_payload_statement("ws", "root-thread", &root_reference()),
     ] {
-        assert_exact_search(&plan, &["p", "compaction_checkpoint"], "id");
+        let plan = explain(&db, query).await;
+        assert_exact_branch_search(&plan, "compaction_checkpoint", "id", false);
         assert!(
-            plan.iter().all(|detail| {
+            plan.walk().into_iter().all(|node| {
                 ![
-                    "context_revision",
-                    "item_revision",
-                    "event_revision",
-                    "input_revision",
+                    "compaction_source_revision",
+                    "compaction_item_revision",
+                    "compaction_event_revision",
+                    "compaction_input_revision",
                 ]
                 .iter()
-                .any(|table| detail.contains(table))
+                .any(|table| node.relation.as_deref() == Some(table))
             }),
             "checkpoint lookup unexpectedly reads canonical leaves: {plan:#?}"
         );

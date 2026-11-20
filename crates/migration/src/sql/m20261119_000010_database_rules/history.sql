@@ -4449,7 +4449,7 @@ CREATE OR REPLACE FUNCTION "compaction_task_basis_update"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$
 BEGIN
-    IF (OLD.history_json_payload_id IS DISTINCT FROM NEW.history_json_payload_id OR OLD.history_json IS DISTINCT FROM NEW.history_json OR OLD.run_id IS DISTINCT FROM NEW.run_id OR OLD.task_id IS DISTINCT FROM NEW.task_id OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id OR OLD.conversation_thread_id IS DISTINCT FROM NEW.conversation_thread_id OR OLD.source_turn_id IS DISTINCT FROM NEW.source_turn_id OR OLD.created_at IS DISTINCT FROM NEW.created_at OR OLD.frozen_manifest_id IS DISTINCT FROM NEW.frozen_manifest_id) IS NOT TRUE THEN
+    IF (OLD.history_json_payload_id IS DISTINCT FROM NEW.history_json_payload_id OR OLD.history_json_has_array_prefix IS DISTINCT FROM NEW.history_json_has_array_prefix OR OLD.history_json IS DISTINCT FROM NEW.history_json OR OLD.run_id IS DISTINCT FROM NEW.run_id OR OLD.task_id IS DISTINCT FROM NEW.task_id OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id OR OLD.conversation_thread_id IS DISTINCT FROM NEW.conversation_thread_id OR OLD.source_turn_id IS DISTINCT FROM NEW.source_turn_id OR OLD.created_at IS DISTINCT FROM NEW.created_at OR OLD.frozen_manifest_id IS DISTINCT FROM NEW.frozen_manifest_id) IS NOT TRUE THEN
         RETURN NEW;
     END IF;
     INSERT INTO compaction_task_basis_revision (run_id
@@ -4472,7 +4472,7 @@ BEGIN
 END;
 $trigger$;
 
-CREATE TRIGGER "compaction_task_basis_update" AFTER UPDATE OF history_json,history_json_payload_id,run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,created_at,frozen_manifest_id
+CREATE TRIGGER "compaction_task_basis_update" AFTER UPDATE OF history_json,history_json_payload_id,history_json_has_array_prefix,run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,created_at,frozen_manifest_id
 ON "task_run_conversation_snapshot" FOR EACH ROW EXECUTE FUNCTION "compaction_task_basis_update"();
 
 CREATE OR REPLACE FUNCTION "compaction_event_update"()

@@ -16,6 +16,8 @@ mod compaction_frozen_views;
 pub(crate) mod compaction_history;
 pub(crate) mod compaction_lifecycle;
 pub(crate) mod compaction_lifecycle_pending;
+#[cfg(test)]
+mod compaction_plan_test_support;
 pub(crate) mod compaction_preparation;
 pub(crate) mod compaction_runner;
 pub(crate) mod compaction_source_projection;

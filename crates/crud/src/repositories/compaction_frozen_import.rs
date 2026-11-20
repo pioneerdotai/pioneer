@@ -1076,7 +1076,7 @@ WHERE execution.thread_id=$3
         ON basis_thread.id=basis.conversation_thread_id
        AND basis_thread.workspace_id=basis.workspace_id
       LEFT JOIN compaction_task_basis_revision revision ON revision.run_id=basis.run_id
-      WHERE basis.history_json_payload_id IS NOT NULL
+      WHERE basis.history_json_has_array_prefix
         AND basis.workspace_id=h.workspace_id
         AND basis.conversation_thread_id=i.source_thread
         AND 'task-basis:'||basis.run_id=i.source_scope

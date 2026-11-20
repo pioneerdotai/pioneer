@@ -200,8 +200,7 @@ async fn history_capture_and_checkpoint_preserve_compressed_event_across_a_fence
             .compaction_head(&checkpoint.owner)
             .await
             .unwrap()
-            .unwrap()
-            .id,
+            .unwrap(),
         checkpoint.id
     );
 }

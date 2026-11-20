@@ -1,35 +1,23 @@
 use super::*;
 use crate::CrudStore;
-use crate::compaction::sqlite_specific_sql;
 use crate::repositories::compaction::{
     arm_checkpoint_projection_page_test_hook, checkpoint_projection_page_sizes_statement,
     checkpoint_projection_page_statement, checkpoint_projection_page_test_pause,
-    observe_checkpoint_projection_page_test_reads,
+    observe_checkpoint_projection_page_test_reads, seed_compressed_sources,
 };
-use migration::{Migrator, MigratorTrait};
+use crate::repositories::compaction_plan_test_support::{
+    PlanNode, assert_exact_branch_search, explain,
+};
+use migration::Migrator;
 use pioneer_compaction::runner::{RunnerPhase, RunnerState, SourceCursor};
 use pioneer_compaction::{ModelSelection, Transport};
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
-use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait, Value,
-};
-use std::path::{Path, PathBuf};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
 use std::time::Duration;
-
-struct TestFile(PathBuf);
-
-impl Drop for TestFile {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
-}
 
 struct Fixture {
     store: CrudStore,
     writer: SqliteWriteExecutor,
-    _file: TestFile,
 }
 
 impl Fixture {
@@ -46,63 +34,27 @@ impl Fixture {
     }
 }
 
-async fn open(path: &Path) -> (CrudStore, SqliteWriteExecutor) {
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options.max_connections(1).min_connections(1);
-    let writer_connection = Database::connect(options).await.unwrap();
-    let writer = SqliteWriteExecutor::new(writer_connection);
-    writer
-        .apply_pragmas(SqliteWriteClass::Maintenance)
-        .await
-        .unwrap();
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    options.max_connections(1).min_connections(1);
-    let reader = Database::connect(options).await.unwrap();
-    let journal_mode: String = reader
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA journal_mode".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "journal_mode")
-        .unwrap();
-    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-    reader
-        .execute_unprepared("PRAGMA query_only=ON")
-        .await
-        .unwrap();
-    let store = CrudStore::new(SqliteDatabase::from_executor(reader, writer.clone()))
-        .with_maintenance_access();
-    // `apply_pragmas` is the supported way to put this fixture in WAL mode,
-    // but it also applies the production `foreign_keys=OFF` setting. Restore
-    // the fixture's pre-existing FK semantics so cascade assertions keep
-    // exercising the same database behavior they did before WAL was explicit.
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=ON")
-        .await
-        .unwrap();
-    (store, writer)
+async fn fixture() -> Fixture {
+    fixture_with_portable_sources(false).await
 }
 
-async fn fixture() -> Fixture {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let file = TestFile(std::env::temp_dir().join(format!(
-        "pioneer-manifest-source-lookups-{}.sqlite",
-        uuid::Uuid::new_v4()
-    )));
-    let (store, writer) = open(&file.0).await;
+async fn fixture_with_portable_sources(portable: bool) -> Fixture {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = SqliteWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
+    let reader = fixture.connect_read_only().await.unwrap();
+    let store = CrudStore::new(SqliteDatabase::from_executor(reader, writer.clone()))
+        .with_maintenance_access();
+    assert!(
+        store
+            .database_connection()
+            .reader_query_only_enabled()
+            .await
+            .unwrap()
+    );
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('other','other',1,0)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,TRUE)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('other','other',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('root-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('source-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('foreign-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -114,10 +66,22 @@ async fn fixture() -> Fixture {
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('other-turn','other-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','root-thread','root-thread','root-turn','agent','running','Task','fixture')",
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,1,'succeeded','agent')",
-        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,created_at) VALUES ('context-source','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item-source','source-turn','item-source','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('event-source','source-thread','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    crate::repositories::compaction::seed_task_basis(&db).await;
+    if portable {
+        seed_compressed_sources(&db).await;
+    } else {
+        for sql in [
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item-source','source-turn','item-source','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('event-source','source-thread','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+    }
+    for sql in [
         "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input-source','source-turn',0,'text','fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('foreign-event','foreign-thread','foreign-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('other-event','other-thread','other-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
@@ -135,8 +99,8 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET snapshot=?1 WHERE id='source-operation'",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET snapshot=$1::text::json WHERE id='source-operation'",
         [raw_fixture_snapshot(
             "source-operation",
             "source-owner",
@@ -154,11 +118,7 @@ async fn fixture() -> Fixture {
     ))
     .await
     .unwrap();
-    Fixture {
-        store,
-        writer,
-        _file: file,
-    }
+    Fixture { store, writer }
 }
 
 #[derive(Clone)]
@@ -176,7 +136,7 @@ struct CanonicalCase {
     revision_table: &'static str,
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_edges_require_exact_unambiguous_historical_ownership() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -281,8 +241,8 @@ async fn set_manifest(db: &SqliteDatabase, source: &SourceCase, reference_only: 
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,?,?,?,?,?)",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,$1,$2,$3,$4,$5)",
         [
             (if reference_only { 1_i64 } else { 0_i64 }).into(),
             source.thread.into(),
@@ -302,7 +262,7 @@ async fn assert_manifest_current(db: &SqliteDatabase, operation: &str, expected:
     assert_eq!(actual, expected, "unexpected result: {case}");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_source_lookup_checks_all_source_types() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -320,8 +280,8 @@ async fn manifest_source_lookup_checks_all_source_types() {
             ("source_thread", "foreign-thread"),
         ] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                format!("UPDATE compaction_manifest SET {column}=? WHERE operation_id='manifest-operation'"),
+                DbBackend::Postgres,
+                format!("UPDATE compaction_manifest SET {column}=$1 WHERE operation_id='manifest-operation'"),
                 [value.into()],
             ))
             .await
@@ -398,11 +358,7 @@ async fn manifest_source_lookup_checks_all_source_types() {
 
     let basis = source_cases()[5].clone();
     set_manifest(&db, &basis, true).await;
-    db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='  []',frozen_manifest_id=NULL WHERE run_id='basis-run'",
-    )
-    .await
-    .unwrap();
+    crate::repositories::compaction::replace_task_basis(&db, "  []").await;
     db.execute_unprepared("DELETE FROM compaction_task_basis_revision WHERE run_id='basis-run'")
         .await
         .unwrap();
@@ -413,11 +369,7 @@ async fn manifest_source_lookup_checks_all_source_types() {
         "task basis whitespace and fallback",
     )
     .await;
-    db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json=' {}',frozen_manifest_id=NULL WHERE run_id='basis-run'",
-    )
-    .await
-    .unwrap();
+    crate::repositories::compaction::replace_task_basis(&db, " {}").await;
     db.execute_unprepared("DELETE FROM compaction_task_basis_revision WHERE run_id='basis-run'")
         .await
         .unwrap();
@@ -455,7 +407,7 @@ async fn manifest_source_lookup_checks_all_source_types() {
     assert_manifest_current(&db, "manifest-operation", false, "workspace isolation").await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn every_canonical_branch_independently_checks_revision_and_physical_identity() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -510,8 +462,8 @@ async fn every_canonical_branch_independently_checks_revision_and_physical_ident
         .await
         .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_manifest SET source_scope=? WHERE operation_id='manifest-operation'",
+            DbBackend::Postgres,
+            "UPDATE compaction_manifest SET source_scope=$1 WHERE operation_id='manifest-operation'",
             [changed_scope.into()],
         ))
         .await
@@ -539,7 +491,7 @@ async fn every_canonical_branch_independently_checks_revision_and_physical_ident
         .unwrap();
         let trigger_revision = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 format!(
                     "SELECT revision,present FROM {} WHERE source_id='{}'",
                     canonical.revision_table, canonical.source.id
@@ -566,7 +518,7 @@ async fn every_canonical_branch_independently_checks_revision_and_physical_ident
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn every_source_branch_independently_checks_operation_workspace() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -643,21 +595,17 @@ async fn every_source_branch_independently_checks_operation_workspace() {
     assert_manifest_current(&db, "manifest-operation", false, "task basis workspace").await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     let fixture = fixture().await;
     let db = fixture.db();
     let basis = source_cases()[5].clone();
     set_manifest(&db, &basis, true).await;
 
-    db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='[]',frozen_manifest_id=NULL WHERE run_id='basis-run'",
-    )
-    .await
-    .unwrap();
+    crate::repositories::compaction::replace_task_basis(&db, "[]").await;
     let revision = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT revision FROM compaction_task_basis_revision WHERE run_id='basis-run'",
         ))
         .await
@@ -667,8 +615,8 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
         .unwrap();
     assert!(revision > 1);
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_manifest SET source_version=? WHERE operation_id='manifest-operation'",
+        DbBackend::Postgres,
+        "UPDATE compaction_manifest SET source_version=$1 WHERE operation_id='manifest-operation'",
         [format!("task-basis-revision:{revision}").into()],
     ))
     .await
@@ -681,8 +629,8 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     )
     .await;
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_manifest SET source_version=? WHERE operation_id='manifest-operation'",
+        DbBackend::Postgres,
+        "UPDATE compaction_manifest SET source_version=$1 WHERE operation_id='manifest-operation'",
         [format!("task-basis-revision:{}", revision - 1).into()],
     ))
     .await
@@ -695,8 +643,8 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     )
     .await;
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_manifest SET source_version=? WHERE operation_id='manifest-operation'",
+        DbBackend::Postgres,
+        "UPDATE compaction_manifest SET source_version=$1 WHERE operation_id='manifest-operation'",
         [format!("task-basis-revision:{revision}").into()],
     ))
     .await
@@ -707,16 +655,10 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
         ("\t[]", false, "tab before task basis array"),
         ("   {}", false, "task basis non-array"),
     ] {
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='basis-run'",
-            [history.into()],
-        ))
-        .await
-        .unwrap();
+        crate::repositories::compaction::replace_task_basis(&db, history).await;
         let current = db
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT revision FROM compaction_task_basis_revision WHERE run_id='basis-run'",
             ))
             .await
@@ -725,8 +667,8 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
             .try_get::<i64>("", "revision")
             .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_manifest SET source_version=? WHERE operation_id='manifest-operation'",
+            DbBackend::Postgres,
+            "UPDATE compaction_manifest SET source_version=$1 WHERE operation_id='manifest-operation'",
             [format!("task-basis-revision:{current}").into()],
         ))
         .await
@@ -735,7 +677,7 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_statuses_and_operation_liveness_are_independent() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -790,7 +732,7 @@ async fn checkpoint_statuses_and_operation_liveness_are_independent() {
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_checkpoint_ignores_historical_leaf_revision_presence_and_storage() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -817,7 +759,7 @@ async fn published_checkpoint_ignores_historical_leaf_revision_presence_and_stor
     assert_manifest_current(&db, "manifest-operation", true, "historical physical row").await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -868,7 +810,7 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
         "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) SELECT 'import-storage',ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes FROM compaction_frozen_import_data WHERE manifest_id='accepted-manifest'",
         "DELETE FROM compaction_frozen_import_data WHERE manifest_id='accepted-manifest'",
         "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('accepted-manifest',1,0,1)",
-        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('accepted-manifest',1,0,1,'import-storage')",
+        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES ('accepted-manifest',1,0,1,'import-storage')",
         "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='accepted-manifest' AND kind=1",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -940,29 +882,29 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
 
 async fn install_projection(db: &SqliteDatabase, manifest: &str, message_json: &str) {
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,'ws','root-thread','identity',1,1,0,'imports',0,1)",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ($1,'ws','root-thread','identity',1,1,0,'imports',0,1)",
         [manifest.into()],
     ))
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES (?,0,?,length(CAST(? AS BLOB)))",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ($1,0,$2,octet_length($3::text))",
         [manifest.into(), message_json.into(), message_json.into()],
     ))
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('manifest-operation',?,'identity','imports',0)",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('manifest-operation',$1,'identity','imports',0)",
         [manifest.into()],
     ))
     .await
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage() {
     let f = fixture().await;
     let db = f.db();
@@ -1008,8 +950,8 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         async move {
             let json = reference.to_string();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=length(CAST(?1 AS BLOB)) WHERE manifest_id='input-alias-basis' AND ordinal=0",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=octet_length($1::text) WHERE manifest_id='input-alias-basis' AND ordinal=0",
                 [json.into()],
             )).await.unwrap();
         }
@@ -1089,7 +1031,7 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     )
     .await;
     set_manifest(&db, &checkpoint, false).await;
-    db.execute_unprepared("UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','own_contribution') WHERE id='manifest-operation'").await.unwrap();
+    db.execute_unprepared("UPDATE compaction_operation SET snapshot=jsonb_set(snapshot::jsonb,'{plan,coverage_domain}',to_jsonb('own_contribution'::text))::json WHERE id='manifest-operation'").await.unwrap();
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -1097,7 +1039,7 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         "alias is not an OWN import",
     )
     .await;
-    db.execute_unprepared("UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','working_context') WHERE id='manifest-operation'").await.unwrap();
+    db.execute_unprepared("UPDATE compaction_operation SET snapshot=jsonb_set(snapshot::jsonb,'{plan,coverage_domain}',to_jsonb('working_context'::text))::json WHERE id='manifest-operation'").await.unwrap();
     db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('source-checkpoint','event:source-turn','event-source','event-revision:1'); INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('source-operation',1,1,0,'source-thread','event:source-turn','event-source','event-revision:1')").await.unwrap();
     assert_manifest_current(
         &db,
@@ -1149,8 +1091,8 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     })
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_checkpoint SET selection=? WHERE id IN ('source-checkpoint','original-summary')",
+        DbBackend::Postgres,
+        "UPDATE compaction_checkpoint SET selection=$1::text::json WHERE id IN ('source-checkpoint','original-summary')",
         [selection.into()],
     ))
     .await
@@ -1161,8 +1103,8 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         version: "input-revision:1".into(),
     };
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET snapshot=?1 WHERE id='original-operation'",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET snapshot=$1::text::json WHERE id='original-operation'",
         [raw_fixture_snapshot(
             "original-operation",
             "original-owner",
@@ -1187,18 +1129,18 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
 
     let state = publication_candidate(&f, "alias-publication", 1).await;
     for sql in [
-        "UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','working_context') WHERE id='alias-publication'",
+        "UPDATE compaction_operation SET snapshot=jsonb_set(snapshot::jsonb,'{plan,coverage_domain}',to_jsonb('working_context'::text))::json WHERE id='alias-publication'",
         "UPDATE compaction_manifest SET source_thread='source-thread',source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE operation_id='alias-publication'",
         "UPDATE compaction_coverage SET source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE checkpoint_id='alias-publication-checkpoint'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
     for sql in [
-        "UPDATE compaction_manifest SET source_version=?1 WHERE operation_id='alias-publication'",
-        "UPDATE compaction_coverage SET source_version=?1 WHERE checkpoint_id='alias-publication-checkpoint'",
+        "UPDATE compaction_manifest SET source_version=$1 WHERE operation_id='alias-publication'",
+        "UPDATE compaction_coverage SET source_version=$1 WHERE checkpoint_id='alias-publication-checkpoint'",
     ] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             [source_identity.clone().into()],
         ))
@@ -1236,7 +1178,7 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     assert_eq!(preserved.coverage, old.coverage);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1310,8 +1252,8 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
         .await
         .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('basis-storage',0,?,length(CAST(? AS BLOB)))",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('basis-storage',0,$1,octet_length($2::text))",
         [reference.clone().into(), reference.clone().into()],
     ))
     .await
@@ -1319,7 +1261,7 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     for sql in [
         "DELETE FROM compaction_frozen_message_data WHERE manifest_id='basis-manifest'",
         "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('basis-manifest',0,0,1)",
-        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('basis-manifest',0,0,1,'basis-storage')",
+        "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES ('basis-manifest',0,0,1,'basis-storage')",
         "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='basis-manifest' AND kind=0",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -1394,8 +1336,8 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     })
     .to_string();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=length(CAST(? AS BLOB)) WHERE manifest_id='basis-storage' AND ordinal=0",
+        DbBackend::Postgres,
+        "UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=octet_length($2::text) WHERE manifest_id='basis-storage' AND ordinal=0",
         [raw_basis.clone().into(), raw_basis.into()],
     ))
     .await
@@ -1440,8 +1382,8 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=length(CAST(? AS BLOB)) WHERE manifest_id='basis-storage' AND ordinal=0",
+        DbBackend::Postgres,
+        "UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=octet_length($2::text) WHERE manifest_id='basis-storage' AND ordinal=0",
         [reference.clone().into(), reference.clone().into()],
     ))
     .await
@@ -1503,7 +1445,7 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_basis_does_not_grant_direct_access_to_historical_raw_leaves() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1597,7 +1539,7 @@ async fn checkpoint_basis_does_not_grant_direct_access_to_historical_raw_leaves(
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1636,8 +1578,8 @@ async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() 
     })
     .to_string();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('atomic-import-manifest',0,?,length(CAST(? AS BLOB)))",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('atomic-import-manifest',0,$1,octet_length($2::text))",
         [reference.clone().into(), reference.into()],
     ))
     .await
@@ -1710,57 +1652,26 @@ async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() 
     .await;
 }
 
-async fn enable_and_physically_compress_canonical_payloads(db: &SqliteDatabase) {
-    for table in ["turn_llm_context", "turn_item", "turn_event", "turn_input"] {
-        db.query_one_write_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT zstd_enable_transparent(?)",
-            [serde_json::json!({
-                "table": table,
-                "column": "payload",
-                "compression_level": 3,
-                "dict_chooser": "'[nodict]'"
-            })
-            .to_string()
-            .into()],
+#[pioneer_postgres_test::postgres_test]
+async fn manifest_lookup_checks_physically_compressed_canonical_rows() {
+    let fixture = fixture_with_portable_sources(true).await;
+    let db = fixture.db();
+    let result = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT count(DISTINCT payload_id) AS n FROM portable_payload_part WHERE codec=1",
         ))
         .await
+        .unwrap()
         .unwrap();
-        let rows = db
-            .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                format!("SELECT id,payload FROM _{table}_zstd WHERE _payload_dict IS NULL"),
-            ))
-            .await
-            .unwrap();
-        for row in rows {
-            let id = row.try_get::<String>("", "id").unwrap();
-            let payload = row.try_get::<String>("", "payload").unwrap();
-            let compressed =
-                pioneer_sqlite::zstd::compress_column_value(payload.as_bytes(), 3, None).unwrap();
-            db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                format!("UPDATE _{table}_zstd SET payload=?,_payload_dict=-1 WHERE id=?"),
-                [compressed.into(), id.into()],
-            ))
-            .await
-            .unwrap();
-        }
-    }
-}
-
-#[tokio::test]
-async fn manifest_lookup_checks_physically_compressed_canonical_rows() {
-    let fixture = fixture().await;
-    let db = fixture.db();
-    enable_and_physically_compress_canonical_payloads(&db).await;
+    assert_eq!(result.try_get::<i64>("", "n").unwrap(), 2);
     for source in source_cases().into_iter().take(4) {
         set_manifest(&db, &source, true).await;
         assert_manifest_current(&db, "manifest-operation", true, source.name).await;
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reference_only_checkpoint_validation_does_not_walk_historical_ancestry() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1801,8 +1712,8 @@ FROM n"#,
         .await
         .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,1,'source-thread','checkpoint:limit-owner',?,?)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,1,'source-thread','checkpoint:limit-owner',$1,$2)",
             [
                 format!("limit-{root}").into(),
                 format!("limit-version-{root}").into(),
@@ -1814,7 +1725,7 @@ FROM n"#,
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_basis_preserves_the_65536_65537_boundary() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1839,14 +1750,14 @@ async fn accepted_basis_preserves_the_65536_65537_boundary() {
         .await
         .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         r#"WITH RECURSIVE n(value) AS (
  SELECT 0
  UNION ALL
  SELECT value+1 FROM n WHERE value<65535
 )
 INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes)
-SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
+SELECT 'accepted-basis-boundary',value,$1,octet_length($1::text) FROM n"#,
         [reference.clone().into()],
     ))
     .await
@@ -1857,8 +1768,8 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     assert_manifest_current(&db, "manifest-operation", true, "65536 accepted basis rows").await;
 
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('accepted-basis-boundary',65536,?1,length(CAST(?1 AS BLOB)))",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('accepted-basis-boundary',65536,$1,octet_length($1::text))",
         [reference.into()],
     ))
     .await
@@ -1891,8 +1802,8 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     })
     .to_string();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=length(CAST(?1 AS BLOB)) WHERE manifest_id='accepted-basis-boundary'",
+        DbBackend::Postgres,
+        "UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=octet_length($1::text) WHERE manifest_id='accepted-basis-boundary'",
         [checkpoint_reference.clone().into()],
     ))
     .await
@@ -1905,8 +1816,8 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     )
     .await;
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('accepted-basis-boundary',65536,?1,length(CAST(?1 AS BLOB)))",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('accepted-basis-boundary',65536,$1,octet_length($1::text))",
         [checkpoint_reference.into()],
     ))
     .await
@@ -1921,7 +1832,7 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn historical_basis_coverage_does_not_grant_its_raw_leaf() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -1984,8 +1895,8 @@ FROM n"#,
 
     let over = reference(65535);
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=length(CAST(? AS BLOB)) WHERE manifest_id='basis-coverage-boundary' AND ordinal=0",
+        DbBackend::Postgres,
+        "UPDATE compaction_frozen_message_data SET reference_json=$1,bytes=octet_length($2::text) WHERE manifest_id='basis-coverage-boundary' AND ordinal=0",
         [over.clone().into(), over.into()],
     ))
     .await
@@ -1999,159 +1910,27 @@ FROM n"#,
     .await;
 }
 
-#[derive(Clone, Debug)]
-struct PlanNode {
-    id: i64,
-    parent: i64,
-    detail: String,
-}
-
-fn plan_subject(detail: &str, operation: &str, subject: &str) -> bool {
-    let prefix = format!("{operation} {subject}");
-    detail.strip_prefix(&prefix).is_some_and(|suffix| {
-        suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
-    })
-}
-
-fn constraint_parts(detail: &str) -> Vec<&str> {
-    detail
-        .rsplit_once('(')
-        .map(|(_, constraints)| constraints.trim_end_matches(')').split("AND").collect())
-        .unwrap_or_default()
-}
-
-fn constraint_column(lhs: &str) -> &str {
-    lhs.trim()
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|character| matches!(character, '"' | '`' | '[' | ']'))
-}
-
-fn has_constraint(detail: &str, column: &str, operator: &str) -> bool {
-    constraint_parts(detail).into_iter().any(|constraint| {
-        constraint
-            .split_once(operator)
-            .is_some_and(|(lhs, rhs)| constraint_column(lhs) == column && rhs.trim() == "?")
-    })
-}
-
-fn subtree<'a>(plan: &'a [PlanNode], root: i64) -> Vec<&'a PlanNode> {
-    let mut ids = vec![root];
-    let mut result = Vec::new();
-    for node in plan {
-        if node.id == root {
-            result.push(node);
-        }
-    }
-    let mut cursor = 0;
-    while cursor < ids.len() {
-        let parent = ids[cursor];
-        for node in plan {
-            if node.parent == parent && !ids.contains(&node.id) {
-                ids.push(node.id);
-                result.push(node);
-            }
-        }
-        cursor += 1;
-    }
-    result
-}
-
-fn unique_subtree<'a>(plan: &'a [PlanNode], root_detail: &str) -> Vec<&'a PlanNode> {
-    let roots = plan
-        .iter()
-        .filter(|node| node.detail == root_detail)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        roots.len(),
-        1,
-        "expected one {root_detail:?} node: {plan:#?}"
-    );
-    subtree(plan, roots[0].id)
-}
-
-fn assert_exact_branch_search(branch: &[&PlanNode], subjects: &[&str], column: &str, label: &str) {
-    assert!(
-        branch.iter().any(|node| {
-            subjects
-                .iter()
-                .any(|subject| plan_subject(&node.detail, "SEARCH", subject))
-                && has_constraint(&node.detail, column, "=")
-        }),
-        "missing exact {column} lookup for {label} ({subjects:?}): {branch:#?}"
-    );
-    assert!(
-        !branch
-            .iter()
-            .any(|node| subjects
-                .iter()
-                .any(|subject| plan_subject(&node.detail, "SCAN", subject))),
-        "unexpected scan for {label} ({subjects:?}): {branch:#?}"
-    );
-}
-
 #[derive(Clone, Copy, Debug)]
 enum ProjectionPageBounds {
     Sizes { start: i64 },
     Data { start: i64, end: i64 },
 }
 
-fn assert_projection_page_statement(
+fn assert_projection_page_parameters(
     statement: &Statement,
     manifest: &str,
     bounds: ProjectionPageBounds,
 ) {
-    let (sql, expected_values) = match bounds {
-        ProjectionPageBounds::Sizes { start } => (
-            "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
-             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
-             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
-               AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
-                               WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
-             UNION ALL \
-             SELECT d.ordinal,d.bytes FROM compaction_frozen_span s \
-             JOIN compaction_frozen_message_data d \
-               ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
-             JOIN compaction_frozen_layout l \
-               ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
-             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
-             ORDER BY ordinal LIMIT ?",
-            vec![
-                Value::from(manifest),
-                Value::from(start),
-                Value::from(manifest),
-                Value::from(start),
-                Value::from(SOURCE_PAGE_ROWS as i64),
-            ],
-        ),
-        ProjectionPageBounds::Data { start, end } => (
-            "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
-             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
-             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
-               AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
-                               WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
-             UNION ALL \
-             SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_span s \
-             JOIN compaction_frozen_message_data d \
-               ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
-             JOIN compaction_frozen_layout l \
-               ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
-             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
-             ORDER BY ordinal",
-            vec![
-                Value::from(manifest),
-                Value::from(start),
-                Value::from(end),
-                Value::from(manifest),
-                Value::from(start),
-                Value::from(end),
-            ],
-        ),
+    let expected_values = match bounds {
+        ProjectionPageBounds::Sizes { start } => [
+            Value::from(manifest),
+            Value::from(start),
+            Value::from(SOURCE_PAGE_ROWS as i64),
+        ],
+        ProjectionPageBounds::Data { start, end } => {
+            [Value::from(manifest), Value::from(start), Value::from(end)]
+        }
     };
-    assert_eq!(statement.sql, sql, "production page SQL lost its bounds");
     assert_eq!(
         statement
             .values
@@ -2165,229 +1944,111 @@ fn assert_projection_page_statement(
     );
 }
 
-fn assert_data_search_page_bounds(branch: &[&PlanNode], bounds: ProjectionPageBounds, label: &str) {
-    let searches = branch
-        .iter()
-        .filter(|node| {
-            plan_subject(&node.detail, "SEARCH", "d")
-                && has_constraint(&node.detail, "manifest_id", "=")
+fn storage_branches<'a>(plan: &'a PlanNode, relation: &str) -> (&'a PlanNode, &'a PlanNode) {
+    let union = plan
+        .walk()
+        .into_iter()
+        .find(|node| {
+            matches!(node.kind.as_str(), "Append" | "Merge Append")
+                && node.children.len() == 2
+                && node.children.iter().all(|branch| {
+                    branch
+                        .walk()
+                        .into_iter()
+                        .any(|child| child.relation.as_deref() == Some(relation))
+                })
         })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        searches.len(),
-        1,
-        "expected one manifest-scoped data lookup for {label}: {branch:#?}"
-    );
-    let detail = &searches[0].detail;
-    assert!(
-        has_constraint(detail, "ordinal", ">"),
-        "{label} data lookup lost its lower page boundary: {detail}"
-    );
-    if matches!(bounds, ProjectionPageBounds::Data { .. }) {
-        assert!(
-            has_constraint(detail, "ordinal", "<"),
-            "{label} data lookup lost its upper page boundary: {detail}"
-        );
-    }
-}
-
-fn projection_page_branches(plan: &[PlanNode]) -> (Vec<&PlanNode>, Vec<&PlanNode>) {
-    let compound = plan
-        .iter()
-        .filter(|node| node.detail == "LEFT-MOST SUBQUERY")
-        .count();
-    if compound == 1 {
-        let plan = plan.iter().collect::<Vec<_>>();
-        return (
-            unique_detail_subtree(&plan, "LEFT-MOST SUBQUERY", "projection page"),
-            unique_detail_subtree(&plan, "UNION ALL", "projection page"),
-        );
-    }
-    assert_eq!(
-        compound, 0,
-        "ambiguous projection-page compound plan: {plan:#?}"
-    );
-    let merged = unique_subtree(plan, "MERGE (UNION ALL)");
-    (
-        unique_detail_subtree(&merged, "LEFT", "projection page merge"),
-        unique_detail_subtree(&merged, "RIGHT", "projection page merge"),
-    )
-}
-
-fn assert_projection_page_plan(plan: &[PlanNode], bounds: ProjectionPageBounds) {
-    let (ordinary, shared) = projection_page_branches(plan);
-    assert_exact_branch_search(&ordinary, &["d"], "manifest_id", "ordinary message data");
-    assert_exact_branch_search(&shared, &["d"], "manifest_id", "shared message data");
-    assert_exact_branch_search(&shared, &["s"], "manifest_id", "shared message span");
-    assert!(
-        shared.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "s")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "kind", "=")
-        }),
-        "shared span lookup must constrain manifest and kind: {shared:#?}"
-    );
-
-    assert_data_search_page_bounds(&ordinary, bounds, "ordinary");
-    // Shared storage already has a span range. This assertion is deliberately
-    // scoped to its data node; the exact production statement/binds prove that
-    // the requested page range was also supplied rather than borrowing the
-    // span's range as page evidence.
-    assert_data_search_page_bounds(&shared, bounds, "shared");
-}
-
-fn frozen_view_branch<'a>(plan: &'a [PlanNode], view: &str) -> Vec<&'a PlanNode> {
-    let producer_details = [format!("CO-ROUTINE {view}"), format!("MATERIALIZE {view}")];
-    let producers = plan
-        .iter()
-        .filter(|node| producer_details.contains(&node.detail))
-        .collect::<Vec<_>>();
-    assert!(
-        producers.len() <= 1,
-        "expected at most one producer for {view:?}: {plan:#?}"
-    );
-    if let Some(root) = producers.first() {
-        return subtree(plan, root.id);
-    }
-
-    // SQLite may inline a view into its sole consumer. These consumers are
-    // disjoint in the production query, so their subtrees retain ownership of
-    // otherwise repeated d/l/s aliases.
-    let consumer = match view {
-        "compaction_frozen_import" => "accepted_imports",
-        "compaction_frozen_message" => "accepted_basis",
-        _ => panic!("unknown frozen view {view:?}"),
+        .unwrap_or_else(|| panic!("missing ordinary and shared {relation} branches: {plan:#?}"));
+    let is_shared = |branch: &PlanNode| {
+        branch
+            .walk()
+            .into_iter()
+            .any(|node| node.relation.as_deref() == Some("compaction_frozen_span"))
     };
-    let consumer_details = [
-        format!("CO-ROUTINE {consumer}"),
-        format!("MATERIALIZE {consumer}"),
-    ];
-    let consumers = plan
-        .iter()
-        .filter(|node| consumer_details.contains(&node.detail))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        consumers.len(),
-        1,
-        "inlined {view:?} must have one identifiable {consumer:?} consumer: {plan:#?}"
+    let first = &union.children[0];
+    let second = &union.children[1];
+    assert_ne!(
+        is_shared(first),
+        is_shared(second),
+        "ambiguous storage branches: {union:#?}"
     );
-    subtree(plan, consumers[0].id)
-}
-
-fn unique_detail_subtree<'a>(
-    branch: &[&'a PlanNode],
-    detail: &str,
-    view: &str,
-) -> Vec<&'a PlanNode> {
-    let roots = branch
-        .iter()
-        .copied()
-        .filter(|node| node.detail == detail)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        roots.len(),
-        1,
-        "expected one {detail:?} branch for {view:?}: {branch:#?}"
-    );
-    let mut ids = vec![roots[0].id];
-    let mut result = vec![roots[0]];
-    let mut cursor = 0;
-    while cursor < ids.len() {
-        let parent = ids[cursor];
-        for node in branch.iter().copied() {
-            if node.parent == parent && !ids.contains(&node.id) {
-                ids.push(node.id);
-                result.push(node);
-            }
-        }
-        cursor += 1;
+    if is_shared(first) {
+        (second, first)
+    } else {
+        (first, second)
     }
-    result
 }
 
-fn assert_frozen_view_plan(plan: &[PlanNode], view: &str) {
-    let view_branch = frozen_view_branch(plan, view);
-    let ordinary = unique_detail_subtree(&view_branch, "LEFT-MOST SUBQUERY", view);
-    let shared = unique_detail_subtree(&view_branch, "UNION ALL", view);
-    assert_exact_branch_search(
-        &ordinary,
-        &["d"],
-        "manifest_id",
-        &format!("ordinary {view} data"),
-    );
-    assert_exact_branch_search(
-        &ordinary,
-        &["l"],
-        "manifest_id",
-        &format!("ordinary {view} layout"),
-    );
+fn assert_storage_bounds(
+    branch: &PlanNode,
+    relation: &str,
+    identity_column: &str,
+    range_column: &str,
+    require_upper: bool,
+) {
+    assert_exact_branch_search(branch, relation, identity_column, false);
+    let candidates = branch.walk();
+    let index = candidates
+        .iter()
+        .find(|node| {
+            node.relation.as_deref() == Some(relation) && node.scoped_index(identity_column)
+        })
+        .unwrap();
     assert!(
-        ordinary.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "d")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "ordinal", ">")
-        }),
-        "ordinary {view} data lookup must seek the logical ordinal prefix: {ordinary:#?}"
+        index.has_index_constraint(range_column, ">=")
+            || index.has_index_constraint(range_column, ">"),
+        "missing indexed lower range on {relation}.{range_column}: {index:#?}"
     );
-    assert!(
-        ordinary.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "l")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "kind", "=")
-        }),
-        "ordinary {view} layout must constrain manifest_id and kind: {ordinary:#?}"
-    );
+    if require_upper {
+        assert!(
+            index.has_index_constraint(range_column, "<")
+                || index.has_index_constraint(range_column, "<="),
+            "missing indexed upper range on {relation}.{range_column}: {index:#?}"
+        );
+    }
+}
 
-    assert_exact_branch_search(
-        &shared,
-        &["d"],
-        "manifest_id",
-        &format!("shared {view} data"),
-    );
-    assert_exact_branch_search(
-        &shared,
-        &["l"],
-        "manifest_id",
-        &format!("shared {view} layout"),
-    );
-    assert_exact_branch_search(
-        &shared,
-        &["s"],
-        "manifest_id",
-        &format!("shared {view} span"),
-    );
+fn assert_storage_kind(branch: &PlanNode, relation: &str) {
+    assert_exact_branch_search(branch, relation, "manifest_id", false);
     assert!(
-        shared.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "l")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "kind", "=")
+        branch.walk().into_iter().any(|node| {
+            node.relation.as_deref() == Some(relation)
+                && node.scoped_index("manifest_id")
+                && node.has_index_constraint("kind", "=")
         }),
-        "shared {view} layout must constrain manifest_id and kind: {shared:#?}"
+        "missing manifest and kind constraints for {relation}: {branch:#?}"
     );
-    assert!(
-        shared.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "s")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "kind", "=")
-        }),
-        "shared {view} span must constrain manifest_id and kind: {shared:#?}"
-    );
-    assert!(
-        shared.iter().any(|node| {
-            plan_subject(&node.detail, "SEARCH", "d")
-                && has_constraint(&node.detail, "manifest_id", "=")
-                && has_constraint(&node.detail, "ordinal", ">")
-                && has_constraint(&node.detail, "ordinal", "<")
-        }),
-        "shared-range {view} data lookup must constrain manifest and ordinal range: {shared:#?}"
-    );
+}
+
+fn assert_projection_page_plan(plan: &PlanNode, bounds: ProjectionPageBounds) {
+    let relation = "compaction_frozen_message_data";
+    let (ordinary, shared) = storage_branches(plan, relation);
+    let require_upper = matches!(bounds, ProjectionPageBounds::Data { .. });
+    assert_storage_bounds(ordinary, relation, "manifest_id", "ordinal", require_upper);
+    assert_storage_bounds(shared, relation, "manifest_id", "ordinal", require_upper);
+    assert_storage_kind(shared, "compaction_frozen_span");
+}
+
+fn assert_frozen_view_plan(plan: &PlanNode, name: &str, relation: &str) {
+    let scope = format!("CTE {name}");
+    let consumer = plan
+        .walk()
+        .into_iter()
+        .find(|node| node.subplan.as_deref() == Some(&scope))
+        .unwrap_or_else(|| panic!("missing materialized {name}: {plan:#?}"));
+    let (ordinary, shared) = storage_branches(consumer, relation);
+    assert_storage_bounds(ordinary, relation, "manifest_id", "ordinal", false);
+    assert_storage_kind(ordinary, "compaction_frozen_layout");
+    assert_storage_bounds(shared, relation, "manifest_id", "ordinal", true);
+    assert_storage_kind(shared, "compaction_frozen_layout");
+    assert_storage_kind(shared, "compaction_frozen_span");
 }
 
 async fn seed_plan_noise(db: &SqliteDatabase) {
     for index in 0..16 {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'other-thread','other-turn',?,'noise','{}',CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'other-thread','other-turn',$2,'noise','{}',CURRENT_TIMESTAMP)",
             [format!("noise-event-{index}").into(), (index as i64 + 10).into()],
         ))
         .await
@@ -2410,22 +2071,22 @@ async fn seed_plan_noise(db: &SqliteDatabase) {
     for index in 0..12 {
         let id = format!("ordinary-noise-{index}");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,'ws','root-thread','noise',1,1,1,'noise',1,1)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ($1,'ws','root-thread','noise',1,1,1,'noise',1,1)",
             [id.clone().into()],
         ))
         .await
         .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES (?,0,'{}',2)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ($1,0,'{}',2)",
             [id.clone().into()],
         ))
         .await
         .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES (?,0,0,'event:foreign-turn','foreign-event','event-revision:1','foreign-thread','{}',2)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ($1,0,0,'event:foreign-turn','foreign-event','event-revision:1','foreign-thread','{}',2)",
             [id.into()],
         ))
         .await
@@ -2434,39 +2095,39 @@ async fn seed_plan_noise(db: &SqliteDatabase) {
     for index in 0..12 {
         let id = format!("shared-noise-{index}");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,'ws','root-thread','noise',1,1,1,'noise',1,1)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ($1,'ws','root-thread','noise',1,1,1,'noise',1,1)",
             [id.clone().into()],
         ))
         .await
         .unwrap();
         for kind in [0_i64, 1_i64] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES (?,?,0,1)",
+                DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ($1,$2,0,1)",
                 [id.clone().into(), kind.into()],
             ))
             .await
             .unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES (?,?,0,1,'noise-storage')",
+                DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES ($1,$2,0,1,'noise-storage')",
                 [id.clone().into(), kind.into()],
             ))
             .await
             .unwrap();
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1 AND kind=?2",[id.clone().into(),kind.into()])).await.unwrap();
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=$1 AND kind=$2",[id.clone().into(),kind.into()])).await.unwrap();
         }
     }
 }
 
-async fn production_plan(compressed: bool) -> Vec<PlanNode> {
-    let fixture = fixture().await;
+async fn production_plan(compressed: bool) -> PlanNode {
+    let fixture = fixture_with_portable_sources(compressed).await;
     let db = fixture.db();
     for (ordinal, source) in source_cases().into_iter().enumerate() {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',?,?,1,?,?,?,?)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',$1,$2,1,$3,$4,$5,$6)",
             [
                 (ordinal as i64).into(),
                 (ordinal as i64).into(),
@@ -2480,75 +2141,42 @@ async fn production_plan(compressed: bool) -> Vec<PlanNode> {
         .unwrap();
     }
     seed_plan_noise(&db).await;
-    if compressed {
-        enable_and_physically_compress_canonical_payloads(&db).await;
-    }
-    let mut statement = compaction_manifest_sources_current_statement("manifest-operation");
-    statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
-    db.query_all_raw(statement)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| PlanNode {
-            id: row.try_get("", "id").unwrap(),
-            parent: row.try_get("", "parent").unwrap(),
-            detail: row.try_get("", "detail").unwrap(),
-        })
-        .collect()
+    explain(
+        &db,
+        compaction_manifest_sources_current_statement("manifest-operation"),
+    )
+    .await
 }
 
-fn assert_production_plan(plan: &[PlanNode], compressed: bool) {
-    let current_roots = plan
-        .iter()
-        .filter(|node| {
-            matches!(
-                node.detail.as_str(),
-                "MATERIALIZE current_sources" | "CO-ROUTINE current_sources"
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        current_roots.len(),
-        1,
-        "expected one current_sources producer: {plan:#?}"
-    );
-    let current = subtree(plan, current_roots[0].id);
+fn assert_production_plan(plan: &PlanNode) {
+    // Inline and compressed values use the same canonical row and revision indexes.
     for (revision, canonical, key) in [
         ("context_revision", "context_source", "source_id"),
         ("item_revision", "item_source", "source_id"),
         ("event_revision", "event_source", "source_id"),
         ("input_revision", "input_source", "source_id"),
     ] {
-        assert_exact_branch_search(&current, &[revision], key, revision);
-        let physical = if compressed {
-            match canonical {
-                "context_source" => &["context_source", "_turn_llm_context_zstd"][..],
-                "item_source" => &["item_source", "_turn_item_zstd"][..],
-                "event_source" => &["event_source", "_turn_event_zstd"][..],
-                "input_source" => &["input_source", "_turn_input_zstd"][..],
-                _ => unreachable!(),
-            }
-        } else {
-            std::slice::from_ref(&canonical)
-        };
-        assert_exact_branch_search(&current, physical, "id", canonical);
+        assert_exact_branch_search(plan, revision, key, true);
+        assert_exact_branch_search(plan, canonical, "id", true);
     }
-    assert_exact_branch_search(&current, &["checkpoint_source"], "id", "checkpoint source");
-    assert_exact_branch_search(&current, &["basis_source"], "run_id", "task basis source");
-    assert_frozen_view_plan(plan, "compaction_frozen_import");
-    assert_frozen_view_plan(plan, "compaction_frozen_message");
+    assert_exact_branch_search(plan, "checkpoint_source", "id", true);
+    assert_exact_branch_search(plan, "basis_source", "run_id", true);
+    assert_frozen_view_plan(plan, "accepted_imports", "compaction_frozen_import_data");
+    assert_frozen_view_plan(
+        plan,
+        "accepted_basis_messages",
+        "compaction_frozen_message_data",
+    );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn production_plan_scopes_plain_source_and_logical_frozen_view_lookups() {
-    let plan = production_plan(false).await;
-    assert_production_plan(&plan, false);
+    assert_production_plan(&production_plan(false).await);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn production_plan_scopes_zstd_source_and_logical_frozen_view_lookups() {
-    let plan = production_plan(true).await;
-    assert_production_plan(&plan, true);
+    assert_production_plan(&production_plan(true).await);
 }
 
 fn raw_fixture_snapshot(operation: &str, owner: &str, coverage: Vec<SourceRef>) -> String {
@@ -2587,8 +2215,8 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
     let db = fixture.db();
     for ordinal in 0..sources {
         let id = format!("{operation}-source-{ordinal}");
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?1,'root-thread','root-turn',?2,'fixture','{}',CURRENT_TIMESTAMP)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'root-thread','root-turn',$2,'fixture','{}',CURRENT_TIMESTAMP)",
             [id.into(),(10_000_i64+ordinal as i64).into()])).await.unwrap();
     }
     let coverage = (0..sources)
@@ -2598,17 +2226,17 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
             version: "event-revision:1".into(),
         })
         .collect::<Vec<_>>();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES (?1,'root-owner',?1,'running',?2,900000)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ($1,'root-owner',$1,'running',$2::text::json,900000)",
         [operation.into(),raw_fixture_snapshot(operation,"root-owner",coverage.clone()).into()])).await.unwrap();
     for ordinal in 0..sources {
         let id = format!("{operation}-source-{ordinal}");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "INSERT INTO compaction_manifest(\
                 operation_id,ordinal,unit_ordinal,reference_only,source_thread,\
                 source_scope,source_id,source_version) \
-             VALUES (?,?,?,?,'root-thread','event:root-turn',?,'event-revision:1')",
+             VALUES ($1,$2,$3,$4,'root-thread','event:root-turn',$5,'event-revision:1')",
             [
                 operation.into(),
                 (ordinal as i64).into(),
@@ -2644,11 +2272,11 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
     };
     let identity = checkpoint_identity(&exact_candidate).unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         "INSERT INTO compaction_checkpoint(\
             id,operation_id,owner,portion,summary,identity_sha256,selection,\
             projection_version,format_version,status) \
-         VALUES (?,?,'root-owner',0,'prepared summary',?,?,0,1,'candidate')",
+         VALUES ($1,$2,'root-owner',0,'prepared summary',$3,$4,0,1,'candidate')",
         [
             checkpoint.clone().into(),
             operation.into(),
@@ -2660,10 +2288,10 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
     .unwrap();
     for ordinal in 0..sources {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "INSERT INTO compaction_coverage(\
                 checkpoint_id,source_scope,source_id,source_version) \
-             VALUES (?,'event:root-turn',?,'event-revision:1')",
+             VALUES ($1,'event:root-turn',$2,'event-revision:1')",
             [
                 checkpoint.clone().into(),
                 format!("{operation}-source-{ordinal}").into(),
@@ -2694,8 +2322,8 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         diagnostic: None,
     };
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES (?,?,?)",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES ($1,$2,$3::text::json)",
         [
             operation.into(),
             i64::try_from(state.generation).unwrap().into(),
@@ -2759,8 +2387,8 @@ async fn finish_checkpoint_fixture(fixture: &Fixture, id: &str) -> String {
     fixture
         .db()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_checkpoint SET identity_sha256=?1 WHERE id=?2 AND proof_version=0",
+            DbBackend::Postgres,
+            "UPDATE compaction_checkpoint SET identity_sha256=$1 WHERE id=$2 AND proof_version=0",
             [identity.clone().into(), id.into()],
         ))
         .await
@@ -2785,17 +2413,17 @@ async fn install_verified_projection(
     let json = serde_json::to_string(&typed).unwrap();
     let manifest = format!("{operation}-verified-origin");
     let db = fixture.db();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) VALUES (?1,'ws','root-thread',?2,1,0,?3,1,1,0)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) VALUES ($1,'ws','root-thread',$2,1,0,$3,1,1,0)",
         [manifest.clone().into(),identity.clone().into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES (?1,0,?2,?3)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ($1,0,$2,$3)",
         [manifest.clone().into(),json.clone().into(),(json.len() as i64).into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES (?1,?2,?3,?4,0)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ($1,$2,$3,$4,0)",
         [operation.into(),manifest.into(),identity.into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES (?1,1,0,'fixture ready plan',1)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES ($1,1,0,'fixture ready plan',1)",
         [operation.into()])).await.unwrap();
 }
 
@@ -2806,11 +2434,11 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
     for ordinal in 0..nodes {
         let id = format!("{operation}-dag-{ordinal}");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "INSERT INTO compaction_checkpoint(\
               id,operation_id,owner,previous,portion,summary,identity_sha256,selection,\
               projection_version,format_version,status) \
-             VALUES (?,'source-operation','source-owner',?,?, 'dag',?,'{}',0,1,'applied')",
+             VALUES ($1,'source-operation','source-owner',$2,$3, 'dag',$4,'{}',0,1,'applied')",
             [
                 id.clone().into(),
                 previous.into(),
@@ -2823,10 +2451,10 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
         previous = id;
     }
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         "UPDATE compaction_manifest SET reference_only=1,source_thread='source-thread',\
-          source_scope='checkpoint:source-owner',source_id=?,source_version=? \
-         WHERE operation_id=? AND ordinal=0",
+          source_scope='checkpoint:source-owner',source_id=$1,source_version=$2 \
+         WHERE operation_id=$3 AND ordinal=0",
         [
             previous.into(),
             format!("{operation}-dag-version-{}", nodes - 1).into(),
@@ -2836,8 +2464,8 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM compaction_coverage WHERE checkpoint_id=? AND source_id=?",
+        DbBackend::Postgres,
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=$1 AND source_id=$2",
         [
             format!("{operation}-checkpoint").into(),
             format!("{operation}-source-0").into(),
@@ -2848,7 +2476,7 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
     finish_checkpoint_fixture(fixture, &format!("{operation}-checkpoint")).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn completed_summary_publishes_after_selected_source_edits_and_deletes() {
     use crate::repositories::compaction::CommitOutcome;
 
@@ -2923,7 +2551,7 @@ async fn completed_summary_publishes_after_selected_source_edits_and_deletes() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unrelated_streaming_and_compaction_work_does_not_delay_publication() {
     use crate::repositories::compaction::CommitOutcome;
     let fixture = fixture().await;
@@ -2958,7 +2586,7 @@ async fn unrelated_streaming_and_compaction_work_does_not_delay_publication() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_keeps_atomic_cancellation_generation_identity_and_head_guards() {
     use crate::repositories::compaction::CommitOutcome;
     for (mutation, expected) in [
@@ -3023,7 +2651,7 @@ async fn publication_keeps_atomic_cancellation_generation_identity_and_head_guar
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_rejects_changed_candidate_owner_before_seal_and_guard_blocks_it_after_seal() {
     use crate::repositories::compaction::CommitOutcome;
     let fixture = fixture().await;
@@ -3069,7 +2697,7 @@ async fn publication_rejects_changed_candidate_owner_before_seal_and_guard_block
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_rejects_incomplete_saved_coverage_without_reading_live_sources() {
     use crate::repositories::compaction::CommitOutcome;
     let fixture = fixture().await;
@@ -3103,7 +2731,7 @@ async fn publication_rejects_incomplete_saved_coverage_without_reading_live_sour
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn concurrent_success_is_already_applied() {
     use crate::repositories::compaction::CommitOutcome;
 
@@ -3126,29 +2754,29 @@ async fn concurrent_success_is_already_applied() {
 
     let txn = fixture.db().begin().await.unwrap();
     txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_context SET head=? WHERE owner='root-owner' AND head IS NULL",
+        DbBackend::Postgres,
+        "UPDATE compaction_context SET head=$1 WHERE owner='root-owner' AND head IS NULL",
         [checkpoint.clone().into()],
     ))
     .await
     .unwrap();
     txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+        DbBackend::Postgres,
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id=$1",
         [checkpoint.clone().into()],
     ))
     .await
     .unwrap();
     txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=$1",
         [operation.into()],
     ))
     .await
     .unwrap();
     txn.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_runner_state SET generation=?,state=? WHERE operation_id=?",
+        DbBackend::Postgres,
+        "UPDATE compaction_runner_state SET generation=$1,state=$2::text::json WHERE operation_id=$3",
         [
             i64::try_from(applied_state.generation).unwrap().into(),
             serde_json::to_string(&applied_state).unwrap().into(),
@@ -3163,7 +2791,7 @@ async fn concurrent_success_is_already_applied() {
     assert_eq!(apply.await.unwrap(), CommitOutcome::AlreadyApplied);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_hook_is_scoped_to_one_database_with_reused_operation_id() {
     use crate::repositories::compaction::CommitOutcome;
 
@@ -3197,7 +2825,7 @@ async fn publication_hook_is_scoped_to_one_database_with_reused_operation_id() {
     assert_eq!(first_apply.await.unwrap(), CommitOutcome::Applied);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publication_hook_is_consumed_by_only_one_concurrent_publication() {
     let fixture = fixture().await;
     let operation = "publication-single-consumer-hook";
@@ -3240,7 +2868,7 @@ async fn publication_hook_is_consumed_by_only_one_concurrent_publication() {
     replacement_task.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn aborted_publication_hook_can_be_rearmed_without_leaking_registration() {
     use crate::repositories::compaction::CommitOutcome;
 
@@ -3278,7 +2906,7 @@ async fn aborted_publication_hook_can_be_rearmed_without_leaking_registration() 
     assert_eq!(apply.await.unwrap(), CommitOutcome::Applied);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_grow() {
     use crate::repositories::compaction::CommitOutcome;
 
@@ -3335,78 +2963,51 @@ async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_gro
     }
 }
 
-#[tokio::test]
-async fn retired_publication_fence_triggers_are_removed_and_migration_is_idempotent() {
-    async fn trigger_count(db: &SqliteDatabase) -> i64 {
-        db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM sqlite_schema WHERE type='trigger' AND name GLOB 'compaction_publication_*'".to_owned()))
-            .await.unwrap().unwrap().try_get("", "n").unwrap()
-    }
-    async fn generation(db: &SqliteDatabase) -> i64 {
-        db.query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT structural_generation FROM compaction_publication_fence WHERE singleton=1"
-                .to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "structural_generation")
-        .unwrap()
-    }
-    for compressed in [false, true] {
-        let fixture = fixture().await;
+#[pioneer_postgres_test::postgres_test]
+async fn fresh_schema_updates_source_revisions_without_retired_publication_fences() {
+    for portable in [false, true] {
+        let fixture = fixture_with_portable_sources(portable).await;
+        fixture
+            .writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
         let db = fixture.db();
-        if compressed {
-            enable_and_physically_compress_canonical_payloads(&db).await;
-        }
-        assert_eq!(trigger_count(&db).await, 0);
-        let before = generation(&db).await;
-        let table = if compressed {
-            "_turn_event_zstd"
-        } else {
-            "turn_event"
-        };
-        db.execute_unprepared(&format!("CREATE TRIGGER compaction_publication_test AFTER UPDATE ON {table} BEGIN UPDATE compaction_publication_fence SET structural_generation=structural_generation+1 WHERE singleton=1; END")).await.unwrap();
-        let migration = Migrator::migrations()
-            .into_iter()
-            .find(|migration| {
-                migration.name() == "m20261008_000009_retire_compaction_publication_fences"
-            })
-            .expect("publication fence retirement migration is registered");
-        for _ in 0..2 {
-            // Reapply through the supported serialized migration executor.
-            db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "DELETE FROM seaql_migrations WHERE version=?",
-                [migration.name().into()],
+        let retired = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('public.compaction_publication_fence') IS NULL AND NOT EXISTS (
+                SELECT 1 FROM pg_trigger WHERE tgname LIKE 'compaction_publication_%'
+            ) AS absent",
             ))
             .await
+            .unwrap()
             .unwrap();
-            fixture
-                .writer
-                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-                .await
-                .unwrap();
-        }
-        assert_eq!(trigger_count(&db).await, 0);
-        db.execute_unprepared("UPDATE turn_event SET payload='edited' WHERE id='event-source'")
+        assert!(retired.try_get::<bool>("", "absent").unwrap());
+        db.execute_unprepared(
+            r#"UPDATE turn_event SET payload='{"edited":true}', payload_payload_id=NULL
+            WHERE id='event-source'"#,
+        )
+        .await
+        .unwrap();
+        let revision = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT revision FROM compaction_event_revision WHERE source_id='event-source'",
+            ))
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(
-            generation(&db).await,
-            before,
-            "retired counters must no longer add write work"
-        );
+        assert_eq!(revision.try_get::<i64>("", "revision").unwrap(), 2);
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_projection_metadata_queries_seek_one_manifest_and_ordinal_page() {
     let fixture = fixture().await;
     let db = fixture.db();
     seed_plan_noise(&db).await;
-    for (mut statement, bounds) in [
+    for (statement, bounds) in [
         (
             checkpoint_projection_page_sizes_statement("plan-manifest", 7),
             ProjectionPageBounds::Sizes { start: 7 },
@@ -3416,19 +3017,8 @@ async fn checkpoint_projection_metadata_queries_seek_one_manifest_and_ordinal_pa
             ProjectionPageBounds::Data { start: 7, end: 128 },
         ),
     ] {
-        assert_projection_page_statement(&statement, "plan-manifest", bounds);
-        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
-        let plan = db
-            .query_all_raw(statement)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| PlanNode {
-                id: row.try_get("", "id").unwrap(),
-                parent: row.try_get("", "parent").unwrap(),
-                detail: row.try_get("", "detail").unwrap(),
-            })
-            .collect::<Vec<_>>();
+        assert_projection_page_parameters(&statement, "plan-manifest", bounds);
+        let plan = explain(&db, statement).await;
         assert_projection_page_plan(&plan, bounds);
     }
 }
@@ -3466,7 +3056,7 @@ impl<T> Drop for AbortJoinOnDrop<T> {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_projection_page_hook_is_token_owned_and_cancellation_safe() {
     let primary_fixture = fixture().await;
     let db = primary_fixture.db();
@@ -3562,13 +3152,13 @@ async fn checkpoint_projection_page_hook_is_token_owned_and_cancellation_safe() 
     drop(arm_checkpoint_projection_page_test_hook(&db, "early-error"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_reader() {
     let fixture = fixture().await;
     let db = fixture.db();
     let count = SOURCE_PAGE_ROWS as i64 * 2 + 2;
-    db.execute_raw(sqlite_specific_sql(
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('projection-pages','ws','source-thread','preparing',?,?,0,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0,0)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('projection-pages','ws','source-thread','preparing',$1,$2,0,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0,0)",
         [count.into(), count.into()],
     ))
     .await
@@ -3601,8 +3191,8 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
         let canonical = serde_json::to_vec(&typed).unwrap();
         digest.update((canonical.len() as u64).to_be_bytes());
         digest.update(canonical);
-        db.execute_raw(sqlite_specific_sql(
-            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('projection-pages',?,?,?)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('projection-pages',$1,$2,$3)",
             [ordinal.into(), reference.clone().into(), (reference.len() as i64).into()],
         ))
         .await
@@ -3610,8 +3200,8 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
     }
 
     let identity = hex::encode(digest.finalize());
-    db.execute_raw(sqlite_specific_sql("UPDATE compaction_frozen_history SET identity_sha256=?,ready=1 WHERE id='projection-pages'", [identity.clone().into()])).await.unwrap();
-    db.execute_raw(sqlite_specific_sql("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','projection-pages',?,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0)", [identity.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres, "UPDATE compaction_frozen_history SET identity_sha256=$1,ready=1 WHERE id='projection-pages'", [identity.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres, "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','projection-pages',$1,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0)", [identity.into()])).await.unwrap();
 
     for shared in [false, true] {
         let observer = observe_checkpoint_projection_page_test_reads(&db, "projection-pages");
@@ -3629,7 +3219,7 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
         let unrelated: i64 = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             db.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT count(*) AS n FROM thread".to_owned(),
             )),
         )
@@ -3678,7 +3268,7 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
                 "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) SELECT 'projection-storage',workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready FROM compaction_frozen_history WHERE id='projection-pages'",
                 "INSERT INTO compaction_frozen_message_data SELECT 'projection-storage',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
                 "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('projection-pages',0,0,1)",
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) SELECT 'projection-pages',0,0,message_count,'projection-storage' FROM compaction_frozen_history WHERE id='projection-pages'",
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) SELECT 'projection-pages',0,0,message_count,'projection-storage' FROM compaction_frozen_history WHERE id='projection-pages'",
                 "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='projection-pages' AND kind=0",
                 "DELETE FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
             ] {
@@ -3717,19 +3307,19 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
             format_version: 1,
         };
         let identity = checkpoint_identity(&cp).unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES(?1,'ws','source-thread',1)",[owner.clone().into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES(?1,?2,?1,'completed',?3,900000)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES($1,'ws','source-thread',1)",[owner.clone().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES($1,$2,$1,'completed',$3::text::json,900000)",
             [op.clone().into(),owner.clone().into(),raw_fixture_snapshot(&op,&owner,vec![leaf.clone()]).into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,selection,projection_version,format_version,identity_sha256,status) VALUES(?1,?2,?3,0,?4,?5,0,1,?6,'applied')",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,selection,projection_version,format_version,identity_sha256,status) VALUES($1,$2,$3,0,$4,$5::text::json,0,1,$6,'applied')",
             [cp.id.clone().into(),op.clone().into(),owner.clone().into(),cp.summary.clone().into(),serde_json::to_string(&cp.selection).unwrap().into(),identity.clone().into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES($1,$2,$3,$4)",
             [cp.id.clone().into(),leaf.scope.clone().into(),leaf.id.clone().into(),leaf.version.clone().into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,0,0,0,'source-thread',?2,?3,?4)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES($1,0,0,0,'source-thread',$2,$3,$4)",
             [op.into(),leaf.scope.clone().into(),leaf.id.clone().into(),leaf.version.clone().into()])).await.unwrap();
         sources.push(SourceRef {
             scope: format!("checkpoint:{owner}"),
@@ -3738,8 +3328,8 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
         });
     }
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+        DbBackend::Postgres,
+        "UPDATE compaction_operation SET snapshot=$2::text::json WHERE id=$1",
         [
             operation.into(),
             raw_fixture_snapshot(operation, "root-owner", sources.clone()).into(),
@@ -3748,25 +3338,25 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM compaction_manifest WHERE operation_id=?1",
+        DbBackend::Postgres,
+        "DELETE FROM compaction_manifest WHERE operation_id=$1",
         [operation.into()],
     ))
     .await
     .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "DELETE FROM compaction_coverage WHERE checkpoint_id=?1",
+        DbBackend::Postgres,
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=$1",
         [root.clone().into()],
     ))
     .await
     .unwrap();
     for (ordinal, r) in sources.iter().enumerate() {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,?2,?2,0,'source-thread',?3,?4,?5)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES($1,$2,$2,0,'source-thread',$3,$4,$5)",
             [operation.into(),(ordinal as i64).into(),r.scope.clone().into(),r.id.clone().into(),r.version.clone().into()])).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES($1,$2,$3,$4)",
             [root.clone().into(),r.scope.clone().into(),r.id.clone().into(),r.version.clone().into()])).await.unwrap();
     }
     if n == CHECKPOINT_SOURCE_LIMIT {
@@ -3781,8 +3371,8 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
     }
     checkpoint.coverage = sources;
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_checkpoint SET identity_sha256=?2 WHERE id=?1",
+        DbBackend::Postgres,
+        "UPDATE compaction_checkpoint SET identity_sha256=$2 WHERE id=$1",
         [
             root.into(),
             checkpoint_identity(&checkpoint).unwrap().into(),
@@ -3792,8 +3382,8 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
     .unwrap();
     state.cursor.unit = n as u64;
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_runner_state SET state=?2 WHERE operation_id=?1",
+        DbBackend::Postgres,
+        "UPDATE compaction_runner_state SET state=$2::text::json WHERE operation_id=$1",
         [
             operation.into(),
             serde_json::to_string(&state).unwrap().into(),
@@ -3803,7 +3393,7 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
     .unwrap();
     state
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn large_selected_foreign_fanout_pages_every_set_and_observes_constant_actual_seal_writer() {
     use crate::repositories::compaction::CommitOutcome;
     for n in [2, CHECKPOINT_SOURCE_LIMIT] {
@@ -3839,15 +3429,15 @@ async fn large_selected_foreign_fanout_pages_every_set_and_observes_constant_act
             .unwrap()
             .unwrap();
         assert_eq!(edges.coverage.len(), n);
-        let sealed:i64=f.db().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_checkpoint WHERE id LIKE ?1 AND proof_version=1",[format!("{operation}-dependency-%").into()])).await.unwrap().unwrap().try_get("","n").unwrap();
+        let sealed:i64=f.db().query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT count(*) AS n FROM compaction_checkpoint WHERE id LIKE $1 AND proof_version=1",[format!("{operation}-dependency-%").into()])).await.unwrap().unwrap().try_get("","n").unwrap();
         assert_eq!(
             sealed, n as i64,
             "all foreign dependencies were prepared, not just a final summary"
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_historical_source_edits() {
     use crate::repositories::compaction::CommitOutcome;
     for before in [false, true] {
@@ -3922,7 +3512,7 @@ async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_histori
         let version: i64 = f
             .db()
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-stop-checkpoint'",
             ))
             .await
@@ -3933,7 +3523,7 @@ async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_histori
         assert_eq!(version, 0, "Stop must not seal a stale preparation");
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() {
     use crate::repositories::compaction::CommitOutcome;
     for rollback in [false, true] {
@@ -3965,7 +3555,7 @@ async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() 
             assert!(task.await.unwrap_err().is_cancelled());
             drop(hook);
         }
-        let marker:i64=f.db().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT proof_version FROM compaction_checkpoint WHERE id='seal-restart-checkpoint'")).await.unwrap().unwrap().try_get("","proof_version").unwrap();
+        let marker:i64=f.db().query_one_raw(Statement::from_string(DbBackend::Postgres,"SELECT proof_version FROM compaction_checkpoint WHERE id='seal-restart-checkpoint'")).await.unwrap().unwrap().try_get("","proof_version").unwrap();
         assert_eq!(marker, 0);
         assert_eq!(f.store.compaction_head("root-owner").await.unwrap(), None);
         assert_eq!(
@@ -3978,7 +3568,7 @@ async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous_ownership() {
     for poison in ["source", "owner", "ambiguous", "version", "missing"] {
         let f = fixture().await;
@@ -3990,8 +3580,8 @@ async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous
             "source" => {
                 f.db()
                     .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "UPDATE compaction_coverage SET source_id=?2 WHERE checkpoint_id=?1",
+                        DbBackend::Postgres,
+                        "UPDATE compaction_coverage SET source_id=$2 WHERE checkpoint_id=$1",
                         [
                             root.clone().into(),
                             "x".repeat(SOURCE_PAGE_BYTES + 1).into(),
@@ -4003,8 +3593,8 @@ async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous
             "owner" => {
                 f.db()
                     .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "UPDATE compaction_manifest SET source_thread=?2 WHERE operation_id=?1",
+                        DbBackend::Postgres,
+                        "UPDATE compaction_manifest SET source_thread=$2 WHERE operation_id=$1",
                         [
                             operation.clone().into(),
                             "x".repeat(SOURCE_PAGE_BYTES + 1).into(),
@@ -4014,18 +3604,18 @@ async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous
                     .unwrap();
             }
             "ambiguous" => {
-                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,1,0,0,'foreign-thread','event:root-turn',?2,'event-revision:1')",[operation.clone().into(),source.into()])).await.unwrap();
+                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES($1,1,0,0,'foreign-thread','event:root-turn',$2,'event-revision:1')",[operation.clone().into(),source.into()])).await.unwrap();
             }
             "version" => {
-                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE compaction_coverage SET source_version='lost-version' WHERE checkpoint_id=?1",[root.clone().into()])).await.unwrap();
+                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "UPDATE compaction_coverage SET source_version='lost-version' WHERE checkpoint_id=$1",[root.clone().into()])).await.unwrap();
             }
             "missing" => {
                 f.db()
                     .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "DELETE FROM compaction_manifest WHERE operation_id=?1",
+                        DbBackend::Postgres,
+                        "DELETE FROM compaction_manifest WHERE operation_id=$1",
                         [operation.clone().into()],
                     ))
                     .await
@@ -4059,8 +3649,8 @@ async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous
         let marker: i64 = f
             .db()
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+                DbBackend::Postgres,
+                "SELECT proof_version FROM compaction_checkpoint WHERE id=$1",
                 [root.into()],
             ))
             .await
@@ -4077,7 +3667,7 @@ async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are_consistency_failures()
  {
     use crate::repositories::compaction::CheckpointTopologyRead;
@@ -4115,25 +3705,25 @@ async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are
         let first = format!("{operation}-source-0");
         let sql = match mutation {
             "header" => {
-                "UPDATE compaction_checkpoint SET identity_sha256='replaced' WHERE id=?1 AND ?2 IS NOT NULL"
+                "UPDATE compaction_checkpoint SET identity_sha256='replaced' WHERE id=$1 AND $2 IS NOT NULL"
             }
             "coverage" | "coverage-close" => {
-                "DELETE FROM compaction_coverage WHERE checkpoint_id=?1 AND source_id=?2"
+                "DELETE FROM compaction_coverage WHERE checkpoint_id=$1 AND source_id=$2"
             }
             "version" | "version-close" => {
-                "UPDATE compaction_coverage SET source_version='changed' WHERE checkpoint_id=?1 AND source_id=?2"
+                "UPDATE compaction_coverage SET source_version='changed' WHERE checkpoint_id=$1 AND source_id=$2"
             }
             "ownership-close" => {
-                "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=(SELECT operation_id FROM compaction_checkpoint WHERE id=?1) AND source_id=?2"
+                "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=(SELECT operation_id FROM compaction_checkpoint WHERE id=$1) AND source_id=$2"
             }
             "status" => {
-                "UPDATE compaction_checkpoint SET status='stale' WHERE id=?1 AND ?2 IS NOT NULL"
+                "UPDATE compaction_checkpoint SET status='stale' WHERE id=$1 AND $2 IS NOT NULL"
             }
             "format" => {
-                "UPDATE compaction_checkpoint SET format_version=2 WHERE id=?1 AND ?2 IS NOT NULL"
+                "UPDATE compaction_checkpoint SET format_version=2 WHERE id=$1 AND $2 IS NOT NULL"
             }
             "unsupported-proof" => {
-                "UPDATE compaction_checkpoint SET proof_version=2 WHERE id=?1 AND ?2 IS NOT NULL"
+                "UPDATE compaction_checkpoint SET proof_version=2 WHERE id=$1 AND $2 IS NOT NULL"
             }
             _ => unreachable!(),
         };
@@ -4151,7 +3741,7 @@ async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are
             assert!(
                 f.db()
                     .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
+                        DbBackend::Postgres,
                         sql,
                         [root.clone().into(), first.into()]
                     ))
@@ -4163,7 +3753,7 @@ async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are
         }
         f.db()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 [root.clone().into(), first.into()],
             ))
@@ -4195,7 +3785,7 @@ async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actual_seal() {
     use crate::repositories::compaction::CommitOutcome;
     let f = fixture().await;
@@ -4213,7 +3803,7 @@ async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actua
     let version: i64 = f
         .db()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-incoming-checkpoint'",
         ))
         .await
@@ -4229,7 +3819,7 @@ async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actua
     assert_eq!(task.await.unwrap().unwrap(), CommitOutcome::Applied);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dense_selected_ownership_page_plan_seeks_thread_extrema_without_duplicate_scan() {
     use crate::repositories::compaction::CheckpointTopologyRead;
     let f = fixture().await;
@@ -4247,39 +3837,35 @@ async fn dense_selected_ownership_page_plan_seeks_thread_extrema_without_duplica
     for _ in 0..3 {
         read.step(&f.store.connection).await.unwrap();
     }
-    let mut statement = read.page_statement().unwrap();
-    statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
-    let plan = db
-        .query_all_raw(statement)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| PlanNode {
-            id: row.try_get("", "id").unwrap(),
-            parent: row.try_get("", "parent").unwrap(),
-            detail: row.try_get("", "detail").unwrap(),
-        })
-        .collect::<Vec<_>>();
-    let seeks = plan
+    let plan = explain(&db, read.page_statement().unwrap()).await;
+    let nodes = plan.walk();
+    let seeks = nodes
         .iter()
         .filter(|node| {
-            node.detail
-                .starts_with("SEARCH m USING COVERING INDEX compaction_manifest_source")
-                && node.detail.contains("operation_id=?")
-                && node.detail.contains("reference_only=?")
-                && node.detail.contains("source_scope=?")
-                && node.detail.contains("source_id=?")
-                && node.detail.contains("source_version=?")
+            node.index.as_deref() == Some("compaction_manifest_source")
+                && [
+                    "operation_id",
+                    "reference_only",
+                    "source_scope",
+                    "source_id",
+                    "source_version",
+                ]
+                .into_iter()
+                .all(|column| node.has_index_constraint(column, "="))
         })
-        .collect::<Vec<_>>();
+        .count();
     assert_eq!(
-        seeks.len(),
-        2,
-        "both ascending and descending owner extrema need exact indexed bounds: {plan:?}"
+        seeks, 2,
+        "both ascending and descending owner extrema need exact indexed bounds: {plan:#?}"
     );
     assert!(
-        !plan.iter().any(|node| node.detail.starts_with("SCAN m")),
-        "no duplicate-range scan: {plan:?}"
+        !nodes.iter().any(|node| {
+            node.alias
+                .as_deref()
+                .is_some_and(|alias| alias == "m" || alias.starts_with("m_"))
+                && node.kind == "Seq Scan"
+        }),
+        "no duplicate-range scan: {plan:#?}"
     );
     while !read.done {
         read.step(&f.store.connection).await.unwrap();
@@ -4287,7 +3873,7 @@ async fn dense_selected_ownership_page_plan_seeks_thread_extrema_without_duplica
     assert_eq!(read.finish().unwrap().ownership.len(), 130);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn actual_freeze_and_seal_between_topology_pages_preserve_exact_edges_with_one_restart() {
     use crate::repositories::{
         checkpoint_proofs::{GraphPreparation, prepare_graph},
@@ -4377,12 +3963,12 @@ async fn actual_freeze_and_seal_between_topology_pages_preserve_exact_edges_with
                 .all(|s| s.source_thread == "root-thread")
         );
         // A sealed observation accepts no demotion or scope/owner rewrite.
-        assert!(f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=?1 AND ordinal=0",[operation.clone().into()])).await.is_err());
+        assert!(f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=$1 AND ordinal=0",[operation.clone().into()])).await.is_err());
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn coverage_eof_restart_rejects_extra_key_after_observed_maximum() {
     use crate::repositories::{
         checkpoint_proofs::GraphPreparation,
@@ -4417,11 +4003,11 @@ async fn coverage_eof_restart_rejects_extra_key_after_observed_maximum() {
     // Corrupt the still-open legacy sets without rewriting checkpoint identity
     // or disabling guards. Give the extra key a valid single historical owner
     // so current coverage/ownership equality cannot detect this discrepancy.
-    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES (?1,130,130,0,'root-thread',?2,?3,?4)",
+    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ($1,130,130,0,'root-thread',$2,$3,$4)",
         [operation.into(),extra.scope.clone().into(),extra.id.clone().into(),extra.version.clone().into()])).await.unwrap();
-    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES (?1,?2,?3,?4)",
+    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ($1,$2,$3,$4)",
         [root.clone().into(),extra.scope.clone().into(),extra.id.clone().into(),extra.version.clone().into()])).await.unwrap();
     assert_eq!(
         checkpoint_source_owner(&f.store.connection, &original.row, &extra)

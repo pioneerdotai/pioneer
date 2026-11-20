@@ -57,7 +57,7 @@ use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, Value};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 pub(crate) use task_output::bind_queued_task_output;
 pub use task_output::{
@@ -133,16 +133,6 @@ pub struct CheckpointMetadata {
 pub const SOURCE_PAGE_ROWS: u64 = 128;
 pub const SOURCE_PAGE_BYTES: usize = 256 * 1024;
 pub const CHECKPOINT_SOURCE_LIMIT: usize = pioneer_compaction::REPLAY_ALIAS_LIMIT;
-
-// Correlated SQLite json_each validation and bounded MATERIALIZED metadata
-// quanta require SQLite-specific SQL. Ordinary reads/writes use entities.
-#[cfg(test)]
-pub(super) fn sqlite_specific_sql(
-    statement: &str,
-    values: impl IntoIterator<Item = Value>,
-) -> Statement {
-    Statement::from_sql_and_values(DbBackend::Sqlite, statement, values)
-}
 
 /// Sources with a stable sequence used for bounded discovery. Tool items are
 /// resolved by exact references and deliberately have no paging API.
@@ -1240,7 +1230,7 @@ WHERE
      AND basis_thread.workspace_id=basis.workspace_id
     LEFT JOIN compaction_task_basis_revision basis_revision
       ON basis_revision.run_id=basis.run_id
-    WHERE basis.history_json_payload_id IS NOT NULL
+    WHERE basis.history_json_has_array_prefix
       AND basis.workspace_id=$2
       AND basis.conversation_thread_id=$3
       AND 'task-basis:'||basis.run_id=(wanted.value->>'scope')
@@ -1722,15 +1712,109 @@ pub(crate) async fn compaction_save_candidate(
 // no production transition or race fixture runs with a weakened guard.
 #[cfg(test)]
 pub(super) async fn seed_legacy_frozen_header(db: &pioneer_sqlite::SqliteDatabase, sql: &str) {
-    let ddl: String = db.query_one_raw(sqlite_specific_sql(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='frozen_complete_identity'", []))
-        .await.unwrap().unwrap().try_get("", "sql").unwrap();
     let tx = db.begin().await.unwrap();
-    tx.execute_unprepared("DROP TRIGGER frozen_complete_identity")
+    tx.execute_unprepared(
+        "ALTER TABLE compaction_frozen_history DISABLE TRIGGER frozen_complete_identity",
+    )
+    .await
+    .unwrap();
+    tx.execute_unprepared(sql).await.unwrap();
+    tx.execute_unprepared(
+        "ALTER TABLE compaction_frozen_history ENABLE TRIGGER frozen_complete_identity",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[cfg(test)]
+pub(super) async fn seed_compressed_sources(db: &SqliteDatabase) {
+    use pioneer_crud_conversations::{turn_event, turn_item};
+    use pioneer_crud_payloads::storage::PreparedPayload;
+
+    let wire = format!(r#"{{"value":"{}"}}"#, "canonical 🌍".repeat(8192));
+    let event = PreparedPayload::new(&wire).unwrap();
+    let item = PreparedPayload::new(&wire).unwrap();
+    let now = chrono::Utc::now().fixed_offset();
+    let tx = db.begin().await.unwrap();
+    turn_event::lock_stream(&tx, "source-turn").await.unwrap();
+    turn_event::insert(
+        &tx,
+        turn_event::NewEvent {
+            id: "event-source",
+            thread_id: "source-thread",
+            turn_id: "source-turn",
+            sequence: 1,
+            event_type: "fixture",
+            idempotency_key: "event-source",
+            created_at: now,
+        },
+        &event,
+    )
+    .await
+    .unwrap();
+    turn_item::upsert(
+        &tx,
+        turn_item::ItemWrite {
+            id: "item-source".into(),
+            turn_id: "source-turn".into(),
+            item_id: "item-source".into(),
+            item_type: "command_execution".into(),
+            status: Some("completed".into()),
+            created_at: now,
+            updated_at: now,
+        },
+        &item,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[cfg(test)]
+pub(super) async fn seed_task_basis(db: &pioneer_sqlite::SqliteDatabase) {
+    use pioneer_crud_tasks::conversation_snapshot::{
+        NewTaskRunConversationSnapshot, insert_if_absent,
+    };
+
+    let snapshot = NewTaskRunConversationSnapshot {
+        run_id: "basis-run".into(),
+        task_id: "task".into(),
+        workspace_id: "ws".into(),
+        conversation_thread_id: "source-thread".into(),
+        source_turn_id: None,
+        history_json: "[]".into(),
+        created_at: chrono::Utc::now().fixed_offset(),
+    };
+    let prepared =
+        pioneer_crud_payloads::storage::PreparedPayload::new(&snapshot.history_json).unwrap();
+    let tx = db.begin().await.unwrap();
+    let (_, inserted) = insert_if_absent(&tx, &snapshot, None, Some(&prepared))
         .await
         .unwrap();
-    tx.execute_unprepared(sql).await.unwrap();
-    tx.execute_unprepared(&ddl).await.unwrap();
+    assert!(inserted);
+    tx.commit().await.unwrap();
+}
+
+#[cfg(test)]
+pub(super) async fn replace_task_basis(db: &pioneer_sqlite::SqliteDatabase, text: &str) {
+    let prepared = pioneer_crud_payloads::storage::PreparedPayload::new(text).unwrap();
+    let tx = db.begin().await.unwrap();
+    prepared.insert(&tx).await.unwrap();
+    let result = tx
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE task_run_conversation_snapshot
+         SET history_json_payload_id=$1, history_json_has_array_prefix=$2
+         WHERE run_id='basis-run'",
+            [
+                prepared.id().into(),
+                text.trim_start_matches(' ').starts_with('[').into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
     tx.commit().await.unwrap();
 }
 

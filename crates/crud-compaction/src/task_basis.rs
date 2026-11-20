@@ -60,7 +60,7 @@ pub async fn capture<C: ConnectionTrait>(
         .filter(thread::Column::WorkspaceId.eq(workspace))
         .filter(Col::ConversationThreadId.eq(thread_id))
         .filter(Col::RunId.eq(&reference.id))
-        .filter(Col::HistoryJsonPayloadId.is_not_null())
+        .filter(Col::HistoryJsonHasArrayPrefix.eq(true))
         .filter(
             Expr::from(Func::coalesce([
                 Expr::col((revision::Entity, revision::Column::Revision)),

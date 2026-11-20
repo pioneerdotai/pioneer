@@ -124,6 +124,9 @@ pub async fn insert_if_absent(
             .as_ref()
             .map(|_| input.history_json.clone())),
         history_json_payload_id: Set(prepared.map(|value| value.id().to_owned())),
+        history_json_has_array_prefix: Set(
+            prepared.is_some() && input.history_json.trim_start_matches(' ').starts_with('[')
+        ),
         frozen_manifest_id: Set(frozen_manifest_id),
         created_at: Set(input.created_at),
         ..Default::default()

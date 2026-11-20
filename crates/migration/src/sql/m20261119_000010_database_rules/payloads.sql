@@ -52,11 +52,11 @@ AS $trigger$
 BEGIN
     IF (NEW.run_id, NEW.task_id, NEW.workspace_id, NEW.conversation_thread_id,
         NEW.source_turn_id, NEW.created_at, NEW.frozen_manifest_id,
-        NEW.history_json, NEW.history_json_payload_id)
+        NEW.history_json, NEW.history_json_payload_id, NEW.history_json_has_array_prefix)
        IS DISTINCT FROM
        (OLD.run_id, OLD.task_id, OLD.workspace_id, OLD.conversation_thread_id,
         OLD.source_turn_id, OLD.created_at, OLD.frozen_manifest_id,
-        OLD.history_json, OLD.history_json_payload_id) THEN
+        OLD.history_json, OLD.history_json_payload_id, OLD.history_json_has_array_prefix) THEN
         NEW.portable_revision := OLD.portable_revision + 1;
     END IF;
     RETURN NEW;

@@ -75,7 +75,7 @@ current_sources(source_scope,source_id,source_version,thread_id,workspace_id) AS
  JOIN thread basis_thread ON basis_thread.id=basis_source.conversation_thread_id
   AND basis_thread.workspace_id=basis_source.workspace_id
  LEFT JOIN compaction_task_basis_revision basis_revision ON basis_revision.run_id=basis_source.run_id
- WHERE basis_source.history_json_payload_id IS NOT NULL
+ WHERE basis_source.history_json_has_array_prefix
   AND 'task-basis:'||basis_source.run_id=need.source_scope
   AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=need.source_version
   AND basis_source.workspace_id=o.workspace_id

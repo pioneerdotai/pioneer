@@ -1611,6 +1611,7 @@ impl MigrationTrait for Migration {
                     .col(big_integer("portable_revision").default(0))
                     .col(text("portable_identity").default(""))
                     .col(text_null("history_json_payload_id").unique_key())
+                    .col(boolean("history_json_has_array_prefix").default(false))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_task_history_payload")
@@ -1619,6 +1620,9 @@ impl MigrationTrait for Migration {
                     )
                     .check(Expr::cust(
                         "(history_json IS NULL) <> (history_json_payload_id IS NULL)",
+                    ))
+                    .check(Expr::cust(
+                        "NOT history_json_has_array_prefix OR history_json_payload_id IS NOT NULL",
                     ))
                     .col(
                         ColumnDef::new("insertion_ordinal")

@@ -27,6 +27,7 @@ pub struct Model {
     pub portable_identity: String,
     #[sea_orm(column_type = "Text", nullable, unique)]
     pub history_json_payload_id: Option<String>,
+    pub history_json_has_array_prefix: bool,
     #[sea_orm(unique)]
     pub insertion_ordinal: i64,
     #[sea_orm(
