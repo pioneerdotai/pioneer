@@ -107,6 +107,15 @@ async fn boundary(store: &CrudStore, turn_id: &str) -> i64 {
         .receipts_compacted_through_sequence
 }
 
+async fn watermark(db: &pioneer_sqlite::SqliteDatabase, turn_id: &str) -> i64 {
+    stream_entity::Entity::find_by_id(turn_id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+        .projected_through_sequence
+}
+
 async fn seed_compacted_history(store: &CrudStore) {
     // Retain canonical events, with no old receipts and equal durable boundaries.
     // Bulk insertion is fixture setup only, never a production history backfill.
@@ -437,15 +446,7 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
         assert!(first.source_bytes <= RECEIPT_CLEANUP_MAX_SOURCE_BYTES as u64);
         assert_eq!(boundary(&store, "turn").await, 128);
         let db = store.database_connection();
-        let observed = write_fixture(&db, async |tx| {
-            projections::backfill_projected_watermark(tx, "turn", chrono::Utc::now().fixed_offset())
-                .await
-        })
-        .await
-        .unwrap();
-        assert_eq!(observed.observed_projected_through_sequence, 130);
-        assert!(observed.matches());
-        assert!(!observed.watermark_advanced);
+        assert_eq!(watermark(&db, "turn").await, 130);
         let restarted = CrudStore::new(db.clone()).with_maintenance_access();
         assert_eq!(
             restarted
@@ -462,16 +463,11 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
         assert_eq!(empty.rows_deleted, 0);
         assert!(empty.last_turn_id.is_none());
         assert_eq!(boundary(&restarted, "turn").await, 130);
+        assert_eq!(watermark(&db, "turn").await, 130);
         assert!(
-            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
-                tx,
-                "turn",
-                chrono::Utc::now().fixed_offset()
-            )
-            .await)
-            .await
-            .unwrap()
-            .matches()
+            projections::is_projected(&db, "turn-130", "turn", 130)
+                .await
+                .unwrap()
         );
         Ok(())
     })
@@ -480,7 +476,7 @@ async fn bounded_cleanup_resumes_and_observes_the_retained_suffix() {
 }
 
 #[tokio::test]
-async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
+async fn receipt_gap_is_not_bridged_by_cleanup_or_restart() {
     with_database(async |fixture| {
         let store = store(fixture).await;
         seed(&store, "turn", 131, 129).await;
@@ -523,14 +519,7 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
                 .unwrap()
                 .is_some()
         );
-        let observation = write_fixture(&db, async |tx| {
-            projections::backfill_projected_watermark(tx, "turn", chrono::Utc::now().fixed_offset())
-                .await
-        })
-        .await
-        .unwrap();
-        assert!(observation.matches());
-        assert_eq!(observation.stored_projected_through_sequence, 129);
+        assert_eq!(watermark(&db, "turn").await, 129);
         assert!(
             projections::is_projected(&db, "turn-1", "turn", 1)
                 .await
@@ -922,15 +911,7 @@ async fn new_claims_and_atomic_watermark_updates_continue_after_all_receipts_are
             .unwrap()
         );
         transaction.commit().await.unwrap();
-        assert!(
-            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
-                tx, "turn", now
-            )
-            .await)
-            .await
-            .unwrap()
-            .matches()
-        );
+        assert_eq!(watermark(&db, "turn").await, 3);
         assert!(
             projections::has_unprojected_event(&db, "turn")
                 .await
@@ -987,17 +968,14 @@ async fn cleanup_reads_canonical_keys_with_portable_event_bodies() {
             3
         );
         assert_eq!(turn_event::Entity::find().count(&db).await.unwrap(), 3);
-        assert!(
-            write_fixture(&db, async |tx| projections::backfill_projected_watermark(
-                tx,
-                "turn",
-                chrono::Utc::now().fixed_offset()
-            )
-            .await)
-            .await
-            .unwrap()
-            .matches()
-        );
+        assert_eq!(watermark(&db, "turn").await, 3);
+        for sequence in 1..=3 {
+            assert!(
+                projections::is_projected(&db, &format!("turn-{sequence}"), "turn", sequence)
+                    .await
+                    .unwrap()
+            );
+        }
         Ok(())
     })
     .await
