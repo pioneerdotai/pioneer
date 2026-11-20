@@ -1,7 +1,6 @@
 pub use pioneer_crud_access::administrative_audit;
 pub mod agent_domain;
 pub mod agent_identity_catalog;
-pub(crate) mod agent_skill;
 pub(crate) use pioneer_crud_access::auth_session;
 pub use pioneer_crud_artifacts::artifact;
 pub(crate) mod authorization_persistence;

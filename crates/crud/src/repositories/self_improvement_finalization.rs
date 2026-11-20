@@ -13,17 +13,17 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect,
 };
 
-use super::agent_skill::{
-    CreateAgentSkillMutation, NewAgentSkill, NewAgentSkillVersion, RollbackAgentSkillMutation,
-    RollbackAgentSkillMutationResult, UpdateAgentSkillMutation, UpdateAgentSkillMutationResult,
-    apply_create_in_caller_transaction, apply_rollback_in_caller_transaction,
-    apply_update_in_caller_transaction, prepare_agent_skill_version,
-};
 use super::self_improvement_run::STATUS_COMPLETED;
 use crate::{
     AcceptedAgentSkillCreate, FinalizeSelfImprovementRunInput, FinalizeSelfImprovementRunResult,
     SelfImprovementFinalOutcome, SelfImprovementFinalizationConflict,
     SelfImprovementNoChangeReason,
+};
+use pioneer_crud_packages::agent_skill::{
+    CreateAgentSkillMutation, NewAgentSkill, NewAgentSkillVersion, RollbackAgentSkillMutation,
+    RollbackAgentSkillMutationResult, UpdateAgentSkillMutation, UpdateAgentSkillMutationResult,
+    apply_create_in_caller_transaction, apply_rollback_in_caller_transaction,
+    apply_update_in_caller_transaction, prepare_agent_skill_version,
 };
 
 const RESULT_SUMMARY_MAX_BYTES: usize = 16 * 1024;

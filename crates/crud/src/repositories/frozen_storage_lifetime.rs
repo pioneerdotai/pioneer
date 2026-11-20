@@ -2314,11 +2314,6 @@ impl FrozenStorageLifetimeProgress {
             return Ok(true);
         }
         self.sweep_discover = false;
-        // Neither unfinished bootstrap nor pending fanout is physical EOF.
-        // One durable continuation per quantum, with no retained DB capacity.
-        if frozen_sweep_work::bootstrap_step(store).await? {
-            return Ok(true);
-        }
         // One fanout turn alternates with one physical admission turn. Active
         // preparations keep their existing rotation; fanout need not drain.
         let fanout_checked = self.sweep_fanout;
@@ -2958,8 +2953,7 @@ impl ScopeDiscovery {
         if self.family == 1 {
             query.order_by((Alias::new(table), Alias::new("kind")), Order::Asc);
         }
-        // Physical families use checked durable bootstrap in step_pending;
-        // only logical metadata families retain a bounded RAM page here.
+        // Only logical metadata families retain a bounded RAM page here.
         query.limit(if page { META_ROWS } else { 1 });
         query
     }
@@ -2991,13 +2985,9 @@ impl ScopeDiscovery {
         if self.done {
             return Ok(false);
         }
-        // Physical families retain the original global startup prerequisite.
-        // Bootstrap persists the checked oracle outcome with each cursor/work
-        // commit; completed families do not inventory again on restart.
+        // Physical work is registered by the insert triggers. The scope pass
+        // covers headers, layouts, operations and checkpoints.
         if matches!(self.family, 2 | 3) {
-            if frozen_sweep_work::bootstrap_step(store).await? {
-                return Ok(true);
-            }
             self.pending.clear();
             self.family = 4;
             self.after.clear();

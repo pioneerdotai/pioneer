@@ -1,7 +1,6 @@
 use super::*;
-// Written regression coverage. CLOSED GATE: do not execute before acceptance.
 mod child_work_regressions {
-    use super::test_store_with_workspace;
+    use super::postgres_store_with_workspace;
     use crate::repositories::task_child_work::{ChildScope, enqueue_point, enqueue_scope};
     use pioneer_entity::{
         task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
@@ -11,182 +10,208 @@ mod child_work_regressions {
 
     #[tokio::test]
     async fn point_crash_before_wake_expiry_and_new_revision_reject_stale_ack() {
-        let store = test_store_with_workspace("child-work-expiry").await;
-        let db = store.database_connection();
-        let tx = db.begin().await.unwrap();
-        enqueue_point(&tx, "thread", "turn", 100).await.unwrap();
-        tx.commit().await.unwrap(); // Intentionally no wake.
-        let candidate = store.discover_child_points(100, 1).await.unwrap().remove(0);
-        let first = store
-            .claim_child_point(&candidate, 100)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            store
-                .discover_child_points(159, 1)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "child-work-expiry").await;
+            let db = store.database_connection();
+            let tx = db.begin().await.unwrap();
+            enqueue_point(&tx, "thread", "turn", 100).await.unwrap();
+            tx.commit().await.unwrap(); // Intentionally no wake.
+            let candidate = store.discover_child_points(100, 1).await.unwrap().remove(0);
+            let first = store
+                .claim_child_point(&candidate, 100)
                 .await
                 .unwrap()
-                .is_empty()
-        );
-        let expired = store.discover_child_points(160, 1).await.unwrap().remove(0);
-        let second = store
-            .claim_child_point(&expired, 160)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!store.finish_child_point(&first, None, true).await.unwrap());
-        let tx = db.begin().await.unwrap();
-        enqueue_point(&tx, "thread", "turn", 161).await.unwrap();
-        tx.commit().await.unwrap();
-        assert!(!store.finish_child_point(&second, None, true).await.unwrap());
-        assert_eq!(store.discover_child_points(161, 1).await.unwrap().len(), 1);
+                .unwrap();
+            assert!(
+                store
+                    .discover_child_points(159, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let expired = store.discover_child_points(160, 1).await.unwrap().remove(0);
+            let second = store
+                .claim_child_point(&expired, 160)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!store.finish_child_point(&first, None, true).await.unwrap());
+            let tx = db.begin().await.unwrap();
+            enqueue_point(&tx, "thread", "turn", 161).await.unwrap();
+            tx.commit().await.unwrap();
+            assert!(!store.finish_child_point(&second, None, true).await.unwrap());
+            assert_eq!(store.discover_child_points(161, 1).await.unwrap().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn parked_dependency_repair_and_delete_reinsert_fence() {
-        let store = test_store_with_workspace("child-work-aba").await;
-        let db = store.database_connection();
-        let tx = db.begin().await.unwrap();
-        enqueue_point(&tx, "t", "x", 1).await.unwrap();
-        tx.commit().await.unwrap();
-        let row = store.discover_child_points(1, 1).await.unwrap().remove(0);
-        let claim = store.claim_child_point(&row, 1).await.unwrap().unwrap();
-        assert!(store.finish_child_point(&claim, None, false).await.unwrap());
-        assert!(
-            store
-                .discover_child_points(1000, 1)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let tx = db.begin().await.unwrap();
-        point::Entity::delete_by_id("x").exec(&tx).await.unwrap();
-        enqueue_point(&tx, "t", "x", 2).await.unwrap();
-        tx.commit().await.unwrap();
-        assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
-        assert_eq!(store.discover_child_points(2, 1).await.unwrap().len(), 1);
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "child-work-aba").await;
+            let db = store.database_connection();
+            let tx = db.begin().await.unwrap();
+            enqueue_point(&tx, "t", "x", 1).await.unwrap();
+            tx.commit().await.unwrap();
+            let row = store.discover_child_points(1, 1).await.unwrap().remove(0);
+            let claim = store.claim_child_point(&row, 1).await.unwrap().unwrap();
+            assert!(store.finish_child_point(&claim, None, false).await.unwrap());
+            assert!(
+                store
+                    .discover_child_points(1000, 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let tx = db.begin().await.unwrap();
+            point::Entity::delete_by_id("x").exec(&tx).await.unwrap();
+            enqueue_point(&tx, "t", "x", 2).await.unwrap();
+            tx.commit().await.unwrap();
+            assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
+            assert_eq!(store.discover_child_points(2, 1).await.unwrap().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn producer_rollback_does_not_publish_work() {
-        let store = test_store_with_workspace("child-work-rollback").await;
-        let db = store.database_connection();
-        let tx = db.begin().await.unwrap();
-        enqueue_point(&tx, "t", "x", 1).await.unwrap();
-        enqueue_scope(&tx, ChildScope::Task("a".into()), 1)
-            .await
-            .unwrap();
-        tx.rollback().await.unwrap();
-        assert!(
-            store
-                .discover_child_points(100, 32)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "child-work-rollback").await;
+            let db = store.database_connection();
+            let tx = db.begin().await.unwrap();
+            enqueue_point(&tx, "t", "x", 1).await.unwrap();
+            enqueue_scope(&tx, ChildScope::Task("a".into()), 1)
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(!store.expand_child_scope(100, false).await.unwrap());
+                .unwrap();
+            tx.rollback().await.unwrap();
+            assert!(
+                store
+                    .discover_child_points(100, 32)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!store.expand_child_scope(100, false).await.unwrap());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn continuous_invalidations_keep_active_pass_lease_and_cursor() {
-        let store = test_store_with_workspace("child-work-pass").await;
-        let db = store.database_connection();
-        let tx = db.begin().await.unwrap();
-        enqueue_scope(&tx, ChildScope::Task("a".into()), 1)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let before = scope::Entity::find_by_id(("task".to_string(), "a".to_string()))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        let tx = db.begin().await.unwrap();
-        scope::Entity::update_many()
-            .filter(scope::Column::ScopeKind.eq("task"))
-            .filter(scope::Column::ScopeKey.eq("a"))
-            .col_expr(scope::Column::ClaimToken, Expr::value("holder"))
-            .col_expr(
-                scope::Column::PassRevision,
-                Expr::value(&before.requested_revision),
-            )
-            .col_expr(scope::Column::Cursor, Expr::value("middle"))
-            .col_expr(scope::Column::UpperWatermark, Expr::value("upper"))
-            .col_expr(scope::Column::NextAttemptAt, Expr::value(61i64))
-            .exec(&tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        for now in 2..20 {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "child-work-pass").await;
+            let db = store.database_connection();
             let tx = db.begin().await.unwrap();
-            enqueue_scope(&tx, ChildScope::Task("a".into()), now)
+            enqueue_scope(&tx, ChildScope::Task("a".into()), 1)
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
-            let after = scope::Entity::find_by_id(("task".to_string(), "a".to_string()))
+            let before = scope::Entity::find_by_id(("task".to_string(), "a".to_string()))
                 .one(&db)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(after.pass_revision, Some(before.requested_revision.clone()));
-            assert_eq!(after.cursor.as_deref(), Some("middle"));
-            assert_eq!(after.upper_watermark.as_deref(), Some("upper"));
-            assert_eq!(after.claim_token.as_deref(), Some("holder"));
-            assert_eq!(after.next_attempt_at, Some(61));
-            assert_ne!(after.requested_revision, before.requested_revision);
-        }
-        // Between pages the lease is released but the pass/cursor remains.
-        // Constant new requests must not move an already due pass behind the
-        // consumer's discovery time or restart its progress.
-        scope::Entity::update_many()
-            .filter(scope::Column::ScopeKind.eq("task"))
-            .filter(scope::Column::ScopeKey.eq("a"))
-            .col_expr(
-                scope::Column::ClaimToken,
-                Expr::value(Option::<String>::None),
-            )
-            .col_expr(scope::Column::NextAttemptAt, Expr::value(1i64))
-            .exec(&db)
-            .await
-            .unwrap();
-        for now in 100..118 {
             let tx = db.begin().await.unwrap();
-            enqueue_scope(&tx, ChildScope::Task("a".into()), now)
+            scope::Entity::update_many()
+                .filter(scope::Column::ScopeKind.eq("task"))
+                .filter(scope::Column::ScopeKey.eq("a"))
+                .col_expr(scope::Column::ClaimToken, Expr::value("holder"))
+                .col_expr(
+                    scope::Column::PassRevision,
+                    Expr::value(&before.requested_revision),
+                )
+                .col_expr(scope::Column::Cursor, Expr::value("middle"))
+                .col_expr(scope::Column::UpperWatermark, Expr::value("upper"))
+                .col_expr(scope::Column::NextAttemptAt, Expr::value(61i64))
+                .exec(&tx)
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
-            let due = store
-                .discover_child_scope_after(99, false, None)
+            for now in 2..20 {
+                let tx = db.begin().await.unwrap();
+                enqueue_scope(&tx, ChildScope::Task("a".into()), now)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                let after = scope::Entity::find_by_id(("task".to_string(), "a".to_string()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.pass_revision, Some(before.requested_revision.clone()));
+                assert_eq!(after.cursor.as_deref(), Some("middle"));
+                assert_eq!(after.upper_watermark.as_deref(), Some("upper"));
+                assert_eq!(after.claim_token.as_deref(), Some("holder"));
+                assert_eq!(after.next_attempt_at, Some(61));
+                assert_ne!(after.requested_revision, before.requested_revision);
+            }
+            // Between pages the lease is released but the pass/cursor remains.
+            // Constant new requests must not move an already due pass behind the
+            // consumer's discovery time or restart its progress.
+            scope::Entity::update_many()
+                .filter(scope::Column::ScopeKind.eq("task"))
+                .filter(scope::Column::ScopeKey.eq("a"))
+                .col_expr(
+                    scope::Column::ClaimToken,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(scope::Column::NextAttemptAt, Expr::value(1i64))
+                .exec(&db)
                 .await
-                .unwrap()
-                .expect("new invalidation must retain already-due eligibility");
-            assert_eq!(due.next_attempt_at, Some(1));
-            assert_eq!(due.cursor.as_deref(), Some("middle"));
-            assert_eq!(due.pass_revision.as_ref(), Some(&before.requested_revision));
-        }
+                .unwrap();
+            for now in 100..118 {
+                let tx = db.begin().await.unwrap();
+                enqueue_scope(&tx, ChildScope::Task("a".into()), now)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                let due = store
+                    .discover_child_scope_after(99, false, None)
+                    .await
+                    .unwrap()
+                    .expect("new invalidation must retain already-due eligibility");
+                assert_eq!(due.next_attempt_at, Some(1));
+                assert_eq!(due.cursor.as_deref(), Some("middle"));
+                assert_eq!(due.pass_revision.as_ref(), Some(&before.requested_revision));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn empty_seed_eof_persists_across_restart() {
-        let store = test_store_with_workspace("child-work-seed").await;
-        assert!(store.expand_child_scope(1, true).await.unwrap());
-        let restarted = crate::CrudStore::new(store.database_connection());
-        assert!(!restarted.expand_child_scope(1000, true).await.unwrap());
-        assert!(
-            restarted
-                .discover_child_points(1000, 32)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let marker = scope::Entity::find_by_id(("historical-seed".to_string(), "v1".to_string()))
-            .one(&store.database_connection())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(marker.next_attempt_at.is_none());
-        assert!(marker.claim_token.is_none());
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "child-work-seed").await;
+            assert!(store.expand_child_scope(1, true).await.unwrap());
+            let restarted = crate::CrudStore::new(store.database_connection());
+            assert!(!restarted.expand_child_scope(1000, true).await.unwrap());
+            assert!(
+                restarted
+                    .discover_child_points(1000, 32)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let marker =
+                scope::Entity::find_by_id(("historical-seed".to_string(), "v1".to_string()))
+                    .one(&store.database_connection())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(marker.next_attempt_at.is_none());
+            assert!(marker.claim_token.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -229,177 +254,197 @@ mod child_queue_pass_regressions {
     }
     #[tokio::test]
     async fn invalidation_behind_cursor_and_above_upper_finishes_current_pass_before_rescan() {
-        let store = test_store_with_workspace("ws_task").await;
-        pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-            .await
-            .unwrap();
-        // Historical FK-disabled metadata can be orphaned. Seed must carry its
-        // locators without interpreting that as destructive domain authority.
-        for n in 0..40 {
-            link(&store, &format!("m{n:03}"), n).await;
-        }
-        point::Entity::delete_many()
-            .exec(&store.connection)
-            .await
-            .unwrap();
-        assert!(store.expand_child_scope(100, true).await.unwrap());
-        let first = seed(&store).await;
-        assert_eq!(first.cursor.as_deref(), Some("m031"));
-        assert_eq!(first.upper_watermark.as_deref(), Some("m039"));
-        link(&store, "a-behind", 40).await;
-        link(&store, "z-above", 41).await;
-        // Treat the point obligations as already drained. Scope's next pass
-        // still has to enumerate both late insertions after an explicit resync.
-        point::Entity::delete_many()
-            .exec(&store.connection)
-            .await
-            .unwrap();
-        let tx = store.connection.begin().await.unwrap();
-        enqueue_scope(&tx, ChildScope::HistoricalSeed, 101)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let invalidated = seed(&store).await;
-        assert_eq!(invalidated.cursor, first.cursor);
-        assert_eq!(invalidated.upper_watermark, first.upper_watermark);
-        assert_eq!(invalidated.pass_revision, first.pass_revision);
-        assert_ne!(invalidated.requested_revision, first.requested_revision);
-        assert!(store.expand_child_scope(101, true).await.unwrap()); // Old pass EOF.
-        assert!(
-            point::Entity::find_by_id("turn-a-behind")
-                .one(&store.connection)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "ws_task").await;
+            pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
                 .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            point::Entity::find_by_id("turn-z-above")
-                .one(&store.connection)
+                .unwrap();
+            // Historical FK-disabled metadata can be orphaned. Seed must carry its
+            // locators without interpreting that as destructive domain authority.
+            for n in 0..40 {
+                link(&store, &format!("m{n:03}"), n).await;
+            }
+            point::Entity::delete_many()
+                .exec(&store.connection)
                 .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(seed(&store).await.next_attempt_at.is_some());
-        assert!(store.expand_child_scope(101, true).await.unwrap()); // New pass first page.
-        assert!(
-            point::Entity::find_by_id("turn-a-behind")
-                .one(&store.connection)
+                .unwrap();
+            assert!(store.expand_child_scope(100, true).await.unwrap());
+            let first = seed(&store).await;
+            assert_eq!(first.cursor.as_deref(), Some("m031"));
+            assert_eq!(first.upper_watermark.as_deref(), Some("m039"));
+            link(&store, "a-behind", 40).await;
+            link(&store, "z-above", 41).await;
+            // Treat the point obligations as already drained. Scope's next pass
+            // still has to enumerate both late insertions after an explicit resync.
+            point::Entity::delete_many()
+                .exec(&store.connection)
                 .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(store.expand_child_scope(101, true).await.unwrap());
-        assert!(
-            point::Entity::find_by_id("turn-z-above")
-                .one(&store.connection)
+                .unwrap();
+            let tx = store.connection.begin().await.unwrap();
+            enqueue_scope(&tx, ChildScope::HistoricalSeed, 101)
                 .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(seed(&store).await.next_attempt_at.is_none());
+                .unwrap();
+            tx.commit().await.unwrap();
+            let invalidated = seed(&store).await;
+            assert_eq!(invalidated.cursor, first.cursor);
+            assert_eq!(invalidated.upper_watermark, first.upper_watermark);
+            assert_eq!(invalidated.pass_revision, first.pass_revision);
+            assert_ne!(invalidated.requested_revision, first.requested_revision);
+            assert!(store.expand_child_scope(101, true).await.unwrap()); // Old pass EOF.
+            assert!(
+                point::Entity::find_by_id("turn-a-behind")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                point::Entity::find_by_id("turn-z-above")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(seed(&store).await.next_attempt_at.is_some());
+            assert!(store.expand_child_scope(101, true).await.unwrap()); // New pass first page.
+            assert!(
+                point::Entity::find_by_id("turn-a-behind")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(store.expand_child_scope(101, true).await.unwrap());
+            assert!(
+                point::Entity::find_by_id("turn-z-above")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(seed(&store).await.next_attempt_at.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test]
     async fn old_eof_snapshot_and_aba_cannot_delete_new_scope_incarnation() {
-        let store = test_store_with_workspace("ws_task").await;
-        let old = seed(&store).await;
-        let tx = store.connection.begin().await.unwrap();
-        scope::Entity::delete_by_id((old.scope_kind.clone(), old.scope_key.clone()))
-            .exec(&tx)
-            .await
-            .unwrap();
-        enqueue_scope(&tx, ChildScope::HistoricalSeed, 1)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let replacement = seed(&store).await;
-        assert_ne!(replacement.incarnation_token, old.incarnation_token);
-        store
-            .expand_child_scope_candidate_with_clock(&old, &|| 100, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            seed(&store).await,
-            replacement,
-            "a delayed EOF candidate cannot ACK a replacement"
-        );
-        // A new request arriving after EOF revives the parked seed and is due.
-        store.expand_child_scope(100, true).await.unwrap();
-        let tx = store.connection.begin().await.unwrap();
-        enqueue_scope(&tx, ChildScope::HistoricalSeed, 101)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        assert!(seed(&store).await.next_attempt_at.is_some());
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "ws_task").await;
+            let old = seed(&store).await;
+            let tx = store.connection.begin().await.unwrap();
+            scope::Entity::delete_by_id((old.scope_kind.clone(), old.scope_key.clone()))
+                .exec(&tx)
+                .await
+                .unwrap();
+            enqueue_scope(&tx, ChildScope::HistoricalSeed, 1)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let replacement = seed(&store).await;
+            assert_ne!(replacement.incarnation_token, old.incarnation_token);
+            store
+                .expand_child_scope_candidate_with_clock(&old, &|| 100, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                seed(&store).await,
+                replacement,
+                "a delayed EOF candidate cannot ACK a replacement"
+            );
+            // A new request arriving after EOF revives the parked seed and is due.
+            store.expand_child_scope(100, true).await.unwrap();
+            let tx = store.connection.begin().await.unwrap();
+            enqueue_scope(&tx, ChildScope::HistoricalSeed, 101)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assert!(seed(&store).await.next_attempt_at.is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test]
     async fn expired_scope_lease_recovers_and_poison_scope_does_not_block_other_scopes() {
-        let store = test_store_with_workspace("ws_task").await;
-        let tx = store.connection.begin().await.unwrap();
-        enqueue_scope(&tx, ChildScope::Task("healthy".into()), 1)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = postgres_store_with_workspace(fixture, "ws_task").await;
+            let tx = store.connection.begin().await.unwrap();
+            enqueue_scope(&tx, ChildScope::Task("healthy".into()), 1)
+                .await
+                .unwrap();
+            enqueue_scope(
+                &tx,
+                ChildScope::CreatorTurn {
+                    thread_id: "t".into(),
+                    turn_id: "x".into(),
+                },
+                0,
+            )
             .await
             .unwrap();
-        enqueue_scope(
-            &tx,
-            ChildScope::CreatorTurn {
-                thread_id: "t".into(),
-                turn_id: "x".into(),
-            },
-            0,
-        )
+            scope::Entity::update_many()
+                .filter(scope::Column::ScopeKind.eq("creator-turn"))
+                .col_expr(scope::Column::ScopeKey, Expr::value("corrupt-pair"))
+                .exec(&tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assert!(store.expand_child_scope(1, false).await.is_err());
+            assert!(
+                store.expand_child_scope(1, false).await.unwrap(),
+                "poison row is deferred behind healthy work"
+            );
+            let tx = store.connection.begin().await.unwrap();
+            scope::Entity::update_many()
+                .filter(scope::Column::ScopeKind.eq("historical-seed"))
+                .col_expr(scope::Column::ClaimToken, Expr::value("dead-worker"))
+                .col_expr(scope::Column::NextAttemptAt, Expr::value(50i64))
+                .exec(&tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            assert!(!store.expand_child_scope(49, true).await.unwrap());
+            assert!(store.expand_child_scope(50, true).await.unwrap());
+            assert!(seed(&store).await.next_attempt_at.is_none());
+            Ok(())
+        })
         .await
         .unwrap();
-        scope::Entity::update_many()
-            .filter(scope::Column::ScopeKind.eq("creator-turn"))
-            .col_expr(scope::Column::ScopeKey, Expr::value("corrupt-pair"))
-            .exec(&tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        assert!(store.expand_child_scope(1, false).await.is_err());
-        assert!(
-            store.expand_child_scope(1, false).await.unwrap(),
-            "poison row is deferred behind healthy work"
-        );
-        let tx = store.connection.begin().await.unwrap();
-        scope::Entity::update_many()
-            .filter(scope::Column::ScopeKind.eq("historical-seed"))
-            .col_expr(scope::Column::ClaimToken, Expr::value("dead-worker"))
-            .col_expr(scope::Column::NextAttemptAt, Expr::value(50i64))
-            .exec(&tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        assert!(!store.expand_child_scope(49, true).await.unwrap());
-        assert!(store.expand_child_scope(50, true).await.unwrap());
-        assert!(seed(&store).await.next_attempt_at.is_none());
     }
     #[tokio::test]
     async fn claim_deadline_uses_post_admission_clock() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let store = test_store_with_workspace("ws_task").await;
-        let tx = store.connection.begin().await.unwrap();
-        crate::repositories::task_child_work::enqueue_point(&tx, "thread", "turn", 100)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let candidate = store.discover_child_points(100, 1).await.unwrap().remove(0);
-        let calls = AtomicUsize::new(0);
-        let claim = store
-            .claim_child_point_with_clock(&candidate, &|| {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    100
-                } else {
-                    400
-                }
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            claim.next_attempt_at,
-            Some(460),
-            "waiting for the writer must not consume the lease"
-        );
+        pioneer_postgres_test::with_database(async |fixture| {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let store = postgres_store_with_workspace(fixture, "ws_task").await;
+            let tx = store.connection.begin().await.unwrap();
+            crate::repositories::task_child_work::enqueue_point(&tx, "thread", "turn", 100)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let candidate = store.discover_child_points(100, 1).await.unwrap().remove(0);
+            let calls = AtomicUsize::new(0);
+            let claim = store
+                .claim_child_point_with_clock(&candidate, &|| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        100
+                    } else {
+                        400
+                    }
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                claim.next_attempt_at,
+                Some(460),
+                "waiting for the writer must not consume the lease"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 

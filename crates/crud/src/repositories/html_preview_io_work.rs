@@ -480,10 +480,7 @@ impl CrudStore {
         .await
     }
     #[cfg(test)]
-    pub async fn html_preview_io_seed_startup_quantum(&self) -> Result<bool> {
-        if self.html_preview_io_seed_complete().await? {
-            return Ok(false);
-        }
+    pub(super) async fn html_preview_test_repair_quantum(&self) -> Result<bool> {
         if let Some(claim) = self
             .claim_html_preview_io_work_kind(chrono::Utc::now().timestamp_millis(), 300_000, true)
             .await?
@@ -584,22 +581,6 @@ impl CrudStore {
             request_prepared(db, seed, workspace, 0, &workspace.source_id).await?;
         }
         Ok(())
-    }
-    #[cfg(test)]
-    pub async fn html_preview_io_seed_complete(&self) -> Result<bool> {
-        for family in ["seed_witness", "seed_copies"] {
-            let marker = find_work(family.to_owned(), String::new(), 0_i64)
-                .select_only()
-                .column(work::Column::SeedVersion)
-                .column(work::Column::State)
-                .into_tuple::<(i64, String)>()
-                .one(&self.connection)
-                .await?;
-            if marker.is_none_or(|(version, state)| version != 1 || state != "done") {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
     /// Bounded traversal of the queue, including quarantined/terminal records,
     /// avoids an unindexed search through an arbitrarily large parked set.

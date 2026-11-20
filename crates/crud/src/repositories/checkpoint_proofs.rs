@@ -1562,7 +1562,7 @@ impl NodePreparation {
                 current.proof_version = row.proof_version;
                 ensure!(current == *row, "proof identity/status/binding changed");
                 ensure!(
-                    current.coverage_closed == 1,
+                    current.coverage_closed,
                     "proof portion lost its immutable boundary"
                 );
                 if let Some(previous) = &row.previous {
@@ -3373,7 +3373,7 @@ mod tests {
     #[test]
     fn cached_full_graph_rejects_lost_ancestry_and_foreign_owner_even_for_empty_metadata() {
         let row = CheckpointEdgesRow {
-            coverage_closed: 1,
+            coverage_closed: true,
             id: "root".into(),
             proof_version: 0,
             status: "candidate".into(),
@@ -3421,7 +3421,7 @@ mod tests {
         let mut cache = BTreeMap::new();
         for index in 0..2048 {
             let row = CheckpointEdgesRow {
-                coverage_closed: 1,
+                coverage_closed: true,
                 id: format!("node-{index}"),
                 proof_version: 1,
                 status: "retained".into(),
@@ -3532,7 +3532,7 @@ async fn freeze_checkpoint(store: &CrudStore, id: &str) -> Result<()> {
     let row = compaction::checkpoint_row(&store.connection, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint to freeze missing"))?;
-    if row.coverage_closed == 1 {
+    if row.coverage_closed {
         return Ok(());
     }
     store

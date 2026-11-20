@@ -2193,98 +2193,98 @@ mod tests {
 
     #[tokio::test]
     async fn epic6_turn_columns_and_revision_use_existing_turn_repository() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        connection
-            .execute_unprepared(
-                "INSERT INTO workspace (id, name, is_active, is_current) \
-                 VALUES ('workspace_epic6_repo', 'Epic 6', 1, 1); \
-                 INSERT INTO thread \
-                    (id, workspace_id, preview, mode, model, model_provider, status) \
-                 VALUES \
-                    ('H00000000000000000001', 'workspace_epic6_repo', '', 'Chat', \
-                     'model', 'provider', 'active');",
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            connection
+                .execute_unprepared(
+                    "INSERT INTO workspace (id, name, is_active, is_current) \
+                     VALUES ('workspace_epic6_repo', 'Epic 6', TRUE, FALSE); \
+                     INSERT INTO thread \
+                        (id, workspace_id, preview, mode, model, model_provider, status) \
+                     VALUES \
+                        ('H00000000000000000001', 'workspace_epic6_repo', '', 'chat', \
+                         'model', 'provider', 'active');",
+                )
+                .await
+                .expect("Turn owner fixture should insert");
+
+            let now = fixed_test_datetime();
+            let actor = PersistedActorRef::System;
+            let message = Turn {
+                work_owner: Default::default(),
+                id: "T00000000000000000001".to_owned(),
+                status: TurnStatus::Completed,
+                turn_kind: TurnKind::Conversation,
+                origin: pioneer_protocol::TurnOrigin::User,
+                mode: ThreadMode::Message,
+                author: Some(TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
+                    actor: actor.clone(),
+                    display_name: "System".to_owned(),
+                    nickname: "system".to_owned(),
+                    avatar_revision: None,
+                    agent: None,
+                }),
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            upsert_turn_with_initiator(
+                &connection,
+                message.id.as_str(),
+                "H00000000000000000001",
+                &message,
+                None,
+                None,
+                &actor,
+                now,
+                now,
             )
             .await
-            .expect("Turn owner fixture should insert");
+            .expect("Message Turn should persist through the existing repository");
 
-        let now = fixed_test_datetime();
-        let actor = PersistedActorRef::System;
-        let message = Turn {
-            work_owner: Default::default(),
-            id: "T00000000000000000001".to_owned(),
-            status: TurnStatus::Completed,
-            turn_kind: TurnKind::Conversation,
-            origin: pioneer_protocol::TurnOrigin::User,
-            mode: ThreadMode::Message,
-            author: Some(TurnAuthorSnapshot {
-                cli_runtime_kind: None,
-                actor: actor.clone(),
-                display_name: "System".to_owned(),
-                nickname: "system".to_owned(),
-                avatar_revision: None,
-                agent: None,
-            }),
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        upsert_turn_with_initiator(
-            &connection,
-            message.id.as_str(),
-            "H00000000000000000001",
-            &message,
-            None,
-            None,
-            &actor,
-            now,
-            now,
-        )
-        .await
-        .expect("Message Turn should persist through the existing repository");
+            let (_, collaboration) =
+                find_turn_collaboration(&connection, "H00000000000000000001", message.id.as_str())
+                    .await
+                    .expect("Message Turn should load")
+                    .expect("Message Turn should exist");
+            assert_eq!(collaboration.mode.effective_mode, ThreadMode::Message);
+            assert!(collaboration.mode.message_mutation_eligible);
 
-        let (_, collaboration) =
-            find_turn_collaboration(&connection, "H00000000000000000001", message.id.as_str())
-                .await
-                .expect("Message Turn should load")
-                .expect("Message Turn should exist");
-        assert_eq!(collaboration.mode.effective_mode, ThreadMode::Message);
-        assert!(collaboration.mode.message_mutation_eligible);
-
-        insert_turn_message_revision(
-            &connection,
-            NewTurnMessageRevision {
-                turn_id: message.id.as_str(),
-                revision: 0,
-                input: &[UserInput::Text {
-                    text: "original".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-                mentions: &[],
-                changed_by: &actor,
-                change_kind: TurnMessageRevisionChangeKind::Edit,
-                created_at: now,
-            },
-        )
-        .await
-        .expect("previous Turn version should persist");
-        let revisions = list_turn_message_revisions(&connection, message.id.as_str(), None, 10)
+            insert_turn_message_revision(
+                &connection,
+                NewTurnMessageRevision {
+                    turn_id: message.id.as_str(),
+                    revision: 0,
+                    input: &[UserInput::Text {
+                        text: "original".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    mentions: &[],
+                    changed_by: &actor,
+                    change_kind: TurnMessageRevisionChangeKind::Edit,
+                    created_at: now,
+                },
+            )
             .await
-            .expect("revisions should list");
-        assert_eq!(revisions.len(), 1);
-        let revision = turn_message_revision_from_model(revisions[0].clone())
-            .expect("revision should map to protocol");
-        assert_eq!(revision.turn_id, message.id);
-        assert_eq!(revision.revision, 0);
-        assert_eq!(revision.changed_by, actor);
+            .expect("previous Turn version should persist");
+            let revisions = list_turn_message_revisions(&connection, message.id.as_str(), None, 10)
+                .await
+                .expect("revisions should list");
+            assert_eq!(revisions.len(), 1);
+            let revision = turn_message_revision_from_model(revisions[0].clone())
+                .expect("revision should map to protocol");
+            assert_eq!(revision.turn_id, message.id);
+            assert_eq!(revision.revision, 0);
+            assert_eq!(revision.changed_by, actor);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn agent_message_item(item_id: &str, marker: &str) -> TurnItem {

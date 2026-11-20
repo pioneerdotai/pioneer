@@ -31,7 +31,7 @@ use pioneer_protocol::{
 #[cfg(test)]
 use sea_orm::DatabaseConnection;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{OnConflict, Query};
+use sea_orm::sea_query::{Expr, Func, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
     ExprTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
@@ -7892,19 +7892,21 @@ async fn bind_running_state<C: ConnectionTrait>(
     if let Some(seconds) = idle_timeout_secs {
         state_update = state_update.col_expr(
             agent_execution_resource_state::Column::IdleDeadline,
-            sea_orm::sea_query::Expr::cust_with_values(
-                "CASE WHEN idle_deadline IS NULL THEN ? ELSE idle_deadline END",
-                [Some(now.clone() + Duration::seconds(seconds))],
-            ),
+            Func::coalesce([
+                Expr::col(agent_execution_resource_state::Column::IdleDeadline),
+                Expr::val(now + Duration::seconds(seconds)),
+            ])
+            .into(),
         );
     }
     if let Some(seconds) = hard_timeout_secs {
         state_update = state_update.col_expr(
             agent_execution_resource_state::Column::HardDeadline,
-            sea_orm::sea_query::Expr::cust_with_values(
-                "CASE WHEN hard_deadline IS NULL THEN ? ELSE hard_deadline END",
-                [Some(now.clone() + Duration::seconds(seconds))],
-            ),
+            Func::coalesce([
+                Expr::col(agent_execution_resource_state::Column::HardDeadline),
+                Expr::val(now + Duration::seconds(seconds)),
+            ])
+            .into(),
         );
     }
     let state_result = state_update

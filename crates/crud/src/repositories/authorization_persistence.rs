@@ -1137,7 +1137,7 @@ mod tests {
             database
                 .execute_unprepared(
                     "INSERT INTO workspace (id,name,is_active,is_current) VALUES \
-                        ('W00000000000000000002','Other workspace',1,0); \
+                        ('W00000000000000000002','Other workspace',TRUE,FALSE); \
                      INSERT INTO thread (
                         id,workspace_id,preview,mode,model,model_provider,status,origin_kind,
                         sidebar_visibility,access_class,created_at,updated_at

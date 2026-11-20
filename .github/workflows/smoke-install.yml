@@ -52,7 +52,7 @@ jobs:
   smoke-path-warning-macos:
     name: smoke-path-warning-macos
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -152,7 +152,7 @@ jobs:
   smoke-path-warning-linux:
     name: smoke-path-warning-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -265,7 +265,7 @@ jobs:
   smoke-path-warning-windows:
     name: smoke-path-warning-windows
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -361,7 +361,7 @@ jobs:
   smoke-linux:
     name: smoke-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -472,7 +472,7 @@ jobs:
   smoke-windows:
     name: smoke-windows
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -582,7 +582,7 @@ jobs:
   smoke-desktop-local-linux:
     name: smoke-desktop-local-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:

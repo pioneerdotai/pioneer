@@ -1,5 +1,6 @@
 //! Package repositories share the caller’s connection or transaction.
 
+pub mod agent_skill;
 pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;

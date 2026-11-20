@@ -74,7 +74,6 @@ async fn index_quantum(
                 .ne(Expr::Constant(1.into()))
                 .or(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(1.into()))),
         )
-        .and_where(col("i", frozen_index::Column::Unknown).eq(Expr::Constant(0.into())))
         .and_where(col("i", frozen_index::Column::ManifestId).gt(after.as_str()))
         .and_where(col("i", frozen_index::Column::ManifestId).lte(upper))
         .order_by(("i", frozen_index::Column::ManifestId), Order::Asc);

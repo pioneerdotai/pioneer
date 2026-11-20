@@ -177,9 +177,9 @@ connections.
   state.
 - Make migrations and reconciliation idempotent across retry and restart.
   Migration completion markers must reflect the actual durable outcome.
-- Keep reader connections physically read-only. Do not weaken `query_only`,
-  silently route writes through readers, or use a read transaction as a write
-  boundary.
+- Keep PostgreSQL reader sessions read-only with
+  `default_transaction_read_only` and a restricted reader role for the bundled
+  server. Route writes through the writer pool and an explicit transaction.
 - Keep database observability low-cardinality and free of SQL text, payloads,
   identifiers, paths, credentials, and raw errors.
 

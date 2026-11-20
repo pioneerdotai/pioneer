@@ -164,7 +164,7 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
             .unwrap();
         assert_eq!(upper, candidates[2]);
 
-        // Check the access path against the current schema without pinning names.
+        // The partial index must exclude the large compacted prefix before PostgreSQL orders the page.
         for after in [None, Some(candidates[0])] {
             let mut statement = discovery_query(after, None, false).build(DbBackend::Postgres);
             statement.sql = format!("EXPLAIN {}", statement.sql);
@@ -181,7 +181,9 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
                 "{plan:?}"
             );
             assert!(
-                !plan.iter().any(|line| line.contains("Sort Key")),
+                !plan
+                    .iter()
+                    .any(|line| line.contains("Seq Scan on turn_event_projection_stream_state")),
                 "{plan:?}"
             );
             if after.is_some() {
@@ -548,8 +550,8 @@ async fn legacy_gap_is_not_bridged_by_compaction_or_restart_observation() {
 
 #[tokio::test]
 async fn unfinished_receipts_and_quarantined_streams_survive_without_stalling_other_streams() {
-    with_database(async |fixture| {
-        for status in ["pending", "projecting", "failed", "exhausted"] {
+    for status in ["pending", "projecting", "failed", "exhausted"] {
+        with_database(async |fixture| {
             let store = store(fixture).await;
             seed(&store, "a", 3, 3).await;
             seed(&store, "b", 1, 1).await;
@@ -588,7 +590,12 @@ async fn unfinished_receipts_and_quarantined_streams_survive_without_stalling_ot
                     .unwrap()
                     .is_some()
             );
-        }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    with_database(async |fixture| {
         let store = store(fixture).await;
         seed(&store, "quarantined", 1, 1).await;
         stream_entity::Entity::update_many()
@@ -722,16 +729,16 @@ async fn oversized_receipt_and_canonical_gap_are_deferred() {
 
 #[tokio::test]
 async fn stale_preparation_is_revalidated_under_the_writer() {
-    with_database(async |fixture| {
-        for mutation in [
-            "UPDATE turn_event_projection_state SET status = 'failed' WHERE event_id = 'turn-2'",
-            "UPDATE turn_event_projection_stream_state SET projected_through_sequence = 1 WHERE turn_id = 'turn'",
-            "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = 'turn'",
-            "UPDATE turn_event_projection_stream_state SET thread_id = 'other' WHERE turn_id = 'turn'",
-            "UPDATE turn_event_projection_state SET thread_id = 'other' WHERE event_id = 'turn-2'",
-            "UPDATE turn_event SET sequence = 4 WHERE id = 'turn-2'",
-            "UPDATE turn_event_projection_state SET projection_context_json = 'changed' WHERE event_id = 'turn-2'",
-        ] {
+    for mutation in [
+        "UPDATE turn_event_projection_state SET status = 'failed' WHERE event_id = 'turn-2'",
+        "UPDATE turn_event_projection_stream_state SET projected_through_sequence = 1 WHERE turn_id = 'turn'",
+        "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = 'turn'",
+        "UPDATE turn_event_projection_stream_state SET thread_id = 'other' WHERE turn_id = 'turn'",
+        "UPDATE turn_event_projection_state SET thread_id = 'other' WHERE event_id = 'turn-2'",
+        "UPDATE turn_event SET sequence = 4 WHERE id = 'turn-2'",
+        r#"UPDATE turn_event_projection_state SET projection_context_json = '{"changed":true}' WHERE event_id = 'turn-2'"#,
+    ] {
+        with_database(async |fixture| {
             let store = store(fixture).await;
             seed(&store, "turn", 2, 2).await;
             let db = store.database_connection();
@@ -744,9 +751,11 @@ async fn stale_preparation_is_revalidated_under_the_writer() {
             transaction.commit().await.unwrap();
             assert_eq!(boundary(&store, "turn").await, 0);
             assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 2);
-        }
-        Ok(())
-    }).await.unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -781,7 +790,7 @@ async fn boundary_failure_rolls_back_deletion_and_does_not_starve_next_stream() 
                 .rows_deleted,
             1
         );
-        db.execute_unprepared("DROP TRIGGER reject_cleanup_boundary")
+        db.execute_unprepared("DROP TRIGGER reject_cleanup_boundary ON turn_event_projection_stream_state")
             .await
             .unwrap();
         let restarted = CrudStore::new(db.clone()).with_maintenance_access();

@@ -10,6 +10,7 @@ pub mod native_cancellation_context;
 pub mod outbox_discovery;
 pub mod pending_requests;
 pub mod recovery_diagnostic;
+pub mod recovery_reads;
 pub mod tool_output;
 pub mod turn_envelope;
 pub mod turn_execution;

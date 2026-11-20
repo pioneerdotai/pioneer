@@ -4343,7 +4343,7 @@ async fn actual_freeze_and_seal_between_topology_pages_preserve_exact_edges_with
         let completed = read.finish().unwrap();
         assert_eq!(completed.ownership, original.ownership);
         assert_eq!(completed.row.identity_sha256, original.row.identity_sha256);
-        assert_eq!(completed.row.coverage_closed, 1);
+        assert!(completed.row.coverage_closed);
         assert_eq!(
             completed.row.proof_version,
             if transition.starts_with("seal") { 1 } else { 0 }
@@ -4407,7 +4407,7 @@ async fn coverage_eof_restart_rejects_extra_key_after_observed_maximum() {
         read.step(&f.store.connection).await.unwrap();
     }
     assert!(!read.done);
-    assert_eq!(read.row.coverage_closed, 0);
+    assert!(!read.row.coverage_closed);
     let extra = SourceRef {
         scope: "event:root-turn".into(),
         id: format!("{operation}-source-zz-extra"),
@@ -4433,7 +4433,7 @@ async fn coverage_eof_restart_rejects_extra_key_after_observed_maximum() {
     // the reader defect by independently rejecting the corrupted full hash.
     GraphPreparation::new(&root).step(&f.store).await.unwrap();
     read.step(&f.store.connection).await.unwrap(); // observes close; one restart
-    assert_eq!(read.row.coverage_closed, 1);
+    assert!(read.row.coverage_closed);
     let mut identity = read.row.clone();
     identity.coverage_closed = original.row.coverage_closed;
     assert_eq!(identity, original.row);

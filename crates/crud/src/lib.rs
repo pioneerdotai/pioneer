@@ -689,33 +689,9 @@ pub enum FinalizeSelfImprovementRunResult {
     Conflict(SelfImprovementFinalizationConflict),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentSkillVersionRecord {
-    pub evidence_latest_at_unix: Option<i64>,
-    pub id: String,
-    pub version_number: i64,
-    pub source_run_id: Option<String>,
-    pub parent_version_id: Option<String>,
-    pub candidate_key: String,
-    pub display_name: String,
-    pub skill_markdown: String,
-    pub instruction_body: String,
-    pub when_to_use: String,
-    pub when_not_to_use: String,
-    pub fingerprint: String,
-    pub source_turn_ids: Vec<String>,
-    pub created_at_unix: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentSkillVersionSnapshotRecord {
-    /// Latest evidence supporting the current lifecycle decision, including rollback.
-    pub lifecycle_evidence_latest_at_unix: Option<i64>,
-    pub skill_id: SkillId,
-    pub workspace_id: String,
-    pub slug: String,
-    pub version: AgentSkillVersionRecord,
-}
+pub use pioneer_crud_packages::agent_skill::{
+    AgentSkillVersionRecord, AgentSkillVersionSnapshotRecord,
+};
 
 impl StdError for TurnEventProjectionAfterAppendError {}
 
@@ -3554,7 +3530,8 @@ impl CrudStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<AgentSkillVersionSnapshotRecord>> {
-        repositories::agent_skill::list_active_versions(&self.connection, workspace_id).await
+        pioneer_crud_packages::agent_skill::list_active_versions(&self.connection, workspace_id)
+            .await
     }
 
     pub async fn self_improvement_processed_history_date(
@@ -3584,8 +3561,12 @@ impl CrudStore {
         workspace_id: &str,
         version_id: &str,
     ) -> Result<Option<AgentSkillVersionSnapshotRecord>> {
-        repositories::agent_skill::find_exact_version(&self.connection, workspace_id, version_id)
-            .await
+        pioneer_crud_packages::agent_skill::find_exact_version(
+            &self.connection,
+            workspace_id,
+            version_id,
+        )
+        .await
     }
 
     pub async fn get_next_agent_skill_version_number(
@@ -3593,7 +3574,7 @@ impl CrudStore {
         workspace_id: &str,
         skill_id: &SkillId,
     ) -> Result<Option<i64>> {
-        repositories::agent_skill::find_next_version_number(
+        pioneer_crud_packages::agent_skill::find_next_version_number(
             &self.connection,
             workspace_id,
             skill_id,
@@ -3605,7 +3586,7 @@ impl CrudStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<String>> {
-        repositories::agent_skill::list_workspace_version_fingerprints(
+        pioneer_crud_packages::agent_skill::list_workspace_version_fingerprints(
             &self.connection,
             workspace_id,
         )
@@ -30816,39 +30797,12 @@ impl CrudStore {
         let stale_cutoff = unix_to_datetime(
             now_unix.saturating_sub(i64::try_from(stale_after_secs).unwrap_or(i64::MAX)),
         );
-        let native_turn_counts = self
-            .connection
-            .query_one_raw(Statement::from_sql_and_values(
-                self.connection.get_database_backend(),
-                "SELECT COUNT(*) AS active_turns, \
-                        COALESCE(SUM(CASE WHEN t.updated_at <= ? THEN 1 ELSE 0 END), 0) \
-                            AS stale_running_turns \
-                 FROM \"turn\" t \
-                 WHERE t.status = 'in_progress' \
-                   AND ( \
-                     EXISTS ( \
-                       SELECT 1 FROM turn_execution e \
-                       WHERE e.turn_id = t.id \
-                         AND e.executor_kind IN ('native_agent', 'api_provider') \
-                     ) \
-                     OR ( \
-                       NOT EXISTS (SELECT 1 FROM turn_execution e WHERE e.turn_id = t.id) \
-                       AND t.turn_kind = 'conversation' \
-                       AND EXISTS (SELECT 1 FROM turn_runtime_snapshot s WHERE s.turn_id = t.id) \
-                       AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_binding c WHERE c.turn_id = t.id) \
-                     ) \
-                   )"
-                    .to_owned(),
-                [stale_cutoff.into()],
-            ))
-            .await
-            .context("failed to count active native Turns")?
-            .context("native Turn health query returned no row")?;
-        let active_turns = u64::try_from(native_turn_counts.try_get::<i64>("", "active_turns")?)
-            .context("active native Turn count is invalid")?;
-        let stale_running_turns =
-            u64::try_from(native_turn_counts.try_get::<i64>("", "stale_running_turns")?)
-                .context("stale native Turn count is invalid")?;
+        let (active_turns, stale_running_turns) =
+            pioneer_crud_execution::recovery_reads::active_native_turn_counts(
+                &self.connection,
+                stale_cutoff,
+            )
+            .await?;
         let active_recovery_jobs = self.list_active_recovery_jobs(101).await?;
         let oldest_recovery_age_secs = active_recovery_jobs
             .iter()
@@ -31407,41 +31361,12 @@ impl CrudStore {
                             "failed to begin recovery terminalization batch classification",
                         )?;
                     let result = async {
-                    let placeholders = std::iter::repeat_n("?", records.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut values = Vec::<sea_orm::Value>::with_capacity(records.len() + 1);
-                    values.push(claim_token.clone().into());
-                    values.extend(
-                        records
-                            .iter()
-                            .map(|record| record.recovery_job_id.clone().into()),
-                    );
-                    let rows = tx
-                        .query_all_raw(Statement::from_sql_and_values(
-                            tx.get_database_backend(),
-                            format!(
-                                "SELECT o.recovery_job_id, \
-                                        r.id AS job_id, r.turn_id AS job_turn_id, \
-                                        r.item_id AS job_item_id, r.item_type AS job_item_type, \
-                                        r.status AS job_status, \
-                                        CASE WHEN r.run_count < 1 THEN 1 ELSE r.run_count END \
-                                            AS job_attempt_number, \
-                                        COALESCE(r.last_error, r.reason, \
-                                            'recovery reached a terminal outcome') \
-                                            AS job_error_message, \
-                                        t.id AS turn_row_id, t.status AS turn_status \
-                                 FROM recovery_terminalization_outbox o \
-                                 LEFT JOIN recovery_job r ON r.id = o.recovery_job_id \
-                                 LEFT JOIN \"turn\" t ON t.id = o.turn_id \
-                                 WHERE o.status = 'delivering' \
-                                   AND o.claim_token = ? \
-                                   AND o.recovery_job_id IN ({placeholders})"
-                            ),
-                            values,
-                        ))
-                        .await
-                        .context("failed to classify claimed recovery terminalization batch")?;
+                    let rows = pioneer_crud_execution::recovery_reads::load_claimed_recovery_facts(
+                        &tx,
+                        &claim_token,
+                        records.iter().map(|record| record.recovery_job_id.clone()),
+                    )
+                    .await?;
                     if rows.len() != records.len() {
                         anyhow::bail!(
                             "one or more recovery terminalization claims are no longer owned"
@@ -31456,7 +31381,7 @@ impl CrudStore {
                     let mut superseded = Vec::new();
                     let mut quarantined = HashMap::<String, (String, Vec<String>)>::new();
                     for row in rows {
-                        let recovery_job_id: String = row.try_get("", "recovery_job_id")?;
+                        let recovery_job_id = row.recovery_job_id;
                         let record = records_by_id
                             .get(&recovery_job_id)
                             .context("classification returned an unexpected recovery job")?;
@@ -31469,18 +31394,18 @@ impl CrudStore {
                             )
                         };
                         let (disposition, quarantine_reason) = 'decision: {
-                            if row.try_get::<Option<String>>("", "job_id")?.is_none() {
+                            if row.job_id.is_none() {
                                 break 'decision quarantine(
                                     "missing_recovery_job",
                                     "recovery terminalization job is missing",
                                 );
                             }
-                            let job_turn_id: String = row.try_get("", "job_turn_id")?;
-                            let job_item_id: String = row.try_get("", "job_item_id")?;
-                            let job_item_type_db: String = row.try_get("", "job_item_type")?;
-                            let job_status_db: String = row.try_get("", "job_status")?;
-                            let job_attempt_number: i64 = row.try_get("", "job_attempt_number")?;
-                            let job_error_message: String = row.try_get("", "job_error_message")?;
+                            let job_turn_id = row.job_turn_id.context("missing recovery job Turn")?;
+                            let job_item_id = row.job_item_id.context("missing recovery job item")?;
+                            let job_item_type_db = row.job_item_type.context("missing recovery job item type")?;
+                            let job_status_db = row.job_status.context("missing recovery job status")?;
+                            let job_attempt_number = row.job_attempt_number;
+                            let job_error_message = row.job_error_message;
                             let Some(job_item_type) =
                                 turn_item_type_from_db(job_item_type_db.as_str())
                             else {
@@ -31526,13 +31451,13 @@ impl CrudStore {
                                     "recovery terminalization job is not terminalizable",
                                 );
                             }
-                            if row.try_get::<Option<String>>("", "turn_row_id")?.is_none() {
+                            if row.turn_row_id.is_none() {
                                 break 'decision quarantine(
                                     "missing_turn",
                                     "recovery terminalization Turn is missing",
                                 );
                             }
-                            let turn_status_db: String = row.try_get("", "turn_status")?;
+                            let turn_status_db = row.turn_status.context("missing terminalization Turn status")?;
                             let Some(turn_status) = turn_status_from_db(turn_status_db.as_str())
                             else {
                                 break 'decision quarantine(
@@ -39327,6 +39252,29 @@ mod tests {
         (CrudStore::new(connection), query_count)
     }
 
+    async fn postgres_store_with_workspace_and_query_counter(
+        fixture: &pioneer_postgres_test::TestDatabase,
+        workspace_id: &str,
+    ) -> (CrudStore, Arc<AtomicU64>) {
+        let mut writer = fixture.connection().clone();
+        seed_observation_workspace_on(&writer, workspace_id).await;
+        let mut reader = fixture
+            .connect_read_only()
+            .await
+            .expect("read-only PostgreSQL pool");
+        let query_count = Arc::new(AtomicU64::new(0));
+        for connection in [&mut writer, &mut reader] {
+            let query_count = Arc::clone(&query_count);
+            connection.set_metric_callback(move |_| {
+                query_count.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        (
+            CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer)),
+            query_count,
+        )
+    }
+
     async fn test_store_with_zstd_turn_items() -> CrudStore {
         pioneer_sqlite::zstd::register_auto_extension_once()
             .expect("sqlite-zstd extension should register");
@@ -39355,35 +39303,39 @@ mod tests {
 
     #[tokio::test]
     async fn store_preserves_typed_database_scope_across_construction_and_write_reclassification() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection)
-            .maintenance()
-            .with_critical_writes();
+        pioneer_postgres_test::with_database(async |fixture| {
+            let reader = fixture.connect_read_only().await.unwrap();
+            let writer = fixture.connection().clone();
+            let database = pioneer_sqlite::SqliteDatabase::new(reader, writer)
+                .maintenance()
+                .with_critical_writes();
 
-        let store = CrudStore::new(database);
-        let scoped = store.database_connection();
+            let store = CrudStore::new(database);
+            let scoped = store.database_connection();
 
-        assert_eq!(
-            scoped.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
-        );
-        assert_eq!(
-            scoped.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Critical
-        );
+            assert_eq!(
+                scoped.read_class(),
+                pioneer_sqlite::SqliteReadClass::Maintenance
+            );
+            assert_eq!(
+                scoped.write_class(),
+                pioneer_sqlite::SqliteWriteClass::Critical
+            );
 
-        let background_control_plane = store.with_maintenance_reads_and_critical_writes();
-        let scoped = background_control_plane.database_connection();
-        assert_eq!(
-            scoped.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
-        );
-        assert_eq!(
-            scoped.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Critical
-        );
+            let background_control_plane = store.with_maintenance_reads_and_critical_writes();
+            let scoped = background_control_plane.database_connection();
+            assert_eq!(
+                scoped.read_class(),
+                pioneer_sqlite::SqliteReadClass::Maintenance
+            );
+            assert_eq!(
+                scoped.write_class(),
+                pioneer_sqlite::SqliteWriteClass::Critical
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -39426,6 +39378,25 @@ mod tests {
     }
 
     async fn seed_observation_workspace(store: &CrudStore, workspace_id: &str) {
+        let tx = store
+            .connection
+            .begin()
+            .await
+            .expect("begin workspace fixture");
+        seed_observation_workspace_on(&tx, workspace_id).await;
+        tx.commit().await.expect("commit workspace fixture");
+    }
+
+    async fn seed_observation_workspace_on(connection: &impl ConnectionTrait, workspace_id: &str) {
+        pioneer_entity::workspace::Entity::update_many()
+            .col_expr(
+                pioneer_entity::workspace::Column::IsCurrent,
+                Expr::value(false),
+            )
+            .filter(pioneer_entity::workspace::Column::IsCurrent.eq(true))
+            .exec(connection)
+            .await
+            .expect("clear the seeded current workspace");
         pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
             id: Set(workspace_id.to_owned()),
             name: Set("Observation fixture".to_owned()),
@@ -39433,7 +39404,7 @@ mod tests {
             is_current: Set(true),
             ..Default::default()
         })
-        .exec(&store.connection)
+        .exec(connection)
         .await
         .expect("observation workspace should exist");
     }
@@ -40052,55 +40023,61 @@ mod tests {
     async fn cancelled_context_append_keeps_only_relevant_uncertainty_and_writer_fence() {
         use futures_util::FutureExt;
         for preview in [false, true] {
-            let (store, _, _) = test_store_with_started_turn(
-                "ws_context_cancel",
-                "thr_context_cancel",
-                "turn_context_cancel",
-            )
-            .await;
-            let database = store.database_connection();
-            let mut html = database.work_signal("maintenance.html").subscribe();
-            let mut frozen = database.work_signal("maintenance.frozen").subscribe();
-            let transaction = database.begin().await.unwrap();
-            let entry = NewTurnLlmContextEntry {
-                turn_id: "turn_context_cancel".into(),
-                item_id: Some("cancelled".into()),
-                attempt_id: None,
-                sequence: 0,
-                source: "tool_result_v2".into(),
-                tool_name: Some(if preview { "html_preview" } else { "read_file" }.into()),
-                payload: "{}".into(),
-                output_policy_snapshot: "{}".into(),
-                created_at: unix_to_datetime(1_700_000_100),
-                expires_at: None,
-            };
-            let mut append = Box::pin(store.append_turn_llm_context(entry, "cancelled"));
-            assert!(
-                append.as_mut().now_or_never().is_none(),
-                "writer is occupied"
-            );
-            drop(append);
-            assert_eq!(html.changed().now_or_never().is_some(), preview);
-            assert!(frozen.changed().now_or_never().is_none());
-            if preview {
-                let mut fence = Box::pin(html.begin_pass(&database));
+            pioneer_postgres_test::with_database(async |fixture| {
+                let (store, _, _) = postgres_store_with_started_turn(
+                    fixture,
+                    "ws_context_cancel",
+                    "thr_context_cancel",
+                    "turn_context_cancel",
+                )
+                .await;
+                let database = store.database_connection();
+                let mut html = database.work_signal("maintenance.html").subscribe();
+                let mut frozen = database.work_signal("maintenance.frozen").subscribe();
+                let transaction = database.begin().await.unwrap();
+                let entry = NewTurnLlmContextEntry {
+                    turn_id: "turn_context_cancel".into(),
+                    item_id: Some("cancelled".into()),
+                    attempt_id: None,
+                    sequence: 0,
+                    source: "tool_result_v2".into(),
+                    tool_name: Some(if preview { "html_preview" } else { "read_file" }.into()),
+                    payload: "{}".into(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: unix_to_datetime(1_700_000_100),
+                    expires_at: None,
+                };
+                let mut append = Box::pin(store.append_turn_llm_context(entry, "cancelled"));
                 assert!(
-                    fence.as_mut().now_or_never().is_none(),
-                    "unknown outcome must settle the writer"
+                    append.as_mut().now_or_never().is_none(),
+                    "writer is occupied"
                 );
-                transaction.rollback().await.unwrap();
-                fence.await.unwrap();
-            } else {
-                transaction.rollback().await.unwrap();
-            }
-            assert!(
-                store
-                    .list_turn_llm_context("turn_context_cancel")
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert!(html.changed().now_or_never().is_none());
+                drop(append);
+                assert_eq!(html.changed().now_or_never().is_some(), preview);
+                assert!(frozen.changed().now_or_never().is_none());
+                if preview {
+                    let mut fence = Box::pin(html.begin_pass(&database));
+                    assert!(
+                        fence.as_mut().now_or_never().is_none(),
+                        "unknown outcome must settle the writer"
+                    );
+                    transaction.rollback().await.unwrap();
+                    fence.await.unwrap();
+                } else {
+                    transaction.rollback().await.unwrap();
+                }
+                assert!(
+                    store
+                        .list_turn_llm_context("turn_context_cancel")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(html.changed().now_or_never().is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -41457,97 +41434,108 @@ mod tests {
     #[tokio::test]
     async fn completed_final_selector_uses_committed_intent_and_checks_ownership() {
         for final_id in ["a_final", "z_final"] {
-            let (store, _, _) =
-                test_store_with_started_turn("ws_select", "thr_select", "turn_select").await;
-            let notification = |id: &str, phase, text: &str| ItemCompletedNotification {
-                workspace_id: "ws_select".into(),
-                thread_id: "thr_select".into(),
-                turn_id: "turn_select".into(),
-                item: TurnItem::AgentMessage {
-                    id: id.into(),
-                    text: text.into(),
-                    phase,
-                    markdown: None,
-                    markdown_version: None,
-                },
-            };
-            let answer = notification(
-                final_id,
-                AgentMessagePhase::FinalAnswer,
-                "accepted substantive answer",
-            );
-            store
-                .materialize_item_completed(
-                    notification(
-                        "old_partial_final",
-                        AgentMessagePhase::FinalAnswer,
-                        "old attempt",
-                    ),
-                    1_700_000_100,
+            pioneer_postgres_test::with_database(async |fixture| {
+                let (store, _, _) = postgres_store_with_started_turn(
+                    fixture,
+                    "ws_select",
+                    "thr_select",
+                    "turn_select",
                 )
-                .await
-                .unwrap();
-            for (id, phase) in [
-                ("0_commentary", AgentMessagePhase::Commentary),
-                ("old_partial_final", AgentMessagePhase::Commentary),
-                ("zz_commentary", AgentMessagePhase::Commentary),
-            ] {
+                .await;
+                let notification = |id: &str, phase, text: &str| ItemCompletedNotification {
+                    workspace_id: "ws_select".into(),
+                    thread_id: "thr_select".into(),
+                    turn_id: "turn_select".into(),
+                    item: TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                };
+                let answer = notification(
+                    final_id,
+                    AgentMessagePhase::FinalAnswer,
+                    "accepted substantive answer",
+                );
                 store
                     .materialize_item_completed(
-                        notification(id, phase, "not the answer"),
+                        notification(
+                            "old_partial_final",
+                            AgentMessagePhase::FinalAnswer,
+                            "old attempt",
+                        ),
                         1_700_000_100,
                     )
                     .await
                     .unwrap();
-            }
-            store
-                .prepare_turn_finalization(&answer, 1, None, 1_700_000_100)
-                .await
-                .unwrap();
-            assert!(
+                for (id, phase) in [
+                    ("0_commentary", AgentMessagePhase::Commentary),
+                    ("old_partial_final", AgentMessagePhase::Commentary),
+                    ("zz_commentary", AgentMessagePhase::Commentary),
+                ] {
+                    store
+                        .materialize_item_completed(
+                            notification(id, phase, "not the answer"),
+                            1_700_000_100,
+                        )
+                        .await
+                        .unwrap();
+                }
                 store
-                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .prepare_turn_finalization(&answer, 1, None, 1_700_000_100)
                     .await
-                    .unwrap()
-                    .is_none()
-            );
-            store
-                .commit_prepared_turn_finalization("turn_select", 1_700_000_100)
-                .await
-                .unwrap();
-            store
-                .materialize_item_completed(
-                    notification(
-                        "late_commentary",
-                        AgentMessagePhase::Commentary,
-                        "not a final",
-                    ),
-                    1_700_000_100,
-                )
-                .await
-                .unwrap();
-            let restarted = CrudStore::new(store.database_connection()).with_maintenance_access();
-            assert_eq!(
-                restarted
-                    .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                    .unwrap();
+                assert!(
+                    store
+                        .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                store
+                    .commit_prepared_turn_finalization("turn_select", 1_700_000_100)
                     .await
-                    .unwrap(),
-                Some(answer.item)
-            );
-            assert!(
-                restarted
-                    .completed_turn_final_answer("foreign", "thr_select", "turn_select")
+                    .unwrap();
+                store
+                    .materialize_item_completed(
+                        notification(
+                            "late_commentary",
+                            AgentMessagePhase::Commentary,
+                            "not a final",
+                        ),
+                        1_700_000_100,
+                    )
                     .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                restarted
-                    .completed_turn_final_answer("ws_select", "foreign", "turn_select")
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+                    .unwrap();
+                let restarted =
+                    CrudStore::new(store.database_connection()).with_maintenance_access();
+                assert_eq!(
+                    restarted
+                        .completed_turn_final_answer("ws_select", "thr_select", "turn_select")
+                        .await
+                        .unwrap(),
+                    Some(answer.item)
+                );
+                assert!(
+                    restarted
+                        .completed_turn_final_answer("foreign", "thr_select", "turn_select")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    restarted
+                        .completed_turn_final_answer("ws_select", "foreign", "turn_select")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -41555,69 +41543,75 @@ mod tests {
     async fn legacy_final_selector_rejects_commentary_and_ambiguous_finals() {
         for final_count in 0..=2 {
             for final_id in ["a_final", "z_final"] {
-                let (store, _, mut turn) = test_store_with_started_turn(
-                    "ws_legacy_select",
-                    "thr_legacy_select",
-                    "turn_legacy_select",
-                )
-                .await;
-                let item = |id: &str, phase| TurnItem::AgentMessage {
-                    id: id.into(),
-                    text: id.into(),
-                    phase,
-                    markdown: None,
-                    markdown_version: None,
-                };
-                let answer = item(final_id, AgentMessagePhase::FinalAnswer);
-                let mut items = vec![
-                    item("0_commentary", AgentMessagePhase::Commentary),
-                    item("old_partial_final", AgentMessagePhase::Commentary),
-                    item("zz_commentary", AgentMessagePhase::Commentary),
-                ];
-                if final_count > 0 {
-                    items.push(answer.clone());
-                }
-                if final_count > 1 {
-                    items.push(item("other_final", AgentMessagePhase::FinalAnswer));
-                }
-                items.push(item("late_commentary", AgentMessagePhase::Commentary));
-                for item in items {
+                pioneer_postgres_test::with_database(async |fixture| {
+                    let (store, _, mut turn) = postgres_store_with_started_turn(
+                        fixture,
+                        "ws_legacy_select",
+                        "thr_legacy_select",
+                        "turn_legacy_select",
+                    )
+                    .await;
+                    let item = |id: &str, phase| TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: id.into(),
+                        phase,
+                        markdown: None,
+                        markdown_version: None,
+                    };
+                    let answer = item(final_id, AgentMessagePhase::FinalAnswer);
+                    let mut items = vec![
+                        item("0_commentary", AgentMessagePhase::Commentary),
+                        item("old_partial_final", AgentMessagePhase::Commentary),
+                        item("zz_commentary", AgentMessagePhase::Commentary),
+                    ];
+                    if final_count > 0 {
+                        items.push(answer.clone());
+                    }
+                    if final_count > 1 {
+                        items.push(item("other_final", AgentMessagePhase::FinalAnswer));
+                    }
+                    items.push(item("late_commentary", AgentMessagePhase::Commentary));
+                    for item in items {
+                        store
+                            .materialize_item_completed(
+                                ItemCompletedNotification {
+                                    workspace_id: "ws_legacy_select".into(),
+                                    thread_id: "thr_legacy_select".into(),
+                                    turn_id: "turn_legacy_select".into(),
+                                    item,
+                                },
+                                1_700_000_100,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    turn.status = TurnStatus::Completed;
                     store
-                        .materialize_item_completed(
-                            ItemCompletedNotification {
+                        .materialize_turn_completed(
+                            TurnCompletedNotification {
                                 workspace_id: "ws_legacy_select".into(),
                                 thread_id: "thr_legacy_select".into(),
-                                turn_id: "turn_legacy_select".into(),
-                                item,
+                                turn,
                             },
                             1_700_000_100,
                         )
                         .await
                         .unwrap();
-                }
-                turn.status = TurnStatus::Completed;
-                store
-                    .materialize_turn_completed(
-                        TurnCompletedNotification {
-                            workspace_id: "ws_legacy_select".into(),
-                            thread_id: "thr_legacy_select".into(),
-                            turn,
-                        },
-                        1_700_000_100,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    store
-                        .completed_turn_final_answer(
-                            "ws_legacy_select",
-                            "thr_legacy_select",
-                            "turn_legacy_select"
-                        )
-                        .await
-                        .unwrap(),
-                    (final_count == 1).then_some(answer)
-                );
+                    assert_eq!(
+                        store
+                            .completed_turn_final_answer(
+                                "ws_legacy_select",
+                                "thr_legacy_select",
+                                "turn_legacy_select"
+                            )
+                            .await
+                            .unwrap(),
+                        (final_count == 1).then_some(answer)
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
             }
         }
     }
@@ -41965,9 +41959,7 @@ mod tests {
             store
                 .connection
                 .execute_unprepared(
-                    "CREATE TRIGGER reject_progress_finalization BEFORE INSERT ON turn_event
-             WHEN NEW.turn_id='turn_progress_4'
-             BEGIN SELECT RAISE(ABORT, 'finalization storage failure'); END",
+                    "CREATE OR REPLACE FUNCTION reject_progress_finalization() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'finalization storage failure'; END $$; CREATE TRIGGER reject_progress_finalization BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='turn_progress_4') EXECUTE FUNCTION reject_progress_finalization()",
                 )
                 .await
                 .unwrap();
@@ -42013,7 +42005,7 @@ mod tests {
             assert_eq!(retry.failures.len(), 2);
             store
                 .connection
-                .execute_unprepared("DROP TRIGGER reject_progress_finalization")
+                .execute_unprepared("DROP TRIGGER reject_progress_finalization ON turn_event")
                 .await
                 .unwrap();
             Ok(())
@@ -42527,211 +42519,213 @@ mod tests {
     #[tokio::test]
     async fn native_terminal_effect_outbox_activates_atomically_and_recovers_expired_claim_after_restart()
      {
-        let workspace_id = "ws_terminal_effect_atomic";
-        let thread_id = "thr_terminal_effect_atomic";
-        let turn_id = "turn_terminal_effect_atomic";
-        let (store, _, mut turn) =
-            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
-        let preparation =
-            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "generation-1");
-        let effect_id = preparation.effects[0].effect_id.clone();
-        store
-            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
-            .await
-            .expect("terminal effect should prepare");
-        store
-            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
-            .await
-            .expect("exact preparation replay should be idempotent");
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let workspace_id = "ws_terminal_effect_atomic";
+            let thread_id = "thr_terminal_effect_atomic";
+            let turn_id = "turn_terminal_effect_atomic";
+            let (store, _, mut turn) =
+                postgres_store_with_started_turn(fixture, workspace_id, thread_id, turn_id).await;
+            let preparation =
+                cleanup_effect_preparation(workspace_id, thread_id, turn_id, "generation-1");
+            let effect_id = preparation.effects[0].effect_id.clone();
             store
-                .native_terminal_effect_status(effect_id.as_str())
+                .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
                 .await
-                .expect("effect status should load")
-                .expect("effect should exist")
-                .status,
-            "prepared"
-        );
-
-        store
-            .connection
-            .execute_unprepared(
-                "CREATE TRIGGER reject_terminal_effect_commit \
-                 BEFORE UPDATE OF status ON turn \
-                 WHEN NEW.id = 'turn_terminal_effect_atomic' AND NEW.status = 'completed' \
-                 BEGIN SELECT RAISE(ABORT, 'injected terminal commit failure'); END",
-            )
-            .await
-            .expect("fault trigger should install");
-        turn.status = TurnStatus::Completed;
-        assert!(
+                .expect("terminal effect should prepare");
             store
-                .materialize_turn_completed(
-                    TurnCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn: turn.clone(),
-                    },
-                    1_700_000_101,
+                .prepare_native_terminal_effects(preparation.clone(), 1_700_000_100)
+                .await
+                .expect("exact preparation replay should be idempotent");
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect status should load")
+                    .expect("effect should exist")
+                    .status,
+                "prepared"
+            );
+
+            store
+                .connection
+                .execute_unprepared(
+                    "CREATE FUNCTION reject_terminal_effect_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected terminal commit failure'; END $$; CREATE TRIGGER reject_terminal_effect_commit BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.id = 'turn_terminal_effect_atomic' AND NEW.status = 'completed') EXECUTE FUNCTION reject_terminal_effect_commit()",
                 )
                 .await
-                .is_err(),
-            "terminal projection fault must roll back outbox activation"
-        );
-        assert_eq!(
+                .expect("fault trigger should install");
+            turn.status = TurnStatus::Completed;
+            assert!(
+                store
+                    .materialize_turn_completed(
+                        TurnCompletedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn: turn.clone(),
+                        },
+                        1_700_000_101,
+                    )
+                    .await
+                    .is_err(),
+                "terminal projection fault must roll back outbox activation"
+            );
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect status should load after rollback")
+                    .expect("effect should remain")
+                    .status,
+                "prepared"
+            );
             store
-                .native_terminal_effect_status(effect_id.as_str())
+                .connection
+                .execute_unprepared("DROP TRIGGER reject_terminal_effect_commit ON turn")
                 .await
-                .expect("effect status should load after rollback")
-                .expect("effect should remain")
-                .status,
-            "prepared"
-        );
-        store
-            .connection
-            .execute_unprepared("DROP TRIGGER reject_terminal_effect_commit")
-            .await
-            .expect("fault trigger should uninstall");
-        let replay = store
-            .replay_due_turn_event_projections(1_700_000_103, 10)
-            .await
-            .expect("durable terminal projection should recover after the fault");
-        assert_eq!(replay.projected, 1);
-        assert_eq!(
-            store
-                .native_terminal_effect_status(effect_id.as_str())
+                .expect("fault trigger should uninstall");
+            let replay = store
+                .replay_due_turn_event_projections(1_700_000_103, 10)
                 .await
-                .expect("effect status should load after terminal commit")
-                .expect("effect should remain")
-                .status,
-            "ready"
-        );
-        let committed_row =
-            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
-                .one(&store.connection)
-                .await
-                .expect("committed effect lookup should succeed")
-                .expect("committed effect should exist");
-        let immutable_payload_hash = committed_row.payload_identity_sha256.clone();
+                .expect("durable terminal projection should recover after the fault");
+            assert_eq!(replay.projected, 1);
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect status should load after terminal commit")
+                    .expect("effect should remain")
+                    .status,
+                "ready"
+            );
+            let committed_row =
+                pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
+                    .one(&store.connection)
+                    .await
+                    .expect("committed effect lookup should succeed")
+                    .expect("committed effect should exist");
+            let immutable_payload_hash = committed_row.payload_identity_sha256.clone();
 
-        let late_effect = pioneer_protocol::NativeTerminalEffectPreparation {
-            batch_id: format!("{turn_id}:batch:late"),
-            workspace_id: workspace_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            runtime_generation: 1,
-            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                effect_id: format!("{turn_id}:terminal-effect:post-turn"),
-                effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                payload:
-                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
-                        failure: pioneer_protocol::NativeTerminalEffectPreparationFailure::HookRuntimeUnavailable,
-                    },
-                max_attempts: 3,
-            }],
-        };
-        assert!(
-            store
-                .prepare_native_terminal_effects(late_effect, 1_700_000_103)
-                .await
-                .is_err(),
-            "new obligations cannot be invented after the canonical terminal commit"
-        );
-
-        let first_claim = store
-            .claim_due_native_terminal_effects_at(1_700_000_103, 5, 10)
-            .await
-            .expect("ready effect should claim")
-            .records;
-        assert_eq!(first_claim.len(), 1);
-        assert_eq!(first_claim[0].attempt_count, 1);
-        assert_eq!(
-            store
-                .next_native_terminal_effect_execution_deadline()
-                .await
-                .unwrap(),
-            Some(1_700_000_108),
-            "the claimed row retains its lease wake after an empty claim"
-        );
-
-        // A fresh store models restart after the side-effect worker claimed
-        // the row but before it acknowledged an outcome.
-        let restarted = CrudStore::new(store.database_connection());
-        assert!(
-            restarted
-                .claim_due_native_terminal_effects_at(1_700_000_106, 5, 10)
-                .await
-                .expect("unexpired claim lookup should succeed")
-                .records
-                .is_empty()
-        );
-        let reclaimed = restarted
-            .claim_due_native_terminal_effects_at(1_700_000_109, 5, 10)
-            .await
-            .expect("expired claim should recover after restart")
-            .records;
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].effect_id, effect_id);
-        assert_eq!(reclaimed[0].attempt_count, 2);
-        assert!(
-            restarted
-                .complete_native_terminal_effect(
-                    reclaimed[0].effect_id.as_str(),
-                    reclaimed[0].claim_token.as_str(),
-                    1_700_000_109,
-                )
-                .await
-                .expect("effect completion should persist")
-        );
-        assert!(
-            restarted
-                .claim_due_native_terminal_effects_at(1_700_000_200, 5, 10)
-                .await
-                .expect("succeeded effect lookup should succeed")
-                .records
-                .is_empty(),
-            "a succeeded obligation must never be claimed twice"
-        );
-        let compacted =
-            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
-                .one(&restarted.connection)
-                .await
-                .expect("compacted effect lookup should succeed")
-                .expect("compacted effect should remain");
-        assert_eq!(compacted.payload_json, r#"{"compacted":true}"#);
-        assert!(
-            restarted
-                .next_native_terminal_effect_execution_deadline()
-                .await
-                .unwrap()
-                .is_none(),
-            "completed history does not arm another discovery timer"
-        );
-        assert_eq!(
-            compacted.payload_sha256,
-            native_terminal_effect_outbox::payload_sha256_hex(compacted.payload_json.as_str())
-        );
-        assert_eq!(compacted.payload_identity_sha256, immutable_payload_hash);
-        assert_eq!(compacted.payload_sha256.len(), 64);
-
-        restarted
-            .prepare_native_terminal_effects(preparation.clone(), 1_700_000_201)
-            .await
-            .expect("exact committed replay must use the retained payload hash");
-        let mut conflicting = preparation;
-        conflicting.effects[0].payload =
-            pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
-                reason: "conflicting cleanup reason".to_owned(),
-                runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+            let late_effect = pioneer_protocol::NativeTerminalEffectPreparation {
+                batch_id: format!("{turn_id}:batch:late"),
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                runtime_generation: 1,
+                effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                    effect_id: format!("{turn_id}:terminal-effect:post-turn"),
+                    effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                    gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                    payload:
+                        pioneer_protocol::NativeTerminalEffectPayload::PostTurnHookPreparationFailed {
+                            failure: pioneer_protocol::NativeTerminalEffectPreparationFailure::HookRuntimeUnavailable,
+                        },
+                    max_attempts: 3,
+                }],
             };
-        assert!(
-            restarted
-                .prepare_native_terminal_effects(conflicting, 1_700_000_202)
+            assert!(
+                store
+                    .prepare_native_terminal_effects(late_effect, 1_700_000_103)
+                    .await
+                    .is_err(),
+                "new obligations cannot be invented after the canonical terminal commit"
+            );
+
+            let first_claim = store
+                .claim_due_native_terminal_effects_at(1_700_000_103, 5, 10)
                 .await
-                .is_err(),
-            "compaction must not weaken immutable replay conflict detection"
-        );
+                .expect("ready effect should claim")
+                .records;
+            assert_eq!(first_claim.len(), 1);
+            assert_eq!(first_claim[0].attempt_count, 1);
+            assert_eq!(
+                store
+                    .next_native_terminal_effect_execution_deadline()
+                    .await
+                    .unwrap(),
+                Some(1_700_000_108),
+                "the claimed row retains its lease wake after an empty claim"
+            );
+
+            // A fresh store models restart after the side-effect worker claimed
+            // the row but before it acknowledged an outcome.
+            let restarted = CrudStore::new(store.database_connection());
+            assert!(
+                restarted
+                    .claim_due_native_terminal_effects_at(1_700_000_106, 5, 10)
+                    .await
+                    .expect("unexpired claim lookup should succeed")
+                    .records
+                    .is_empty()
+            );
+            let reclaimed = restarted
+                .claim_due_native_terminal_effects_at(1_700_000_109, 5, 10)
+                .await
+                .expect("expired claim should recover after restart")
+                .records;
+            assert_eq!(reclaimed.len(), 1);
+            assert_eq!(reclaimed[0].effect_id, effect_id);
+            assert_eq!(reclaimed[0].attempt_count, 2);
+            assert!(
+                restarted
+                    .complete_native_terminal_effect(
+                        reclaimed[0].effect_id.as_str(),
+                        reclaimed[0].claim_token.as_str(),
+                        1_700_000_109,
+                    )
+                    .await
+                    .expect("effect completion should persist")
+            );
+            assert!(
+                restarted
+                    .claim_due_native_terminal_effects_at(1_700_000_200, 5, 10)
+                    .await
+                    .expect("succeeded effect lookup should succeed")
+                    .records
+                    .is_empty(),
+                "a succeeded obligation must never be claimed twice"
+            );
+            let compacted =
+                pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
+                    .one(&restarted.connection)
+                    .await
+                    .expect("compacted effect lookup should succeed")
+                    .expect("compacted effect should remain");
+            assert_eq!(compacted.payload_json, r#"{"compacted":true}"#);
+            assert!(
+                restarted
+                    .next_native_terminal_effect_execution_deadline()
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "completed history does not arm another discovery timer"
+            );
+            assert_eq!(
+                compacted.payload_sha256,
+                native_terminal_effect_outbox::payload_sha256_hex(compacted.payload_json.as_str())
+            );
+            assert_eq!(compacted.payload_identity_sha256, immutable_payload_hash);
+            assert_eq!(compacted.payload_sha256.len(), 64);
+
+            restarted
+                .prepare_native_terminal_effects(preparation.clone(), 1_700_000_201)
+                .await
+                .expect("exact committed replay must use the retained payload hash");
+            let mut conflicting = preparation;
+            conflicting.effects[0].payload =
+                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                    reason: "conflicting cleanup reason".to_owned(),
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                };
+            assert!(
+                restarted
+                    .prepare_native_terminal_effects(conflicting, 1_700_000_202)
+                    .await
+                    .is_err(),
+                "compaction must not weaken immutable replay conflict detection"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -43203,166 +43197,171 @@ mod tests {
         runtime_snapshot: serde_json::Value,
         cleanup: bool,
     ) {
-        let timestamp = 1_700_005_250;
-        let workspace_id = "ws_terminal_effect_bad_checkpoint";
-        let thread_id = "thr_terminal_effect_bad_checkpoint";
-        let turn_id = "turn_terminal_effect_bad_checkpoint";
-        let (store, _, mut terminal_turn) =
-            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
-        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
-        store
-            .prepare_native_terminal_effects(
-                pioneer_protocol::NativeTerminalEffectPreparation {
-                    batch_id: format!("{turn_id}:batch:bad-checkpoint"),
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    runtime_generation: 1,
-                    effects: vec![
-                        pioneer_protocol::NativeTerminalEffectSpec {
-                            effect_id: effect_id.clone(),
-                            effect_kind: if cleanup {
-                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
-                            } else {
-                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
-                            },
-                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                            payload: if cleanup {
-                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
-                                    reason: "parent turn completed".to_owned(),
-                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
-                                        .to_owned(),
-                                }
-                            } else {
-                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                                    request: serde_json::json!({"phase": "turn.post_turn"}),
-                                    runtime_snapshot,
-                                }
-                            },
-                            max_attempts: 3,
-                        },
-                        pioneer_protocol::NativeTerminalEffectSpec {
-                            effect_id: format!("{turn_id}:terminal-effect:healthy"),
-                            effect_kind: if cleanup {
-                                pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
-                            } else {
-                                pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
-                            },
-                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                            payload: if cleanup {
-                                pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                                    request: serde_json::json!({}),
-                                    runtime_snapshot: serde_json::json!({}),
-                                }
-                            } else {
-                                pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
-                                    reason: "completed".to_owned(),
-                                    runtime_contract: "pioneer.test.attached-task-cleanup.v1"
-                                        .to_owned(),
-                                }
-                            },
-                            max_attempts: 3,
-                        },
-                    ],
-                },
-                timestamp,
-            )
-            .await
-            .expect("post-turn effect should prepare");
-        terminal_turn.status = TurnStatus::Completed;
-        store
-            .materialize_turn_completed(
-                TurnCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn: terminal_turn,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("terminal commit should activate the effect");
-
-        pioneer_entity::native_terminal_effect_outbox::Entity::update_many()
-            .col_expr(
-                pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointJson,
-                Expr::value(Some(r#"{"schema_version":1}"#.to_owned())),
-            )
-            .col_expr(
-                pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointSha256,
-                Expr::value(Some(if cleanup {
-                    native_terminal_effect_outbox::payload_sha256_hex(r#"{"schema_version":1}"#)
-                } else {
-                    "0".repeat(64)
-                })),
-            )
-            .filter(
-                pioneer_entity::native_terminal_effect_outbox::Column::EffectId
-                    .eq(effect_id.clone()),
-            )
-            .exec(&store.connection)
-            .await
-            .expect("fault injection should corrupt the durable checkpoint hash");
-
-        let healthy = store
-            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 10)
-            .await
-            .expect("corrupt checkpoint should be quarantined without poisoning its batch")
-            .records;
-        assert_eq!(
-            healthy.len(),
-            1,
-            "only the healthy obligation may reach a handler"
-        );
-        assert_eq!(
-            healthy[0].effect_id,
-            format!("{turn_id}:terminal-effect:healthy")
-        );
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let timestamp = 1_700_005_250;
+            let workspace_id = "ws_terminal_effect_bad_checkpoint";
+            let thread_id = "thr_terminal_effect_bad_checkpoint";
+            let turn_id = "turn_terminal_effect_bad_checkpoint";
+            let (store, _, mut terminal_turn) =
+                postgres_store_with_started_turn(fixture, workspace_id, thread_id, turn_id).await;
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
             store
-                .complete_native_terminal_effect(
-                    &healthy[0].effect_id,
-                    &healthy[0].claim_token,
-                    timestamp + 2
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:bad-checkpoint"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![
+                            pioneer_protocol::NativeTerminalEffectSpec {
+                                effect_id: effect_id.clone(),
+                                effect_kind: if cleanup {
+                                    pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                                } else {
+                                    pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                                },
+                                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                                payload: if cleanup {
+                                    pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                        reason: "parent turn completed".to_owned(),
+                                        runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                            .to_owned(),
+                                    }
+                                } else {
+                                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                        request: serde_json::json!({"phase": "turn.post_turn"}),
+                                        runtime_snapshot,
+                                    }
+                                },
+                                max_attempts: 3,
+                            },
+                            pioneer_protocol::NativeTerminalEffectSpec {
+                                effect_id: format!("{turn_id}:terminal-effect:healthy"),
+                                effect_kind: if cleanup {
+                                    pioneer_protocol::NativeTerminalEffectKind::PostTurnHook
+                                } else {
+                                    pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup
+                                },
+                                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                                payload: if cleanup {
+                                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                        request: serde_json::json!({}),
+                                        runtime_snapshot: serde_json::json!({}),
+                                    }
+                                } else {
+                                    pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                                        reason: "completed".to_owned(),
+                                        runtime_contract: "pioneer.test.attached-task-cleanup.v1"
+                                            .to_owned(),
+                                    }
+                                },
+                                max_attempts: 3,
+                            },
+                        ],
+                    },
+                    timestamp,
                 )
                 .await
-                .unwrap()
-        );
-        let quarantined = store
-            .native_terminal_effect_status(effect_id.as_str())
-            .await
-            .expect("quarantined effect status should load")
-            .expect("quarantined effect should remain inspectable");
-        assert_eq!(quarantined.status, "unresolved");
-        assert_eq!(
-            quarantined.last_error_code.as_deref(),
-            Some("invalid_persisted_effect")
-        );
-        let persisted =
-            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
-                .one(&store.connection)
-                .await
-                .unwrap()
-                .unwrap();
-        assert!(persisted.next_run_at.is_none());
-        assert_eq!(
-            persisted.handler_checkpoint_json.as_deref(),
-            Some(r#"{"schema_version":1}"#)
-        );
-        assert_eq!(
+                .expect("post-turn effect should prepare");
+            terminal_turn.status = TurnStatus::Completed;
             store
-                .requeue_retryable_unresolved_native_terminal_effects(timestamp + 7200, 10)
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp + 1,
+                )
                 .await
-                .unwrap(),
-            0
-        );
-        assert!(
-            store
-                .claim_due_native_terminal_effects_at(timestamp + 7200, 10, 10)
+                .expect("terminal commit should activate the effect");
+
+            pioneer_entity::native_terminal_effect_outbox::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointJson,
+                    Expr::value(Some(r#"{"schema_version":1}"#.to_owned())),
+                )
+                .col_expr(
+                    pioneer_entity::native_terminal_effect_outbox::Column::HandlerCheckpointSha256,
+                    Expr::value(Some(if cleanup {
+                        native_terminal_effect_outbox::payload_sha256_hex(r#"{"schema_version":1}"#)
+                    } else {
+                        "0".repeat(64)
+                    })),
+                )
+                .filter(
+                    pioneer_entity::native_terminal_effect_outbox::Column::EffectId
+                        .eq(effect_id.clone()),
+                )
+                .exec(&store.connection)
                 .await
-                .unwrap()
-                .records
-                .is_empty()
-        );
+                .expect("fault injection should corrupt the durable checkpoint hash");
+
+            let healthy = store
+                .claim_due_native_terminal_effects_at(timestamp + 1, 10, 10)
+                .await
+                .expect("corrupt checkpoint should be quarantined without poisoning its batch")
+                .records;
+            assert_eq!(
+                healthy.len(),
+                1,
+                "only the healthy obligation may reach a handler"
+            );
+            assert_eq!(
+                healthy[0].effect_id,
+                format!("{turn_id}:terminal-effect:healthy")
+            );
+            assert!(
+                store
+                    .complete_native_terminal_effect(
+                        &healthy[0].effect_id,
+                        &healthy[0].claim_token,
+                        timestamp + 2
+                    )
+                    .await
+                    .unwrap()
+            );
+            let quarantined = store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("quarantined effect status should load")
+                .expect("quarantined effect should remain inspectable");
+            assert_eq!(quarantined.status, "unresolved");
+            assert_eq!(
+                quarantined.last_error_code.as_deref(),
+                Some("invalid_persisted_effect")
+            );
+            let persisted =
+                pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(persisted.next_run_at.is_none());
+            assert_eq!(
+                persisted.handler_checkpoint_json.as_deref(),
+                Some(r#"{"schema_version":1}"#)
+            );
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + 7200, 10)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                store
+                    .claim_due_native_terminal_effects_at(timestamp + 7200, 10, 10)
+                    .await
+                    .unwrap()
+                    .records
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -43814,247 +43813,249 @@ mod tests {
     #[tokio::test]
     async fn native_terminal_effect_outbox_converges_for_completion_before_acceptance_after_restart()
      {
-        let timestamp = 1_700_020_000;
-        let workspace_id = "ws_effect_late_accept";
-        let thread_id = "thr_effect_late_accept";
-        let turn_id = "turn_effect_late_accept";
-        let (store, _, mut terminal_turn) =
-            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
-        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
-        store
-            .prepare_native_terminal_effects(
-                pioneer_protocol::NativeTerminalEffectPreparation {
-                    batch_id: format!("{turn_id}:batch:waiting"),
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    runtime_generation: 1,
-                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                        effect_id: effect_id.clone(),
-                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                        gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
-                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                            request: serde_json::json!({"durable": true}),
-                            runtime_snapshot: serde_json::json!({
-                                "schema_version": 1,
-                                "subscriptions": [],
-                                "handlers": []
-                            }),
-                        },
-                        max_attempts: 5,
-                    }],
-                },
-                timestamp,
-            )
-            .await
-            .expect("candidate-gated effect should prepare before acceptance");
-        terminal_turn.status = TurnStatus::Completed;
-        store
-            .materialize_turn_completed(
-                TurnCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn: terminal_turn,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("terminal commit should preserve the waiting gate");
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let timestamp = 1_700_020_000;
+            let workspace_id = "ws_effect_late_accept";
+            let thread_id = "thr_effect_late_accept";
+            let turn_id = "turn_effect_late_accept";
+            let (store, _, mut terminal_turn) =
+                postgres_store_with_started_turn(fixture, workspace_id, thread_id, turn_id).await;
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
             store
-                .native_terminal_effect_status(effect_id.as_str())
-                .await
-                .expect("effect status should load")
-                .expect("effect should exist")
-                .status,
-            "waiting_acceptance"
-        );
-
-        // Restart before the durable candidate exists. Candidate projection
-        // must wake the already-terminal obligation without an in-memory
-        // rendezvous or a second completion event.
-        let restarted = CrudStore::new(store.database_connection());
-        let mut task = sample_task(timestamp + 2);
-        task.id = "task_effect_late_accept".to_owned();
-        task.workspace_id = workspace_id.to_owned();
-        task.created_by_thread_id = Some("parent_thread_late".to_owned());
-        task.created_by_turn_id = Some("parent_turn_late".to_owned());
-        let mut run = sample_task_run(timestamp + 2);
-        run.id = "run_effect_late_accept".to_owned();
-        run.task_id = task.id.clone();
-        run.trigger_id = None;
-        run.run_group_id = run.id.clone();
-        restarted
-            .append_task_events(
-                vec![
-                    TaskEventPayload::TaskCreated { task: task.clone() },
-                    TaskEventPayload::RunCreated {
-                        run: run.clone(),
-                        agent_spec: None,
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:waiting"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult,
+                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                request: serde_json::json!({"durable": true}),
+                                runtime_snapshot: serde_json::json!({
+                                    "schema_version": 1,
+                                    "subscriptions": [],
+                                    "handlers": []
+                                }),
+                            },
+                            max_attempts: 5,
+                        }],
                     },
-                ],
-                timestamp + 2,
-            )
-            .await
-            .expect("late-acceptance task aggregate should persist");
-        let task_run_turn = TaskRunTurn {
-            id: "task_run_turn_late_accept".to_owned(),
-            task_id: task.id.clone(),
-            run_id: run.id.clone(),
-            execution_id: None,
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            kind: TaskRunTurnKind::Initial,
-            round: 0,
-            sequence: 0,
-            status: TaskRunTurnStatus::CandidateCreated,
-            reviews_candidate_id: None,
-            requested_by_candidate_id: None,
-            requested_by_review_event_id: None,
-            created_at: timestamp + 2,
-            started_at: Some(timestamp + 2),
-            completed_at: Some(timestamp + 2),
-        };
-        restarted
-            .upsert_task_run_turn(task_run_turn.clone())
-            .await
-            .expect("late-acceptance task-run Turn should persist");
-        let candidate_id = "candidate_effect_late_accept";
-        let extraction_failed = TaskResultCandidate {
-            id: candidate_id.to_owned(),
-            task_id: task.id,
-            run_id: run.id,
-            task_run_turn_id: task_run_turn.id,
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            round: 0,
-            // Extraction failure is recoverable and must not discard the
-            // acceptance-gated terminal effect before a durable review can
-            // accept the candidate.
-            status: TaskResultCandidateStatus::ExtractionFailed,
-            result: Some(TaskResult {
-                summary: Some("accepted after restart".to_owned()),
-                data: None,
-                artifacts: Vec::new(),
-                completed_by_run_id: Some("run_effect_late_accept".to_owned()),
-            }),
-            extraction_error: None,
-            summary: Some("accepted after restart".to_owned()),
-            diagnostics: Vec::new(),
-            final_review_event_id: None,
-            created_at: timestamp + 3,
-            updated_at: timestamp + 3,
-            resolved_at: None,
-        };
-        restarted
-            .upsert_task_result_candidate(extraction_failed)
-            .await
-            .expect("recoverable extraction failure should persist after restart");
-        assert_eq!(
-            restarted
-                .native_terminal_effect_status(effect_id.as_str())
+                    timestamp,
+                )
                 .await
-                .expect("effect should remain readable after extraction failure")
-                .expect("effect should remain present after extraction failure")
-                .status,
-            "waiting_acceptance",
-            "a recoverable extraction failure must not discard acceptance-gated work"
-        );
-        restarted
-            .database_connection()
-            .execute_unprepared(
-                "CREATE TRIGGER reject_candidate_gate_release \
-                 BEFORE UPDATE ON native_terminal_effect_outbox \
-                 WHEN OLD.effect_id = 'turn_effect_late_accept:terminal-effect:post-turn' \
-                      AND NEW.status = 'ready' \
-                 BEGIN SELECT RAISE(ABORT, 'injected gate release failure'); END",
-            )
-            .await
-            .expect("candidate gate fault trigger should install");
-        assert!(
+                .expect("candidate-gated effect should prepare before acceptance");
+            terminal_turn.status = TurnStatus::Completed;
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("terminal commit should preserve the waiting gate");
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect status should load")
+                    .expect("effect should exist")
+                    .status,
+                "waiting_acceptance"
+            );
+
+            // Restart before the durable candidate exists. Candidate projection
+            // must wake the already-terminal obligation without an in-memory
+            // rendezvous or a second completion event.
+            let restarted = CrudStore::new(store.database_connection());
+            let mut task = sample_task(timestamp + 2);
+            task.id = "task_effect_late_accept".to_owned();
+            task.workspace_id = workspace_id.to_owned();
+            task.created_by_thread_id = Some("parent_thread_late".to_owned());
+            task.created_by_turn_id = Some("parent_turn_late".to_owned());
+            let mut run = sample_task_run(timestamp + 2);
+            run.id = "run_effect_late_accept".to_owned();
+            run.task_id = task.id.clone();
+            run.trigger_id = None;
+            run.run_group_id = run.id.clone();
+            restarted
+                .append_task_events(
+                    vec![
+                        TaskEventPayload::TaskCreated { task: task.clone() },
+                        TaskEventPayload::RunCreated {
+                            run: run.clone(),
+                            agent_spec: None,
+                        },
+                    ],
+                    timestamp + 2,
+                )
+                .await
+                .expect("late-acceptance task aggregate should persist");
+            let task_run_turn = TaskRunTurn {
+                id: "task_run_turn_late_accept".to_owned(),
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                execution_id: None,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                kind: TaskRunTurnKind::Initial,
+                round: 0,
+                sequence: 0,
+                status: TaskRunTurnStatus::CandidateCreated,
+                reviews_candidate_id: None,
+                requested_by_candidate_id: None,
+                requested_by_review_event_id: None,
+                created_at: timestamp + 2,
+                started_at: Some(timestamp + 2),
+                completed_at: Some(timestamp + 2),
+            };
+            restarted
+                .upsert_task_run_turn(task_run_turn.clone())
+                .await
+                .expect("late-acceptance task-run Turn should persist");
+            let candidate_id = "candidate_effect_late_accept";
+            let extraction_failed = TaskResultCandidate {
+                id: candidate_id.to_owned(),
+                task_id: task.id,
+                run_id: run.id,
+                task_run_turn_id: task_run_turn.id,
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                round: 0,
+                // Extraction failure is recoverable and must not discard the
+                // acceptance-gated terminal effect before a durable review can
+                // accept the candidate.
+                status: TaskResultCandidateStatus::ExtractionFailed,
+                result: Some(TaskResult {
+                    summary: Some("accepted after restart".to_owned()),
+                    data: None,
+                    artifacts: Vec::new(),
+                    completed_by_run_id: Some("run_effect_late_accept".to_owned()),
+                }),
+                extraction_error: None,
+                summary: Some("accepted after restart".to_owned()),
+                diagnostics: Vec::new(),
+                final_review_event_id: None,
+                created_at: timestamp + 3,
+                updated_at: timestamp + 3,
+                resolved_at: None,
+            };
+            restarted
+                .upsert_task_result_candidate(extraction_failed)
+                .await
+                .expect("recoverable extraction failure should persist after restart");
+            assert_eq!(
+                restarted
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect should remain readable after extraction failure")
+                    .expect("effect should remain present after extraction failure")
+                    .status,
+                "waiting_acceptance",
+                "a recoverable extraction failure must not discard acceptance-gated work"
+            );
+            restarted
+                .database_connection()
+                .execute_unprepared(
+                    "CREATE FUNCTION reject_candidate_gate_release() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected gate release failure'; END $$; CREATE TRIGGER reject_candidate_gate_release BEFORE UPDATE ON native_terminal_effect_outbox FOR EACH ROW WHEN (OLD.effect_id = 'turn_effect_late_accept:terminal-effect:post-turn' \
+                          AND NEW.status = 'ready') EXECUTE FUNCTION reject_candidate_gate_release()",
+                )
+                .await
+                .expect("candidate gate fault trigger should install");
+            assert!(
+                restarted
+                    .update_task_result_candidate_resolution(
+                        candidate_id,
+                        TaskResultCandidateStatus::Accepted,
+                        Some("review_effect_late_accept"),
+                        Some(timestamp + 4),
+                        timestamp + 4,
+                    )
+                    .await
+                    .is_err(),
+                "an outbox write fault must roll back candidate acceptance"
+            );
+            assert_eq!(
+                restarted
+                    .get_task_result_candidate(candidate_id)
+                    .await
+                    .expect("candidate should remain readable")
+                    .expect("candidate should remain present")
+                    .status,
+                TaskResultCandidateStatus::ExtractionFailed
+            );
+            assert_eq!(
+                restarted
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("effect should remain readable after rollback")
+                    .expect("effect should remain present")
+                    .status,
+                "waiting_acceptance"
+            );
+            restarted
+                .database_connection()
+                .execute_unprepared("DROP TRIGGER reject_candidate_gate_release ON native_terminal_effect_outbox")
+                .await
+                .expect("candidate gate fault trigger should uninstall");
             restarted
                 .update_task_result_candidate_resolution(
                     candidate_id,
                     TaskResultCandidateStatus::Accepted,
                     Some("review_effect_late_accept"),
-                    Some(timestamp + 4),
-                    timestamp + 4,
+                    Some(timestamp + 5),
+                    timestamp + 5,
                 )
                 .await
-                .is_err(),
-            "an outbox write fault must roll back candidate acceptance"
-        );
-        assert_eq!(
-            restarted
-                .get_task_result_candidate(candidate_id)
-                .await
-                .expect("candidate should remain readable")
-                .expect("candidate should remain present")
-                .status,
-            TaskResultCandidateStatus::ExtractionFailed
-        );
-        assert_eq!(
-            restarted
-                .native_terminal_effect_status(effect_id.as_str())
-                .await
-                .expect("effect should remain readable after rollback")
-                .expect("effect should remain present")
-                .status,
-            "waiting_acceptance"
-        );
-        restarted
-            .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_candidate_gate_release")
-            .await
-            .expect("candidate gate fault trigger should uninstall");
-        restarted
-            .update_task_result_candidate_resolution(
-                candidate_id,
-                TaskResultCandidateStatus::Accepted,
-                Some("review_effect_late_accept"),
-                Some(timestamp + 5),
-                timestamp + 5,
-            )
-            .await
-            .expect("late durable acceptance should release the gate")
-            .expect("accepted candidate should remain present");
-        restarted
-            .update_task_result_candidate_resolution(
-                candidate_id,
-                TaskResultCandidateStatus::Accepted,
-                Some("review_effect_late_accept"),
-                Some(timestamp + 5),
-                timestamp + 5,
-            )
-            .await
-            .expect("duplicate durable acceptance should be idempotent");
-        let status = restarted
-            .native_terminal_effect_status(effect_id.as_str())
-            .await
-            .expect("released effect status should load")
-            .expect("released effect should exist");
-        assert_eq!(status.status, "ready");
-        assert_eq!(status.accepted_candidate_id.as_deref(), Some(candidate_id));
-        assert_eq!(status.attempt_count, 0);
-        assert!(
+                .expect("late durable acceptance should release the gate")
+                .expect("accepted candidate should remain present");
             restarted
                 .update_task_result_candidate_resolution(
                     candidate_id,
-                    TaskResultCandidateStatus::Rejected,
-                    Some("review_conflicting_rejection"),
-                    Some(timestamp + 6),
-                    timestamp + 6,
+                    TaskResultCandidateStatus::Accepted,
+                    Some("review_effect_late_accept"),
+                    Some(timestamp + 5),
+                    timestamp + 5,
                 )
                 .await
-                .is_err(),
-            "accepted candidate state and its released side effect must be irreversible"
-        );
-        let accepted = restarted
-            .get_task_result_candidate(candidate_id)
-            .await
-            .expect("accepted candidate should remain readable")
-            .expect("accepted candidate should remain present");
-        assert_eq!(accepted.status, TaskResultCandidateStatus::Accepted);
+                .expect("duplicate durable acceptance should be idempotent");
+            let status = restarted
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("released effect status should load")
+                .expect("released effect should exist");
+            assert_eq!(status.status, "ready");
+            assert_eq!(status.accepted_candidate_id.as_deref(), Some(candidate_id));
+            assert_eq!(status.attempt_count, 0);
+            assert!(
+                restarted
+                    .update_task_result_candidate_resolution(
+                        candidate_id,
+                        TaskResultCandidateStatus::Rejected,
+                        Some("review_conflicting_rejection"),
+                        Some(timestamp + 6),
+                        timestamp + 6,
+                    )
+                    .await
+                    .is_err(),
+                "accepted candidate state and its released side effect must be irreversible"
+            );
+            let accepted = restarted
+                .get_task_result_candidate(candidate_id)
+                .await
+                .expect("accepted candidate should remain readable")
+                .expect("accepted candidate should remain present");
+            assert_eq!(accepted.status, TaskResultCandidateStatus::Accepted);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -44190,156 +44191,161 @@ mod tests {
     }
 
     async fn assert_neighbor_post_turn_effect_reopens(code: &str) {
-        let timestamp = 1_700_040_000;
-        let workspace_id = "ws_post_turn_reopen";
-        let thread_id = "thr_post_turn_reopen";
-        let turn_id = "turn_post_turn_reopen";
-        let (store, _, mut terminal_turn) =
-            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
-        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
-        store
-            .prepare_native_terminal_effects(
-                pioneer_protocol::NativeTerminalEffectPreparation {
-                    batch_id: format!("{turn_id}:batch:post-turn-reopen"),
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    runtime_generation: 1,
-                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                        effect_id: effect_id.clone(),
-                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                            request: serde_json::json!({}),
-                            runtime_snapshot: serde_json::json!({}),
-                        },
-                        max_attempts: 1,
-                    }],
-                },
-                timestamp,
-            )
-            .await
-            .expect("post-turn effect should prepare");
-        terminal_turn.status = TurnStatus::Completed;
-        store
-            .materialize_turn_completed(
-                TurnCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn: terminal_turn,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("terminal commit should activate post-turn effect");
-
-        let first = store
-            .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
-            .await
-            .expect("first attempt should claim")
-            .records
-            .pop()
-            .expect("first attempt must exist");
-        let database = store.database_connection();
-        let mut retry_wake = database.work_signal("control.native_retry").subscribe();
-        retry_wake.begin_pass(&database).await.unwrap();
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let timestamp = 1_700_040_000;
+            let workspace_id = "ws_post_turn_reopen";
+            let thread_id = "thr_post_turn_reopen";
+            let turn_id = "turn_post_turn_reopen";
+            let (store, _, mut terminal_turn) =
+                postgres_store_with_started_turn(fixture, workspace_id, thread_id, turn_id).await;
+            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
             store
-                .next_native_terminal_effect_recovery_deadline(timestamp + 1)
+                .prepare_native_terminal_effects(
+                    pioneer_protocol::NativeTerminalEffectPreparation {
+                        batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        runtime_generation: 1,
+                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                            effect_id: effect_id.clone(),
+                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                request: serde_json::json!({}),
+                                runtime_snapshot: serde_json::json!({}),
+                            },
+                            max_attempts: 1,
+                        }],
+                    },
+                    timestamp,
+                )
                 .await
-                .unwrap(),
-            None,
-            "a running effect is not an exhausted retry obligation"
-        );
-        assert!(
+                .expect("post-turn effect should prepare");
+            terminal_turn.status = TurnStatus::Completed;
             store
-                .fail_native_terminal_effect(
-                    effect_id.as_str(),
-                    first.claim_token.as_str(),
-                    code,
-                    "provider request failed (network_transient)",
-                    true,
-                    timestamp + 2,
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn: terminal_turn,
+                    },
                     timestamp + 1,
                 )
                 .await
-                .expect("exhausted transient failure should persist")
-        );
-        assert!(futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_some());
-        retry_wake.begin_pass(&database).await.unwrap();
-        assert_eq!(
-            store
-                .next_native_terminal_effect_recovery_deadline(timestamp + 1)
-                .await
-                .unwrap(),
-            Some(timestamp + 3_601),
-            "the cooldown belongs to the committed failure, independent of worker cadence"
-        );
-        assert_eq!(
-            store
-                .next_native_terminal_effect_recovery_deadline(timestamp + 86_401)
-                .await
-                .unwrap(),
-            None,
-            "expired history must not schedule empty recovery scans"
-        );
-        assert!(
-            !store
-                .fail_native_terminal_effect(
-                    &effect_id,
-                    &first.claim_token,
-                    code,
-                    "stale failure",
-                    true,
-                    timestamp + 2,
-                    timestamp + 1,
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_none(),
-            "a rejected stale claim must not wake its own discovery loop"
-        );
-        assert_eq!(
-            store
-                .native_terminal_effect_status(effect_id.as_str())
-                .await
-                .expect("status should load")
-                .expect("effect should exist")
-                .status,
-            "unresolved"
-        );
+                .expect("terminal commit should activate post-turn effect");
 
-        assert_eq!(
-            store
-                .requeue_retryable_unresolved_native_terminal_effects(timestamp + 3_602, 1)
+            let first = store
+                .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
                 .await
-                .expect("recovery scan should succeed"),
-            1
-        );
-        assert_eq!(
-            store
-                .next_native_terminal_effect_recovery_deadline(timestamp + 3_602)
+                .expect("first attempt should claim")
+                .records
+                .pop()
+                .expect("first attempt must exist");
+            let database = store.database_connection();
+            let mut retry_wake = database.work_signal("control.native_retry").subscribe();
+            retry_wake.begin_pass(&database).await.unwrap();
+            assert_eq!(
+                store
+                    .next_native_terminal_effect_recovery_deadline(timestamp + 1)
+                    .await
+                    .unwrap(),
+                None,
+                "a running effect is not an exhausted retry obligation"
+            );
+            assert!(
+                store
+                    .fail_native_terminal_effect(
+                        effect_id.as_str(),
+                        first.claim_token.as_str(),
+                        code,
+                        "provider request failed (network_transient)",
+                        true,
+                        timestamp + 2,
+                        timestamp + 1,
+                    )
+                    .await
+                    .expect("exhausted transient failure should persist")
+            );
+            assert!(futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_some());
+            retry_wake.begin_pass(&database).await.unwrap();
+            assert_eq!(
+                store
+                    .next_native_terminal_effect_recovery_deadline(timestamp + 1)
+                    .await
+                    .unwrap(),
+                Some(timestamp + 3_601),
+                "the cooldown belongs to the committed failure, independent of worker cadence"
+            );
+            assert_eq!(
+                store
+                    .next_native_terminal_effect_recovery_deadline(timestamp + 86_401)
+                    .await
+                    .unwrap(),
+                None,
+                "expired history must not schedule empty recovery scans"
+            );
+            assert!(
+                !store
+                    .fail_native_terminal_effect(
+                        &effect_id,
+                        &first.claim_token,
+                        code,
+                        "stale failure",
+                        true,
+                        timestamp + 2,
+                        timestamp + 1,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_none(),
+                "a rejected stale claim must not wake its own discovery loop"
+            );
+            assert_eq!(
+                store
+                    .native_terminal_effect_status(effect_id.as_str())
+                    .await
+                    .expect("status should load")
+                    .expect("effect should exist")
+                    .status,
+                "unresolved"
+            );
+
+            assert_eq!(
+                store
+                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + 3_602, 1)
+                    .await
+                    .expect("recovery scan should succeed"),
+                1
+            );
+            assert_eq!(
+                store
+                    .next_native_terminal_effect_recovery_deadline(timestamp + 3_602)
+                    .await
+                    .unwrap(),
+                None,
+                "requeue consumed this exhausted obligation"
+            );
+            assert!(
+                futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_none(),
+                "the requeue ACK must not restart exhausted-effect discovery"
+            );
+            let reopened = store
+                .claim_due_native_terminal_effects_at(timestamp + 3_602, 10, 1)
                 .await
-                .unwrap(),
-            None,
-            "requeue consumed this exhausted obligation"
-        );
-        assert!(
-            futures_util::FutureExt::now_or_never(retry_wake.wait(None)).is_none(),
-            "the requeue ACK must not restart exhausted-effect discovery"
-        );
-        let reopened = store
-            .claim_due_native_terminal_effects_at(timestamp + 3_602, 10, 1)
-            .await
-            .expect("recovery scan should succeed")
-            .records
-            .pop()
-            .expect("recent transient post-turn failure should reopen");
-        assert_eq!(reopened.effect_id, effect_id);
-        assert_eq!(reopened.attempt_count, 1);
-        assert_eq!(reopened.max_attempts, 8);
+                .expect("recovery scan should succeed")
+                .records
+                .pop()
+                .expect("recent transient post-turn failure should reopen");
+            assert_eq!(reopened.effect_id, effect_id);
+            assert_eq!(reopened.attempt_count, 1);
+            assert_eq!(reopened.max_attempts, 8);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -44501,224 +44507,227 @@ mod tests {
                 "effect_timeout",
             ),
         ] {
-            let timestamp = 1_700_040_000;
-            let workspace_id = "ws_post_turn_reopen";
-            let thread_id = "thr_post_turn_reopen";
-            let turn_id = "turn_post_turn_reopen";
-            let (store, _, mut terminal_turn) =
-                test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
-            let store = store.with_maintenance_access();
-            let effect_id = format!("{turn_id}:terminal-effect:post-turn");
-            store
-                .prepare_native_terminal_effects(
-                    pioneer_protocol::NativeTerminalEffectPreparation {
-                        batch_id: format!("{turn_id}:batch:post-turn-reopen"),
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        runtime_generation: 1,
-                        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                            effect_id: effect_id.clone(),
-                            effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
-                            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                            payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
-                                request: serde_json::json!({}),
-                                runtime_snapshot: serde_json::json!({}),
-                            },
-                            max_attempts: 1,
-                        }],
-                    },
-                    timestamp,
-                )
-                .await
-                .expect("post-turn effect should prepare");
-            terminal_turn.status = TurnStatus::Completed;
-            store
-                .materialize_turn_completed(
-                    TurnCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn: terminal_turn,
-                    },
-                    timestamp + 1,
-                )
-                .await
-                .expect("terminal commit should activate post-turn effect");
-
-            let first = store
-                .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
-                .await
-                .expect("first attempt should claim")
-                .records
-                .pop()
-                .expect("first attempt must exist");
-            if checkpoint {
-                store.store_native_terminal_effect_handler_checkpoint(
-                    &effect_id, &first.claim_token, r#"{"schema_version":1,"raw_json":"{\"facts\":[]}","model":"model","model_provider":"provider"}"#, timestamp + 1,
-                ).await.unwrap();
-            }
-            assert!(
+            pioneer_postgres_test::with_database(async |fixture| {
+                let timestamp = 1_700_040_000;
+                let workspace_id = "ws_post_turn_reopen";
+                let thread_id = "thr_post_turn_reopen";
+                let turn_id = "turn_post_turn_reopen";
+                let (store, _, mut terminal_turn) =
+                    postgres_store_with_started_turn(fixture, workspace_id, thread_id, turn_id).await;
+                let store = store.with_maintenance_access();
+                let effect_id = format!("{turn_id}:terminal-effect:post-turn");
                 store
-                    .fail_native_terminal_effect(
-                        effect_id.as_str(),
-                        first.claim_token.as_str(),
-                        code,
-                        "safe write failure",
-                        matches!(
-                            code,
-                            "memory.post_turn_extractor.write_storage_transient"
-                                | "memory.post_turn_extractor.write_failed"
-                        ),
-                        timestamp + 2,
+                    .prepare_native_terminal_effects(
+                        pioneer_protocol::NativeTerminalEffectPreparation {
+                            batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            runtime_generation: 1,
+                            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                                effect_id: effect_id.clone(),
+                                effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                                payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                                    request: serde_json::json!({}),
+                                    runtime_snapshot: serde_json::json!({}),
+                                },
+                                max_attempts: 1,
+                            }],
+                        },
+                        timestamp,
+                    )
+                    .await
+                    .expect("post-turn effect should prepare");
+                terminal_turn.status = TurnStatus::Completed;
+                store
+                    .materialize_turn_completed(
+                        TurnCompletedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn: terminal_turn,
+                        },
                         timestamp + 1,
                     )
                     .await
-                    .expect("exhausted transient failure should persist")
-            );
-            assert_eq!(
-                store
-                    .native_terminal_effect_status(effect_id.as_str())
+                    .expect("terminal commit should activate post-turn effect");
+
+                let first = store
+                    .claim_due_native_terminal_effects_at(timestamp + 1, 10, 1)
                     .await
-                    .expect("status should load")
-                    .expect("effect should exist")
-                    .status,
-                "unresolved"
-            );
-            assert_eq!(
-                store
-                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
-                    .await
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                store
-                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
-                    .await
-                    .unwrap(),
-                expected,
-                "{code}, delay={delay}"
-            );
-            if expected == 0 {
+                    .expect("first attempt should claim")
+                    .records
+                    .pop()
+                    .expect("first attempt must exist");
+                if checkpoint {
+                    store.store_native_terminal_effect_handler_checkpoint(
+                        &effect_id, &first.claim_token, r#"{"schema_version":1,"raw_json":"{\"facts\":[]}","model":"model","model_provider":"provider"}"#, timestamp + 1,
+                    ).await.unwrap();
+                }
                 assert!(
                     store
-                        .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
+                        .fail_native_terminal_effect(
+                            effect_id.as_str(),
+                            first.claim_token.as_str(),
+                            code,
+                            "safe write failure",
+                            matches!(
+                                code,
+                                "memory.post_turn_extractor.write_storage_transient"
+                                    | "memory.post_turn_extractor.write_failed"
+                            ),
+                            timestamp + 2,
+                            timestamp + 1,
+                        )
                         .await
-                        .unwrap()
-                        .records
-                        .is_empty()
+                        .expect("exhausted transient failure should persist")
                 );
-                continue;
-            }
-            // Repeat discovery through a newly scoped handle, as after restart.
-            assert_eq!(
-                store
-                    .with_maintenance_access()
-                    .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
-                    .await
-                    .unwrap(),
-                0
-            );
-            let reopened = store
-                .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
-                .await
-                .unwrap()
-                .records
-                .pop()
-                .unwrap();
-            assert_eq!(reopened.effect_id, effect_id);
-            assert_eq!(
-                reopened.legacy_manifest_revalidation,
-                code == "memory.post_turn_extractor.manifest_failed"
-            );
-            assert!(
-                !store
-                    .fail_native_terminal_effect(
-                        &effect_id,
-                        &first.claim_token,
-                        "stale_owner",
-                        "stale result",
-                        false,
-                        timestamp + delay,
-                        timestamp + delay
-                    )
+                assert_eq!(
+                    store
+                        .native_terminal_effect_status(effect_id.as_str())
+                        .await
+                        .expect("status should load")
+                        .expect("effect should exist")
+                        .status,
+                    "unresolved"
+                );
+                assert_eq!(
+                    store
+                        .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 0)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    store
+                        .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                        .await
+                        .unwrap(),
+                    expected,
+                    "{code}, delay={delay}"
+                );
+                if expected == 0 {
+                    assert!(
+                        store
+                            .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
+                            .await
+                            .unwrap()
+                            .records
+                            .is_empty()
+                    );
+                    return Ok(());
+                }
+                // Repeat discovery through a newly scoped handle, as after restart.
+                assert_eq!(
+                    store
+                        .with_maintenance_access()
+                        .requeue_retryable_unresolved_native_terminal_effects(timestamp + delay, 1)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                let reopened = store
+                    .claim_due_native_terminal_effects_at(timestamp + delay, 10, 1)
                     .await
                     .unwrap()
-            );
-
-            if matches!(
-                code,
-                "memory.post_turn_extractor.write_failed"
-                    | "memory.post_turn_extractor.manifest_failed"
-            ) {
+                    .records
+                    .pop()
+                    .unwrap();
+                assert_eq!(reopened.effect_id, effect_id);
                 assert_eq!(
-                    reopened.max_attempts, 1,
-                    "legacy revalidation must not expand the budget"
+                    reopened.legacy_manifest_revalidation,
+                    code == "memory.post_turn_extractor.manifest_failed"
                 );
-                assert_eq!(reopened.attempt_count, reopened.max_attempts);
-                assert_eq!(
-                    store
-                        .native_terminal_effect_status(&effect_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .last_error_code
-                        .as_deref(),
-                    Some(if code == "memory.post_turn_extractor.manifest_failed" {
-                        "memory.post_turn_extractor.legacy_manifest_revalidate"
-                    } else {
-                        "memory.post_turn_extractor.legacy_write_revalidate"
-                    })
-                );
-                assert_eq!(
-                    store
-                        .native_terminal_effect_handler_checkpoint(
+                assert!(
+                    !store
+                        .fail_native_terminal_effect(
                             &effect_id,
-                            &reopened.claim_token
+                            &first.claim_token,
+                            "stale_owner",
+                            "stale result",
+                            false,
+                            timestamp + delay,
+                            timestamp + delay
                         )
                         .await
                         .unwrap()
-                        .is_some(),
-                    checkpoint
                 );
-                // The revalidated cause replaces the legacy marker and stays terminal.
-                store
-                    .fail_native_terminal_effect(
-                        &effect_id,
-                        &reopened.claim_token,
-                        revalidated_code,
-                        "safe classified failure",
-                        matches!(
+
+                if matches!(
+                    code,
+                    "memory.post_turn_extractor.write_failed"
+                        | "memory.post_turn_extractor.manifest_failed"
+                ) {
+                    assert_eq!(
+                        reopened.max_attempts, 1,
+                        "legacy revalidation must not expand the budget"
+                    );
+                    assert_eq!(reopened.attempt_count, reopened.max_attempts);
+                    assert_eq!(
+                        store
+                            .native_terminal_effect_status(&effect_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .last_error_code
+                            .as_deref(),
+                        Some(if code == "memory.post_turn_extractor.manifest_failed" {
+                            "memory.post_turn_extractor.legacy_manifest_revalidate"
+                        } else {
+                            "memory.post_turn_extractor.legacy_write_revalidate"
+                        })
+                    );
+                    assert_eq!(
+                        store
+                            .native_terminal_effect_handler_checkpoint(
+                                &effect_id,
+                                &reopened.claim_token
+                            )
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        checkpoint
+                    );
+                    // The revalidated cause replaces the legacy marker and stays terminal.
+                    store
+                        .fail_native_terminal_effect(
+                            &effect_id,
+                            &reopened.claim_token,
+                            revalidated_code,
+                            "safe classified failure",
+                            matches!(
+                                revalidated_code,
+                                "memory.post_turn_extractor.write_storage_transient"
+                                    | "memory.post_turn_extractor.manifest_storage_transient"
+                            ),
+                            timestamp + delay + 1,
+                            timestamp + delay,
+                        )
+                        .await
+                        .unwrap();
+                    let reclassified_recovery = store
+                        .requeue_retryable_unresolved_native_terminal_effects(
+                            timestamp + delay + 3_601,
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        reclassified_recovery,
+                        u64::from(matches!(
                             revalidated_code,
                             "memory.post_turn_extractor.write_storage_transient"
                                 | "memory.post_turn_extractor.manifest_storage_transient"
-                        ),
-                        timestamp + delay + 1,
-                        timestamp + delay,
-                    )
-                    .await
-                    .unwrap();
-                let reclassified_recovery = store
-                    .requeue_retryable_unresolved_native_terminal_effects(
-                        timestamp + delay + 3_601,
-                        1,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    reclassified_recovery,
-                    u64::from(matches!(
-                        revalidated_code,
-                        "memory.post_turn_extractor.write_storage_transient"
-                            | "memory.post_turn_extractor.manifest_storage_transient"
-                    ),)
-                );
-            } else {
-                assert_eq!(
-                    reopened.max_attempts, 8,
-                    "preserve existing transient recovery budget"
-                );
-            }
+                        ),)
+                    );
+                } else {
+                    assert_eq!(
+                        reopened.max_attempts, 8,
+                        "preserve existing transient recovery budget"
+                    );
+                }
+                    Ok(())
+                }).await.unwrap();
         }
     }
 
@@ -44995,115 +45004,117 @@ mod tests {
 
     #[tokio::test]
     async fn native_finalization_transaction_rolls_back_and_reconciles_after_injected_crash() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_native_finalize_fault",
-            "thr_native_finalize_fault",
-            "turn_native_fault",
-        )
-        .await;
-        let started = unix_to_datetime(1_700_000_010);
-        store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: "ws_native_finalize_fault".into(),
-                    thread_id: "thr_native_finalize_fault".into(),
-                    turn_id: "turn_native_fault".into(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 0,
-                    tool_call_count: 0,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({}),
-                    started_at: started,
-                },
-                started,
-                started,
-            )
-            .await
-            .unwrap();
-        let notification = ItemCompletedNotification {
-            workspace_id: "ws_native_finalize_fault".to_owned(),
-            thread_id: "thr_native_finalize_fault".to_owned(),
-            turn_id: "turn_native_fault".to_owned(),
-            item: TurnItem::AgentMessage {
-                id: "final_native_fault_1".to_owned(),
-                text: "durable answer before injected crash".to_owned(),
-                phase: AgentMessagePhase::FinalAnswer,
-                markdown: None,
-                markdown_version: None,
-            },
-        };
-        store
-            .prepare_turn_finalization(&notification, 1, None, 1_700_000_100)
-            .await
-            .expect("finalization intent should prepare");
-        store
-            .connection
-            .execute_unprepared(
-                "CREATE TRIGGER reject_native_terminal_commit \
-                 BEFORE UPDATE OF status ON turn_execution_window \
-                 WHEN NEW.turn_id = 'turn_native_fault' AND NEW.status = 'completed' \
-                 BEGIN SELECT RAISE(ABORT, 'injected terminal commit crash'); END;",
-            )
-            .await
-            .expect("fault trigger should install");
-        let error = store
-            .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<super::NativeFinalizationPhase>(),
-            Some(super::NativeFinalizationPhase::WriterApply)
-        ));
-
-        assert!(
-            turn::find_turn_item(
-                &store.connection,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (store, _, _) = postgres_store_with_started_turn(fixture,
+                "ws_native_finalize_fault",
+                "thr_native_finalize_fault",
                 "turn_native_fault",
-                "final_native_fault_1"
             )
-            .await
-            .expect("item lookup should succeed")
-            .is_none(),
-            "failed terminal commit must roll back the final item"
-        );
-        let (_, still_running) = store
-            .get_turn("thr_native_finalize_fault", "turn_native_fault")
-            .await
-            .expect("turn lookup should succeed")
-            .expect("turn should exist");
-        assert_eq!(still_running.status, TurnStatus::InProgress);
-        assert_eq!(
+            .await;
+            let started = unix_to_datetime(1_700_000_010);
             store
-                .latest_turn_execution_window("turn_native_fault")
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_native_finalize_fault".into(),
+                        thread_id: "thr_native_finalize_fault".into(),
+                        turn_id: "turn_native_fault".into(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: started,
+                    },
+                    started,
+                    started,
+                )
                 .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ExecutionWindowStatus::Running,
-            "failure of window closure must roll back terminal publication too"
-        );
-        store
-            .connection
-            .execute_unprepared("DROP TRIGGER reject_native_terminal_commit")
-            .await
-            .expect("fault trigger should uninstall");
-        let reconciliation = store
-            .reconcile_prepared_turn_finalizations(10, 1_700_000_102)
-            .await
-            .expect("prepared intent should reconcile");
-        assert_eq!(reconciliation.scanned, 1);
-        assert_eq!(reconciliation.committed_count(), 1);
-        assert_eq!(
+                .unwrap();
+            let notification = ItemCompletedNotification {
+                workspace_id: "ws_native_finalize_fault".to_owned(),
+                thread_id: "thr_native_finalize_fault".to_owned(),
+                turn_id: "turn_native_fault".to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: "final_native_fault_1".to_owned(),
+                    text: "durable answer before injected crash".to_owned(),
+                    phase: AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            };
             store
-                .latest_turn_execution_window("turn_native_fault")
+                .prepare_turn_finalization(&notification, 1, None, 1_700_000_100)
                 .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ExecutionWindowStatus::Completed
-        );
+                .expect("finalization intent should prepare");
+            store
+                .connection
+                .execute_unprepared(
+                    "CREATE FUNCTION reject_native_terminal_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected terminal commit crash'; END $$; CREATE TRIGGER reject_native_terminal_commit BEFORE UPDATE OF status ON turn_execution_window FOR EACH ROW WHEN (NEW.turn_id = 'turn_native_fault' AND NEW.status = 'completed') EXECUTE FUNCTION reject_native_terminal_commit()",
+                )
+                .await
+                .expect("fault trigger should install");
+            let error = store
+                .commit_prepared_turn_finalization("turn_native_fault", 1_700_000_101)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<super::NativeFinalizationPhase>(),
+                Some(super::NativeFinalizationPhase::WriterApply)
+            ));
+
+            assert!(
+                turn::find_turn_item(
+                    &store.connection,
+                    "turn_native_fault",
+                    "final_native_fault_1"
+                )
+                .await
+                .expect("item lookup should succeed")
+                .is_none(),
+                "failed terminal commit must roll back the final item"
+            );
+            let (_, still_running) = store
+                .get_turn("thr_native_finalize_fault", "turn_native_fault")
+                .await
+                .expect("turn lookup should succeed")
+                .expect("turn should exist");
+            assert_eq!(still_running.status, TurnStatus::InProgress);
+            assert_eq!(
+                store
+                    .latest_turn_execution_window("turn_native_fault")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ExecutionWindowStatus::Running,
+                "failure of window closure must roll back terminal publication too"
+            );
+            store
+                .connection
+                .execute_unprepared("DROP TRIGGER reject_native_terminal_commit ON turn_execution_window")
+                .await
+                .expect("fault trigger should uninstall");
+            let reconciliation = store
+                .reconcile_prepared_turn_finalizations(10, 1_700_000_102)
+                .await
+                .expect("prepared intent should reconcile");
+            assert_eq!(reconciliation.scanned, 1);
+            assert_eq!(reconciliation.committed_count(), 1);
+            assert_eq!(
+                store
+                    .latest_turn_execution_window("turn_native_fault")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ExecutionWindowStatus::Completed
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -45114,242 +45125,266 @@ mod tests {
     }
 
     async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
-        use pioneer_protocol::{
-            ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
-            RecoveryProviderFailure, RecoveryStopReason,
-        };
-        let (store, _, _) =
-            test_store_with_started_turn("ws_diag_atomic", "thr_diag_atomic", "turn_diag_atomic")
-                .await;
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: "ws_diag_atomic".to_owned(),
-                    thread_id: "thr_diag_atomic".to_owned(),
-                    turn_id: "turn_diag_atomic".to_owned(),
-                    item: safe_web_fetch_item("tool_diag_atomic"),
-                },
-                1_700_000_001,
-            )
-            .await
-            .unwrap();
-        let initial = RecoveryDiagnostic {
-            last_failure: Some(RecoveryProviderFailure {
-                raw_response: None,
-                error_reason: None,
-                request_id: None,
-                class: ProviderFailureClass::StreamTruncated,
-                stage: ProviderFailureStage::MidStream,
-                transport: ProviderTransportKind::Stream,
-                http_status: None,
-                retry_after_ms: None,
-            }),
-            stop_reason: None,
-        };
-        let job = match store
-            .enqueue_recovery_job_with_diagnostic_if_no_unresolved(
-                "turn_diag_atomic".to_owned(),
-                "tool_diag_atomic".to_owned(),
-                TurnItemType::WebFetch,
-                None,
-                RecoveryTrigger::ProviderError,
-                RecoveryAction::RetryWithBackoff,
-                Some("raw initial secret".to_owned()),
-                Some(ProviderFailureClass::StreamTruncated),
-                Some(ProviderFailureStage::MidStream),
-                None,
-                0,
-                2,
-                serde_json::json!({}),
-                serde_json::json!({}),
-                Some(initial.clone()),
-                1_700_000_002,
-            )
-            .await
-            .unwrap()
-        {
-            AtomicRecoveryJobEnqueueOutcome::Created(job) => job,
-            _ => panic!("new job expected"),
-        };
-        let claimed = store
-            .claim_due_recovery_jobs(1_700_000_003, 45, 1)
-            .await
-            .unwrap();
-        store
-            .mark_claimed_recovery_job_active(
-                &job.id,
-                claimed[0].claim_token.as_deref().unwrap(),
-                "diag_attempt",
-                1_700_000_003,
-            )
-            .await
-            .unwrap();
-        let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(
-            format!(
-                "{} original provider diagnostic body",
-                "x".repeat(20 * 1024)
-            )
-            .as_bytes(),
-            false,
-        );
-        response.processing_error = Some("Responses completed reasoning state conflict".into());
-        response.stream_context = Some("data: original completed reasoning event\n\n".into());
-        let final_diagnostic = RecoveryDiagnostic {
-            last_failure: Some(RecoveryProviderFailure {
-                raw_response: Some(response),
-                error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
-                request_id: Some(
-                    pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
-                        .unwrap(),
-                ),
-                class: ProviderFailureClass::AuthOrPermission,
-                stage: ProviderFailureStage::Connect,
-                transport: ProviderTransportKind::NonStream,
-                http_status: Some(403),
-                retry_after_ms: None,
-            }),
-            stop_reason: Some(if status == RecoveryJobStatus::Blocked {
-                RecoveryStopReason::NoProgress
-            } else {
-                RecoveryStopReason::AttemptsExhausted
-            }),
-        };
-        let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
-        assert!(
-            !store
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                    &job.id,
-                    "stale_attempt",
-                    status,
-                    Some(raw.to_owned()),
-                    Some(final_diagnostic.clone()),
-                    1_700_000_004,
-                    None,
-                )
-                .await
-                .unwrap()
-        );
-        store.connection.execute_unprepared("CREATE TRIGGER reject_diag_outbox BEFORE INSERT ON recovery_terminalization_outbox BEGIN SELECT RAISE(ABORT, 'test outbox failure'); END;").await.unwrap();
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            use pioneer_protocol::{
+                ProviderFailureClass, ProviderFailureStage, ProviderTransportKind, RecoveryDiagnostic,
+                RecoveryProviderFailure, RecoveryStopReason,
+            };
+            let (store, _, _) =
+                postgres_store_with_started_turn(fixture, "ws_diag_atomic", "thr_diag_atomic", "turn_diag_atomic")
+                    .await;
             store
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                    &job.id,
-                    "diag_attempt",
-                    status,
-                    Some(raw.to_owned()),
-                    Some(final_diagnostic.clone()),
-                    1_700_000_004,
-                    None,
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: "ws_diag_atomic".to_owned(),
+                        thread_id: "thr_diag_atomic".to_owned(),
+                        turn_id: "turn_diag_atomic".to_owned(),
+                        item: safe_web_fetch_item("tool_diag_atomic"),
+                    },
+                    1_700_000_001,
                 )
                 .await
-                .is_err()
-        );
-        let rolled_back = store.get_recovery_job(&job.id).await.unwrap().unwrap();
-        assert_eq!(rolled_back.status, RecoveryJobStatus::Active);
-        assert_eq!(rolled_back.run_count, 0);
-        assert_eq!(rolled_back.diagnostic, Some(initial));
-        assert!(rolled_back.last_failure_attempt_id.is_none());
-        store
-            .connection
-            .execute_unprepared("DROP TRIGGER reject_diag_outbox")
-            .await
-            .unwrap();
-        assert!(
-            store
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                    &job.id,
-                    "diag_attempt",
-                    status,
-                    Some(raw.to_owned()),
-                    Some(final_diagnostic.clone()),
-                    1_700_000_004,
-                    None,
-                )
-                .await
-                .unwrap()
-        );
-        let restarted = CrudStore::new(store.database_connection());
-        let terminal = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
-        assert_eq!(terminal.diagnostic.as_ref(), Some(&final_diagnostic));
-        assert_eq!(
-            terminal.error_class,
-            Some(ProviderFailureClass::StreamTruncated)
-        );
-        let claims = restarted
-            .claim_due_recovery_terminalizations(1_700_000_005, 45, 10)
-            .await
-            .unwrap();
-        assert_eq!(claims.len(), 1);
-        let applied = restarted
-            .apply_claimed_recovery_terminalization(
-                &claims[0],
-                (status == RecoveryJobStatus::Blocked).then(|| TurnBlockedResumeMetadata {
-                    reason_class: "execution_budget".to_owned(),
-                    human_message: "max_consecutive_no_progress_windows reached: limit=3"
-                        .to_owned(),
-                    resume_requirements: Vec::new(),
-                    resume_command: "turn.resume:turn_diag_atomic".to_owned(),
-                    blocked_recovery_job_id: Some(job.id.clone()),
-                    latest_checkpoint_id: None,
-                    can_resume_same_turn: false,
+                .unwrap();
+            let initial = RecoveryDiagnostic {
+                last_failure: Some(RecoveryProviderFailure {
+                    raw_response: None,
+                    error_reason: None,
+                    request_id: None,
+                    class: ProviderFailureClass::StreamTruncated,
+                    stage: ProviderFailureStage::MidStream,
+                    transport: ProviderTransportKind::Stream,
+                    http_status: None,
+                    retry_after_ms: None,
                 }),
-                RecoveryTerminalCleanupPlan {
-                    runtime_generation: 77,
-                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
-                },
-                1_700_000_005,
-            )
-            .await
-            .unwrap();
-        let RecoveryTerminalizationApplyOutcome::Applied(applied) = applied else {
-            panic!("terminalization expected");
-        };
-        let expected = final_diagnostic.public_message();
-        let expected_turn_message = if status == RecoveryJobStatus::Blocked {
-            format!("{expected} (recovery job {})", job.id)
-        } else {
-            expected.clone()
-        };
-        let terminal_turn = applied.newly_terminal_turn.unwrap();
-        assert_eq!(
-            terminal_turn.error.as_deref(),
-            Some(expected_turn_message.as_str())
-        );
-        let serialized = serde_json::to_string(&terminal_turn).unwrap();
-        assert!(serialized.contains("HTTP 403"));
-        for secret in [
-            "credential",
-            "secret.example",
-            "/private",
-            "HTTP 401",
-            "gen-atomic_fixture",
-        ] {
-            assert!(!serialized.contains(secret));
-        }
-        if status == RecoveryJobStatus::Blocked {
-            assert!(applied.final_item.is_none());
-            assert_eq!(
-                restarted
-                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
-                    .await
-                    .unwrap(),
-                Some(final_diagnostic.clone())
+                stop_reason: None,
+            };
+            let job = match store
+                .enqueue_recovery_job_with_diagnostic_if_no_unresolved(
+                    "turn_diag_atomic".to_owned(),
+                    "tool_diag_atomic".to_owned(),
+                    TurnItemType::WebFetch,
+                    None,
+                    RecoveryTrigger::ProviderError,
+                    RecoveryAction::RetryWithBackoff,
+                    Some("raw initial secret".to_owned()),
+                    Some(ProviderFailureClass::StreamTruncated),
+                    Some(ProviderFailureStage::MidStream),
+                    None,
+                    0,
+                    2,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    Some(initial.clone()),
+                    1_700_000_002,
+                )
+                .await
+                .unwrap()
+            {
+                AtomicRecoveryJobEnqueueOutcome::Created(job) => job,
+                _ => panic!("new job expected"),
+            };
+            let claimed = store
+                .claim_due_recovery_jobs(1_700_000_003, 45, 1)
+                .await
+                .unwrap();
+            store
+                .mark_claimed_recovery_job_active(
+                    &job.id,
+                    claimed[0].claim_token.as_deref().unwrap(),
+                    "diag_attempt",
+                    1_700_000_003,
+                )
+                .await
+                .unwrap();
+            let mut response = pioneer_protocol::ProviderErrorResponse::from_bytes(
+                format!(
+                    "{} original provider diagnostic body",
+                    "x".repeat(20 * 1024)
+                )
+                .as_bytes(),
+                false,
             );
+            response.processing_error = Some("Responses completed reasoning state conflict".into());
+            response.stream_context = Some("data: original completed reasoning event\n\n".into());
+            let final_diagnostic = RecoveryDiagnostic {
+                last_failure: Some(RecoveryProviderFailure {
+                    raw_response: Some(response),
+                    error_reason: Some(pioneer_protocol::ProviderErrorReason::PermissionDenied),
+                    request_id: Some(
+                        pioneer_protocol::ProviderRequestId::try_from("gen-atomic_fixture".to_owned())
+                            .unwrap(),
+                    ),
+                    class: ProviderFailureClass::AuthOrPermission,
+                    stage: ProviderFailureStage::Connect,
+                    transport: ProviderTransportKind::NonStream,
+                    http_status: Some(403),
+                    retry_after_ms: None,
+                }),
+                stop_reason: Some(if status == RecoveryJobStatus::Blocked {
+                    RecoveryStopReason::NoProgress
+                } else {
+                    RecoveryStopReason::AttemptsExhausted
+                }),
+            };
+            let raw = "raw body credential=secret https://secret.example /private/key HTTP 401";
             assert!(
-                restarted
-                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                !store
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                        &job.id,
+                        "stale_attempt",
+                        status,
+                        Some(raw.to_owned()),
+                        Some(final_diagnostic.clone()),
+                        1_700_000_004,
+                        None,
+                    )
                     .await
                     .unwrap()
-                    .is_none()
             );
-            // A stale/resumed/pending job cannot lend its facts to this result.
-            for job_status in ["pending", "active", "succeeded", "cancelled"] {
+            store.connection.execute_unprepared("CREATE FUNCTION reject_diag_outbox() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test outbox failure'; END $$; CREATE TRIGGER reject_diag_outbox BEFORE INSERT ON recovery_terminalization_outbox FOR EACH ROW EXECUTE FUNCTION reject_diag_outbox()").await.unwrap();
+            assert!(
+                store
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                        &job.id,
+                        "diag_attempt",
+                        status,
+                        Some(raw.to_owned()),
+                        Some(final_diagnostic.clone()),
+                        1_700_000_004,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            let rolled_back = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(rolled_back.status, RecoveryJobStatus::Active);
+            assert_eq!(rolled_back.run_count, 0);
+            assert_eq!(rolled_back.diagnostic, Some(initial));
+            assert!(rolled_back.last_failure_attempt_id.is_none());
+            store
+                .connection
+                .execute_unprepared("DROP TRIGGER reject_diag_outbox ON recovery_terminalization_outbox")
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                        &job.id,
+                        "diag_attempt",
+                        status,
+                        Some(raw.to_owned()),
+                        Some(final_diagnostic.clone()),
+                        1_700_000_004,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let restarted = CrudStore::new(store.database_connection());
+            let terminal = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(terminal.diagnostic.as_ref(), Some(&final_diagnostic));
+            assert_eq!(
+                terminal.error_class,
+                Some(ProviderFailureClass::StreamTruncated)
+            );
+            let claims = restarted
+                .claim_due_recovery_terminalizations(1_700_000_005, 45, 10)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            let applied = restarted
+                .apply_claimed_recovery_terminalization(
+                    &claims[0],
+                    (status == RecoveryJobStatus::Blocked).then(|| TurnBlockedResumeMetadata {
+                        reason_class: "execution_budget".to_owned(),
+                        human_message: "max_consecutive_no_progress_windows reached: limit=3"
+                            .to_owned(),
+                        resume_requirements: Vec::new(),
+                        resume_command: "turn.resume:turn_diag_atomic".to_owned(),
+                        blocked_recovery_job_id: Some(job.id.clone()),
+                        latest_checkpoint_id: None,
+                        can_resume_same_turn: false,
+                    }),
+                    RecoveryTerminalCleanupPlan {
+                        runtime_generation: 77,
+                        runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                    },
+                    1_700_000_005,
+                )
+                .await
+                .unwrap();
+            let RecoveryTerminalizationApplyOutcome::Applied(applied) = applied else {
+                panic!("terminalization expected");
+            };
+            let expected = final_diagnostic.public_message();
+            let expected_turn_message = if status == RecoveryJobStatus::Blocked {
+                format!("{expected} (recovery job {})", job.id)
+            } else {
+                expected.clone()
+            };
+            let terminal_turn = applied.newly_terminal_turn.unwrap();
+            assert_eq!(
+                terminal_turn.error.as_deref(),
+                Some(expected_turn_message.as_str())
+            );
+            let serialized = serde_json::to_string(&terminal_turn).unwrap();
+            assert!(serialized.contains("HTTP 403"));
+            for secret in [
+                "credential",
+                "secret.example",
+                "/private",
+                "HTTP 401",
+                "gen-atomic_fixture",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
+            if status == RecoveryJobStatus::Blocked {
+                assert!(applied.final_item.is_none());
+                assert_eq!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap(),
+                    Some(final_diagnostic.clone())
+                );
+                assert!(
+                    restarted
+                        .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                // A stale/resumed/pending job cannot lend its facts to this result.
+                for job_status in ["pending", "active", "succeeded", "cancelled"] {
+                    restarted
+                        .connection
+                        .execute_unprepared(&format!(
+                            "UPDATE recovery_job SET status = '{job_status}' WHERE id = '{}'",
+                            job.id
+                        ))
+                        .await
+                        .unwrap();
+                    assert!(
+                        restarted
+                            .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
                 restarted
                     .connection
                     .execute_unprepared(&format!(
-                        "UPDATE recovery_job SET status = '{job_status}' WHERE id = '{}'",
+                        "UPDATE recovery_job SET status = 'blocked' WHERE id = '{}'",
                         job.id
                     ))
+                    .await
+                    .unwrap();
+                restarted
+                    .connection
+                    .execute_unprepared(
+                        "UPDATE turn SET error = 'authorization denied' WHERE id = 'turn_diag_atomic'",
+                    )
                     .await
                     .unwrap();
                 assert!(
@@ -45359,88 +45394,69 @@ mod tests {
                         .unwrap()
                         .is_none()
                 );
+                restarted
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE turn SET error = $1 WHERE id = 'turn_diag_atomic'",
+                        [expected_turn_message.into()],
+                    ))
+                    .await
+                    .unwrap();
+                restarted.connection.execute_unprepared("UPDATE turn_event SET payload = json_set(payload, '$.payload.resume.blocked_recovery_job_id', 'unrelated_job') WHERE turn_id = 'turn_diag_atomic' AND event_type = 'turn/blocked'").await.unwrap();
+                assert!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert_eq!(
+                    restarted
+                        .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap(),
+                    Some(final_diagnostic)
+                );
+                assert!(
+                    restarted
+                        .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    serde_json::to_string(&applied.final_item.unwrap())
+                        .unwrap()
+                        .contains("HTTP 403")
+                );
             }
-            restarted
-                .connection
-                .execute_unprepared(&format!(
-                    "UPDATE recovery_job SET status = 'blocked' WHERE id = '{}'",
-                    job.id
-                ))
-                .await
-                .unwrap();
-            restarted
-                .connection
-                .execute_unprepared(
-                    "UPDATE turn SET error = 'authorization denied' WHERE id = 'turn_diag_atomic'",
-                )
-                .await
-                .unwrap();
             assert!(
                 restarted
-                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                    .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
                     .await
                     .unwrap()
-                    .is_none()
-            );
-            restarted
-                .connection
-                .execute_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    "UPDATE turn SET error = ? WHERE id = 'turn_diag_atomic'",
-                    [expected_turn_message.into()],
-                ))
-                .await
-                .unwrap();
-            restarted.connection.execute_unprepared("UPDATE turn_event SET payload = json_set(payload, '$.payload.resume.blocked_recovery_job_id', 'unrelated_job') WHERE turn_id = 'turn_diag_atomic' AND event_type = 'turn/blocked'").await.unwrap();
-            assert!(
-                restarted
-                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        } else {
-            assert_eq!(
-                restarted
-                    .get_failed_turn_recovery_diagnostic("turn_diag_atomic")
-                    .await
-                    .unwrap(),
-                Some(final_diagnostic)
+                    .is_empty()
             );
             assert!(
-                restarted
-                    .get_blocked_turn_recovery_diagnostic("turn_diag_atomic")
+                !restarted
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                        &job.id,
+                        "diag_attempt",
+                        status,
+                        Some("duplicate".to_owned()),
+                        None,
+                        1_700_000_100,
+                        None,
+                    )
                     .await
                     .unwrap()
-                    .is_none()
             );
-            assert!(
-                serde_json::to_string(&applied.final_item.unwrap())
-                    .unwrap()
-                    .contains("HTTP 403")
-            );
-        }
-        assert!(
-            restarted
-                .claim_due_recovery_terminalizations(1_700_000_100, 45, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !restarted
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                    &job.id,
-                    "diag_attempt",
-                    status,
-                    Some("duplicate".to_owned()),
-                    None,
-                    1_700_000_100,
-                    None,
-                )
-                .await
-                .unwrap()
-        );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -45689,160 +45705,162 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_terminalization_rolls_back_both_item_and_turn_then_reclaims_expired_lease() {
-        let (store, _, _) = test_store_with_started_turn(
-            "ws_recovery_terminal_fault",
-            "thr_recovery_terminal_fault",
-            "turn_recovery_fault",
-        )
-        .await;
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: "ws_recovery_terminal_fault".to_owned(),
-                    thread_id: "thr_recovery_terminal_fault".to_owned(),
-                    turn_id: "turn_recovery_fault".to_owned(),
-                    item: safe_web_fetch_item("tool_recovery_fault"),
-                },
-                1_700_000_001,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (store, _, _) = postgres_store_with_started_turn(fixture,
+                "ws_recovery_terminal_fault",
+                "thr_recovery_terminal_fault",
+                "turn_recovery_fault",
             )
-            .await
-            .expect("tool item should start");
-        let job = store
-            .enqueue_recovery_job(
-                "turn_recovery_fault".to_owned(),
-                "tool_recovery_fault".to_owned(),
-                TurnItemType::WebFetch,
-                None,
-                RecoveryTrigger::Timeout,
-                RecoveryAction::MarkFailed,
-                Some("terminal recovery fault".to_owned()),
-                None,
-                None,
-                None,
-                1,
-                1,
-                serde_json::json!({}),
-                serde_json::json!({}),
-                1_700_000_002,
-            )
-            .await
-            .expect("recovery job should enqueue");
-        assert!(
+            .await;
             store
-                .mark_recovery_job_terminal(
-                    job.id.as_str(),
-                    RecoveryJobStatus::Failed,
-                    Some("terminal recovery fault".to_owned()),
-                    1_700_000_003,
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: "ws_recovery_terminal_fault".to_owned(),
+                        thread_id: "thr_recovery_terminal_fault".to_owned(),
+                        turn_id: "turn_recovery_fault".to_owned(),
+                        item: safe_web_fetch_item("tool_recovery_fault"),
+                    },
+                    1_700_000_001,
                 )
                 .await
-                .expect("terminal job should commit with outbox")
-        );
-        let first_claim = store
-            .claim_due_recovery_terminalizations(1_700_000_004, 5, 10)
-            .await
-            .expect("terminalization should claim");
-        assert_eq!(first_claim.len(), 1);
-        store
-            .connection
-            .execute_unprepared(
-                "CREATE TRIGGER reject_recovery_turn_failure \
-                 BEFORE UPDATE OF status ON turn \
-                 WHEN NEW.id = 'turn_recovery_fault' AND NEW.status = 'failed' \
-                 BEGIN SELECT RAISE(ABORT, 'injected recovery terminal crash'); END;",
+                .expect("tool item should start");
+            let job = store
+                .enqueue_recovery_job(
+                    "turn_recovery_fault".to_owned(),
+                    "tool_recovery_fault".to_owned(),
+                    TurnItemType::WebFetch,
+                    None,
+                    RecoveryTrigger::Timeout,
+                    RecoveryAction::MarkFailed,
+                    Some("terminal recovery fault".to_owned()),
+                    None,
+                    None,
+                    None,
+                    1,
+                    1,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    1_700_000_002,
+                )
+                .await
+                .expect("recovery job should enqueue");
+            assert!(
+                store
+                    .mark_recovery_job_terminal(
+                        job.id.as_str(),
+                        RecoveryJobStatus::Failed,
+                        Some("terminal recovery fault".to_owned()),
+                        1_700_000_003,
+                    )
+                    .await
+                    .expect("terminal job should commit with outbox")
+            );
+            let first_claim = store
+                .claim_due_recovery_terminalizations(1_700_000_004, 5, 10)
+                .await
+                .expect("terminalization should claim");
+            assert_eq!(first_claim.len(), 1);
+            store
+                .connection
+                .execute_unprepared(
+                    "CREATE FUNCTION reject_recovery_turn_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected recovery terminal crash'; END $$; CREATE TRIGGER reject_recovery_turn_failure BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.id = 'turn_recovery_fault' AND NEW.status = 'failed') EXECUTE FUNCTION reject_recovery_turn_failure()",
+                )
+                .await
+                .expect("fault trigger should install");
+            assert!(
+                store
+                    .apply_claimed_recovery_terminalization(
+                        &first_claim[0],
+                        None,
+                        RecoveryTerminalCleanupPlan {
+                            runtime_generation: 1,
+                            runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                        },
+                        1_700_000_004,
+                    )
+                    .await
+                    .is_err()
+            );
+            let (_, running) = store
+                .get_turn("thr_recovery_terminal_fault", "turn_recovery_fault")
+                .await
+                .expect("turn lookup should succeed")
+                .expect("turn should exist");
+            assert_eq!(running.status, TurnStatus::InProgress);
+            let running_item = turn::find_turn_item(
+                &store.connection,
+                "turn_recovery_fault",
+                "tool_recovery_fault",
             )
             .await
-            .expect("fault trigger should install");
-        assert!(
+            .expect("tool item lookup should succeed")
+            .expect("tool item should exist");
+            let running_item: TurnItem = read_fixture_item(&store.connection, running_item)
+                .await
+                .expect("running item should decode");
+            assert_eq!(
+                tool_call_status(&running_item),
+                Some(ToolCallStatus::InProgress),
+                "item completion must roll back with Turn terminalization"
+            );
+
             store
+                .connection
+                .execute_unprepared("DROP TRIGGER reject_recovery_turn_failure ON turn")
+                .await
+                .expect("fault trigger should uninstall");
+            let restarted = CrudStore::new(store.database_connection());
+            let reclaimed = restarted
+                .claim_due_recovery_terminalizations(1_700_000_010, 5, 10)
+                .await
+                .expect("expired claim should be recovered after restart");
+            assert_eq!(reclaimed.len(), 1);
+            assert_ne!(reclaimed[0].claim_token, first_claim[0].claim_token);
+            use futures_util::FutureExt;
+            let database = restarted.database_connection();
+            let mut consumers = [
+                "projection",
+                "compaction",
+                "maintenance.zstd",
+                "maintenance.receipts",
+                "maintenance.native",
+            ]
+            .map(|domain| database.work_signal(domain).subscribe());
+            for consumer in &mut consumers {
+                consumer.begin_pass(&database).await.unwrap();
+            }
+            restarted
                 .apply_claimed_recovery_terminalization(
-                    &first_claim[0],
+                    &reclaimed[0],
                     None,
                     RecoveryTerminalCleanupPlan {
                         runtime_generation: 1,
                         runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
                     },
-                    1_700_000_004,
+                    1_700_000_010,
                 )
                 .await
-                .is_err()
-        );
-        let (_, running) = store
-            .get_turn("thr_recovery_terminal_fault", "turn_recovery_fault")
-            .await
-            .expect("turn lookup should succeed")
-            .expect("turn should exist");
-        assert_eq!(running.status, TurnStatus::InProgress);
-        let running_item = turn::find_turn_item(
-            &store.connection,
-            "turn_recovery_fault",
-            "tool_recovery_fault",
-        )
-        .await
-        .expect("tool item lookup should succeed")
-        .expect("tool item should exist");
-        let running_item: TurnItem = read_fixture_item(&store.connection, running_item)
-            .await
-            .expect("running item should decode");
-        assert_eq!(
-            tool_call_status(&running_item),
-            Some(ToolCallStatus::InProgress),
-            "item completion must roll back with Turn terminalization"
-        );
-
-        store
-            .connection
-            .execute_unprepared("DROP TRIGGER reject_recovery_turn_failure")
-            .await
-            .expect("fault trigger should uninstall");
-        let restarted = CrudStore::new(store.database_connection());
-        let reclaimed = restarted
-            .claim_due_recovery_terminalizations(1_700_000_010, 5, 10)
-            .await
-            .expect("expired claim should be recovered after restart");
-        assert_eq!(reclaimed.len(), 1);
-        assert_ne!(reclaimed[0].claim_token, first_claim[0].claim_token);
-        use futures_util::FutureExt;
-        let database = restarted.database_connection();
-        let mut consumers = [
-            "projection",
-            "compaction",
-            "maintenance.zstd",
-            "maintenance.receipts",
-            "maintenance.native",
-        ]
-        .map(|domain| database.work_signal(domain).subscribe());
-        for consumer in &mut consumers {
-            consumer.begin_pass(&database).await.unwrap();
-        }
-        restarted
-            .apply_claimed_recovery_terminalization(
-                &reclaimed[0],
-                None,
-                RecoveryTerminalCleanupPlan {
-                    runtime_generation: 1,
-                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
-                },
-                1_700_000_010,
-            )
-            .await
-            .expect("reclaimed terminalization should converge");
-        for consumer in &mut consumers {
-            assert!(
-                consumer.changed().now_or_never().is_some(),
-                "atomic recovery publisher wakes dependent owners after commit"
+                .expect("reclaimed terminalization should converge");
+            for consumer in &mut consumers {
+                assert!(
+                    consumer.changed().now_or_never().is_some(),
+                    "atomic recovery publisher wakes dependent owners after commit"
+                );
+            }
+            assert_eq!(
+                restarted
+                    .get_turn("thr_recovery_terminal_fault", "turn_recovery_fault")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::Failed
             );
-        }
-        assert_eq!(
-            restarted
-                .get_turn("thr_recovery_terminal_fault", "turn_recovery_fault")
-                .await
-                .unwrap()
-                .unwrap()
-                .1
-                .status,
-            TurnStatus::Failed
-        );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -46186,134 +46204,141 @@ mod tests {
 
     #[tokio::test]
     async fn superseded_terminalization_batch_has_constant_query_count() {
-        const BATCH_SIZE: usize = 64;
-        let workspace_id = "ws_recovery_batch_queries";
-        let (store, query_count) = test_store_with_workspace_and_query_counter(workspace_id).await;
+        pioneer_postgres_test::with_database(async |fixture| {
+            const BATCH_SIZE: usize = 64;
+            let workspace_id = "ws_recovery_batch_queries";
+            let (store, query_count) =
+                postgres_store_with_workspace_and_query_counter(fixture, workspace_id).await;
 
-        for index in 0..BATCH_SIZE {
-            let timestamp = 1_700_000_000 + i64::try_from(index).unwrap_or_default();
-            let thread_id = format!("thr_recovery_batch_{index}");
-            let turn_id = format!("turn_recovery_batch_{index}");
-            let thread = Thread {
-                context_window: None,
-                service_mode: None,
-                context_authority: None,
-                workspace_id: workspace_id.to_owned(),
-                id: thread_id.clone(),
-                name: None,
-                preview: String::new(),
-                preview_author: None,
-                mode: ThreadMode::Agent,
-                model: "gpt-5.4".to_owned(),
-                model_provider: "openai".to_owned(),
-                reasoning_effort: None,
-                created_at: timestamp,
-                updated_at: timestamp,
-                status: ThreadStatus::Active,
-                origin_kind: ThreadOriginKind::User,
-                sidebar_visibility: ThreadSidebarVisibility::Visible,
-                agent_nickname: None,
-                agent_role: None,
-                visibility: None,
-                turns: Vec::new(),
-            };
-            let mut turn = Turn {
-                work_owner: Default::default(),
-                id: turn_id.clone(),
-                status: TurnStatus::InProgress,
-                turn_kind: Default::default(),
-                origin: Default::default(),
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-            };
-            store
-                .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
-                .await
-                .expect("batch thread should persist");
-            store
-                .materialize_turn_start(
-                    &thread,
-                    SandboxMode::FullAccess,
-                    &turn,
-                    &[],
-                    pioneer_protocol::PersistedActorRef::System,
-                )
-                .await
-                .expect("batch Turn should persist");
-            turn.status = TurnStatus::Completed;
-            store
-                .materialize_turn_completed(
-                    TurnCompletedNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id,
-                        turn,
-                    },
-                    timestamp + 1,
-                )
-                .await
-                .expect("authoritative terminal Turn should persist");
-            let job = store
-                .enqueue_recovery_job(
-                    turn_id,
-                    format!("runtime:batch:{index}"),
-                    TurnItemType::Reasoning,
-                    None,
-                    RecoveryTrigger::RuntimeFailure,
-                    RecoveryAction::MarkFailed,
-                    Some("obsolete recovery".to_owned()),
-                    None,
-                    None,
-                    None,
-                    0,
-                    1,
-                    serde_json::json!({}),
-                    serde_json::json!({}),
-                    timestamp + 2,
-                )
-                .await
-                .expect("batch recovery should enqueue");
-            assert!(
+            for index in 0..BATCH_SIZE {
+                let timestamp = 1_700_000_000 + i64::try_from(index).unwrap_or_default();
+                let thread_id = format!("thr_recovery_batch_{index}");
+                let turn_id = format!("turn_recovery_batch_{index}");
+                let thread = Thread {
+                    context_window: None,
+                    service_mode: None,
+                    context_authority: None,
+                    workspace_id: workspace_id.to_owned(),
+                    id: thread_id.clone(),
+                    name: None,
+                    preview: String::new(),
+                    preview_author: None,
+                    mode: ThreadMode::Agent,
+                    model: "gpt-5.4".to_owned(),
+                    model_provider: "openai".to_owned(),
+                    reasoning_effort: None,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    status: ThreadStatus::Active,
+                    origin_kind: ThreadOriginKind::User,
+                    sidebar_visibility: ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                };
+                let mut turn = Turn {
+                    work_owner: Default::default(),
+                    id: turn_id.clone(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: Default::default(),
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                };
                 store
-                    .mark_recovery_job_terminal(
-                        job.id.as_str(),
-                        RecoveryJobStatus::Failed,
-                        Some("obsolete recovery".to_owned()),
-                        timestamp + 3,
+                    .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
+                    .await
+                    .expect("batch thread should persist");
+                store
+                    .materialize_turn_start(
+                        &thread,
+                        SandboxMode::FullAccess,
+                        &turn,
+                        &[],
+                        pioneer_protocol::PersistedActorRef::System,
                     )
                     .await
-                    .expect("batch recovery should become terminal")
-            );
-        }
+                    .expect("batch Turn should persist");
+                turn.status = TurnStatus::Completed;
+                store
+                    .materialize_turn_completed(
+                        TurnCompletedNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id,
+                            turn,
+                        },
+                        timestamp + 1,
+                    )
+                    .await
+                    .expect("authoritative terminal Turn should persist");
+                let job = store
+                    .enqueue_recovery_job(
+                        turn_id,
+                        format!("runtime:batch:{index}"),
+                        TurnItemType::Reasoning,
+                        None,
+                        RecoveryTrigger::RuntimeFailure,
+                        RecoveryAction::MarkFailed,
+                        Some("obsolete recovery".to_owned()),
+                        None,
+                        None,
+                        None,
+                        0,
+                        1,
+                        serde_json::json!({}),
+                        serde_json::json!({}),
+                        timestamp + 2,
+                    )
+                    .await
+                    .expect("batch recovery should enqueue");
+                assert!(
+                    store
+                        .mark_recovery_job_terminal(
+                            job.id.as_str(),
+                            RecoveryJobStatus::Failed,
+                            Some("obsolete recovery".to_owned()),
+                            timestamp + 3,
+                        )
+                        .await
+                        .expect("batch recovery should become terminal")
+                );
+            }
 
-        query_count.store(0, Ordering::Relaxed);
-        let claimed = store
-            .claim_due_recovery_terminalizations(1_700_001_000, 45, BATCH_SIZE as u64)
-            .await
-            .expect("full terminalization batch should claim");
-        assert_eq!(claimed.len(), BATCH_SIZE);
-        let classified = store
-            .classify_claimed_recovery_terminalization_batch(&claimed, 1_700_001_000)
-            .await
-            .expect("full terminalization batch should classify");
-        assert_eq!(classified.len(), BATCH_SIZE);
-        assert!(classified.iter().all(|(_, disposition)| matches!(
-            disposition,
-            RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
-                TurnStatus::Completed
-            )
-        )));
-        let measured = query_count.load(Ordering::Relaxed);
-        assert!(
-            measured <= 8,
-            "claiming and classifying {BATCH_SIZE} stale rows issued {measured} SQL statements"
-        );
+            query_count.store(0, Ordering::Relaxed);
+            let claimed = store
+                .claim_due_recovery_terminalizations(1_700_001_000, 45, BATCH_SIZE as u64)
+                .await
+                .expect("full terminalization batch should claim");
+            assert_eq!(claimed.len(), BATCH_SIZE);
+            let classified = store
+                .classify_claimed_recovery_terminalization_batch(&claimed, 1_700_001_000)
+                .await
+                .expect("full terminalization batch should classify");
+            assert_eq!(classified.len(), BATCH_SIZE);
+            assert!(classified.iter().all(|(_, disposition)| matches!(
+                disposition,
+                RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                    TurnStatus::Completed
+                )
+            )));
+            let measured = query_count.load(Ordering::Relaxed);
+            assert!(
+                measured <= 8,
+                "claiming and classifying {BATCH_SIZE} stale rows issued {measured} SQL statements"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -46536,7 +46561,11 @@ mod tests {
             pioneer_entity::turn_item::Entity::update_many()
                 .col_expr(
                     pioneer_entity::turn_item::Column::Payload,
-                    Expr::value("{retired-invalid-payload"),
+                    Expr::value(serde_json::json!({"retired_invalid_payload":true})),
+                )
+                .col_expr(
+                    pioneer_entity::turn_item::Column::PayloadPayloadId,
+                    Expr::value(Option::<String>::None),
                 )
                 .filter(pioneer_entity::turn_item::Column::TurnId.eq(turn_id.to_owned()))
                 .filter(pioneer_entity::turn_item::Column::ItemId.eq(item_id.to_owned()))
@@ -52319,71 +52348,77 @@ mod tests {
 
     #[tokio::test]
     async fn tree_task_activity_is_a_bounded_read_without_history_or_conversation_status() {
-        let (store, counter) = test_store_with_workspace_and_query_counter("ws_task").await;
-        let (store, mut thread, _) =
-            terminal_task_run_occurrence_fixture_with_store(store, None).await;
-        thread.status = ThreadStatus::Idle;
-        store
-            .upsert_thread_model(&thread, PersistedActorRef::System)
-            .await
-            .unwrap();
-        // The fixture's task has a legacy creating-turn reference. Make this
-        // background task thread-owned, without a foreground turn.
-        store
-            .connection
-            .execute_unprepared(
-                "UPDATE task SET created_by_turn_id=NULL; UPDATE task_run SET status='running'",
-            )
-            .await
-            .unwrap();
-        let principal = PrincipalId::new("P00000000000000000001").unwrap();
-        counter.store(0, Ordering::Relaxed);
-        let page = list_running_task_scopes(
-            &store.connection,
-            "ws_task",
-            &[thread.id.clone(), "missing-thread".into()],
-            &principal,
-            "",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            2,
-            "thin discovery and one bounded scope SELECT"
-        );
-        let filtered = list_running_task_scopes(
-            &store.connection,
-            "ws_task",
-            &["missing-thread".into()],
-            &principal,
-            "",
-        )
-        .await
-        .unwrap();
-        assert!(filtered.scopes.is_empty());
-        assert_eq!(
-            filtered.after_task_id, page.after_task_id,
-            "discovery must progress even when every scope is filtered"
-        );
-        assert_eq!(page.scopes.len(), 1);
-        assert_eq!(
-            page.scopes[0].0.root_thread_id.as_deref(),
-            Some(thread.id.as_str())
-        );
-        assert!(
-            list_running_task_scopes(
-                &store.with_maintenance_access().connection,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (store, counter) =
+                postgres_store_with_workspace_and_query_counter(fixture, "ws_task").await;
+            let (store, mut thread, _) =
+                terminal_task_run_occurrence_fixture_with_store(store, None).await;
+            thread.status = ThreadStatus::Idle;
+            store
+                .upsert_thread_model(&thread, PersistedActorRef::System)
+                .await
+                .unwrap();
+            // The fixture's task has a legacy creating-turn reference. Make this
+            // background task thread-owned, without a foreground turn.
+            store
+                .connection
+                .execute_unprepared(
+                    "UPDATE task SET created_by_turn_id=NULL; UPDATE task_run SET status='running'",
+                )
+                .await
+                .unwrap();
+            let principal = PrincipalId::new("P00000000000000000001").unwrap();
+            counter.store(0, Ordering::Relaxed);
+            let page = list_running_task_scopes(
+                &store.connection,
                 "ws_task",
-                &[thread.id],
+                &[thread.id.clone(), "missing-thread".into()],
                 &principal,
-                page.after_task_id.as_deref().unwrap()
+                "",
             )
             .await
-            .unwrap()
-            .scopes
-            .is_empty()
-        );
+            .unwrap();
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                2,
+                "thin discovery and one bounded scope SELECT"
+            );
+            let filtered = list_running_task_scopes(
+                &store.connection,
+                "ws_task",
+                &["missing-thread".into()],
+                &principal,
+                "",
+            )
+            .await
+            .unwrap();
+            assert!(filtered.scopes.is_empty());
+            assert_eq!(
+                filtered.after_task_id, page.after_task_id,
+                "discovery must progress even when every scope is filtered"
+            );
+            assert_eq!(page.scopes.len(), 1);
+            assert_eq!(
+                page.scopes[0].0.root_thread_id.as_deref(),
+                Some(thread.id.as_str())
+            );
+            assert!(
+                list_running_task_scopes(
+                    &store.with_maintenance_access().connection,
+                    "ws_task",
+                    &[thread.id],
+                    &principal,
+                    page.after_task_id.as_deref().unwrap()
+                )
+                .await
+                .unwrap()
+                .scopes
+                .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -52490,464 +52525,464 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_run_started_with_new_timestamp_is_noop_after_run_is_running() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let task = sample_task(timestamp);
-        let run = sample_task_run(timestamp);
-        store
-            .append_task_events(
-                vec![
-                    TaskEventPayload::TaskCreated { task: task.clone() },
-                    TaskEventPayload::RunCreated {
-                        run: run.clone(),
-                        agent_spec: None,
-                    },
-                ],
-                timestamp,
-            )
-            .await
-            .expect("task and run should persist");
-
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let task = sample_task(timestamp);
+            let run = sample_task_run(timestamp);
             store
-                .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 1,)
+                .append_task_events(
+                    vec![
+                        TaskEventPayload::TaskCreated { task: task.clone() },
+                        TaskEventPayload::RunCreated {
+                            run: run.clone(),
+                            agent_spec: None,
+                        },
+                    ],
+                    timestamp,
+                )
                 .await
-                .expect("first start should succeed")
-                .is_some()
-        );
-        assert!(
-            store
-                .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 2)
-                .await
-                .expect("recovery start after the run is already running should be a no-op")
-                .is_none()
-        );
+                .expect("task and run should persist");
 
-        let persisted = store
-            .get_task_run(run.id.as_str())
-            .await
-            .expect("run should load")
-            .expect("run should exist");
-        assert_eq!(persisted.status, TaskRunStatus::Running);
-        assert_eq!(persisted.started_at, Some(timestamp + 1));
-        let run_started_events = store
-            .get_task_events(task.id.as_str(), None)
-            .await
-            .expect("task events should list")
-            .events
-            .into_iter()
-            .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
-            .count();
-        assert_eq!(run_started_events, 1);
+            assert!(
+                store
+                    .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 1,)
+                    .await
+                    .expect("first start should succeed")
+                    .is_some()
+            );
+            assert!(
+                store
+                    .append_task_run_started_once(task.id.clone(), run.id.clone(), timestamp + 2)
+                    .await
+                    .expect("recovery start after the run is already running should be a no-op")
+                    .is_none()
+            );
+
+            let persisted = store
+                .get_task_run(run.id.as_str())
+                .await
+                .expect("run should load")
+                .expect("run should exist");
+            assert_eq!(persisted.status, TaskRunStatus::Running);
+            assert_eq!(persisted.started_at, Some(timestamp + 1));
+            let run_started_events = store
+                .get_task_events(task.id.as_str(), None)
+                .await
+                .expect("task events should list")
+                .events
+                .into_iter()
+                .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
+                .count();
+            assert_eq!(run_started_events, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn task_events_append_project_and_read_back_lifecycle_state() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let task = sample_task(timestamp);
-        let trigger = sample_task_trigger(timestamp);
-        let run = sample_task_run(timestamp);
-        let agent_spec = sample_task_agent_spec(timestamp);
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let task = sample_task(timestamp);
+            let trigger = sample_task_trigger(timestamp);
+            let run = sample_task_run(timestamp);
+            let agent_spec = sample_task_agent_spec(timestamp);
 
-        let created = store
-            .append_task_event(
-                TaskEventPayload::TaskCreated { task: task.clone() },
-                timestamp,
-            )
-            .await
-            .expect("task created event should append");
-        assert_eq!(created.sequence, 1);
+            let created = store
+                .append_task_event(
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    timestamp,
+                )
+                .await
+                .expect("task created event should append");
+            assert_eq!(created.sequence, 1);
 
-        let scheduled = store
-            .append_task_event(
-                TaskEventPayload::TriggerCreated {
-                    trigger: trigger.clone(),
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("trigger event should append");
-        assert_eq!(scheduled.sequence, 2);
+            let scheduled = store
+                .append_task_event(
+                    TaskEventPayload::TriggerCreated {
+                        trigger: trigger.clone(),
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("trigger event should append");
+            assert_eq!(scheduled.sequence, 2);
 
-        let run_created = store
-            .append_task_event(
-                TaskEventPayload::RunCreated {
-                    run: run.clone(),
-                    agent_spec: Some(agent_spec),
-                },
-                timestamp + 2,
-            )
-            .await
-            .expect("run created event should append");
-        assert_eq!(run_created.sequence, 3);
+            let run_created = store
+                .append_task_event(
+                    TaskEventPayload::RunCreated {
+                        run: run.clone(),
+                        agent_spec: Some(agent_spec),
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .expect("run created event should append");
+            assert_eq!(run_created.sequence, 3);
 
-        store
-            .append_task_event(
-                TaskEventPayload::RunStarted {
-                    task_id: task.id.clone(),
-                    run_id: run.id.clone(),
-                    started_at: timestamp + 3,
-                },
-                timestamp + 3,
-            )
-            .await
-            .expect("run started event should append");
+            store
+                .append_task_event(
+                    TaskEventPayload::RunStarted {
+                        task_id: task.id.clone(),
+                        run_id: run.id.clone(),
+                        started_at: timestamp + 3,
+                    },
+                    timestamp + 3,
+                )
+                .await
+                .expect("run started event should append");
 
-        store
-            .append_task_event(
-                TaskEventPayload::RunCompleted {
-                    task_id: task.id.clone(),
-                    run_id: run.id.clone(),
-                    result: Some(TaskResult {
-                        summary: Some("Clear".to_owned()),
-                        data: None,
-                        artifacts: Vec::new(),
-                        completed_by_run_id: Some(run.id.clone()),
-                    }),
-                    completed_at: timestamp + 4,
-                },
-                timestamp + 4,
-            )
-            .await
-            .expect("run completed event should append");
+            store
+                .append_task_event(
+                    TaskEventPayload::RunCompleted {
+                        task_id: task.id.clone(),
+                        run_id: run.id.clone(),
+                        result: Some(TaskResult {
+                            summary: Some("Clear".to_owned()),
+                            data: None,
+                            artifacts: Vec::new(),
+                            completed_by_run_id: Some(run.id.clone()),
+                        }),
+                        completed_at: timestamp + 4,
+                    },
+                    timestamp + 4,
+                )
+                .await
+                .expect("run completed event should append");
 
-        let completed = store
-            .append_task_event(
-                TaskEventPayload::TaskCompleted {
-                    task_id: task.id.clone(),
-                    result: Some(TaskResult {
-                        summary: Some("Clear".to_owned()),
-                        data: None,
-                        artifacts: Vec::new(),
-                        completed_by_run_id: Some(run.id.clone()),
-                    }),
-                    completed_at: timestamp + 5,
-                },
-                timestamp + 5,
-            )
-            .await
-            .expect("task completed event should append");
-        assert_eq!(completed.sequence, 6);
+            let completed = store
+                .append_task_event(
+                    TaskEventPayload::TaskCompleted {
+                        task_id: task.id.clone(),
+                        result: Some(TaskResult {
+                            summary: Some("Clear".to_owned()),
+                            data: None,
+                            artifacts: Vec::new(),
+                            completed_by_run_id: Some(run.id.clone()),
+                        }),
+                        completed_at: timestamp + 5,
+                    },
+                    timestamp + 5,
+                )
+                .await
+                .expect("task completed event should append");
+            assert_eq!(completed.sequence, 6);
 
-        let response = store
-            .get_task(task.id.as_str())
-            .await
-            .expect("task read should succeed")
-            .expect("task should exist");
-        assert_eq!(response.task.status, TaskStatus::Completed);
-        assert_eq!(
-            response
-                .task
-                .result
-                .as_ref()
-                .and_then(|result| result.summary.as_deref()),
-            Some("Clear")
-        );
-        assert_eq!(response.triggers.len(), 1);
-        assert_eq!(response.runs.len(), 1);
-        assert_eq!(response.runs[0].status, TaskRunStatus::Succeeded);
-        assert_eq!(response.agent_specs.len(), 1);
+            let response = store
+                .get_task(task.id.as_str())
+                .await
+                .expect("task read should succeed")
+                .expect("task should exist");
+            assert_eq!(response.task.status, TaskStatus::Completed);
+            assert_eq!(
+                response
+                    .task
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.summary.as_deref()),
+                Some("Clear")
+            );
+            assert_eq!(response.triggers.len(), 1);
+            assert_eq!(response.runs.len(), 1);
+            assert_eq!(response.runs[0].status, TaskRunStatus::Succeeded);
+            assert_eq!(response.agent_specs.len(), 1);
 
-        let events = store
-            .get_task_events(task.id.as_str(), None)
-            .await
-            .expect("task events read should succeed");
-        assert_eq!(events.last_sequence, 6);
-        assert_eq!(events.events.len(), 6);
+            let events = store
+                .get_task_events(task.id.as_str(), None)
+                .await
+                .expect("task events read should succeed");
+            assert_eq!(events.last_sequence, 6);
+            assert_eq!(events.events.len(), 6);
 
-        let duplicate = connection
-            .execute_unprepared(&format!(
-                "INSERT INTO task_event \
-                 (id, task_id, sequence, event_type, payload_json, created_at) \
-                 VALUES ('evt_duplicate_sequence', '{}', 1, 'task/created', '{{}}', CURRENT_TIMESTAMP)",
-                task.id
-            ))
-            .await;
-        assert!(
-            duplicate.is_err(),
-            "duplicate (task_id, sequence) must be rejected"
-        );
+            let duplicate = connection
+                .execute_unprepared(&format!(
+                    "INSERT INTO task_event \
+                     (id, task_id, sequence, event_type, payload_json, created_at) \
+                     VALUES ('evt_duplicate_sequence', '{}', 1, 'task/created', '{{}}', CURRENT_TIMESTAMP)",
+                    task.id
+                ))
+                .await;
+            assert!(
+                duplicate.is_err(),
+                "duplicate (task_id, sequence) must be rejected"
+            );
 
-        let duplicate_run_number = connection
-            .execute_unprepared(&format!(
-                "INSERT INTO task_run \
-                 (id, task_id, run_number, status, executor_kind) \
-                 VALUES ('run_duplicate_number', '{}', {}, 'queued', 'agent')",
-                task.id, run.run_number
-            ))
-            .await;
-        assert!(
-            duplicate_run_number.is_err(),
-            "duplicate (task_id, run_number) must be rejected"
-        );
+            let duplicate_run_number = connection
+                .execute_unprepared(&format!(
+                    "INSERT INTO task_run \
+                     (id, task_id, run_number, status, executor_kind) \
+                     VALUES ('run_duplicate_number', '{}', {}, 'queued', 'agent')",
+                    task.id, run.run_number
+                ))
+                .await;
+            assert!(
+                duplicate_run_number.is_err(),
+                "duplicate (task_id, run_number) must be rejected"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn task_blocked_projection_pauses_active_triggers_atomically() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let task = sample_task(timestamp);
-        let trigger = sample_task_trigger(timestamp);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let task = sample_task(timestamp);
+            let trigger = sample_task_trigger(timestamp);
 
-        store
-            .append_task_events(
-                vec![
-                    TaskEventPayload::TaskCreated { task: task.clone() },
-                    TaskEventPayload::TriggerCreated {
-                        trigger: trigger.clone(),
-                    },
-                ],
-                timestamp,
-            )
-            .await
-            .expect("task and trigger should project");
+            store
+                .append_task_events(
+                    vec![
+                        TaskEventPayload::TaskCreated { task: task.clone() },
+                        TaskEventPayload::TriggerCreated {
+                            trigger: trigger.clone(),
+                        },
+                    ],
+                    timestamp,
+                )
+                .await
+                .expect("task and trigger should project");
 
-        store
-            .append_task_event(
-                TaskEventPayload::TaskBlocked {
-                    task_id: task.id.clone(),
-                    error: None,
-                    blocked_at: timestamp + 1,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("task blocked event should project");
-
-        let blocked = store
-            .get_task(task.id.as_str())
-            .await
-            .expect("blocked task should load")
-            .expect("blocked task should exist");
-        assert_eq!(blocked.task.status, TaskStatus::Blocked);
-        assert_eq!(blocked.triggers.len(), 1);
-        assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
-        assert_eq!(blocked.triggers[0].next_fire_at, None);
-        assert_eq!(blocked.triggers[0].updated_at, timestamp + 1);
-    }
-
-    #[tokio::test]
-    async fn blocked_task_missing_admission_is_readmitted_with_resume_atomically() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let task = sample_task(timestamp);
-        let trigger = sample_task_trigger(timestamp);
-        store
-            .append_task_events(
-                vec![
-                    TaskEventPayload::TaskCreated { task: task.clone() },
-                    TaskEventPayload::TriggerCreated {
-                        trigger: trigger.clone(),
-                    },
+            store
+                .append_task_event(
                     TaskEventPayload::TaskBlocked {
                         task_id: task.id.clone(),
                         error: None,
                         blocked_at: timestamp + 1,
                     },
-                ],
-                timestamp,
-            )
-            .await
-            .expect("legacy task should block without an admission row");
-
-        let mut resumed_task = task.clone();
-        resumed_task.status = TaskStatus::Scheduled;
-        resumed_task.updated_at = timestamp + 2;
-        resumed_task.revision += 1;
-        let mut resumed_trigger = trigger;
-        resumed_trigger.status = TaskTriggerStatus::Active;
-        resumed_trigger.next_fire_at = Some(timestamp + 3600);
-        resumed_trigger.updated_at = timestamp + 2;
-        let ceilings = super::ExecutionQuotaCeilings {
-            per_principal: 10,
-            per_role: 10,
-            per_workspace: 10,
-            gateway: 10,
-        };
-        store
-            .append_task_events_with_execution_readmission(
-                vec![TaskEventPayload::TaskResumed {
-                    task: resumed_task,
-                    triggers: vec![resumed_trigger],
-                    reason: Some("permissions confirmed".to_owned()),
-                    resumed_at: timestamp + 2,
-                }],
-                timestamp + 2,
-                NewTaskExecutionAdmission {
-                    task_id: task.id.clone(),
-                    workspace_id: task.workspace_id.clone(),
-                    root_thread_id: "thr_task".to_owned(),
-                    initiating_principal_id: "principal_task".to_owned(),
-                    authorization_context_json: "{\"test\":true}".to_owned(),
-                    created_at: unix_to_datetime(timestamp + 2),
-                    execution_lease: Some(NewExecutionAdmissionLease {
-                        id: format!("quota:task:{}", task.id),
-                        subject_kind: "task".to_owned(),
-                        subject_id: task.id.clone(),
-                        operation_class: super::ExecutionAdmissionClass::ScheduledTask,
-                        principal_id: "principal_task".to_owned(),
-                        role_key: "test_role".to_owned(),
-                        workspace_id: task.workspace_id.clone(),
-                        policy_fingerprint: "test_policy".to_owned(),
-                        policy: super::ExecutionAdmissionQuotaPolicy {
-                            active: ceilings,
-                            queued: ceilings,
-                            scheduled: ceilings,
-                        },
-                    }),
-                },
-            )
-            .await
-            .expect("resume and missing admission insert should commit together");
-
-        let resumed = store
-            .get_task(task.id.as_str())
-            .await
-            .expect("resumed task should load")
-            .expect("resumed task should exist");
-        assert_eq!(resumed.task.status, TaskStatus::Scheduled);
-        assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
-        assert!(
-            store
-                .get_task_execution_admission(task.id.as_str())
+                    timestamp + 1,
+                )
                 .await
-                .expect("admission should query")
-                .is_some()
-        );
+                .expect("task blocked event should project");
+
+            let blocked = store
+                .get_task(task.id.as_str())
+                .await
+                .expect("blocked task should load")
+                .expect("blocked task should exist");
+            assert_eq!(blocked.task.status, TaskStatus::Blocked);
+            assert_eq!(blocked.triggers.len(), 1);
+            assert_eq!(blocked.triggers[0].status, TaskTriggerStatus::Paused);
+            assert_eq!(blocked.triggers[0].next_fire_at, None);
+            assert_eq!(blocked.triggers[0].updated_at, timestamp + 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_task_missing_admission_is_readmitted_with_resume_atomically() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let task = sample_task(timestamp);
+            let trigger = sample_task_trigger(timestamp);
+            store
+                .append_task_events(
+                    vec![
+                        TaskEventPayload::TaskCreated { task: task.clone() },
+                        TaskEventPayload::TriggerCreated {
+                            trigger: trigger.clone(),
+                        },
+                        TaskEventPayload::TaskBlocked {
+                            task_id: task.id.clone(),
+                            error: None,
+                            blocked_at: timestamp + 1,
+                        },
+                    ],
+                    timestamp,
+                )
+                .await
+                .expect("legacy task should block without an admission row");
+
+            let mut resumed_task = task.clone();
+            resumed_task.status = TaskStatus::Scheduled;
+            resumed_task.updated_at = timestamp + 2;
+            resumed_task.revision += 1;
+            let mut resumed_trigger = trigger;
+            resumed_trigger.status = TaskTriggerStatus::Active;
+            resumed_trigger.next_fire_at = Some(timestamp + 3600);
+            resumed_trigger.updated_at = timestamp + 2;
+            let ceilings = super::ExecutionQuotaCeilings {
+                per_principal: 10,
+                per_role: 10,
+                per_workspace: 10,
+                gateway: 10,
+            };
+            store
+                .append_task_events_with_execution_readmission(
+                    vec![TaskEventPayload::TaskResumed {
+                        task: resumed_task,
+                        triggers: vec![resumed_trigger],
+                        reason: Some("permissions confirmed".to_owned()),
+                        resumed_at: timestamp + 2,
+                    }],
+                    timestamp + 2,
+                    NewTaskExecutionAdmission {
+                        task_id: task.id.clone(),
+                        workspace_id: task.workspace_id.clone(),
+                        root_thread_id: "thr_task".to_owned(),
+                        initiating_principal_id: "principal_task".to_owned(),
+                        authorization_context_json: "{\"test\":true}".to_owned(),
+                        created_at: unix_to_datetime(timestamp + 2),
+                        execution_lease: Some(NewExecutionAdmissionLease {
+                            id: format!("quota:task:{}", task.id),
+                            subject_kind: "task".to_owned(),
+                            subject_id: task.id.clone(),
+                            operation_class: super::ExecutionAdmissionClass::ScheduledTask,
+                            principal_id: "principal_task".to_owned(),
+                            role_key: "test_role".to_owned(),
+                            workspace_id: task.workspace_id.clone(),
+                            policy_fingerprint: "test_policy".to_owned(),
+                            policy: super::ExecutionAdmissionQuotaPolicy {
+                                active: ceilings,
+                                queued: ceilings,
+                                scheduled: ceilings,
+                            },
+                        }),
+                    },
+                )
+                .await
+                .expect("resume and missing admission insert should commit together");
+
+            let resumed = store
+                .get_task(task.id.as_str())
+                .await
+                .expect("resumed task should load")
+                .expect("resumed task should exist");
+            assert_eq!(resumed.task.status, TaskStatus::Scheduled);
+            assert_eq!(resumed.triggers[0].status, TaskTriggerStatus::Active);
+            assert!(
+                store
+                    .get_task_execution_admission(task.id.as_str())
+                    .await
+                    .expect("admission should query")
+                    .is_some()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn task_event_fanout_cursor_is_durable_and_monotonic() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let task = sample_task(timestamp);
-        let created = store
-            .append_task_event(
-                TaskEventPayload::TaskCreated { task: task.clone() },
-                timestamp,
-            )
-            .await
-            .expect("task created event should append");
-        assert_eq!(
-            store
-                .get_task_event_fanout_cursor(task.id.as_str())
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let task = sample_task(timestamp);
+            let created = store
+                .append_task_event(
+                    TaskEventPayload::TaskCreated { task: task.clone() },
+                    timestamp,
+                )
                 .await
-                .expect("new task cursor should load"),
-            Some(0),
-            "the event transaction must establish a zero cursor before its first wake"
-        );
-        assert_eq!(
-            store
-                .due_task_event_fanout(i64::MAX, 64)
-                .await
-                .expect("durable fanout backlog should list")
-                .into_iter()
-                .map(|row| row.task_id)
-                .collect::<Vec<_>>(),
-            vec![task.id.clone()],
-            "an unacknowledged terminal/progress event must remain discoverable without a wake"
-        );
+                .expect("task created event should append");
+            assert_eq!(
+                store
+                    .get_task_event_fanout_cursor(task.id.as_str())
+                    .await
+                    .expect("new task cursor should load"),
+                Some(0),
+                "the event transaction must establish a zero cursor before its first wake"
+            );
+            assert_eq!(
+                store
+                    .due_task_event_fanout(i64::MAX, 64)
+                    .await
+                    .expect("durable fanout backlog should list")
+                    .into_iter()
+                    .map(|row| row.task_id)
+                    .collect::<Vec<_>>(),
+                vec![task.id.clone()],
+                "an unacknowledged terminal/progress event must remain discoverable without a wake"
+            );
 
-        store
-            .advance_task_event_fanout_cursor(task.id.as_str(), created.sequence)
-            .await
-            .expect("fanout cursor should persist");
-        assert_eq!(
             store
-                .get_task_event_fanout_cursor(task.id.as_str())
+                .advance_task_event_fanout_cursor(task.id.as_str(), created.sequence)
                 .await
-                .expect("persisted cursor should load"),
-            Some(created.sequence)
-        );
-        assert!(
-            store
-                .due_task_event_fanout(i64::MAX, 64)
-                .await
-                .expect("acknowledged fanout backlog should list")
-                .is_empty(),
-            "advancing the durable cursor must remove the task from replay backlog"
-        );
+                .expect("fanout cursor should persist");
+            assert_eq!(
+                store
+                    .get_task_event_fanout_cursor(task.id.as_str())
+                    .await
+                    .expect("persisted cursor should load"),
+                Some(created.sequence)
+            );
+            assert!(
+                store
+                    .due_task_event_fanout(i64::MAX, 64)
+                    .await
+                    .expect("acknowledged fanout backlog should list")
+                    .is_empty(),
+                "advancing the durable cursor must remove the task from replay backlog"
+            );
 
-        store
-            .advance_task_event_fanout_cursor(task.id.as_str(), 0)
-            .await
-            .expect("a stale writer should be harmless");
-        assert_eq!(
             store
-                .get_task_event_fanout_cursor(task.id.as_str())
+                .advance_task_event_fanout_cursor(task.id.as_str(), 0)
                 .await
-                .expect("cursor should remain monotonic"),
-            Some(created.sequence),
-            "an older concurrent writer must not move the durable cursor backwards"
-        );
+                .expect("a stale writer should be harmless");
+            assert_eq!(
+                store
+                    .get_task_event_fanout_cursor(task.id.as_str())
+                    .await
+                    .expect("cursor should remain monotonic"),
+                Some(created.sequence),
+                "an older concurrent writer must not move the durable cursor backwards"
+            );
 
-        pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task.id.clone())
-            .exec(&store.database_connection())
-            .await
-            .expect("legacy cursor fixture should delete");
-        let mut updated_task = task.clone();
-        updated_task.title = "Updated after cursor migration".to_owned();
-        updated_task.updated_at = timestamp + 1;
-        let updated = store
-            .append_task_event(
-                TaskEventPayload::TaskUpdated {
-                    task: updated_task,
-                    trigger: None,
-                    agent_spec: None,
-                    changed_fields: vec!["title".to_owned()],
-                    updated_at: timestamp + 1,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("a new event for a legacy task should append");
-        assert_eq!(
-            store
-                .get_task_event_fanout_cursor(task.id.as_str())
+            pioneer_entity::task_event_fanout_cursor::Entity::delete_by_id(task.id.clone())
+                .exec(&store.database_connection())
                 .await
-                .expect("legacy task cursor should initialize atomically"),
-            Some(0),
-            "the first post-upgrade event must remain pending for fanout while older events stay skipped"
-        );
-        store
-            .advance_task_event_fanout_cursor(task.id.as_str(), updated.sequence)
-            .await
-            .expect("new legacy task event should be acknowledged");
+                .expect("legacy cursor fixture should delete");
+            let mut updated_task = task.clone();
+            updated_task.title = "Updated after cursor migration".to_owned();
+            updated_task.updated_at = timestamp + 1;
+            let updated = store
+                .append_task_event(
+                    TaskEventPayload::TaskUpdated {
+                        task: updated_task,
+                        trigger: None,
+                        agent_spec: None,
+                        changed_fields: vec!["title".to_owned()],
+                        updated_at: timestamp + 1,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("a new event for a legacy task should append");
+            assert_eq!(
+                store
+                    .get_task_event_fanout_cursor(task.id.as_str())
+                    .await
+                    .expect("legacy task cursor should initialize atomically"),
+                Some(0),
+                "the first post-upgrade event must remain pending for fanout while older events stay skipped"
+            );
+            store
+                .advance_task_event_fanout_cursor(task.id.as_str(), updated.sequence)
+                .await
+                .expect("new legacy task event should be acknowledged");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn safe_web_fetch_item(item_id: &str) -> TurnItem {
@@ -53677,70 +53712,75 @@ mod tests {
 
     #[tokio::test]
     async fn episodic_direct_save_bookkeeping_failure_rolls_back_source_and_projection() {
-        let (store, thread, turn) = test_store_with_started_turn(
-            "ws_source_rollback",
-            "thr_source_rollback",
-            "turn_source_rollback",
-        )
-        .await;
-        let item = |text: &str| TurnItem::UserMessage {
-            id: "rollback_source".to_owned(),
-            text: text.to_owned(),
-            attachments: vec![],
-        };
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    item: item("before"),
-                },
-                1_700_000_010,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (store, thread, turn) = postgres_store_with_started_turn(fixture,
+                "ws_source_rollback",
+                "thr_source_rollback",
+                "turn_source_rollback",
             )
-            .await
-            .unwrap();
-        let before = store
-            .get_turn_item(&turn.id, "rollback_source")
-            .await
-            .unwrap()
-            .unwrap();
-        // Fault injection belongs only to this fixture; production guards remain intact.
-        store.connection.execute_unprepared("CREATE TRIGGER fail_episodic_job BEFORE INSERT ON thread_episodic_index_jobs BEGIN SELECT RAISE(ABORT, 'bookkeeping failure'); END").await.unwrap();
-        store
-            .materialize_item_snapshot_updated(
-                ItemUpdatedNotification {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    item: item("after"),
-                },
-                1_700_000_011,
-            )
-            .await
-            .expect_err("source and job must be one atomic write set");
-        assert_eq!(
+            .await;
+            let item = |text: &str| TurnItem::UserMessage {
+                id: "rollback_source".to_owned(),
+                text: text.to_owned(),
+                attachments: vec![],
+            };
             store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: item("before"),
+                    },
+                    1_700_000_010,
+                )
+                .await
+                .unwrap();
+            let before = store
                 .get_turn_item(&turn.id, "rollback_source")
                 .await
                 .unwrap()
-                .unwrap(),
-            before
-        );
-        assert!(
+                .unwrap();
+            // Fault injection belongs only to this fixture; production guards remain intact.
+            store.connection.execute_unprepared("CREATE FUNCTION fail_episodic_job() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'bookkeeping failure'; END $$; CREATE TRIGGER fail_episodic_job BEFORE INSERT ON thread_episodic_index_jobs FOR EACH ROW EXECUTE FUNCTION fail_episodic_job()").await.unwrap();
             store
-                .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: item("after"),
+                    },
+                    1_700_000_011,
+                )
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            store
-                .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+                .expect_err("source and job must be one atomic write set");
+            assert_eq!(
+                store
+                    .get_turn_item(&turn.id, "rollback_source")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert!(
+                store
+                    .list_thread_episodic_items_for_thread(&thread.workspace_id, &thread.id, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .list_thread_episodic_index_jobs_for_thread(&thread.workspace_id, &thread.id, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -55159,338 +55199,339 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_recovery_job_can_be_marked_active_and_retried() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let turn_id = "turn_recovery_budget";
+            let store = CrudStore::new(connection);
+            let turn_id = "turn_recovery_budget";
 
-        let job = store
-            .enqueue_recovery_job(
-                turn_id.to_owned(),
-                "reasoning_1".to_owned(),
-                TurnItemType::Reasoning,
-                None,
-                RecoveryTrigger::ProviderError,
-                RecoveryAction::Fallback,
-                Some("provider failed".to_owned()),
-                None,
-                None,
-                None,
-                0,
-                1,
-                serde_json::json!({}),
-                serde_json::json!({}),
-                1_700_000_000,
-            )
-            .await
-            .expect("job should enqueue");
-
-        let claimed = store
-            .claim_due_recovery_jobs(1_700_000_001, 45, 1)
-            .await
-            .expect("job should claim");
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].id, job.id);
-        let claim_token = claimed[0]
-            .claim_token
-            .as_deref()
-            .expect("claimed job should have claim token");
-        assert!(matches!(
-            store
-                .mark_claimed_recovery_job_active(
-                    job.id.as_str(),
-                    claim_token,
-                    "recovery_attempt_1",
-                    1_700_000_001,
-                )
-                .await
-                .expect("job should transition to active"),
-            ClaimedRecoveryActivation::Activated
-        ));
-        assert!(
-            store
-                .mark_recovery_job_retrying(
-                    job.id.as_str(),
-                    "recovery_attempt_1",
-                    1_700_000_010,
-                    None,
-                    Some("provider failed during recovery".to_owned()),
-                    1_700_000_002,
-                )
-                .await
-                .expect("active job should requeue")
-        );
-
-        let job = store
-            .get_recovery_job(job.id.as_str())
-            .await
-            .expect("job should reload")
-            .expect("job should exist");
-        assert_eq!(job.status, RecoveryJobStatus::Pending);
-        assert_eq!(job.run_count, 1);
-        assert_eq!(job.provider_attempt_number, 1);
-    }
-
-    #[tokio::test]
-    async fn unresolved_recovery_episode_rejects_duplicate_jobs_for_turn() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-
-        let store = CrudStore::new(connection);
-        let turn_id = "turn_single_active_recovery";
-
-        for index in 0..2 {
-            let enqueued = store
+            let job = store
                 .enqueue_recovery_job(
                     turn_id.to_owned(),
-                    format!("reasoning_{index}"),
+                    "reasoning_1".to_owned(),
                     TurnItemType::Reasoning,
                     None,
                     RecoveryTrigger::ProviderError,
-                    RecoveryAction::RetryWithBackoff,
+                    RecoveryAction::Fallback,
                     Some("provider failed".to_owned()),
                     None,
                     None,
                     None,
                     0,
-                    3,
+                    1,
                     serde_json::json!({}),
                     serde_json::json!({}),
                     1_700_000_000,
                 )
-                .await;
-            if index == 0 {
-                enqueued.expect("first recovery episode should enqueue");
-            } else {
-                let error = enqueued.expect_err("a second unresolved episode must be rejected");
-                assert!(
-                    format!("{error:#}").contains("UNIQUE constraint failed: recovery_job.turn_id")
-                );
-            }
-        }
-
-        let claimed = store
-            .claim_due_recovery_jobs(1_700_000_001, 45, 2)
-            .await
-            .expect("jobs should claim");
-        assert_eq!(claimed.len(), 1);
-
-        let first_token = claimed[0]
-            .claim_token
-            .as_deref()
-            .expect("first claimed job should have claim token");
-        assert!(matches!(
-            store
-                .mark_claimed_recovery_job_active(
-                    claimed[0].id.as_str(),
-                    first_token,
-                    "recovery_attempt_1",
-                    1_700_000_001,
-                )
                 .await
-                .expect("first job should activate"),
-            ClaimedRecoveryActivation::Activated
-        ));
-        let first = store
-            .get_recovery_job(claimed[0].id.as_str())
-            .await
-            .expect("job should reload")
-            .expect("job should exist");
-        assert_eq!(first.status, RecoveryJobStatus::Active);
-        assert_eq!(first.run_count, claimed[0].run_count);
-        assert!(first.claim_token.is_none());
-        assert_eq!(
-            first.active_attempt_id.as_deref(),
-            Some("recovery_attempt_1")
-        );
+                .expect("job should enqueue");
+
+            let claimed = store
+                .claim_due_recovery_jobs(1_700_000_001, 45, 1)
+                .await
+                .expect("job should claim");
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].id, job.id);
+            let claim_token = claimed[0]
+                .claim_token
+                .as_deref()
+                .expect("claimed job should have claim token");
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        job.id.as_str(),
+                        claim_token,
+                        "recovery_attempt_1",
+                        1_700_000_001,
+                    )
+                    .await
+                    .expect("job should transition to active"),
+                ClaimedRecoveryActivation::Activated
+            ));
+            assert!(
+                store
+                    .mark_recovery_job_retrying(
+                        job.id.as_str(),
+                        "recovery_attempt_1",
+                        1_700_000_010,
+                        None,
+                        Some("provider failed during recovery".to_owned()),
+                        1_700_000_002,
+                    )
+                    .await
+                    .expect("active job should requeue")
+            );
+
+            let job = store
+                .get_recovery_job(job.id.as_str())
+                .await
+                .expect("job should reload")
+                .expect("job should exist");
+            assert_eq!(job.status, RecoveryJobStatus::Pending);
+            assert_eq!(job.run_count, 1);
+            assert_eq!(job.provider_attempt_number, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_recovery_episode_rejects_duplicate_jobs_for_turn() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+
+            let store = CrudStore::new(connection);
+            let turn_id = "turn_single_active_recovery";
+
+            for index in 0..2 {
+                let enqueued = store
+                    .enqueue_recovery_job(
+                        turn_id.to_owned(),
+                        format!("reasoning_{index}"),
+                        TurnItemType::Reasoning,
+                        None,
+                        RecoveryTrigger::ProviderError,
+                        RecoveryAction::RetryWithBackoff,
+                        Some("provider failed".to_owned()),
+                        None,
+                        None,
+                        None,
+                        0,
+                        3,
+                        serde_json::json!({}),
+                        serde_json::json!({}),
+                        1_700_000_000,
+                    )
+                    .await;
+                if index == 0 {
+                    enqueued.expect("first recovery episode should enqueue");
+                } else {
+                    let error = enqueued.expect_err("a second unresolved episode must be rejected");
+                    assert!(
+                        format!("{error:#}")
+                            .contains("UNIQUE constraint failed: recovery_job.turn_id")
+                    );
+                }
+            }
+
+            let claimed = store
+                .claim_due_recovery_jobs(1_700_000_001, 45, 2)
+                .await
+                .expect("jobs should claim");
+            assert_eq!(claimed.len(), 1);
+
+            let first_token = claimed[0]
+                .claim_token
+                .as_deref()
+                .expect("first claimed job should have claim token");
+            assert!(matches!(
+                store
+                    .mark_claimed_recovery_job_active(
+                        claimed[0].id.as_str(),
+                        first_token,
+                        "recovery_attempt_1",
+                        1_700_000_001,
+                    )
+                    .await
+                    .expect("first job should activate"),
+                ClaimedRecoveryActivation::Activated
+            ));
+            let first = store
+                .get_recovery_job(claimed[0].id.as_str())
+                .await
+                .expect("job should reload")
+                .expect("job should exist");
+            assert_eq!(first.status, RecoveryJobStatus::Active);
+            assert_eq!(first.run_count, claimed[0].run_count);
+            assert!(first.claim_token.is_none());
+            assert_eq!(
+                first.active_attempt_id.as_deref(),
+                Some("recovery_attempt_1")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn tool_recovery_policy_snapshot_round_trips_through_items_and_history() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_tool_policy";
-        seed_observation_workspace(&store, workspace_id).await;
-        let thread_id = "thr_tool_policy";
-        let turn_id = "turn_tool_policy";
-        let item_id = "item_tool_policy";
-        let recovery_policy = sample_tool_recovery_policy();
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_tool_policy";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_tool_policy";
+            let turn_id = "turn_tool_policy";
+            let item_id = "item_tool_policy";
+            let recovery_policy = sample_tool_recovery_policy();
 
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: turn_id.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
 
-        let started_item = TurnItem::WebFetch {
-            id: item_id.to_owned(),
-            tool_name: "web_fetch".to_owned(),
-            arguments: serde_json::json!({"url": "https://example.com"}),
-            status: ToolCallStatus::InProgress,
-            recovery_policy: Some(recovery_policy.clone()),
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(serde_json::json!({
-                    "url": "https://example.com"
-                })),
-            },
-            recovery: None,
-            url: Some("https://example.com".to_owned()),
-            final_url: None,
-            status_code: None,
-            content_type: None,
-            extract_mode: None,
-            resolved_mode: None,
-            bytes_received: None,
-            elapsed_ms: None,
-            truncated: None,
-            title: None,
-            word_count: None,
-            links: Vec::new(),
-            success: None,
-            outcome: None,
-            observation: None,
-        };
-        let mut completed_item = started_item.clone();
-        if let TurnItem::WebFetch {
-            status, success, ..
-        } = &mut completed_item
-        {
-            *status = ToolCallStatus::Completed;
-            *success = Some(true);
-        }
-
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: started_item,
+            let started_item = TurnItem::WebFetch {
+                id: item_id.to_owned(),
+                tool_name: "web_fetch".to_owned(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+                status: ToolCallStatus::InProgress,
+                recovery_policy: Some(recovery_policy.clone()),
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Metadata {
+                    metadata: ToolMetadata::from_json(serde_json::json!({
+                        "url": "https://example.com"
+                    })),
                 },
-                timestamp + 1,
-            )
-            .await
-            .expect("item started should persist");
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: completed_item,
-                },
-                timestamp + 2,
-            )
-            .await
-            .expect("item completed should persist");
+                recovery: None,
+                url: Some("https://example.com".to_owned()),
+                final_url: None,
+                status_code: None,
+                content_type: None,
+                extract_mode: None,
+                resolved_mode: None,
+                bytes_received: None,
+                elapsed_ms: None,
+                truncated: None,
+                title: None,
+                word_count: None,
+                links: Vec::new(),
+                success: None,
+                outcome: None,
+                observation: None,
+            };
+            let mut completed_item = started_item.clone();
+            if let TurnItem::WebFetch {
+                status, success, ..
+            } = &mut completed_item
+            {
+                *status = ToolCallStatus::Completed;
+                *success = Some(true);
+            }
 
-        let stored_item = store
-            .get_turn_item(turn_id, item_id)
-            .await
-            .expect("item lookup should succeed")
-            .expect("item should exist");
-        assert_eq!(stored_item.recovery_policy(), Some(&recovery_policy));
-        if let TurnItem::WebFetch { output_policy, .. } = stored_item {
-            assert_eq!(
-                output_policy,
-                ToolOutputPolicySnapshot::for_tool_name("web_fetch")
-            );
-        } else {
-            panic!("expected web_fetch item");
-        }
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: started_item,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("item started should persist");
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: completed_item,
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .expect("item completed should persist");
 
-        let turn_items = store
-            .get_turn_item_events(thread_id, turn_id)
-            .await
-            .expect("turn items query should succeed")
-            .expect("turn items should exist");
-        let item_events_have_snapshot = turn_items.events.iter().filter(|event| {
-            matches!(
-                &event.payload,
-                TurnItemEventPayload::ItemStarted { item, .. }
-                    | TurnItemEventPayload::ItemCompleted { item, .. }
-                        if item.recovery_policy() == Some(&recovery_policy)
-            )
-        });
-        assert_eq!(item_events_have_snapshot.count(), 2);
+            let stored_item = store
+                .get_turn_item(turn_id, item_id)
+                .await
+                .expect("item lookup should succeed")
+                .expect("item should exist");
+            assert_eq!(stored_item.recovery_policy(), Some(&recovery_policy));
+            if let TurnItem::WebFetch { output_policy, .. } = stored_item {
+                assert_eq!(
+                    output_policy,
+                    ToolOutputPolicySnapshot::for_tool_name("web_fetch")
+                );
+            } else {
+                panic!("expected web_fetch item");
+            }
 
-        let history = store
-            .get_thread_history(thread_id, Some(16))
-            .await
-            .expect("thread history query should succeed")
-            .expect("thread history should exist");
-        let history_events_have_snapshot = history.events.iter().filter(|event| {
-            matches!(
-                &event.payload,
-                ThreadHistoryEventPayload::ItemStarted { item, .. }
-                    | ThreadHistoryEventPayload::ItemCompleted { item, .. }
-                        if item.recovery_policy() == Some(&recovery_policy)
-            )
-        });
-        assert_eq!(history_events_have_snapshot.count(), 2);
+            let turn_items = store
+                .get_turn_item_events(thread_id, turn_id)
+                .await
+                .expect("turn items query should succeed")
+                .expect("turn items should exist");
+            let item_events_have_snapshot = turn_items.events.iter().filter(|event| {
+                matches!(
+                    &event.payload,
+                    TurnItemEventPayload::ItemStarted { item, .. }
+                        | TurnItemEventPayload::ItemCompleted { item, .. }
+                            if item.recovery_policy() == Some(&recovery_policy)
+                )
+            });
+            assert_eq!(item_events_have_snapshot.count(), 2);
+
+            let history = store
+                .get_thread_history(thread_id, Some(16))
+                .await
+                .expect("thread history query should succeed")
+                .expect("thread history should exist");
+            let history_events_have_snapshot = history.events.iter().filter(|event| {
+                matches!(
+                    &event.payload,
+                    ThreadHistoryEventPayload::ItemStarted { item, .. }
+                        | ThreadHistoryEventPayload::ItemCompleted { item, .. }
+                            if item.recovery_policy() == Some(&recovery_policy)
+                )
+            });
+            assert_eq!(history_events_have_snapshot.count(), 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -55743,10 +55784,10 @@ mod tests {
             .unwrap();
         let db = store.database_connection();
         db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('stop-task',?1,'workspace',?1,'system','running','Stop task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.into()])).await.unwrap();
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('stop-task',$1,'workspace',$1,'system','running','Stop task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.into()])).await.unwrap();
         db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at) VALUES('stop-run','stop-task','stop-run',1,1,'running','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
         db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('stop-binding','stop-task','stop-run',?,?,'initial',0,0,'in_progress',CURRENT_TIMESTAMP)", [thread_id.into(),turn_id.into()])).await.unwrap();
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('stop-binding','stop-task','stop-run',$1,$2,'initial',0,0,'in_progress',CURRENT_TIMESTAMP)", [thread_id.into(),turn_id.into()])).await.unwrap();
         let mut turn = store.get_turn(thread_id, turn_id).await.unwrap().unwrap().1;
         turn.status = TurnStatus::Interrupted;
         turn.error = Some("cancel with pending heartbeat writer".to_owned());
@@ -56700,7 +56741,7 @@ mod tests {
                 if corrupt_context {
                     update = update.col_expr(
                         pioneer_entity::turn_event_projection_state::Column::ProjectionContextJson,
-                        sea_orm::sea_query::Expr::value("{"),
+                        sea_orm::sea_query::Expr::value("[]"),
                     );
                 }
                 update
@@ -56945,258 +56986,258 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_storage_rejects_tool_payload_policy_shape_violations() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_raw_payload";
-        seed_observation_workspace(&store, workspace_id).await;
-        let thread_id = "thr_raw_payload";
-        let turn_id = "turn_raw_payload";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_raw_payload";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_raw_payload";
+            let turn_id = "turn_raw_payload";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
 
-        let non_shell_shell_storage_item = TurnItem::DynamicToolCall {
-            id: "item_shell_storage".to_owned(),
-            tool_name: "read_file".to_owned(),
-            arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Shell {
-                stdout: Some("not allowed".to_owned()),
-                stderr: None,
-                aggregated_output: Some("not allowed".to_owned()),
-                exit_code: Some(0),
-                duration_ms: None,
-                timed_out: None,
-                truncated: false,
-            },
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        let error = store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: non_shell_shell_storage_item,
+            let non_shell_shell_storage_item = TurnItem::DynamicToolCall {
+                id: "item_shell_storage".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Shell {
+                    stdout: Some("not allowed".to_owned()),
+                    stderr: None,
+                    aggregated_output: Some("not allowed".to_owned()),
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    timed_out: None,
+                    truncated: false,
                 },
-                timestamp + 1,
-            )
-            .await
-            .expect_err("non-shell shell storage should be rejected");
-        assert!(format!("{error:#}").contains("storage payload must be metadata-only"));
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            };
+            let error = store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: non_shell_shell_storage_item,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect_err("non-shell shell storage should be rejected");
+            assert!(format!("{error:#}").contains("storage payload must be metadata-only"));
 
-        let metadata_only_summary_storage_item = TurnItem::DynamicToolCall {
-            id: "item_summary_storage".to_owned(),
-            tool_name: "read_skill".to_owned(),
-            arguments: serde_json::json!({"slug": "secret-skill"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("read_skill"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Summary(pioneer_protocol::ToolOutputSummary {
-                title: "read_skill completed".to_owned(),
-                lines: vec!["not allowed by metadata-only storage policy".to_owned()],
-                metadata: ToolMetadata::empty(),
-                truncated: false,
-            }),
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        let error = store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: metadata_only_summary_storage_item,
-                },
-                timestamp + 2,
-            )
-            .await
-            .expect_err("summary storage should be rejected for metadata-only policy");
-        assert!(format!("{error:#}").contains("storage payload must be metadata-only"));
+            let metadata_only_summary_storage_item = TurnItem::DynamicToolCall {
+                id: "item_summary_storage".to_owned(),
+                tool_name: "read_skill".to_owned(),
+                arguments: serde_json::json!({"slug": "secret-skill"}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("read_skill"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Summary(pioneer_protocol::ToolOutputSummary {
+                    title: "read_skill completed".to_owned(),
+                    lines: vec!["not allowed by metadata-only storage policy".to_owned()],
+                    metadata: ToolMetadata::empty(),
+                    truncated: false,
+                }),
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            };
+            let error = store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: metadata_only_summary_storage_item,
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .expect_err("summary storage should be rejected for metadata-only policy");
+            assert!(format!("{error:#}").contains("storage payload must be metadata-only"));
 
-        let external_mcp_summary = pioneer_protocol::ToolOutputSummary {
-            title: "Tool: mcp:Resend/send-email".to_owned(),
-            lines: vec!["Sending email".to_owned()],
-            metadata: ToolMetadata::from_json(serde_json::json!({
-                "server": "Resend",
-                "tool": "send-email",
-                "arguments": {
-                    "to": "alexander.oskin@gmail.com"
-                }
-            })),
-            truncated: false,
-        };
-        let external_mcp_item = TurnItem::DynamicToolCall {
-            id: "item_external_mcp".to_owned(),
-            tool_name: "mcp:Resend/send-email".to_owned(),
-            arguments: serde_json::json!({"to": "alexander.oskin@gmail.com"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name(
-                "mcp:Resend/send-email",
-            ),
-            display: ToolDisplayPayload::Summary(external_mcp_summary.clone()),
-            storage: ToolStoragePayload::Metadata {
-                metadata: external_mcp_summary.metadata.clone(),
-            },
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: external_mcp_item,
-                },
-                timestamp + 3,
-            )
-            .await
-            .expect("external runtime MCP metadata storage should be accepted");
-
-        let retained_llm_context_item = TurnItem::DynamicToolCall {
-            id: "item_llm_context".to_owned(),
-            tool_name: "read_file".to_owned(),
-            arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
-            status: ToolCallStatus::Completed,
-            recovery_policy: None,
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Metadata {
+            let external_mcp_summary = pioneer_protocol::ToolOutputSummary {
+                title: "Tool: mcp:Resend/send-email".to_owned(),
+                lines: vec!["Sending email".to_owned()],
                 metadata: ToolMetadata::from_json(serde_json::json!({
-                    "llmView": {
-                        "kind": "json",
-                        "value": "not allowed in permanent storage"
+                    "server": "Resend",
+                    "tool": "send-email",
+                    "arguments": {
+                        "to": "alexander.oskin@gmail.com"
                     }
                 })),
-            },
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        let error = store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: retained_llm_context_item,
+                truncated: false,
+            };
+            let external_mcp_item = TurnItem::DynamicToolCall {
+                id: "item_external_mcp".to_owned(),
+                tool_name: "mcp:Resend/send-email".to_owned(),
+                arguments: serde_json::json!({"to": "alexander.oskin@gmail.com"}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+                output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name(
+                    "mcp:Resend/send-email",
+                ),
+                display: ToolDisplayPayload::Summary(external_mcp_summary.clone()),
+                storage: ToolStoragePayload::Metadata {
+                    metadata: external_mcp_summary.metadata.clone(),
                 },
-                timestamp + 4,
-            )
-            .await
-            .expect_err("retained llm context should be rejected");
-        assert!(format!("{error:#}").contains("retained llm context key `llmView`"));
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            };
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: external_mcp_item,
+                    },
+                    timestamp + 3,
+                )
+                .await
+                .expect("external runtime MCP metadata storage should be accepted");
+
+            let retained_llm_context_item = TurnItem::DynamicToolCall {
+                id: "item_llm_context".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({"path": "/tmp/secret.txt"}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("read_file"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Metadata {
+                    metadata: ToolMetadata::from_json(serde_json::json!({
+                        "llmView": {
+                            "kind": "json",
+                            "value": "not allowed in permanent storage"
+                        }
+                    })),
+                },
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            };
+            let error = store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: retained_llm_context_item,
+                    },
+                    timestamp + 4,
+                )
+                .await
+                .expect_err("retained llm context should be rejected");
+            assert!(format!("{error:#}").contains("retained llm context key `llmView`"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn item_completed_rejects_terminal_tool_payload_still_in_progress() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_terminal_payload";
-        let thread_id = "thr_terminal_payload";
-        let turn_id = "turn_terminal_payload";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_terminal_payload";
+            let thread_id = "thr_terminal_payload";
+            let turn_id = "turn_terminal_payload";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
 
-        let stuck_tool_item = TurnItem::WebFetch {
-            id: "item_stuck_tool".to_owned(),
-            tool_name: "web_fetch".to_owned(),
-            arguments: serde_json::json!({"url": "https://example.com"}),
-            status: ToolCallStatus::InProgress,
-            recovery_policy: None,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::from_json(serde_json::json!({
-                    "url": "https://example.com"
-                })),
-            },
-            recovery: None,
-            url: Some("https://example.com".to_owned()),
-            final_url: None,
-            status_code: None,
-            content_type: None,
-            extract_mode: None,
-            resolved_mode: None,
-            bytes_received: None,
-            elapsed_ms: None,
-            truncated: None,
-            title: None,
-            word_count: None,
-            links: Vec::new(),
-            success: None,
-            outcome: None,
-            observation: None,
-        };
-
-        let error = store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: stuck_tool_item,
+            let stuck_tool_item = TurnItem::WebFetch {
+                id: "item_stuck_tool".to_owned(),
+                tool_name: "web_fetch".to_owned(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+                status: ToolCallStatus::InProgress,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Metadata {
+                    metadata: ToolMetadata::from_json(serde_json::json!({
+                        "url": "https://example.com"
+                    })),
                 },
-                timestamp + 1,
-            )
-            .await
-            .expect_err("terminal item completion must reject active tool payload");
+                recovery: None,
+                url: Some("https://example.com".to_owned()),
+                final_url: None,
+                status_code: None,
+                content_type: None,
+                extract_mode: None,
+                resolved_mode: None,
+                bytes_received: None,
+                elapsed_ms: None,
+                truncated: None,
+                title: None,
+                word_count: None,
+                links: Vec::new(),
+                success: None,
+                outcome: None,
+                observation: None,
+            };
 
-        assert!(format!("{error:#}").contains("cannot remain in_progress"));
+            let error = store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: stuck_tool_item,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect_err("terminal item completion must reject active tool payload");
+
+            assert!(format!("{error:#}").contains("cannot remain in_progress"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -57487,431 +57528,432 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_transition_rejects_candidate_stale_after_heartbeat() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_timeout_stale_candidate";
-        seed_observation_workspace(&store, workspace_id).await;
-        let thread_id = "thr_timeout_stale_candidate";
-        let turn_id = "turn_timeout_stale_candidate";
-        let item_id = "item_timeout_stale_candidate";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_timeout_stale_candidate";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_timeout_stale_candidate";
+            let turn_id = "turn_timeout_stale_candidate";
+            let item_id = "item_timeout_stale_candidate";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: safe_web_fetch_item(item_id),
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("item start should persist");
-        store
-            .configure_turn_item_attempt_deadlines(
-                turn_id,
-                item_id,
-                timestamp + 1,
-                Some(timestamp + 2),
-                Some(timestamp + 2),
-                Some(timestamp + 2),
-            )
-            .await
-            .expect("expired deadlines should be configured");
-
-        let candidates = store
-            .list_timeout_candidates(timestamp + 3, 8)
-            .await
-            .expect("timeout candidate list should succeed");
-        assert_eq!(candidates.len(), 1);
-
-        assert!(
             store
-                .heartbeat_turn_item_attempt(
-                    turn_id,
-                    item_id,
-                    TurnItemType::WebFetch,
-                    timestamp + 3,
-                    Some(timestamp + 103),
-                    Some(timestamp + 103),
-                    Some(timestamp + 103),
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
                 )
                 .await
-                .expect("heartbeat should move every deadline")
-        );
-        assert!(
-            !store
-                .transition_timeout_candidate(&candidates[0], timestamp + 3)
+                .expect("turn start should persist");
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: safe_web_fetch_item(item_id),
+                    },
+                    timestamp + 1,
+                )
                 .await
-                .expect("stale timeout transition should be rejected"),
-            "a timeout candidate must not survive a newer heartbeat frontier"
-        );
+                .expect("item start should persist");
+            store
+                .configure_turn_item_attempt_deadlines(
+                    turn_id,
+                    item_id,
+                    timestamp + 1,
+                    Some(timestamp + 2),
+                    Some(timestamp + 2),
+                    Some(timestamp + 2),
+                )
+                .await
+                .expect("expired deadlines should be configured");
 
-        let row = crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
-            .await
-            .expect("turn_item lookup should succeed")
-            .expect("turn_item row should exist");
-        assert_eq!(row.status.as_deref(), Some("in_progress"));
-        assert_eq!(row.active_attempt_status.as_deref(), Some("running"));
-        let payload: TurnItem = read_fixture_item(&store.connection, row)
-            .await
-            .expect("payload should decode");
-        assert!(matches!(
-            payload,
-            TurnItem::WebFetch {
-                status: ToolCallStatus::InProgress,
-                ..
-            }
-        ));
+            let candidates = store
+                .list_timeout_candidates(timestamp + 3, 8)
+                .await
+                .expect("timeout candidate list should succeed");
+            assert_eq!(candidates.len(), 1);
+
+            assert!(
+                store
+                    .heartbeat_turn_item_attempt(
+                        turn_id,
+                        item_id,
+                        TurnItemType::WebFetch,
+                        timestamp + 3,
+                        Some(timestamp + 103),
+                        Some(timestamp + 103),
+                        Some(timestamp + 103),
+                    )
+                    .await
+                    .expect("heartbeat should move every deadline")
+            );
+            assert!(
+                !store
+                    .transition_timeout_candidate(&candidates[0], timestamp + 3)
+                    .await
+                    .expect("stale timeout transition should be rejected"),
+                "a timeout candidate must not survive a newer heartbeat frontier"
+            );
+
+            let row =
+                crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
+                    .await
+                    .expect("turn_item lookup should succeed")
+                    .expect("turn_item row should exist");
+            assert_eq!(row.status.as_deref(), Some("in_progress"));
+            assert_eq!(row.active_attempt_status.as_deref(), Some("running"));
+            let payload: TurnItem = read_fixture_item(&store.connection, row)
+                .await
+                .expect("payload should decode");
+            assert!(matches!(
+                payload,
+                TurnItem::WebFetch {
+                    status: ToolCallStatus::InProgress,
+                    ..
+                }
+            ));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn turn_liveness_tracks_latest_activity_and_attempt_start_sequence() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_turn_liveness";
-        seed_observation_workspace(&store, workspace_id).await;
-        let thread_id = "thr_turn_liveness";
-        let turn_id = "turn_turn_liveness";
-        let stale_item_id = "reasoning_stale_liveness";
-        let later_item_id = "agent_message_liveness";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_turn_liveness";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_turn_liveness";
+            let turn_id = "turn_turn_liveness";
+            let stale_item_id = "reasoning_stale_liveness";
+            let later_item_id = "agent_message_liveness";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::Reasoning {
-                        id: stale_item_id.to_owned(),
-                        summary: Vec::new(),
-                        content: Vec::new(),
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::Reasoning {
+                            id: stale_item_id.to_owned(),
+                            summary: Vec::new(),
+                            content: Vec::new(),
+                        },
                     },
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("stale item start should persist");
-        store
-            .configure_turn_item_attempt_deadlines(
-                turn_id,
-                stale_item_id,
-                timestamp + 1,
-                Some(timestamp + 2),
-                Some(timestamp + 2),
-                Some(timestamp + 2),
-            )
-            .await
-            .expect("deadlines should be configured");
+                    timestamp + 1,
+                )
+                .await
+                .expect("stale item start should persist");
+            store
+                .configure_turn_item_attempt_deadlines(
+                    turn_id,
+                    stale_item_id,
+                    timestamp + 1,
+                    Some(timestamp + 2),
+                    Some(timestamp + 2),
+                    Some(timestamp + 2),
+                )
+                .await
+                .expect("deadlines should be configured");
 
-        let later_item = TurnItem::AgentMessage {
-            id: later_item_id.to_owned(),
-            text: "still working".to_owned(),
-            phase: AgentMessagePhase::FinalAnswer,
-            markdown: None,
-            markdown_version: None,
-        };
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: later_item.clone(),
-                },
-                timestamp + 10,
-            )
-            .await
-            .expect("later item start should persist");
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: later_item,
-                },
-                timestamp + 11,
-            )
-            .await
-            .expect("later item completion should persist");
+            let later_item = TurnItem::AgentMessage {
+                id: later_item_id.to_owned(),
+                text: "still working".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            };
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: later_item.clone(),
+                    },
+                    timestamp + 10,
+                )
+                .await
+                .expect("later item start should persist");
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: later_item,
+                    },
+                    timestamp + 11,
+                )
+                .await
+                .expect("later item completion should persist");
 
-        let liveness = store
-            .get_turn_liveness(turn_id)
-            .await
-            .expect("liveness query should succeed")
-            .expect("liveness row should exist");
-        assert_eq!(liveness.turn_id, turn_id);
-        assert_eq!(liveness.thread_id, thread_id);
-        assert_eq!(liveness.last_activity_sequence, 4);
-        assert_eq!(liveness.last_activity_kind, "item/completed");
-        assert_eq!(
-            liveness.last_activity_item_id.as_deref(),
-            Some(later_item_id)
-        );
-        assert_eq!(
-            liveness.last_activity_item_type.as_deref(),
-            Some("agent_message")
-        );
-        assert_eq!(liveness.last_activity_at_unix, timestamp + 11);
+            let liveness = store
+                .get_turn_liveness(turn_id)
+                .await
+                .expect("liveness query should succeed")
+                .expect("liveness row should exist");
+            assert_eq!(liveness.turn_id, turn_id);
+            assert_eq!(liveness.thread_id, thread_id);
+            assert_eq!(liveness.last_activity_sequence, 4);
+            assert_eq!(liveness.last_activity_kind, "item/completed");
+            assert_eq!(
+                liveness.last_activity_item_id.as_deref(),
+                Some(later_item_id)
+            );
+            assert_eq!(
+                liveness.last_activity_item_type.as_deref(),
+                Some("agent_message")
+            );
+            assert_eq!(liveness.last_activity_at_unix, timestamp + 11);
 
-        let candidates = store
-            .list_timeout_candidates(timestamp + 12, 8)
-            .await
-            .expect("timeout candidate list should succeed");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].item_id, stale_item_id);
-        assert_eq!(candidates[0].started_event_sequence, Some(2));
-        assert_eq!(candidates[0].last_heartbeat_at_unix, Some(timestamp + 1));
+            let candidates = store
+                .list_timeout_candidates(timestamp + 12, 8)
+                .await
+                .expect("timeout candidate list should succeed");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].item_id, stale_item_id);
+            assert_eq!(candidates[0].started_event_sequence, Some(2));
+            assert_eq!(candidates[0].last_heartbeat_at_unix, Some(timestamp + 1));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn turn_liveness_tracks_confirmed_external_activity_without_new_turn_event() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_turn_liveness_heartbeat";
-        let thread_id = "thr_turn_liveness_heartbeat";
-        let turn_id = "turn_turn_liveness_heartbeat";
-        let item_id = "reasoning_heartbeat_liveness";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_turn_liveness_heartbeat";
+            let thread_id = "thr_turn_liveness_heartbeat";
+            let turn_id = "turn_turn_liveness_heartbeat";
+            let item_id = "reasoning_heartbeat_liveness";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        seed_observation_workspace(&store, &thread.workspace_id).await;
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: TurnItem::Reasoning {
-                        id: item_id.to_owned(),
-                        summary: Vec::new(),
-                        content: Vec::new(),
-                    },
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("item start should persist");
-
-        assert!(
+            seed_observation_workspace(&store, &thread.workspace_id).await;
             store
-                .heartbeat_turn_item_attempt_with_activity_kind(
-                    turn_id,
-                    item_id,
-                    TurnItemType::Reasoning,
-                    timestamp + 5,
-                    Some(timestamp + 905),
-                    Some(timestamp + 905),
-                    None,
-                    "item/confirmed_external_activity",
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
                 )
                 .await
-                .expect("heartbeat should persist")
-        );
+                .expect("turn start should persist");
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::Reasoning {
+                            id: item_id.to_owned(),
+                            summary: Vec::new(),
+                            content: Vec::new(),
+                        },
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("item start should persist");
 
-        let liveness = store
-            .get_turn_liveness(turn_id)
-            .await
-            .expect("liveness query should succeed")
-            .expect("liveness row should exist");
-        assert_eq!(liveness.last_activity_sequence, 2);
-        assert_eq!(
-            liveness.last_activity_kind,
-            "item/confirmed_external_activity"
-        );
-        assert_eq!(liveness.last_activity_item_id.as_deref(), Some(item_id));
-        assert_eq!(
-            liveness.last_activity_item_type.as_deref(),
-            Some("reasoning")
-        );
-        assert_eq!(liveness.last_activity_at_unix, timestamp + 5);
+            assert!(
+                store
+                    .heartbeat_turn_item_attempt_with_activity_kind(
+                        turn_id,
+                        item_id,
+                        TurnItemType::Reasoning,
+                        timestamp + 5,
+                        Some(timestamp + 905),
+                        Some(timestamp + 905),
+                        None,
+                        "item/confirmed_external_activity",
+                    )
+                    .await
+                    .expect("heartbeat should persist")
+            );
+
+            let liveness = store
+                .get_turn_liveness(turn_id)
+                .await
+                .expect("liveness query should succeed")
+                .expect("liveness row should exist");
+            assert_eq!(liveness.last_activity_sequence, 2);
+            assert_eq!(
+                liveness.last_activity_kind,
+                "item/confirmed_external_activity"
+            );
+            assert_eq!(liveness.last_activity_item_id.as_deref(), Some(item_id));
+            assert_eq!(
+                liveness.last_activity_item_type.as_deref(),
+                Some("reasoning")
+            );
+            assert_eq!(liveness.last_activity_at_unix, timestamp + 5);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn turn_liveness_tracks_authoritative_runtime_observation_without_item() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_turn_runtime_observation";
-        let thread_id = "thr_turn_runtime_observation";
-        let turn_id = "turn_runtime_observation";
-        store
-            .materialize_turn_start(
-                &sample_thread(workspace_id, thread_id, timestamp),
-                SandboxMode::FullAccess,
-                &sample_turn(turn_id),
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-
-        assert!(
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_turn_runtime_observation";
+            let thread_id = "thr_turn_runtime_observation";
+            let turn_id = "turn_runtime_observation";
             store
-                .observe_turn_runtime_activity(
-                    turn_id,
-                    "runtime/observed_in_progress",
-                    timestamp + 30,
+                .materialize_turn_start(
+                    &sample_thread(workspace_id, thread_id, timestamp),
+                    SandboxMode::FullAccess,
+                    &sample_turn(turn_id),
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
                 )
                 .await
-                .expect("runtime observation should persist")
-        );
-        let liveness = store
-            .get_turn_liveness(turn_id)
-            .await
-            .expect("liveness query should succeed")
-            .expect("liveness row should exist");
-        assert_eq!(liveness.thread_id, thread_id);
-        assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
-        assert_eq!(liveness.last_activity_item_id, None);
-        assert_eq!(liveness.last_activity_item_type, None);
-        assert_eq!(liveness.last_activity_at_unix, timestamp + 30);
+                .expect("turn start should persist");
+
+            assert!(
+                store
+                    .observe_turn_runtime_activity(
+                        turn_id,
+                        "runtime/observed_in_progress",
+                        timestamp + 30,
+                    )
+                    .await
+                    .expect("runtime observation should persist")
+            );
+            let liveness = store
+                .get_turn_liveness(turn_id)
+                .await
+                .expect("liveness query should succeed")
+                .expect("liveness row should exist");
+            assert_eq!(liveness.thread_id, thread_id);
+            assert_eq!(liveness.last_activity_kind, "runtime/observed_in_progress");
+            assert_eq!(liveness.last_activity_item_id, None);
+            assert_eq!(liveness.last_activity_item_type, None);
+            assert_eq!(liveness.last_activity_at_unix, timestamp + 30);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn turn_liveness_orders_activity_by_time_then_sequence() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let turn_id = "turn_liveness_ordering";
-        let thread_id = "thr_liveness_ordering";
-        let timestamp = 1_700_000_000;
+            let turn_id = "turn_liveness_ordering";
+            let thread_id = "thr_liveness_ordering";
+            let timestamp = 1_700_000_000;
 
-        assert!(
-            crate::repositories::turn_liveness::observe_activity(
-                &connection,
-                crate::repositories::turn_liveness::TurnLivenessObservation {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    activity_sequence: 2,
-                    activity_kind: "item/heartbeat".to_owned(),
-                    item_id: Some("item_later_clock".to_owned()),
-                    item_type: Some("reasoning".to_owned()),
-                    observed_at: unix_to_datetime(timestamp + 10),
-                },
-            )
-            .await
-            .expect("initial liveness observation should persist")
-        );
+            assert!(
+                crate::repositories::turn_liveness::observe_activity(
+                    &connection,
+                    crate::repositories::turn_liveness::TurnLivenessObservation {
+                        turn_id: turn_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        activity_sequence: 2,
+                        activity_kind: "item/heartbeat".to_owned(),
+                        item_id: Some("item_later_clock".to_owned()),
+                        item_type: Some("reasoning".to_owned()),
+                        observed_at: unix_to_datetime(timestamp + 10),
+                    },
+                )
+                .await
+                .expect("initial liveness observation should persist")
+            );
 
-        assert!(
-            !crate::repositories::turn_liveness::observe_activity(
-                &connection,
-                crate::repositories::turn_liveness::TurnLivenessObservation {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    activity_sequence: 3,
-                    activity_kind: "item/completed".to_owned(),
-                    item_id: Some("item_older_clock".to_owned()),
-                    item_type: Some("agent_message".to_owned()),
-                    observed_at: unix_to_datetime(timestamp + 5),
-                },
-            )
-            .await
-            .expect("older liveness observation should be ignored")
-        );
+            assert!(
+                !crate::repositories::turn_liveness::observe_activity(
+                    &connection,
+                    crate::repositories::turn_liveness::TurnLivenessObservation {
+                        turn_id: turn_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        activity_sequence: 3,
+                        activity_kind: "item/completed".to_owned(),
+                        item_id: Some("item_older_clock".to_owned()),
+                        item_type: Some("agent_message".to_owned()),
+                        observed_at: unix_to_datetime(timestamp + 5),
+                    },
+                )
+                .await
+                .expect("older liveness observation should be ignored")
+            );
 
-        let store = CrudStore::new(connection);
-        let liveness = store
-            .get_turn_liveness(turn_id)
-            .await
-            .expect("liveness query should succeed")
-            .expect("liveness row should exist");
-        assert_eq!(liveness.last_activity_sequence, 2);
-        assert_eq!(liveness.last_activity_kind, "item/heartbeat");
-        assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
+            let store = CrudStore::new(connection);
+            let liveness = store
+                .get_turn_liveness(turn_id)
+                .await
+                .expect("liveness query should succeed")
+                .expect("liveness row should exist");
+            assert_eq!(liveness.last_activity_sequence, 2);
+            assert_eq!(liveness.last_activity_kind, "item/heartbeat");
+            assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
 
-        assert!(
-            crate::repositories::turn_liveness::observe_activity(
-                &store.connection,
-                crate::repositories::turn_liveness::TurnLivenessObservation {
-                    turn_id: turn_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    activity_sequence: 4,
-                    activity_kind: "item/updated".to_owned(),
-                    item_id: Some("item_same_clock".to_owned()),
-                    item_type: Some("agent_message".to_owned()),
-                    observed_at: unix_to_datetime(timestamp + 10),
-                },
-            )
-            .await
-            .expect("same-time higher sequence should update liveness")
-        );
+            assert!(
+                crate::repositories::turn_liveness::observe_activity(
+                    &store.connection,
+                    crate::repositories::turn_liveness::TurnLivenessObservation {
+                        turn_id: turn_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        activity_sequence: 4,
+                        activity_kind: "item/updated".to_owned(),
+                        item_id: Some("item_same_clock".to_owned()),
+                        item_type: Some("agent_message".to_owned()),
+                        observed_at: unix_to_datetime(timestamp + 10),
+                    },
+                )
+                .await
+                .expect("same-time higher sequence should update liveness")
+            );
 
-        let liveness = store
-            .get_turn_liveness(turn_id)
-            .await
-            .expect("liveness query should succeed")
-            .expect("liveness row should exist");
-        assert_eq!(liveness.last_activity_sequence, 4);
-        assert_eq!(liveness.last_activity_kind, "item/updated");
-        assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
+            let liveness = store
+                .get_turn_liveness(turn_id)
+                .await
+                .expect("liveness query should succeed")
+                .expect("liveness row should exist");
+            assert_eq!(liveness.last_activity_sequence, 4);
+            assert_eq!(liveness.last_activity_kind, "item/updated");
+            assert_eq!(liveness.last_activity_at_unix, timestamp + 10);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -58177,298 +58219,302 @@ mod tests {
 
     #[tokio::test]
     async fn read_model_invariant_verifier_detects_and_repairs_terminal_tool_payload() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_invariant_repair";
-        let thread_id = "thr_invariant_repair";
-        let turn_id = "turn_invariant_repair";
-        let item_id = "item_invariant_repair";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_invariant_repair";
+            let thread_id = "thr_invariant_repair";
+            let turn_id = "turn_invariant_repair";
+            let item_id = "item_invariant_repair";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        seed_observation_workspace(&store, &thread.workspace_id).await;
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_started(
-                ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: safe_web_fetch_item(item_id),
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("item start should persist");
-
-        pioneer_entity::turn_item::Entity::update_many()
-            .filter(pioneer_entity::turn_item::Column::TurnId.eq(turn_id.to_owned()))
-            .filter(pioneer_entity::turn_item::Column::ItemId.eq(item_id.to_owned()))
-            .col_expr(
-                pioneer_entity::turn_item::Column::Status,
-                sea_orm::sea_query::Expr::value(Some("completed")),
-            )
-            .exec(&store.connection)
-            .await
-            .expect("status mutation should succeed");
-
-        // Exceed one repair quantum so the test also proves keyset progress
-        // and durable processing across batch boundaries.
-        for index in 0..=super::READ_MODEL_REPAIR_BATCH_SIZE {
-            let extra_item_id = format!("item_invariant_repair_{index:03}");
-            let extra_item = safe_web_fetch_item(extra_item_id.as_str());
-            let item_timestamp = unix_to_datetime(timestamp + 1);
-            pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
-                id: Set(format!("row_invariant_repair_{index:03}")),
-                turn_id: Set(turn_id.to_owned()),
-                item_id: Set(extra_item_id),
-                item_type: Set("web_fetch".to_owned()),
-                status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-                payload: Set(Some(
-                    serde_json::to_value(&extra_item).expect("extra item should serialize"),
-                )),
-                active_attempt_number: Set(0),
-                active_attempt_status: Set(None),
-                active_attempt_id: Set(None),
-                last_heartbeat_at: Set(None),
-                lease_expires_at: Set(None),
-                created_at: Set(item_timestamp),
-                updated_at: Set(item_timestamp),
-                ..Default::default()
-            })
-            .exec(&store.connection)
-            .await
-            .expect("extra terminal turn_item should insert");
-        }
-
-        let violations = store
-            .list_read_model_invariant_violations()
-            .await
-            .expect("invariant list should succeed");
-        assert!(violations.iter().any(|violation| {
-            matches!(
-                violation.kind,
-                super::ReadModelInvariantKind::TerminalToolPayloadInProgress
-            )
-        }));
-
-        let report = store
-            .repair_deterministic_read_model_violations_with_timings()
-            .await
-            .expect("repair should succeed");
-        let summary = &report.summary;
-        assert!(summary.detected > super::READ_MODEL_REPAIR_BATCH_SIZE as usize);
-        assert_eq!(summary.remaining, 0);
-        let full_scan_commits = report
-            .stage_timings
-            .iter()
-            .find(|timing| {
-                timing.stage == super::ReadModelRepairStage::TerminalPayloadFullScanBatchCommit
-            })
-            .expect("full-scan commit timing should be reported");
-        assert!(full_scan_commits.operations >= 2);
-        assert!(report.stage_timings.iter().any(|timing| {
-            timing.stage == super::ReadModelRepairStage::TerminalPayloadIncrementalComplete
-        }));
-
-        assert!(
+            seed_observation_workspace(&store, &thread.workspace_id).await;
             store
-                .list_read_model_invariant_violations()
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
                 .await
-                .expect("post-repair invariant list should succeed")
-                .is_empty()
-        );
+                .expect("turn start should persist");
+            store
+                .materialize_item_started(
+                    ItemStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: safe_web_fetch_item(item_id),
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("item start should persist");
 
-        let row = crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
-            .await
-            .expect("turn_item lookup should succeed")
-            .expect("turn_item row should exist");
-        let payload: TurnItem = read_fixture_item(&store.connection, row)
-            .await
-            .expect("payload should decode");
-        let TurnItem::WebFetch { status, .. } = payload else {
-            panic!("expected web_fetch payload");
-        };
-        assert_ne!(status, ToolCallStatus::InProgress);
-    }
+            pioneer_entity::turn_item::Entity::update_many()
+                .filter(pioneer_entity::turn_item::Column::TurnId.eq(turn_id.to_owned()))
+                .filter(pioneer_entity::turn_item::Column::ItemId.eq(item_id.to_owned()))
+                .col_expr(
+                    pioneer_entity::turn_item::Column::Status,
+                    sea_orm::sea_query::Expr::value(Some("completed")),
+                )
+                .exec(&store.connection)
+                .await
+                .expect("status mutation should succeed");
 
-    #[tokio::test]
-    async fn read_model_repair_resumes_incremental_pass_and_catches_up_same_startup() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection.clone());
-        let timestamp = unix_to_datetime(1_700_000_000);
-
-        let insert_inconsistent = |id: &str, item_id: &str| {
-            let id = id.to_owned();
-            let item_id = item_id.to_owned();
-            let timestamp = timestamp.clone();
-            let connection = connection.clone();
-            async move {
-                let item = safe_web_fetch_item(item_id.as_str());
+            // Exceed one repair quantum so the test also proves keyset progress
+            // and durable processing across batch boundaries.
+            for index in 0..=super::READ_MODEL_REPAIR_BATCH_SIZE {
+                let extra_item_id = format!("item_invariant_repair_{index:03}");
+                let extra_item = safe_web_fetch_item(extra_item_id.as_str());
+                let item_timestamp = unix_to_datetime(timestamp + 1);
                 pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
-                    id: Set(id),
-                    turn_id: Set("turn_incremental_repair".to_owned()),
-                    item_id: Set(item_id),
+                    id: Set(format!("row_invariant_repair_{index:03}")),
+                    turn_id: Set(turn_id.to_owned()),
+                    item_id: Set(extra_item_id),
                     item_type: Set("web_fetch".to_owned()),
                     status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
                     payload: Set(Some(
-                        serde_json::to_value(&item).expect("turn item should serialize"),
+                        serde_json::to_value(&extra_item).expect("extra item should serialize"),
                     )),
                     active_attempt_number: Set(0),
                     active_attempt_status: Set(None),
                     active_attempt_id: Set(None),
                     last_heartbeat_at: Set(None),
                     lease_expires_at: Set(None),
-                    created_at: Set(timestamp.clone()),
-                    updated_at: Set(timestamp),
+                    created_at: Set(item_timestamp),
+                    updated_at: Set(item_timestamp),
                     ..Default::default()
                 })
-                .exec(&connection)
+                .exec(&store.connection)
                 .await
-                .expect("inconsistent turn_item should insert");
+                .expect("extra terminal turn_item should insert");
             }
-        };
 
-        insert_inconsistent("row_incremental_seed", "item_incremental_seed").await;
-        store
-            .repair_deterministic_read_model_violations()
-            .await
-            .expect("initial full repair should succeed");
-
-        insert_inconsistent("row_incremental_resume", "item_incremental_resume").await;
-        let interrupted_high_watermark = read_model_repair::current_change_generation(&connection)
-            .await
-            .expect("change generation should load");
-        read_model_repair::begin_incremental_pass(
-            &connection,
-            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-            super::READ_MODEL_REPAIR_ALGORITHM_VERSION,
-            interrupted_high_watermark,
-        )
-        .await
-        .expect("interrupted incremental pass should start");
-
-        // This row is newer than the interrupted pass's high-watermark. The
-        // same startup must finish the old pass and then take a fresh snapshot.
-        insert_inconsistent("row_incremental_catchup", "item_incremental_catchup").await;
-        let summary = store
-            .repair_deterministic_read_model_violations()
-            .await
-            .expect("resumed and catch-up repair should succeed");
-        assert_eq!(summary.remaining, 0);
-        assert!(summary.repaired >= 2);
-
-        for id in ["row_incremental_resume", "row_incremental_catchup"] {
-            let row = pioneer_entity::turn_item::Entity::find_by_id(id)
-                .one(&connection)
+            let violations = store
+                .list_read_model_invariant_violations()
                 .await
-                .expect("repaired turn_item should query")
-                .expect("repaired turn_item should exist");
-            let item: TurnItem = read_fixture_item(&store.connection, row)
+                .expect("invariant list should succeed");
+            assert!(violations.iter().any(|violation| {
+                matches!(
+                    violation.kind,
+                    super::ReadModelInvariantKind::TerminalToolPayloadInProgress
+                )
+            }));
+
+            let report = store
+                .repair_deterministic_read_model_violations_with_timings()
+                .await
+                .expect("repair should succeed");
+            let summary = &report.summary;
+            assert!(summary.detected > super::READ_MODEL_REPAIR_BATCH_SIZE as usize);
+            assert_eq!(summary.remaining, 0);
+            let full_scan_commits = report
+                .stage_timings
+                .iter()
+                .find(|timing| {
+                    timing.stage == super::ReadModelRepairStage::TerminalPayloadFullScanBatchCommit
+                })
+                .expect("full-scan commit timing should be reported");
+            assert!(full_scan_commits.operations >= 2);
+            assert!(report.stage_timings.iter().any(|timing| {
+                timing.stage == super::ReadModelRepairStage::TerminalPayloadIncrementalComplete
+            }));
+
+            assert!(
+                store
+                    .list_read_model_invariant_violations()
+                    .await
+                    .expect("post-repair invariant list should succeed")
+                    .is_empty()
+            );
+
+            let row =
+                crate::repositories::turn::find_turn_item(&store.connection, turn_id, item_id)
+                    .await
+                    .expect("turn_item lookup should succeed")
+                    .expect("turn_item row should exist");
+            let payload: TurnItem = read_fixture_item(&store.connection, row)
                 .await
                 .expect("payload should decode");
-            assert_ne!(tool_call_status(&item), Some(ToolCallStatus::InProgress));
-        }
-
-        let checkpoint = read_model_repair::load_checkpoint(
-            &connection,
-            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-        )
+            let TurnItem::WebFetch { status, .. } = payload else {
+                panic!("expected web_fetch payload");
+            };
+            assert_ne!(status, ToolCallStatus::InProgress);
+            Ok(())
+        })
         .await
-        .expect("checkpoint should query")
-        .expect("checkpoint should exist");
-        assert_eq!(
-            checkpoint.incremental_status,
-            read_model_repair::STATUS_COMPLETED
-        );
-        let dirty_count = connection
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS value FROM read_model_repair_dirty_turn_item".to_owned(),
-            ))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_model_repair_resumes_incremental_pass_and_catches_up_same_startup() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection.clone());
+            let timestamp = unix_to_datetime(1_700_000_000);
+
+            let insert_inconsistent = |id: &str, item_id: &str| {
+                let id = id.to_owned();
+                let item_id = item_id.to_owned();
+                let timestamp = timestamp.clone();
+                let connection = connection.clone();
+                async move {
+                    let item = safe_web_fetch_item(item_id.as_str());
+                    pioneer_entity::turn_item::Entity::insert(
+                        pioneer_entity::turn_item::ActiveModel {
+                            id: Set(id),
+                            turn_id: Set("turn_incremental_repair".to_owned()),
+                            item_id: Set(item_id),
+                            item_type: Set("web_fetch".to_owned()),
+                            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+                            payload: Set(Some(
+                                serde_json::to_value(&item).expect("turn item should serialize"),
+                            )),
+                            active_attempt_number: Set(0),
+                            active_attempt_status: Set(None),
+                            active_attempt_id: Set(None),
+                            last_heartbeat_at: Set(None),
+                            lease_expires_at: Set(None),
+                            created_at: Set(timestamp.clone()),
+                            updated_at: Set(timestamp),
+                            ..Default::default()
+                        },
+                    )
+                    .exec(&connection)
+                    .await
+                    .expect("inconsistent turn_item should insert");
+                }
+            };
+
+            insert_inconsistent("row_incremental_seed", "item_incremental_seed").await;
+            store
+                .repair_deterministic_read_model_violations()
+                .await
+                .expect("initial full repair should succeed");
+
+            insert_inconsistent("row_incremental_resume", "item_incremental_resume").await;
+            let interrupted_high_watermark =
+                read_model_repair::current_change_generation(&connection)
+                    .await
+                    .expect("change generation should load");
+            read_model_repair::begin_incremental_pass(
+                &connection,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                super::READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                interrupted_high_watermark,
+            )
             .await
-            .expect("dirty count should query")
-            .expect("dirty count should return a row")
-            .try_get::<i64>("", "value")
-            .expect("dirty count should decode");
-        assert_eq!(dirty_count, 0);
+            .expect("interrupted incremental pass should start");
+
+            // This row is newer than the interrupted pass's high-watermark. The
+            // same startup must finish the old pass and then take a fresh snapshot.
+            insert_inconsistent("row_incremental_catchup", "item_incremental_catchup").await;
+            let summary = store
+                .repair_deterministic_read_model_violations()
+                .await
+                .expect("resumed and catch-up repair should succeed");
+            assert_eq!(summary.remaining, 0);
+            assert!(summary.repaired >= 2);
+
+            for id in ["row_incremental_resume", "row_incremental_catchup"] {
+                let row = pioneer_entity::turn_item::Entity::find_by_id(id)
+                    .one(&connection)
+                    .await
+                    .expect("repaired turn_item should query")
+                    .expect("repaired turn_item should exist");
+                let item: TurnItem = read_fixture_item(&store.connection, row)
+                    .await
+                    .expect("payload should decode");
+                assert_ne!(tool_call_status(&item), Some(ToolCallStatus::InProgress));
+            }
+
+            let checkpoint = read_model_repair::load_checkpoint(
+                &connection,
+                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+            )
+            .await
+            .expect("checkpoint should query")
+            .expect("checkpoint should exist");
+            assert_eq!(
+                checkpoint.incremental_status,
+                read_model_repair::STATUS_COMPLETED
+            );
+            let dirty_count = connection
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS value FROM read_model_repair_dirty_turn_item".to_owned(),
+                ))
+                .await
+                .expect("dirty count should query")
+                .expect("dirty count should return a row")
+                .try_get::<i64>("", "value")
+                .expect("dirty count should decode");
+            assert_eq!(dirty_count, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn read_model_repair_version_bump_forces_a_new_full_scan() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection.clone());
-        store
-            .repair_deterministic_read_model_violations()
-            .await
-            .expect("empty initial full repair should succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection.clone());
+            store
+                .repair_deterministic_read_model_violations()
+                .await
+                .expect("empty initial full repair should succeed");
 
-        let timestamp = unix_to_datetime(1_700_000_000);
-        pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
-            id: Set("row_repair_version_probe".to_owned()),
-            turn_id: Set("turn_repair_version_probe".to_owned()),
-            item_id: Set("item_repair_version_probe".to_owned()),
-            item_type: Set("web_fetch".to_owned()),
-            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-            payload: Set(Some(serde_json::json!([]))),
-            active_attempt_number: Set(0),
-            active_attempt_status: Set(None),
-            active_attempt_id: Set(None),
-            last_heartbeat_at: Set(None),
-            lease_expires_at: Set(None),
-            created_at: Set(timestamp.clone()),
-            updated_at: Set(timestamp),
-            ..Default::default()
+            let timestamp = unix_to_datetime(1_700_000_000);
+            pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+                id: Set("row_repair_version_probe".to_owned()),
+                turn_id: Set("turn_repair_version_probe".to_owned()),
+                item_id: Set("item_repair_version_probe".to_owned()),
+                item_type: Set("web_fetch".to_owned()),
+                status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+                payload: Set(Some(serde_json::json!([]))),
+                active_attempt_number: Set(0),
+                active_attempt_status: Set(None),
+                active_attempt_id: Set(None),
+                last_heartbeat_at: Set(None),
+                lease_expires_at: Set(None),
+                created_at: Set(timestamp.clone()),
+                updated_at: Set(timestamp),
+                ..Default::default()
+            })
+            .exec(&connection)
+            .await
+            .expect("version probe row should insert");
+
+            // Simulate a historical row that predates the exact dirty journal.
+            connection
+                .execute_unprepared("DELETE FROM read_model_repair_dirty_turn_item")
+                .await
+                .expect("test should clear the exact-change journal");
+            store
+                .repair_deterministic_read_model_violations()
+                .await
+                .expect("same-version startup should not repeat the historical full scan");
+
+            connection
+                .execute_unprepared("UPDATE read_model_repair_checkpoint SET algorithm_version = 0")
+                .await
+                .expect("test should age the repair algorithm version");
+            let error = store
+                .repair_deterministic_read_model_violations()
+                .await
+                .expect_err("version bump must force a new historical full scan");
+            assert!(format!("{error:#}").contains("failed to decode turn_item payload"));
+            Ok(())
         })
-        .exec(&connection)
         .await
-        .expect("version probe row should insert");
-
-        // Simulate a historical row that predates the exact dirty journal.
-        connection
-            .execute_unprepared("DELETE FROM read_model_repair_dirty_turn_item")
-            .await
-            .expect("test should clear the exact-change journal");
-        store
-            .repair_deterministic_read_model_violations()
-            .await
-            .expect("same-version startup should not repeat the historical full scan");
-
-        connection
-            .execute_unprepared("UPDATE read_model_repair_checkpoint SET algorithm_version = 0")
-            .await
-            .expect("test should age the repair algorithm version");
-        let error = store
-            .repair_deterministic_read_model_violations()
-            .await
-            .expect_err("version bump must force a new historical full scan");
-        assert!(format!("{error:#}").contains("failed to decode turn_item payload"));
+        .unwrap();
     }
 
     #[tokio::test]
@@ -58571,178 +58617,171 @@ mod tests {
 
     #[tokio::test]
     async fn read_model_repair_never_applies_payload_for_a_stale_terminal_status() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection.clone());
-        let timestamp = unix_to_datetime(1_700_000_000);
-        let item = safe_web_fetch_item("item_repair_status_fence");
-        pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
-            id: Set("row_repair_status_fence".to_owned()),
-            turn_id: Set("turn_repair_status_fence".to_owned()),
-            item_id: Set("item_repair_status_fence".to_owned()),
-            item_type: Set("web_fetch".to_owned()),
-            status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
-            payload: Set(Some(
-                serde_json::to_value(&item).expect("turn item should serialize"),
-            )),
-            active_attempt_number: Set(0),
-            active_attempt_status: Set(None),
-            active_attempt_id: Set(None),
-            last_heartbeat_at: Set(None),
-            lease_expires_at: Set(None),
-            created_at: Set(timestamp.clone()),
-            updated_at: Set(timestamp),
-            ..Default::default()
-        })
-        .exec(&connection)
-        .await
-        .expect("status-fence seed should insert");
-        let stale_row = pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
-            .one(&connection)
-            .await
-            .expect("status-fence seed should query")
-            .expect("status-fence seed should exist");
-        let stale_repair = super::repaired_terminal_turn_item_payload(&stale_row)
-            .expect("stale payload should decode")
-            .expect("stale payload should need repair");
-
-        pioneer_entity::turn_item::Entity::update_many()
-            .filter(pioneer_entity::turn_item::Column::Id.eq("row_repair_status_fence".to_owned()))
-            .col_expr(
-                pioneer_entity::turn_item::Column::Status,
-                Expr::value(Some(super::TURN_ITEM_STATUS_FAILED)),
-            )
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection.clone());
+            let timestamp = unix_to_datetime(1_700_000_000);
+            let item = safe_web_fetch_item("item_repair_status_fence");
+            pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+                id: Set("row_repair_status_fence".to_owned()),
+                turn_id: Set("turn_repair_status_fence".to_owned()),
+                item_id: Set("item_repair_status_fence".to_owned()),
+                item_type: Set("web_fetch".to_owned()),
+                status: Set(Some(super::TURN_ITEM_STATUS_COMPLETED.to_owned())),
+                payload: Set(Some(
+                    serde_json::to_value(&item).expect("turn item should serialize"),
+                )),
+                active_attempt_number: Set(0),
+                active_attempt_status: Set(None),
+                active_attempt_id: Set(None),
+                last_heartbeat_at: Set(None),
+                lease_expires_at: Set(None),
+                created_at: Set(timestamp.clone()),
+                updated_at: Set(timestamp),
+                ..Default::default()
+            })
             .exec(&connection)
             .await
-            .expect("live writer should change terminal status");
+            .expect("status-fence seed should insert");
+            let stale_row =
+                pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
+                    .one(&connection)
+                    .await
+                    .expect("status-fence seed should query")
+                    .expect("status-fence seed should exist");
+            let stale_repair = super::repaired_terminal_turn_item_payload(&stale_row)
+                .expect("stale payload should decode")
+                .expect("stale payload should need repair");
 
-        let transaction = connection
-            .begin()
-            .await
-            .expect("repair transaction should begin");
-        let applied = store
-            .apply_one_terminal_turn_item_payload_repair(
-                &transaction,
-                &stale_row,
-                &pioneer_crud_payloads::storage::PreparedPayload::new(stale_repair.as_str())
-                    .unwrap(),
-                None,
-            )
-            .await
-            .expect("stale conditional repair should execute safely");
-        transaction
-            .commit()
-            .await
-            .expect("repair transaction should commit");
-        assert!(!applied);
+            pioneer_entity::turn_item::Entity::update_many()
+                .filter(
+                    pioneer_entity::turn_item::Column::Id.eq("row_repair_status_fence".to_owned()),
+                )
+                .col_expr(
+                    pioneer_entity::turn_item::Column::Status,
+                    Expr::value(Some(super::TURN_ITEM_STATUS_FAILED)),
+                )
+                .exec(&connection)
+                .await
+                .expect("live writer should change terminal status");
 
-        let current = pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
-            .one(&connection)
-            .await
-            .expect("status-fence row should query")
-            .expect("status-fence row should exist");
-        assert_eq!(
-            current.status.as_deref(),
-            Some(super::TURN_ITEM_STATUS_FAILED)
-        );
-        assert_eq!(current.payload, stale_row.payload);
+            let transaction = connection
+                .begin()
+                .await
+                .expect("repair transaction should begin");
+            let applied = store
+                .apply_one_terminal_turn_item_payload_repair(
+                    &transaction,
+                    &stale_row,
+                    &pioneer_crud_payloads::storage::PreparedPayload::new(stale_repair.as_str())
+                        .unwrap(),
+                    None,
+                )
+                .await
+                .expect("stale conditional repair should execute safely");
+            transaction
+                .commit()
+                .await
+                .expect("repair transaction should commit");
+            assert!(!applied);
+
+            let current = pioneer_entity::turn_item::Entity::find_by_id("row_repair_status_fence")
+                .one(&connection)
+                .await
+                .expect("status-fence row should query")
+                .expect("status-fence row should exist");
+            assert_eq!(
+                current.status.as_deref(),
+                Some(super::TURN_ITEM_STATUS_FAILED)
+            );
+            assert_eq!(current.payload, stale_row.payload);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn thread_history_never_exposes_retained_turn_llm_context() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_history_llm_context";
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set(workspace_id.to_owned()),
-            name: Set("History test".to_owned()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(unix_to_datetime(timestamp)),
-            updated_at: Set(unix_to_datetime(timestamp)),
-        })
-        .exec(&store.connection)
-        .await
-        .expect("workspace required by item projections should exist");
-        let thread_id = "thr_history_llm_context";
-        let turn_id = "turn_history_llm_context";
-        let item_id = "item_history_llm_context";
-        let thread = sample_thread(workspace_id, thread_id, timestamp);
-        let turn = sample_turn(turn_id);
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_history_llm_context";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_history_llm_context";
+            let turn_id = "turn_history_llm_context";
+            let item_id = "item_history_llm_context";
+            let thread = sample_thread(workspace_id, thread_id, timestamp);
+            let turn = sample_turn(turn_id);
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
 
-        let mut completed_item = safe_web_fetch_item(item_id);
-        if let TurnItem::WebFetch {
-            status, success, ..
-        } = &mut completed_item
-        {
-            *status = ToolCallStatus::Completed;
-            *success = Some(true);
-        }
-        store
-            .materialize_item_completed(
-                ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
+            let mut completed_item = safe_web_fetch_item(item_id);
+            if let TurnItem::WebFetch {
+                status, success, ..
+            } = &mut completed_item
+            {
+                *status = ToolCallStatus::Completed;
+                *success = Some(true);
+            }
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: completed_item,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("safe completed item should persist");
+
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
                     turn_id: turn_id.to_owned(),
-                    item: completed_item,
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("safe completed item should persist");
-
-        store
-            .insert_turn_llm_context(NewTurnLlmContextEntry {
-                turn_id: turn_id.to_owned(),
-                item_id: Some(item_id.to_owned()),
-                attempt_id: Some("1".to_owned()),
-                sequence: 1,
-                source: "tool_result".to_owned(),
-                tool_name: Some("web_fetch".to_owned()),
-                payload: serde_json::json!({
-                    "output": "SECRET_WEB_FETCH_BODY_SENTINEL"
+                    item_id: Some(item_id.to_owned()),
+                    attempt_id: Some("1".to_owned()),
+                    sequence: 1,
+                    source: "tool_result".to_owned(),
+                    tool_name: Some("web_fetch".to_owned()),
+                    payload: serde_json::json!({
+                        "output": "SECRET_WEB_FETCH_BODY_SENTINEL"
+                    })
+                    .to_string(),
+                    output_policy_snapshot: serde_json::json!(
+                        ToolOutputPolicySnapshot::for_tool_name("web_fetch")
+                    )
+                    .to_string(),
+                    created_at: unix_to_datetime(timestamp + 2),
+                    expires_at: None,
                 })
-                .to_string(),
-                output_policy_snapshot: serde_json::json!(ToolOutputPolicySnapshot::for_tool_name(
-                    "web_fetch"
-                ))
-                .to_string(),
-                created_at: unix_to_datetime(timestamp + 2),
-                expires_at: None,
-            })
-            .await
-            .expect("retained llm context should persist");
+                .await
+                .expect("retained llm context should persist");
 
-        let history = store
-            .get_thread_history(thread_id, Some(16))
-            .await
-            .expect("thread history query should succeed")
-            .expect("thread history should exist");
-        let history_json = serde_json::to_string(&history.events)
-            .expect("thread history should serialize for leakage assertion");
-        assert!(!history_json.contains("SECRET_WEB_FETCH_BODY_SENTINEL"));
+            let history = store
+                .get_thread_history(thread_id, Some(16))
+                .await
+                .expect("thread history query should succeed")
+                .expect("thread history should exist");
+            let history_json = serde_json::to_string(&history.events)
+                .expect("thread history should serialize for leakage assertion");
+            assert!(!history_json.contains("SECRET_WEB_FETCH_BODY_SENTINEL"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -59025,318 +59064,318 @@ mod tests {
 
     #[tokio::test]
     async fn execution_window_repository_round_trips_lifecycle_checkpoints_and_cleanup() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let timestamp = unix_to_datetime(1_700_000_000);
 
-        let first_window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: "ws_window".to_owned(),
-                    thread_id: "thr_window".to_owned(),
-                    turn_id: "turn_window".to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 0,
-                    tool_call_count: 0,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({ "phase": "start" }),
-                    started_at: timestamp,
-                },
-                timestamp,
-                timestamp,
-            )
-            .await
-            .expect("first window should insert");
-        assert_eq!(first_window.window_index, 1);
-
-        let duplicate = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: "ws_window".to_owned(),
-                    thread_id: "thr_window".to_owned(),
-                    turn_id: "turn_window".to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 0,
-                    tool_call_count: 0,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({}),
-                    started_at: timestamp,
-                },
-                timestamp,
-                timestamp,
-            )
-            .await;
-        assert!(
-            duplicate.is_err(),
-            "duplicate window index should be rejected before insert"
-        );
-
-        let exhausted = store
-            .mark_turn_execution_window_exhausted(
-                first_window.id.as_str(),
-                ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
-                TurnExecutionWindowStatsRecord {
-                    agent_round_count: 7,
-                    tool_call_count: 11,
-                    provider_token_count: 13,
-                    metadata_json: serde_json::json!({ "phase": "exhausted" }),
-                    completed_at: timestamp + chrono::Duration::seconds(10),
-                    updated_at: timestamp + chrono::Duration::seconds(10),
-                },
-            )
-            .await
-            .expect("window should mark exhausted");
-        assert_eq!(exhausted.status, ExecutionWindowStatus::Exhausted);
-        assert_eq!(
-            exhausted.exhaustion_reason,
-            Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow)
-        );
-
-        let checkpoint = store
-            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
-                id: None,
-                window_id: first_window.id.clone(),
-                workspace_id: first_window.workspace_id.clone(),
-                thread_id: first_window.thread_id.clone(),
-                turn_id: first_window.turn_id.clone(),
-                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
-                payload_json: serde_json::json!({
-                    "turn_id": first_window.turn_id.clone(),
-                    "window_index": first_window.window_index,
-                    "summary": "bounded runtime facts only"
-                }),
-                created_at: timestamp + chrono::Duration::seconds(11),
-            })
-            .await
-            .expect("checkpoint should save");
-        assert_eq!(
-            checkpoint.checkpoint_kind,
-            TurnExecutionCheckpointKind::WindowExhausted
-        );
-        let stored_checkpoint = store
-            .database_connection()
-            .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
-                "SELECT checkpoint_kind FROM turn_execution_checkpoint WHERE id = ?",
-                [checkpoint.id.clone().into()],
-            ))
-            .await
-            .expect("stored checkpoint kind should query")
-            .expect("stored checkpoint should exist");
-        assert_eq!(
-            stored_checkpoint
-                .try_get::<String>("", "checkpoint_kind")
-                .unwrap(),
-            "window_exhausted"
-        );
-
-        assert_eq!(
-            store
-                .list_turn_execution_checkpoints_for_window(first_window.id.as_str())
+            let first_window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_window".to_owned(),
+                        thread_id: "thr_window".to_owned(),
+                        turn_id: "turn_window".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({ "phase": "start" }),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
                 .await
-                .expect("window checkpoints should list")
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .latest_turn_execution_checkpoint_for_turn("turn_window")
+                .expect("first window should insert");
+            assert_eq!(first_window.window_index, 1);
+
+            let duplicate = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_window".to_owned(),
+                        thread_id: "thr_window".to_owned(),
+                        turn_id: "turn_window".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await;
+            assert!(
+                duplicate.is_err(),
+                "duplicate window index should be rejected before insert"
+            );
+
+            let exhausted = store
+                .mark_turn_execution_window_exhausted(
+                    first_window.id.as_str(),
+                    ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
+                    TurnExecutionWindowStatsRecord {
+                        agent_round_count: 7,
+                        tool_call_count: 11,
+                        provider_token_count: 13,
+                        metadata_json: serde_json::json!({ "phase": "exhausted" }),
+                        completed_at: timestamp + chrono::Duration::seconds(10),
+                        updated_at: timestamp + chrono::Duration::seconds(10),
+                    },
+                )
                 .await
-                .expect("latest checkpoint should load")
-                .expect("latest checkpoint should exist")
-                .id,
-            checkpoint.id
-        );
+                .expect("window should mark exhausted");
+            assert_eq!(exhausted.status, ExecutionWindowStatus::Exhausted);
+            assert_eq!(
+                exhausted.exhaustion_reason,
+                Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow)
+            );
 
-        let oversized = serde_json::json!({
-            "payload": "x".repeat(super::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1)
-        });
-        let oversized_result = store
-            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
-                id: None,
-                window_id: first_window.id.clone(),
-                workspace_id: first_window.workspace_id.clone(),
-                thread_id: first_window.thread_id.clone(),
-                turn_id: first_window.turn_id.clone(),
-                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
-                payload_json: oversized,
-                created_at: timestamp,
-            })
-            .await;
-        assert!(
-            oversized_result.is_err(),
-            "oversized checkpoint payload should be rejected"
-        );
-
-        store
-            .mark_turn_execution_window_checkpointed(
-                first_window.id.as_str(),
-                timestamp + chrono::Duration::seconds(12),
-            )
-            .await
-            .expect("window should mark checkpointed");
-        store
-            .mark_turn_execution_window_continued(
-                first_window.id.as_str(),
-                timestamp + chrono::Duration::seconds(13),
-            )
-            .await
-            .expect("window should mark continued");
-
-        let second_window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: "ws_window".to_owned(),
-                    thread_id: "thr_window".to_owned(),
-                    turn_id: "turn_window".to_owned(),
-                    window_index: 2,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 0,
-                    tool_call_count: 0,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({}),
-                    started_at: timestamp + chrono::Duration::seconds(14),
-                },
-                timestamp + chrono::Duration::seconds(14),
-                timestamp + chrono::Duration::seconds(14),
-            )
-            .await
-            .expect("second monotonic window should insert");
-        let completed = store
-            .mark_turn_execution_window_completed(
-                second_window.id.as_str(),
-                TurnExecutionWindowStatsRecord {
-                    agent_round_count: 3,
-                    tool_call_count: 5,
-                    provider_token_count: 8,
-                    metadata_json: serde_json::json!({ "phase": "completed" }),
-                    completed_at: timestamp + chrono::Duration::seconds(15),
-                    updated_at: timestamp + chrono::Duration::seconds(15),
-                },
-            )
-            .await
-            .expect("window should mark completed");
-        assert_eq!(completed.status, ExecutionWindowStatus::Completed);
-        assert_eq!(completed.exhaustion_reason, None);
-
-        let blocked = store
-            .mark_turn_execution_window_blocked(
-                second_window.id.as_str(),
-                Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
-                TurnExecutionWindowStatsRecord {
-                    agent_round_count: 3,
-                    tool_call_count: 5,
-                    provider_token_count: 8,
-                    metadata_json: serde_json::json!({ "phase": "blocked" }),
-                    completed_at: timestamp + chrono::Duration::seconds(16),
-                    updated_at: timestamp + chrono::Duration::seconds(16),
-                },
-            )
-            .await
-            .expect("window should mark blocked");
-        assert_eq!(blocked.status, ExecutionWindowStatus::Blocked);
-        assert_eq!(
-            blocked.exhaustion_reason,
-            Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow)
-        );
-        assert_eq!(
-            store
-                .latest_turn_execution_window("turn_window")
+            let checkpoint = store
+                .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                    id: None,
+                    window_id: first_window.id.clone(),
+                    workspace_id: first_window.workspace_id.clone(),
+                    thread_id: first_window.thread_id.clone(),
+                    turn_id: first_window.turn_id.clone(),
+                    checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                    payload_json: serde_json::json!({
+                        "turn_id": first_window.turn_id.clone(),
+                        "window_index": first_window.window_index,
+                        "summary": "bounded runtime facts only"
+                    }),
+                    created_at: timestamp + chrono::Duration::seconds(11),
+                })
                 .await
-                .expect("latest window should load")
-                .expect("latest window should exist")
-                .id,
-            second_window.id
-        );
-
-        let aggregate = store
-            .aggregate_turn_execution_window_usage("turn_window")
-            .await
-            .expect("execution window usage should aggregate");
-        assert_eq!(
-            aggregate,
-            TurnExecutionWindowUsageAggregateRecord {
-                total_windows: 2,
-                latest_window_index: 2,
-                total_agent_rounds: 10,
-                total_tool_calls: 16,
-                total_wall_clock_ms: 12_000,
-                wall_clock_window_count: 2,
-                total_provider_tokens: 21,
-                provider_token_usage_unknown: false,
-                consecutive_no_progress_windows: 0,
-            }
-        );
-
-        store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: "ws_window".to_owned(),
-                    thread_id: "thr_window".to_owned(),
-                    turn_id: "turn_window_missing_tokens".to_owned(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 2,
-                    tool_call_count: 4,
-                    provider_token_count: 0,
-                    metadata_json: serde_json::json!({ "phase": "running_without_tokens" }),
-                    started_at: timestamp,
-                },
-                timestamp,
-                timestamp,
-            )
-            .await
-            .expect("window with missing token usage should insert");
-        let missing_token_aggregate = store
-            .aggregate_turn_execution_window_usage("turn_window_missing_tokens")
-            .await
-            .expect("missing token usage should not block aggregate counters");
-        assert_eq!(
-            missing_token_aggregate,
-            TurnExecutionWindowUsageAggregateRecord {
-                total_windows: 1,
-                latest_window_index: 1,
-                total_agent_rounds: 2,
-                total_tool_calls: 4,
-                total_wall_clock_ms: 0,
-                wall_clock_window_count: 0,
-                total_provider_tokens: 0,
-                provider_token_usage_unknown: true,
-                consecutive_no_progress_windows: 0,
-            }
-        );
-
-        let cleanup = store
-            .delete_turn_execution_data_for_turn("turn_window")
-            .await
-            .expect("execution data cleanup should succeed");
-        assert_eq!(cleanup.checkpoints_deleted, 1);
-        assert_eq!(cleanup.windows_deleted, 2);
-        assert!(
-            store
-                .list_turn_execution_windows("turn_window")
+                .expect("checkpoint should save");
+            assert_eq!(
+                checkpoint.checkpoint_kind,
+                TurnExecutionCheckpointKind::WindowExhausted
+            );
+            let stored_checkpoint = store
+                .database_connection()
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT checkpoint_kind FROM turn_execution_checkpoint WHERE id = $1",
+                    [checkpoint.id.clone().into()],
+                ))
                 .await
-                .expect("windows should list after cleanup")
-                .is_empty()
-        );
-        assert!(
+                .expect("stored checkpoint kind should query")
+                .expect("stored checkpoint should exist");
+            assert_eq!(
+                stored_checkpoint
+                    .try_get::<String>("", "checkpoint_kind")
+                    .unwrap(),
+                "window_exhausted"
+            );
+
+            assert_eq!(
+                store
+                    .list_turn_execution_checkpoints_for_window(first_window.id.as_str())
+                    .await
+                    .expect("window checkpoints should list")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .latest_turn_execution_checkpoint_for_turn("turn_window")
+                    .await
+                    .expect("latest checkpoint should load")
+                    .expect("latest checkpoint should exist")
+                    .id,
+                checkpoint.id
+            );
+
+            let oversized = serde_json::json!({
+                "payload": "x".repeat(super::TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES + 1)
+            });
+            let oversized_result = store
+                .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                    id: None,
+                    window_id: first_window.id.clone(),
+                    workspace_id: first_window.workspace_id.clone(),
+                    thread_id: first_window.thread_id.clone(),
+                    turn_id: first_window.turn_id.clone(),
+                    checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                    payload_json: oversized,
+                    created_at: timestamp,
+                })
+                .await;
+            assert!(
+                oversized_result.is_err(),
+                "oversized checkpoint payload should be rejected"
+            );
+
             store
-                .latest_turn_execution_checkpoint_for_turn("turn_window")
+                .mark_turn_execution_window_checkpointed(
+                    first_window.id.as_str(),
+                    timestamp + chrono::Duration::seconds(12),
+                )
                 .await
-                .expect("latest checkpoint should load after cleanup")
-                .is_none()
-        );
+                .expect("window should mark checkpointed");
+            store
+                .mark_turn_execution_window_continued(
+                    first_window.id.as_str(),
+                    timestamp + chrono::Duration::seconds(13),
+                )
+                .await
+                .expect("window should mark continued");
+
+            let second_window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_window".to_owned(),
+                        thread_id: "thr_window".to_owned(),
+                        turn_id: "turn_window".to_owned(),
+                        window_index: 2,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: timestamp + chrono::Duration::seconds(14),
+                    },
+                    timestamp + chrono::Duration::seconds(14),
+                    timestamp + chrono::Duration::seconds(14),
+                )
+                .await
+                .expect("second monotonic window should insert");
+            let completed = store
+                .mark_turn_execution_window_completed(
+                    second_window.id.as_str(),
+                    TurnExecutionWindowStatsRecord {
+                        agent_round_count: 3,
+                        tool_call_count: 5,
+                        provider_token_count: 8,
+                        metadata_json: serde_json::json!({ "phase": "completed" }),
+                        completed_at: timestamp + chrono::Duration::seconds(15),
+                        updated_at: timestamp + chrono::Duration::seconds(15),
+                    },
+                )
+                .await
+                .expect("window should mark completed");
+            assert_eq!(completed.status, ExecutionWindowStatus::Completed);
+            assert_eq!(completed.exhaustion_reason, None);
+
+            let blocked = store
+                .mark_turn_execution_window_blocked(
+                    second_window.id.as_str(),
+                    Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow),
+                    TurnExecutionWindowStatsRecord {
+                        agent_round_count: 3,
+                        tool_call_count: 5,
+                        provider_token_count: 8,
+                        metadata_json: serde_json::json!({ "phase": "blocked" }),
+                        completed_at: timestamp + chrono::Duration::seconds(16),
+                        updated_at: timestamp + chrono::Duration::seconds(16),
+                    },
+                )
+                .await
+                .expect("window should mark blocked");
+            assert_eq!(blocked.status, ExecutionWindowStatus::Blocked);
+            assert_eq!(
+                blocked.exhaustion_reason,
+                Some(ExecutionWindowExhaustionReason::MaxWallClockMsPerWindow)
+            );
+            assert_eq!(
+                store
+                    .latest_turn_execution_window("turn_window")
+                    .await
+                    .expect("latest window should load")
+                    .expect("latest window should exist")
+                    .id,
+                second_window.id
+            );
+
+            let aggregate = store
+                .aggregate_turn_execution_window_usage("turn_window")
+                .await
+                .expect("execution window usage should aggregate");
+            assert_eq!(
+                aggregate,
+                TurnExecutionWindowUsageAggregateRecord {
+                    total_windows: 2,
+                    latest_window_index: 2,
+                    total_agent_rounds: 10,
+                    total_tool_calls: 16,
+                    total_wall_clock_ms: 12_000,
+                    wall_clock_window_count: 2,
+                    total_provider_tokens: 21,
+                    provider_token_usage_unknown: false,
+                    consecutive_no_progress_windows: 0,
+                }
+            );
+
+            store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: "ws_window".to_owned(),
+                        thread_id: "thr_window".to_owned(),
+                        turn_id: "turn_window_missing_tokens".to_owned(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 2,
+                        tool_call_count: 4,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({ "phase": "running_without_tokens" }),
+                        started_at: timestamp,
+                    },
+                    timestamp,
+                    timestamp,
+                )
+                .await
+                .expect("window with missing token usage should insert");
+            let missing_token_aggregate = store
+                .aggregate_turn_execution_window_usage("turn_window_missing_tokens")
+                .await
+                .expect("missing token usage should not block aggregate counters");
+            assert_eq!(
+                missing_token_aggregate,
+                TurnExecutionWindowUsageAggregateRecord {
+                    total_windows: 1,
+                    latest_window_index: 1,
+                    total_agent_rounds: 2,
+                    total_tool_calls: 4,
+                    total_wall_clock_ms: 0,
+                    wall_clock_window_count: 0,
+                    total_provider_tokens: 0,
+                    provider_token_usage_unknown: true,
+                    consecutive_no_progress_windows: 0,
+                }
+            );
+
+            let cleanup = store
+                .delete_turn_execution_data_for_turn("turn_window")
+                .await
+                .expect("execution data cleanup should succeed");
+            assert_eq!(cleanup.checkpoints_deleted, 1);
+            assert_eq!(cleanup.windows_deleted, 2);
+            assert!(
+                store
+                    .list_turn_execution_windows("turn_window")
+                    .await
+                    .expect("windows should list after cleanup")
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .latest_turn_execution_checkpoint_for_turn("turn_window")
+                    .await
+                    .expect("latest checkpoint should load after cleanup")
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -60208,578 +60247,578 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_lifecycle_events_round_trip_through_turn_history() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let timestamp = 1_700_000_000;
-        let workspace_id = "ws_000000000000000099";
-        let thread_id = "thr_000000000000000099";
-        let turn_id = "turn_000000000000000099";
-        let item_id = "reasoning_recovery";
-        let recovery_job_id = "recovery_job_99";
+            let store = CrudStore::new(connection);
+            let timestamp = 1_700_000_000;
+            let workspace_id = "ws_000000000000000099";
+            let thread_id = "thr_000000000000000099";
+            let turn_id = "turn_000000000000000099";
+            let item_id = "reasoning_recovery";
+            let recovery_job_id = "recovery_job_99";
 
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: turn_id.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
 
-        seed_observation_workspace(&store, &thread.workspace_id).await;
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_timeout_detected(
-                ItemTimeoutDetectedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    attempt_number: 1,
-                    reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
-                    recovery_job_id: Some(recovery_job_id.to_owned()),
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("timeout detected should persist");
-        store
-            .materialize_item_recovery_opened(
-                ItemRecoveryOpenedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    trigger: RecoveryTrigger::Timeout,
-                    action: RecoveryAction::RetryAttempt,
-                    attempt_number: 1,
-                },
-                timestamp + 2,
-            )
-            .await
-            .expect("recovery opened should persist");
-        store
-            .materialize_item_recovery_attached(
-                ItemRecoveryAttachedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: "reasoning_second_failure".to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    recovery_item_id: item_id.to_owned(),
-                    recovery_item_type: TurnItemType::Reasoning,
-                    trigger: RecoveryTrigger::ProviderError,
-                    action: RecoveryAction::RetryAttempt,
-                    existing_status: RecoveryJobStatus::Pending,
-                    next_attempt_number: 1,
-                },
-                timestamp + 3,
-            )
-            .await
-            .expect("recovery attached should persist");
-        store
-            .materialize_item_retry_scheduled(
-                ItemRetryScheduledNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    attempt_number: 2,
-                    next_run_at_unix: timestamp + 30,
-                    reason: Some("retry later".to_owned()),
-                },
-                timestamp + 4,
-            )
-            .await
-            .expect("retry scheduled should persist");
-        store
-            .materialize_item_retry_attempt_started(
-                ItemRetryAttemptStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    attempt_number: 2,
-                },
-                timestamp + 5,
-            )
-            .await
-            .expect("retry attempt started should persist");
-        store
-            .materialize_item_recovery_succeeded(
-                ItemRecoverySucceededNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    attempt_number: 2,
-                },
-                timestamp + 6,
-            )
-            .await
-            .expect("recovery succeeded should persist");
-        store
-            .materialize_item_recovery_exhausted(
-                ItemRecoveryExhaustedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::Reasoning,
-                    recovery_job_id: recovery_job_id.to_owned(),
-                    attempt_number: 3,
-                    status: RecoveryJobStatus::Exhausted,
-                    error_message: "attempts exhausted".to_owned(),
-                },
-                timestamp + 7,
-            )
-            .await
-            .expect("recovery exhausted should persist");
+            seed_observation_workspace(&store, &thread.workspace_id).await;
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+            store
+                .materialize_item_timeout_detected(
+                    ItemTimeoutDetectedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        attempt_number: 1,
+                        reason: TurnItemTimeoutReason::IdleDeadlineExceeded,
+                        recovery_job_id: Some(recovery_job_id.to_owned()),
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("timeout detected should persist");
+            store
+                .materialize_item_recovery_opened(
+                    ItemRecoveryOpenedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        trigger: RecoveryTrigger::Timeout,
+                        action: RecoveryAction::RetryAttempt,
+                        attempt_number: 1,
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .expect("recovery opened should persist");
+            store
+                .materialize_item_recovery_attached(
+                    ItemRecoveryAttachedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: "reasoning_second_failure".to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        recovery_item_id: item_id.to_owned(),
+                        recovery_item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::ProviderError,
+                        action: RecoveryAction::RetryAttempt,
+                        existing_status: RecoveryJobStatus::Pending,
+                        next_attempt_number: 1,
+                    },
+                    timestamp + 3,
+                )
+                .await
+                .expect("recovery attached should persist");
+            store
+                .materialize_item_retry_scheduled(
+                    ItemRetryScheduledNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        attempt_number: 2,
+                        next_run_at_unix: timestamp + 30,
+                        reason: Some("retry later".to_owned()),
+                    },
+                    timestamp + 4,
+                )
+                .await
+                .expect("retry scheduled should persist");
+            store
+                .materialize_item_retry_attempt_started(
+                    ItemRetryAttemptStartedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        attempt_number: 2,
+                    },
+                    timestamp + 5,
+                )
+                .await
+                .expect("retry attempt started should persist");
+            store
+                .materialize_item_recovery_succeeded(
+                    ItemRecoverySucceededNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        attempt_number: 2,
+                    },
+                    timestamp + 6,
+                )
+                .await
+                .expect("recovery succeeded should persist");
+            store
+                .materialize_item_recovery_exhausted(
+                    ItemRecoveryExhaustedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        recovery_job_id: recovery_job_id.to_owned(),
+                        attempt_number: 3,
+                        status: RecoveryJobStatus::Exhausted,
+                        error_message: "attempts exhausted".to_owned(),
+                    },
+                    timestamp + 7,
+                )
+                .await
+                .expect("recovery exhausted should persist");
 
-        let turn_items = store
-            .get_turn_item_events(thread_id, turn_id)
-            .await
-            .expect("turn items should load")
-            .expect("turn items should exist");
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemTimeoutDetected { recovery_job_id: Some(job_id), .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRecoveryOpened { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRecoveryAttached { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRetryScheduled { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRetryAttemptStarted { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRecoverySucceeded { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(turn_items.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::ItemRecoveryExhausted { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
+            let turn_items = store
+                .get_turn_item_events(thread_id, turn_id)
+                .await
+                .expect("turn items should load")
+                .expect("turn items should exist");
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemTimeoutDetected { recovery_job_id: Some(job_id), .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRecoveryOpened { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRecoveryAttached { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRetryScheduled { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRetryAttemptStarted { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRecoverySucceeded { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(turn_items.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::ItemRecoveryExhausted { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
 
-        let history = store
-            .get_thread_history(thread_id, Some(32))
-            .await
-            .expect("thread history should load")
-            .expect("thread history should exist");
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRecoveryOpened { recovery_job_id: job_id, .. }
-                if job_id == recovery_job_id
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRecoveryAttached { recovery_job_id: job_id, recovery_item_id, .. }
-                if job_id == recovery_job_id && recovery_item_id == item_id
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRetryScheduled { recovery_job_id: job_id, next_run_at_unix, .. }
-                if job_id == recovery_job_id && *next_run_at_unix == timestamp + 30
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRetryAttemptStarted { recovery_job_id: job_id, attempt_number, .. }
-                if job_id == recovery_job_id && *attempt_number == 2
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRecoverySucceeded { recovery_job_id: job_id, attempt_number, .. }
-                if job_id == recovery_job_id && *attempt_number == 2
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemRecoveryExhausted { recovery_job_id: job_id, status, error_message, .. }
-                if job_id == recovery_job_id
-                    && *status == RecoveryJobStatus::Exhausted
-                    && error_message == "attempts exhausted"
-        )));
+            let history = store
+                .get_thread_history(thread_id, Some(32))
+                .await
+                .expect("thread history should load")
+                .expect("thread history should exist");
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRecoveryOpened { recovery_job_id: job_id, .. }
+                    if job_id == recovery_job_id
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRecoveryAttached { recovery_job_id: job_id, recovery_item_id, .. }
+                    if job_id == recovery_job_id && recovery_item_id == item_id
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRetryScheduled { recovery_job_id: job_id, next_run_at_unix, .. }
+                    if job_id == recovery_job_id && *next_run_at_unix == timestamp + 30
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRetryAttemptStarted { recovery_job_id: job_id, attempt_number, .. }
+                    if job_id == recovery_job_id && *attempt_number == 2
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRecoverySucceeded { recovery_job_id: job_id, attempt_number, .. }
+                    if job_id == recovery_job_id && *attempt_number == 2
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemRecoveryExhausted { recovery_job_id: job_id, status, error_message, .. }
+                    if job_id == recovery_job_id
+                        && *status == RecoveryJobStatus::Exhausted
+                        && error_message == "attempts exhausted"
+            )));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn tool_retry_lifecycle_events_round_trip_without_recovery_jobs() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_100_000;
-        let workspace_id = "ws_000000000000000199";
-        seed_observation_workspace(&store, workspace_id).await;
-        let thread_id = "thr_000000000000000199";
-        let turn_id = "turn_000000000000000199";
-        let item_id = "item_tool_retry";
-        let episode_id = "tool_retry_turn_199_1";
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_100_000;
+            let workspace_id = "ws_000000000000000199";
+            seed_observation_workspace(&store, workspace_id).await;
+            let thread_id = "thr_000000000000000199";
+            let turn_id = "turn_000000000000000199";
+            let item_id = "item_tool_retry";
+            let episode_id = "tool_retry_turn_199_1";
 
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: turn_id.to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        let budgets = vec![ToolRetryBudgetUsage {
-            kind: ToolRetryBudgetKind::Episode,
-            used: 1,
-            limit: 2,
-        }];
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: turn_id.to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            let budgets = vec![ToolRetryBudgetUsage {
+                kind: ToolRetryBudgetKind::Episode,
+                used: 1,
+                limit: 2,
+            }];
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
-        store
-            .materialize_item_tool_retry_scheduled(
-                ItemToolRetryScheduledNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::WebFetch,
-                    tool_retry_episode_id: episode_id.to_owned(),
-                    tool_name: "web_fetch".to_owned(),
-                    attempt_number: 1,
-                    error_class: ToolRetryErrorClass::Timeout,
-                    retry_hint: "retry with a smaller request".to_owned(),
-                    budgets: budgets.clone(),
-                    failure_signature_fingerprint: "sig_timeout".to_owned(),
-                    reason: "recoverable_tool_output".to_owned(),
-                },
-                timestamp + 1,
-            )
-            .await
-            .expect("tool retry scheduled should persist");
-        store
-            .materialize_item_tool_retry_resolved(
-                ItemToolRetryResolvedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::WebFetch,
-                    tool_retry_episode_id: episode_id.to_owned(),
-                    tool_name: "web_fetch".to_owned(),
-                    attempt_number: 2,
-                    resolution: ToolRetryResolution::Succeeded,
-                    budgets: budgets.clone(),
-                    reason: "successful_tool_output".to_owned(),
-                },
-                timestamp + 2,
-            )
-            .await
-            .expect("tool retry resolved should persist");
-        store
-            .materialize_item_tool_retry_exhausted(
-                ItemToolRetryExhaustedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item_id: item_id.to_owned(),
-                    item_type: TurnItemType::WebFetch,
-                    tool_retry_episode_id: episode_id.to_owned(),
-                    tool_name: "web_fetch".to_owned(),
-                    attempt_number: 3,
-                    error_class: ToolRetryErrorClass::Timeout,
-                    exhaustion_kind: ToolRetryExhaustionKind::FailureSignature,
-                    budgets: budgets.clone(),
-                    failure_signature_fingerprint: "sig_timeout".to_owned(),
-                    reason: "same_failure_signature".to_owned(),
-                },
-                timestamp + 3,
-            )
-            .await
-            .expect("tool retry exhausted should persist");
-        store
-            .materialize_turn_tool_loop_budget_exceeded(
-                TurnToolLoopBudgetExceededNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
-                    limit: 32,
-                    observed: 33,
-                    action: ToolLoopBudgetAction::ContinueInNextWindow,
-                    reason: "agent_rounds_exceeded".to_owned(),
-                },
-                timestamp + 4,
-            )
-            .await
-            .expect("tool loop budget event should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+            store
+                .materialize_item_tool_retry_scheduled(
+                    ItemToolRetryScheduledNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::WebFetch,
+                        tool_retry_episode_id: episode_id.to_owned(),
+                        tool_name: "web_fetch".to_owned(),
+                        attempt_number: 1,
+                        error_class: ToolRetryErrorClass::Timeout,
+                        retry_hint: "retry with a smaller request".to_owned(),
+                        budgets: budgets.clone(),
+                        failure_signature_fingerprint: "sig_timeout".to_owned(),
+                        reason: "recoverable_tool_output".to_owned(),
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("tool retry scheduled should persist");
+            store
+                .materialize_item_tool_retry_resolved(
+                    ItemToolRetryResolvedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::WebFetch,
+                        tool_retry_episode_id: episode_id.to_owned(),
+                        tool_name: "web_fetch".to_owned(),
+                        attempt_number: 2,
+                        resolution: ToolRetryResolution::Succeeded,
+                        budgets: budgets.clone(),
+                        reason: "successful_tool_output".to_owned(),
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .expect("tool retry resolved should persist");
+            store
+                .materialize_item_tool_retry_exhausted(
+                    ItemToolRetryExhaustedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        item_type: TurnItemType::WebFetch,
+                        tool_retry_episode_id: episode_id.to_owned(),
+                        tool_name: "web_fetch".to_owned(),
+                        attempt_number: 3,
+                        error_class: ToolRetryErrorClass::Timeout,
+                        exhaustion_kind: ToolRetryExhaustionKind::FailureSignature,
+                        budgets: budgets.clone(),
+                        failure_signature_fingerprint: "sig_timeout".to_owned(),
+                        reason: "same_failure_signature".to_owned(),
+                    },
+                    timestamp + 3,
+                )
+                .await
+                .expect("tool retry exhausted should persist");
+            store
+                .materialize_turn_tool_loop_budget_exceeded(
+                    TurnToolLoopBudgetExceededNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
+                        limit: 32,
+                        observed: 33,
+                        action: ToolLoopBudgetAction::ContinueInNextWindow,
+                        reason: "agent_rounds_exceeded".to_owned(),
+                    },
+                    timestamp + 4,
+                )
+                .await
+                .expect("tool loop budget event should persist");
 
-        let turn_items = store
-            .get_turn_item_events(thread_id, turn_id)
-            .await
-            .expect("turn items should load")
-            .expect("turn items should exist");
-        let payloads = turn_items
-            .events
-            .iter()
-            .map(|event| &event.payload)
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            payloads[0],
-            TurnItemEventPayload::ItemToolRetryScheduled {
-                tool_retry_episode_id,
-                error_class: ToolRetryErrorClass::Timeout,
-                ..
-            } if tool_retry_episode_id == episode_id
-        ));
-        assert!(matches!(
-            payloads[1],
-            TurnItemEventPayload::ItemToolRetryResolved {
-                resolution: ToolRetryResolution::Succeeded,
-                ..
-            }
-        ));
-        assert!(matches!(
-            payloads[2],
-            TurnItemEventPayload::ItemToolRetryExhausted {
-                exhaustion_kind: ToolRetryExhaustionKind::FailureSignature,
-                ..
-            }
-        ));
-        assert!(matches!(
-            payloads[3],
-            TurnItemEventPayload::TurnToolLoopBudgetExceeded {
-                action: ToolLoopBudgetAction::ContinueInNextWindow,
-                ..
-            }
-        ));
-
-        let history = store
-            .get_thread_history(thread_id, Some(16))
-            .await
-            .expect("thread history should load")
-            .expect("thread history should exist");
-        assert!(
-            history
+            let turn_items = store
+                .get_turn_item_events(thread_id, turn_id)
+                .await
+                .expect("turn items should load")
+                .expect("turn items should exist");
+            let payloads = turn_items
                 .events
-                .windows(2)
-                .all(|pair| pair[0].sequence < pair[1].sequence)
-        );
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemToolRetryScheduled {
-                tool_retry_episode_id,
-                budgets,
-                ..
-            } if tool_retry_episode_id == episode_id
-                && budgets.first().is_some_and(|budget| budget.kind == ToolRetryBudgetKind::Episode)
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemToolRetryResolved {
-                resolution: ToolRetryResolution::Succeeded,
-                ..
-            }
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::ItemToolRetryExhausted {
-                failure_signature_fingerprint,
-                ..
-            } if failure_signature_fingerprint == "sig_timeout"
-        )));
-        assert!(history.events.iter().any(|event| matches!(
-            &event.payload,
-            ThreadHistoryEventPayload::TurnToolLoopBudgetExceeded {
-                limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
-                observed: 33,
-                ..
-            }
-        )));
+                .iter()
+                .map(|event| &event.payload)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                payloads[0],
+                TurnItemEventPayload::ItemToolRetryScheduled {
+                    tool_retry_episode_id,
+                    error_class: ToolRetryErrorClass::Timeout,
+                    ..
+                } if tool_retry_episode_id == episode_id
+            ));
+            assert!(matches!(
+                payloads[1],
+                TurnItemEventPayload::ItemToolRetryResolved {
+                    resolution: ToolRetryResolution::Succeeded,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                payloads[2],
+                TurnItemEventPayload::ItemToolRetryExhausted {
+                    exhaustion_kind: ToolRetryExhaustionKind::FailureSignature,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                payloads[3],
+                TurnItemEventPayload::TurnToolLoopBudgetExceeded {
+                    action: ToolLoopBudgetAction::ContinueInNextWindow,
+                    ..
+                }
+            ));
 
-        let recovery_jobs = pioneer_entity::recovery_job::Entity::find()
-            .all(&connection)
-            .await
-            .expect("recovery job query should succeed");
-        assert!(
-            recovery_jobs.is_empty(),
-            "tool retry lifecycle must not create recovery jobs"
-        );
+            let history = store
+                .get_thread_history(thread_id, Some(16))
+                .await
+                .expect("thread history should load")
+                .expect("thread history should exist");
+            assert!(
+                history
+                    .events
+                    .windows(2)
+                    .all(|pair| pair[0].sequence < pair[1].sequence)
+            );
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemToolRetryScheduled {
+                    tool_retry_episode_id,
+                    budgets,
+                    ..
+                } if tool_retry_episode_id == episode_id
+                    && budgets.first().is_some_and(|budget| budget.kind == ToolRetryBudgetKind::Episode)
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemToolRetryResolved {
+                    resolution: ToolRetryResolution::Succeeded,
+                    ..
+                }
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::ItemToolRetryExhausted {
+                    failure_signature_fingerprint,
+                    ..
+                } if failure_signature_fingerprint == "sig_timeout"
+            )));
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                ThreadHistoryEventPayload::TurnToolLoopBudgetExceeded {
+                    limit_kind: ToolLoopBudgetLimitKind::AgentRounds,
+                    observed: 33,
+                    ..
+                }
+            )));
+
+            let recovery_jobs = pioneer_entity::recovery_job::Entity::find()
+                .all(&connection)
+                .await
+                .expect("recovery job query should succeed");
+            assert!(
+                recovery_jobs.is_empty(),
+                "tool retry lifecycle must not create recovery jobs"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn replace_and_find_turn_skill_bindings_round_trip() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let turn_id = "turn_000000000000000001";
+            let store = CrudStore::new(connection);
+            let turn_id = "turn_000000000000000001";
 
-        let first = vec![
-            TurnSkillBindingRecord {
-                skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
-                skill_owner: Some("pioneer".to_owned()),
-                skill_slug: "duplicate-label".to_owned(),
-                skill_version: Some("1.0.0".to_owned()),
-                fingerprint: "fp-alpha".to_owned(),
-                source_kind: "registry".to_owned(),
+            let first = vec![
+                TurnSkillBindingRecord {
+                    skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
+                    skill_owner: Some("pioneer".to_owned()),
+                    skill_slug: "duplicate-label".to_owned(),
+                    skill_version: Some("1.0.0".to_owned()),
+                    fingerprint: "fp-alpha".to_owned(),
+                    source_kind: "registry".to_owned(),
+                    resolved_reason: "explicit_composer_capability".to_owned(),
+                },
+                TurnSkillBindingRecord {
+                    skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
+                    skill_owner: Some("pioneer".to_owned()),
+                    skill_slug: "duplicate-label".to_owned(),
+                    skill_version: None,
+                    fingerprint: "fp-beta".to_owned(),
+                    source_kind: "user".to_owned(),
+                    resolved_reason: "path_match".to_owned(),
+                },
+            ];
+
+            store
+                .replace_turn_skill_bindings(turn_id, first.as_slice(), 1_700_000_000)
+                .await
+                .expect("initial turn skill bindings should persist");
+
+            let first_read = store
+                .find_turn_skill_bindings(turn_id)
+                .await
+                .expect("must read persisted turn skill bindings");
+            assert_eq!(first_read, first);
+
+            let second = vec![TurnSkillBindingRecord {
+                skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
+                skill_owner: None,
+                skill_slug: "gamma-skill".to_owned(),
+                skill_version: Some("2.1.0".to_owned()),
+                fingerprint: "fp-gamma".to_owned(),
+                source_kind: "system".to_owned(),
                 resolved_reason: "explicit_composer_capability".to_owned(),
-            },
-            TurnSkillBindingRecord {
-                skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
-                skill_owner: Some("pioneer".to_owned()),
-                skill_slug: "duplicate-label".to_owned(),
-                skill_version: None,
-                fingerprint: "fp-beta".to_owned(),
-                source_kind: "user".to_owned(),
-                resolved_reason: "path_match".to_owned(),
-            },
-        ];
+            }];
 
-        store
-            .replace_turn_skill_bindings(turn_id, first.as_slice(), 1_700_000_000)
-            .await
-            .expect("initial turn skill bindings should persist");
+            store
+                .replace_turn_skill_bindings(turn_id, second.as_slice(), 1_700_000_100)
+                .await
+                .expect("second replacement should overwrite prior bindings");
 
-        let first_read = store
-            .find_turn_skill_bindings(turn_id)
-            .await
-            .expect("must read persisted turn skill bindings");
-        assert_eq!(first_read, first);
-
-        let second = vec![TurnSkillBindingRecord {
-            skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
-            skill_owner: None,
-            skill_slug: "gamma-skill".to_owned(),
-            skill_version: Some("2.1.0".to_owned()),
-            fingerprint: "fp-gamma".to_owned(),
-            source_kind: "system".to_owned(),
-            resolved_reason: "explicit_composer_capability".to_owned(),
-        }];
-
-        store
-            .replace_turn_skill_bindings(turn_id, second.as_slice(), 1_700_000_100)
-            .await
-            .expect("second replacement should overwrite prior bindings");
-
-        let second_read = store
-            .find_turn_skill_bindings(turn_id)
-            .await
-            .expect("must read replaced turn skill bindings");
-        assert_eq!(second_read, second);
+            let second_read = store
+                .find_turn_skill_bindings(turn_id)
+                .await
+                .expect("must read replaced turn skill bindings");
+            assert_eq!(second_read, second);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -60918,243 +60957,246 @@ mod tests {
 
     #[tokio::test]
     async fn skill_pack_child_transactions_preserve_membership_and_order() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let parent = skill_pack_record('P', "initial", "workspace-one");
-        let zeta = pack_skill_record('Z', &parent, "zeta");
-        let alpha = pack_skill_record('A', &parent, "alpha");
-        store
-            .insert_skill_pack_installation_with_children(&parent, &[zeta.clone(), alpha.clone()])
-            .await
-            .expect("parent and children should insert atomically");
-
-        let ordered = store
-            .list_skill_installations_for_pack("workspace-one", &parent.pack_id)
-            .await
-            .expect("pack children should list");
-        assert_eq!(
-            ordered
-                .iter()
-                .map(|child| child.pack_member_key.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some("alpha"), Some("zeta")]
-        );
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let parent = skill_pack_record('P', "initial", "workspace-one");
+            let zeta = pack_skill_record('Z', &parent, "zeta");
+            let alpha = pack_skill_record('A', &parent, "alpha");
             store
-                .list_skill_installations_for_pack("workspace-two", &parent.pack_id)
-                .await
-                .expect("cross-scope child query should succeed")
-                .is_empty()
-        );
-
-        let mut retained = alpha.clone();
-        retained.fingerprint = "updated-alpha".to_owned();
-        retained.updated_at_unix = 1_700_000_100;
-        let beta = pack_skill_record('B', &parent, "beta");
-        let mut renamed_parent = parent.clone();
-        renamed_parent.name = "renamed".to_owned();
-        renamed_parent.updated_at_unix = 1_700_000_100;
-        let diff = SkillPackChildDiff {
-            retained: vec![retained.clone()],
-            added: vec![beta.clone()],
-            removed: vec![zeta.skill_id.clone()],
-        };
-        assert!(
-            store
-                .update_skill_pack_installation_with_child_diff(&renamed_parent, &diff)
-                .await
-                .expect("pack diff should apply")
-        );
-
-        let updated = store
-            .list_skill_installations_for_pack("workspace-one", &parent.pack_id)
-            .await
-            .expect("updated pack children should list");
-        assert_eq!(updated.len(), 2);
-        assert_eq!(updated[0].skill_id, alpha.skill_id);
-        assert_eq!(updated[0].pack_id, Some(parent.pack_id.clone()));
-        assert_eq!(updated[0].pack_member_key.as_deref(), Some("alpha"));
-        assert_eq!(updated[0].fingerprint, "updated-alpha");
-        assert_eq!(updated[1].skill_id, beta.skill_id);
-        assert_eq!(
-            store
-                .find_skill_pack_installation("workspace-one", &parent.pack_id)
-                .await
-                .expect("updated parent should query")
-                .expect("updated parent should exist")
-                .name,
-            "renamed"
-        );
-
-        assert!(
-            store
-                .update_skill_installation(
-                    &alpha.skill_id,
-                    &SkillInstallationPatch {
-                        pack_id: Some(None),
-                        pack_member_key: Some(None),
-                        ..Default::default()
-                    },
-                    1_700_000_200,
+                .insert_skill_pack_installation_with_children(
+                    &parent,
+                    &[zeta.clone(), alpha.clone()],
                 )
                 .await
-                .is_err()
-        );
-        let unchanged = store
-            .find_skill_installation(&alpha.skill_id)
-            .await
-            .expect("retained child should query")
-            .expect("retained child should exist");
-        assert_eq!(unchanged.pack_id, Some(parent.pack_id.clone()));
-        assert_eq!(unchanged.pack_member_key.as_deref(), Some("alpha"));
-        assert!(
-            store
-                .update_skill_installation(
-                    &alpha.skill_id,
-                    &SkillInstallationPatch {
-                        source_kind: Some("registry".to_owned()),
-                        ..Default::default()
-                    },
-                    1_700_000_201,
-                )
+                .expect("parent and children should insert atomically");
+
+            let ordered = store
+                .list_skill_installations_for_pack("workspace-one", &parent.pack_id)
                 .await
-                .is_err()
-        );
-        assert_eq!(
-            store
+                .expect("pack children should list");
+            assert_eq!(
+                ordered
+                    .iter()
+                    .map(|child| child.pack_member_key.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![Some("alpha"), Some("zeta")]
+            );
+            assert!(
+                store
+                    .list_skill_installations_for_pack("workspace-two", &parent.pack_id)
+                    .await
+                    .expect("cross-scope child query should succeed")
+                    .is_empty()
+            );
+
+            let mut retained = alpha.clone();
+            retained.fingerprint = "updated-alpha".to_owned();
+            retained.updated_at_unix = 1_700_000_100;
+            let beta = pack_skill_record('B', &parent, "beta");
+            let mut renamed_parent = parent.clone();
+            renamed_parent.name = "renamed".to_owned();
+            renamed_parent.updated_at_unix = 1_700_000_100;
+            let diff = SkillPackChildDiff {
+                retained: vec![retained.clone()],
+                added: vec![beta.clone()],
+                removed: vec![zeta.skill_id.clone()],
+            };
+            assert!(
+                store
+                    .update_skill_pack_installation_with_child_diff(&renamed_parent, &diff)
+                    .await
+                    .expect("pack diff should apply")
+            );
+
+            let updated = store
+                .list_skill_installations_for_pack("workspace-one", &parent.pack_id)
+                .await
+                .expect("updated pack children should list");
+            assert_eq!(updated.len(), 2);
+            assert_eq!(updated[0].skill_id, alpha.skill_id);
+            assert_eq!(updated[0].pack_id, Some(parent.pack_id.clone()));
+            assert_eq!(updated[0].pack_member_key.as_deref(), Some("alpha"));
+            assert_eq!(updated[0].fingerprint, "updated-alpha");
+            assert_eq!(updated[1].skill_id, beta.skill_id);
+            assert_eq!(
+                store
+                    .find_skill_pack_installation("workspace-one", &parent.pack_id)
+                    .await
+                    .expect("updated parent should query")
+                    .expect("updated parent should exist")
+                    .name,
+                "renamed"
+            );
+
+            assert!(
+                store
+                    .update_skill_installation(
+                        &alpha.skill_id,
+                        &SkillInstallationPatch {
+                            pack_id: Some(None),
+                            pack_member_key: Some(None),
+                            ..Default::default()
+                        },
+                        1_700_000_200,
+                    )
+                    .await
+                    .is_err()
+            );
+            let unchanged = store
                 .find_skill_installation(&alpha.skill_id)
                 .await
-                .expect("retained child should query after rejected source change")
-                .expect("retained child should exist after rejected source change")
-                .source_kind,
-            parent.source_kind
-        );
+                .expect("retained child should query")
+                .expect("retained child should exist");
+            assert_eq!(unchanged.pack_id, Some(parent.pack_id.clone()));
+            assert_eq!(unchanged.pack_member_key.as_deref(), Some("alpha"));
+            assert!(
+                store
+                    .update_skill_installation(
+                        &alpha.skill_id,
+                        &SkillInstallationPatch {
+                            source_kind: Some("registry".to_owned()),
+                            ..Default::default()
+                        },
+                        1_700_000_201,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .find_skill_installation(&alpha.skill_id)
+                    .await
+                    .expect("retained child should query after rejected source change")
+                    .expect("retained child should exist after rejected source change")
+                    .source_kind,
+                parent.source_kind
+            );
 
-        let mut standalone = pack_skill_record('S', &parent, "standalone");
-        standalone.pack_id = None;
-        standalone.pack_member_key = None;
-        store
-            .insert_skill_installation(&standalone, 1_700_000_200)
-            .await
-            .expect("insert standalone skill");
-        assert!(
+            let mut standalone = pack_skill_record('S', &parent, "standalone");
+            standalone.pack_id = None;
+            standalone.pack_member_key = None;
             store
-                .update_skill_installation(
-                    &standalone.skill_id,
-                    &SkillInstallationPatch {
-                        pack_id: Some(Some(parent.pack_id.clone())),
-                        pack_member_key: Some(Some("adopted".to_owned())),
-                        ..Default::default()
-                    },
-                    1_700_000_300,
-                )
+                .insert_skill_installation(&standalone, 1_700_000_200)
                 .await
-                .is_err()
-        );
-        let standalone = store
-            .find_skill_installation(&standalone.skill_id)
-            .await
-            .expect("standalone skill should query")
-            .expect("standalone skill should remain");
-        assert_eq!(standalone.pack_id, None);
-        assert_eq!(standalone.pack_member_key, None);
+                .expect("insert standalone skill");
+            assert!(
+                store
+                    .update_skill_installation(
+                        &standalone.skill_id,
+                        &SkillInstallationPatch {
+                            pack_id: Some(Some(parent.pack_id.clone())),
+                            pack_member_key: Some(Some("adopted".to_owned())),
+                            ..Default::default()
+                        },
+                        1_700_000_300,
+                    )
+                    .await
+                    .is_err()
+            );
+            let standalone = store
+                .find_skill_installation(&standalone.skill_id)
+                .await
+                .expect("standalone skill should query")
+                .expect("standalone skill should remain");
+            assert_eq!(standalone.pack_id, None);
+            assert_eq!(standalone.pack_member_key, None);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn skill_pack_transactions_reject_cross_scope_and_delete_children_before_parent() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let parent = skill_pack_record('Q', "scoped", "workspace-one");
-        let mut invalid_child = pack_skill_record('X', &parent, "member");
-        invalid_child.scope_key = "workspace-two".to_owned();
-        assert!(
-            store
-                .insert_skill_pack_installation_with_children(&parent, &[invalid_child])
-                .await
-                .is_err()
-        );
-        assert!(
-            store
-                .find_skill_pack_installation("workspace-one", &parent.pack_id)
-                .await
-                .expect("rolled-back parent lookup should succeed")
-                .is_none()
-        );
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let parent = skill_pack_record('Q', "scoped", "workspace-one");
+            let mut invalid_child = pack_skill_record('X', &parent, "member");
+            invalid_child.scope_key = "workspace-two".to_owned();
+            assert!(
+                store
+                    .insert_skill_pack_installation_with_children(&parent, &[invalid_child])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .find_skill_pack_installation("workspace-one", &parent.pack_id)
+                    .await
+                    .expect("rolled-back parent lookup should succeed")
+                    .is_none()
+            );
 
-        let child = pack_skill_record('Y', &parent, "member");
-        store
-            .insert_skill_pack_installation_with_children(&parent, &[child.clone()])
-            .await
-            .expect("valid pack should insert");
-        let mut invalid_retained = child.clone();
-        invalid_retained.scope_key = "workspace-two".to_owned();
-        let mut attempted_parent = parent.clone();
-        attempted_parent.name = "must-not-commit".to_owned();
-        assert!(
+            let child = pack_skill_record('Y', &parent, "member");
             store
-                .update_skill_pack_installation_with_child_diff(
-                    &attempted_parent,
-                    &SkillPackChildDiff {
-                        retained: vec![invalid_retained],
-                        added: Vec::new(),
-                        removed: Vec::new(),
-                    },
-                )
+                .insert_skill_pack_installation_with_children(&parent, &[child.clone()])
                 .await
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .find_skill_pack_installation("workspace-one", &parent.pack_id)
-                .await
-                .expect("parent should query after rejected update")
-                .expect("parent should remain after rejected update")
-                .name,
-            "scoped"
-        );
-        assert!(
-            !store
-                .delete_skill_pack_installation_with_children("workspace-two", &parent.pack_id,)
-                .await
-                .expect("wrong-scope deletion should be a no-op")
-        );
-        assert!(
-            store
-                .find_skill_installation(&child.skill_id)
-                .await
-                .expect("child should remain after wrong-scope delete")
-                .is_some()
-        );
-        assert!(
-            store
-                .delete_skill_pack_installation_with_children("workspace-one", &parent.pack_id,)
-                .await
-                .expect("pack removal should succeed")
-        );
-        assert!(
-            store
-                .find_skill_installation(&child.skill_id)
-                .await
-                .expect("removed child lookup should succeed")
-                .is_none()
-        );
-        assert!(
-            store
-                .find_skill_pack_installation("workspace-one", &parent.pack_id)
-                .await
-                .expect("removed parent lookup should succeed")
-                .is_none()
-        );
+                .expect("valid pack should insert");
+            let mut invalid_retained = child.clone();
+            invalid_retained.scope_key = "workspace-two".to_owned();
+            let mut attempted_parent = parent.clone();
+            attempted_parent.name = "must-not-commit".to_owned();
+            assert!(
+                store
+                    .update_skill_pack_installation_with_child_diff(
+                        &attempted_parent,
+                        &SkillPackChildDiff {
+                            retained: vec![invalid_retained],
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .find_skill_pack_installation("workspace-one", &parent.pack_id)
+                    .await
+                    .expect("parent should query after rejected update")
+                    .expect("parent should remain after rejected update")
+                    .name,
+                "scoped"
+            );
+            assert!(
+                !store
+                    .delete_skill_pack_installation_with_children("workspace-two", &parent.pack_id,)
+                    .await
+                    .expect("wrong-scope deletion should be a no-op")
+            );
+            assert!(
+                store
+                    .find_skill_installation(&child.skill_id)
+                    .await
+                    .expect("child should remain after wrong-scope delete")
+                    .is_some()
+            );
+            assert!(
+                store
+                    .delete_skill_pack_installation_with_children("workspace-one", &parent.pack_id,)
+                    .await
+                    .expect("pack removal should succeed")
+            );
+            assert!(
+                store
+                    .find_skill_installation(&child.skill_id)
+                    .await
+                    .expect("removed child lookup should succeed")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .find_skill_pack_installation("workspace-one", &parent.pack_id)
+                    .await
+                    .expect("removed parent lookup should succeed")
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -61574,132 +61616,132 @@ mod tests {
 
     #[tokio::test]
     async fn skill_installation_mutations_target_exact_id_with_duplicate_metadata() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
+            let store = CrudStore::new(connection);
 
-        let first = SkillInstallationRecord {
-            skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
-            owner: Some("pioneer".to_owned()),
-            slug: "agent-browser".to_owned(),
-            version: Some("1.0.0".to_owned()),
-            source_kind: "registry".to_owned(),
-            scope_key: "ws_one".to_owned(),
-            source_ref: "github.com/example/agent-browser".to_owned(),
-            install_path: "/tmp/skills/pioneer/agent-browser".to_owned(),
-            trust_level: "verified".to_owned(),
-            fingerprint: "fp-1".to_owned(),
-            updated_at_unix: 1_700_000_000,
-            pack_id: None,
-            pack_member_key: None,
-        };
-        store
-            .insert_skill_installation(&first, 1_700_000_000)
-            .await
-            .expect("first insert");
-
-        let second = SkillInstallationRecord {
-            skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
-            ..first.clone()
-        };
-        store
-            .insert_skill_installation(&second, 1_700_000_100)
-            .await
-            .expect("duplicate-metadata insert");
-
-        let rows = store
-            .list_skill_installations()
-            .await
-            .expect("list skill installations");
-        assert_eq!(rows.len(), 2);
-
-        let patch = SkillInstallationPatch {
-            version: Some(Some("1.1.0".to_owned())),
-            fingerprint: Some("fp-updated".to_owned()),
-            ..Default::default()
-        };
-        assert!(
+            let first = SkillInstallationRecord {
+                skill_id: SkillId::new("A".repeat(21)).expect("valid skill id"),
+                owner: Some("pioneer".to_owned()),
+                slug: "agent-browser".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                source_kind: "registry".to_owned(),
+                scope_key: "ws_one".to_owned(),
+                source_ref: "github.com/example/agent-browser".to_owned(),
+                install_path: "/tmp/skills/pioneer/agent-browser".to_owned(),
+                trust_level: "verified".to_owned(),
+                fingerprint: "fp-1".to_owned(),
+                updated_at_unix: 1_700_000_000,
+                pack_id: None,
+                pack_member_key: None,
+            };
             store
-                .update_skill_installation(&first.skill_id, &patch, 1_700_000_200)
+                .insert_skill_installation(&first, 1_700_000_000)
                 .await
-                .expect("exact update")
-        );
+                .expect("first insert");
 
-        let updated = store
-            .find_skill_installation(&first.skill_id)
-            .await
-            .expect("find updated row")
-            .expect("updated row exists");
-        let untouched = store
-            .find_skill_installation(&second.skill_id)
-            .await
-            .expect("find duplicate row")
-            .expect("duplicate row exists");
-        assert_eq!(updated.fingerprint, "fp-updated");
-        assert_eq!(updated.version.as_deref(), Some("1.1.0"));
-        assert_eq!(untouched.fingerprint, "fp-1");
-
-        assert!(
+            let second = SkillInstallationRecord {
+                skill_id: SkillId::new("B".repeat(21)).expect("valid skill id"),
+                ..first.clone()
+            };
             store
-                .delete_skill_installation(&first.skill_id)
+                .insert_skill_installation(&second, 1_700_000_100)
                 .await
-                .expect("exact delete")
-        );
-        assert!(
-            store
+                .expect("duplicate-metadata insert");
+
+            let rows = store
+                .list_skill_installations()
+                .await
+                .expect("list skill installations");
+            assert_eq!(rows.len(), 2);
+
+            let patch = SkillInstallationPatch {
+                version: Some(Some("1.1.0".to_owned())),
+                fingerprint: Some("fp-updated".to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                store
+                    .update_skill_installation(&first.skill_id, &patch, 1_700_000_200)
+                    .await
+                    .expect("exact update")
+            );
+
+            let updated = store
                 .find_skill_installation(&first.skill_id)
                 .await
-                .expect("find deleted row")
-                .is_none()
-        );
-        assert!(
-            store
+                .expect("find updated row")
+                .expect("updated row exists");
+            let untouched = store
                 .find_skill_installation(&second.skill_id)
                 .await
-                .expect("find surviving duplicate")
-                .is_some()
-        );
+                .expect("find duplicate row")
+                .expect("duplicate row exists");
+            assert_eq!(updated.fingerprint, "fp-updated");
+            assert_eq!(updated.version.as_deref(), Some("1.1.0"));
+            assert_eq!(untouched.fingerprint, "fp-1");
+
+            assert!(
+                store
+                    .delete_skill_installation(&first.skill_id)
+                    .await
+                    .expect("exact delete")
+            );
+            assert!(
+                store
+                    .find_skill_installation(&first.skill_id)
+                    .await
+                    .expect("find deleted row")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .find_skill_installation(&second.skill_id)
+                    .await
+                    .expect("find surviving duplicate")
+                    .is_some()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn insertion_rejects_duplicate_skill_id_without_retargeting_metadata() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let record = SkillInstallationRecord {
-            skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
-            owner: None,
-            slug: "same".to_owned(),
-            version: None,
-            source_kind: "user".to_owned(),
-            scope_key: "ws_one".to_owned(),
-            source_ref: "upload:first".to_owned(),
-            install_path: "/tmp/skills/C/same".to_owned(),
-            trust_level: "community".to_owned(),
-            fingerprint: "fp".to_owned(),
-            updated_at_unix: 1_700_000_000,
-            pack_id: None,
-            pack_member_key: None,
-        };
-        store
-            .insert_skill_installation(&record, 1_700_000_000)
-            .await
-            .expect("first insert");
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let record = SkillInstallationRecord {
+                skill_id: SkillId::new("C".repeat(21)).expect("valid skill id"),
+                owner: None,
+                slug: "same".to_owned(),
+                version: None,
+                source_kind: "user".to_owned(),
+                scope_key: "ws_one".to_owned(),
+                source_ref: "upload:first".to_owned(),
+                install_path: "/tmp/skills/C/same".to_owned(),
+                trust_level: "community".to_owned(),
+                fingerprint: "fp".to_owned(),
+                updated_at_unix: 1_700_000_000,
+                pack_id: None,
+                pack_member_key: None,
+            };
             store
-                .insert_skill_installation(&record, 1_700_000_001)
+                .insert_skill_installation(&record, 1_700_000_000)
                 .await
-                .is_err()
-        );
+                .expect("first insert");
+            assert!(
+                store
+                    .insert_skill_installation(&record, 1_700_000_001)
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -62085,104 +62127,104 @@ mod tests {
 
     #[tokio::test]
     async fn turn_mcp_binding_repositories_round_trip_all_digest_fields() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
+            let store = CrudStore::new(connection);
 
-        let beta_updated_id = "installed-beta".to_owned();
+            let beta_updated_id = "installed-beta".to_owned();
 
-        let turn_bindings = vec![TurnMcpBindingRecord {
-            server_installation_id: beta_updated_id.clone(),
-            server_name: "beta".to_owned(),
-            raw_tool_name: "send".to_owned(),
-            callable_name: "mcp_beta_send".to_owned(),
-            canonical_callable_name: "mcp_beta_send".to_owned(),
-            provider_callable_name: "mcp__pioneer__mcp_beta_send".to_owned(),
-            catalog_version: "catalog-v1".to_owned(),
-            fingerprint: "fingerprint-beta-updated".to_owned(),
-            canonical_schema_fingerprint: "canonical-schema-v1".to_owned(),
-            provider_schema_fingerprint: "provider-schema-v1".to_owned(),
-            annotations_json: r#"{"readOnlyHint":true}"#.to_owned(),
-            annotations_digest: "annotations-v1".to_owned(),
-            effective_timeout_ms: 20_000,
-            runtime_generation: 7,
-            projection_activation_generation: 2,
-            selection_reason: "explicit_composer_capability".to_owned(),
-            capability_id: Some("mcp:workspace:beta:send".to_owned()),
-        }];
-        store
-            .replace_turn_mcp_bindings("turn_mcp_roundtrip", &turn_bindings, 1_700_000_005)
-            .await
-            .expect("MCP turn bindings replace should succeed");
-        let read_bindings = store
-            .list_turn_mcp_bindings("turn_mcp_roundtrip")
-            .await
-            .expect("MCP turn bindings list should succeed");
-        assert_eq!(read_bindings, turn_bindings);
+            let turn_bindings = vec![TurnMcpBindingRecord {
+                server_installation_id: beta_updated_id.clone(),
+                server_name: "beta".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                callable_name: "mcp_beta_send".to_owned(),
+                canonical_callable_name: "mcp_beta_send".to_owned(),
+                provider_callable_name: "mcp__pioneer__mcp_beta_send".to_owned(),
+                catalog_version: "catalog-v1".to_owned(),
+                fingerprint: "fingerprint-beta-updated".to_owned(),
+                canonical_schema_fingerprint: "canonical-schema-v1".to_owned(),
+                provider_schema_fingerprint: "provider-schema-v1".to_owned(),
+                annotations_json: r#"{"readOnlyHint":true}"#.to_owned(),
+                annotations_digest: "annotations-v1".to_owned(),
+                effective_timeout_ms: 20_000,
+                runtime_generation: 7,
+                projection_activation_generation: 2,
+                selection_reason: "explicit_composer_capability".to_owned(),
+                capability_id: Some("mcp:workspace:beta:send".to_owned()),
+            }];
+            store
+                .replace_turn_mcp_bindings("turn_mcp_roundtrip", &turn_bindings, 1_700_000_005)
+                .await
+                .expect("MCP turn bindings replace should succeed");
+            let read_bindings = store
+                .list_turn_mcp_bindings("turn_mcp_roundtrip")
+                .await
+                .expect("MCP turn bindings list should succeed");
+            assert_eq!(read_bindings, turn_bindings);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn skill_audit_event_persistence_orders_by_created_at() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let turn_id = "turn_000000000000000077";
+            let store = CrudStore::new(connection);
+            let turn_id = "turn_000000000000000077";
 
-        let older = SkillAuditEventRecord {
-            turn_id: Some(turn_id.to_owned()),
-            skill_id: SkillId::new("E".repeat(21)).expect("valid skill id"),
-            skill_owner: Some("pioneer".to_owned()),
-            skill_slug: "agent-browser".to_owned(),
-            source_kind: "registry".to_owned(),
-            action: "resolve_blocked".to_owned(),
-            decision: "blocked".to_owned(),
-            reason_code: Some("dependency_missing".to_owned()),
-            details_json: "{\"reason\":\"dependency_missing\"}".to_owned(),
-            created_at_unix: 1_700_000_000,
-        };
-        let newer = SkillAuditEventRecord {
-            turn_id: Some(turn_id.to_owned()),
-            skill_id: older.skill_id.clone(),
-            skill_owner: older.skill_owner.clone(),
-            skill_slug: older.skill_slug.clone(),
-            source_kind: "registry".to_owned(),
-            action: "runtime_blocked".to_owned(),
-            decision: "blocked".to_owned(),
-            reason_code: Some("runtime.dependency_missing".to_owned()),
-            details_json: "{\"reason\":\"runtime.dependency_missing\"}".to_owned(),
-            created_at_unix: 1_700_000_100,
-        };
+            let older = SkillAuditEventRecord {
+                turn_id: Some(turn_id.to_owned()),
+                skill_id: SkillId::new("E".repeat(21)).expect("valid skill id"),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "agent-browser".to_owned(),
+                source_kind: "registry".to_owned(),
+                action: "resolve_blocked".to_owned(),
+                decision: "blocked".to_owned(),
+                reason_code: Some("dependency_missing".to_owned()),
+                details_json: "{\"reason\":\"dependency_missing\"}".to_owned(),
+                created_at_unix: 1_700_000_000,
+            };
+            let newer = SkillAuditEventRecord {
+                turn_id: Some(turn_id.to_owned()),
+                skill_id: older.skill_id.clone(),
+                skill_owner: older.skill_owner.clone(),
+                skill_slug: older.skill_slug.clone(),
+                source_kind: "registry".to_owned(),
+                action: "runtime_blocked".to_owned(),
+                decision: "blocked".to_owned(),
+                reason_code: Some("runtime.dependency_missing".to_owned()),
+                details_json: "{\"reason\":\"runtime.dependency_missing\"}".to_owned(),
+                created_at_unix: 1_700_000_100,
+            };
 
-        store
-            .append_skill_audit_event_records(turn_id, &[older.clone(), newer.clone()])
-            .await
-            .expect("append audit events");
+            store
+                .append_skill_audit_event_records(turn_id, &[older.clone(), newer.clone()])
+                .await
+                .expect("append audit events");
 
-        let rows = store
-            .list_turn_skill_audit_event_records(turn_id)
-            .await
-            .expect("list turn audit events");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].action, older.action);
-        assert_eq!(rows[1].action, newer.action);
+            let rows = store
+                .list_turn_skill_audit_event_records(turn_id)
+                .await
+                .expect("list turn audit events");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].action, older.action);
+            assert_eq!(rows[1].action, newer.action);
 
-        let timeline = store
-            .list_skill_audit_event_records(&older.skill_id, 16)
-            .await
-            .expect("list audit timeline");
-        assert_eq!(timeline.len(), 2);
-        assert_eq!(timeline[0].action, newer.action);
-        assert_eq!(timeline[1].action, older.action);
+            let timeline = store
+                .list_skill_audit_event_records(&older.skill_id, 16)
+                .await
+                .expect("list audit timeline");
+            assert_eq!(timeline.len(), 2);
+            assert_eq!(timeline[0].action, newer.action);
+            assert_eq!(timeline[1].action, older.action);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -62278,660 +62320,669 @@ mod tests {
 
     #[tokio::test]
     async fn skill_history_survives_exact_installation_delete() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let skill_id = SkillId::new("G".repeat(21)).expect("valid skill id");
-        let turn_id = "turn_000000000000000088";
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let skill_id = SkillId::new("G".repeat(21)).expect("valid skill id");
+            let turn_id = "turn_000000000000000088";
 
-        store
-            .insert_skill_installation(
-                &SkillInstallationRecord {
-                    skill_id: skill_id.clone(),
-                    owner: Some("pioneer".to_owned()),
-                    slug: "historical".to_owned(),
-                    version: Some("1.0.0".to_owned()),
-                    source_kind: "user".to_owned(),
-                    scope_key: "ws_history".to_owned(),
-                    source_ref: "upload:history".to_owned(),
-                    install_path: "/tmp/skills/G/historical".to_owned(),
-                    trust_level: "community".to_owned(),
-                    fingerprint: "fp-history".to_owned(),
-                    updated_at_unix: 1_700_000_000,
-                    pack_id: None,
-                    pack_member_key: None,
-                },
-                1_700_000_000,
-            )
-            .await
-            .expect("insert active installation");
-
-        let binding = TurnSkillBindingRecord {
-            skill_id: skill_id.clone(),
-            skill_owner: Some("pioneer".to_owned()),
-            skill_slug: "historical".to_owned(),
-            skill_version: Some("1.0.0".to_owned()),
-            fingerprint: "fp-history".to_owned(),
-            source_kind: "user".to_owned(),
-            resolved_reason: "explicit_composer_capability".to_owned(),
-        };
-        store
-            .replace_turn_skill_bindings(turn_id, &[binding.clone()], 1_700_000_001)
-            .await
-            .expect("insert binding history");
-
-        let audit = SkillAuditEventRecord {
-            turn_id: Some(turn_id.to_owned()),
-            skill_id: skill_id.clone(),
-            skill_owner: Some("pioneer".to_owned()),
-            skill_slug: "historical".to_owned(),
-            source_kind: "user".to_owned(),
-            action: "resolve".to_owned(),
-            decision: "accepted".to_owned(),
-            reason_code: None,
-            details_json: "{}".to_owned(),
-            created_at_unix: 1_700_000_002,
-        };
-        store
-            .append_skill_audit_event_records(turn_id, &[audit.clone()])
-            .await
-            .expect("insert audit history");
-
-        let dependency = SkillDependencySnapshotRecord {
-            turn_id: Some(turn_id.to_owned()),
-            skill_id: skill_id.clone(),
-            skill_owner: Some("pioneer".to_owned()),
-            skill_slug: "historical".to_owned(),
-            source_kind: "user".to_owned(),
-            diagnostics_json: "[]".to_owned(),
-            created_at_unix: 1_700_000_003,
-        };
-        store
-            .insert_skill_dependency_snapshot_record(&dependency)
-            .await
-            .expect("insert dependency history");
-
-        assert!(
             store
-                .delete_skill_installation(&skill_id)
+                .insert_skill_installation(
+                    &SkillInstallationRecord {
+                        skill_id: skill_id.clone(),
+                        owner: Some("pioneer".to_owned()),
+                        slug: "historical".to_owned(),
+                        version: Some("1.0.0".to_owned()),
+                        source_kind: "user".to_owned(),
+                        scope_key: "ws_history".to_owned(),
+                        source_ref: "upload:history".to_owned(),
+                        install_path: "/tmp/skills/G/historical".to_owned(),
+                        trust_level: "community".to_owned(),
+                        fingerprint: "fp-history".to_owned(),
+                        updated_at_unix: 1_700_000_000,
+                        pack_id: None,
+                        pack_member_key: None,
+                    },
+                    1_700_000_000,
+                )
                 .await
-                .expect("delete active installation")
-        );
-        assert_eq!(
+                .expect("insert active installation");
+
+            let binding = TurnSkillBindingRecord {
+                skill_id: skill_id.clone(),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "historical".to_owned(),
+                skill_version: Some("1.0.0".to_owned()),
+                fingerprint: "fp-history".to_owned(),
+                source_kind: "user".to_owned(),
+                resolved_reason: "explicit_composer_capability".to_owned(),
+            };
             store
-                .find_turn_skill_bindings(turn_id)
+                .replace_turn_skill_bindings(turn_id, &[binding.clone()], 1_700_000_001)
                 .await
-                .expect("read binding history"),
-            vec![binding]
-        );
-        assert_eq!(
+                .expect("insert binding history");
+
+            let audit = SkillAuditEventRecord {
+                turn_id: Some(turn_id.to_owned()),
+                skill_id: skill_id.clone(),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "historical".to_owned(),
+                source_kind: "user".to_owned(),
+                action: "resolve".to_owned(),
+                decision: "accepted".to_owned(),
+                reason_code: None,
+                details_json: "{}".to_owned(),
+                created_at_unix: 1_700_000_002,
+            };
             store
-                .list_skill_audit_event_records(&skill_id, 16)
+                .append_skill_audit_event_records(turn_id, &[audit.clone()])
                 .await
-                .expect("read audit history"),
-            vec![audit]
-        );
-        assert_eq!(
+                .expect("insert audit history");
+
+            let dependency = SkillDependencySnapshotRecord {
+                turn_id: Some(turn_id.to_owned()),
+                skill_id: skill_id.clone(),
+                skill_owner: Some("pioneer".to_owned()),
+                skill_slug: "historical".to_owned(),
+                source_kind: "user".to_owned(),
+                diagnostics_json: "[]".to_owned(),
+                created_at_unix: 1_700_000_003,
+            };
             store
-                .list_turn_skill_dependency_snapshot_records(turn_id)
+                .insert_skill_dependency_snapshot_record(&dependency)
                 .await
-                .expect("read dependency history"),
-            vec![dependency]
-        );
+                .expect("insert dependency history");
+
+            assert!(
+                store
+                    .delete_skill_installation(&skill_id)
+                    .await
+                    .expect("delete active installation")
+            );
+            assert_eq!(
+                store
+                    .find_turn_skill_bindings(turn_id)
+                    .await
+                    .expect("read binding history"),
+                vec![binding]
+            );
+            assert_eq!(
+                store
+                    .list_skill_audit_event_records(&skill_id, 16)
+                    .await
+                    .expect("read audit history"),
+                vec![audit]
+            );
+            assert_eq!(
+                store
+                    .list_turn_skill_dependency_snapshot_records(turn_id)
+                    .await
+                    .expect("read dependency history"),
+                vec![dependency]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn workspace_skill_policy_upsert_and_delete_round_trip() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
+            let store = CrudStore::new(connection);
 
-        let first = WorkspaceSkillPolicyRecord {
-            id: generate_id(21),
-            workspace_id: "ws_000000000000000001".to_owned(),
-            skill_id: SkillId::new("D".repeat(21)).expect("valid bundled skill id"),
-            enabled: Some(false),
-            allow_implicit_invocation: Some(false),
-        };
+            let first = WorkspaceSkillPolicyRecord {
+                id: generate_id(21),
+                workspace_id: "ws_000000000000000001".to_owned(),
+                skill_id: SkillId::new("D".repeat(21)).expect("valid bundled skill id"),
+                enabled: Some(false),
+                allow_implicit_invocation: Some(false),
+            };
 
-        assert!(
+            assert!(
+                store
+                    .find_skill_installation(&first.skill_id)
+                    .await
+                    .expect("bundled installation lookup")
+                    .is_none(),
+                "bundled policy must not require an installation row"
+            );
+
             store
-                .find_skill_installation(&first.skill_id)
+                .upsert_workspace_skill_policy(&first, 1_700_000_000)
                 .await
-                .expect("bundled installation lookup")
-                .is_none(),
-            "bundled policy must not require an installation row"
-        );
+                .expect("first policy upsert");
 
-        store
-            .upsert_workspace_skill_policy(&first, 1_700_000_000)
-            .await
-            .expect("first policy upsert");
-
-        let second = WorkspaceSkillPolicyRecord {
-            enabled: Some(true),
-            allow_implicit_invocation: Some(true),
-            ..first.clone()
-        };
-        store
-            .upsert_workspace_skill_policy(&second, 1_700_000_100)
-            .await
-            .expect("second policy upsert");
-
-        let rows = store
-            .list_workspace_skill_policies(first.workspace_id.as_str())
-            .await
-            .expect("list workspace policies");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], second);
-        assert_eq!(
+            let second = WorkspaceSkillPolicyRecord {
+                enabled: Some(true),
+                allow_implicit_invocation: Some(true),
+                ..first.clone()
+            };
             store
-                .find_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+                .upsert_workspace_skill_policy(&second, 1_700_000_100)
                 .await
-                .expect("find exact policy"),
-            Some(second.clone())
-        );
+                .expect("second policy upsert");
 
-        assert!(
-            store
-                .delete_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+            let rows = store
+                .list_workspace_skill_policies(first.workspace_id.as_str())
                 .await
-                .expect("delete exact workspace policy")
-        );
+                .expect("list workspace policies");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0], second);
+            assert_eq!(
+                store
+                    .find_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+                    .await
+                    .expect("find exact policy"),
+                Some(second.clone())
+            );
 
-        let rows = store
-            .list_workspace_skill_policies(first.workspace_id.as_str())
-            .await
-            .expect("list workspace policies after delete");
-        assert!(rows.is_empty());
+            assert!(
+                store
+                    .delete_workspace_skill_policy(first.workspace_id.as_str(), &first.skill_id)
+                    .await
+                    .expect("delete exact workspace policy")
+            );
+
+            let rows = store
+                .list_workspace_skill_policies(first.workspace_id.as_str())
+                .await
+                .expect("list workspace policies after delete");
+            assert!(rows.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn installation_and_default_policy_are_created_and_removed_atomically() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection);
-        let skill_id = SkillId::new("I".repeat(21)).expect("valid skill id");
-        let workspace_id = "ws_atomic_skill";
-        let installation = SkillInstallationRecord {
-            skill_id: skill_id.clone(),
-            owner: Some("pioneer".to_owned()),
-            slug: "atomic-skill".to_owned(),
-            version: None,
-            source_kind: "user".to_owned(),
-            scope_key: workspace_id.to_owned(),
-            source_ref: "upload:atomic".to_owned(),
-            install_path: "/tmp/skills/atomic-skill".to_owned(),
-            trust_level: "community".to_owned(),
-            fingerprint: "atomic-fingerprint".to_owned(),
-            updated_at_unix: 1_700_000_000,
-            pack_id: None,
-            pack_member_key: None,
-        };
-        let policy = WorkspaceSkillPolicyRecord {
-            id: generate_id(21),
-            workspace_id: workspace_id.to_owned(),
-            skill_id: skill_id.clone(),
-            enabled: Some(true),
-            allow_implicit_invocation: Some(false),
-        };
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection);
+            let skill_id = SkillId::new("I".repeat(21)).expect("valid skill id");
+            let workspace_id = "ws_atomic_skill";
+            let installation = SkillInstallationRecord {
+                skill_id: skill_id.clone(),
+                owner: Some("pioneer".to_owned()),
+                slug: "atomic-skill".to_owned(),
+                version: None,
+                source_kind: "user".to_owned(),
+                scope_key: workspace_id.to_owned(),
+                source_ref: "upload:atomic".to_owned(),
+                install_path: "/tmp/skills/atomic-skill".to_owned(),
+                trust_level: "community".to_owned(),
+                fingerprint: "atomic-fingerprint".to_owned(),
+                updated_at_unix: 1_700_000_000,
+                pack_id: None,
+                pack_member_key: None,
+            };
+            let policy = WorkspaceSkillPolicyRecord {
+                id: generate_id(21),
+                workspace_id: workspace_id.to_owned(),
+                skill_id: skill_id.clone(),
+                enabled: Some(true),
+                allow_implicit_invocation: Some(false),
+            };
 
-        store
-            .insert_skill_installation_with_policy(&installation, &policy, 1_700_000_000)
-            .await
-            .expect("atomic install persistence");
-        assert!(
             store
-                .find_skill_installation(&skill_id)
+                .insert_skill_installation_with_policy(&installation, &policy, 1_700_000_000)
                 .await
-                .expect("find installation")
-                .is_some()
-        );
-        assert_eq!(
-            store
-                .find_workspace_skill_policy(workspace_id, &skill_id)
-                .await
-                .expect("find policy"),
-            Some(policy)
-        );
+                .expect("atomic install persistence");
+            assert!(
+                store
+                    .find_skill_installation(&skill_id)
+                    .await
+                    .expect("find installation")
+                    .is_some()
+            );
+            assert_eq!(
+                store
+                    .find_workspace_skill_policy(workspace_id, &skill_id)
+                    .await
+                    .expect("find policy"),
+                Some(policy)
+            );
 
-        assert!(
-            store
-                .delete_skill_installation_with_workspace_policy(workspace_id, &skill_id)
-                .await
-                .expect("atomic uninstall persistence")
-        );
-        assert!(
-            store
-                .find_skill_installation(&skill_id)
-                .await
-                .expect("find deleted installation")
-                .is_none()
-        );
-        assert!(
-            store
-                .find_workspace_skill_policy(workspace_id, &skill_id)
-                .await
-                .expect("find deleted policy")
-                .is_none()
-        );
+            assert!(
+                store
+                    .delete_skill_installation_with_workspace_policy(workspace_id, &skill_id)
+                    .await
+                    .expect("atomic uninstall persistence")
+            );
+            assert!(
+                store
+                    .find_skill_installation(&skill_id)
+                    .await
+                    .expect("find deleted installation")
+                    .is_none()
+            );
+            assert!(
+                store
+                    .find_workspace_skill_policy(workspace_id, &skill_id)
+                    .await
+                    .expect("find deleted policy")
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn materialize_turn_start_without_prompt_manifest_persists_turn() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_000000000000000001".to_owned(),
-            id: "thr_000000000000000001".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000001".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        let input = vec![UserInput::Text {
-            text: "hello".to_owned(),
-            text_elements: Vec::new(),
-        }];
-        let principal_actor = PersistedActorRef::Principal(
-            PrincipalId::new("P00000000000000000001").expect("valid principal id"),
-        );
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_000000000000000001".to_owned(),
+                id: "thr_000000000000000001".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000001".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            let input = vec![UserInput::Text {
+                text: "hello".to_owned(),
+                text_elements: Vec::new(),
+            }];
+            let principal_actor = PersistedActorRef::Principal(
+                PrincipalId::new("P00000000000000000001").expect("valid principal id"),
+            );
 
-        let missing_actor_error = store
-            .materialize_turn_event(
-                crate::events::TurnEventPayload::TurnStarted(
-                    crate::events::TurnStartedEventPayload {
-                        thread: thread.clone(),
-                        sandbox_mode: SandboxMode::FullAccess,
-                        turn: turn.clone(),
-                        input: input.clone(),
-                        actor: None,
-                        reasoning_effort: None,
-                        work_owner: Default::default(),
-                    },
-                ),
-                timestamp,
-            )
-            .await
-            .expect_err("normal materialization must reject a missing actor");
-        assert!(
-            missing_actor_error
-                .to_string()
-                .contains("missing its required actor")
-        );
-
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                input.as_slice(),
-                principal_actor.clone(),
-            )
-            .await
-            .expect("turn start without manifest should persist");
-
-        let (workspace_id, fetched_turn) = store
-            .get_turn(thread.id.as_str(), turn.id.as_str())
-            .await
-            .expect("must read turn")
-            .expect("turn should exist");
-
-        assert_eq!(workspace_id, thread.workspace_id);
-        assert_eq!(fetched_turn.id, turn.id);
-        assert_eq!(fetched_turn.status, TurnStatus::InProgress);
-        assert_eq!(fetched_turn.prompt_manifest, None);
-        let permission_profile = &fetched_turn.permission_profile;
-        assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
-        assert_eq!(
-            permission_profile.source,
-            TurnPermissionProfileSource::Defaulted
-        );
-        assert_eq!(
-            permission_profile.effective_policy,
-            ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
-        );
-
-        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query persisted turn")
-            .expect("persisted turn should exist");
-        assert_eq!(persisted_turn.prompt_manifest_json, "{}");
-        assert_eq!(persisted_turn.reasoning_effort, None);
-        assert_eq!(
-            persisted_turn.permission_profile_mode.as_deref(),
-            Some("full_access")
-        );
-        assert_eq!(
-            persisted_turn.permission_profile_source.as_deref(),
-            Some("defaulted")
-        );
-        assert!(persisted_turn.permission_profile_snapshot_json.is_some());
-        assert_eq!(
-            persisted_turn.initiated_by_actor_kind.as_deref(),
-            Some("principal")
-        );
-        assert_eq!(
-            persisted_turn.initiated_by_actor_id.as_deref(),
-            Some("P00000000000000000001")
-        );
-
-        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query persisted thread")
-            .expect("persisted thread should exist");
-        assert_eq!(
-            persisted_thread.created_by_actor_kind.as_deref(),
-            Some("principal")
-        );
-        assert_eq!(
-            persisted_thread.created_by_actor_id.as_deref(),
-            Some("P00000000000000000001")
-        );
-
-        let persisted_event = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
-            .one(&connection)
-            .await
-            .expect("must query persisted turn/start event")
-            .expect("turn/start event should exist");
-        let decoded_event: crate::events::TurnEventPayload = serde_json::from_value(
-            read_fixture_event_payload(&store.connection, &persisted_event)
+            let missing_actor_error = store
+                .materialize_turn_event(
+                    crate::events::TurnEventPayload::TurnStarted(
+                        crate::events::TurnStartedEventPayload {
+                            thread: thread.clone(),
+                            sandbox_mode: SandboxMode::FullAccess,
+                            turn: turn.clone(),
+                            input: input.clone(),
+                            actor: None,
+                            reasoning_effort: None,
+                            work_owner: Default::default(),
+                        },
+                    ),
+                    timestamp,
+                )
                 .await
-                .unwrap(),
-        )
-        .expect("persisted turn/start event should decode");
-        let crate::events::TurnEventPayload::TurnStarted(decoded_started) = decoded_event else {
-            panic!("expected persisted turn/start event");
-        };
-        assert_eq!(decoded_started.actor, Some(principal_actor));
+                .expect_err("normal materialization must reject a missing actor");
+            assert!(
+                missing_actor_error
+                    .to_string()
+                    .contains("missing its required actor")
+            );
 
-        let system_turn = Turn {
-            id: "turn_000000000000000002".to_owned(),
-            ..turn.clone()
-        };
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &system_turn,
-                &[],
-                PersistedActorRef::System,
-            )
-            .await
-            .expect("System turn should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    input.as_slice(),
+                    principal_actor.clone(),
+                )
+                .await
+                .expect("turn start without manifest should persist");
 
-        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query persisted thread after second turn")
-            .expect("persisted thread should exist");
-        assert_eq!(
-            persisted_thread.created_by_actor_kind.as_deref(),
-            Some("principal"),
-            "a later turn must not overwrite the existing thread creator"
-        );
-        assert_eq!(
-            persisted_thread.created_by_actor_id.as_deref(),
-            Some("P00000000000000000001")
-        );
-        let persisted_system_turn =
-            pioneer_entity::turn::Entity::find_by_id(system_turn.id.clone())
+            let (workspace_id, fetched_turn) = store
+                .get_turn(thread.id.as_str(), turn.id.as_str())
+                .await
+                .expect("must read turn")
+                .expect("turn should exist");
+
+            assert_eq!(workspace_id, thread.workspace_id);
+            assert_eq!(fetched_turn.id, turn.id);
+            assert_eq!(fetched_turn.status, TurnStatus::InProgress);
+            assert_eq!(fetched_turn.prompt_manifest, None);
+            let permission_profile = &fetched_turn.permission_profile;
+            assert_eq!(permission_profile.mode, TurnPermissionMode::FullAccess);
+            assert_eq!(
+                permission_profile.source,
+                TurnPermissionProfileSource::Defaulted
+            );
+            assert_eq!(
+                permission_profile.effective_policy,
+                ToolPermissionPolicySnapshot::all(PermissionBehavior::Allow)
+            );
+
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
                 .one(&connection)
                 .await
-                .expect("must query persisted System turn")
-                .expect("persisted System turn should exist");
-        assert_eq!(
-            persisted_system_turn.initiated_by_actor_kind.as_deref(),
-            Some("system")
-        );
-        assert_eq!(persisted_system_turn.initiated_by_actor_id, None);
+                .expect("must query persisted turn")
+                .expect("persisted turn should exist");
+            assert_eq!(persisted_turn.prompt_manifest_json, "{}");
+            assert_eq!(persisted_turn.reasoning_effort, None);
+            assert_eq!(
+                persisted_turn.permission_profile_mode.as_deref(),
+                Some("full_access")
+            );
+            assert_eq!(
+                persisted_turn.permission_profile_source.as_deref(),
+                Some("defaulted")
+            );
+            assert!(persisted_turn.permission_profile_snapshot_json.is_some());
+            assert_eq!(
+                persisted_turn.initiated_by_actor_kind.as_deref(),
+                Some("principal")
+            );
+            assert_eq!(
+                persisted_turn.initiated_by_actor_id.as_deref(),
+                Some("P00000000000000000001")
+            );
+
+            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query persisted thread")
+                .expect("persisted thread should exist");
+            assert_eq!(
+                persisted_thread.created_by_actor_kind.as_deref(),
+                Some("principal")
+            );
+            assert_eq!(
+                persisted_thread.created_by_actor_id.as_deref(),
+                Some("P00000000000000000001")
+            );
+
+            let persisted_event = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .one(&connection)
+                .await
+                .expect("must query persisted turn/start event")
+                .expect("turn/start event should exist");
+            let decoded_event: crate::events::TurnEventPayload = serde_json::from_value(
+                read_fixture_event_payload(&store.connection, &persisted_event)
+                    .await
+                    .unwrap(),
+            )
+            .expect("persisted turn/start event should decode");
+            let crate::events::TurnEventPayload::TurnStarted(decoded_started) = decoded_event
+            else {
+                panic!("expected persisted turn/start event");
+            };
+            assert_eq!(decoded_started.actor, Some(principal_actor));
+
+            let system_turn = Turn {
+                id: "turn_000000000000000002".to_owned(),
+                ..turn.clone()
+            };
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &system_turn,
+                    &[],
+                    PersistedActorRef::System,
+                )
+                .await
+                .expect("System turn should persist");
+
+            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query persisted thread after second turn")
+                .expect("persisted thread should exist");
+            assert_eq!(
+                persisted_thread.created_by_actor_kind.as_deref(),
+                Some("principal"),
+                "a later turn must not overwrite the existing thread creator"
+            );
+            assert_eq!(
+                persisted_thread.created_by_actor_id.as_deref(),
+                Some("P00000000000000000001")
+            );
+            let persisted_system_turn =
+                pioneer_entity::turn::Entity::find_by_id(system_turn.id.clone())
+                    .one(&connection)
+                    .await
+                    .expect("must query persisted System turn")
+                    .expect("persisted System turn should exist");
+            assert_eq!(
+                persisted_system_turn.initiated_by_actor_kind.as_deref(),
+                Some("system")
+            );
+            assert_eq!(persisted_system_turn.initiated_by_actor_id, None);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn legacy_turn_started_projection_accepts_missing_actor_only_without_new_append() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_legacy_actor".to_owned(),
-            id: "thr_legacy_actor".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_legacy_actor".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        let payload =
-            crate::events::TurnEventPayload::TurnStarted(crate::events::TurnStartedEventPayload {
-                thread: thread.clone(),
-                sandbox_mode: SandboxMode::FullAccess,
-                turn: turn.clone(),
-                input: Vec::new(),
-                actor: None,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_legacy_actor".to_owned(),
+                id: "thr_legacy_actor".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
                 reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
                 work_owner: Default::default(),
-            });
-        let legacy_event = crate::events::AppendedTurnEvent {
-            id: "event_legacy_actor".to_owned(),
-            thread_id: thread.id.clone(),
-            turn_id: turn.id.clone(),
-            sequence: 1,
-            payload,
-            idempotency_key: None,
-            was_inserted: true,
-            created_at: unix_to_datetime(timestamp),
-        };
+                id: "turn_legacy_actor".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            let payload = crate::events::TurnEventPayload::TurnStarted(
+                crate::events::TurnStartedEventPayload {
+                    thread: thread.clone(),
+                    sandbox_mode: SandboxMode::FullAccess,
+                    turn: turn.clone(),
+                    input: Vec::new(),
+                    actor: None,
+                    reasoning_effort: None,
+                    work_owner: Default::default(),
+                },
+            );
+            let legacy_event = crate::events::AppendedTurnEvent {
+                id: "event_legacy_actor".to_owned(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                sequence: 1,
+                payload,
+                idempotency_key: None,
+                was_inserted: true,
+                created_at: unix_to_datetime(timestamp),
+            };
 
-        crate::projector::TurnProjector::new()
-            .project(&connection, &legacy_event)
-            .await
-            .expect("explicit historical projection path should accept a missing actor");
+            crate::projector::TurnProjector::new()
+                .project(&connection, &legacy_event)
+                .await
+                .expect("explicit historical projection path should accept a missing actor");
 
-        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query legacy thread")
-            .expect("legacy thread should project");
-        assert_eq!(persisted_thread.created_by_actor_kind, None);
-        assert_eq!(persisted_thread.created_by_actor_id, None);
-        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query legacy turn")
-            .expect("legacy turn should project");
-        assert_eq!(persisted_turn.initiated_by_actor_kind, None);
-        assert_eq!(persisted_turn.initiated_by_actor_id, None);
+            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query legacy thread")
+                .expect("legacy thread should project");
+            assert_eq!(persisted_thread.created_by_actor_kind, None);
+            assert_eq!(persisted_thread.created_by_actor_id, None);
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query legacy turn")
+                .expect("legacy turn should project");
+            assert_eq!(persisted_turn.initiated_by_actor_kind, None);
+            assert_eq!(persisted_turn.initiated_by_actor_id, None);
 
-        let gateway_id =
-            GatewayId::new("G00000000000000000001").expect("gateway id should be valid");
-        let principal_id =
-            PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
-        crate::create_gateway_singleton(&connection, &gateway_id, 1, unix_to_datetime(timestamp))
+            let gateway_id =
+                GatewayId::new("G00000000000000000001").expect("gateway id should be valid");
+            let principal_id =
+                PrincipalId::new("P00000000000000000001").expect("principal id should be valid");
+            crate::create_gateway_singleton(
+                &connection,
+                &gateway_id,
+                1,
+                unix_to_datetime(timestamp),
+            )
             .await
             .expect("Gateway identity should persist");
-        crate::create_superuser(
-            &connection,
-            &principal_id,
-            &gateway_id,
-            "Superuser",
-            "superuser",
-            "superuser",
-            unix_to_datetime(timestamp),
-        )
+            crate::create_superuser(
+                &connection,
+                &principal_id,
+                &gateway_id,
+                "Superuser",
+                "superuser",
+                "superuser",
+                unix_to_datetime(timestamp),
+            )
+            .await
+            .expect("Superuser should persist");
+
+            crate::projector::TurnProjector::new()
+                .project(&connection, &legacy_event)
+                .await
+                .expect(
+                    "legacy replay after identity bootstrap should run the idempotent backfill",
+                );
+
+            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id)
+                .one(&connection)
+                .await
+                .expect("must query backfilled legacy thread")
+                .expect("backfilled legacy thread should exist");
+            assert_eq!(
+                persisted_thread.created_by_actor_kind.as_deref(),
+                Some("principal")
+            );
+            assert_eq!(
+                persisted_thread.created_by_actor_id.as_deref(),
+                Some(principal_id.as_str())
+            );
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id)
+                .one(&connection)
+                .await
+                .expect("must query backfilled legacy turn")
+                .expect("backfilled legacy turn should exist");
+            assert_eq!(
+                persisted_turn.initiated_by_actor_kind.as_deref(),
+                Some("principal")
+            );
+            assert_eq!(
+                persisted_turn.initiated_by_actor_id.as_deref(),
+                Some(principal_id.as_str())
+            );
+            Ok(())
+        })
         .await
-        .expect("Superuser should persist");
-
-        crate::projector::TurnProjector::new()
-            .project(&connection, &legacy_event)
-            .await
-            .expect("legacy replay after identity bootstrap should run the idempotent backfill");
-
-        let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id)
-            .one(&connection)
-            .await
-            .expect("must query backfilled legacy thread")
-            .expect("backfilled legacy thread should exist");
-        assert_eq!(
-            persisted_thread.created_by_actor_kind.as_deref(),
-            Some("principal")
-        );
-        assert_eq!(
-            persisted_thread.created_by_actor_id.as_deref(),
-            Some(principal_id.as_str())
-        );
-        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id)
-            .one(&connection)
-            .await
-            .expect("must query backfilled legacy turn")
-            .expect("backfilled legacy turn should exist");
-        assert_eq!(
-            persisted_turn.initiated_by_actor_kind.as_deref(),
-            Some("principal")
-        );
-        assert_eq!(
-            persisted_turn.initiated_by_actor_id.as_deref(),
-            Some(principal_id.as_str())
-        );
+        .unwrap();
     }
 
     #[tokio::test]
     async fn terminal_turn_projection_rejects_missing_turn_start_without_partial_writes() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let turn_id = "turn_terminal_without_start";
-        let mut terminal_turn = sample_turn(turn_id);
-        terminal_turn.status = TurnStatus::Completed;
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let turn_id = "turn_terminal_without_start";
+            let mut terminal_turn = sample_turn(turn_id);
+            terminal_turn.status = TurnStatus::Completed;
 
-        let error = store
-            .materialize_turn_completed(
-                TurnCompletedNotification {
-                    workspace_id: "ws_terminal_without_start".to_owned(),
-                    thread_id: "thr_terminal_without_start".to_owned(),
-                    turn: terminal_turn,
-                },
-                timestamp,
-            )
-            .await
-            .expect_err("terminal projection without turn/start must fail closed");
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("refusing to append orphan `turn/completed` event")
-                && error.contains("missing turn `turn_terminal_without_start`")
-                && error.contains("thread `thr_terminal_without_start`"),
-            "unexpected terminal projection error: {error}"
-        );
+            let error = store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: "ws_terminal_without_start".to_owned(),
+                        thread_id: "thr_terminal_without_start".to_owned(),
+                        turn: terminal_turn,
+                    },
+                    timestamp,
+                )
+                .await
+                .expect_err("terminal projection without turn/start must fail closed");
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("refusing to append orphan `turn/completed` event")
+                    && error.contains("missing turn `turn_terminal_without_start`")
+                    && error.contains("thread `thr_terminal_without_start`"),
+                "unexpected terminal projection error: {error}"
+            );
 
-        assert!(
-            pioneer_entity::turn::Entity::find_by_id(turn_id)
-                .one(&connection)
-                .await
-                .expect("turn lookup should succeed")
-                .is_none(),
-            "failed terminal projection must not insert an actorless turn"
-        );
-        assert!(
-            pioneer_entity::turn_event::Entity::find()
-                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
-                .one(&connection)
-                .await
-                .expect("turn event lookup should succeed")
-                .is_none(),
-            "orphan terminal event must be rejected before append"
-        );
+            assert!(
+                pioneer_entity::turn::Entity::find_by_id(turn_id)
+                    .one(&connection)
+                    .await
+                    .expect("turn lookup should succeed")
+                    .is_none(),
+                "failed terminal projection must not insert an actorless turn"
+            );
+            assert!(
+                pioneer_entity::turn_event::Entity::find()
+                    .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+                    .one(&connection)
+                    .await
+                    .expect("turn event lookup should succeed")
+                    .is_none(),
+                "orphan terminal event must be rejected before append"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -63040,449 +63091,455 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_turn_start_decode_and_replay_preserve_actor_without_rewriting_history() {
-        let principal = PrincipalId::new("P00000000000000000001")
-            .expect("canonical replay principal id should be valid");
-        for (suffix, actor, expected_kind, expected_id) in [
-            (
-                "principal",
-                PersistedActorRef::Principal(principal),
-                "principal",
-                Some("P00000000000000000001"),
-            ),
-            ("system", PersistedActorRef::System, "system", None),
-        ] {
-            let connection = Database::connect("sqlite::memory:")
-                .await
-                .expect("must connect to sqlite memory");
-            Migrator::up(&connection, None)
-                .await
-                .expect("migrations must succeed");
-            let store = CrudStore::new(connection);
-            let connection = store.database_connection();
-            let timestamp = 1_700_000_000;
-            let thread_id = format!("thr_replay_actor_{suffix}");
-            let turn_id = format!("turn_replay_actor_{suffix}");
-            let thread = sample_thread("ws_replay_actor", thread_id.as_str(), timestamp);
-            let turn = sample_turn(turn_id.as_str());
-            let payload = crate::events::TurnEventPayload::TurnStarted(
-                crate::events::TurnStartedEventPayload {
-                    thread: thread.clone(),
-                    sandbox_mode: SandboxMode::FullAccess,
-                    turn: turn.clone(),
-                    input: Vec::new(),
-                    actor: Some(actor.clone()),
-                    reasoning_effort: None,
-                    work_owner: Default::default(),
-                },
-            );
+        pioneer_postgres_test::with_database(async |fixture| {
+            let principal = PrincipalId::new("P00000000000000000001")
+                .expect("canonical replay principal id should be valid");
+            for (suffix, actor, expected_kind, expected_id) in [
+                (
+                    "principal",
+                    PersistedActorRef::Principal(principal),
+                    "principal",
+                    Some("P00000000000000000001"),
+                ),
+                ("system", PersistedActorRef::System, "system", None),
+            ] {
+                let connection = fixture.connection().clone();
+                let store = CrudStore::new(connection);
+                let connection = store.database_connection();
+                let timestamp = 1_700_000_000;
+                let thread_id = format!("thr_replay_actor_{suffix}");
+                let turn_id = format!("turn_replay_actor_{suffix}");
+                let thread = sample_thread("ws_replay_actor", thread_id.as_str(), timestamp);
+                let turn = sample_turn(turn_id.as_str());
+                let payload = crate::events::TurnEventPayload::TurnStarted(
+                    crate::events::TurnStartedEventPayload {
+                        thread: thread.clone(),
+                        sandbox_mode: SandboxMode::FullAccess,
+                        turn: turn.clone(),
+                        input: Vec::new(),
+                        actor: Some(actor.clone()),
+                        reasoning_effort: None,
+                        work_owner: Default::default(),
+                    },
+                );
 
-            let appended = crate::repositories::turn_event::append_event(
-                &connection,
-                &payload,
-                unix_to_datetime(timestamp),
-            )
-            .await
-            .expect("raw canonical event should append");
-            let raw_before = pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
-                .one(&connection)
+                let appended = crate::repositories::turn_event::append_event(
+                    &connection,
+                    &payload,
+                    unix_to_datetime(timestamp),
+                )
                 .await
-                .expect("raw canonical event query should succeed")
-                .expect("raw canonical event should exist");
-            let replayed =
-                crate::repositories::turn_event::appended_event_from_model(raw_before.clone())
-                    .expect("canonical event should decode for replay");
-            let crate::events::TurnEventPayload::TurnStarted(decoded) = &replayed.payload else {
-                panic!("replayed canonical event should be turn/started");
-            };
-            assert_eq!(decoded.actor.as_ref(), Some(&actor));
+                .expect("raw canonical event should append");
+                let raw_before =
+                    pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
+                        .one(&connection)
+                        .await
+                        .expect("raw canonical event query should succeed")
+                        .expect("raw canonical event should exist");
+                let replayed =
+                    crate::repositories::turn_event::appended_event_from_model(raw_before.clone())
+                        .expect("canonical event should decode for replay");
+                let crate::events::TurnEventPayload::TurnStarted(decoded) = &replayed.payload
+                else {
+                    panic!("replayed canonical event should be turn/started");
+                };
+                assert_eq!(decoded.actor.as_ref(), Some(&actor));
 
-            crate::projector::TurnProjector::new()
-                .project(&connection, &replayed)
-                .await
-                .expect("decoded canonical event should replay");
+                crate::projector::TurnProjector::new()
+                    .project(&connection, &replayed)
+                    .await
+                    .expect("decoded canonical event should replay");
 
-            let persisted_thread = pioneer_entity::thread::Entity::find_by_id(thread.id.as_str())
-                .one(&connection)
-                .await
-                .expect("replayed thread query should succeed")
-                .expect("replayed thread should exist");
-            assert_eq!(
-                persisted_thread.created_by_actor_kind.as_deref(),
-                Some(expected_kind)
-            );
-            assert_eq!(persisted_thread.created_by_actor_id.as_deref(), expected_id);
-            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.as_str())
-                .one(&connection)
-                .await
-                .expect("replayed turn query should succeed")
-                .expect("replayed turn should exist");
-            assert_eq!(
-                persisted_turn.initiated_by_actor_kind.as_deref(),
-                Some(expected_kind)
-            );
-            assert_eq!(persisted_turn.initiated_by_actor_id.as_deref(), expected_id);
+                let persisted_thread =
+                    pioneer_entity::thread::Entity::find_by_id(thread.id.as_str())
+                        .one(&connection)
+                        .await
+                        .expect("replayed thread query should succeed")
+                        .expect("replayed thread should exist");
+                assert_eq!(
+                    persisted_thread.created_by_actor_kind.as_deref(),
+                    Some(expected_kind)
+                );
+                assert_eq!(persisted_thread.created_by_actor_id.as_deref(), expected_id);
+                let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.as_str())
+                    .one(&connection)
+                    .await
+                    .expect("replayed turn query should succeed")
+                    .expect("replayed turn should exist");
+                assert_eq!(
+                    persisted_turn.initiated_by_actor_kind.as_deref(),
+                    Some(expected_kind)
+                );
+                assert_eq!(persisted_turn.initiated_by_actor_id.as_deref(), expected_id);
 
-            let raw_after = pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
-                .one(&connection)
-                .await
-                .expect("raw canonical event re-query should succeed")
-                .expect("raw canonical event should remain");
-            assert_eq!(
-                raw_after.payload, raw_before.payload,
-                "projection replay must not rewrite append-only event payloads"
-            );
-        }
+                let raw_after =
+                    pioneer_entity::turn_event::Entity::find_by_id(appended.id.as_str())
+                        .one(&connection)
+                        .await
+                        .expect("raw canonical event re-query should succeed")
+                        .expect("raw canonical event should remain");
+                assert_eq!(
+                    raw_after.payload, raw_before.payload,
+                    "projection replay must not rewrite append-only event payloads"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn materialize_turn_start_persists_explicit_permission_profile() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_permission_profile".to_owned(),
-            id: "thr_permission_profile".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::Supervised,
-            TurnPermissionProfileSource::Composer,
-        );
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_permission_profile".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: permission_profile.clone(),
-        };
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_permission_profile".to_owned(),
+                id: "thr_permission_profile".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            );
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_permission_profile".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: permission_profile.clone(),
+            };
 
-        seed_observation_workspace(&store, &thread.workspace_id).await;
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start with profile should persist");
-
-        let (_, fetched_turn) = store
-            .get_turn(thread.id.as_str(), turn.id.as_str())
-            .await
-            .expect("must read turn")
-            .expect("turn should exist");
-        assert_eq!(fetched_turn.permission_profile, permission_profile);
-
-        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query persisted turn")
-            .expect("persisted turn should exist");
-        assert_eq!(
-            persisted_turn.permission_profile_mode.as_deref(),
-            Some("supervised")
-        );
-        assert_eq!(
-            persisted_turn.permission_profile_source.as_deref(),
-            Some("composer")
-        );
-        assert_eq!(
-            serde_json::from_str::<TurnPermissionProfileSnapshot>(
-                persisted_turn
-                    .permission_profile_snapshot_json
-                    .as_deref()
-                    .expect("permission profile snapshot should persist")
-            )
-            .expect("snapshot should decode"),
-            permission_profile
-        );
-
-        let audit_events_before_explicit_audit = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
-            .filter(
-                pioneer_entity::turn_event::Column::EventType
-                    .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
-            )
-            .all(&connection)
-            .await
-            .expect("must query turn permission audit events");
-        assert!(
-            audit_events_before_explicit_audit.is_empty(),
-            "CRUD must not synthesize profile-selected audit events during turn/start"
-        );
-
-        store
-            .materialize_turn_permission_audit(
-                pioneer_protocol::TurnPermissionAuditEvent {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    event_kind: TurnPermissionAuditEventKind::ProfileSelected,
-                    profile_mode: permission_profile.mode,
-                    profile_source: permission_profile.source,
-                    security_snapshot_id: None,
-                    security_snapshot_version: None,
-                    security_reason_code: None,
-                    security_capability: None,
-                    item_id: None,
-                    tool_call_id: None,
-                    tool_name: None,
-                    action_kind: None,
-                    request_key: None,
-                    decision: None,
-                    reason: None,
-                    cached: false,
-                },
-                timestamp,
-            )
-            .await
-            .expect("explicit profile-selected audit should persist");
-
-        let audit_events = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
-            .filter(
-                pioneer_entity::turn_event::Column::EventType
-                    .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
-            )
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .all(&connection)
-            .await
-            .expect("must query turn permission audit events");
-        assert_eq!(audit_events.len(), 1);
-        let audit_payload: crate::events::TurnEventPayload = serde_json::from_value(
-            read_fixture_event_payload(&store.connection, &audit_events[0])
+            seed_observation_workspace(&store, &thread.workspace_id).await;
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
                 .await
-                .unwrap(),
-        )
-        .expect("audit event payload should decode");
-        let crate::events::TurnEventPayload::TurnPermissionAudit(audit) = audit_payload else {
-            panic!("expected turn permission audit event");
-        };
-        assert_eq!(
-            audit.event_kind,
-            TurnPermissionAuditEventKind::ProfileSelected
-        );
-        assert_eq!(audit.workspace_id, thread.workspace_id);
-        assert_eq!(audit.thread_id, thread.id);
-        assert_eq!(audit.turn_id, turn.id);
-        assert_eq!(audit.profile_mode, TurnPermissionMode::Supervised);
-        assert_eq!(audit.profile_source, TurnPermissionProfileSource::Composer);
-        assert!(audit.tool_name.is_none());
-        assert!(audit.request_key.is_none());
+                .expect("turn start with profile should persist");
 
-        let turn_item_events = store
-            .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
-            .await
-            .expect("turn item events should load")
-            .expect("turn item events should exist");
-        assert!(
-            turn_item_events.events.iter().any(|event| matches!(
-                &event.payload,
-                TurnItemEventPayload::TurnPermissionAudit(audit)
-                    if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
-            )),
-            "permission audit should be exposed through turn item event replay"
-        );
+            let (_, fetched_turn) = store
+                .get_turn(thread.id.as_str(), turn.id.as_str())
+                .await
+                .expect("must read turn")
+                .expect("turn should exist");
+            assert_eq!(fetched_turn.permission_profile, permission_profile);
 
-        let history = store
-            .get_thread_history(thread.id.as_str(), Some(16))
-            .await
-            .expect("thread history should load")
-            .expect("thread history should exist");
-        assert!(
-            history.events.iter().any(|event| matches!(
-                &event.payload,
-                ThreadHistoryEventPayload::TurnPermissionAudit(audit)
-                    if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
-            )),
-            "permission audit should be exposed through thread history"
-        );
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query persisted turn")
+                .expect("persisted turn should exist");
+            assert_eq!(
+                persisted_turn.permission_profile_mode.as_deref(),
+                Some("supervised")
+            );
+            assert_eq!(
+                persisted_turn.permission_profile_source.as_deref(),
+                Some("composer")
+            );
+            assert_eq!(
+                serde_json::from_str::<TurnPermissionProfileSnapshot>(
+                    persisted_turn
+                        .permission_profile_snapshot_json
+                        .as_deref()
+                        .expect("permission profile snapshot should persist")
+                )
+                .expect("snapshot should decode"),
+                permission_profile
+            );
+
+            let audit_events_before_explicit_audit = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .filter(
+                    pioneer_entity::turn_event::Column::EventType
+                        .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
+                )
+                .all(&connection)
+                .await
+                .expect("must query turn permission audit events");
+            assert!(
+                audit_events_before_explicit_audit.is_empty(),
+                "CRUD must not synthesize profile-selected audit events during turn/start"
+            );
+
+            store
+                .materialize_turn_permission_audit(
+                    pioneer_protocol::TurnPermissionAuditEvent {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                        profile_mode: permission_profile.mode,
+                        profile_source: permission_profile.source,
+                        security_snapshot_id: None,
+                        security_snapshot_version: None,
+                        security_reason_code: None,
+                        security_capability: None,
+                        item_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        action_kind: None,
+                        request_key: None,
+                        decision: None,
+                        reason: None,
+                        cached: false,
+                    },
+                    timestamp,
+                )
+                .await
+                .expect("explicit profile-selected audit should persist");
+
+            let audit_events = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .filter(
+                    pioneer_entity::turn_event::Column::EventType
+                        .eq(pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT),
+                )
+                .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+                .all(&connection)
+                .await
+                .expect("must query turn permission audit events");
+            assert_eq!(audit_events.len(), 1);
+            let audit_payload: crate::events::TurnEventPayload = serde_json::from_value(
+                read_fixture_event_payload(&store.connection, &audit_events[0])
+                    .await
+                    .unwrap(),
+            )
+            .expect("audit event payload should decode");
+            let crate::events::TurnEventPayload::TurnPermissionAudit(audit) = audit_payload else {
+                panic!("expected turn permission audit event");
+            };
+            assert_eq!(
+                audit.event_kind,
+                TurnPermissionAuditEventKind::ProfileSelected
+            );
+            assert_eq!(audit.workspace_id, thread.workspace_id);
+            assert_eq!(audit.thread_id, thread.id);
+            assert_eq!(audit.turn_id, turn.id);
+            assert_eq!(audit.profile_mode, TurnPermissionMode::Supervised);
+            assert_eq!(audit.profile_source, TurnPermissionProfileSource::Composer);
+            assert!(audit.tool_name.is_none());
+            assert!(audit.request_key.is_none());
+
+            let turn_item_events = store
+                .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
+                .await
+                .expect("turn item events should load")
+                .expect("turn item events should exist");
+            assert!(
+                turn_item_events.events.iter().any(|event| matches!(
+                    &event.payload,
+                    TurnItemEventPayload::TurnPermissionAudit(audit)
+                        if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+                )),
+                "permission audit should be exposed through turn item event replay"
+            );
+
+            let history = store
+                .get_thread_history(thread.id.as_str(), Some(16))
+                .await
+                .expect("thread history should load")
+                .expect("thread history should exist");
+            assert!(
+                history.events.iter().any(|event| matches!(
+                    &event.payload,
+                    ThreadHistoryEventPayload::TurnPermissionAudit(audit)
+                        if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+                )),
+                "permission audit should be exposed through thread history"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn materialize_non_executable_system_turn_projects_both_events_atomically() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_atomic_profile".to_owned(),
-            id: "thr_atomic_profile".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::Supervised,
-            TurnPermissionProfileSource::Composer,
-        );
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_atomic_profile".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: permission_profile.clone(),
-        };
-        let audit = pioneer_protocol::TurnPermissionAuditEvent {
-            workspace_id: thread.workspace_id.clone(),
-            thread_id: thread.id.clone(),
-            turn_id: turn.id.clone(),
-            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
-            profile_mode: permission_profile.mode,
-            profile_source: permission_profile.source,
-            security_snapshot_id: None,
-            security_snapshot_version: None,
-            security_reason_code: None,
-            security_capability: None,
-            item_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            action_kind: None,
-            request_key: None,
-            decision: None,
-            reason: None,
-            cached: false,
-        };
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_atomic_profile".to_owned(),
+                id: "thr_atomic_profile".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            );
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_atomic_profile".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: permission_profile.clone(),
+            };
+            let audit = pioneer_protocol::TurnPermissionAuditEvent {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                profile_mode: permission_profile.mode,
+                profile_source: permission_profile.source,
+                security_snapshot_id: None,
+                security_snapshot_version: None,
+                security_reason_code: None,
+                security_capability: None,
+                item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                action_kind: None,
+                request_key: None,
+                decision: None,
+                reason: None,
+                cached: false,
+            };
 
-        let mut executable_turn = turn.clone();
-        executable_turn.id = "turn_contextless_execution_rejected".to_owned();
-        executable_turn.mode = ThreadMode::Agent;
-        let mut executable_audit = audit.clone();
-        executable_audit.turn_id = executable_turn.id.clone();
-        seed_observation_workspace(&store, &thread.workspace_id).await;
-        store
-            .materialize_non_executable_system_turn_start_with_permission_audit(
-                &thread,
-                SandboxMode::FullAccess,
-                &executable_turn,
-                &[],
-                executable_audit,
-            )
-            .await
-            .expect_err("an execution-capable Turn must require an authority envelope");
-        assert!(
-            pioneer_entity::turn::Entity::find_by_id(executable_turn.id)
-                .one(&connection)
+            let mut executable_turn = turn.clone();
+            executable_turn.id = "turn_contextless_execution_rejected".to_owned();
+            executable_turn.mode = ThreadMode::Agent;
+            let mut executable_audit = audit.clone();
+            executable_audit.turn_id = executable_turn.id.clone();
+            seed_observation_workspace(&store, &thread.workspace_id).await;
+            store
+                .materialize_non_executable_system_turn_start_with_permission_audit(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &executable_turn,
+                    &[],
+                    executable_audit,
+                )
                 .await
-                .expect("rejected Turn lookup should succeed")
-                .is_none()
-        );
+                .expect_err("an execution-capable Turn must require an authority envelope");
+            assert!(
+                pioneer_entity::turn::Entity::find_by_id(executable_turn.id)
+                    .one(&connection)
+                    .await
+                    .expect("rejected Turn lookup should succeed")
+                    .is_none()
+            );
 
-        store
-            .materialize_non_executable_system_turn_start_with_permission_audit(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                audit,
-            )
-            .await
-            .expect("turn start and profile audit should persist atomically");
+            store
+                .materialize_non_executable_system_turn_start_with_permission_audit(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    audit,
+                )
+                .await
+                .expect("turn start and profile audit should persist atomically");
 
-        let events = pioneer_entity::turn_event::Entity::find()
-            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
-            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
-            .all(&connection)
-            .await
-            .expect("must query turn events");
-        assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            pioneer_protocol::constants::events::TURN_STARTED
-        );
-        assert_eq!(
-            events[1].event_type,
-            pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT
-        );
+            let events = pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+                .all(&connection)
+                .await
+                .expect("must query turn events");
+            assert!(store.get_turn_execution(&turn.id).await.unwrap().is_none());
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[0].event_type,
+                pioneer_protocol::constants::events::TURN_STARTED
+            );
+            assert_eq!(
+                events[1].event_type,
+                pioneer_protocol::constants::events::TURN_PERMISSION_AUDIT
+            );
 
-        let projection_states = pioneer_entity::turn_event_projection_state::Entity::find()
-            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn.id.clone()))
-            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
-            .all(&connection)
-            .await
-            .expect("must query turn event projection states");
-        assert_eq!(projection_states.len(), 2);
-        assert!(projection_states.iter().all(|state| {
-            state.status
-                == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
-        }));
+            let projection_states = pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn.id.clone()),
+                )
+                .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+                .all(&connection)
+                .await
+                .expect("must query turn event projection states");
+            assert_eq!(projection_states.len(), 2);
+            assert!(projection_states.iter().all(|state| {
+                state.status
+                    == crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+            }));
 
-        let turn_item_events = store
-            .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
-            .await
-            .expect("turn item events should load")
-            .expect("turn item events should exist");
-        assert!(turn_item_events.events.iter().any(|event| matches!(
-            &event.payload,
-            TurnItemEventPayload::TurnPermissionAudit(audit)
-                if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
-        )));
+            let turn_item_events = store
+                .get_turn_item_events(thread.id.as_str(), turn.id.as_str())
+                .await
+                .expect("turn item events should load")
+                .expect("turn item events should exist");
+            assert!(turn_item_events.events.iter().any(|event| matches!(
+                &event.payload,
+                TurnItemEventPayload::TurnPermissionAudit(audit)
+                    if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
+            )));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -63549,8 +63606,7 @@ mod tests {
                 store
                     .connection
                     .execute_unprepared(
-                        "CREATE TRIGGER reject_admission_owner BEFORE INSERT ON turn_execution \
-                 BEGIN SELECT RAISE(ABORT, 'injected ownership failure'); END",
+                        "CREATE OR REPLACE FUNCTION reject_admission_owner() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected ownership failure'; END $$; CREATE TRIGGER reject_admission_owner BEFORE INSERT ON turn_execution FOR EACH ROW EXECUTE FUNCTION reject_admission_owner()",
                     )
                     .await
                     .unwrap();
@@ -63611,7 +63667,7 @@ mod tests {
                         );
                         store
                             .connection
-                            .execute_unprepared("DROP TRIGGER reject_admission_owner")
+                            .execute_unprepared("DROP TRIGGER reject_admission_owner ON turn_execution")
                             .await
                             .unwrap();
                     } else {
@@ -63662,151 +63718,151 @@ mod tests {
 
     #[tokio::test]
     async fn stale_policy_generation_rolls_back_started_event_and_projection() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let changed = crate::append_authorization_change(
-            &connection,
-            pioneer_protocol::AuthorizationChangeKind::RolePolicy,
-            pioneer_protocol::AuthorizationChangeScope::Role {
-                role_key: pioneer_protocol::RoleKey::member(),
-            },
-        )
-        .await
-        .expect("policy revoke must advance generation");
-        assert_eq!(changed.policy_generation.get(), 2);
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_atomic_admission_fault".to_owned(),
-            id: "thr_atomic_admission_fault".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_atomic_admission_fault".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        let audit = pioneer_protocol::TurnPermissionAuditEvent {
-            workspace_id: thread.workspace_id.clone(),
-            thread_id: thread.id.clone(),
-            turn_id: turn.id.clone(),
-            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
-            profile_mode: turn.permission_profile.mode,
-            profile_source: turn.permission_profile.source,
-            security_snapshot_id: None,
-            security_snapshot_version: None,
-            security_reason_code: None,
-            security_capability: None,
-            item_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            action_kind: None,
-            request_key: None,
-            decision: None,
-            reason: None,
-            cached: false,
-        };
-        let security_snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
-            "/workspace/atomic-admission",
-            timestamp.saturating_mul(1000),
-        );
-
-        store
-            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                None,
-                TurnWorkOwner::Turn,
-                pioneer_protocol::PersistedActorRef::System,
-                audit,
-                r#"{"kind":"test_explicit_authority"}"#,
-                None,
-                Some(crate::NewTurnAdmission {
-                    turn_id: turn.id.clone(),
-                    thread_id: thread.id.clone(),
-                    workspace_id: thread.workspace_id.clone(),
-                    request_digest: "a".repeat(64),
-                    policy_generation: Some(1),
-                    role_key: Some("member".to_owned()),
-                    policy_fingerprint: Some("a".repeat(64)),
-                    execution_lease: None,
-                }),
-                Some(crate::NewTurnExecution {
-                    turn_id: turn.id.clone(),
-                    thread_id: thread.id.clone(),
-                    workspace_id: thread.workspace_id.clone(),
-                    executor_kind: crate::TurnExecutorKind::ApiProvider,
-                    executor_key: Some("openai".to_owned()),
-                    status: crate::TurnExecutionStatus::Starting,
-                    owner_id: "test-owner".to_owned(),
-                    lease_until: unix_to_datetime(timestamp + 45),
-                    created_at: unix_to_datetime(timestamp),
-                }),
-                &security_snapshot,
-                Vec::new(),
-                None,
-                None,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
+            let changed = crate::append_authorization_change(
+                &connection,
+                pioneer_protocol::AuthorizationChangeKind::RolePolicy,
+                pioneer_protocol::AuthorizationChangeScope::Role {
+                    role_key: pioneer_protocol::RoleKey::member(),
+                },
             )
             .await
-            .expect_err("stale policy admission must abort the whole batch");
+            .expect("policy revoke must advance generation");
+            assert_eq!(changed.policy_generation.get(), 2);
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_atomic_admission_fault".to_owned(),
+                id: "thr_atomic_admission_fault".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_atomic_admission_fault".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            let audit = pioneer_protocol::TurnPermissionAuditEvent {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+                profile_mode: turn.permission_profile.mode,
+                profile_source: turn.permission_profile.source,
+                security_snapshot_id: None,
+                security_snapshot_version: None,
+                security_reason_code: None,
+                security_capability: None,
+                item_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                action_kind: None,
+                request_key: None,
+                decision: None,
+                reason: None,
+                cached: false,
+            };
+            let security_snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                "/workspace/atomic-admission",
+                timestamp.saturating_mul(1000),
+            );
 
-        assert!(
-            pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
-                .one(&connection)
+            store
+                .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    None,
+                    TurnWorkOwner::Turn,
+                    pioneer_protocol::PersistedActorRef::System,
+                    audit,
+                    r#"{"kind":"test_explicit_authority"}"#,
+                    None,
+                    Some(crate::NewTurnAdmission {
+                        turn_id: turn.id.clone(),
+                        thread_id: thread.id.clone(),
+                        workspace_id: thread.workspace_id.clone(),
+                        request_digest: "a".repeat(64),
+                        policy_generation: Some(1),
+                        role_key: Some("member".to_owned()),
+                        policy_fingerprint: Some("a".repeat(64)),
+                        execution_lease: None,
+                    }),
+                    Some(crate::NewTurnExecution {
+                        turn_id: turn.id.clone(),
+                        thread_id: thread.id.clone(),
+                        workspace_id: thread.workspace_id.clone(),
+                        executor_kind: crate::TurnExecutorKind::ApiProvider,
+                        executor_key: Some("openai".to_owned()),
+                        status: crate::TurnExecutionStatus::Starting,
+                        owner_id: "test-owner".to_owned(),
+                        lease_until: unix_to_datetime(timestamp + 45),
+                        created_at: unix_to_datetime(timestamp),
+                    }),
+                    &security_snapshot,
+                    Vec::new(),
+                    None,
+                    None,
+                )
                 .await
-                .expect("turn lookup should succeed")
-                .is_none()
-        );
-        assert!(
-            pioneer_entity::turn_event::Entity::find()
-                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id))
-                .all(&connection)
-                .await
-                .expect("event lookup should succeed")
-                .is_empty()
-        );
-        assert!(
-            pioneer_entity::turn_execution::Entity::find()
-                .all(&connection)
-                .await
-                .expect("Turn execution lookup should succeed")
-                .is_empty()
-        );
+                .expect_err("stale policy admission must abort the whole batch");
+
+            assert!(
+                pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                    .one(&connection)
+                    .await
+                    .expect("turn lookup should succeed")
+                    .is_none()
+            );
+            assert!(
+                pioneer_entity::turn_event::Entity::find()
+                    .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id))
+                    .all(&connection)
+                    .await
+                    .expect("event lookup should succeed")
+                    .is_empty()
+            );
+            assert!(
+                pioneer_entity::turn_execution::Entity::find()
+                    .all(&connection)
+                    .await
+                    .expect("Turn execution lookup should succeed")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -66054,73 +66110,73 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_turn_start_persists_explicit_reasoning_effort() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_reasoning_effort".to_owned(),
-            id: "thr_reasoning_effort".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_reasoning_effort".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_reasoning_effort".to_owned(),
+                id: "thr_reasoning_effort".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_reasoning_effort".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
 
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                Some("high"),
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start with reasoning effort should persist");
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    Some("high"),
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start with reasoning effort should persist");
 
-        let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
-            .one(&connection)
-            .await
-            .expect("must query persisted turn")
-            .expect("persisted turn should exist");
-        assert_eq!(persisted_turn.reasoning_effort.as_deref(), Some("high"));
+            let persisted_turn = pioneer_entity::turn::Entity::find_by_id(turn.id.clone())
+                .one(&connection)
+                .await
+                .expect("must query persisted turn")
+                .expect("persisted turn should exist");
+            assert_eq!(persisted_turn.reasoning_effort.as_deref(), Some("high"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -66365,252 +66421,252 @@ mod tests {
 
     #[tokio::test]
     async fn list_threads_for_workspace_includes_latest_turn_marker() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection);
-        let workspace_id = "ws_000000000000000001";
-        let thread_id = "thr_000000000000000003";
-        let first_timestamp = 1_700_000_000;
-        let second_timestamp = 1_700_000_100;
+            let store = CrudStore::new(connection);
+            let workspace_id = "ws_000000000000000001";
+            let thread_id = "thr_000000000000000003";
+            let first_timestamp = 1_700_000_000;
+            let second_timestamp = 1_700_000_100;
 
-        let first_thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: workspace_id.to_owned(),
-            id: thread_id.to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: first_timestamp,
-            updated_at: first_timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let first_turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000003".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &first_thread,
-                SandboxMode::FullAccess,
-                &first_turn,
-                &[],
-                Some("low"),
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("first turn start should persist");
+            let first_thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: first_timestamp,
+                updated_at: first_timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let first_turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000003".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &first_thread,
+                    SandboxMode::FullAccess,
+                    &first_turn,
+                    &[],
+                    Some("low"),
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("first turn start should persist");
 
-        let second_thread = Thread {
-            model: "o3".to_owned(),
-            model_provider: "custom-provider".to_owned(),
-            updated_at: second_timestamp,
-            ..first_thread
-        };
-        let second_turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000004".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &second_thread,
-                SandboxMode::FullAccess,
-                &second_turn,
-                &[],
-                Some("high"),
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("second turn start should persist");
+            let second_thread = Thread {
+                model: "o3".to_owned(),
+                model_provider: "custom-provider".to_owned(),
+                updated_at: second_timestamp,
+                ..first_thread
+            };
+            let second_turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000004".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &second_thread,
+                    SandboxMode::FullAccess,
+                    &second_turn,
+                    &[],
+                    Some("high"),
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("second turn start should persist");
 
-        let task_run_thread = Thread {
-            updated_at: second_timestamp + 1,
-            ..second_thread.clone()
-        };
-        let task_run_turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000005".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: TurnKind::TaskRun,
-            origin: TurnOrigin::DetachedTask,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &task_run_thread,
-                SandboxMode::FullAccess,
-                &task_run_turn,
-                &[],
-                None,
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("task run marker should persist");
+            let task_run_thread = Thread {
+                updated_at: second_timestamp + 1,
+                ..second_thread.clone()
+            };
+            let task_run_turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000005".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::TaskRun,
+                origin: TurnOrigin::DetachedTask,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &task_run_thread,
+                    SandboxMode::FullAccess,
+                    &task_run_turn,
+                    &[],
+                    None,
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("task run marker should persist");
 
-        let threads = store
-            .list_threads_for_workspace(workspace_id, 10)
-            .await
-            .expect("list threads should succeed");
-        let listed = threads
-            .iter()
-            .find(|thread| thread.id == thread_id)
-            .expect("thread should be listed");
+            let threads = store
+                .list_threads_for_workspace(workspace_id, 10)
+                .await
+                .expect("list threads should succeed");
+            let listed = threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .expect("thread should be listed");
 
-        assert_eq!(listed.model, "o3");
-        assert_eq!(listed.model_provider, "custom-provider");
-        assert_eq!(listed.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(listed.turns.len(), 1);
-        assert_eq!(listed.turns[0].id, task_run_turn.id);
-        assert_eq!(listed.turns[0].turn_kind, TurnKind::TaskRun);
+            assert_eq!(listed.model, "o3");
+            assert_eq!(listed.model_provider, "custom-provider");
+            assert_eq!(listed.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(listed.turns.len(), 1);
+            assert_eq!(listed.turns[0].id, task_run_turn.id);
+            assert_eq!(listed.turns[0].turn_kind, TurnKind::TaskRun);
 
-        let fetched = store
-            .get_thread_model(thread_id)
-            .await
-            .expect("get thread model should succeed")
-            .expect("thread should exist");
-        assert_eq!(fetched.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(fetched.turns.len(), 1);
-        assert_eq!(fetched.turns[0].id, task_run_turn.id);
-        assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+            let fetched = store
+                .get_thread_model(thread_id)
+                .await
+                .expect("get thread model should succeed")
+                .expect("thread should exist");
+            assert_eq!(fetched.reasoning_effort.as_deref(), Some("high"));
+            assert_eq!(fetched.turns.len(), 1);
+            assert_eq!(fetched.turns[0].id, task_run_turn.id);
+            assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
 
-        let default_effort_thread = Thread {
-            updated_at: second_timestamp + 2,
-            ..second_thread.clone()
-        };
-        let default_effort_turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000006".to_owned(),
-            status: TurnStatus::Completed,
-            turn_kind: TurnKind::Conversation,
-            origin: TurnOrigin::User,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &default_effort_thread,
-                SandboxMode::FullAccess,
-                &default_effort_turn,
-                &[],
-                None,
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("default-effort conversation turn should persist");
+            let default_effort_thread = Thread {
+                updated_at: second_timestamp + 2,
+                ..second_thread.clone()
+            };
+            let default_effort_turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000006".to_owned(),
+                status: TurnStatus::Completed,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &default_effort_thread,
+                    SandboxMode::FullAccess,
+                    &default_effort_turn,
+                    &[],
+                    None,
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("default-effort conversation turn should persist");
 
-        let listed = store
-            .list_threads_for_workspace(workspace_id, 10)
-            .await
-            .unwrap();
-        assert!(listed[0].reasoning_effort.is_none());
-        assert_eq!(listed[0].turns[0].id, default_effort_turn.id);
+            let listed = store
+                .list_threads_for_workspace(workspace_id, 10)
+                .await
+                .unwrap();
+            assert!(listed[0].reasoning_effort.is_none());
+            assert_eq!(listed[0].turns[0].id, default_effort_turn.id);
 
-        let latest_task_run_thread = Thread {
-            updated_at: second_timestamp + 3,
-            ..default_effort_thread
-        };
-        let latest_task_run_turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000007".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: TurnKind::TaskRun,
-            origin: TurnOrigin::DetachedTask,
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        store
-            .materialize_turn_start_with_reasoning_effort(
-                &latest_task_run_thread,
-                SandboxMode::FullAccess,
-                &latest_task_run_turn,
-                &[],
-                None,
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("latest task run marker should persist");
+            let latest_task_run_thread = Thread {
+                updated_at: second_timestamp + 3,
+                ..default_effort_thread
+            };
+            let latest_task_run_turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000007".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::TaskRun,
+                origin: TurnOrigin::DetachedTask,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start_with_reasoning_effort(
+                    &latest_task_run_thread,
+                    SandboxMode::FullAccess,
+                    &latest_task_run_turn,
+                    &[],
+                    None,
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("latest task run marker should persist");
 
-        let fetched = store
-            .get_thread_model(thread_id)
-            .await
-            .expect("thread should load after default effort")
-            .expect("thread should exist after default effort");
-        assert!(
-            fetched.reasoning_effort.is_none(),
-            "the latest Conversation turn must be allowed to clear an older effort"
-        );
-        assert_eq!(fetched.turns.len(), 1);
-        assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
-        assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
-        let listed = store
-            .list_threads_for_workspace(workspace_id, 10)
-            .await
-            .unwrap();
-        assert!(listed[0].reasoning_effort.is_none());
-        assert_eq!(listed[0].turns[0].id, latest_task_run_turn.id);
-        assert_eq!(listed[0].turns[0].turn_kind, TurnKind::TaskRun);
+            let fetched = store
+                .get_thread_model(thread_id)
+                .await
+                .expect("thread should load after default effort")
+                .expect("thread should exist after default effort");
+            assert!(
+                fetched.reasoning_effort.is_none(),
+                "the latest Conversation turn must be allowed to clear an older effort"
+            );
+            assert_eq!(fetched.turns.len(), 1);
+            assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
+            assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+            let listed = store
+                .list_threads_for_workspace(workspace_id, 10)
+                .await
+                .unwrap();
+            assert!(listed[0].reasoning_effort.is_none());
+            assert_eq!(listed[0].turns[0].id, latest_task_run_turn.id);
+            assert_eq!(listed[0].turns[0].turn_kind, TurnKind::TaskRun);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     pub(crate) fn assert_thread_turn_snapshot_statements(
@@ -66647,11 +66703,10 @@ mod tests {
                     .expect("one Conversation fallback batch query");
                 assert_thread_turn_snapshot_statement(fallback, true);
                 let values = &fallback.values.as_ref().unwrap().0;
-                assert_eq!(values.last(), Some(&sea_orm::Value::from("conversation")));
-                assert_eq!(values.len(), fallback_ids.len() + 1);
+                assert_eq!(values.len(), fallback_ids.len());
                 // SQL result order is deliberately irrelevant to list order.
                 for id in fallback_ids {
-                    assert!(values[..values.len() - 1].contains(&id.into()));
+                    assert!(values.contains(&id.into()));
                 }
             }
         }
@@ -66664,232 +66719,235 @@ mod tests {
     fn assert_thread_turn_snapshot_statement(statement: &Statement, conversation_only: bool) {
         let sql = &statement.sql;
         assert!(sql.starts_with("WITH selected(thread_id) AS (VALUES "));
-        assert!(sql.contains("SELECT latest.* FROM selected CROSS JOIN turn AS latest"));
-        assert!(sql.contains("INDEXED BY idx_turn_thread_created_id"));
+        assert!(sql.contains("SELECT latest.* FROM selected CROSS JOIN LATERAL"));
         assert!(sql.contains("candidate.thread_id = selected.thread_id"));
         assert!(sql.contains("ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1"));
         assert_eq!(
-            sql.contains("AND candidate.turn_kind = ?"),
+            sql.contains("AND candidate.turn_kind = 'conversation'"),
             conversation_only
         );
         assert!(!sql.contains("reasoning_effort IS NOT NULL"));
-        let id_count = statement.values.as_ref().unwrap().0.len() - usize::from(conversation_only);
+        let id_count = statement.values.as_ref().unwrap().0.len();
         assert!((1..=128).contains(&id_count));
-        assert_eq!(sql.matches("(?)").count(), id_count);
+        assert_eq!(sql.matches("::text)").count(), id_count);
     }
 
     #[tokio::test]
     async fn thread_list_batches_preserve_order_limit_effort_and_snapshot_metadata() {
-        let mut connection = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&connection, None).await.unwrap();
-        let statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
-        connection.set_metric_callback({
-            let statements = statements.clone();
-            move |info| statements.lock().unwrap().push(info.statement.clone())
-        });
-        let store = CrudStore::new(connection);
-        store.connection.execute_unprepared(
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_batch','Batch',1,1)"
-        ).await.unwrap();
-        for index in 0..231 {
-            let thread_id = format!("H{index:020}");
-            store.connection.execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,created_at,updated_at) \
-                 VALUES (?,'ws_batch','preview','agent','model','provider','idle',?,?)",
-                vec![thread_id.clone().into(), unix_to_datetime(1_700_000_000 + index).into(),
-                     unix_to_datetime(1_700_000_000 + index).into()],
-            )).await.unwrap();
-            let turns: Vec<(&str, &str, Option<&str>, i64)> = match index % 6 {
-                0 => vec![],
-                1 => vec![
-                    ("z", "conversation", Some("low"), 0),
-                    ("a", "conversation", Some("high"), 0),
-                    ("t", "task_run", Some("high"), 2),
-                ],
-                2 => vec![
-                    ("a", "conversation", Some("high"), 0),
-                    ("b", "conversation", None, 1),
-                    ("t", "task_run", Some("high"), 2),
-                ],
-                3 => vec![("t", "task_run", Some("high"), 2)],
-                // Insert z before a: equal timestamps must use ID DESC, not insertion order.
-                4 => vec![
-                    ("z", "conversation", Some("low"), 1),
-                    ("a", "conversation", Some("high"), 1),
-                ],
-                _ => vec![("a", "conversation", Some("high"), 0)],
-            };
-            for (suffix, kind, effort, offset) in turns {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let mut connection = fixture.connection().clone();
+            let statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+            connection.set_metric_callback({
+                let statements = statements.clone();
+                move |info| statements.lock().unwrap().push(info.statement.clone())
+            });
+            let store = CrudStore::new(connection);
+            store.connection.execute_unprepared(
+                "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_batch','Batch',TRUE,FALSE)"
+            ).await.unwrap();
+            for index in 0..231 {
+                let thread_id = format!("H{index:020}");
                 store.connection.execute_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
-                     VALUES (?,?,'in_progress',?,'user',?,?,?)",
-                    vec![format!("T{index:019}{suffix}").into(), thread_id.clone().into(), kind.into(), effort.into(),
-                         unix_to_datetime(1_700_000_000 + offset).into(), unix_to_datetime(1_700_000_000 + offset).into()],
+                    DatabaseBackend::Postgres,
+                    "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,created_at,updated_at) \
+                     VALUES ($1,'ws_batch','preview','agent','model','provider','idle',$2,$3)",
+                    vec![thread_id.clone().into(), unix_to_datetime(1_700_000_000 + index).into(),
+                         unix_to_datetime(1_700_000_000 + index).into()],
                 )).await.unwrap();
-            }
-        }
-        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
-            TurnPermissionMode::Supervised,
-            TurnPermissionProfileSource::Composer,
-        );
-        let rich_turn_id = format!("T{:019}t", 229);
-        let reply_id = format!("T{:019}a", 229);
-        let mention = TurnMention {
-            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
-            nickname: "member".to_owned(),
-        };
-        store.connection.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE turn SET origin='detached_task', send_mode='message', \
-             initiated_by_actor_kind='system', author_display_name_snapshot='Batch Author', \
-             author_nickname_snapshot='batch_author', author_avatar_revision_snapshot='avatar-7', \
-             reply_to_turn_id=?, mentions_json=?, message_revision=3, message_deleted_at=created_at, \
-             error='snapshot error', prompt_manifest_json='broken ignored manifest', \
-             permission_profile_snapshot_json=? WHERE id=?",
-            vec![reply_id.clone().into(), serde_json::to_string(&vec![mention.clone()]).unwrap().into(),
-                 serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
-        )).await.unwrap();
-
-        // At 129, the second batch contains only thread 102, which has no Turns.
-        // At 130, it also contains thread 101, whose latest Turn is Conversation.
-        // Neither needs a fallback query; at 132, TaskRun thread 99 does.
-        for (limit, expected_turn_queries) in [
-            (0, 0),
-            (1, 2),
-            (128, 2),
-            (129, 3),
-            (130, 3),
-            (132, 4),
-            (231, 4),
-        ] {
-            statements.lock().unwrap().clear();
-            let threads = store
-                .list_threads_for_workspace("ws_batch", limit)
-                .await
-                .unwrap();
-            assert_eq!(threads.len(), limit as usize);
-            let recorded = statements.lock().unwrap().clone();
-            assert_eq!(
-                recorded.len(),
-                1 + expected_turn_queries,
-                "unexpected query count for limit {limit}"
-            );
-            assert_thread_turn_snapshot_statements(&recorded, &threads);
-            for (position, thread) in threads.iter().enumerate() {
-                let index = 230 - position;
-                assert_eq!(thread.id, format!("H{index:020}"));
-                assert_eq!(thread.model, "model");
-                assert_eq!(thread.model_provider, "provider");
-                assert_eq!(
-                    thread.status,
-                    ThreadStatus::Idle,
-                    "TaskRun must not activate foreground"
-                );
-                let (suffix, effort, kind) = match index % 6 {
-                    0 => {
-                        assert!(thread.turns.is_empty());
-                        assert!(thread.reasoning_effort.is_none());
-                        continue;
-                    }
-                    1 => ("t", Some("low"), TurnKind::TaskRun),
-                    2 | 3 => ("t", None, TurnKind::TaskRun),
-                    4 => ("z", Some("low"), TurnKind::Conversation),
-                    _ => ("a", Some("high"), TurnKind::Conversation),
+                let turns: Vec<(&str, &str, Option<&str>, i64)> = match index % 6 {
+                    0 => vec![],
+                    1 => vec![
+                        ("z", "conversation", Some("low"), 0),
+                        ("a", "conversation", Some("high"), 0),
+                        ("t", "task_run", Some("high"), 2),
+                    ],
+                    2 => vec![
+                        ("a", "conversation", Some("high"), 0),
+                        ("b", "conversation", None, 1),
+                        ("t", "task_run", Some("high"), 2),
+                    ],
+                    3 => vec![("t", "task_run", Some("high"), 2)],
+                    // Insert z before a: equal timestamps must use ID DESC, not insertion order.
+                    4 => vec![
+                        ("z", "conversation", Some("low"), 1),
+                        ("a", "conversation", Some("high"), 1),
+                    ],
+                    _ => vec![("a", "conversation", Some("high"), 0)],
                 };
-                assert_eq!(thread.reasoning_effort.as_deref(), effort);
-                assert_eq!(thread.turns.len(), 1);
-                assert_eq!(thread.turns[0].id, format!("T{index:019}{suffix}"));
-                assert_eq!(thread.turns[0].turn_kind, kind);
-                assert!(thread.turns[0].prompt_manifest.is_none());
-                if index == 229 {
-                    let snapshot = &thread.turns[0];
-                    assert_eq!(snapshot.permission_profile, permission_profile);
-                    assert_eq!(snapshot.origin, TurnOrigin::DetachedTask);
-                    assert_eq!(snapshot.mode, ThreadMode::Message);
-                    let author = snapshot.author.as_ref().unwrap();
-                    assert_eq!(author.actor, PersistedActorRef::System);
-                    assert_eq!(author.display_name, "Batch Author");
-                    assert_eq!(author.nickname, "batch_author");
-                    assert_eq!(author.avatar_revision.as_deref(), Some("avatar-7"));
-                    assert_eq!(
-                        snapshot.reply_to_turn_id.as_deref(),
-                        Some(reply_id.as_str())
-                    );
-                    assert_eq!(snapshot.mentions, vec![mention.clone()]);
-                    assert_eq!(snapshot.message_revision, 3);
-                    assert!(snapshot.message_deleted);
-                    assert_eq!(snapshot.error.as_deref(), Some("snapshot error"));
+                for (suffix, kind, effort, offset) in turns {
+                    store.connection.execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
+                         VALUES ($1,$2,'in_progress',$3,'user',$4,$5,$6)",
+                        vec![format!("T{index:019}{suffix}").into(), thread_id.clone().into(), kind.into(), effort.into(),
+                             unix_to_datetime(1_700_000_000 + offset).into(), unix_to_datetime(1_700_000_000 + offset).into()],
+                    )).await.unwrap();
                 }
             }
-        }
-        statements.lock().unwrap().clear();
-        assert!(
+            let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            );
+            let rich_turn_id = format!("T{:019}t", 229);
+            let reply_id = format!("T{:019}a", 229);
+            let mention = TurnMention {
+                principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+                nickname: "member".to_owned(),
+            };
+            store.connection.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE turn SET origin='detached_task', send_mode='message', \
+                 initiated_by_actor_kind='system', author_display_name_snapshot='Batch Author', \
+                 author_nickname_snapshot='batch_author', author_avatar_revision_snapshot='avatar-7', \
+                 reply_to_turn_id=$1, mentions_json=$2, message_revision=3, message_deleted_at=created_at, \
+                 error='snapshot error', prompt_manifest_json='123', \
+                 permission_profile_snapshot_json=$3 WHERE id=$4",
+                vec![reply_id.clone().into(), serde_json::to_string(&vec![mention.clone()]).unwrap().into(),
+                     serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+            )).await.unwrap();
+
+            // At 129, the second batch contains only thread 102, which has no Turns.
+            // At 130, it also contains thread 101, whose latest Turn is Conversation.
+            // Neither needs a fallback query; at 132, TaskRun thread 99 does.
+            for (limit, expected_turn_queries) in [
+                (0, 0),
+                (1, 2),
+                (128, 2),
+                (129, 3),
+                (130, 3),
+                (132, 4),
+                (231, 4),
+            ] {
+                statements.lock().unwrap().clear();
+                let threads = store
+                    .list_threads_for_workspace("ws_batch", limit)
+                    .await
+                    .unwrap();
+                assert_eq!(threads.len(), limit as usize);
+                let recorded = statements.lock().unwrap().clone();
+                assert_eq!(
+                    recorded.len(),
+                    1 + expected_turn_queries,
+                    "unexpected query count for limit {limit}"
+                );
+                assert_thread_turn_snapshot_statements(&recorded, &threads);
+                for (position, thread) in threads.iter().enumerate() {
+                    let index = 230 - position;
+                    assert_eq!(thread.id, format!("H{index:020}"));
+                    assert_eq!(thread.model, "model");
+                    assert_eq!(thread.model_provider, "provider");
+                    assert_eq!(
+                        thread.status,
+                        ThreadStatus::Idle,
+                        "TaskRun must not activate foreground"
+                    );
+                    let (suffix, effort, kind) = match index % 6 {
+                        0 => {
+                            assert!(thread.turns.is_empty());
+                            assert!(thread.reasoning_effort.is_none());
+                            continue;
+                        }
+                        1 => ("t", Some("low"), TurnKind::TaskRun),
+                        2 | 3 => ("t", None, TurnKind::TaskRun),
+                        4 => ("z", Some("low"), TurnKind::Conversation),
+                        _ => ("a", Some("high"), TurnKind::Conversation),
+                    };
+                    assert_eq!(thread.reasoning_effort.as_deref(), effort);
+                    assert_eq!(thread.turns.len(), 1);
+                    assert_eq!(thread.turns[0].id, format!("T{index:019}{suffix}"));
+                    assert_eq!(thread.turns[0].turn_kind, kind);
+                    assert!(thread.turns[0].prompt_manifest.is_none());
+                    if index == 229 {
+                        let snapshot = &thread.turns[0];
+                        assert_eq!(snapshot.permission_profile, permission_profile);
+                        assert_eq!(snapshot.origin, TurnOrigin::DetachedTask);
+                        assert_eq!(snapshot.mode, ThreadMode::Message);
+                        let author = snapshot.author.as_ref().unwrap();
+                        assert_eq!(author.actor, PersistedActorRef::System);
+                        assert_eq!(author.display_name, "Batch Author");
+                        assert_eq!(author.nickname, "batch_author");
+                        assert_eq!(author.avatar_revision.as_deref(), Some("avatar-7"));
+                        assert_eq!(
+                            snapshot.reply_to_turn_id.as_deref(),
+                            Some(reply_id.as_str())
+                        );
+                        assert_eq!(snapshot.mentions, vec![mention.clone()]);
+                        assert_eq!(snapshot.message_revision, 3);
+                        assert!(snapshot.message_deleted);
+                        assert_eq!(snapshot.error.as_deref(), Some("snapshot error"));
+                    }
+                }
+            }
+            statements.lock().unwrap().clear();
+            assert!(
+                store
+                    .list_threads_for_workspace("missing", 231)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(statements.lock().unwrap().len(), 1);
+
+            // A skipped thread model must never be included in the selected-ID batch.
             store
-                .list_threads_for_workspace("missing", 231)
+                .connection
+                .execute_unprepared("UPDATE thread SET mode='unknown' WHERE id='H00000000000000000230'")
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(statements.lock().unwrap().len(), 1);
+                .unwrap();
+            statements.lock().unwrap().clear();
+            let threads = store
+                .list_threads_for_workspace("ws_batch", 1)
+                .await
+                .unwrap();
+            assert!(threads.is_empty());
+            assert_eq!(statements.lock().unwrap().len(), 1);
 
-        // A skipped thread model must never be included in the selected-ID batch.
-        store
-            .connection
-            .execute_unprepared("UPDATE thread SET mode='unknown' WHERE id='H00000000000000000230'")
-            .await
-            .unwrap();
-        statements.lock().unwrap().clear();
-        let threads = store
-            .list_threads_for_workspace("ws_batch", 1)
-            .await
-            .unwrap();
-        assert!(threads.is_empty());
-        assert_eq!(statements.lock().unwrap().len(), 1);
-
-        // Unknown Turn status still suppresses its snapshot, including effort;
-        // malformed selected snapshot metadata still fails through the old decoder.
-        store
-            .connection
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE turn SET status='unknown' WHERE id=?",
-                [rich_turn_id.clone().into()],
-            ))
-            .await
-            .unwrap();
-        let threads = store
-            .list_threads_for_workspace("ws_batch", 2)
-            .await
-            .unwrap();
-        assert_eq!(threads.len(), 1);
-        assert!(threads[0].turns.is_empty());
-        assert!(threads[0].reasoning_effort.is_none());
-        for corrupt_column in ["permission_profile_snapshot_json", "mentions_json"] {
+            // Unknown Turn status still suppresses its snapshot, including effort;
+            // malformed selected snapshot metadata still fails through the old decoder.
             store
                 .connection
                 .execute_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    format!(
-                        "UPDATE turn SET status='in_progress', {corrupt_column}='broken' WHERE id=?"
-                    ),
+                    DatabaseBackend::Postgres,
+                    "UPDATE turn SET status='unknown' WHERE id=$1",
                     [rich_turn_id.clone().into()],
                 ))
                 .await
                 .unwrap();
-            assert!(
+            let threads = store
+                .list_threads_for_workspace("ws_batch", 2)
+                .await
+                .unwrap();
+            assert_eq!(threads.len(), 1);
+            assert!(threads[0].turns.is_empty());
+            assert!(threads[0].reasoning_effort.is_none());
+            for corrupt_column in ["permission_profile_snapshot_json", "mentions_json"] {
                 store
-                    .list_threads_for_workspace("ws_batch", 2)
+                    .connection
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        format!(
+                            "UPDATE turn SET status='in_progress', {corrupt_column}='123' WHERE id=$1"
+                        ),
+                        [rich_turn_id.clone().into()],
+                    ))
                     .await
-                    .is_err()
-            );
-            store.connection.execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE turn SET permission_profile_snapshot_json=?, mentions_json='[]' WHERE id=?",
-                [serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
-            )).await.unwrap();
-        }
+                    .unwrap();
+                assert!(
+                    store
+                        .list_threads_for_workspace("ws_batch", 2)
+                        .await
+                        .is_err()
+                );
+                store.connection.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE turn SET permission_profile_snapshot_json=$1, mentions_json='[]' WHERE id=$2",
+                    [serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+                )).await.unwrap();
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[derive(Default)]
@@ -67246,7 +67304,11 @@ mod tests {
             pioneer_entity::turn_event::Entity::update_many()
                 .col_expr(
                     pioneer_entity::turn_event::Column::Payload,
-                    Expr::value(legacy_json),
+                    Expr::value(serde_json::from_str::<serde_json::Value>(&legacy_json).unwrap()),
+                )
+                .col_expr(
+                    pioneer_entity::turn_event::Column::PayloadPayloadId,
+                    Expr::value(Option::<String>::None),
                 )
                 .filter(pioneer_entity::turn_event::Column::Id.eq(terminal_row.id))
                 .exec(&store.connection)
@@ -67306,118 +67368,123 @@ mod tests {
 
     #[tokio::test]
     async fn update_turn_prompt_manifest_roundtrips_via_prompt_manifest_json() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let connection = fixture.connection().clone();
 
-        let store = CrudStore::new(connection.clone());
-        let timestamp = 1_700_000_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: "ws_000000000000000001".to_owned(),
-            id: "thr_000000000000000002".to_owned(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: "turn_000000000000000002".to_owned(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: Default::default(),
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
+            let store = CrudStore::new(connection.clone());
+            let timestamp = 1_700_000_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: "ws_000000000000000001".to_owned(),
+                id: "thr_000000000000000002".to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: "turn_000000000000000002".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
 
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .expect("turn start should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
 
-        let manifest = PromptManifest {
-            compiler_version: "0.1.0-test".to_owned(),
-            profile: PromptManifestProfile::AssistantFull,
-            section_ids: vec![
-                "identity_base".to_owned(),
-                "assistant_safety".to_owned(),
-                "soul_core".to_owned(),
-            ],
-            fingerprint_stable: "stable".to_owned(),
-            fingerprint_dynamic: "dynamic".to_owned(),
-            fingerprint_full: "full".to_owned(),
-            diagnostics: vec![PromptManifestDiagnostic {
-                code: PromptManifestDiagnosticCode::MissingFile,
-                message: "bootstrap file `SOUL.md` is missing".to_owned(),
-                file: Some("/tmp/SOUL.md".to_owned()),
-                section_id: None,
-                hook_source: Some(PromptManifestHookSource {
-                    hook_id: "test.crud_hook".to_owned(),
-                    subscription_id: "test.crud_subscription".to_owned(),
-                    phase: PromptManifestHookPhase::TurnPrePromptCompile,
-                    contribution_id: None,
-                    contribution_hash: Some("sha256:cruddiagnostic".to_owned()),
-                }),
-            }],
-            hook_sources: vec![PromptManifestHookSourceEntry {
-                source: PromptManifestHookSource {
-                    hook_id: "test.crud_hook".to_owned(),
-                    subscription_id: "test.crud_subscription".to_owned(),
-                    phase: PromptManifestHookPhase::TurnPrePromptCompile,
-                    contribution_id: None,
-                    contribution_hash: Some("sha256:crudsource".to_owned()),
-                },
-                section_id: Some("identity_base".to_owned()),
-                contribution_kind: PromptManifestHookContributionKind::PromptSection,
-                priority: Some(10),
-                source_count: Some(1),
-                truncation: PromptManifestHookTruncation::None,
-            }],
-        };
+            let manifest = PromptManifest {
+                compiler_version: "0.1.0-test".to_owned(),
+                profile: PromptManifestProfile::AssistantFull,
+                section_ids: vec![
+                    "identity_base".to_owned(),
+                    "assistant_safety".to_owned(),
+                    "soul_core".to_owned(),
+                ],
+                fingerprint_stable: "stable".to_owned(),
+                fingerprint_dynamic: "dynamic".to_owned(),
+                fingerprint_full: "full".to_owned(),
+                diagnostics: vec![PromptManifestDiagnostic {
+                    code: PromptManifestDiagnosticCode::MissingFile,
+                    message: "bootstrap file `SOUL.md` is missing".to_owned(),
+                    file: Some("/tmp/SOUL.md".to_owned()),
+                    section_id: None,
+                    hook_source: Some(PromptManifestHookSource {
+                        hook_id: "test.crud_hook".to_owned(),
+                        subscription_id: "test.crud_subscription".to_owned(),
+                        phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                        contribution_id: None,
+                        contribution_hash: Some("sha256:cruddiagnostic".to_owned()),
+                    }),
+                }],
+                hook_sources: vec![PromptManifestHookSourceEntry {
+                    source: PromptManifestHookSource {
+                        hook_id: "test.crud_hook".to_owned(),
+                        subscription_id: "test.crud_subscription".to_owned(),
+                        phase: PromptManifestHookPhase::TurnPrePromptCompile,
+                        contribution_id: None,
+                        contribution_hash: Some("sha256:crudsource".to_owned()),
+                    },
+                    section_id: Some("identity_base".to_owned()),
+                    contribution_kind: PromptManifestHookContributionKind::PromptSection,
+                    priority: Some(10),
+                    source_count: Some(1),
+                    truncation: PromptManifestHookTruncation::None,
+                }],
+            };
 
-        let updated = store
-            .update_turn_prompt_manifest(thread.id.as_str(), turn.id.as_str(), &manifest, timestamp)
-            .await
-            .expect("update should succeed");
-        assert!(updated, "turn row must be updated");
+            let updated = store
+                .update_turn_prompt_manifest(
+                    thread.id.as_str(),
+                    turn.id.as_str(),
+                    &manifest,
+                    timestamp,
+                )
+                .await
+                .expect("update should succeed");
+            assert!(updated, "turn row must be updated");
 
-        let (_workspace_id, roundtrip_turn) = store
-            .get_turn(thread.id.as_str(), turn.id.as_str())
-            .await
-            .expect("turn/get should succeed")
-            .expect("turn should exist");
-        assert_eq!(roundtrip_turn.prompt_manifest, Some(manifest));
+            let (_workspace_id, roundtrip_turn) = store
+                .get_turn(thread.id.as_str(), turn.id.as_str())
+                .await
+                .expect("turn/get should succeed")
+                .expect("turn should exist");
+            assert_eq!(roundtrip_turn.prompt_manifest, Some(manifest));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

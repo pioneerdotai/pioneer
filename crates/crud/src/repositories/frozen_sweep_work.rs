@@ -1,18 +1,21 @@
 //! Durable eligibility only. These tokens never authorize physical deletion.
 //! All helpers inherit the maintenance handle and release capacity per quantum.
+#[cfg(test)]
 use super::frozen_storage_lifetime::{frozen_scope_query, physical_table};
 use crate::CrudStore;
 use anyhow::{Result, ensure};
+#[cfg(test)]
+use pioneer_entity::compaction_frozen_sweep_bootstrap as bootstrap;
 use pioneer_entity::{
     compaction_frozen_history as history, compaction_frozen_layout as layout,
-    compaction_frozen_span as span, compaction_frozen_sweep_bootstrap as bootstrap,
-    compaction_frozen_sweep_consumer as consumer, compaction_frozen_sweep_fanout as fanout,
-    compaction_frozen_sweep_work as work,
+    compaction_frozen_span as span, compaction_frozen_sweep_consumer as consumer,
+    compaction_frozen_sweep_fanout as fanout, compaction_frozen_sweep_work as work,
 };
 use sea_orm::sea_query::{
-    Alias, BinOper, Expr, ExprTrait, Func, IntoIden, IntoTableRef, JoinType, OnConflict, Order,
-    Query, SelectStatement,
+    Alias, BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query,
 };
+#[cfg(test)]
+use sea_orm::sea_query::{IntoIden, IntoTableRef, SelectStatement};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, Statement, TransactionTrait,
@@ -27,6 +30,7 @@ pub(super) struct Work {
 
 /// Single group per quantum, with a persisted upper bound for each family.
 /// Concurrent groups on either side of the cursor are covered by INSERT triggers.
+#[cfg(test)]
 pub(super) async fn bootstrap_step(store: &CrudStore) -> Result<bool> {
     let row = store
         .connection
@@ -150,6 +154,7 @@ pub(super) async fn bootstrap_step(store: &CrudStore) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg(test)]
 fn scope_witness_guard(id: &str, row: &sea_orm::QueryResult) -> Result<SelectStatement> {
     let via: i64 = row.try_get("", "scope_via")?;
     if via == 0 {

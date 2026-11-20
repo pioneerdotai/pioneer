@@ -106,7 +106,7 @@ impl Parser {
     }
     fn finish(mut self) -> Result<Value> {
         match self.token.take() {
-            Some(Token::Number(bytes)) => self.value(serde_json::from_slice(&bytes)?)?,
+            Some(Token::Number(bytes)) => self.number(&bytes)?,
             Some(Token::Literal(word, n)) if n == word.len() => {
                 self.value(serde_json::from_slice(word)?)?
             }
@@ -150,7 +150,7 @@ impl Parser {
                         return Ok(());
                     }
                     ensure!(delimiter(byte), "invalid legacy root number delimiter");
-                    self.value(serde_json::from_slice(&bytes)?)?;
+                    self.number(&bytes)?;
                 }
                 Token::Literal(word, n) => {
                     if n < word.len() {
@@ -226,6 +226,18 @@ impl Parser {
     fn close(&mut self) -> Result<()> {
         let frame = self.stack.pop().expect("closing JSON frame");
         self.value(frame.finish())
+    }
+    fn number(&mut self, bytes: &[u8]) -> Result<()> {
+        let schema = self.stack.last().map(Frame::child).unwrap_or(self.schema);
+        let value = if matches!(schema, Schema::Discard) {
+            // Check JSON grammar without imposing a floating-point range on
+            // unselected values from exact-text PostgreSQL JSON columns.
+            serde_json::from_slice::<serde::de::IgnoredAny>(bytes)?;
+            Value::Null
+        } else {
+            serde_json::from_slice(bytes)?
+        };
+        self.value(value)
     }
     fn value(&mut self, value: Value) -> Result<()> {
         if let Some(frame) = self.stack.last_mut() {

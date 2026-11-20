@@ -785,7 +785,11 @@ async fn corrupt_body_in_claim_batch_does_not_suppress_healthy_turn() {
         pioneer_entity::turn_event::Entity::update_many()
             .col_expr(
                 pioneer_entity::turn_event::Column::Payload,
-                Expr::value("{invalid-json"),
+                Expr::value(serde_json::json!({"invalid_canonical_event": true})),
+            )
+            .col_expr(
+                pioneer_entity::turn_event::Column::PayloadPayloadId,
+                Expr::value(Option::<String>::None),
             )
             .filter(pioneer_entity::turn_event::Column::Id.eq(bad.event_id))
             .exec(&store.connection)

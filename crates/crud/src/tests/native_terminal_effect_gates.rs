@@ -2035,12 +2035,55 @@ async fn failed_claim_discovery_page_keeps_its_input_quota_and_other_statuses_pr
                 row.update(&f.store.connection).await.unwrap();
             }
         }
-        // SQL returns three ready inputs, but typed decoding cannot return the
-        // page. Its full quota still counts, leaving only five independent inputs.
-        f.store.connection.execute_unprepared("UPDATE native_terminal_effect_outbox SET updated_at='invalid-time' WHERE effect_id LIKE 'turn_discovery_ready_00:%'").await.unwrap();
+        // Fail the ready page through a private schema visible only to the
+        // reader. Its full quota still counts against this attempt.
+        use sea_orm::Iterable;
+        use sea_orm::sea_query::Query;
+        let db = database.connection();
+        db.execute_unprepared(
+            "CREATE SCHEMA terminal_fixture;
+             CREATE FUNCTION terminal_fixture.read_timestamp(id text, stamp timestamptz)
+             RETURNS timestamptz LANGUAGE plpgsql AS $$
+             BEGIN
+               IF starts_with(id, 'turn_discovery_ready_00:') THEN
+                 RAISE EXCEPTION 'fixture could not read this ready page';
+               END IF;
+               RETURN stamp;
+             END $$;",
+        )
+        .await
+        .unwrap();
+        let discovery = Query::select()
+            .from(effect::Entity)
+            .columns(
+                effect::Column::iter()
+                    .filter(|column| !matches!(column, effect::Column::UpdatedAt)),
+            )
+            .expr_as(
+                Expr::cust("terminal_fixture.read_timestamp(effect_id, updated_at)"),
+                "updated_at",
+            )
+            .to_owned();
+        let sql = DatabaseBackend::Postgres.build(&discovery).sql;
+        db.execute_unprepared(&format!(
+            "CREATE VIEW terminal_fixture.native_terminal_effect_outbox AS {sql}"
+        ))
+        .await
+        .unwrap();
+        let reader = database
+            .connect_with_options(|options| {
+                options.map_sqlx_postgres_opts(|opts| {
+                    opts.options([
+                        ("search_path", "terminal_fixture,public"),
+                        ("default_transaction_read_only", "on"),
+                    ])
+                });
+            })
+            .await
+            .unwrap();
+        let store = CrudStore::new(SqliteDatabase::new(reader, db.clone()));
         let at = NOW + 2; // ready first, then retry_wait, then running
-        let outcome = f
-            .store
+        let outcome = store
             .claim_due_native_terminal_effects_with_clock(at, 10, 8, &|| at)
             .await
             .unwrap();
@@ -2069,5 +2112,7 @@ async fn failed_claim_discovery_page_keeps_its_input_quota_and_other_statuses_pr
                 .all(|record| !record.effect_id.contains("ready"))
         );
         Ok(())
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

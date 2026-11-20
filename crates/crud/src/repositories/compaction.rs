@@ -1880,7 +1880,7 @@ impl CheckpointTopologyRead {
     }
     async fn refresh<C: ConnectionTrait>(&mut self, db: &C) -> Result<bool> {
         let current = refresh_checkpoint_row(db, &self.row).await?;
-        if self.row.coverage_closed == 0 && current.coverage_closed == 1 {
+        if !self.row.coverage_closed && current.coverage_closed {
             ensure!(self.observed.is_none(), "repeated checkpoint close");
             let old = std::mem::replace(
                 self,
@@ -2007,8 +2007,7 @@ pub(super) async fn checkpoint_row<C: ConnectionTrait>(
             .lt(Expr::col((
                 compaction_operation::Entity,
                 compaction_operation::Column::NextPortion,
-            )))
-            .cast_as(Alias::new("bigint")),
+            ))),
             Alias::new("coverage_closed"),
         )
         .columns(
@@ -2097,11 +2096,9 @@ pub(super) async fn refresh_checkpoint_row<C: ConnectionTrait>(
     ensure!(
         matches!(observed.proof_version, 0 | 1)
             && matches!(current.proof_version, 0 | 1)
-            && matches!(observed.coverage_closed, 0 | 1)
-            && matches!(current.coverage_closed, 0 | 1)
             && current.proof_version >= observed.proof_version
-            && current.coverage_closed >= observed.coverage_closed
-            && (current.proof_version == 0 || current.coverage_closed == 1),
+            && (!observed.coverage_closed || current.coverage_closed)
+            && (current.proof_version == 0 || current.coverage_closed),
         "unsupported or regressed checkpoint readiness"
     );
     let mut identity = current.clone();
@@ -2234,7 +2231,7 @@ pub(super) struct CheckpointEdgesRow {
     pub id: String,
     pub proof_version: i64,
     /// Existing portion boundary; prevents a legacy repair mixing read pages.
-    pub coverage_closed: i64,
+    pub coverage_closed: bool,
     pub status: String,
     pub owner: String,
     pub workspace_id: String,
@@ -2327,7 +2324,7 @@ async fn refresh_metadata_topology(
     ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
 ) -> Result<CheckpointEdgesRow> {
     let current = refresh_checkpoint_row(&store.connection, observed).await?;
-    if observed.coverage_closed == 0 && current.coverage_closed == 1 {
+    if !observed.coverage_closed && current.coverage_closed {
         let frozen = checkpoint_topology(&store.connection, &current.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("closed checkpoint disappeared"))?;
