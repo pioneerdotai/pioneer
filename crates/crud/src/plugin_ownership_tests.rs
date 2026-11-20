@@ -1235,7 +1235,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
             .upsert_mcp_server_installation(&legacy, 1)
             .await
             .unwrap();
-        legacy.transport_json = "updated".into();
+        legacy.transport_json = r#"{"command":"updated"}"#.into();
         assert_eq!(
             store
                 .upsert_mcp_server_installation_with_audit(&legacy, &mcp_audit(&legacy), 2,)
@@ -1251,7 +1251,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
                 .unwrap()
                 .unwrap()
                 .transport_json,
-            "updated"
+            r#"{"command":"updated"}"#
         );
 
         let fresh = mcp("new", "ws", "new-server");

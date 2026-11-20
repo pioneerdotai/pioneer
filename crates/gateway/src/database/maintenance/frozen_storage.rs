@@ -222,13 +222,12 @@ fn can_start_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::frozen::FrozenHistoryRef;
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
         SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
     };
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -281,8 +280,8 @@ mod tests {
         }
     }
 
-    // Real separate read-only reader and FK OFF serialized writer. Seed through
-    // existing domain APIs; installed guards remain on during every action.
+    // Separate read-only and writer pools on the same private PostgreSQL database.
+    // Seed through the domain APIs and keep all production guards enabled.
     async fn fixture() -> (tempfile::TempDir, CrudStore, Arc<Observer>) {
         fixture_with_metadata(512).await
     }
@@ -290,26 +289,11 @@ mod tests {
     async fn fixture_with_metadata(count: usize) -> (tempfile::TempDir, CrudStore, Arc<Observer>) {
         use sha2::{Digest, Sha256};
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("frozen-batch.sqlite");
-        let mut options =
-            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-        options
-            .max_connections(1)
-            .min_connections(1)
-            .sqlx_logging(false);
-        let writer = Database::connect(options).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA foreign_keys=OFF")
-            .await
-            .unwrap();
-        Migrator::up(&writer, None).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let writer = fixture.connect_with_limit(1).await.unwrap();
         writer
             .execute_unprepared(
-                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
             )
             .await
             .unwrap();
@@ -351,13 +335,14 @@ mod tests {
             status: "active".into(), created_at: now, updated_at: now,
         }).await.unwrap();
         drop(seed);
-        let mut options =
-            sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-        options
-            .max_connections(2)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|o| o.pragma("query_only", "ON"));
-        let reader = Database::connect(options).await.unwrap();
+        let reader = fixture
+            .connect_with_options(|options| {
+                options.max_connections(2).map_sqlx_postgres_opts(|opts| {
+                    opts.options([("default_transaction_read_only", "on")])
+                });
+            })
+            .await
+            .unwrap();
         let observer = Arc::new(Observer::default());
         let database = SqliteDatabase::from_executor_with_read_observer(
             reader,
@@ -375,7 +360,7 @@ mod tests {
         (directory, store, observer)
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn real_metadata_batches_are_bounded_continue_and_revisit_idle_without_empty_sleeps() {
         let (_directory, store, observer) = fixture().await;
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -501,7 +486,7 @@ mod tests {
         assert!(!writes.iter().any(|e| matches!(e, SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Maintenance)));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn slow_reader_admission_finishes_current_step_and_cancelled_batch_releases_queue() {
         let (_directory, store, observer) = fixture().await;
         let held = store.database_connection().begin_read().await.unwrap();
@@ -576,15 +561,16 @@ mod tests {
         let pragma = store
             .database_connection()
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_keys",
+                DbBackend::Postgres,
+                "SELECT current_setting('session_replication_role') AS replication_role",
             ))
             .await
             .unwrap()
             .unwrap();
-        // FK policy belongs to the writer; this read also proves reader routing
-        // still works after cancellation, while the fixture uses FK OFF above.
-        let _: i64 = pragma.try_get("", "foreign_keys").unwrap();
+        assert_eq!(
+            pragma.try_get::<String>("", "replication_role").unwrap(),
+            "origin"
+        );
     }
 
     #[test]
@@ -602,7 +588,7 @@ mod tests {
             assert!(!admission.ready(1 - first));
         }
     }
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn one_released_manifest_finishes_without_revisiting_retained_histories() {
         use pioneer_entity::compaction_frozen_history as history;
         use sea_orm::EntityTrait;
@@ -712,7 +698,7 @@ mod tests {
         drop(holds);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn metadata_refresh_is_quiet_and_root_replacement_addresses_both_identities() {
         use pioneer_crud::NewCliRuntimeThreadBinding;
         use sha2::{Digest, Sha256};
@@ -810,7 +796,7 @@ mod tests {
         drop(hold);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn source_invalidation_registers_new_work_without_repeating_legacy_inventory() {
         use pioneer_entity::compaction_frozen_history as history;
         use sea_orm::EntityTrait;
@@ -893,7 +879,7 @@ mod tests {
         panic!("new supported work must be registered without a legacy scan");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn conversion_release_reopens_lifetime_after_eof() {
         use pioneer_entity::compaction_frozen_history as history;
         use sea_orm::EntityTrait;
@@ -910,7 +896,7 @@ mod tests {
                 .compact_frozen_storage_quantum(&mut progress)
                 .await
                 .unwrap();
-            let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+            let row = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
                 "SELECT count(*) AS n FROM compaction_frozen_layout WHERE manifest_id='live' AND pending=1".to_owned())).await.unwrap().unwrap();
             if row.try_get::<i64>("", "n").unwrap() > 0 {
                 break;
@@ -976,7 +962,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn conversion_eof_survives_batches_and_invalidation_discovers_new_work() {
         use pioneer_entity::{
             compaction_frozen_history as history, compaction_frozen_layout as layout,
@@ -1160,7 +1146,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn discard_preflight_uses_maintenance_reader_without_writer_admission() {
         use pioneer_compaction::{
             ModelSelection, Transport,
@@ -1220,8 +1206,8 @@ mod tests {
             diagnostic: None,
         };
         store.database_connection().execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('discard-op',0,?1)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('discard-op',0,$1::text::json)",
             [serde_json::to_string(&state).unwrap().into()],
         )).await.unwrap();
         let selection = ModelSelection {
@@ -1234,8 +1220,8 @@ mod tests {
             effort: None,
         };
         store.database_connection().execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('discard-key','discard-op','discard-owner',0,'s','identity',?1,1,1,'candidate')",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('discard-key','discard-op','discard-owner',0,'s','identity',$1::text::json,1,1,'candidate')",
             [serde_json::to_string(&selection).unwrap().into()],
         )).await.unwrap();
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -1286,7 +1272,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn budget_error_and_cancelled_admission_do_not_record_eof() {
         let (_directory, store, observer) = fixture_with_metadata(0).await;
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -1349,26 +1335,26 @@ mod tests {
 
     // Distinct lifecycle proof: the actual run future stays parked, including
     // across elapsed pacing/backoff intervals, with protected pending work.
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn protected_pending_owner_parks_without_clock_rescans() {
         let (_directory, store, observer) = fixture_with_metadata(0).await;
         let db = store.database_connection();
         for index in 0..7 {
             let id = format!("protected-{index}");
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES(?1,'ws','thread','fixture','fixture',0,0,0,0,0)",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES($1,'ws','thread','fixture','fixture',0,0,0,0,0)",
                 [id.clone().into()])).await.unwrap();
             let kind = i64::from(index != 0);
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,?2,0,1)",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES($1,$2,0,1)",
                 [id.clone().into(), kind.into()])).await.unwrap();
             let sql = if kind == 0 {
-                "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,0,'{}',2)"
+                "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES($1,0,'{}',2)"
             } else {
-                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,0,0,'event','e','v','thread','{}',2)"
+                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES($1,0,0,'event','e','v','thread','{}',2)"
             };
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 [id.into()],
             ))
@@ -1436,15 +1422,15 @@ mod tests {
         worker.await;
         // Pool acquisition uses real SQLite worker I/O after the virtual-time proof.
         tokio::time::resume();
-        let pending = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        let pending = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0")).await.unwrap().unwrap();
         assert_eq!(pending.try_get::<i64>("", "n").unwrap(), 7);
-        let retained = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        let retained = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
             "SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id LIKE 'protected-%') + (SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id LIKE 'protected-%') AS n")).await.unwrap().unwrap();
         assert_eq!(retained.try_get::<i64>("", "n").unwrap(), 7);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn durable_sweep_restarts_quietly_without_writes_and_keeps_maintenance_routes() {
         let (_directory, store, observer) = fixture_with_metadata(0).await;
         let db = store.database_connection();
@@ -1462,7 +1448,7 @@ mod tests {
         }
         assert!(idle);
         let first_reads = observer.operations() - before;
-        let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        let row = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id='held-physical' AND pending=0")).await.unwrap().unwrap();
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), 2);
         let writes = observer.writes.lock().unwrap().len();
@@ -1515,7 +1501,7 @@ mod tests {
         assert!(db.reader_query_only_enabled().await.unwrap());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn html_preview_index_uses_scoped_readers_and_serial_writer_and_cancels_admission() {
         let (directory, store, observer) = fixture().await;
         use pioneer_entity::{
@@ -1529,13 +1515,16 @@ mod tests {
         let tx = db.begin().await.unwrap();
         let fk = tx
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_keys",
+                DbBackend::Postgres,
+                "SELECT current_setting('session_replication_role') AS replication_role",
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fk.try_get::<i64>("", "foreign_keys").unwrap(), 0);
+        assert_eq!(
+            fk.try_get::<String>("", "replication_role").unwrap(),
+            "origin"
+        );
         let marker = index::Entity::find_by_id("metadata-0000")
             .one(&tx)
             .await

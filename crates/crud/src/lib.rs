@@ -38928,83 +38928,6 @@ mod tests {
         }
     }
 
-    // Some rollback guards exercise today's projector on a deliberately older
-    // migration prefix. Add only its unrelated inbox runtime dependencies, not
-    // migration records or historical grants. Webhook input columns are also
-    // required by today's task entities. Pure upgrade fixtures must not
-    // call this helper: they retain the exact historical schema under test.
-    async fn add_inbox_runtime_fields_to_legacy_projector_fixture(store: &CrudStore) {
-        use migration::{ColumnDef, SchemaManager, Table};
-        use sea_orm::sea_query::Alias;
-
-        let transaction = store.connection.begin().await.unwrap();
-        let schema = SchemaManager::new(&*transaction);
-        for (table, column) in [
-            ("thread", "inbox_workspace_after_sequence"),
-            ("task_run", "inbox_sequence"),
-        ] {
-            schema
-                .alter_table(
-                    Table::alter()
-                        .table(Alias::new(table))
-                        .add_column(ColumnDef::new(Alias::new(column)).big_integer().null())
-                        .to_owned(),
-                )
-                .await
-                .unwrap();
-        }
-        for (table, column) in [
-            ("task_trigger", "webhook_secret_ref"),
-            ("task_run", "trigger_input_json"),
-            ("turn", "package_selection_json"),
-        ] {
-            if !schema.has_column(table, column).await.unwrap() {
-                schema
-                    .alter_table(
-                        Table::alter()
-                            .table(Alias::new(table))
-                            .add_column(ColumnDef::new(Alias::new(column)).text().null())
-                            .to_owned(),
-                    )
-                    .await
-                    .unwrap();
-            }
-        }
-        schema
-            .alter_table(
-                Table::alter()
-                    .table(Alias::new("thread"))
-                    .add_column(
-                        ColumnDef::new(Alias::new("inbox_workspace_started_at"))
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
-                    .to_owned(),
-            )
-            .await
-            .unwrap();
-        // Real current terminal commits allocate a sequence, even though these
-        // tests do not exercise inbox eligibility or notification history.
-        schema
-            .create_table(
-                sea_orm::Schema::new(DatabaseBackend::Sqlite)
-                    .create_table_from_entity(pioneer_entity::task_inbox_activation::Entity),
-            )
-            .await
-            .unwrap();
-        pioneer_entity::task_inbox_activation::Entity::insert(
-            pioneer_entity::task_inbox_activation::ActiveModel {
-                id: Set(1),
-                started_at: Set(0),
-                completion_sequence: Set(0),
-            },
-        )
-        .exec(&transaction)
-        .await
-        .unwrap();
-        transaction.commit().await.unwrap();
-    }
-
     async fn read_fixture_item(
         db: &pioneer_sqlite::SqliteDatabase,
         row: pioneer_entity::turn_item::Model,
@@ -39071,37 +38994,6 @@ mod tests {
             .await
             .expect("clone the PostgreSQL CRUD fixture database");
         postgres_store_with_workspace(&fixture, workspace_id).await
-    }
-
-    // Empty-input projector fixtures exercise old migration boundaries with
-    // today's Thread Entity. Add only its later metadata column, without
-    // applying/registering unread or changing which migration down() tests.
-    async fn add_thread_unread_column_to_legacy_fixture(store: &CrudStore) {
-        use migration::{ColumnDef, SchemaManager, Table};
-
-        let transaction = store.connection.begin().await.unwrap();
-        let schema = SchemaManager::new(&*transaction);
-        assert!(
-            !schema
-                .has_column("thread", "workspace_unread_started_at")
-                .await
-                .unwrap()
-        );
-        schema
-            .alter_table(
-                Table::alter()
-                    .table(pioneer_entity::thread::Entity)
-                    .add_column(
-                        ColumnDef::new(pioneer_entity::thread::Column::WorkspaceUnreadStartedAt)
-                            .big_integer()
-                            .not_null()
-                            .default(0),
-                    )
-                    .to_owned(),
-            )
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
     }
 
     async fn test_store_with_workspace_and_query_counter(

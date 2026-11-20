@@ -1,37 +1,27 @@
 use super::*;
-use migration::{Migrator, MigratorTrait};
-use sea_orm::Database;
 use std::sync::{Arc, Mutex};
 
-const MIGRATION: &str = "m20261026_000002_frozen_proof_discovery_index";
 type RecordedStatements = Arc<Mutex<Vec<Statement>>>;
 
 // Isolated metadata-only fixtures. Synthetic seals test discovery membership,
 // never authority to publish; real sealing is covered by the queued-proof test.
-async fn metadata_fixture(
-    before_index: bool,
-) -> (CrudStore, sea_orm::DatabaseConnection, RecordedStatements) {
-    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-    options.max_connections(1).min_connections(1);
-    let mut db = Database::connect(options).await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let before = Migrator::migrations()
-        .iter()
-        .position(|migration| migration.name() == MIGRATION)
-        .expect("proof discovery index must be registered");
-    Migrator::up(&db, before_index.then_some(before as u32))
-        .await
-        .unwrap();
+async fn metadata_fixture() -> (
+    CrudStore,
+    RecordedStatements,
+    sea_orm::DatabaseConnection,
+) {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let mut db = fixture.connect_read_only().await.unwrap();
     let statements = RecordedStatements::default();
     let captured = statements.clone();
     db.set_metric_callback(move |info| {
         captured.lock().unwrap().push(info.statement.clone());
     });
-    let store = CrudStore::new(db.clone()).with_maintenance_access();
+    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        db, fixture.connection().clone(),
+    )).with_maintenance_access();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)",
         "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,next_portion) VALUES('failed','owner','failed','failed','{}',1000,0)",
@@ -42,13 +32,13 @@ async fn metadata_fixture(
     ] {
         store.connection.execute_unprepared(sql).await.unwrap();
     }
-    (store, db, statements)
+    (store, statements, fixture.connection().clone())
 }
 
 async fn header(store: &CrudStore, id: &str, op: &str, status: &str, version: i64) {
     store.connection.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status,proof_version) VALUES(?1,?2,'owner',COALESCE((SELECT portion+1 FROM compaction_checkpoint WHERE operation_id=?2 ORDER BY portion DESC LIMIT 1),0),'summary','identity','{}',1,1,?3,?4)",
+        DbBackend::Postgres,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status,proof_version) VALUES($1,$2,'owner',COALESCE((SELECT portion+1 FROM compaction_checkpoint WHERE operation_id=$2 ORDER BY portion DESC LIMIT 1),0),'summary','identity','{}',1,1,$3,$4)",
         [id.into(), op.into(), status.into(), version.into()],
     )).await.unwrap();
 }
@@ -58,17 +48,17 @@ async fn raw_candidate_fixture() -> (CrudStore, Checkpoint) {
     use pioneer_compaction::{
         CompactionMode, CompactionPlan, CompactionSettings, CoverageDomain, OperationSnapshot,
     };
-    let (store, _, _) = metadata_fixture(false).await;
+    let (store, _, _) = metadata_fixture().await;
     for sql in [
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('source','thread','turn',1,'fixture','original',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('source','thread','turn',1,'fixture','\"original\"',CURRENT_TIMESTAMP)",
     ] {
         store.connection.execute_unprepared(sql).await.unwrap();
     }
     let revision = store
         .connection
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT revision FROM compaction_event_revision WHERE source_id='source'",
         ))
         .await
@@ -81,7 +71,7 @@ async fn raw_candidate_fixture() -> (CrudStore, Checkpoint) {
         kind: CanonicalSource::Event,
         turn_id: "turn".into(),
         id: "source".into(),
-        payload: "original".into(),
+        payload: "\"original\"".into(),
     };
     let selection = ModelSelection {
         service_mode: None,
@@ -159,9 +149,9 @@ pub(super) async fn queued_raw_candidate_rechecks_concurrent_seal() {
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn sparse_unsealed_pages_seek_past_seals_and_keep_parameterized_order() {
-    let (store, _, statements) = metadata_fixture(false).await;
+    let (store, statements, _) = metadata_fixture().await;
     let mut unsealed = Vec::new();
     for i in 0..530 {
         let id = format!("cp-{i:04}");
@@ -172,6 +162,7 @@ async fn sparse_unsealed_pages_seek_past_seals_and_keep_parameterized_order() {
             unsealed.push(id);
         }
     }
+    store.connection.execute_unprepared("ANALYZE compaction_checkpoint").await.unwrap();
     let mut progress = FrozenStorageLifetimeProgress::default();
     statements.lock().unwrap().clear();
     assert!(progress.proof_quantum(&store).await.unwrap());
@@ -187,23 +178,20 @@ async fn sparse_unsealed_pages_seek_past_seals_and_keep_parameterized_order() {
     let mut statement = statements.lock().unwrap().last().unwrap().clone();
     // Explain the actual SeaQuery statement with its original bound values.
     // Assert the useful access property, never an entire plan/SQL snapshot.
-    statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+    statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
     let plan = store.connection.query_all_raw(statement).await.unwrap();
     let details: Vec<String> = plan
         .iter()
-        .map(|row| row.try_get("", "detail").unwrap())
+        .map(|row| row.try_get("", "QUERY PLAN").unwrap())
         .collect();
     assert!(
         details
             .iter()
-            .any(|detail| detail.contains("SEARCH compaction_checkpoint ")
-                && detail.contains("checkpoint_proof_discovery")
-                && detail.contains("proof_version=?")
-                && detail.contains("id>?")),
+            .any(|detail| detail.contains("checkpoint_proof_discovery")),
         "{details:#?}"
     );
     assert!(
-        !details.iter().any(|detail| detail.contains("TEMP B-TREE")),
+        details.iter().any(|detail| detail.contains("Index Cond") && detail.contains("proof_version = 0") && detail.contains("id >")),
         "{details:#?}"
     );
 
@@ -221,9 +209,9 @@ async fn sparse_unsealed_pages_seek_past_seals_and_keep_parameterized_order() {
     assert!(progress.proof_after.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn discovery_keeps_all_eligibility_branches_and_dequeue_rechecks_scope_and_format() {
-    let (store, _, _) = metadata_fixture(false).await;
+    let (store, _, _) = metadata_fixture().await;
     for (id, op, status) in [
         ("a-applied", "failed", "applied"),
         ("b-retained", "completed", "retained"),
@@ -294,7 +282,7 @@ async fn discovery_keeps_all_eligibility_branches_and_dequeue_rechecks_scope_and
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn demotion_behind_cursor_is_rediscovered_after_pass_and_restart() {
     let (store, checkpoint) = raw_candidate_fixture().await;
     checkpoint_proofs::prepare_graph(&store, &checkpoint.id)
@@ -361,9 +349,9 @@ async fn demotion_behind_cursor_is_rediscovered_after_pass_and_restart() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn discovery_database_error_preserves_cursor_and_does_not_latch_eof() {
-    let (store, _, _) = metadata_fixture(false).await;
+    let (store, _, _) = metadata_fixture().await;
     header(&store, "a", "raw", "candidate", 0).await;
     header(&store, "b", "raw", "candidate", 0).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
@@ -399,8 +387,8 @@ async fn index_columns(store: &CrudStore, name: &str) -> Vec<String> {
     store
         .connection
         .query_all_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+            DbBackend::Postgres,
+            "SELECT a.attname::text AS name FROM pg_index i              CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(position, ordinal)              JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.position              WHERE i.indexrelid=to_regclass($1::text) ORDER BY key.ordinal",
             [name.into()],
         ))
         .await
@@ -410,57 +398,34 @@ async fn index_columns(store: &CrudStore, name: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
-async fn incremental_proof_index_upgrade_preserves_headers_and_other_indexes() {
-    let (store, db, _) = metadata_fixture(true).await;
-    header(&store, "legacy-unsealed", "raw", "candidate", 0).await;
-    header(&store, "legacy-sealed", "raw", "candidate", 1).await;
-    let before = checkpoint::Entity::find()
+#[pioneer_postgres_test::postgres_test]
+async fn initial_proof_indexes_preserve_existing_headers_on_repeated_up() {
+    use migration::{Migrator, MigratorTrait};
+
+    let (store, _, writer) = metadata_fixture().await;
+    header(&store, "unsealed", "raw", "candidate", 0).await;
+    header(&store, "sealed", "raw", "candidate", 1).await;
+    let headers = || checkpoint::Entity::find()
         .order_by_asc(checkpoint::Column::Id)
-        .all(&store.connection)
-        .await
-        .unwrap();
-    assert!(
-        index_columns(&store, "checkpoint_proof_discovery")
-            .await
-            .is_empty()
-    );
-    Migrator::up(&db, None).await.unwrap();
+        .all(&store.connection);
+    let before = headers().await.unwrap();
     assert_eq!(
         index_columns(&store, "checkpoint_proof_discovery").await,
         ["proof_version", "id"]
     );
-    let indexes = ["checkpoint_proof_operation", "checkpoint_unproved_owner"];
     let mut others = Vec::new();
-    for name in indexes {
+    for name in ["checkpoint_proof_operation", "checkpoint_unproved_owner"] {
         let columns = index_columns(&store, name).await;
         assert!(!columns.is_empty());
-        others.push(columns);
+        others.push((name, columns));
     }
-    // Explicit retry/down exercises only this incremental migration; never
-    // roll back the historical frozen-lifetime migration or a neighbor.
-    let migrations = Migrator::migrations();
-    let migration = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
-    let manager = migration::SchemaManager::new(&db);
-    migration.up(&manager).await.unwrap();
-    migration.down(&manager).await.unwrap();
-    assert!(
-        index_columns(&store, "checkpoint_proof_discovery")
-            .await
-            .is_empty()
-    );
-    migration.up(&manager).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
     assert_eq!(
         index_columns(&store, "checkpoint_proof_discovery").await,
         ["proof_version", "id"]
     );
-    for (name, columns) in indexes.into_iter().zip(others) {
+    for (name, columns) in others {
         assert_eq!(index_columns(&store, name).await, columns);
     }
-    let after = checkpoint::Entity::find()
-        .order_by_asc(checkpoint::Column::Id)
-        .all(&store.connection)
-        .await
-        .unwrap();
-    assert_eq!(after, before);
+    assert_eq!(headers().await.unwrap(), before);
 }

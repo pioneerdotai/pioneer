@@ -7985,13 +7985,12 @@ where
 #[cfg(test)]
 mod prepared_snapshot_tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::compaction::PagedSource;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
-    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
+    use sea_orm::{ConnectionTrait, TransactionTrait};
     use std::{collections::BTreeSet, sync::Arc};
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_history_preparation_does_not_inherit_critical_transition_writes() {
         let store = fixture("scope-ws").await;
         let live = ordinary_history_store(&store.with_critical_writes());
@@ -8015,7 +8014,7 @@ mod prepared_snapshot_tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn legacy_task_restart_restores_standalone_and_nested_affinity_without_snapshot_rewrite()
     {
         use pioneer_entity::{task as task_entity, turn as turn_entity};
@@ -8178,7 +8177,7 @@ mod prepared_snapshot_tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn common_cold_recovery_restores_legacy_task_routing_from_durable_binding() {
         use pioneer_entity::{
             task as task_entity, task_run, thread as thread_entity, turn as turn_entity,
@@ -8369,11 +8368,10 @@ mod prepared_snapshot_tests {
     }
 
     async fn fixture(workspace: &str) -> pioneer_crud::CrudStore {
-        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-        let database = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&database, None).await.unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let database = fixture.connection().clone();
         database.execute_unprepared(&format!(
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',1,1);
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',TRUE,TRUE);
              INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('parent','{workspace}','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('execution','{workspace}','','agent','m','p','active','task','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('own-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('loser-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('winner-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('own-input','own-turn',0,'text','own history','{{\"type\":\"text\",\"text\":\"own history\"}}',CURRENT_TIMESTAMP),('loser-input','loser-turn',0,'text','losing history','{{\"type\":\"text\",\"text\":\"losing history\"}}',CURRENT_TIMESTAMP),('winner-input','winner-turn',0,'text','winning history','{{\"type\":\"text\",\"text\":\"winning history\"}}',CURRENT_TIMESTAMP);
@@ -8436,7 +8434,7 @@ mod prepared_snapshot_tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn own_insert_if_absent_snapshot_reuses_only_prepared_messages() {
         let store = fixture("own-ws").await;
         let prepared = prepared(&store, "own-ws", "own-turn", "own history").await;
@@ -8470,7 +8468,7 @@ mod prepared_snapshot_tests {
         assert_eq!(persisted.task_id, "own-task");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn competing_insert_if_absent_snapshot_restores_only_winner_messages() {
         let store = fixture("race-ws").await;
         let loser = prepared(&store, "race-ws", "loser-turn", "losing history").await;
@@ -8537,7 +8535,7 @@ mod prepared_snapshot_tests {
         assert_eq!(persisted.task_id, "race-task");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn competing_legacy_snapshot_keeps_literal_technical_ordinal_with_accepted_import() {
         use pioneer_crud::compaction::FrozenImportRecord;
         use pioneer_keystore::MemorySecretStore;
@@ -8717,8 +8715,8 @@ mod prepared_snapshot_tests {
         let record_json = serde_json::to_string(&record).unwrap();
         let tx = store.database_connection().begin().await.unwrap();
         tx.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES (?,0,2,?,?,?,?,?,?)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ($1,0,2,$2,$3,$4,$5,$6,$7)",
             [
                 winner.descriptor.manifest_id.clone().into(),
                 source.scope.clone().into(),
@@ -8733,8 +8731,8 @@ mod prepared_snapshot_tests {
         .unwrap();
         let advanced = tx
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_history SET next_import=1 WHERE id=? AND ready=0",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_history SET next_import=1 WHERE id=$1 AND ready=0",
                 [winner.descriptor.manifest_id.clone().into()],
             ))
             .await
@@ -12406,7 +12404,6 @@ fn first_meaningful_line(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
@@ -12426,7 +12423,7 @@ mod tests {
     use pioneer_tools::{
         ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     fn test_task_run_turn() -> TaskRunTurn {
         TaskRunTurn {
@@ -12794,7 +12791,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn missing_execution_checkpoint_context_falls_back_to_none() {
         let (processor, _task, task_run_turn, _lineage) =
             task_artifact_harness("missing_checkpoint_context").await;
@@ -12805,7 +12802,7 @@ mod tests {
         assert!(context.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn child_runtime_without_persisted_lineage_fails_closed() {
         let (processor, _task, task_run_turn, _lineage) =
             task_artifact_harness("missing_child_lineage").await;
@@ -12821,7 +12818,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn agent_task_without_persisted_execution_admission_fails_closed() {
         let (processor, task, _task_run_turn, _lineage) =
             task_artifact_harness("missing_task_admission").await;
@@ -12837,7 +12834,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unavailable_workspace_skill_policy_projection_fails_closed() {
         let (processor, task, _task_run_turn, _lineage) =
             task_artifact_harness("skill_policy_unavailable").await;
@@ -12861,8 +12858,8 @@ mod tests {
     async fn task_artifact_harness(
         name: &str,
     ) -> (Arc<MessageProcessor>, Task, TaskRunTurn, TaskThreadLineage) {
-        let connection = Database::connect("sqlite::memory:").await.expect("sqlite");
-        Migrator::up(&connection, None).await.expect("migrate");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connection().clone();
         crate::bootstrap::bootstrap(&connection)
             .await
             .expect("bootstrap");
@@ -13067,7 +13064,7 @@ mod tests {
             .expect("ingest artifact")
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
         let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
         use crate::session::test_support::{
@@ -13083,16 +13080,16 @@ mod tests {
             (&execution.thread_id, "internal"),
         ] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES (?,?,'','agent','model','provider','active','user',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                DbBackend::Postgres,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ($1,$2,'','agent','model','provider','active','user',$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 [thread_id.clone().into(), task.workspace_id.clone().into(), access_class.into()],
             ))
             .await
             .expect("HTML response collaboration thread");
         }
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,$2,'in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [execution.turn_id.clone().into(), execution.thread_id.clone().into()],
         ))
         .await
@@ -13253,8 +13250,8 @@ mod tests {
             .await
             .expect("source execution provenance");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'completed','conversation','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,$2,'completed','conversation','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [execution.run_id.clone().into(), lineage.parent_thread_id.clone().into()],
         )).await.expect("canonical delivery destination Turn");
         let final_source = pioneer_protocol::TurnItem::AgentMessage {
@@ -13784,7 +13781,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_existing_id_gets_task_result_binding() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("existing").await;
         let source = ingest_task_test_artifact(
@@ -13841,7 +13838,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn review_candidate_artifact_existing_id_gets_task_result_candidate_binding() {
         let (processor, task, task_run_turn, lineage) =
             task_artifact_harness("candidate_existing").await;
@@ -13926,7 +13923,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_path_is_rejected_without_an_execution_owned_handle() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("path").await;
         let output_dir = std::env::current_dir()
@@ -13989,7 +13986,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(output_dir.as_path()).await;
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_rejects_cross_workspace_id() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("foreign").await;
         let other_workspace = processor
@@ -14029,7 +14026,7 @@ mod tests {
         assert_eq!(error.code, "task_artifact_invalid");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_rejects_unbound_workspace_artifact() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("unbound").await;
         let source =
@@ -14064,7 +14061,7 @@ mod tests {
         assert_eq!(error.code, "task_artifact_invalid");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn include_artifacts_context_renders_refs_without_paths() {
         let (processor, task, _task_run_turn, lineage) = task_artifact_harness("context").await;
         let source = ingest_task_test_artifact(

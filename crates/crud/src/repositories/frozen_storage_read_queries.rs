@@ -10,8 +10,7 @@ use pioneer_entity::{
     turn_cli_runtime_binding as turn_binding, turn_runtime_snapshot as runtime,
 };
 use sea_orm::sea_query::{
-    Alias, BinOper, CommonTableExpression, Expr, ExprTrait, JoinType, Query, SelectStatement,
-    SimpleExpr,
+    Alias, BinOper, Expr, ExprTrait, JoinType, Query, SelectStatement, SimpleExpr,
 };
 use sea_orm::{
     Condition, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -19,7 +18,6 @@ use sea_orm::{
 };
 use std::{collections::VecDeque, sync::OnceLock};
 
-const INPUT_TABLE: &str = "frozen_read_args";
 // Private build-time markers identify bound slots without parsing SQL or
 // relying on a dialect's placeholder numbering. Every execution replaces them.
 const INPUTS: [&str; 2] = ["__frozen_read_arg_0", "__frozen_read_arg_1"];
@@ -31,37 +29,9 @@ struct PreparedRead {
 }
 
 impl PreparedRead {
-    fn new(
-        backend: DbBackend,
-        mut query: SelectStatement,
-        input_count: usize,
-        fixed_limit: u64,
-    ) -> Self {
-        if backend == DbBackend::Sqlite {
-            let mut args = Query::select();
-            for input in &INPUTS[..input_count] {
-                args.expr(Expr::val(*input));
-            }
-            let mut cte = CommonTableExpression::new();
-            cte.table_name(Alias::new(INPUT_TABLE))
-                .columns(INPUTS[..input_count].iter().map(|name| Alias::new(*name)))
-                .materialized(true)
-                .query(args.to_owned());
-            // Scalar reads of the single materialized argument row keep bound
-            // values out of STAT4-sensitive indexed predicates, without a join
-            // that makes SQLite sort the already index-ordered physical page.
-            query.with_cte(cte);
-        } else {
-            query.limit(fixed_limit);
-        }
-        let mut statement = backend.build(&query);
-        if backend == DbBackend::Sqlite {
-            // SeaQuery 1.0's LIMIT accepts only a Value, so build() always binds
-            // it. Even a constant bound LIMIT triggers STAT4 reprepare. All four
-            // callers below supply code-owned limits; no input enters this SQL.
-            // Do not inline any cursor/ID or replace SQLx's prepared cache.
-            statement.sql.push_str(&format!(" LIMIT {fixed_limit}"));
-        }
+    fn new(mut query: SelectStatement, input_count: usize, limit: u64) -> Self {
+        query.limit(limit);
+        let statement = DbBackend::Postgres.build(&query);
         let slots: Vec<_> = statement
             .values
             .iter()
@@ -93,16 +63,8 @@ impl PreparedRead {
     }
 }
 
-fn input(backend: DbBackend, index: usize) -> SimpleExpr {
-    if backend == DbBackend::Sqlite {
-        Query::select()
-            .column(Alias::new(INPUTS[index]))
-            .from(Alias::new(INPUT_TABLE))
-            .to_owned()
-            .into()
-    } else {
-        Expr::val(INPUTS[index])
-    }
+fn input(index: usize) -> SimpleExpr {
+    Expr::val(INPUTS[index])
 }
 
 struct FrozenReads {
@@ -113,26 +75,13 @@ struct FrozenReads {
 }
 
 impl FrozenReads {
-    fn get(backend: DbBackend) -> Result<&'static Self> {
-        static SQLITE: OnceLock<FrozenReads> = OnceLock::new();
+    fn get() -> &'static Self {
         static POSTGRES: OnceLock<FrozenReads> = OnceLock::new();
-        static MYSQL: OnceLock<FrozenReads> = OnceLock::new();
-        let cache = match backend {
-            DbBackend::Sqlite => &SQLITE,
-            DbBackend::Postgres => &POSTGRES,
-            DbBackend::MySql => &MYSQL,
-            _ => anyhow::bail!("unsupported frozen read SQL dialect"),
-        };
-        Ok(cache.get_or_init(|| Self::new(backend)))
+        POSTGRES.get_or_init(Self::new)
     }
 
-    fn new(backend: DbBackend) -> Self {
-        let bounded_key = match backend {
-            DbBackend::Sqlite => Expr::cust(format!(
-                "length(CAST(id AS BLOB)) <= {SCOPE_PAGE_KEY_BYTES}"
-            )),
-            _ => Expr::cust(format!("octet_length(id) <= {SCOPE_PAGE_KEY_BYTES}")),
-        };
+    fn new() -> Self {
+        let bounded_key = Expr::cust(format!("octet_length(id) <= {SCOPE_PAGE_KEY_BYTES}"));
         let key: SimpleExpr = Expr::case(bounded_key.clone(), Expr::col(checkpoint::Column::Id))
             .finally(Expr::Constant(Option::<String>::None.into()))
             .into();
@@ -149,12 +98,12 @@ impl FrozenReads {
             .column_as(key, "id")
             .column_as(candidate, "candidate")
             // Eligibility stays in SELECT, never in the physical page filter.
-            .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(input(backend, 0)))
-            .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).lte(input(backend, 1)))
+            .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(input(0)))
+            .filter(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).lte(input(1)))
             .order_by_asc(checkpoint::Column::Id)
             .into_query();
 
-        let id = input(backend, 0);
+        let id = input(0);
         let previous = checkpoint::Entity::find()
             .select_only()
             .column(checkpoint::Column::Id)
@@ -192,23 +141,23 @@ impl FrozenReads {
             .filter(
                 Expr::col((history::Entity, history::Column::Ready)).eq(Expr::Constant(1.into())),
             )
-            .filter(Expr::col((history::Entity, history::Column::Id)).gt(input(backend, 0)))
-            .filter(Expr::col((history::Entity, history::Column::Id)).lte(input(backend, 1)))
+            .filter(Expr::col((history::Entity, history::Column::Id)).gt(input(0)))
+            .filter(Expr::col((history::Entity, history::Column::Id)).lte(input(1)))
             .order_by_asc(history::Column::Id)
             .into_query();
         Self {
-            discard_page: PreparedRead::new(backend, discard_page, 2, META_ROWS),
-            discard_preflight: PreparedRead::new(backend, discard_preflight, 1, 1),
-            expiry_page: PreparedRead::new(backend, expiry_page, 2, 16),
-            directly_held: PreparedRead::new(backend, direct_roots(backend), 1, 1),
+            discard_page: PreparedRead::new(discard_page, 2, META_ROWS),
+            discard_preflight: PreparedRead::new(discard_preflight, 1, 1),
+            expiry_page: PreparedRead::new(expiry_page, 2, 16),
+            directly_held: PreparedRead::new(direct_roots(), 1, 1),
         }
     }
 }
 
-fn direct_roots(backend: DbBackend) -> SelectStatement {
+fn direct_roots() -> SelectStatement {
     Query::select()
         .expr_as(Expr::Constant(1.into()), Alias::new("held"))
-        .cond_where(direct_root_filter(input(backend, 0)))
+        .cond_where(direct_root_filter(input(0)))
         .to_owned()
 }
 
@@ -305,7 +254,7 @@ pub(super) async fn discard_page(
     after: &str,
     upper: &str,
 ) -> Result<VecDeque<(Option<String>, bool)>> {
-    let reads = FrozenReads::get(store.connection.get_database_backend())?;
+    let reads = FrozenReads::get();
     Ok(
         DiscardPageRow::find_by_statement(reads.discard_page.bind(&[after, upper]))
             .all(&store.connection)
@@ -317,7 +266,7 @@ pub(super) async fn discard_page(
 }
 
 pub(super) async fn discard_preflight(store: &CrudStore, id: &str) -> Result<bool> {
-    let reads = FrozenReads::get(store.connection.get_database_backend())?;
+    let reads = FrozenReads::get();
     Ok(
         DiscardProof::find_by_statement(reads.discard_preflight.bind(&[id]))
             .one(&store.connection)
@@ -332,7 +281,7 @@ pub(super) async fn expiry_page(
     after: &str,
     upper: &str,
 ) -> Result<VecDeque<ExpiryHeader>> {
-    let reads = FrozenReads::get(store.connection.get_database_backend())?;
+    let reads = FrozenReads::get();
     Ok(
         ExpiryHeader::find_by_statement(reads.expiry_page.bind(&[after, upper]))
             .all(&store.connection)
@@ -342,7 +291,7 @@ pub(super) async fn expiry_page(
 }
 
 pub(super) async fn directly_held(store: &CrudStore, id: &str) -> Result<bool> {
-    let reads = FrozenReads::get(store.connection.get_database_backend())?;
+    let reads = FrozenReads::get();
     Ok(RootHold::find_by_statement(reads.directly_held.bind(&[id]))
         .one(&store.connection)
         .await?
