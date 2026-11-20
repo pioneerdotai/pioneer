@@ -180,13 +180,21 @@ pub trait NativeContextController: Send + Sync {
 pub struct NativeContextSession {
     pub context: NativeContext,
     controller: Arc<dyn NativeContextController>,
-    measurement: Mutex<Option<NativeUsageMeasurement>>,
+    measurement: Arc<Mutex<Option<NativeUsageMeasurement>>>,
     recovery_pending: std::sync::atomic::AtomicBool,
     recovery_active: std::sync::atomic::AtomicBool,
     recovery_deadline: Option<tokio::time::Instant>,
 }
 impl NativeContextSession {
     pub fn new(context: NativeContext, controller: Arc<dyn NativeContextController>) -> Self {
+        Self::with_turn_measurement(context, controller, Arc::default())
+    }
+
+    pub(crate) fn with_turn_measurement(
+        context: NativeContext,
+        controller: Arc<dyn NativeContextController>,
+        measurement: Arc<Mutex<Option<NativeUsageMeasurement>>>,
+    ) -> Self {
         let recovery = context.overflow_recovery;
         let recovery_deadline = context.recovery_deadline_ms.map(|deadline| {
             let now = std::time::SystemTime::now()
@@ -200,7 +208,7 @@ impl NativeContextSession {
         Self {
             context,
             controller,
-            measurement: Mutex::new(None),
+            measurement,
             recovery_pending: std::sync::atomic::AtomicBool::new(recovery),
             recovery_active: std::sync::atomic::AtomicBool::new(recovery),
             recovery_deadline,
