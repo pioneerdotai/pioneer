@@ -55,27 +55,9 @@ pub const NICKNAME_TOMBSTONED: &str = "tombstoned";
 pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
-// Keep the existing partial-index predicate intact; the additional exclusion
-// closes corrupt detached bindings without ACKing or retrying them forever.
-// Pin these existing ordered ranges so the retention status index cannot
-// replace them with a broad status scan and temporary sort. SeaQuery does not
-// expose SQLite INDEXED BY; these statements keep values bound as parameters.
-#[cfg(test)]
-const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 AND (status='pending' OR last_error IS NULL OR last_error NOT IN ('outbox_start_integrity_rejected','outbox_start_authority_denied','outbox_start_runtime_unavailable','outbox_foreground_conflict','outbox_start_outcome_unknown')) AND (status!='failed' OR COALESCE(last_error,'')!='outbox_detached_binding_rejected') ORDER BY created_at,id LIMIT ?";
-#[cfg(test)]
-const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_timed WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
 pub const AGENT_START_RECONCILIATION_REQUIRED: &str = "outbox_start_reconciliation_required";
-// Reconciliation claims bounded candidates before checking canonical proof.
-// Legacy failed/8/NULL terminal receipts must be ACKed once, not filtered while
-// remaining forever in the working index. The dispatcher validates their exact
-// terminal generation/resources and never redelivers an exhausted model start.
-// The immutable payload kind narrows the index; missing/invalid kind remains a
-// candidate. The action join remains authoritative, never payload authorization.
-#[cfg(test)]
-const AGENT_START_RECONCILIATION_SQL: &str = "SELECT o.id FROM agent_action_outbox o JOIN agent_action a ON a.id=o.action_id WHERE a.action_kind='start_agent' AND o.status IN ('pending','failed') AND o.attempts=8 AND NOT (o.status='failed' AND o.next_attempt_at IS NULL AND COALESCE(o.last_error,'')='outbox_detached_binding_rejected') AND COALESCE(CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.kind') END,'start_agent')='start_agent' AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?) ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT ?";
-
 const AGENT_START_TERMINAL_FAILURE_CLASSES: [&str; 6] = [
     "outbox_detached_binding_rejected",
     "outbox_start_integrity_rejected",
@@ -5270,31 +5252,6 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 pub use pioneer_crud_execution::outbox_discovery::next_deadline as next_agent_action_outbox_deadline;
-
-// Predicates and ordering match the existing due indexes and the exhausted
-// expression index added by m20261026_000001_agent_start_reconciliation_index.
-// SeaORM/SeaQuery do not expose SQLite INDEXED BY on the bounded UNION arm;
-// keep that discovery statement here, with only clocks and limits as binds.
-#[cfg(test)]
-fn agent_action_outbox_timed_discovery_sql() -> String {
-    // Empty text sorts before every stored timestamp. This makes NULL and timed
-    // exhausted deadlines one searchable range with the unchanged input quota.
-    let exhausted = AGENT_START_RECONCILIATION_SQL.replace(
-        "SELECT o.id FROM agent_action_outbox o",
-        "SELECT o.id,o.next_attempt_at,o.created_at FROM agent_action_outbox o INDEXED BY idx_agent_action_outbox_exhausted",
-    ).replace("(o.next_attempt_at IS NULL OR o.next_attempt_at<=?)",
-        "COALESCE(o.next_attempt_at,'')<=?")
-     .replace("ORDER BY o.next_attempt_at,o.created_at,o.id",
-        "ORDER BY COALESCE(o.next_attempt_at,''),o.created_at,o.id");
-    format!(
-        "SELECT id FROM (SELECT id,next_attempt_at,created_at FROM ({}) UNION SELECT id,next_attempt_at,created_at FROM ({})) ORDER BY next_attempt_at,created_at,id LIMIT ?",
-        AGENT_ACTION_OUTBOX_TIMED_SQL.replace(
-            "SELECT id FROM",
-            "SELECT id,next_attempt_at,created_at FROM"
-        ),
-        exhausted,
-    )
-}
 
 /// Known-committed claims and independent candidate failures from one input quantum.
 #[derive(Debug, Default)]

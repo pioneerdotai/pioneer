@@ -11,6 +11,8 @@ use fs4::{FileExt as Fs4FileExt, TryLockError as Fs4TryLockError};
 use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
+#[cfg(test)]
+use pioneer_crud::list_projection_meta_by_key_prefix;
 use pioneer_crud::{
     CrudStore, PROJECTION_META_STATUS_BACKFILLING, PROJECTION_META_STATUS_COMPLETE,
     PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING, ProjectionMetaConfigRecord,
@@ -18,8 +20,7 @@ use pioneer_crud::{
     ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
     ThreadEpisodicItemIndexedUpdate, ThreadEpisodicRefillThread, find_projection_meta,
-    list_projection_meta_by_key_prefix, update_projection_meta_status,
-    upsert_projection_meta_with_config,
+    update_projection_meta_status, upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
     PostgresThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicSearchBackend,
@@ -40,7 +41,8 @@ pub(crate) use tests::make_refill_history_unavailable;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-pub(crate) const THREAD_EPISODIC_REFILL_KEY: &str = "thread_episodic_workspace_capsule_refill";
+#[cfg(test)]
+const THREAD_EPISODIC_REFILL_KEY: &str = "thread_episodic_workspace_capsule_refill";
 pub(crate) const THREAD_EPISODIC_REFILL_VERSION: i64 = 2;
 const THREAD_EPISODIC_REFILL_CONFIG_VERSION: u32 = 1;
 
@@ -48,6 +50,7 @@ const REFILL_ENQUEUE_BATCH_SIZE: u64 = 1024;
 const REFILL_EXECUTOR_MAX_BATCHES: u64 = 100_000;
 const REFILL_JOB_CLAIM_LIMIT: u64 = 1;
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
+#[cfg(test)]
 const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicWorkspaceRefillStatusEvent {
@@ -678,8 +681,8 @@ fn local_embedding_model_status_for_refill(
     })
 }
 
-#[allow(dead_code)]
-pub(crate) async fn refill_once(
+#[cfg(test)]
+async fn refill_once(
     crud_store: Arc<CrudStore>,
     thread_episodic_lock_root: &Path,
 ) -> Result<ThreadEpisodicWorkspaceRefillSummary> {
@@ -692,7 +695,8 @@ pub(crate) async fn refill_once(
     .await
 }
 
-pub(crate) async fn refill_once_with_projection(
+#[cfg(test)]
+async fn refill_once_with_projection(
     crud_store: Arc<CrudStore>,
     thread_episodic_lock_root: &Path,
     projection_target: ThreadEpisodicWorkspaceProjectionTarget,
@@ -793,9 +797,8 @@ pub(crate) async fn refill_once_with_projection_resolver_and_config(
             return Ok(summary);
         }
     }
-    // Whole-refill admission across processes, not just individual SQLite
-    // transactions. CrudStore entrypoints do not require WriterOwnership;
-    // supervisor and workspace mutex only coordinate their own process.
+    // The refill lock coordinates processes across the full workspace rebuild.
+    // The supervisor and workspace mutex coordinate tasks within one process.
     let Some(_lock_guard) =
         try_acquire_refill_lock_for_workspace(thread_episodic_lock_root, workspace_id)?
     else {
@@ -1107,8 +1110,8 @@ async fn resolve_refill_embedding_provider_for_target(
     Ok(provider)
 }
 
-#[allow(dead_code)]
-pub(crate) async fn refill_once_for_vector_search_config(
+#[cfg(test)]
+async fn refill_once_for_vector_search_config(
     crud_store: Arc<CrudStore>,
     thread_episodic_lock_root: &Path,
     vector_search_config: &GatewayThreadEpisodicVectorSearchConfig,
@@ -1125,6 +1128,7 @@ pub(crate) async fn refill_once_for_vector_search_config(
     .await
 }
 
+#[cfg(test)]
 async fn first_refill_workspace_id_or_legacy(crud_store: &CrudStore) -> Result<String> {
     Ok(crud_store
         .list_thread_episodic_refill_workspace_ids()
@@ -1220,8 +1224,8 @@ fn refill_lock_file_name_for_workspace(workspace_id: &str) -> Result<String> {
     Ok(format!("workspace-{workspace_key_hash}.lock"))
 }
 
-#[allow(dead_code)]
-pub(crate) async fn refill_is_current(crud_store: &CrudStore) -> Result<bool> {
+#[cfg(test)]
+async fn refill_is_current(crud_store: &CrudStore) -> Result<bool> {
     refill_is_current_for_target(
         crud_store,
         &ThreadEpisodicWorkspaceProjectionTarget::lexical_only(),
@@ -1229,7 +1233,8 @@ pub(crate) async fn refill_is_current(crud_store: &CrudStore) -> Result<bool> {
     .await
 }
 
-pub(crate) async fn refill_is_current_for_target(
+#[cfg(test)]
+async fn refill_is_current_for_target(
     crud_store: &CrudStore,
     projection_target: &ThreadEpisodicWorkspaceProjectionTarget,
 ) -> Result<bool> {
@@ -1296,15 +1301,6 @@ fn projection_meta_is_current_for_target(
         && meta.status == PROJECTION_META_STATUS_COMPLETE
         && (projection_target.matches_projection_meta(&marker)
             || projection_target.matches_projection_meta_selection(&marker))
-}
-
-#[allow(dead_code)]
-pub(crate) async fn refill_status_for_target(
-    crud_store: &CrudStore,
-    projection_target: &ThreadEpisodicWorkspaceProjectionTarget,
-) -> Result<pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus> {
-    refill_status_for_workspace_target(crud_store, LEGACY_REFILL_WORKSPACE_ID, projection_target)
-        .await
 }
 
 pub(crate) async fn refill_status_for_workspace_target(
@@ -1615,7 +1611,7 @@ async fn cleanup_derived_artifacts(
     workspace_id: &str,
     ownership: ThreadEpisodicWorkspaceOwnership,
 ) -> Result<ThreadEpisodicWorkspaceRefillSummary> {
-    // SQLite reset retires each text/vector association together with a fresh
+    // Projection reset retires each text/vector association together with a fresh
     // durable job identity in the existing bounded reset transaction. Directory
     // metadata is retained. No stored file URI is ever followed for cleanup.
     let _ownership = ownership;
@@ -2960,7 +2956,6 @@ mod tests {
     };
     use crate::thread_episodic_embedding::CHUNKED_EMBEDDING_INPUT_ERROR_MARKER;
     use crate::workspace::WorkspaceManager;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
         NewThreadEpisodicItemRecord, NewThreadEpisodicThreadDirectoryRecord,
@@ -2982,8 +2977,7 @@ mod tests {
     };
     use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{
-        ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
-        TransactionTrait,
+        ConnectOptions, ConnectionTrait, DatabaseBackend, EntityTrait, Statement, TransactionTrait,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -5274,61 +5268,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "manual smoke: requires copied production DB and storage paths in env"]
-    async fn thread_episodic_vector_refill_smoke_on_copied_production_db() {
-        let Some(db_path) =
-            std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_DB").map(PathBuf::from)
-        else {
-            eprintln!("skipping smoke: PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_DB is not set");
-            return;
-        };
-        let Some(storage_root) =
-            std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_STORAGE_ROOT")
-                .map(PathBuf::from)
-        else {
-            eprintln!(
-                "skipping smoke: PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_STORAGE_ROOT is not set"
-            );
-            return;
-        };
-        assert_manual_smoke_path_is_not_production(&db_path, "smoke DB");
-        assert_manual_smoke_path_is_not_production(&storage_root, "smoke storage root");
-        assert!(
-            db_path.exists(),
-            "smoke DB must exist: {}",
-            db_path.display()
-        );
-        std::fs::create_dir_all(&storage_root).expect("smoke storage root should be creatable");
-
-        pioneer_sqlite::zstd::register_auto_extension_once()
-            .expect("sqlite-zstd extension should register");
-        let database_url = pioneer_sqlite::sqlite_connection_url(db_path.as_path());
-        let connection = Database::connect(database_url.as_str())
-            .await
-            .expect("smoke DB should connect");
-        Migrator::up(&connection, None)
-            .await
-            .expect("smoke DB migrations should apply");
-        let quick_check_statement =
-            Statement::from_string(DatabaseBackend::Sqlite, "PRAGMA quick_check;".to_owned());
-        let quick_check = connection
-            .query_one_raw(quick_check_statement)
-            .await
-            .expect("quick_check query should succeed")
-            .expect("quick_check should return a row")
-            .try_get_by_index::<String>(0)
-            .expect("quick_check row should decode");
-        assert_eq!(quick_check, "ok");
-        let crud_store = Arc::new(CrudStore::new(connection));
+    #[pioneer_postgres_test::postgres_test]
+    async fn thread_episodic_vector_refill_smoke_on_isolated_postgres() {
+        let (crud_store, storage_root, workspace_id) = setup_store().await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            &workspace_id,
+            "thread_vector_smoke",
+            "turn_vector_smoke",
+            "item_vector_smoke",
+            "The workspace vector refill indexes saved PostgreSQL history.",
+        )
+        .await;
         let workspace_ids = crud_store
             .list_thread_episodic_refill_workspace_ids()
             .await
             .expect("smoke workspace ids should list");
-        assert!(
-            !workspace_ids.is_empty(),
-            "copied production DB should contain refill workspaces"
-        );
+        assert_eq!(workspace_ids, vec![workspace_id]);
 
         let vector_config = GatewayThreadEpisodicVectorSearchConfig {
             enabled: true,
@@ -5350,14 +5306,15 @@ mod tests {
 
         let summary = refill_once_for_vector_search_config(
             crud_store.clone(),
-            storage_root.as_path(),
+            storage_root.path(),
             &vector_config,
             Some(embedding_provider),
         )
         .await
-        .expect("copied production DB vector refill should complete");
+        .expect("isolated PostgreSQL vector refill should complete");
 
         assert!(!summary.lock_contended);
+        assert!(summary.completed_jobs > 0);
         assert_eq!(summary.source_threads_failed, 0);
         assert_eq!(summary.failed_retryable_jobs, 0);
         assert_eq!(summary.failed_terminal_jobs, 0);
@@ -8634,29 +8591,6 @@ mod tests {
         )
         .await
         .expect("marker should upsert");
-    }
-
-    fn assert_manual_smoke_path_is_not_production(path: &Path, label: &str) {
-        if std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_ALLOW_ANY_PATH").is_some()
-        {
-            return;
-        }
-
-        let normalized = path.to_string_lossy().replace('\\', "/");
-        assert!(
-            !normalized.ends_with("/.pioneer/gateway.db")
-                && !normalized.contains("/.pioneer/memory"),
-            "{label} must point to an isolated copy, not production: {}",
-            path.display()
-        );
-        assert!(
-            normalized.contains("/.worktrees/")
-                || normalized.contains("/.scratch/")
-                || normalized.contains("/tmp/")
-                || normalized.contains("/var/folders/"),
-            "{label} must live in a worktree/scratch/temp path unless PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_ALLOW_ANY_PATH=1 is set: {}",
-            path.display()
-        );
     }
 
     fn vector_search_config(

@@ -1420,7 +1420,7 @@ mod tests {
         }
         cancellation.cancel();
         worker.await;
-        // Pool acquisition uses real SQLite worker I/O after the virtual-time proof.
+        // Pool acquisition uses real PostgreSQL I/O after the virtual-time proof.
         tokio::time::resume();
         let pending = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_frozen_sweep_work WHERE manifest_id LIKE 'protected-%' AND pending=1 AND retry_at=0")).await.unwrap().unwrap();

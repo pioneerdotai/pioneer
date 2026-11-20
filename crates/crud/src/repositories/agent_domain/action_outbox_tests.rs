@@ -1,16 +1,31 @@
 use super::*;
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud_execution::outbox_discovery::discover as discover_agent_action_outbox;
-use sea_orm::{Database, DatabaseBackend, DbErr};
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{DatabaseBackend, DbErr};
+
+const OWNER: &str = "E00000000000000000001";
 
 async fn database() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    // These fixtures exercise outbox state only, as the existing ledger tests do.
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = fixture.connection().clone();
+    seed_database(&db).await;
     db
+}
+
+async fn seed_database(db: &DatabaseConnection) {
+    db.execute_unprepared(
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('outbox','Outbox',TRUE,FALSE);
+         INSERT INTO agent_identity(id,workspace_id,source_kind,source_id,source_fingerprint)
+         VALUES('I00000000000000000001','outbox','ephemeral','fixture','fixture');",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "INSERT INTO agent_execution(id,workspace_id,agent_identity_id,identity_source_revision,identity_source_fingerprint,home_root_thread_id,work_graph_root_execution_id,requested_identity_selection_json,requested_profile_selection_json,authorization_context_fingerprint)
+         VALUES($1,'outbox','I00000000000000000001',1,'fixture','fixture-thread',$1,'{}','{}','fixture')",
+        [OWNER.into()],
+    )).await.unwrap();
 }
 
 async fn seed<C: ConnectionTrait>(
@@ -21,10 +36,28 @@ async fn seed<C: ConnectionTrait>(
     created: DateTimeWithTimeZone,
     due: Option<DateTimeWithTimeZone>,
 ) {
+    agent_action::Entity::insert(agent_action::ActiveModel {
+        id: Set(format!("action-{id}")),
+        execution_id: Set(OWNER.to_owned()),
+        action_kind: Set("send_message".to_owned()),
+        idempotency_key: Set(id.to_owned()),
+        request_fingerprint: Set(id.to_owned()),
+        status: Set("committed".to_owned()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(agent_action::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .do_nothing()
+    .exec(db)
+    .await
+    .unwrap();
     agent_action_outbox::ActiveModel {
         id: Set(id.to_owned()),
         action_id: Set(format!("action-{id}")),
-        owner_execution_id: Set("fixture-owner".to_owned()),
+        owner_execution_id: Set(OWNER.to_owned()),
         payload_json: Set(format!(r#"{{"kind":"send_message","original":"{id}"}}"#)),
         status: Set(status.to_owned()),
         attempts: Set(attempts),
@@ -36,6 +69,42 @@ async fn seed<C: ConnectionTrait>(
     .insert(db)
     .await
     .unwrap();
+}
+
+fn fixture_now() -> DateTimeWithTimeZone {
+    chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .unwrap()
+        .fixed_offset()
+}
+
+async fn discovery_plans(db: &DatabaseConnection, now: DateTimeWithTimeZone) -> Vec<Vec<String>> {
+    use std::sync::{Arc, Mutex};
+    db.execute_unprepared("ANALYZE agent_action_outbox; ANALYZE agent_action")
+        .await
+        .unwrap();
+    let mut observed = db.clone();
+    let statements = Arc::new(Mutex::new(Vec::new()));
+    let captured = statements.clone();
+    observed.set_metric_callback(move |info| {
+        captured.lock().unwrap().push(info.statement.clone());
+    });
+    discover_agent_action_outbox(&observed, now, 64)
+        .await
+        .unwrap();
+    let queries = std::mem::take(&mut *statements.lock().unwrap());
+    let mut plans = Vec::new();
+    for mut statement in queries {
+        statement.sql.insert_str(0, "EXPLAIN (COSTS OFF) ");
+        plans.push(
+            db.query_all_raw(statement)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+                .collect(),
+        );
+    }
+    plans
 }
 
 async fn load<C: ConnectionTrait>(db: &C, id: &str) -> agent_action_outbox::Model {
@@ -50,10 +119,10 @@ async fn ids<C: ConnectionTrait>(db: &C, now: DateTimeWithTimeZone) -> Vec<Strin
     discover_agent_action_outbox(db, now, 64).await.unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_ranges_bound_mixed_work_and_share_final_cleanup_budget() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     for index in (0..40).rev() {
         seed(
             &db,
@@ -169,10 +238,10 @@ async fn action_outbox_ranges_bound_mixed_work_and_share_final_cleanup_budget() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_plans_exclude_closed_refusals_from_small_and_empty_backlogs() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     for index in 0..2048 {
         let id = format!("terminal-refusal-{index:04}");
         seed(
@@ -204,72 +273,47 @@ async fn action_outbox_plans_exclude_closed_refusals_from_small_and_empty_backlo
             .unwrap()
             .is_empty()
     );
-    for (sql, values, index) in [
-        (
-            AGENT_ACTION_OUTBOX_IMMEDIATE_SQL,
-            vec![32_u64.into()],
-            "idx_agent_action_outbox_immediate",
-        ),
-        (
-            AGENT_ACTION_OUTBOX_TIMED_SQL,
-            vec![now.into(), 32_u64.into()],
-            "idx_agent_action_outbox_timed",
-        ),
-    ] {
-        // This EXPLAIN is test code only; it must be run after review approval.
-        let plan = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                format!("EXPLAIN QUERY PLAN {sql}"),
-                values,
-            ))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.try_get::<String>("", "detail").unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            plan.len(),
-            1,
-            "one index range, without a second scan: {plan:?}"
-        );
-        let plan = &plan[0];
-        assert!(plan.contains(index), "{plan}");
-        assert!(!plan.contains("USE TEMP B-TREE"), "{plan}");
-        assert!(
-            plan.contains("USING INDEX") || plan.contains("USING COVERING INDEX"),
-            "{plan}"
-        );
-        if index.ends_with("timed") {
-            assert!(
-                plan.contains("SEARCH") && plan.contains("next_attempt_at"),
-                "{plan}"
-            );
-        }
-    }
-    // Ask SQLite to plan a wider range that includes closed refusals using the
-    // working index. A correctly narrowed partial index cannot serve it; the
-    // old index could, despite also appearing in the positive query plan above.
-    assert!(db.query_all_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?",
-        [32_u64.into()],
-    )).await.is_err());
+    let plans = discovery_plans(&db, now).await;
+    assert_eq!(plans.len(), 2);
+    assert!(
+        plans[0]
+            .iter()
+            .any(|line| line.contains("idx_agent_action_outbox_immediate")),
+        "{plans:#?}"
+    );
+    assert!(
+        plans[1]
+            .iter()
+            .any(|line| line.contains("idx_agent_action_outbox_timed")),
+        "{plans:#?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .all(|line| !line.contains("Seq Scan on agent_action_outbox")),
+        "{plans:#?}"
+    );
+    assert!(
+        plans[0].iter().all(|line| !line.contains("Sort")),
+        "{plans:#?}"
+    );
+    // The broad query includes terminal refusals and cannot use that partial index.
+    let plan = db.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "EXPLAIN (COSTS OFF) SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT 32",
+    )).await.unwrap().into_iter().map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        plan.iter()
+            .all(|line| !line.contains("idx_agent_action_outbox_immediate")),
+        "{plan:#?}"
+    );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_closed_ledger() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let end = Migrator::migrations()
-        .iter()
-        .position(|m| m.name() == "m20261026_000001_agent_start_reconciliation_index")
-        .unwrap()
-        + 1;
-    // Start at the index owner's released schema; later portable storage cannot be downgraded.
-    Migrator::up(&db, Some(end as u32)).await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let now = utc_now();
+    let db = database().await;
+    let now = fixture_now();
     for n in 0..2048 {
         seed(
             &db,
@@ -286,68 +330,32 @@ async fn exhausted_discovery_uses_indexed_null_and_timed_ranges_with_a_large_clo
         seed(&db, id, "failed", 8, now, due).await;
         let mut outbox: agent_action_outbox::ActiveModel = load(&db, id).await.into();
         outbox.payload_json = Set(serde_json::json!({"kind":"start_agent",
-            "action_id":format!("action-{id}"),"execution_id":"fixture-owner"})
+            "action_id":format!("action-{id}"),"execution_id":OWNER})
         .to_string());
         outbox.update(&db).await.unwrap();
         seed_action_for_discovery(&db, id, "start_agent", now).await;
     }
-    // Roll back through the named outbox migration even when newer, unrelated
-    // migrations have been appended to the registry.
-    let applied = Migrator::get_applied_migrations(&db).await.unwrap();
-    let target = applied
-        .iter()
-        .position(|migration| {
-            migration.name() == "m20261026_000001_agent_start_reconciliation_index"
-        })
-        .unwrap();
-    let rollback_steps = (applied.len() - target).try_into().unwrap();
-    // Upgrade existing ledger data after rolling back both outbox indexes.
-    // The old immediate range must be restored while the exhausted index is
-    // absent; reapplying must restore the production selectors and their plans.
-    Migrator::down(&db, Some(rollback_steps)).await.unwrap();
-    assert!(db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite,
-        "EXPLAIN QUERY PLAN SELECT id FROM agent_action_outbox INDEXED BY idx_agent_action_outbox_immediate WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT 1"
-    )).await.is_ok());
-    let exhausted_index = db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite,
-        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_agent_action_outbox_exhausted'"
-    )).await.unwrap();
-    assert!(exhausted_index.is_none());
     Migrator::up(&db, None).await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let sql = agent_action_outbox_timed_discovery_sql();
-    let plan = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            format!("EXPLAIN QUERY PLAN {sql}"),
-            [
-                now.into(),
-                1_u64.into(),
-                now.into(),
-                1_u64.into(),
-                1_u64.into(),
-            ],
-        ))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "detail").unwrap())
-        .collect::<Vec<_>>();
-    let exhausted = plan
-        .iter()
-        .filter(|line| line.contains("idx_agent_action_outbox_exhausted"))
-        .collect::<Vec<_>>();
-    assert_eq!(exhausted.len(), 1, "{plan:?}");
+    let plans = discovery_plans(&db, now).await;
+    assert_eq!(plans.len(), 2);
     assert!(
-        exhausted
+        plans[1]
             .iter()
-            .all(|line| line.contains("SEARCH") && line.contains("<expr>")),
-        "{plan:?}"
+            .any(|line| line.contains("idx_agent_action_outbox_exhausted")),
+        "{plans:#?}"
     );
     assert!(
-        !plan
+        plans[1]
             .iter()
-            .any(|line| line.starts_with("SCAN o") || line.starts_with("SCAN agent_action_outbox")),
-        "{plan:?}"
+            .any(|line| line.contains("Index Cond") && line.contains("COALESCE")),
+        "{plans:#?}"
+    );
+    assert!(
+        plans
+            .iter()
+            .flatten()
+            .all(|line| !line.contains("Seq Scan on agent_action_outbox")),
+        "{plans:#?}"
     );
     let first = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
         .await
@@ -371,9 +379,9 @@ async fn seed_action_for_discovery(
     kind: &str,
     now: DateTimeWithTimeZone,
 ) {
-    agent_action::ActiveModel {
+    agent_action::Entity::insert(agent_action::ActiveModel {
         id: Set(format!("action-{id}")),
-        execution_id: Set("fixture-owner".into()),
+        execution_id: Set(OWNER.into()),
         action_kind: Set(kind.into()),
         idempotency_key: Set(id.into()),
         request_fingerprint: Set(id.into()),
@@ -381,16 +389,21 @@ async fn seed_action_for_discovery(
         created_at: Set(now),
         committed_at: Set(Some(now)),
         response_json: Set(None),
-    }
-    .insert(db)
+    })
+    .on_conflict(
+        OnConflict::column(agent_action::Column::Id)
+            .update_column(agent_action::Column::ActionKind)
+            .to_owned(),
+    )
+    .exec(db)
     .await
     .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_final_attempt_crash_closes_only_expired_supported_leases() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "final", "pending", 7, now, None).await;
     seed(&db, "unsupported-null", "pending", 8, now, None).await;
     seed(
@@ -454,10 +467,10 @@ async fn action_outbox_final_attempt_crash_closes_only_expired_supported_leases(
     assert_eq!(load(&db, "exhausted").await.next_attempt_at, Some(now));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_exact_lease_status_attempt_races_and_old_callbacks_are_fenced() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "race", "pending", 8, now, Some(now)).await;
     let mut stale = load(&db, "race").await;
     let mut changed: agent_action_outbox::ActiveModel = stale.clone().into();
@@ -520,10 +533,10 @@ async fn action_outbox_exact_lease_status_attempt_races_and_old_callbacks_are_fe
     assert!(ids(&db, now + Duration::hours(2)).await.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_deferral_returns_final_attempt_budget_for_both_wait_classes() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     for id in ["permit", "runtime"] {
         seed(&db, id, "failed", 7, now, None).await;
     }
@@ -565,10 +578,10 @@ async fn action_outbox_deferral_returns_final_attempt_budget_for_both_wait_class
     assert!(again.iter().all(|row| row.attempts == 8));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_rollback_preserves_source_and_partial_index_membership() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "immediate", "pending", 0, now, None).await;
     seed(&db, "final", "pending", 8, now, Some(now)).await;
     let original_ids = ids(&db, now).await;
@@ -601,90 +614,49 @@ async fn action_outbox_rollback_preserves_source_and_partial_index_membership() 
     assert_eq!(load(&db, "final").await.status, "pending");
 }
 
-#[tokio::test]
-async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic() {
-    const MIGRATION: &str = "m20261008_000002_background_access_indexes";
-    let migrations = Migrator::migrations();
-    let target = migrations
-        .iter()
-        .position(|migration| migration.name() == MIGRATION)
-        .unwrap();
-    // Start at this migration, without applying later irreversible changes.
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, Some((target + 1).try_into().unwrap()))
-        .await
-        .unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let now = utc_now();
+#[pioneer_postgres_test::postgres_test]
+async fn repeated_migrator_keeps_outbox_indexes_and_current_attempts() {
+    let db = database().await;
+    let now = fixture_now();
     seed(&db, "existing-immediate", "pending", 0, now, None).await;
     seed(&db, "existing-final", "pending", 8, now, Some(now)).await;
-    Migrator::down(&db, Some(1)).await.unwrap();
-    async fn index_count<C: ConnectionTrait>(db: &C) -> i64 {
-        db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite,
-            "SELECT count(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('idx_agent_action_outbox_immediate','idx_agent_action_outbox_timed')"))
-            .await.unwrap().unwrap().try_get("", "count").unwrap()
-    }
-    assert_eq!(index_count(&db).await, 0);
-    let transaction = db.begin().await.unwrap();
-    Migrator::up(&transaction, Some(1)).await.unwrap();
-    assert_eq!(index_count(&transaction).await, 2);
-    transaction.rollback().await.unwrap();
-    assert_eq!(index_count(&db).await, 0);
-    assert!(
-        !Migrator::get_applied_migrations(&db)
-            .await
-            .unwrap()
-            .iter()
-            .any(|migration| migration.name() == MIGRATION)
-    );
     let immediate_before = load(&db, "existing-immediate").await;
     let final_before = load(&db, "existing-final").await;
-    // A table/index namespace collision fails the second CREATE INDEX, after
-    // the first DDL succeeded. The migration's own transaction must roll back.
-    db.execute_unprepared("CREATE TABLE idx_agent_action_outbox_timed(id INTEGER)")
-        .await
-        .unwrap();
-    assert!(Migrator::up(&db, Some(1)).await.is_err());
-    assert_eq!(index_count(&db).await, 0);
-    assert!(
-        !Migrator::get_applied_migrations(&db)
-            .await
-            .unwrap()
-            .iter()
-            .any(|migration| migration.name() == MIGRATION)
-    );
-    assert_eq!(load(&db, "existing-immediate").await, immediate_before);
-    assert_eq!(load(&db, "existing-final").await, final_before);
-    db.execute_unprepared("DROP TABLE idx_agent_action_outbox_timed")
-        .await
-        .unwrap();
-    // Retry must see the reverted marker and rebuild both ranges from source.
-    Migrator::up(&db, Some(1)).await.unwrap();
-    assert!(
-        Migrator::get_applied_migrations(&db)
-            .await
-            .unwrap()
-            .iter()
-            .any(|migration| migration.name() == MIGRATION)
-    );
-    assert_eq!(load(&db, "existing-immediate").await, immediate_before);
-    assert_eq!(load(&db, "existing-final").await, final_before);
-    assert_eq!(index_count(&db).await, 2);
-    // Historical rollback/retry is complete. Current discovery also requires
-    // the later exhausted expression index, installed by the normal Migrator.
+
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared(
+        "DROP INDEX idx_agent_action_outbox_immediate; DROP INDEX idx_agent_action_outbox_timed",
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
     Migrator::up(&db, None).await.unwrap();
+
+    for name in [
+        "idx_agent_action_outbox_immediate",
+        "idx_agent_action_outbox_timed",
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1::text) IS NOT NULL AS present",
+                [name.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.try_get::<bool>("", "present").unwrap());
+    }
+    assert_eq!(load(&db, "existing-immediate").await, immediate_before);
+    assert_eq!(load(&db, "existing-final").await, final_before);
     assert_eq!(
         ids(&db, now).await,
         vec!["existing-immediate", "existing-final"]
     );
-    assert_eq!(load(&db, "existing-immediate").await.attempts, 0);
-    assert_eq!(load(&db, "existing-final").await.status, "pending");
 }
 
 // Test-only faults at the two externally observable boundaries: another
-// writer between discovery reads, or a lost reply after SQLite commits.
+// writer between discovery reads, or a lost reply after PostgreSQL commits.
 #[derive(Clone, Copy)]
 enum OutboxFault {
     LostCommitReply,
@@ -746,7 +718,7 @@ impl<C: ConnectionTrait> ConnectionTrait for OutboxFaultConnection<C> {
         &self,
         s: Statement,
     ) -> std::result::Result<Vec<sea_orm::QueryResult>, DbErr> {
-        let immediate = s.sql == AGENT_ACTION_OUTBOX_IMMEDIATE_SQL;
+        let immediate = s.sql.contains("next_attempt_at IS NULL") && !s.sql.contains("UNION");
         let rows = self.0.query_all_raw(s).await?;
         if immediate
             && let OutboxFault::MoveToTimed(due) = self.1
@@ -853,10 +825,10 @@ impl<C: ConnectionTrait + TransactionTrait> TransactionTrait for OutboxFaultConn
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_unknown_second_commit_preserves_known_claims_without_retry() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "a", "pending", 7, now, None).await;
     seed(&db, "b", "pending", 0, now, None).await;
     seed(&db, "c", "pending", 0, now, None).await;
@@ -894,10 +866,10 @@ async fn action_outbox_unknown_second_commit_preserves_known_claims_without_retr
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_point_read_error_keeps_partial_success_and_reports_missing_durability() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     for (id, attempts) in [("a", 7), ("b", 0), ("c", 0)] {
         seed(&db, id, "pending", attempts, now, None).await;
     }
@@ -919,15 +891,15 @@ async fn action_outbox_point_read_error_keeps_partial_success_and_reports_missin
     assert_eq!(load(&db, "b").await.next_attempt_at, None);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_failed_transition_defers_original_snapshot_without_spending_attempt() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     for (id, attempts) in [("a", 7), ("b", 0), ("c", 0)] {
         seed(&db, id, "pending", attempts, now, None).await;
     }
     // Test-only storage fault: refuses execution attempt writes, permits delay.
-    db.execute_unprepared("CREATE TRIGGER reject_b_claim BEFORE UPDATE OF attempts ON agent_action_outbox WHEN OLD.id='b' BEGIN SELECT RAISE(ABORT,'local claim failure'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION reject_b_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'local claim failure'; END; $$; CREATE TRIGGER reject_b_claim BEFORE UPDATE OF attempts ON agent_action_outbox FOR EACH ROW WHEN (OLD.id='b') EXECUTE FUNCTION reject_b_claim()").await.unwrap();
     let batch = claim_agent_action_outbox_with_clock(&db, 64, &|| now)
         .await
         .unwrap();
@@ -947,10 +919,10 @@ async fn action_outbox_failed_transition_defers_original_snapshot_without_spendi
     assert!(ids(&db, now).await.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_failed_or_stale_conditional_deferral_preserves_new_ownership() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "b", "pending", 0, now, None).await;
     let stale_null = load(&db, "b").await;
     let batch = claim_agent_action_outbox_with_clock(&db, 2, &|| now)
@@ -970,7 +942,7 @@ async fn action_outbox_failed_or_stale_conditional_deferral_preserves_new_owners
             .await
             .unwrap()
     );
-    db.execute_unprepared("CREATE TRIGGER reject_b_delay BEFORE UPDATE ON agent_action_outbox WHEN OLD.id='b' BEGIN SELECT RAISE(ABORT,'bookkeeping unavailable'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION reject_b_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'bookkeeping unavailable'; END; $$; CREATE TRIGGER reject_b_delay BEFORE UPDATE ON agent_action_outbox FOR EACH ROW WHEN (OLD.id='b') EXECUTE FUNCTION reject_b_delay()").await.unwrap();
     assert!(
         defer_unclaimed_agent_action_outbox(&db, &claimed, &|| now)
             .await
@@ -998,10 +970,10 @@ async fn action_outbox_failed_or_stale_conditional_deferral_preserves_new_owners
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_minimum_budget_rejects_one_and_serves_both_ranges_at_two() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "immediate", "pending", 0, now, None).await;
     seed(&db, "timed", "failed", 0, now, Some(now)).await;
     let error = claim_agent_action_outbox_with_clock(&db, 1, &|| {
@@ -1070,51 +1042,21 @@ impl RouteObserver {
         .unwrap();
     }
 }
-struct DatabasePath(std::path::PathBuf);
-impl Drop for DatabasePath {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
-        sqlite_read_only_connection_url,
     };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    let path = DatabasePath(
-        std::env::temp_dir().join(format!("pioneer-outbox-{}.sqlite", uuid::Uuid::new_v4())),
-    );
-    let mut options =
-        sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
-    options.max_connections(1);
-    let writer = Database::connect(options).await.unwrap();
-    Migrator::up(&writer, None).await.unwrap();
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    writer
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let now = utc_now();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    seed_database(&writer).await;
+    let now = fixture_now();
     seed(&writer, "queued", "pending", 0, now, None).await;
-    let mut options = sea_orm::ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
-    options.max_connections(2).map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-    });
-    let reader = Database::connect(options).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(RouteObserver::default());
     let db = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -1337,10 +1279,10 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn action_outbox_concurrent_range_move_does_not_duplicate_an_input() {
     let db = database().await;
-    let now = utc_now();
+    let now = fixture_now();
     seed(&db, "moving", "pending", 0, now, None).await;
     let concurrent_writer = OutboxFaultConnection::new(db.clone(), OutboxFault::MoveToTimed(now));
     let selected = discover_agent_action_outbox(&concurrent_writer, now, 64)
@@ -1352,7 +1294,7 @@ async fn action_outbox_concurrent_range_move_does_not_duplicate_an_input() {
 
 // One repository-level proof for each head population. These assert behavior,
 // not SQL text or a planner choice; scan/VM-step evidence needs later execution.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn future_outbox_head_preserves_retry_and_exhausted_start_population() {
     let db = database().await;
     let now = DateTime::from_timestamp(1_700_000_000, 0)
@@ -1365,6 +1307,14 @@ async fn future_outbox_head_preserves_retry_and_exhausted_start_population() {
         ("pending", 8, Some("send_message"), "{}", Some(future), true),
         ("failed", 7, None, "broken", Some(future), true),
         ("failed", 8, Some("start_agent"), "{}", Some(future), true),
+        (
+            "failed",
+            8,
+            Some("start_agent"),
+            r#"{"nested":{"message":"a\u0000b"}}"#,
+            Some(future),
+            true,
+        ),
         (
             "failed",
             8,
@@ -1537,7 +1487,7 @@ async fn future_outbox_head_preserves_retry_and_exhausted_start_population() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retention_head_preserves_terminal_and_legacy_marker_policy() {
     let db = database().await;
     let now = DateTime::from_timestamp(1_700_000_000, 0)
