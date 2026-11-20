@@ -1390,6 +1390,7 @@ fn report_dispatch_terminal_failure(error: &anyhow::Error) {
         } else {
             diagnostic.cause.label()
         },
+        postgres_sqlstate = diagnostic.postgres_sqlstate.as_deref(),
         sqlite_primary_code = diagnostic.sqlite_primary_code,
         sqlite_extended_code = diagnostic.sqlite_extended_code,
         original_start_stage = original.map(|value| value.stage.label()),

@@ -29,7 +29,16 @@ runs:
         if ($LASTEXITCODE -ne 0) { throw "Meson or Ninja installation failed" }
         choco install winflexbison3 --yes --no-progress
         if ($LASTEXITCODE -ne 0) { throw "winflexbison installation failed" }
-    - name: build-runtime
+    - name: build-windows-runtime
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        POSTGRES_TARGET: ${{ inputs.target }}
+        POSTGRES_OUTPUT: ${{ inputs.out }}
+      # Git Bash prepends its GNU link.exe ahead of the MSVC linker.
+      run: python scripts/packaging/postgres-runtime.py --target $env:POSTGRES_TARGET --out $env:POSTGRES_OUTPUT
+    - name: build-unix-runtime
+      if: runner.os != 'Windows'
       shell: bash
       env:
         POSTGRES_TARGET: ${{ inputs.target }}

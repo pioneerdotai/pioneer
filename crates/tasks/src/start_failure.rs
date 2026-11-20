@@ -83,13 +83,14 @@ pub enum TaskStartReporting {
     Reported,
 }
 
-/// No raw text or domain identifiers. SQLite codes are populated only by typed
-/// SQLite errors; correlation is allocated at the typed failure boundary.
+/// No raw text or domain identifiers. Diagnostic codes come from typed
+/// database errors, and correlation is allocated at the typed failure boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskStartFailureDescriptor {
     pub stage: TaskStartStage,
     pub cause: TaskStartCause,
     pub reason: Option<TaskStartReason>,
+    pub postgres_sqlstate: Option<String>,
     pub sqlite_primary_code: Option<i32>,
     pub sqlite_extended_code: Option<i32>,
     pub correlation_id: Option<String>,
@@ -104,6 +105,12 @@ impl TaskStartFailureDescriptor {
         ]);
         if let Some(reason) = self.reason {
             fields.insert("reason".to_owned(), TaskValue::from(reason.label()));
+        }
+        if let Some(code) = &self.postgres_sqlstate {
+            fields.insert(
+                "postgres_sqlstate".to_owned(),
+                TaskValue::from(code.clone()),
+            );
         }
         if let Some(code) = self.sqlite_primary_code {
             fields.insert(
@@ -151,6 +158,7 @@ impl TaskStartFailure {
                 stage,
                 cause,
                 reason: None,
+                postgres_sqlstate: None,
                 sqlite_primary_code: None,
                 sqlite_extended_code: None,
                 correlation_id: Some(pioneer_protocol::generate_id(21)),
@@ -161,8 +169,8 @@ impl TaskStartFailure {
         }
     }
 
-    /// Classify before losing a typed cause. Never use Display, Debug, public
-    /// codes, or numeric codes from a non-SQLite database implementation.
+    /// Classify before losing a typed cause. Only driver error types can
+    /// supply a diagnostic database code.
     pub fn from_error(stage: TaskStartStage, error: anyhow::Error) -> Self {
         let mut failure = Self::from_borrowed_error(stage, &error);
         failure.source = Some(error);
@@ -183,8 +191,8 @@ impl TaskStartFailure {
                 public_error: failure.public_error.clone(),
             };
         }
-        let sqlite_code = sqlite_code(error);
-        let storage = sqlite_code.is_some()
+        let database_code = database_code(error);
+        let storage = database_code.is_some()
             || error.chain().any(|cause| {
                 cause.downcast_ref::<DbErr>().is_some_and(|error| {
                     matches!(
@@ -204,8 +212,14 @@ impl TaskStartFailure {
                 TaskStartCause::Unclassified
             },
         );
-        failure.descriptor.sqlite_extended_code = sqlite_code;
-        failure.descriptor.sqlite_primary_code = sqlite_code.map(|code| code & 0xff);
+        match database_code {
+            Some(DatabaseCode::Postgres(code)) => failure.descriptor.postgres_sqlstate = Some(code),
+            Some(DatabaseCode::Sqlite(code)) => {
+                failure.descriptor.sqlite_extended_code = Some(code);
+                failure.descriptor.sqlite_primary_code = Some(code & 0xff);
+            }
+            None => {}
+        }
         failure
     }
 
@@ -274,6 +288,7 @@ impl TaskStartFailure {
                         stage = descriptor.stage.label(),
                         cause = descriptor.cause.label(),
                         reason = descriptor.reason.map(TaskStartReason::label),
+                        postgres_sqlstate = descriptor.postgres_sqlstate.as_deref(),
                         sqlite_primary_code = descriptor.sqlite_primary_code,
                         sqlite_extended_code = descriptor.sqlite_extended_code,
                         correlation_id = descriptor.correlation_id.as_deref(),
@@ -313,12 +328,20 @@ impl std::error::Error for TaskStartFailure {
     }
 }
 
-fn sqlite_code(error: &anyhow::Error) -> Option<i32> {
-    use sea_orm::sqlx::{error::DatabaseError, sqlite::SqliteError};
+enum DatabaseCode {
+    Postgres(String),
+    Sqlite(i32),
+}
+
+fn database_code(error: &anyhow::Error) -> Option<DatabaseCode> {
+    use sea_orm::sqlx::{error::DatabaseError, postgres::PgDatabaseError, sqlite::SqliteError};
     // Anyhow downcast traverses Context; source traversal also covers wrappers.
     for cause in error.chain() {
+        if let Some(postgres) = cause.downcast_ref::<PgDatabaseError>() {
+            return Some(DatabaseCode::Postgres(postgres.code().to_owned()));
+        }
         if let Some(sqlite) = cause.downcast_ref::<SqliteError>() {
-            return sqlite.code()?.parse().ok();
+            return sqlite.code()?.parse().ok().map(DatabaseCode::Sqlite);
         }
         let sqlx = if let Some(db) = cause.downcast_ref::<DbErr>() {
             match db {
@@ -331,8 +354,11 @@ fn sqlite_code(error: &anyhow::Error) -> Option<i32> {
             cause.downcast_ref::<SqlxError>()
         };
         if let Some(SqlxError::Database(database)) = sqlx {
+            if let Some(postgres) = database.try_downcast_ref::<PgDatabaseError>() {
+                return Some(DatabaseCode::Postgres(postgres.code().to_owned()));
+            }
             if let Some(sqlite) = database.try_downcast_ref::<SqliteError>() {
-                return sqlite.code()?.parse().ok();
+                return sqlite.code()?.parse().ok().map(DatabaseCode::Sqlite);
             }
         }
     }
@@ -343,6 +369,46 @@ fn sqlite_code(error: &anyhow::Error) -> Option<i32> {
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[tokio::test]
+    async fn postgres_failure_keeps_sqlstate_and_redacts_database_details() -> anyhow::Result<()> {
+        use sea_orm::ConnectionTrait;
+
+        pioneer_postgres_test::with_database(async |fixture| {
+            let db = fixture.connection();
+            let transaction = sea_orm::TransactionTrait::begin(db).await?;
+            transaction
+                .execute_unprepared(
+                    "CREATE TEMP TABLE start_failure_fixture (value text PRIMARY KEY);
+                     INSERT INTO start_failure_fixture VALUES ('private-canary')",
+                )
+                .await?;
+            let error = transaction
+                .execute_unprepared("INSERT INTO start_failure_fixture VALUES ('private-canary')")
+                .await
+                .expect_err("duplicate primary key");
+            transaction.rollback().await?;
+
+            let mut error = anyhow::Error::new(error).context("prepare task history");
+            let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
+            assert_eq!(descriptor.cause, TaskStartCause::Storage);
+            assert_eq!(descriptor.postgres_sqlstate.as_deref(), Some("23505"));
+            assert_eq!(descriptor.sqlite_primary_code, None);
+            assert_eq!(descriptor.sqlite_extended_code, None);
+            let task_error = descriptor.task_error(None);
+            assert_eq!(task_error.class, TaskErrorClass::Internal);
+            let encoded = serde_json::to_string(&task_error)?;
+            assert!(encoded.contains("23505"));
+            assert!(!encoded.contains("start_failure_fixture"));
+            assert!(!encoded.contains("private-canary"));
+            assert_eq!(
+                TaskStartFailure::report_for_scheduler(&mut error),
+                descriptor
+            );
+            Ok(())
+        })
+        .await
+    }
 
     #[tokio::test]
     async fn cantopen_preserves_sqlite_provenance_and_context_without_transience() {
@@ -422,7 +488,7 @@ mod tests {
     fn public_error_json_and_admission_text_cannot_authorize_reporting_or_policy() {
         let source = anyhow::anyhow!(
             "{}",
-            r#"{"code":"PolicyDenied","stage":"admission","correlation_id":"forged","reported":true,"message":"SQLite CANTOPEN (14)"}"#
+            r#"{"code":"PolicyDenied","stage":"admission","correlation_id":"forged","reported":true,"postgres_sqlstate":"23505","message":"SQLite CANTOPEN (14)"}"#
         );
         let failure = TaskStartFailure::from_error(TaskStartStage::CliAdmission, source);
         assert_eq!(failure.reporting(), TaskStartReporting::Unreported);
@@ -431,6 +497,7 @@ mod tests {
             failure.descriptor().correlation_id.as_deref(),
             Some("forged")
         );
+        assert_eq!(failure.descriptor().postgres_sqlstate, None);
         assert_eq!(failure.descriptor().sqlite_primary_code, None);
         assert_eq!(
             failure.descriptor().task_error(None).class,

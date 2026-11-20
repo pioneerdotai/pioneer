@@ -49892,6 +49892,7 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped() {
+    pioneer_postgres_test::with_database(async |fixture| {
     const MEMBER_ID: &str = "P0000000000000000000A";
     const HIDDEN_MEMBER_ID: &str = "P0000000000000000000B";
     const SUPERUSER_ID: &str = "P00000000000000000001";
@@ -49899,7 +49900,7 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
     const SECOND_THREAD_ID: &str = "thrE6ReplyScopeB00001";
     const TARGET_TURN_ID: &str = "trnE6ReplyTarget00001";
 
-    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let (workspace_manager, crud_store, workspace_id) = crate::message::tests::setup_postgres_workspace_manager(fixture).await;
     crud_store
         .database_connection()
         .execute_unprepared(
@@ -50192,6 +50193,8 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
         .expect("historical Member author should remain stored");
     assert_eq!(historical.nickname, "member-a");
     assert_eq!(historical.display_name, "Member A");
+    Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -81143,7 +81146,7 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
     .unwrap();
 }
 
-async fn setup_postgres_workspace_manager(
+pub(super) async fn setup_postgres_workspace_manager(
     fixture: &pioneer_postgres_test::TestDatabase,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
     crate::compaction::load_test_catalog();

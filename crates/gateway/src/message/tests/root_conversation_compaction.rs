@@ -661,85 +661,68 @@ async fn reviewed_task_in(
 #[tokio::test]
 async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arriving_during_preparation()
  {
-    let provider = Arc::new(CaptureSummaryProvider::new(
-        r#"<task_result>{"summary":"accepted task fact","data":{"answer":"ok"}}</task_result>"#,
-    ));
-    let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
-    let connection = register_authenticated_test_connection(&sessions, tx).await;
-    let (manager, store, workspace) = setup_workspace_manager().await;
-    sessions
-        .set_connection_workspace(connection, Some(workspace.clone()))
-        .await;
-    let processor = review_enabled_processor(
-        phase_13_provider_registry(provider.clone()),
-        sessions,
-        manager,
-        store.clone(),
-    );
-    let now = phase_13_now_secs();
-    let original_activity = now - 3600;
-    let clock = Arc::new(RootClock::new(now as u64 * 1000));
-    let mut processor_config = processor.as_ref().clone();
-    processor_config.compaction_clock = clock.clone();
-    let harness = Phase13CompactionHarness {
-        processor: Arc::new(processor_config),
-        crud_store: store,
-        workspace_id: workspace,
-    };
-    enable_worker(&harness).await;
-    harness.processor.bind_task_bridge().await;
-    human_input(
-        &harness,
-        "delivery-root",
-        "delivery-question",
-        original_activity,
-        "shared-root-history-once",
-    )
-    .await;
-    // A message-only finished root has no response publication debt.
-    harness
-        .crud_store
-        .materialize_turn_completed(
-            TurnCompletedNotification {
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: "delivery-root".into(),
-                turn: phase_13_turn("delivery-question", TurnStatus::Completed),
-            },
-            phase_13_now_secs(),
+    pioneer_postgres_test::with_database(async |fixture| {
+        let provider = Arc::new(CaptureSummaryProvider::new(
+            r#"<task_result>{"summary":"accepted task fact","data":{"answer":"ok"}}</task_result>"#,
+        ));
+        let sessions = Arc::new(SessionManager::new());
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
+        let connection = register_authenticated_test_connection(&sessions, tx).await;
+        let (manager, store, workspace) =
+            crate::message::tests::setup_postgres_workspace_manager(fixture).await;
+        sessions
+            .set_connection_workspace(connection, Some(workspace.clone()))
+            .await;
+        let processor = review_enabled_processor(
+            phase_13_provider_registry(provider.clone()),
+            sessions,
+            manager,
+            store.clone(),
+        );
+        let now = phase_13_now_secs();
+        let original_activity = now - 3600;
+        let clock = Arc::new(RootClock::new(now as u64 * 1000));
+        let mut processor_config = processor.as_ref().clone();
+        processor_config.compaction_clock = clock.clone();
+        let harness = Phase13CompactionHarness {
+            processor: Arc::new(processor_config),
+            crud_store: store,
+            workspace_id: workspace,
+        };
+        enable_worker(&harness).await;
+        harness.processor.bind_task_bridge().await;
+        human_input(
+            &harness,
+            "delivery-root",
+            "delivery-question",
+            original_activity,
+            "shared-root-history-once",
         )
-        .await
-        .unwrap();
-
-    let mut frozen = Vec::new();
-    for goal in ["first-result", "second-result"] {
-        let (task, candidate) = reviewed_task(&harness, goal, Some("delivery-root")).await;
-        let run = task.run.as_ref().unwrap();
-        let snapshot = harness
+        .await;
+        // A message-only finished root has no response publication debt.
+        harness
             .crud_store
-            .compaction_task_output(&harness.workspace_id, &candidate.task_run_turn_id)
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: harness.workspace_id.clone(),
+                    thread_id: "delivery-root".into(),
+                    turn: phase_13_turn("delivery-question", TurnStatus::Completed),
+                },
+                phase_13_now_secs(),
+            )
             .await
-            .unwrap()
-            .expect("review candidate must retain immutable output before acceptance");
-        assert!(
-            harness
+            .unwrap();
+
+        let mut frozen = Vec::new();
+        for goal in ["first-result", "second-result"] {
+            let (task, candidate) = reviewed_task(&harness, goal, Some("delivery-root")).await;
+            let run = task.run.as_ref().unwrap();
+            let snapshot = harness
                 .crud_store
-                .compaction_pending_history_checks()
+                .compaction_task_output(&harness.workspace_id, &candidate.task_run_turn_id)
                 .await
                 .unwrap()
-                .is_empty(),
-            "unaccepted child completion is not root publication"
-        );
-        accept_candidate(
-            &harness,
-            connection,
-            &mut rx,
-            &task.task.id,
-            &run.id,
-            &candidate,
-        )
-        .await;
-        if frozen.is_empty() {
+                .expect("review candidate must retain immutable output before acceptance");
             assert!(
                 harness
                     .crud_store
@@ -747,320 +730,344 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
                     .await
                     .unwrap()
                     .is_empty(),
-                "acceptance alone must not prepare an undelivered result"
+                "unaccepted child completion is not root publication"
             );
+            accept_candidate(
+                &harness,
+                connection,
+                &mut rx,
+                &task.task.id,
+                &run.id,
+                &candidate,
+            )
+            .await;
+            if frozen.is_empty() {
+                assert!(
+                    harness
+                        .crud_store
+                        .compaction_pending_history_checks()
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "acceptance alone must not prepare an undelivered result"
+                );
+            }
+            frozen.push((candidate.task_run_turn_id.clone(), snapshot));
         }
-        frozen.push((candidate.task_run_turn_id.clone(), snapshot));
-    }
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    let pending = harness
-        .crud_store
-        .compaction_pending_history_checks()
-        .await
-        .unwrap();
-    assert_eq!(
-        pending.len(),
-        1,
-        "multiple deliveries must share one root work item"
-    );
-    assert_eq!(pending[0].thread_id, "delivery-root");
-    assert_eq!(pending[0].turn_id, "delivery-question");
-    assert_eq!(
         harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
+        let pending = harness
             .crud_store
-            .compaction_root_history_activity(
+            .compaction_pending_history_checks()
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "multiple deliveries must share one root work item"
+        );
+        assert_eq!(pending[0].thread_id, "delivery-root");
+        assert_eq!(pending[0].turn_id, "delivery-question");
+        assert_eq!(
+            harness
+                .crud_store
+                .compaction_root_history_activity(
+                    &harness.workspace_id,
+                    "delivery-root",
+                    "delivery-question",
+                )
+                .await
+                .unwrap(),
+            Some(original_activity * 1000),
+            "ordinary results enter context but do not renew a conversation's activity"
+        );
+        let revision_before = pending[0].revision;
+        let prepared = harness
+            .processor
+            .capture_current_context_basis_prepared(
+                &harness.crud_store.with_maintenance_access(),
                 &harness.workspace_id,
                 "delivery-root",
                 "delivery-question",
+                None,
             )
             .await
-            .unwrap(),
-        Some(original_activity * 1000),
-        "ordinary results enter context but do not renew a conversation's activity"
-    );
-    let revision_before = pending[0].revision;
-    let prepared = harness
-        .processor
-        .capture_current_context_basis_prepared(
-            &harness.crud_store.with_maintenance_access(),
-            &harness.workspace_id,
-            "delivery-root",
-            "delivery-question",
-            None,
+            .unwrap();
+        let joined = prepared
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            joined.matches("shared-root-history-once").count(),
+            1,
+            "accepted child branches must not duplicate their shared root history"
+        );
+        drop(prepared);
+
+        harness
+            .processor
+            .arm_completed_history_preparation_barrier("delivery-question");
+        harness
+            .processor
+            .poll_completed_history_checks()
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            harness
+                .processor
+                .wait_for_completed_history_preparation_barrier(),
         )
         .await
         .unwrap();
-    let joined = prepared
-        .messages
-        .iter()
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        joined.matches("shared-root-history-once").count(),
-        1,
-        "accepted child branches must not duplicate their shared root history"
-    );
-    drop(prepared);
-
-    harness
-        .processor
-        .arm_completed_history_preparation_barrier("delivery-question");
-    harness
-        .processor
-        .poll_completed_history_checks()
-        .await
-        .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        harness
-            .processor
-            .wait_for_completed_history_preparation_barrier(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        harness
-            .processor
-            .completed_history_checks
-            .lock()
-            .await
-            .len(),
-        1
-    );
-    let claimed = check::Entity::find_by_id("delivery-question")
-        .one(&harness.crud_store.database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(claimed.revision > revision_before);
-    let (third, candidate) = reviewed_task(&harness, "third-result", Some("delivery-root")).await;
-    let third_run = third.run.as_ref().unwrap();
-    accept_candidate(
-        &harness,
-        connection,
-        &mut rx,
-        &third.task.id,
-        &third_run.id,
-        &candidate,
-    )
-    .await;
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    let arrived = check::Entity::find_by_id("delivery-question")
-        .one(&harness.crud_store.database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        arrived.revision > claimed.revision,
-        "delivery must supersede the captured work revision"
-    );
-    harness
-        .processor
-        .release_completed_history_preparation_barrier();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if harness
+        assert_eq!(
+            harness
                 .processor
                 .completed_history_checks
                 .lock()
                 .await
-                .values()
-                .all(|job| {
-                    job.handle
-                        .as_ref()
-                        .is_none_or(tokio::task::JoinHandle::is_finished)
-                })
-            {
-                break;
+                .len(),
+            1
+        );
+        let claimed = check::Entity::find_by_id("delivery-question")
+            .one(&harness.crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(claimed.revision > revision_before);
+        let (third, candidate) =
+            reviewed_task(&harness, "third-result", Some("delivery-root")).await;
+        let third_run = third.run.as_ref().unwrap();
+        accept_candidate(
+            &harness,
+            connection,
+            &mut rx,
+            &third.task.id,
+            &third_run.id,
+            &candidate,
+        )
+        .await;
+        harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
+        let arrived = check::Entity::find_by_id("delivery-question")
+            .one(&harness.crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            arrived.revision > claimed.revision,
+            "delivery must supersede the captured work revision"
+        );
+        harness
+            .processor
+            .release_completed_history_preparation_barrier();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if harness
+                    .processor
+                    .completed_history_checks
+                    .lock()
+                    .await
+                    .values()
+                    .all(|job| {
+                        job.handle
+                            .as_ref()
+                            .is_none_or(tokio::task::JoinHandle::is_finished)
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+        })
+        .await
+        .unwrap();
+        let retained = check::Entity::find_by_id("delivery-question")
+            .one(&harness.crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.revision, arrived.revision,
+            "stale worker completion must lose its CAS"
+        );
+        assert_eq!(
+            retained.state, "pending",
+            "the new delivery must survive the old worker"
+        );
+        // Drop in-memory ownership as at shutdown; publication debt is durable.
+        harness.processor.suspend_completed_history_checks().await;
+        drain_worker(&harness.processor).await;
+        let finished = check::Entity::find_by_id("delivery-question")
+            .one(&harness.crud_store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.outcome.as_deref(), Some("fits"));
+        let intermediate = frozen[0].1.source_thread.clone();
+        for (id, snapshot) in frozen {
+            assert_eq!(
+                harness
+                    .crud_store
+                    .compaction_task_output(&harness.workspace_id, &id)
+                    .await
+                    .unwrap(),
+                Some(snapshot)
+            );
         }
-    })
-    .await
-    .unwrap();
-    let retained = check::Entity::find_by_id("delivery-question")
-        .one(&harness.crud_store.database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        retained.revision, arrived.revision,
-        "stale worker completion must lose its CAS"
-    );
-    assert_eq!(
-        retained.state, "pending",
-        "the new delivery must survive the old worker"
-    );
-    // Drop in-memory ownership as at shutdown; publication debt is durable.
-    harness.processor.suspend_completed_history_checks().await;
-    drain_worker(&harness.processor).await;
-    let finished = check::Entity::find_by_id("delivery-question")
-        .one(&harness.crud_store.database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(finished.outcome.as_deref(), Some("fits"));
-    let intermediate = frozen[0].1.source_thread.clone();
-    for (id, snapshot) in frozen {
+        let calls = provider.call_count();
+        harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
+        drain_worker(&harness.processor).await;
+        assert_eq!(
+            provider.call_count(),
+            calls,
+            "replayed delivery and compaction events must not create a loop"
+        );
+        assert!(
+            harness
+                .crud_store
+                .compaction_pending_history_checks()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let (intermediate_task, intermediate_candidate) =
+            reviewed_task(&harness, "intermediate-only", Some(&intermediate)).await;
+        accept_candidate(
+            &harness,
+            connection,
+            &mut rx,
+            &intermediate_task.task.id,
+            &intermediate_task.run.as_ref().unwrap().id,
+            &intermediate_candidate,
+        )
+        .await;
+        harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .crud_store
+                .compaction_pending_history_checks()
+                .await
+                .unwrap()
+                .is_empty(),
+            "delivery available only to an internal parent must not prepare root or intermediate"
+        );
+        assert!(
+            harness
+                .crud_store
+                .compaction_head(&crate::compaction::native_owner(
+                    &harness.workspace_id,
+                    &intermediate
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (task, candidate) = reviewed_task(&harness, "accepted-but-none", None).await;
+        accept_candidate(
+            &harness,
+            connection,
+            &mut rx,
+            &task.task.id,
+            &task.run.as_ref().unwrap().id,
+            &candidate,
+        )
+        .await;
+        harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .crud_store
+                .compaction_pending_history_checks()
+                .await
+                .unwrap()
+                .is_empty(),
+            "accepted result with delivery none must not prepare root"
+        );
+        // A later independent report is real new context, but an abandoned root
+        // stays cold. The Task still prepares its Native main request normally.
+        clock.set(original_activity as u64 * 1000 + 28_800_000);
+        let (monitor, candidate) = reviewed_task(
+            &harness,
+            "independent-monitor-report",
+            Some("delivery-root"),
+        )
+        .await;
+        accept_candidate(
+            &harness,
+            connection,
+            &mut rx,
+            &monitor.task.id,
+            &monitor.run.as_ref().unwrap().id,
+            &candidate,
+        )
+        .await;
+        harness
+            .processor
+            .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
+            .await
+            .unwrap();
         assert_eq!(
             harness
                 .crud_store
-                .compaction_task_output(&harness.workspace_id, &id)
+                .compaction_root_history_activity(
+                    &harness.workspace_id,
+                    "delivery-root",
+                    "delivery-question",
+                )
                 .await
                 .unwrap(),
-            Some(snapshot)
+            Some(original_activity * 1000)
         );
-    }
-    let calls = provider.call_count();
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    drain_worker(&harness.processor).await;
-    assert_eq!(
-        provider.call_count(),
-        calls,
-        "replayed delivery and compaction events must not create a loop"
-    );
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
+        drain_worker(&harness.processor).await;
+        let cold = check::Entity::find_by_id("delivery-question")
+            .one(&harness.crud_store.database_connection())
             .await
             .unwrap()
-            .is_empty()
-    );
-
-    let (intermediate_task, intermediate_candidate) =
-        reviewed_task(&harness, "intermediate-only", Some(&intermediate)).await;
-    accept_candidate(
-        &harness,
-        connection,
-        &mut rx,
-        &intermediate_task.task.id,
-        &intermediate_task.run.as_ref().unwrap().id,
-        &intermediate_candidate,
-    )
-    .await;
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "delivery available only to an internal parent must not prepare root or intermediate"
-    );
-    assert!(
-        harness
-            .crud_store
-            .compaction_head(&crate::compaction::native_owner(
-                &harness.workspace_id,
-                &intermediate
-            ))
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    let (task, candidate) = reviewed_task(&harness, "accepted-but-none", None).await;
-    accept_candidate(
-        &harness,
-        connection,
-        &mut rx,
-        &task.task.id,
-        &task.run.as_ref().unwrap().id,
-        &candidate,
-    )
-    .await;
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    assert!(
-        harness
-            .crud_store
-            .compaction_pending_history_checks()
-            .await
-            .unwrap()
-            .is_empty(),
-        "accepted result with delivery none must not prepare root"
-    );
-    // A later independent report is real new context, but an abandoned root
-    // stays cold. The Task still prepares its Native main request normally.
-    clock.set(original_activity as u64 * 1000 + 28_800_000);
-    let (monitor, candidate) = reviewed_task(
-        &harness,
-        "independent-monitor-report",
-        Some("delivery-root"),
-    )
-    .await;
-    accept_candidate(
-        &harness,
-        connection,
-        &mut rx,
-        &monitor.task.id,
-        &monitor.run.as_ref().unwrap().id,
-        &candidate,
-    )
-    .await;
-    harness
-        .processor
-        .process_due_task_deliveries(phase_13_now_secs() + 1, 16)
-        .await
-        .unwrap();
-    assert_eq!(
-        harness
-            .crud_store
-            .compaction_root_history_activity(
-                &harness.workspace_id,
-                "delivery-root",
-                "delivery-question",
-            )
-            .await
-            .unwrap(),
-        Some(original_activity * 1000)
-    );
-    drain_worker(&harness.processor).await;
-    let cold = check::Entity::find_by_id("delivery-question")
-        .one(&harness.crud_store.database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        cold.outcome.as_deref(),
-        Some("cancelled"),
-        "monitor publication must not reopen an expired root window"
-    );
-    assert_eq!(
-        provider
-            .snapshot_requests()
-            .iter()
-            .filter(|request| {
-                request.messages.first().is_some_and(|message| {
-                    message.content == pioneer_compaction::summary::INSTRUCTIONS
+            .unwrap();
+        assert_eq!(
+            cold.outcome.as_deref(),
+            Some("cancelled"),
+            "monitor publication must not reopen an expired root window"
+        );
+        assert_eq!(
+            provider
+                .snapshot_requests()
+                .iter()
+                .filter(|request| {
+                    request.messages.first().is_some_and(|message| {
+                        message.content == pioneer_compaction::summary::INSTRUCTIONS
+                    })
                 })
-            })
-            .count(),
-        0,
-        "cold root must not call the summarizer"
-    );
+                .count(),
+            0,
+            "cold root must not call the summarizer"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -1524,13 +1531,14 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl()
 
 #[tokio::test]
 async fn real_composer_native_start_preempts_background_owned_by_the_visible_root() {
+    pioneer_postgres_test::with_database(async |fixture| {
     let provider = Arc::new(CaptureSummaryProvider::new(
         r#"<task_result>{"summary":"foreground completed","data":{"answer":"ready"}}</task_result>"#,
     ).with_valid_summary_completion());
     let sessions = Arc::new(SessionManager::new());
     let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
-    let (manager, store, workspace) = setup_workspace_manager().await;
+    let (manager, store, workspace) = crate::message::tests::setup_postgres_workspace_manager(fixture).await;
     let processor = review_enabled_processor(
         phase_13_provider_registry(provider.clone()),
         sessions.clone(),
@@ -1736,4 +1744,6 @@ async fn real_composer_native_start_preempts_background_owned_by_the_visible_roo
             .await;
     assert_ne!(lineage.child_thread_id, "priority-composer-root");
     harness.processor.suspend_completed_history_checks().await;
+    Ok(())
+    }).await.unwrap();
 }
