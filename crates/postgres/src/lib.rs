@@ -20,6 +20,9 @@ use tokio::{process::Command, time::Instant};
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(windows)]
+mod windows;
+
 const ROLE: &str = "pioneer";
 const READER_ROLE: &str = "pioneer_reader";
 const DATABASE: &str = "pioneer";
@@ -74,7 +77,8 @@ impl Runtime {
             .stderr(Stdio::null());
         // Never let ambient Postgres client settings redirect bundled tools.
         for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"PG") {
+            let prefix = key.as_encoded_bytes().get(..2);
+            if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"PG")) {
                 command.env_remove(key);
             }
         }
@@ -238,7 +242,7 @@ fn private_lock_file(path: &Path) -> std::io::Result<File> {
 pub struct BundledPostgres {
     runtime: Runtime,
     cluster: Cluster,
-    child: Box<dyn ChildWrapper>,
+    child: Postmaster,
     port: u16,
 }
 
@@ -296,6 +300,7 @@ impl BundledPostgres {
     }
 
     async fn launch(runtime: Runtime, cluster: Cluster) -> Result<Self> {
+        let mut last_exit = None;
         for _ in 0..4 {
             // Port 5432 is irrelevant to this instance. Retry the small race
             // between releasing the loopback reservation and PostgreSQL bind.
@@ -331,14 +336,11 @@ impl BundledPostgres {
                     });
                 }
             }
-            let mut wrapped = CommandWrap::from(command);
-            wrapped.wrap(KillOnDrop);
-            #[cfg(windows)]
-            wrapped.wrap(process_wrap::tokio::JobObject);
-            let mut child = wrapped.spawn().context("launch bundled postgres")?;
+            let mut child = Postmaster::spawn(command).context("launch bundled postgres")?;
             let deadline = Instant::now() + START_TIMEOUT;
             loop {
-                if child.try_wait()?.is_some() {
+                if let Some(status) = child.try_wait()? {
+                    last_exit = Some(status);
                     break;
                 }
                 if let Ok(connection) =
@@ -364,7 +366,8 @@ impl BundledPostgres {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        anyhow::bail!("bundled postgres exited before readiness")
+        let status = last_exit.expect("every unsuccessful launch observed an exit");
+        anyhow::bail!("bundled postgres exited before readiness ({status})")
     }
 
     async fn prepare(&self) -> Result<()> {
@@ -459,6 +462,42 @@ impl BundledPostgres {
             "bundled PostgreSQL shutdown failed ({status})"
         );
         Ok(())
+    }
+}
+
+enum Postmaster {
+    Standard(Box<dyn ChildWrapper>),
+    #[cfg(windows)]
+    Restricted(windows::RestrictedChild),
+}
+
+impl Postmaster {
+    fn spawn(command: Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        if windows::has_administrator_group()? {
+            return windows::RestrictedChild::spawn(command.as_std()).map(Self::Restricted);
+        }
+        let mut command = CommandWrap::from(command);
+        command.wrap(KillOnDrop);
+        #[cfg(windows)]
+        command.wrap(process_wrap::tokio::JobObject);
+        command.spawn().map(Self::Standard)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Standard(child) => child.try_wait(),
+            #[cfg(windows)]
+            Self::Restricted(child) => child.try_wait(),
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Standard(child) => child.wait().await,
+            #[cfg(windows)]
+            Self::Restricted(child) => child.wait().await,
+        }
     }
 }
 

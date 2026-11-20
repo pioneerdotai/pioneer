@@ -669,6 +669,10 @@ jobs:
           try {
             ./install.ps1 -ForceStart -LocalAssetFile $asset -LocalChecksumsFile $checksums
             python scripts/packaging/smoke-gateway-postgres.py --binary $binary
+          } catch {
+            $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+            if (Test-Path $log) { Get-Content $log -Tail 30 }
+            throw
           } finally {
             if (Test-Path $binary) { & $binary stop }
           }

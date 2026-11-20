@@ -347,6 +347,13 @@ jobs:
           python scripts/packaging/smoke-gateway-postgres.py --binary $env:SMOKE_BINARY
           if ($LASTEXITCODE -ne 0) { throw "Bundled PostgreSQL lifecycle smoke failed" }
 
+      - name: report Gateway startup failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+          if (Test-Path $log) { Get-Content $log -Tail 30 }
+
       - name: cleanup
         if: always()
         shell: pwsh
@@ -567,6 +574,13 @@ jobs:
           if ($status.service_active) {
             throw "gateway service should be stopped"
           }
+
+      - name: report Gateway startup failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+          if (Test-Path $log) { Get-Content $log -Tail 30 }
 
       - name: cleanup
         if: always()

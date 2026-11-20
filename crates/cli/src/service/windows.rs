@@ -4,10 +4,13 @@ use tracing::info;
 
 use pioneer_config::InstallManagedBy;
 
-use super::{GatewayServiceStartReport, GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+#[cfg(windows)]
+use super::GatewayServiceStartReport;
+use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
 
 const WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE: &str = "windows_logon_task_login_session_scoped";
 
+#[cfg(windows)]
 pub fn start_gateway_service(
     settings: &ServiceSettings,
     report: &mut GatewayServiceStartReport,
@@ -21,7 +24,12 @@ pub fn start_gateway_service(
         let service_path = super::resolve_service_path()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let runner_script = render_gateway_runner_script(&executable, service_path.as_deref(), config_path);
+        std::fs::create_dir_all(&settings.runtime_home)
+            .context("create Gateway runtime directory")?;
+        let log = settings.runtime_home.join("gateway-service.log");
+        let runner_script = render_gateway_runner_script(
+            &executable, service_path.as_deref(), config_path, &log,
+        );
         let runner_script = powershell_escape_single_quoted(runner_script.as_str());
 
         Ok(format!(
@@ -200,13 +208,16 @@ fn render_gateway_runner_script(
     executable: &str,
     path_env: Option<&str>,
     config_path: Option<&std::path::Path>,
+    log: &std::path::Path,
 ) -> String {
+    let log = powershell_escape_single_quoted(&log.display().to_string());
+    let launch = format!("& '{executable}' '{SERVICE_MODE_ARG}' *> '{log}'; exit $LASTEXITCODE");
     let runner = match path_env {
         Some(path_env) => {
             let path = powershell_escape_single_quoted(path_env);
-            format!("$env:PATH = '{path}'; & '{executable}' '{SERVICE_MODE_ARG}'")
+            format!("$env:PATH = '{path}'; {launch}")
         }
-        None => format!("& '{executable}' '{SERVICE_MODE_ARG}'"),
+        None => launch,
     };
     if let Some(config_path) = config_path {
         format!(
@@ -254,10 +265,11 @@ mod tests {
             r"C:\dev checkout\pioneer.exe",
             None,
             Some(std::path::Path::new(r"C:\dev's checkout\config.toml")),
+            std::path::Path::new(r"C:\runtime's home\gateway-service.log"),
         );
         assert_eq!(
             runner,
-            r"$env:PIONEER_CONFIG = 'C:\dev''s checkout\config.toml'; & 'C:\dev checkout\pioneer.exe' 'gateway-service'"
+            r"$env:PIONEER_CONFIG = 'C:\dev''s checkout\config.toml'; & 'C:\dev checkout\pioneer.exe' 'gateway-service' *> 'C:\runtime''s home\gateway-service.log'; exit $LASTEXITCODE"
         );
     }
 
