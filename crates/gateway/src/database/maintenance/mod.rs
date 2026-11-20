@@ -8,9 +8,6 @@ mod zstd_payload_compression;
 #[cfg(test)]
 pub(crate) use frozen_storage::run as run_frozen_worker_for_test;
 
-#[cfg(test)]
-pub(crate) use zstd_payload_compression::run as run_zstd_worker_for_test;
-
 use pioneer_crud::CrudStore;
 use std::sync::Arc;
 
