@@ -76,12 +76,21 @@ pub struct McpServerInstallation {
 }
 
 impl McpServerInstallation {
+    /// App-owned target; still uses the ordinary Streamable HTTP transport.
+    pub fn is_pioneer(&self) -> bool {
+        self.source_ref
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("pioneer")
+    }
+
     pub fn transport_kind(&self) -> &'static str {
         self.transport.kind()
     }
 
     pub fn explicit_authorization_overrides_oauth(&self) -> bool {
-        self.transport.has_authorization_header()
+        // Pioneer targets receive explicit execution authority from Gateway at dispatch.
+        self.is_pioneer() || self.transport.has_authorization_header()
     }
 }
 

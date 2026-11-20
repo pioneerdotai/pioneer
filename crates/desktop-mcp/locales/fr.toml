@@ -164,3 +164,8 @@ recovering = "La connexion est temporairement indisponible. Pioneer réessaiera.
 clear_sign_in = "Réinitialiser la connexion"
 prepare_failed = "Impossible de préparer la connexion. Fermez l’application qui utilise le port de retour, puis réessayez."
 client_auth_unsupported = "La méthode d’authentification de ce client OAuth n’est pas prise en charge. Vérifiez son inscription."
+
+[mcp.settings]
+title = "Paramètres"
+enabled_description = "Rend les outils et les ressources de ce serveur MCP disponibles dans l’espace de travail actuel."
+implicit_description = "Autorise les agents à utiliser automatiquement ce serveur MCP même s’il n’est pas explicitement nommé dans la demande."

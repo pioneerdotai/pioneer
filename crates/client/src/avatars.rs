@@ -13,22 +13,7 @@ pub use pioneer_protocol::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
-/// Resolve built-in CLI artwork from provider identity and the shell's appearance.
-pub fn cli_runtime_avatar_revision(
-    kind: pioneer_protocol::CLIAgentRuntimeKind,
-    dark: bool,
-) -> &'static str {
-    use pioneer_protocol::{
-        CLAUDE_AGENT_AVATAR_REVISION, CLIAgentRuntimeKind, CODEX_AGENT_AVATAR_REVISION,
-        OPENCODE_AGENT_AVATAR_DARK_REVISION, OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
-    };
-    match kind {
-        CLIAgentRuntimeKind::Codex => CODEX_AGENT_AVATAR_REVISION,
-        CLIAgentRuntimeKind::Claude => CLAUDE_AGENT_AVATAR_REVISION,
-        CLIAgentRuntimeKind::OpenCode if dark => OPENCODE_AGENT_AVATAR_DARK_REVISION,
-        CLIAgentRuntimeKind::OpenCode => OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
-    }
-}
+pub use pioneer_protocol::cli_runtime_avatar_revision;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

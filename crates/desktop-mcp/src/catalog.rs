@@ -1,5 +1,4 @@
 use crate::{sidebar::CatalogSidebar, table::*};
-use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::table::TableState;
 use gpui_kit::{prelude::*, *};
 pub(crate) use pioneer_client::state::client_state::GatewayConnectionState;
@@ -131,7 +130,7 @@ pub struct McpCatalogView {
     pub(crate) presentation_error: Option<String>,
     pub(crate) native_task: Option<Task<()>>,
     pub(crate) parent_generation: u64,
-    pub(crate) mcp_list_scroll_handle: VirtualListScrollHandle,
+    pub(crate) mcp_list_state: ListState,
     pub(crate) mcp_details_expanded_sections:
         std::collections::BTreeMap<String, std::collections::HashSet<String>>,
     pub(crate) mcp_audit_table_state: Entity<TableState<McpDiagnosticsTableDelegate>>,
@@ -237,7 +236,7 @@ impl McpCatalogView {
                 dialogs: vec![],
                 _release: release,
                 rows: Default::default(),
-                mcp_list_scroll_handle: VirtualListScrollHandle::new(),
+                mcp_list_state: ListState::new(0, ListAlignment::Top, px(0.)),
                 mcp_details_expanded_sections: Default::default(),
                 mcp_audit_table_state: table,
                 config_form: None,
@@ -495,7 +494,8 @@ impl McpCatalogView {
         {
             self.rows.clear();
             self.mcp_details_expanded_sections.clear();
-            self.mcp_list_scroll_handle = VirtualListScrollHandle::new();
+            self.mcp_list_state =
+                ListState::new(self.input.mcp_servers.len(), ListAlignment::Top, px(0.));
         }
         if self.input.navigation_input.workspace_id() != next.navigation_input.workspace_id()
             || self.input.gateway.capabilities != next.gateway.capabilities
@@ -550,6 +550,18 @@ impl McpCatalogView {
         let screen_changed = !self.input.same_screen(&next);
         let sidebar_changed = !self.input.same_sidebar(&next);
         if changed {
+            let previous_ids: Vec<_> = self
+                .input
+                .mcp_servers
+                .iter()
+                .map(|server| &server.id)
+                .collect();
+            let next_ids: Vec<_> = next.mcp_servers.iter().map(|server| &server.id).collect();
+            pioneer_desktop_foundation::reconcile_catalog_list(
+                &self.mcp_list_state,
+                &previous_ids,
+                &next_ids,
+            );
             self.input = Arc::new(next);
             self.sync_rows(cx);
             if sidebar_changed {

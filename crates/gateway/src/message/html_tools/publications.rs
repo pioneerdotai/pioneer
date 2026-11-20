@@ -92,10 +92,8 @@ impl MessageProcessor {
                 continue;
             };
             if delivery.error_snapshot.is_some()
-                || delivery
-                    .delivered_turn_id
-                    .as_deref()
-                    .is_some_and(|id| id != turn)
+                || delivery.status != pioneer_protocol::TaskDeliveryStatus::Delivered
+                || delivery.delivered_turn_id.as_deref() != Some(turn.as_str())
             {
                 continue;
             }

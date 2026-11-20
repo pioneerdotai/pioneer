@@ -11286,6 +11286,7 @@ dependencies = [
  "flate2",
  "hex",
  "pioneer-cli-mcp-bridge",
+ "pioneer-client",
  "pioneer-config",
  "pioneer-gateway",
  "pioneer-observability",
@@ -11533,9 +11534,12 @@ dependencies = [
  "gpui-webview",
  "lb-wry",
  "pioneer-client",
+ "rand 0.10.3",
  "rust-i18n",
  "serde_json",
  "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]

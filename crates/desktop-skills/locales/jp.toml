@@ -168,3 +168,8 @@ empty_audit = "監査イベントはまだありません。"
 [skills.catalog]
 source = "ソース"
 trust = "信頼"
+
+[skills.settings]
+title = "設定"
+enabled_description = "現在のワークスペースでエージェントがこのスキルを使用できるようにします。"
+implicit_description = "リクエストで明示的に指定されていなくても、エージェントがこのスキルを自動的に適用できるようにします。"

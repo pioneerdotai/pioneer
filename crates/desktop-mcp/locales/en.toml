@@ -166,3 +166,8 @@ recovering = "The connection is temporarily unavailable. Pioneer will retry."
 clear_sign_in = "Clear sign-in"
 prepare_failed = "Could not prepare sign-in. Close any app using the callback port and try signing in again."
 client_auth_unsupported = "This OAuth client uses an unsupported authentication method. Check its registration."
+
+[mcp.settings]
+title = "Settings"
+enabled_description = "Make this MCP server’s tools and resources available in the current workspace."
+implicit_description = "Allow agents to use this MCP server automatically even when it is not explicitly named in a request."

@@ -152,6 +152,29 @@ fn hash_secret_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+/// Trusted per-call context, carried only through RMCP's in-process extensions.
+#[derive(Clone)]
+pub struct McpCaller {
+    pub user_id: String,
+    pub agent_id: String,
+}
+
+/// HTTP routing supplied by the host; the MCP crate cannot depend on App runtime owners.
+pub struct McpHttpTarget {
+    pub uri: Arc<str>,
+    pub headers: std::collections::HashMap<http::HeaderName, http::HeaderValue>,
+    pub cancellation: Option<CancellationToken>,
+}
+#[async_trait]
+pub trait McpHttpResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        installation_id: &str,
+        installation: &McpServerInstallation,
+        caller: Option<&McpCaller>,
+    ) -> Result<McpHttpTarget, McpRuntimeError>;
+}
+
 #[async_trait]
 pub trait McpRuntimeSession: Send {
     fn initial_catalog(&self) -> &McpCatalogSnapshot;
@@ -171,6 +194,23 @@ pub trait McpRuntimeSession: Send {
         timeout: Duration,
         cancellation: CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError>;
+    async fn call_tool_with_caller(
+        &mut self,
+        raw_tool_name: &str,
+        arguments: JsonValue,
+        budget: crate::McpInvocationBudget,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        caller: Option<McpCaller>,
+    ) -> Result<McpToolCallResult, McpRuntimeError> {
+        if caller.is_some() {
+            return Err(McpRuntimeError::failed(
+                "MCP transport cannot carry caller context",
+            ));
+        }
+        self.call_tool(raw_tool_name, arguments, budget, timeout, cancellation)
+            .await
+    }
     async fn shutdown(&mut self);
     /// Native completion path. Legacy implementations cannot silently claim an
     /// acknowledgement they have never provided.

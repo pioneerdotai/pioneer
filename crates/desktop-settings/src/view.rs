@@ -71,15 +71,7 @@ impl SettingsScreenView {
         let selected_file_opener = self.active_workspace_file_opener(cx);
         let desktop_entity = cx.entity().clone();
 
-        let mut general_settings = v_flex()
-            .w_full()
-            .gap_0()
-            .px_4()
-            .py_0()
-            .rounded_lg()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+        let mut general_settings = pioneer_desktop_foundation::settings_group(cx)
             .child(Self::render_locale_setting(
                 selected_language,
                 desktop_entity.clone(),
@@ -903,40 +895,19 @@ impl SettingsScreenView {
         desktop_entity: Entity<Self>,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
-            .w_full()
-            .gap_6()
-            .py_3()
-            .justify_between()
-            .items_center()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("settings.option.keepawake.label").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .child(t!("settings.option.keepawake.description").to_string()),
-                    ),
-            )
-            .child(
-                Switch::new("settings-keepawake")
-                    .checked(selected)
-                    .on_click(move |enabled, _, cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            view.apply_keepawake_setting(*enabled, cx);
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
+        pioneer_desktop_foundation::settings_row(
+            t!("settings.option.keepawake.label").to_string(),
+            t!("settings.option.keepawake.description").to_string(),
+            Switch::new("settings-keepawake")
+                .checked(selected)
+                .on_click(move |enabled, _, cx| {
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.apply_keepawake_setting(*enabled, cx);
+                        cx.notify();
+                    });
+                }),
+        )
+        .into_any_element()
     }
 
     fn render_telemetry_setting(
@@ -944,40 +915,19 @@ impl SettingsScreenView {
         desktop_entity: Entity<Self>,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
-            .w_full()
-            .gap_6()
-            .py_3()
-            .justify_between()
-            .items_center()
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("settings.option.telemetry.label").to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .opacity(0.6)
-                            .child(t!("settings.option.telemetry.description").to_string()),
-                    ),
-            )
-            .child(
-                Switch::new("settings-telemetry")
-                    .checked(selected)
-                    .on_click(move |enabled, _, cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            view.apply_telemetry_setting(*enabled, cx);
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
+        pioneer_desktop_foundation::settings_row(
+            t!("settings.option.telemetry.label").to_string(),
+            t!("settings.option.telemetry.description").to_string(),
+            Switch::new("settings-telemetry")
+                .checked(selected)
+                .on_click(move |enabled, _, cx| {
+                    let _ = desktop_entity.update(cx, |view, cx| {
+                        view.apply_telemetry_setting(*enabled, cx);
+                        cx.notify();
+                    });
+                }),
+        )
+        .into_any_element()
     }
 
     fn render_model_catalog_setting(
@@ -1947,11 +1897,7 @@ impl SettingsScreenView {
     }
 
     fn render_settings_divider(cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .w_full()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .into_any_element()
+        pioneer_desktop_foundation::settings_divider(cx).into_any_element()
     }
 
     fn render_memory_toggle_row(

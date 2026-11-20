@@ -308,6 +308,12 @@ pub struct AppViewParams {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AppViewBootstrap {
+    #[serde(default)]
+    pub development: bool,
+    /// Verified local authoring URL. The relative URL remains a native-only
+    /// lease handle for dev views and must never be loaded into their browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_url: Option<String>,
     pub package_revision: i64,
     pub relative_url: crate::AuthSecretString,
     pub expires_at: u64,
@@ -332,4 +338,30 @@ pub struct AppViewLeaseParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AppViewLeaseResponse {
     pub expires_at: u64,
+}
+
+/// Local authoring connection. The Gateway reads project files on its host.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppsDevAddParams {
+    pub workspace_id: String,
+    pub project: String,
+    pub url: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AppDevConnection {
+    pub id: String,
+    pub name: String,
+    pub project: String,
+    pub url: String,
+    pub state: String,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", content = "params", rename_all = "snake_case")]
+pub enum DevAppOperation {
+    Add(AppsDevAddParams),
+    List(AppsListParams),
+    Remove(AppsDetailsParams),
 }

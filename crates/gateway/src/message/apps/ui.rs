@@ -13,6 +13,7 @@ impl MessageProcessor {
         std::net::SocketAddr,
         pioneer_protocol::AuthSecretString,
         tokio_util::sync::CancellationToken,
+        Option<url::Origin>,
     )> {
         self.admit_plugin_image(context, &scope.workspace_id)
             .await?;
@@ -28,6 +29,20 @@ impl MessageProcessor {
                 && parent.state == "installed",
             "apps.unavailable"
         );
+        if super::dev::is_dev(&parent) {
+            anyhow::ensure!(
+                self.dev_view_execution(&scope.app_id).await.as_deref()
+                    == Some(scope.execution_id.as_str()),
+                "apps.execution_unavailable"
+            );
+            let upstream = self.dev_upstream(&parent).await?;
+            return Ok((
+                upstream.address,
+                upstream.credential,
+                upstream.cancellation,
+                Some(upstream.origin),
+            ));
+        }
         let status = self.app_runtime.status(&scope.app_id).await;
         anyhow::ensure!(
             status.state == "ready"
@@ -37,6 +52,7 @@ impl MessageProcessor {
         self.app_runtime
             .upstream(&scope.app_id)
             .await
+            .map(|(address, credential, cancel)| (address, credential, cancel, None))
             .context("apps.execution_unavailable")
     }
     pub(super) async fn app_open_view(&self, context: &RequestContext, request: JsonRpcRequest) {
@@ -64,11 +80,17 @@ impl MessageProcessor {
                     .as_bytes(),
             )?;
             let ui = manifest.ui().context("apps.no_ui")?;
-            let status = self.app_runtime.status(&params.app_id).await;
+            let status = self.app_view_status(&params.app_id).await;
             anyhow::ensure!(status.state == "ready", "apps.not_ready");
             let execution_id = status.execution_id.context("apps.not_ready")?;
             let service = self.view_grant_service().context("apps.view_unavailable")?;
             let principal = context.principal();
+            let development = super::dev::is_dev(&parent);
+            let dev_url = if development {
+                Some(super::dev::view_url(&parent)?)
+            } else {
+                None
+            };
             let issued = service
                 .mint(ViewGrantScope {
                     gateway_id: principal.gateway_id.clone(),
@@ -88,6 +110,8 @@ impl MessageProcessor {
                 1,
             );
             Ok(pioneer_protocol::AppViewBootstrap {
+                development,
+                dev_url,
                 package_revision: parent.revision,
                 relative_url: pioneer_protocol::AuthSecretString::new(format!("{base}{}", ui.path)),
                 expires_at: issued.expires_at_unix,
@@ -141,7 +165,7 @@ impl MessageProcessor {
                         && p.kind == pioneer_protocol::PackageKind::App
                 })
                 .context("apps.not_found")?;
-            let status = self.app_runtime.status(&parent.id).await;
+            let status = self.app_view_status(&parent.id).await;
             let logs = if context.principal().kind == pioneer_protocol::PrincipalKind::Superuser {
                 self.app_runtime.logs(&parent.id).await
             } else {
@@ -231,10 +255,16 @@ impl MessageProcessor {
                     && parent.workspace_id == app.workspace_id,
                 "apps.unavailable"
             );
-            let status = self.app_runtime.status(&app.app_id).await;
+            let execution = if super::dev::is_dev(&parent) {
+                self.dev_view_execution(&app.app_id).await
+            } else {
+                let status = self.app_runtime.status(&app.app_id).await;
+                (status.state == "ready")
+                    .then_some(status.execution_id)
+                    .flatten()
+            };
             anyhow::ensure!(
-                status.execution_id.as_deref() == Some(app.execution_id.as_str())
-                    && status.state == "ready",
+                execution.as_deref() == Some(app.execution_id.as_str()),
                 "apps.unavailable"
             );
             let expires_at = service

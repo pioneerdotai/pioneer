@@ -26034,6 +26034,22 @@ impl CrudStore {
         Ok(row.map(mcp_server_installation_record_from_model))
     }
 
+    pub async fn find_mcp_server_installation_by_id(
+        &self,
+        scope_kind: &str,
+        scope_key: &str,
+        id: &str,
+    ) -> Result<Option<McpServerInstallationRecord>> {
+        let row = mcp_server_installation::find_mcp_server_installation_by_id(
+            &self.connection,
+            scope_kind,
+            scope_key,
+            id,
+        )
+        .await?;
+        Ok(row.map(mcp_server_installation_record_from_model))
+    }
+
     pub async fn delete_mcp_server_installation(
         &self,
         scope_kind: &str,

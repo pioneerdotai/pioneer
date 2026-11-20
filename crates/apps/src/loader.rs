@@ -19,6 +19,26 @@ pub fn load(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestError> {
     let manifest = SelectionPlan::validate_package(snapshot)?;
     load_validated(snapshot, manifest)
 }
+/// Prepare an authoring snapshot without applying release executable/checksum rules.
+/// Component and presentation validation is shared with ordinary installation.
+/// Callers must keep this result out of the release installation path.
+pub fn load_source(snapshot: &Snapshot) -> Result<LoadedAppPackage, ManifestError> {
+    let manifest = AppManifest::parse(
+        snapshot
+            .file("app.json")
+            .ok_or_else(|| ManifestError::new("missing_manifest", "app.json"))?,
+    )?;
+    SelectionPlan::for_source(&manifest)?.validate_snapshot(snapshot)?;
+    let loaded = load_validated(snapshot, manifest)?;
+    if let Some(diagnostic) = loaded.diagnostics.first() {
+        return Err(ManifestError::new(
+            "invalid_source_component",
+            &diagnostic.pointer,
+        ));
+    }
+    Ok(loaded)
+}
+
 pub fn load_for_architecture(
     snapshot: &Snapshot,
     architecture: &str,

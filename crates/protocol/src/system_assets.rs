@@ -21,3 +21,15 @@ pub const OPENCODE_AGENT_AVATAR_LIGHT_REVISION: &str =
 /// SHA-256 revision of the OpenCode avatar for a dark appearance.
 pub const OPENCODE_AGENT_AVATAR_DARK_REVISION: &str =
     "6fbba60dcebe87c2e0f6ff0e3634fdb918c892e9c989f0d72cff6bb806f3ef4b";
+
+/// Selects the built-in CLI agent artwork for an appearance.
+pub fn cli_runtime_avatar_revision(kind: crate::CLIAgentRuntimeKind, dark: bool) -> &'static str {
+    use crate::CLIAgentRuntimeKind;
+
+    match kind {
+        CLIAgentRuntimeKind::Codex => CODEX_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::Claude => CLAUDE_AGENT_AVATAR_REVISION,
+        CLIAgentRuntimeKind::OpenCode if dark => OPENCODE_AGENT_AVATAR_DARK_REVISION,
+        CLIAgentRuntimeKind::OpenCode => OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
+    }
+}

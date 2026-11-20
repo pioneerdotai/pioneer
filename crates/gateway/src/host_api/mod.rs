@@ -1,5 +1,6 @@
 //! Execution admission and capability dispatch. App credentials never enter user RPC.
 mod pty;
+pub(crate) mod render;
 #[cfg(any(unix, windows))]
 mod shell;
 mod stream;
@@ -63,6 +64,26 @@ impl HostApi {
         cancel: CancellationToken,
     ) -> (String, Arc<ExecutionAuthority>) {
         let credential = hex::encode(rand::random::<[u8; 32]>());
+        let authority = self.register(&credential, app_id, workspace_id, execution_id, cancel);
+        (credential, authority)
+    }
+
+    pub(crate) fn register(
+        &self,
+        credential: &str,
+        app_id: String,
+        workspace_id: String,
+        execution_id: String,
+        cancel: CancellationToken,
+    ) -> Arc<ExecutionAuthority> {
+        let digest = hex::encode(Sha256::digest(credential.as_bytes()));
+        let mut executions = self.executions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(scope) = executions
+            .get(&digest)
+            .filter(|scope| !scope.cancel.is_cancelled())
+        {
+            return scope.clone();
+        }
         let output = Arc::new(tokio::sync::Notify::new());
         let (changes, _) = tokio::sync::watch::channel(());
         let authority = Arc::new(ExecutionAuthority {
@@ -76,13 +97,14 @@ impl HostApi {
             activity: tokio::sync::Notify::new(),
             connections: Arc::new(tokio::sync::Semaphore::new(2)),
         });
-        self.executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                hex::encode(Sha256::digest(credential.as_bytes())),
-                authority.clone(),
-            );
+        if let Some(previous) = executions.insert(digest, authority.clone()) {
+            previous
+                .ptys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+        drop(executions);
         let expiry = authority.clone();
         tokio::spawn(async move {
             loop {
@@ -105,7 +127,7 @@ impl HostApi {
                     .expire();
             }
         });
-        (credential, authority)
+        authority
     }
     /// Fence admission immediately; the existing runtime stop/lease owner
     /// performs resource cleanup. No VM wait or database read is needed here.
@@ -153,7 +175,7 @@ impl HostApi {
             });
         apps
     }
-    fn admit(&self, credential: &str) -> Option<Arc<ExecutionAuthority>> {
+    pub(crate) fn admit(&self, credential: &str) -> Option<Arc<ExecutionAuthority>> {
         if credential.len() != 64 {
             return None;
         }

@@ -12,7 +12,7 @@ impl MessageProcessor {
     pub(crate) async fn validate_host_execution(
         &self,
         scope: &crate::host_api::ExecutionAuthority,
-    ) -> Result<()> {
+    ) -> Result<pioneer_crud::PackageRecord> {
         anyhow::ensure!(!scope.cancel.is_cancelled(), "host.revoked");
         let parent = self
             .crud_store
@@ -35,12 +35,50 @@ impl MessageProcessor {
             .is_some_and(|workspace| workspace.is_active),
             "host.revoked"
         );
+        if super::dev::is_dev(&parent) {
+            anyhow::ensure!(
+                scope.execution_id == parent.id
+                    && parent.pending_json.is_none()
+                    && !scope.cancel.is_cancelled(),
+                "host.revoked"
+            );
+            return Ok(parent);
+        }
         let status = self.app_runtime.status(&scope.app_id).await;
         anyhow::ensure!(
             status.execution_id.as_deref() == Some(scope.execution_id.as_str())
                 && matches!(status.state.as_str(), "starting" | "ready"),
             "host.revoked"
         );
-        Ok(())
+        Ok(parent)
+    }
+}
+
+impl MessageProcessor {
+    pub(crate) async fn app_render_source(
+        &self,
+        scope: &crate::host_api::ExecutionAuthority,
+        path: String,
+    ) -> Result<crate::browser_render::AssetSource> {
+        let parent = self.validate_host_execution(scope).await?;
+        let development = super::dev::is_dev(&parent);
+        let (address, credential, upstream) = if development {
+            let upstream = self.dev_upstream(&parent).await?;
+            (upstream.address, upstream.credential, upstream.cancellation)
+        } else {
+            self.app_runtime
+                .upstream(&scope.app_id)
+                .await
+                .context("host.revoked")?
+        };
+        anyhow::ensure!(
+            !upstream.is_cancelled() && !scope.cancel.is_cancelled(),
+            "host.revoked"
+        );
+        crate::browser_render::AssetSource::new(address, credential, path, development)
+    }
+
+    pub(crate) fn app_render_scratch(&self) -> std::path::PathBuf {
+        self.artifact_runtime_home.join("app-render")
     }
 }

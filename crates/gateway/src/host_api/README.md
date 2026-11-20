@@ -89,3 +89,19 @@ Source inspection and syntax/whitespace checks only. Builds, tests, packaging,
 runtime checks and comparison with browser dev latency have not been run for this
 change. Source edits do not replace an installed Terminal payload. Gateway and the
 updated Terminal must be rebuilt for the new streaming/input-window path to run.
+
+## App view profiles
+
+The App view Host API uses the same grant and origin policy as the open App.
+Its reserved paths are relative to `/storage/app-views/{grant}/`:
+
+- `POST _pioneer/profiles/resolve` accepts `include_self` and up to 64
+  `identities` with `type` (`human` or `agent`) and `id`. The response has
+  an optional `self` profile and a `profiles` array of accessible matches.
+  A profile contains `type`, `id`, `display_name`, `nickname`, and a nullable
+  `avatar_revision`. The grant supplies the viewer and workspace.
+- `GET _pioneer/profiles/{type}/{id}/avatar/{revision}` serves the image after
+  checking that the same profile is visible and the revision is current.
+
+These routes are handled by Gateway and require a valid App view in both
+installed and development mode.

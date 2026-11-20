@@ -164,3 +164,8 @@ recovering = "接続が一時的に利用できません。Pioneer が再試行�
 clear_sign_in = "ログインをリセット"
 prepare_failed = "ログインを準備できませんでした。コールバックのポートを使用しているアプリを閉じ、再度ログインしてください。"
 client_auth_unsupported = "このOAuthクライアントの認証方式はサポートされていません。登録設定を確認してください。"
+
+[mcp.settings]
+title = "設定"
+enabled_description = "現在のワークスペースでこのMCPサーバーのツールとリソースを使用できるようにします。"
+implicit_description = "リクエストで明示的に指定されていなくても、エージェントがこのMCPサーバーを自動的に使用できるようにします。"
