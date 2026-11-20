@@ -9,11 +9,12 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::convention::{
-    task_result_review_decision_to_db, task_result_review_event_kind_to_db,
-    task_result_reviewer_kind_to_db,
+use crate::status::{
+    task_result_review_decision_from_db, task_result_review_decision_to_db,
+    task_result_review_event_kind_from_db, task_result_review_event_kind_to_db,
+    task_result_reviewer_kind_from_db, task_result_reviewer_kind_to_db,
 };
-use crate::util::{optional_typed_json_to_db, unix_to_datetime};
+use crate::values::{optional_typed_json_from_db, optional_typed_json_to_db, unix_to_datetime};
 
 #[derive(Clone, Debug)]
 pub struct NewTaskResultReviewEvent {
@@ -39,7 +40,7 @@ pub struct NewTaskResultReviewEvent {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedTaskResultReviewEvent {
+pub struct PreparedTaskResultReviewEvent {
     expected: NewTaskResultReviewEvent,
     active_model: task_result_review_event::ActiveModel,
     reviewer_ref_json: String,
@@ -47,7 +48,7 @@ pub(crate) struct PreparedTaskResultReviewEvent {
     created_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
 }
 
-pub(crate) fn prepare_review_event(
+pub fn prepare_review_event(
     event: NewTaskResultReviewEvent,
 ) -> Result<PreparedTaskResultReviewEvent> {
     let reviewer_ref_json = serde_json::to_string(&event.reviewer)?;
@@ -83,7 +84,7 @@ pub(crate) fn prepare_review_event(
     })
 }
 
-pub(crate) fn prepare_protocol_review_event(
+pub fn prepare_protocol_review_event(
     event: &TaskResultReviewEvent,
 ) -> Result<PreparedTaskResultReviewEvent> {
     prepare_review_event(NewTaskResultReviewEvent {
@@ -211,7 +212,7 @@ pub async fn list_review_events_by_run<C: ConnectionTrait>(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-pub(crate) struct TaskDeliveryReviewerFacts {
+pub struct TaskDeliveryReviewerFacts {
     pub id: String,
     pub task_id: String,
     pub run_id: String,
@@ -219,7 +220,7 @@ pub(crate) struct TaskDeliveryReviewerFacts {
     pub reviewer_ref_json: String,
 }
 
-pub(crate) async fn find_delivery_reviewer<C: ConnectionTrait>(
+pub async fn find_delivery_reviewer<C: ConnectionTrait>(
     db: &C,
     id: &str,
 ) -> Result<Option<TaskDeliveryReviewerFacts>> {
@@ -236,4 +237,31 @@ pub(crate) async fn find_delivery_reviewer<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to read exact delivery final reviewer facts")
+}
+
+pub fn task_result_review_event_from_db_model(
+    model: pioneer_entity::task_result_review_event::Model,
+) -> Result<TaskResultReviewEvent> {
+    Ok(TaskResultReviewEvent {
+        id: model.id,
+        candidate_id: model.candidate_id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        task_run_turn_id: model.task_run_turn_id,
+        reviewer_kind: task_result_reviewer_kind_from_db(model.reviewer_kind.as_str())?,
+        reviewer: serde_json::from_str(&model.reviewer_ref_json)
+            .context("task result review event has an invalid exact reviewer")?,
+        reviewer_thread_id: model.reviewer_thread_id,
+        reviewer_turn_id: model.reviewer_turn_id,
+        reviewer_user_id: model.reviewer_user_id,
+        reviewer_agent_spec_id: model.reviewer_agent_spec_id,
+        event_kind: task_result_review_event_kind_from_db(model.event_kind.as_str())?,
+        decision: task_result_review_decision_from_db(model.decision.as_str())?,
+        feedback_text: model.feedback_text,
+        feedback: optional_typed_json_from_db(model.feedback_json)?,
+        confidence: model.confidence,
+        supersedes_review_event_id: model.supersedes_review_event_id,
+        next_task_run_turn_id: model.next_task_run_turn_id,
+        created_at: model.created_at.timestamp(),
+    })
 }

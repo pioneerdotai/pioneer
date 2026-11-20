@@ -9,12 +9,9 @@ use pioneer_protocol::{
     MemoryLifecycleReasonCode, MemoryLifetimeClass, MemoryOwnershipClass, MemoryQualityAction,
     MemoryScopeKind, MemorySensitivity, MemorySourceContextKind, MemoryStatus, MemoryWriteRelation,
     NewMemberProfile, PersistedActorRef, PromptManifestProfile, ProviderFailureClass,
-    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
-    TaskConcurrencyConflictPolicy, TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus,
-    TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
-    TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind,
-    TaskWriteLockStatus, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+    ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger, TaskExecutorKind,
+    TaskOwnerKind, TaskRunExecutionStatus, TaskRunStatus, TaskStatus, TaskTriggerKind,
+    TaskTriggerStatus, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
     TurnAuthorSnapshot, TurnItem, TurnItemAttemptStatus, TurnItemExecutionClass,
     TurnItemTimeoutReason, TurnItemType, TurnMention, TurnPermissionMode,
     TurnPermissionProfileSource, TurnStatus, UserInput,
@@ -328,122 +325,17 @@ pub fn execution_window_exhaustion_reason_from_db(
     enum_from_snake_string(value, "execution window exhaustion reason")
 }
 
-pub fn task_run_thread_binding_kind_to_db(kind: TaskRunThreadBindingKind) -> String {
-    enum_to_snake_string(kind)
-}
-
-pub fn task_run_thread_binding_kind_from_db(value: &str) -> Result<TaskRunThreadBindingKind> {
-    enum_from_snake_string(value, "task run thread binding kind")
-}
-
-pub fn task_run_turn_kind_to_db(kind: TaskRunTurnKind) -> String {
-    enum_to_snake_string(kind)
-}
-
-pub fn task_run_turn_kind_from_db(value: &str) -> Result<TaskRunTurnKind> {
-    enum_from_snake_string(value, "task run turn kind")
-}
-
-pub fn task_run_turn_status_to_db(status: TaskRunTurnStatus) -> String {
-    enum_to_snake_string(status)
-}
-
-pub fn task_run_turn_status_from_db(value: &str) -> Result<TaskRunTurnStatus> {
-    enum_from_snake_string(value, "task run turn status")
-}
-
-pub fn task_result_candidate_status_to_db(status: TaskResultCandidateStatus) -> String {
-    enum_to_snake_string(status)
-}
-
-pub fn task_result_candidate_status_from_db(value: &str) -> Result<TaskResultCandidateStatus> {
-    enum_from_snake_string(value, "task result candidate status")
-}
-
-pub fn task_result_reviewer_kind_to_db(kind: TaskResultReviewerKind) -> String {
-    enum_to_snake_string(kind)
-}
-
-pub fn task_result_reviewer_kind_from_db(value: &str) -> Result<TaskResultReviewerKind> {
-    enum_from_snake_string(value, "task result reviewer kind")
-}
-
-pub fn task_result_review_event_kind_to_db(kind: TaskResultReviewEventKind) -> String {
-    enum_to_snake_string(kind)
-}
-
-pub fn task_result_review_event_kind_from_db(value: &str) -> Result<TaskResultReviewEventKind> {
-    enum_from_snake_string(value, "task result review event kind")
-}
-
-pub fn task_result_review_decision_to_db(decision: TaskResultReviewDecision) -> String {
-    enum_to_snake_string(decision)
-}
-
-pub fn task_result_review_decision_from_db(value: &str) -> Result<TaskResultReviewDecision> {
-    enum_from_snake_string(value, "task result review decision")
-}
-
-pub fn task_concurrency_conflict_policy_to_db(
-    policy: TaskConcurrencyConflictPolicy,
-) -> &'static str {
-    match policy {
-        TaskConcurrencyConflictPolicy::Queue => "queue",
-        TaskConcurrencyConflictPolicy::Reject => "reject",
-        TaskConcurrencyConflictPolicy::CancelExisting => "cancel_existing",
-        TaskConcurrencyConflictPolicy::Allow => "allow",
-    }
-}
-
-pub fn task_concurrency_conflict_policy_from_db(
-    value: &str,
-) -> Option<TaskConcurrencyConflictPolicy> {
-    match value {
-        "queue" => Some(TaskConcurrencyConflictPolicy::Queue),
-        "reject" => Some(TaskConcurrencyConflictPolicy::Reject),
-        "cancel_existing" => Some(TaskConcurrencyConflictPolicy::CancelExisting),
-        "allow" => Some(TaskConcurrencyConflictPolicy::Allow),
-        _ => None,
-    }
-}
-
-pub fn task_write_lock_scope_kind_to_db(kind: TaskWriteLockScopeKind) -> &'static str {
-    match kind {
-        TaskWriteLockScopeKind::Workspace => "workspace",
-        TaskWriteLockScopeKind::Path => "path",
-    }
-}
-
-pub fn task_write_lock_scope_kind_from_db(value: &str) -> Option<TaskWriteLockScopeKind> {
-    match value {
-        "workspace" => Some(TaskWriteLockScopeKind::Workspace),
-        "path" => Some(TaskWriteLockScopeKind::Path),
-        _ => None,
-    }
-}
-
-pub fn task_write_lock_status_to_db(status: TaskWriteLockStatus) -> &'static str {
-    match status {
-        TaskWriteLockStatus::Pending => "pending",
-        TaskWriteLockStatus::Acquired => "acquired",
-        TaskWriteLockStatus::Released => "released",
-        TaskWriteLockStatus::Expired => "expired",
-        TaskWriteLockStatus::Cancelled => "cancelled",
-        TaskWriteLockStatus::Blocked => "blocked",
-    }
-}
-
-pub fn task_write_lock_status_from_db(value: &str) -> Option<TaskWriteLockStatus> {
-    match value {
-        "pending" => Some(TaskWriteLockStatus::Pending),
-        "acquired" => Some(TaskWriteLockStatus::Acquired),
-        "released" => Some(TaskWriteLockStatus::Released),
-        "expired" => Some(TaskWriteLockStatus::Expired),
-        "cancelled" => Some(TaskWriteLockStatus::Cancelled),
-        "blocked" => Some(TaskWriteLockStatus::Blocked),
-        _ => None,
-    }
-}
+pub use pioneer_crud_tasks::status::{
+    task_concurrency_conflict_policy_from_db, task_concurrency_conflict_policy_to_db,
+    task_result_candidate_status_from_db, task_result_candidate_status_to_db,
+    task_result_review_decision_from_db, task_result_review_decision_to_db,
+    task_result_review_event_kind_from_db, task_result_review_event_kind_to_db,
+    task_result_reviewer_kind_from_db, task_result_reviewer_kind_to_db,
+    task_run_thread_binding_kind_from_db, task_run_thread_binding_kind_to_db,
+    task_run_turn_kind_from_db, task_run_turn_kind_to_db, task_run_turn_status_from_db,
+    task_run_turn_status_to_db, task_write_lock_scope_kind_from_db,
+    task_write_lock_scope_kind_to_db, task_write_lock_status_from_db, task_write_lock_status_to_db,
+};
 
 pub fn task_owner_kind_to_db(kind: TaskOwnerKind) -> &'static str {
     match kind {

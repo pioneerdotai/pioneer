@@ -3,6 +3,11 @@ pub use pioneer_crud_packages::{PackageKind, PackageRecord, PreparedAppMetadata}
 use pioneer_crud_tasks::delivery::{
     task_delivery_attempt_from_db_model, task_delivery_from_db_model,
 };
+use pioneer_crud_tasks::task_result_candidate::task_result_candidate_from_db_model;
+use pioneer_crud_tasks::task_result_review_event::task_result_review_event_from_db_model;
+use pioneer_crud_tasks::task_run_thread_binding::task_run_thread_binding_from_db_model;
+use pioneer_crud_tasks::task_run_turn::task_run_turn_from_db_model;
+use pioneer_crud_tasks::write_lock::task_write_lock_from_db_model;
 mod plugins;
 pub use plugins::{
     PackageNativeWrite, PackageOwnershipWrite, PluginNativeWrite, PluginOwnershipWrite,
@@ -37441,92 +37446,6 @@ fn task_run_execution_from_db_model(
     })
 }
 
-fn task_run_thread_binding_from_db_model(
-    model: pioneer_entity::task_run_thread_binding::Model,
-) -> Result<TaskRunThreadBinding> {
-    Ok(TaskRunThreadBinding {
-        id: model.id,
-        task_id: model.task_id,
-        run_id: model.run_id,
-        execution_id: model.execution_id,
-        thread_id: model.thread_id,
-        binding_kind: task_run_thread_binding_kind_from_db(model.binding_kind.as_str())?,
-        created_at: model.created_at.timestamp(),
-    })
-}
-
-fn task_run_turn_from_db_model(model: pioneer_entity::task_run_turn::Model) -> Result<TaskRunTurn> {
-    Ok(TaskRunTurn {
-        id: model.id,
-        task_id: model.task_id,
-        run_id: model.run_id,
-        execution_id: model.execution_id,
-        thread_id: model.thread_id,
-        turn_id: model.turn_id,
-        kind: task_run_turn_kind_from_db(model.kind.as_str())?,
-        round: u32::try_from(model.round).context("task run turn round is out of range")?,
-        sequence: u32::try_from(model.sequence)
-            .context("task run turn sequence is out of range")?,
-        status: task_run_turn_status_from_db(model.status.as_str())?,
-        reviews_candidate_id: model.reviews_candidate_id,
-        requested_by_candidate_id: model.requested_by_candidate_id,
-        requested_by_review_event_id: model.requested_by_review_event_id,
-        created_at: model.created_at.timestamp(),
-        started_at: model.started_at.map(|value| value.timestamp()),
-        completed_at: model.completed_at.map(|value| value.timestamp()),
-    })
-}
-
-fn task_result_candidate_from_db_model(
-    model: pioneer_entity::task_result_candidate::Model,
-) -> Result<TaskResultCandidate> {
-    Ok(TaskResultCandidate {
-        id: model.id,
-        task_id: model.task_id,
-        run_id: model.run_id,
-        task_run_turn_id: model.task_run_turn_id,
-        thread_id: model.thread_id,
-        turn_id: model.turn_id,
-        round: u32::try_from(model.round).context("task result candidate round is out of range")?,
-        status: task_result_candidate_status_from_db(model.status.as_str())?,
-        result: optional_typed_json_from_db(model.result_json)?,
-        extraction_error: optional_typed_json_from_db(model.extraction_error_json)?,
-        summary: model.summary,
-        diagnostics: optional_typed_json_from_db(model.diagnostics_json)?.unwrap_or_default(),
-        final_review_event_id: model.final_review_event_id,
-        created_at: model.created_at.timestamp(),
-        updated_at: model.updated_at.timestamp(),
-        resolved_at: model.resolved_at.map(|value| value.timestamp()),
-    })
-}
-
-fn task_result_review_event_from_db_model(
-    model: pioneer_entity::task_result_review_event::Model,
-) -> Result<TaskResultReviewEvent> {
-    Ok(TaskResultReviewEvent {
-        id: model.id,
-        candidate_id: model.candidate_id,
-        task_id: model.task_id,
-        run_id: model.run_id,
-        task_run_turn_id: model.task_run_turn_id,
-        reviewer_kind: task_result_reviewer_kind_from_db(model.reviewer_kind.as_str())?,
-        reviewer: serde_json::from_str(&model.reviewer_ref_json)
-            .context("task result review event has an invalid exact reviewer")?,
-        reviewer_thread_id: model.reviewer_thread_id,
-        reviewer_turn_id: model.reviewer_turn_id,
-        reviewer_user_id: model.reviewer_user_id,
-        reviewer_agent_spec_id: model.reviewer_agent_spec_id,
-        event_kind: task_result_review_event_kind_from_db(model.event_kind.as_str())?,
-        decision: task_result_review_decision_from_db(model.decision.as_str())?,
-        feedback_text: model.feedback_text,
-        feedback: optional_typed_json_from_db(model.feedback_json)?,
-        confidence: model.confidence,
-        supersedes_review_event_id: model.supersedes_review_event_id,
-        next_task_run_turn_id: model.next_task_run_turn_id,
-        created_at: model.created_at.timestamp(),
-    })
-}
-
 fn task_agent_spec_from_db_model(
     model: pioneer_entity::task_agent_spec::Model,
 ) -> Result<TaskAgentSpec> {
@@ -37562,38 +37481,6 @@ fn task_dependency_from_db_model(
         kind: model.kind,
         condition: optional_json_value_from_db(model.condition_json)?,
         created_at: model.created_at.timestamp(),
-    })
-}
-
-fn task_write_lock_from_db_model(
-    model: pioneer_entity::task_write_lock::Model,
-) -> Result<TaskWriteLock> {
-    let scope_kind = task_write_lock_scope_kind_from_db(model.scope_kind.as_str())
-        .with_context(|| format!("unknown task write lock scope kind `{}`", model.scope_kind))?;
-    let status = task_write_lock_status_from_db(model.status.as_str())
-        .with_context(|| format!("unknown task write lock status `{}`", model.status))?;
-    let conflict_policy = task_concurrency_conflict_policy_from_db(model.conflict_policy.as_str())
-        .with_context(|| {
-            format!(
-                "unknown task write lock conflict policy `{}`",
-                model.conflict_policy
-            )
-        })?;
-    Ok(TaskWriteLock {
-        id: model.id,
-        workspace_id: model.workspace_id,
-        task_id: model.task_id,
-        run_id: model.run_id,
-        scope_kind,
-        scope_path: model.scope_path,
-        status,
-        acquired_at: model.acquired_at.timestamp(),
-        expires_at: model.expires_at.map(|value| value.timestamp()),
-        released_at: model.released_at.map(|value| value.timestamp()),
-        conflict_policy,
-        reason: model.reason,
-        created_at: model.created_at.timestamp(),
-        updated_at: model.updated_at.timestamp(),
     })
 }
 

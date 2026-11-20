@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use pioneer_entity::task_run_thread_binding;
-use pioneer_protocol::TaskRunThreadBindingKind;
+use pioneer_protocol::{TaskRunThreadBinding, TaskRunThreadBindingKind};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
-use crate::convention::task_run_thread_binding_kind_to_db;
-use crate::util::unix_to_datetime;
+use crate::status::{task_run_thread_binding_kind_from_db, task_run_thread_binding_kind_to_db};
+use crate::values::unix_to_datetime;
 
 pub struct NewTaskRunThreadBinding {
     pub id: String,
@@ -101,4 +101,18 @@ fn active_model_from_new_binding(
         binding_kind: Set(task_run_thread_binding_kind_to_db(binding.binding_kind)),
         created_at: Set(unix_to_datetime(binding.created_at)),
     }
+}
+
+pub fn task_run_thread_binding_from_db_model(
+    model: pioneer_entity::task_run_thread_binding::Model,
+) -> Result<TaskRunThreadBinding> {
+    Ok(TaskRunThreadBinding {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        execution_id: model.execution_id,
+        thread_id: model.thread_id,
+        binding_kind: task_run_thread_binding_kind_from_db(model.binding_kind.as_str())?,
+        created_at: model.created_at.timestamp(),
+    })
 }

@@ -2,28 +2,17 @@ use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 
 pub use pioneer_crud_tasks::values::{
-    deadline_unix_seconds, optional_json_value_to_db, optional_typed_json_to_db, unix_to_datetime,
+    deadline_unix_seconds, optional_json_value_to_db, optional_typed_json_from_db,
+    optional_typed_json_to_db, typed_json_to_db, unix_to_datetime,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 
 pub fn unix_ms_to_datetime(value: i64) -> DateTimeWithTimeZone {
     Utc.timestamp_millis_opt(value)
         .single()
         .unwrap_or_else(Utc::now)
         .fixed_offset()
-}
-
-pub fn optional_typed_json_from_db<T: DeserializeOwned>(
-    value: Option<String>,
-) -> Result<Option<T>> {
-    value
-        .map(|value| serde_json::from_str(value.as_str()).context("failed to decode JSON column"))
-        .transpose()
-}
-
-pub fn typed_json_to_db<T: Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string(value).context("failed to serialize JSON column")
 }
 
 pub fn typed_json_from_db<T: DeserializeOwned>(value: String) -> Result<T> {

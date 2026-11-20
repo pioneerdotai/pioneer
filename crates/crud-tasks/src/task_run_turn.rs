@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use pioneer_entity::task_run_turn;
-use pioneer_protocol::{TaskRunTurnKind, TaskRunTurnStatus};
+use pioneer_protocol::{TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::convention::{task_run_turn_kind_to_db, task_run_turn_status_to_db};
-use crate::util::unix_to_datetime;
+use crate::status::{
+    task_run_turn_kind_from_db, task_run_turn_kind_to_db, task_run_turn_status_from_db,
+    task_run_turn_status_to_db,
+};
+use crate::values::unix_to_datetime;
 
 pub struct NewTaskRunTurn {
     pub id: String,
@@ -173,7 +176,7 @@ fn active_model_from_new_turn(turn: NewTaskRunTurn) -> Result<task_run_turn::Act
     })
 }
 
-pub(crate) async fn find_turns_by_sources<C: ConnectionTrait>(
+pub async fn find_turns_by_sources<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
     sources: &[(String, String)],
@@ -208,4 +211,28 @@ pub(crate) async fn find_turns_by_sources<C: ConnectionTrait>(
         );
     }
     Ok(rows)
+}
+
+pub fn task_run_turn_from_db_model(
+    model: pioneer_entity::task_run_turn::Model,
+) -> Result<TaskRunTurn> {
+    Ok(TaskRunTurn {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        execution_id: model.execution_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        kind: task_run_turn_kind_from_db(model.kind.as_str())?,
+        round: u32::try_from(model.round).context("task run turn round is out of range")?,
+        sequence: u32::try_from(model.sequence)
+            .context("task run turn sequence is out of range")?,
+        status: task_run_turn_status_from_db(model.status.as_str())?,
+        reviews_candidate_id: model.reviews_candidate_id,
+        requested_by_candidate_id: model.requested_by_candidate_id,
+        requested_by_review_event_id: model.requested_by_review_event_id,
+        created_at: model.created_at.timestamp(),
+        started_at: model.started_at.map(|value| value.timestamp()),
+        completed_at: model.completed_at.map(|value| value.timestamp()),
+    })
 }

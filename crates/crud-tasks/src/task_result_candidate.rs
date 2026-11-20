@@ -6,8 +6,10 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::convention::task_result_candidate_status_to_db;
-use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
+use crate::status::{task_result_candidate_status_from_db, task_result_candidate_status_to_db};
+use crate::values::{
+    optional_typed_json_from_db, optional_typed_json_to_db, typed_json_to_db, unix_to_datetime,
+};
 
 #[derive(Clone, Debug)]
 pub struct NewTaskResultCandidate {
@@ -30,7 +32,7 @@ pub struct NewTaskResultCandidate {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PreparedTaskResultCandidate {
+pub struct PreparedTaskResultCandidate {
     expected: NewTaskResultCandidate,
     active_model: task_result_candidate::ActiveModel,
     expected_status: String,
@@ -43,14 +45,12 @@ pub(crate) struct PreparedTaskResultCandidate {
 }
 
 impl PreparedTaskResultCandidate {
-    pub(crate) fn expected(&self) -> &NewTaskResultCandidate {
+    pub fn expected(&self) -> &NewTaskResultCandidate {
         &self.expected
     }
 }
 
-pub(crate) fn prepare_candidate(
-    candidate: NewTaskResultCandidate,
-) -> Result<PreparedTaskResultCandidate> {
+pub fn prepare_candidate(candidate: NewTaskResultCandidate) -> Result<PreparedTaskResultCandidate> {
     let expected_status = task_result_candidate_status_to_db(candidate.status).to_owned();
     let expected_result_json = optional_typed_json_to_db(&candidate.result)?;
     let expected_extraction_error_json = optional_typed_json_to_db(&candidate.extraction_error)?;
@@ -89,7 +89,7 @@ pub(crate) fn prepare_candidate(
     })
 }
 
-pub(crate) fn prepare_protocol_candidate(
+pub fn prepare_protocol_candidate(
     candidate: &TaskResultCandidate,
 ) -> Result<PreparedTaskResultCandidate> {
     prepare_candidate(NewTaskResultCandidate {
@@ -262,7 +262,7 @@ pub async fn upsert_candidate<C: ConnectionTrait>(
 
 /// Mirrors the legacy projector's creation eligibility, without loading JSON.
 /// This is not a terminal-effect gate predicate.
-pub(crate) async fn has_accepted_candidate_by_run<C: ConnectionTrait>(
+pub async fn has_accepted_candidate_by_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
 ) -> Result<bool> {
@@ -396,14 +396,14 @@ pub async fn update_candidate_resolution<C: ConnectionTrait>(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
-pub(crate) struct TaskDeliveryReviewBinding {
+pub struct TaskDeliveryReviewBinding {
     pub id: String,
     pub task_id: String,
     pub run_id: String,
     pub final_review_event_id: Option<String>,
 }
 
-pub(crate) async fn find_delivery_review_binding<C: ConnectionTrait>(
+pub async fn find_delivery_review_binding<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
 ) -> Result<Option<TaskDeliveryReviewBinding>> {
@@ -425,7 +425,7 @@ pub(crate) async fn find_delivery_review_binding<C: ConnectionTrait>(
         .context("failed to read exact delivery final review binding")
 }
 
-pub(crate) async fn find_candidates_by_turns<C: ConnectionTrait>(
+pub async fn find_candidates_by_turns<C: ConnectionTrait>(
     db: &C,
     ids: &[String],
 ) -> Result<Vec<task_result_candidate::Model>> {
@@ -440,4 +440,27 @@ pub(crate) async fn find_candidates_by_turns<C: ConnectionTrait>(
         );
     }
     Ok(rows)
+}
+
+pub fn task_result_candidate_from_db_model(
+    model: pioneer_entity::task_result_candidate::Model,
+) -> Result<TaskResultCandidate> {
+    Ok(TaskResultCandidate {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        task_run_turn_id: model.task_run_turn_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        round: u32::try_from(model.round).context("task result candidate round is out of range")?,
+        status: task_result_candidate_status_from_db(model.status.as_str())?,
+        result: optional_typed_json_from_db(model.result_json)?,
+        extraction_error: optional_typed_json_from_db(model.extraction_error_json)?,
+        summary: model.summary,
+        diagnostics: optional_typed_json_from_db(model.diagnostics_json)?.unwrap_or_default(),
+        final_review_event_id: model.final_review_event_id,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+        resolved_at: model.resolved_at.map(|value| value.timestamp()),
+    })
 }
