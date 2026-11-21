@@ -6809,6 +6809,13 @@ mod tests {
             .await
             .expect("invoker MCP runtime should start");
         wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        wait_for_runtime_state(
+            &service,
+            &workspace_id,
+            &installation_id,
+            DomainRuntimeState::Ready,
+        )
+        .await;
         let projection = service
             .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
                 workspace_id: workspace_id.clone(),

@@ -656,7 +656,7 @@ async fn expiry_pages_skip_holds_without_per_header_work_or_writer() {
     assert!(!progress.expiry_quantum(&store).await.unwrap());
     assert_eq!(
         history::Entity::find()
-            .filter(history::Column::Expired.eq(0))
+            .filter(history::Column::Expired.eq(0_i64))
             .all(&store.connection)
             .await
             .unwrap()

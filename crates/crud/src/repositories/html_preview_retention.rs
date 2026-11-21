@@ -112,8 +112,8 @@ async fn index_quantum(
                         .filter(frozen_index::Column::IdentitySha256.eq(&identity))
                         .filter(frozen_index::Column::MessageCount.eq(count))
                         .filter(frozen_index::Column::NextOrdinal.eq(next))
-                        .filter(frozen_index::Column::Ready.eq(1))
-                        .filter(frozen_index::Column::Expired.eq(0))
+                        .filter(frozen_index::Column::Ready.eq(1_i64))
+                        .filter(frozen_index::Column::Expired.eq(0_i64))
                         .filter(frozen_index::Column::Unknown.eq(1))
                         .exec(&store.connection)
                         .await?;
@@ -235,8 +235,8 @@ async fn index_quantum(
             let header = history::Entity::find_by_id(&id)
                 .filter(history::Column::WorkspaceId.eq(&workspace))
                 .filter(history::Column::OwnerThread.eq(&owner))
-                .filter(history::Column::Ready.eq(1))
-                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::Ready.eq(1_i64))
+                .filter(history::Column::Expired.eq(0_i64))
                 .filter(history::Column::MessageCount.eq(count))
                 .filter(
                     Expr::col(history::Column::NextOrdinal)
@@ -487,8 +487,8 @@ async fn index_import_quantum(
         .filter(history::Column::Id.eq(id))
         .filter(history::Column::WorkspaceId.eq(workspace))
         .filter(history::Column::OwnerThread.eq(owner))
-        .filter(history::Column::Ready.eq(1))
-        .filter(history::Column::Expired.eq(0))
+        .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Expired.eq(0_i64))
         .filter(history::Column::IdentitySha256.eq(identity))
         .filter(history::Column::MessageCount.eq(*messages))
         .filter(
@@ -514,8 +514,8 @@ async fn index_import_quantum(
                 .filter(frozen_index::Column::MessageCount.eq(*messages))
                 .filter(frozen_index::Column::IdentitySha256.eq(identity))
                 .filter(frozen_index::Column::WorkspaceId.eq(workspace))
-                .filter(frozen_index::Column::Ready.eq(1))
-                .filter(frozen_index::Column::Expired.eq(0))
+                .filter(frozen_index::Column::Ready.eq(1_i64))
+                .filter(frozen_index::Column::Expired.eq(0_i64))
                 .filter(Expr::exists(header.clone()))
                 .exec(&store.connection)
                 .await?

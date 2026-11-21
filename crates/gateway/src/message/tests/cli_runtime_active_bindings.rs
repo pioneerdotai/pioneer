@@ -5250,7 +5250,6 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
     let outcome = tokio::time::timeout(Duration::from_secs(30), async {
         let now = now_timestamp_secs();
         let coordinator = &processor.recovery_coordinator;
-        let mut jobs = Vec::new();
         for index in 0..65 {
             let job = coordinator.enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
@@ -5283,9 +5282,15 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
                 &format!("attempt_{index}"),
                 now - 999,
             ).await.unwrap(), pioneer_crud::ClaimedRecoveryActivation::Activated));
-            jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        // Use the same SQL ordering as the watchdog. Native locale ordering
+        // can differ from Rust's bytewise comparison of mixed-case IDs.
+        let upper = store.active_recovery_job_upper_id().await.unwrap().unwrap();
+        let jobs = store
+            .list_active_recovery_job_page(None, &upper, 65)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 65);
         let poison = &jobs[0];
         let tail = &jobs[64];
         for job in &jobs[1..64] {

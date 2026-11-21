@@ -296,8 +296,8 @@ pub async fn expire(
     let expired = history::Entity::update_many()
         .col_expr(history::Column::Expired, Expr::val(1))
         .filter(history::Column::Id.eq(&h.id))
-        .filter(history::Column::Expired.eq(0))
-        .filter(history::Column::Ready.eq(1))
+        .filter(history::Column::Expired.eq(0_i64))
+        .filter(history::Column::Ready.eq(1_i64))
         .filter(
             Expr::col(history::Column::NextOrdinal).eq(Expr::col(history::Column::MessageCount)),
         )

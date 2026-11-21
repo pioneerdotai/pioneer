@@ -119,3 +119,58 @@ async fn query_i64(connection: &DatabaseConnection, sql: &str) -> i64 {
     row.try_get::<i64>("", "value")
         .expect("value should decode")
 }
+
+#[tokio::test]
+async fn item_event_page_is_empty_for_unmaterialized_and_foreign_turns() -> anyhow::Result<()> {
+    use pioneer_crud_conversations::turn_item_events::get_turn_item_events_page;
+    use pioneer_protocol::SystemEventLevel;
+    use sea_orm::TransactionTrait;
+
+    pioneer_postgres_test::with_database(async |fixture| {
+        let writer = fixture.connection();
+        writer
+            .execute_unprepared(
+                "INSERT INTO workspace(id, name) VALUES ('workspace', 'Fixture');
+                 INSERT INTO thread(id, workspace_id, preview, mode, model, model_provider, status)
+                    VALUES ('thread', 'workspace', '', 'agent', 'fixture', 'fixture', 'active'),
+                           ('other', 'workspace', '', 'agent', 'fixture', 'fixture', 'active');
+                 INSERT INTO turn(id, thread_id, status) VALUES ('owned-turn', 'thread', 'in_progress')",
+            )
+            .await?;
+        let item = TurnItem::SystemEvent {
+            id: "update".into(),
+            level: SystemEventLevel::Info,
+            message: "Owned snapshot".into(),
+            code: Some("agent_diff_updated".into()),
+            details: None,
+        };
+        let now = fixed_test_datetime();
+        let prepared = prepare_turn_item_projection("owned-turn", &item, None, now, now)?;
+        let tx = writer.begin().await?;
+        upsert_prepared_turn_item(&tx, prepared).await?;
+        tx.commit().await?;
+        let db =
+            pioneer_sqlite::SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+
+        let owned = get_turn_item_events_page(&db, "thread", "owned-turn", None, 10)
+            .await?
+            .expect("page for owned turn");
+        assert_eq!(owned.events.len(), 1);
+        for (thread_id, turn_id) in [("thread", "unmaterialized"), ("other", "owned-turn")] {
+            let page = get_turn_item_events_page(&db, thread_id, turn_id, Some(7), 10)
+                .await?
+                .expect("existing thread has an empty page");
+            assert_eq!(page.workspace_id, "workspace");
+            assert_eq!(page.last_sequence, 7);
+            assert!(page.events.is_empty());
+            assert!(!page.has_more);
+        }
+        assert!(
+            get_turn_item_events_page(&db, "unknown", "owned-turn", None, 10)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    })
+    .await
+}

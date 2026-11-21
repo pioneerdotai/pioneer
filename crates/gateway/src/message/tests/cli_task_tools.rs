@@ -5692,12 +5692,12 @@ fn cli_threads_read_errors_keep_safe_reasons_through_the_admitted_facade() {
 
 #[test]
 fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_providers() {
-    run_standard_stack_message_test("Threads CLI integration", async {
-        for kind in [
-            CLIAgentRuntimeKind::Codex,
-            CLIAgentRuntimeKind::Claude,
-            CLIAgentRuntimeKind::OpenCode,
-        ] {
+    for kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
+        run_standard_stack_message_test("Threads CLI integration", async move {
             let (harness, processor, turn) = start_task_cli_fixture_with_models(
                 kind,
                 pioneer_tasks::TaskRuntimeConfig::default(),
@@ -5993,11 +5993,18 @@ fn cli_threads_actions_use_facade_shared_handlers_routes_and_replay_for_all_prov
                 .await;
             process_cli_fixture_outbox(&processor).await.unwrap();
             let calls = wait_for_cli_runtime_turn_starts(&harness.cli_session, 2).await;
+            assert_eq!(
+                calls.len(),
+                2,
+                "{kind:?} must start the explicit child exactly once"
+            );
             assert_eq!(calls[1].model.as_deref(), model["id"].as_str());
             assert_eq!(calls[1].effort.as_deref(), effort.as_str());
             // One replayed start has one persisted child execution and payload.
             assert_eq!(replay["outcome"], "agent_action_already_committed");
-        }
+        });
+    }
+    run_standard_stack_message_test("Threads CLI tool selection", async {
         let (_harness, processor, turn) =
             start_threads_cli_fixture(CLIAgentRuntimeKind::Codex, &["threads_search"]).await;
         assert!(

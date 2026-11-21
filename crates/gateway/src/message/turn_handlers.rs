@@ -10380,13 +10380,20 @@ impl MessageProcessor {
         &self,
         scope: &crate::post_startup::PostStartupScope,
     ) {
+        self.spawn_cli_runtime_idle_cleanup_with_period(scope, std::time::Duration::from_secs(60));
+    }
+
+    pub(super) fn spawn_cli_runtime_idle_cleanup_with_period(
+        &self,
+        scope: &crate::post_startup::PostStartupScope,
+        period: std::time::Duration,
+    ) {
         if self.cli_runtime_manager.is_none() {
             return;
         }
         let processor = self.clone();
         let cancellation = scope.cancellation();
         scope.spawn(async move {
-            let period = std::time::Duration::from_secs(60);
             let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {

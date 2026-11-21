@@ -11756,7 +11756,6 @@ mod tests {
     async fn active_scan_advances_through_healthy_and_legacy_raw_poison_values() {
         let (store, coordinator) = setup_coordinator().await;
         let now = chrono::Utc::now().timestamp();
-        let mut jobs = Vec::new();
         for index in 0..5 {
             let job = coordinator
                 .enqueue_provider_failure_job(
@@ -11790,9 +11789,15 @@ mod tests {
                     .unwrap(),
                 ClaimedRecoveryActivation::Activated
             ));
-            jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        // Use the same SQL ordering as the watchdog. Native locale ordering
+        // can differ from Rust's bytewise comparison of mixed-case IDs.
+        let upper = store.active_recovery_job_upper_id().await.unwrap().unwrap();
+        let jobs = store
+            .list_active_recovery_job_page(None, &upper, 5)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 5);
         materialize_turn_with_tool_item(
             store.as_ref(),
             "ws_scan",

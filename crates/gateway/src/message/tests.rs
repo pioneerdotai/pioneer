@@ -4281,7 +4281,9 @@ async fn wait_for_recorded_cli_runtime_turn_count(
     cli_session: &RecordingCliRuntimeSession,
     expected: usize,
 ) {
-    timeout(Duration::from_secs(2), async {
+    // Child startup may wait for scheduler, PostgreSQL admission and CLI
+    // activation. These tests assert the recorded activation, not startup SLA.
+    timeout(Duration::from_secs(30), async {
         loop {
             if cli_session.turn_starts.lock().await.len() >= expected {
                 return;
@@ -4389,10 +4391,10 @@ async fn materialize_thread_episodic_ingest_turn(
 
 #[test]
 fn resilience_worker_pool_timeout_is_transient_storage_backpressure() {
-    let error = anyhow::anyhow!(
-        "failed to query expired running attempts: Failed to acquire connection from pool: \
-         Connection pool timed out: Connection pool timed out"
-    );
+    let error = anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+        sea_orm::ConnAcquireErr::Timeout,
+    ))
+    .context("failed to query expired running attempts");
     let mut transient_storage_poll_failed = false;
 
     record_resilience_worker_poll_error(
@@ -4406,10 +4408,10 @@ fn resilience_worker_pool_timeout_is_transient_storage_backpressure() {
 
 #[test]
 fn resilience_maintenance_failure_does_not_backoff_critical_polling() {
-    let error = anyhow::anyhow!(
-        "failed to purge retained rows: Failed to acquire connection from pool: \
-         Connection pool timed out: Connection pool timed out"
-    );
+    let error = anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+        sea_orm::ConnAcquireErr::Timeout,
+    ))
+    .context("failed to purge retained rows");
 
     assert!(record_resilience_worker_error(
         "critical recovery poll",
@@ -16856,30 +16858,28 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
 
     let first_turn_id = "turn_artifact_followup_01";
     let first_request_id = generate_test_request_id("turnartifact", "followup1");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": first_request_id.clone(),
-                "method": "turn/start",
-                "params": {
-                    "thread_id": thread.thread.id,
-                    "turn_id": first_turn_id,
-                    "input": [
-                        { "type": "text", "text": "Что за машина?" },
-                        {
-                            "type": "artifact",
-                            "artifactId": artifact.artifact_id.clone(),
-                            "versionId": artifact.version_id.clone()
-                        }
-                    ]
+    let first_request = json!({
+        "jsonrpc": "2.0",
+        "id": first_request_id.clone(),
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread.thread.id,
+            "turn_id": first_turn_id,
+            "input": [
+                { "type": "text", "text": "Что за машина?" },
+                {
+                    "type": "artifact",
+                    "artifactId": artifact.artifact_id.clone(),
+                    "versionId": artifact.version_id.clone()
                 }
-            })
-            .to_string(),
-        )
-        .await;
-    let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
+            ]
+        }
+    })
+    .to_string();
+    tokio::join!(
+        processor.process_request_for_connection(connection_id, &first_request),
+        recv_response_by_id(&mut rx, first_request_id.as_str()),
+    );
     let first_status = drain_test_notifications_while(
         &mut rx,
         wait_for_turn_status(
@@ -16906,23 +16906,21 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
 
     let second_turn_id = "turn_artifact_followup_02";
     let second_request_id = generate_test_request_id("turnartifact", "followup2");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": second_request_id.clone(),
-                "method": "turn/start",
-                "params": {
-                    "thread_id": thread.thread.id,
-                    "turn_id": second_turn_id,
-                    "input": [{ "type": "text", "text": "Нет, разве это не Nissan?" }]
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
+    let second_request = json!({
+        "jsonrpc": "2.0",
+        "id": second_request_id.clone(),
+        "method": "turn/start",
+        "params": {
+            "thread_id": thread.thread.id,
+            "turn_id": second_turn_id,
+            "input": [{ "type": "text", "text": "Нет, разве это не Nissan?" }]
+        }
+    })
+    .to_string();
+    tokio::join!(
+        processor.process_request_for_connection(connection_id, &second_request),
+        recv_response_by_id(&mut rx, second_request_id.as_str()),
+    );
     assert_eq!(
         drain_test_notifications_while(
             &mut rx,
@@ -19758,33 +19756,48 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
     processor
         .process_request_for_connection(connection_id, &finalize_request.to_string())
         .await;
-    let finalize_response = recv_response_by_id(&mut rx, finalize_request_id.as_str()).await;
-    let finalize_payload: pioneer_protocol::VoiceSessionFinalizeResponse =
-        serde_json::from_value(finalize_response.result).expect("voice/session/finalize decode");
-    assert_eq!(finalize_payload.status, VoiceStatus::Transcribing);
-
-    let turn_started = recv_notification_by_method(&mut rx, events::TURN_STARTED).await;
-    let turn_started_payload: pioneer_protocol::TurnStartedNotification =
-        serde_json::from_value(turn_started.params.expect("turn/started params"))
-            .expect("turn/started decode");
-    assert_eq!(turn_started_payload.turn.id, "turn_voice_success_0001");
-
+    // The notifier and the response lane may become ready in either order.
+    // Inspect one stream so waiting for one message does not consume another.
+    let mut finalized = false;
+    let mut turn_started = false;
     let mut user_message = None;
     let mut result_payload = None;
     let mut turn_completed = false;
     for _ in 0..40 {
         let payload = recv_text_timeout_context(
             &mut rx,
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             "voice turn lifecycle notification",
         )
         .await;
         let value: serde_json::Value =
             serde_json::from_str(&payload).expect("voice lifecycle payload should decode");
+        if value.get("id").and_then(|id| id.as_str()) == Some(finalize_request_id.as_str()) {
+            let response: JsonRpcResponse =
+                serde_json::from_value(value).expect("voice/session/finalize response");
+            let payload: pioneer_protocol::VoiceSessionFinalizeResponse =
+                serde_json::from_value(response.result).expect("voice/session/finalize decode");
+            assert_eq!(payload.status, VoiceStatus::Transcribing);
+            finalized = true;
+            if turn_started && user_message.is_some() && result_payload.is_some() && turn_completed
+            {
+                break;
+            }
+            continue;
+        }
         let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
             continue;
         };
         match method {
+            events::TURN_STARTED => {
+                let notification: JsonRpcNotification =
+                    serde_json::from_value(value).expect("turn/started notification should decode");
+                let started: pioneer_protocol::TurnStartedNotification =
+                    serde_json::from_value(notification.params.expect("turn/started params"))
+                        .expect("turn/started decode");
+                assert_eq!(started.turn.id, voice_turn_id);
+                turn_started = true;
+            }
             events::ITEM_COMPLETED => {
                 let notification: JsonRpcNotification = serde_json::from_value(value)
                     .expect("item/completed notification should decode");
@@ -19811,10 +19824,17 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
             events::TURN_COMPLETED => turn_completed = true,
             _ => {}
         }
-        if user_message.is_some() && result_payload.is_some() && turn_completed {
+        if finalized
+            && turn_started
+            && user_message.is_some()
+            && result_payload.is_some()
+            && turn_completed
+        {
             break;
         }
     }
+    assert!(finalized, "voice finalize response must arrive");
+    assert!(turn_started, "voice turn must publish its start");
     let (text, attachments) = user_message.expect("voice turn must emit a user message");
     assert_eq!(text, "voice transcript with context");
     assert!(
@@ -29564,6 +29584,14 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         Some(principal.principal_id.as_str())
     );
 
+    // The occurrence projection commits independently of Task completion.
+    wait_for_turn_status(
+        crud_store.clone(),
+        presentation_thread_id,
+        run.id.as_str(),
+        TurnStatus::Completed,
+    )
+    .await;
     let (_, occurrence_turn) = crud_store
         .get_turn(presentation_thread_id, run.id.as_str())
         .await
@@ -41885,7 +41913,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "parent",
     )
     .await;
-    let _ = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method_timeout(
+        &mut rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
 
     let root_execution_id =
         super::agent_action_tools::root_agent_execution_id_for_turn("turn_task_tools_agent");
@@ -42014,7 +42047,12 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "parent",
     )
     .await;
-    let _ = recv_notification_by_method(&mut rx_chat, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method_timeout(
+        &mut rx_chat,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
     let chat_requests = chat_provider.snapshot_requests();
     assert_eq!(
         chat_requests.len(),
@@ -84841,7 +84879,7 @@ async fn wait_for_cli_runtime_turn_starts(
     session: &RecordingCliRuntimeSession,
     expected: usize,
 ) -> Vec<CLIAgentRuntimeTurnStartParams> {
-    // The gateway crate runs a large number of SQLite tests in parallel.
+    // The gateway crate runs a large number of PostgreSQL tests in parallel.
     // A valid child dispatch can therefore be delayed by scheduler and I/O
     // contention even though the runtime contract is healthy. Keep this test
     // observation bounded, but do not turn that transient contention into a

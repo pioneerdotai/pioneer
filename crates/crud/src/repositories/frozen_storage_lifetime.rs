@@ -1066,8 +1066,8 @@ impl FrozenStorageLifetimeProgress {
                 return Ok(false);
             };
             let header = history::Entity::find_by_id(&id)
-                .filter(history::Column::Ready.eq(1))
-                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::Ready.eq(1_i64))
+                .filter(history::Column::Expired.eq(0_i64))
                 .one(&store.connection)
                 .await?;
             self.expiry_after = id;

@@ -246,7 +246,7 @@ pub struct ReadyLayoutCheck {
 impl ReadyLayoutCheck {
     pub async fn prepare(db: &impl ConnectionTrait, manifest: &str) -> Result<Option<Self>> {
         let Some(header) = compaction_frozen_history::Entity::find_by_id(manifest)
-            .filter(compaction_frozen_history::Column::Ready.eq(0))
+            .filter(compaction_frozen_history::Column::Ready.eq(0_i64))
             .one(db)
             .await?
         else {
@@ -316,7 +316,7 @@ impl ReadyLayoutCheck {
                 .col_expr(layout::Column::VerifiedSpanRevision, Expr::val(expected))
                 .filter(layout::Column::ManifestId.eq(manifest))
                 .filter(layout::Column::Kind.eq(kind))
-                .filter(layout::Column::Active.eq(1))
+                .filter(layout::Column::Active.eq(1_i64))
                 .exec(db)
                 .await?;
         }
@@ -341,7 +341,7 @@ pub async fn compaction_finish_frozen_history<C: ConnectionTrait>(
     }
     Ok(compaction_frozen_history::Entity::update_many()
         .col_expr(compaction_frozen_history::Column::Ready, Expr::val(1_i64))
-        .filter(compaction_frozen_history::Column::Expired.eq(0))
+        .filter(compaction_frozen_history::Column::Expired.eq(0_i64))
         .filter(compaction_frozen_history::Column::Ready.gte(i64::from(layout_check.is_none())))
         .filter(compaction_frozen_history::Column::MessageCount.gte(0))
         .filter(compaction_frozen_history::Column::ImportCount.gte(0))

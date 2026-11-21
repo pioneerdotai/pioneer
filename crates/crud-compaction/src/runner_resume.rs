@@ -190,7 +190,7 @@ async fn resume_failed_operation(
                 // Order the durable resume against expiry of the retained input.
                 // The final operation CAS runs after this lock and its recheck.
                 let current = compaction_frozen_history::Entity::find_by_id(&bound.manifest_id)
-                    .filter(compaction_frozen_history::Column::Expired.eq(0))
+                    .filter(compaction_frozen_history::Column::Expired.eq(0_i64))
                     .select_only()
                     .column(compaction_frozen_history::Column::Id)
                     .lock_shared()

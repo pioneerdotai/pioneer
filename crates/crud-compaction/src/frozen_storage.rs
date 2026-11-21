@@ -71,7 +71,7 @@ async fn candidate<C: ConnectionTrait>(
         .select_only()
         .column(layout::Column::ManifestId)
         .filter(layout::Column::Kind.eq(kind))
-        .filter(layout::Column::Active.eq(1))
+        .filter(layout::Column::Active.eq(1_i64))
         .filter(layout::Column::Failed.eq(0))
         .filter(layout::Column::Pending.eq(0))
         .filter(
@@ -82,8 +82,8 @@ async fn candidate<C: ConnectionTrait>(
     Ok(history::Entity::find()
         .filter(history::Column::WorkspaceId.eq(&h.workspace_id))
         .filter(history::Column::OwnerThread.eq(&h.owner_thread))
-        .filter(history::Column::Ready.eq(1))
-        .filter(history::Column::Expired.eq(0))
+        .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Expired.eq(0_i64))
         .filter(
             Expr::col((history::Entity, history::Column::NextOrdinal))
                 .eq(Expr::col((history::Entity, history::Column::MessageCount))),
@@ -118,8 +118,8 @@ pub async fn equivalent(
     let found = history::Entity::find()
         .filter(history::Column::WorkspaceId.eq(workspace))
         .filter(history::Column::OwnerThread.eq(owner))
-        .filter(history::Column::Ready.eq(1))
-        .filter(history::Column::Expired.eq(0))
+        .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Expired.eq(0_i64))
         .filter(
             Expr::col((history::Entity, history::Column::NextOrdinal))
                 .eq(Expr::col((history::Entity, history::Column::MessageCount))),
@@ -439,8 +439,8 @@ async fn publish(
                 history::Entity::find_by_id(base)
                     .filter(history::Column::WorkspaceId.eq(&h.workspace_id))
                     .filter(history::Column::OwnerThread.eq(&h.owner_thread))
-                    .filter(history::Column::Ready.eq(1))
-                    .filter(history::Column::Expired.eq(0))
+                    .filter(history::Column::Ready.eq(1_i64))
+                    .filter(history::Column::Expired.eq(0_i64))
                     .filter(
                         Expr::col((history::Entity, history::Column::NextOrdinal))
                             .eq(Expr::col((history::Entity, history::Column::MessageCount)))
@@ -481,7 +481,7 @@ async fn publish(
             )
             .filter(layout::Column::ManifestId.eq(&h.id))
             .filter(layout::Column::Kind.eq(l.kind))
-            .filter(layout::Column::Active.eq(0))
+            .filter(layout::Column::Active.eq(0_i64))
             .exec(&tx)
             .await?;
         if h.ready == 0 {
@@ -574,7 +574,7 @@ pub async fn append_source<C: ConnectionTrait>(
     ordinal: i64,
 ) -> Result<String> {
     if crate::frozen::find_layout(id.to_owned(), kind)
-        .filter(layout::Column::Active.eq(1))
+        .filter(layout::Column::Active.eq(1_i64))
         .one(db)
         .await?
         .is_none()
@@ -726,8 +726,8 @@ pub async fn maintain(
                         Expr::col((history::Entity, history::Column::Id))
                             .eq(Expr::col((layout::Entity, layout::Column::ManifestId))),
                     )
-                    .filter(history::Column::Ready.eq(1))
-                    .filter(history::Column::Expired.eq(0))
+                    .filter(history::Column::Ready.eq(1_i64))
+                    .filter(history::Column::Expired.eq(0_i64))
                     .filter(
                         Expr::col((history::Entity, history::Column::NextOrdinal))
                             .eq(Expr::col((history::Entity, history::Column::MessageCount))),
@@ -779,8 +779,8 @@ pub async fn maintain(
         })
         .filter(history::Column::Id.gt(&progress.register_after))
         .filter(history::Column::Id.lte(progress.upper.as_deref().unwrap_or_default()))
-        .filter(history::Column::Ready.eq(1))
-        .filter(history::Column::Expired.eq(0))
+        .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Expired.eq(0_i64))
         .filter(
             Expr::col((history::Entity, history::Column::NextOrdinal))
                 .eq(Expr::col((history::Entity, history::Column::MessageCount))),

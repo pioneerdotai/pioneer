@@ -607,7 +607,11 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
     assert_eq!(
         events.len(),
         2,
-        "original admission and new persistence failure each get ERROR"
+        "original admission and new persistence failure each get ERROR: {:?}",
+        events
+            .iter()
+            .map(|event| (&event.logger, &event.message))
+            .collect::<Vec<_>>()
     );
     assert_safe_events(&events);
 }
@@ -1495,7 +1499,7 @@ async fn persist_completed_child(
         )
         .await
         .unwrap();
-    harness
+    let completion = harness
         .crud_store
         .materialize_native_agent_turn_event_owned(
             pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
@@ -1507,8 +1511,43 @@ async fn persist_completed_child(
             None,
             harness.processor.turn_execution_owner_id.as_ref(),
         )
+        .await;
+    if let Err(error) = completion {
+        assert!(
+            error
+                .downcast_ref::<pioneer_crud::TurnEventProjectionAfterAppendError>()
+                .is_some_and(|projection| projection.is_pending()),
+            "fixture completion must either project or durably wait for its predecessor: {error:#}"
+        );
+        let turn_ids = [child.child_turn_id.clone()];
+        // This fixture drives reconciliation itself. Finish ordered publication
+        // before handing the terminal turn to the reconciliation batch.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let now = now_timestamp_secs();
+                let replay = harness
+                    .crud_store
+                    .replay_turn_event_projection_frontier(now, 64, Some(&turn_ids), now)
+                    .await
+                    .expect("replay child projection");
+                assert_eq!(replay.failed, 0, "{replay:?}");
+                assert_eq!(replay.exhausted, 0, "{replay:?}");
+                assert_eq!(replay.quarantined, 0, "{replay:?}");
+                if harness
+                    .crud_store
+                    .get_turn(&child.child_thread_id, &child.child_turn_id)
+                    .await
+                    .expect("read child projection")
+                    .is_some_and(|(_, turn)| turn.status == TurnStatus::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
         .await
-        .unwrap();
+        .expect("project the fixture's terminal child event");
+    }
     harness
         .processor
         .cleanup_completed_cli_task_fixture(&child.child_turn_id)
@@ -1521,29 +1560,28 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
         let (safe_batch, events) = capture_task_start(async move {
             use super::super::{tasks, turn_handlers::TurnStartFailure};
             let (harness, processor) = review_cli_fixture().await;
+            let now = now_timestamp_secs();
             let (poison, poison_child) =
                 create_review_cli_child(&harness, &processor, "batch-poison", true, true).await;
+            persist_completed_child(&harness, &poison_child, now).await;
             let (healthy, healthy_child) =
                 create_review_cli_child(&harness, &processor, "batch-healthy", true, false).await;
+            persist_completed_child(&harness, &healthy_child, now + 1).await;
             let independent = if mixed {
-                Some(
-                    create_review_cli_child(
-                        &harness,
-                        &processor,
-                        "batch-independent",
-                        false,
-                        false,
-                    )
-                    .await,
+                let (task, child) = create_review_cli_child(
+                    &harness,
+                    &processor,
+                    "batch-independent",
+                    false,
+                    false,
                 )
+                .await;
+                persist_completed_child(&harness, &child, now + 2).await;
+                Some((task, child))
             } else {
                 None
             };
-            let now = now_timestamp_secs();
-            persist_completed_child(&harness, &poison_child, now).await;
-            persist_completed_child(&harness, &healthy_child, now + 1).await;
             if let Some((_, child)) = &independent {
-                persist_completed_child(&harness, child, now + 2).await;
                 processor
                     .task_output_capture_failures
                     .lock()
@@ -4070,13 +4108,30 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
         .unwrap();
     let mut destinations = vec![destination.clone()];
     for suffix in ["b", "c"] {
-        let other = call(
+        let other = invoke_with_mutation(
             &creator_tools,
             "thread_create",
             &format!("same-name-{suffix}"),
             json!({"optionId":creation.id}),
+            None,
         )
         .await;
+        let other = match other {
+            Ok(value) => value,
+            Err(error) => {
+                let authority = processor
+                    .revalidate_tool_execution_authorization(
+                        &creator_context.workspace_id,
+                        &creator_context.thread_id,
+                        &creator_context.turn_id,
+                        None,
+                        crate::authorization::ResourceAction::ThreadCreateWorkspace,
+                    )
+                    .await
+                    .map(|_| ());
+                panic!("same-name-{suffix} failed: {error}; current authorization: {authority:#?}");
+            }
+        };
         destinations.push(
             other["threadResult"]["threadId"]
                 .as_str()

@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[derive(Default)]
 struct PayloadBatchStats {
     calls: std::sync::atomic::AtomicUsize,
+    line_history_loads: std::sync::atomic::AtomicUsize,
     max_rows: std::sync::atomic::AtomicUsize,
     max_returned_raw_bytes: std::sync::atomic::AtomicUsize,
     current_raw_bytes: std::sync::atomic::AtomicUsize,
@@ -30,6 +31,7 @@ struct PayloadBatchStats {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PayloadBatchStatsSnapshot {
     pub(crate) calls: usize,
+    pub(crate) line_history_loads: usize,
     pub(crate) max_rows: usize,
     pub(crate) max_returned_raw_bytes: usize,
     pub(crate) current_raw_bytes: usize,
@@ -68,6 +70,7 @@ pub(super) async fn with_payload_batch_stats<F: std::future::Future>(
     let output = PAYLOAD_BATCH_STATS.scope(stats.clone(), future).await;
     let snapshot = PayloadBatchStatsSnapshot {
         calls: stats.calls.load(Ordering::SeqCst),
+        line_history_loads: stats.line_history_loads.load(Ordering::SeqCst),
         max_rows: stats.max_rows.load(Ordering::SeqCst),
         max_returned_raw_bytes: stats.max_returned_raw_bytes.load(Ordering::SeqCst),
         current_raw_bytes: stats.current_raw_bytes.load(Ordering::SeqCst),
@@ -2255,6 +2258,12 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
+    #[cfg(test)]
+    let _ = PAYLOAD_BATCH_STATS.try_with(|stats| {
+        stats
+            .line_history_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
     scope_current_stage(Stage::HistoryLoad, async {
         let (
             selected,

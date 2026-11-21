@@ -1235,46 +1235,50 @@ fn future_task_creation_uses_the_same_explicit_review_choice_for_every_trigger()
             json!({"kind":"external","source":"webhook"}),
         ] {
             for review in [None, Some(false), Some(true)] {
-                let (manager, store, workspace) = setup_workspace_manager().await;
-                let mut args = json!({
-                    "title":"Future reviewed work", "goal":"Inspect saved input",
-                    "instructions":["Inspect the current input and report evidence."],
-                    "outputInstructions":"Return a concise report.", "trigger":trigger
-                });
-                if let Some(review) = review {
-                    args["requireReview"] = json!(review);
-                }
-                let items = capsule_step(
-                    manager,
-                    store.clone(),
-                    &workspace,
-                    "uniform_review_root",
-                    400,
-                    vec![call(400, "task_create", args)],
-                )
-                .await;
-                assert_outcome(&items, "task_create", true);
-                let created = tool_outputs(&items, "task_create");
-                let id = created[0]["taskId"].as_str().unwrap();
-                let state = store.get_task(id).await.unwrap().unwrap();
-                assert!(
-                    state.runs.is_empty(),
-                    "creation waits for the future trigger"
-                );
-                let policy = state.agent_specs.last().unwrap().review_policy.as_ref();
-                assert_eq!(
-                    policy.is_some_and(|policy| policy.is_enabled()),
-                    review == Some(true)
-                );
-                if let Some(policy) = policy {
+                pioneer_postgres_test::with_test_databases(async {
+                    let (manager, store, workspace) = setup_workspace_manager().await;
+                    let mut args = json!({
+                        "title":"Future reviewed work", "goal":"Inspect saved input",
+                        "instructions":["Inspect the current input and report evidence."],
+                        "outputInstructions":"Return a concise report.", "trigger":trigger
+                    });
+                    if let Some(review) = review {
+                        args["requireReview"] = json!(review);
+                    }
+                    let items = capsule_step(
+                        manager,
+                        store.clone(),
+                        &workspace,
+                        "uniform_review_root",
+                        400,
+                        vec![call(400, "task_create", args)],
+                    )
+                    .await;
+                    assert_outcome(&items, "task_create", true);
+                    let created = tool_outputs(&items, "task_create");
+                    let id = created[0]["taskId"].as_str().unwrap();
+                    let state = store.get_task(id).await.unwrap().unwrap();
                     assert!(
-                        policy.disable_timeout_acceptance && policy.require_explicit_acceptance
+                        state.runs.is_empty(),
+                        "creation waits for the future trigger"
                     );
-                }
-                assert_eq!(
-                    state.task.delivery_policy.as_ref().unwrap().mode,
-                    pioneer_protocol::TaskDeliveryMode::Thread
-                );
+                    let policy = state.agent_specs.last().unwrap().review_policy.as_ref();
+                    assert_eq!(
+                        policy.is_some_and(|policy| policy.is_enabled()),
+                        review == Some(true)
+                    );
+                    if let Some(policy) = policy {
+                        assert!(
+                            policy.disable_timeout_acceptance && policy.require_explicit_acceptance
+                        );
+                    }
+                    assert_eq!(
+                        state.task.delivery_policy.as_ref().unwrap().mode,
+                        pioneer_protocol::TaskDeliveryMode::Thread
+                    );
+                })
+                .await
+                .expect("close the isolated database for one review case");
             }
         }
     });

@@ -378,6 +378,8 @@ async fn coalesced_storage_failures_wait_and_shutdown_releases_both_owners() {
             .tasks
             .is_empty()
     );
+    // PostgreSQL fixture cleanup runs on this runtime and needs real IO deadlines.
+    tokio::time::resume();
 }
 
 #[pioneer_postgres_test::postgres_test]

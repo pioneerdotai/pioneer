@@ -19,6 +19,7 @@ use serde_json::json;
 pub(super) struct TaskChildReconciliationFailures {
     reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
     independent: Vec<String>,
+    independent_transient_storage_access: bool,
     pending_projection: usize,
 }
 
@@ -34,15 +35,17 @@ impl TaskChildReconciliationFailures {
             failure.report_in_place();
             self.reported.push(failure.descriptor().clone());
         } else {
-            // Preserve the former independent-error diagnostic and retry input.
+            // Classify the typed error before retaining its diagnostic.
+            // The aggregate exposes no private source through its error chain.
+            self.independent_transient_storage_access |=
+                is_anyhow_database_transient_access(&error);
             self.independent
                 .push(format!("{thread_id}/{turn_id}: {error:#}"));
         }
     }
 
     pub(super) fn retry_transient_storage_access(&self) -> bool {
-        !self.independent.is_empty()
-            && is_anyhow_database_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+        self.independent_transient_storage_access
     }
 
     pub(super) fn report_worker_failure(&self) {
@@ -1968,7 +1971,9 @@ mod task_child_failure_tests {
             batch.push(
                 "independent-thread",
                 "independent-turn",
-                anyhow::anyhow!("unable to open database file"),
+                anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+                    sea_orm::ConnAcquireErr::Timeout,
+                )),
             );
             assert!(batch.retry_transient_storage_access());
             batch.report_worker_failure();

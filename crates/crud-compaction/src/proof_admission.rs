@@ -65,7 +65,7 @@ pub async fn validate_operation_state<C: ConnectionTrait>(
             plan::Entity::find_by_id(&row.operation_id)
                 .select_only()
                 .column(plan::Column::OperationId)
-                .filter(plan::Column::Ready.eq(1))
+                .filter(plan::Column::Ready.eq(1_i64))
                 .into_tuple::<String>()
                 .one(db)
                 .await?

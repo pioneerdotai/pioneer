@@ -821,6 +821,11 @@ pub async fn prepare_agent_delegation_route_expiry_batch<C: ConnectionTrait>(
     let authority_actor_json = serde_json::to_string(&PersistedActorRef::System)
         .context("failed to serialize System actor for route expiry")?;
     let authority_fingerprint = "agent-route-expiry".to_owned();
+    // PostgreSQL timestamptz stores microseconds. Canonicalize before the
+    // event is written and checked again in the same transaction.
+    let occurred_at = chrono::DateTime::from_timestamp_micros(now.timestamp_micros())
+        .context("agent route expiry timestamp is out of range")?
+        .fixed_offset();
     let routes = candidates
         .into_iter()
         .map(|expected| {
@@ -837,7 +842,7 @@ pub async fn prepare_agent_delegation_route_expiry_batch<C: ConnectionTrait>(
                 next_generation,
                 authority_actor_json: authority_actor_json.clone(),
                 authority_fingerprint: authority_fingerprint.clone(),
-                occurred_at: now,
+                occurred_at,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1045,7 +1050,9 @@ mod tests {
                 }
 
                 let generation = i64::try_from(current_policy_generation_on(db).await?.get())?;
-                let now = chrono::Utc::now().fixed_offset();
+                let now = chrono::DateTime::from_timestamp(1_800_000_000, 123_456_789)
+                    .context("valid test timestamp")?
+                    .fixed_offset();
                 let first = db.begin().await?;
                 let first_id = insert_agent_delegation_route(&first, &route("a", "b", now, generation)?)
                     .await?.id;

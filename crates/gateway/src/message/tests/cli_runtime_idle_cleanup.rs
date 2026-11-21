@@ -4,7 +4,7 @@ use crate::cli_runtime::session_instance::CliSessionInstanceId;
 use crate::post_startup::PostStartupSupervisor;
 use tokio_util::sync::CancellationToken;
 
-// Advance only the monotonic idle clock; SQLite/authorization timestamps keep
+// Advance only the monotonic idle clock; PostgreSQL/authorization timestamps keep
 // their real wall clock. No sleeps or provider activity simulate idleness.
 async fn elapse(duration: Duration) {
     tokio::time::pause();
@@ -365,14 +365,15 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     *session.close_pause.lock().await = Some((entered.clone(), release.clone()));
-    tokio::time::pause();
     let mut supervisor = PostStartupSupervisor::start(move |scope| async move {
-        // The same registration entry point is called by Gateway startup.
-        processor.spawn_cli_runtime_idle_cleanup(&scope);
+        // Advance to the idle state before launching the real periodic worker.
+        // PostgreSQL IO and pool deadlines must run on the real clock.
+        processor.spawn_cli_runtime_idle_cleanup_with_period(&scope, Duration::from_millis(5));
         scope.cancellation().cancelled().await;
     });
-    entered.notified().await;
-    tokio::time::resume();
+    timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("periodic cleanup should enter the native lifecycle hook");
     assert!(manager.existing_session(&key).await.is_none());
     let mut shutdown = Box::pin(supervisor.shutdown());
     assert!(futures_util::poll!(&mut shutdown).is_pending());

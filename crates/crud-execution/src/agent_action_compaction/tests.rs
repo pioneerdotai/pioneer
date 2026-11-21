@@ -145,7 +145,10 @@ async fn queued_permit_wait_does_not_consume_outbox_retry_budget_and_is_woken() 
         .unwrap()
         .unwrap();
     assert_eq!(woken.attempts, 0);
-    assert_eq!(woken.next_attempt_at, Some(now));
+    assert_eq!(
+        woken.next_attempt_at.map(|at| at.timestamp_micros()),
+        Some(now.timestamp_micros())
+    );
 }
 
 #[pioneer_postgres_test::postgres_test]

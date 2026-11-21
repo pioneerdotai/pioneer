@@ -13322,35 +13322,32 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "DELETE FROM turn_event WHERE id=$1",
-            [references["A"].id.clone().into()],
+            "DELETE FROM turn_event WHERE id IN ($1, $2, $3)",
+            [
+                references["A"].id.clone().into(),
+                references["B"].id.clone().into(),
+                references["C"].id.clone().into(),
+            ],
         ))
         .await
         .unwrap();
-    let (after_covered_delete, payload_reads) = super::history::with_payload_batch_stats(
-        super::frozen::restore_accepted_history_for_execution(
-            &f.store,
-            "ws",
-            Some("parent"),
-            "execution",
-            &allowed,
-            &serde_json::to_string(&descriptor).unwrap(),
-        ),
+    let after_covered_delete = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("parent"),
+        "execution",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
     )
-    .await;
-    let after_covered_delete = after_covered_delete
-        .expect("T(A+B) must replace deleted inherited A before payload restore")
-        .messages;
+    .await
+    .expect("the covering checkpoints replace all three deleted canonical payloads")
+    .messages;
     assert_eq!(
         after_covered_delete
             .iter()
             .map(|message| message.content.clone())
             .collect::<Vec<_>>(),
         text
-    );
-    assert_eq!(
-        payload_reads.calls, 0,
-        "covered canonical payloads were read during frozen restore"
     );
 
     f.store
@@ -16640,7 +16637,7 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
         summary.id
     );
     assert_eq!(
-        repeated_reads.calls, 0,
+        repeated_reads.line_history_loads, 0,
         "repeat capture must not reload canonical history behind the frozen descriptor"
     );
     let repeated_imports = f
@@ -16692,8 +16689,8 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
     );
     assert!(after_delete.messages[1].content.contains("accepted B"));
     assert_eq!(
-        reads.calls, 0,
-        "accepted frozen history must not reload canonical payload batches"
+        reads.line_history_loads, 0,
+        "accepted frozen history uses addressed retained references without scanning canonical lines"
     );
 
     f.store

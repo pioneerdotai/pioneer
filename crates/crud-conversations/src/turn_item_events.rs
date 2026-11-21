@@ -17,15 +17,9 @@ pub async fn get_turn_item_events_page(
 ) -> Result<Option<TurnItemsResponse>> {
     let limit = limit.max(1);
     let reader = db.begin_read().await?;
-    let Some(workspace_id) = turn::Entity::find_by_id(turn_id)
-        .filter(turn::Column::ThreadId.eq(thread_id))
-        .join(
-            JoinType::InnerJoin,
-            turn::Entity::belongs_to(thread::Entity)
-                .from(turn::Column::ThreadId)
-                .to(thread::Column::Id)
-                .into(),
-        )
+    // The page exists whenever its thread exists, including before any turn
+    // with this ID has materialized.
+    let Some(workspace_id) = thread::Entity::find_by_id(thread_id)
         .select_only()
         .column(thread::Column::WorkspaceId)
         .into_tuple::<String>()
@@ -50,6 +44,14 @@ pub async fn get_turn_item_events_page(
         Vec::new()
     } else {
         let rows = turn_item::Entity::find()
+            .join(
+                JoinType::InnerJoin,
+                turn_item::Entity::belongs_to(turn::Entity)
+                    .from(turn_item::Column::TurnId)
+                    .to(turn::Column::Id)
+                    .into(),
+            )
+            .filter(turn::Column::ThreadId.eq(thread_id))
             .filter(turn_item::Column::TurnId.eq(turn_id))
             .filter(turn_item::Column::ItemType.eq("system_event"))
             .order_by_asc(turn_item::Column::CreatedAt)
