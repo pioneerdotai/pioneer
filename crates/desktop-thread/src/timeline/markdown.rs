@@ -181,14 +181,6 @@ struct MarkdownLinkIcon {
     path: SharedString,
 }
 
-impl IntoElement for MarkdownLinkText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for MarkdownLinkText {
     type RequestLayoutState = ();
     type PrepaintState = Hitbox;
