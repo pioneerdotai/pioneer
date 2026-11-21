@@ -2000,6 +2000,9 @@
     "AppViewPublication": {
       "type": "object",
       "properties": {
+        "development": {
+          "type": "boolean"
+        },
         "state": {
           "type": "string"
         },
@@ -2040,6 +2043,7 @@
         }
       },
       "required": [
+        "development",
         "state",
         "title"
       ]

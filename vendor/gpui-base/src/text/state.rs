@@ -4,6 +4,7 @@ use std::time::Instant;
 use std::{
     ops::{Range, RangeInclusive},
     pin::Pin,
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
     task::Poll,
     time::Duration,
@@ -12,15 +13,15 @@ use std::{
 use web_time::Instant;
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, EntityId, FocusHandle, IntoElement, KeyBinding,
-    ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, Task, Window,
-    prelude::FluentBuilder as _, px,
+    App, AppContext as _, Bounds, Context, CursorStyle, EntityId, FocusHandle, IntoElement,
+    KeyBinding, ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    Task, Window, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
     AutoScroll, ElementExt, TextSelection,
     async_util::{Receiver, Sender, unbounded},
-    input::{self, SelectAll},
+    input::{self, SelectAll, a11y_text::A11yTextRuns},
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, LinkFn, MarkdownExtensions,
         RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn, TaskToggleHandlerFn,
@@ -118,6 +119,9 @@ pub struct TextViewState {
     bounds: Bounds<Pixels>,
 
     pub(super) selectable: bool,
+    /// The cursor set on the [`super::TextView`] itself; when set, it replaces
+    /// the I-beam over selectable text except mid-drag.
+    pub(super) hover_cursor: Option<CursorStyle>,
     pub(super) selection_format: SelectionFormat,
     pub(super) scrollable: bool,
     pub(super) max_lines: Option<usize>,
@@ -135,7 +139,10 @@ pub struct TextViewState {
     pub(super) link_hook: Option<std::sync::Arc<LinkFn>>,
     pub(super) link_tooltip: Option<std::sync::Arc<super::text_view::LinkTooltipFn>>,
     pub(super) hovered_link_tooltip: Option<(SharedString, gpui::AnyView)>,
-    pub(super) link_tooltip_target: Option<(usize, SharedString)>,
+    /// The link under the pointer and the rendering it is in. Two renderings
+    /// of one document share a paragraph's state, so its key alone does not
+    /// tell them apart; their bounds do.
+    pub(super) link_tooltip_target: Option<((usize, Bounds<gpui::Pixels>), SharedString)>,
     pub(super) task_toggle_handler: Option<std::sync::Arc<TaskToggleHandlerFn>>,
     pub(super) markdown_extensions: Arc<MarkdownExtensions>,
 
@@ -145,6 +152,9 @@ pub struct TextViewState {
     multi_click_selection: Option<TextViewMultiClickSelection>,
     selected_text_override: Option<String>,
     select_all: bool,
+    /// The last text runs built for the accessibility tree, with the
+    /// (revision, select-all, scale) they were built for.
+    a11y_text_runs: Option<((usize, bool, f32), Rc<A11yTextRuns>)>,
     pub(super) auto_scroll: AutoScroll,
     pub(super) selection_adapter: TextViewSelectionAdapter,
 
@@ -226,7 +236,9 @@ impl TextViewState {
             multi_click_selection: None,
             selected_text_override: None,
             select_all: false,
+            a11y_text_runs: None,
             selectable: false,
+            hover_cursor: None,
             selection_format: SelectionFormat::default(),
             scrollable: false,
             max_lines: None,
@@ -668,6 +680,30 @@ impl TextViewState {
         )
     }
 
+    /// The rendered text as AccessKit text runs, so a screen reader can read the body.
+    ///
+    /// The runs follow [`Self::rendered_text`], which tracks the document as its parses land,
+    /// so text set or streamed in reaches the tree with the frame that shows it. A select-all
+    /// is reported as the selection; any other selection is not mapped yet, so the view
+    /// reports none rather than a wrong one.
+    ///
+    /// The runs are kept until the text, the select-all or the scale changes, so a long
+    /// document is not split into characters again on every frame.
+    pub(super) fn accessibility_text_runs(&mut self, scale: f32) -> Option<Rc<A11yTextRuns>> {
+        let key = (self.committed_revision, self.select_all, scale);
+        if let Some((cached, runs)) = &self.a11y_text_runs
+            && *cached == key
+        {
+            return Some(runs.clone());
+        }
+        let text = self.rendered_text();
+        let text = text.as_str();
+        let selection = self.select_all.then_some((0, text.len()));
+        let runs = Rc::new(A11yTextRuns::capture(text, selection, scale, |_| None)?);
+        self.a11y_text_runs = Some((key, runs.clone()));
+        Some(runs)
+    }
+
     /// Replace the range highlights, whose ranges index the current rendered text.
     ///
     /// Compute ranges from the current [`Self::rendered_text`] and set them in
@@ -956,14 +992,21 @@ impl TextViewState {
         }
     }
 
-    pub(crate) fn set_multi_click_line(&mut self, bounds: Bounds<Pixels>, cx: &mut App) {
+    /// Selects every inline in `rows.bounds`, as a triple click on a
+    /// paragraph laid out as an inline flow does: from the start of its first
+    /// row to the end of its last row.
+    pub(crate) fn set_multi_click_line(&mut self, rows: ParagraphRows, cx: &mut App) {
+        let bounds = rows.bounds;
         self.set_multi_click_selection(
             bounds.center(),
             TextViewMultiClickKind::Line,
             String::new(),
             (
-                caret_line_box(bounds.origin, bounds.size.height),
-                caret_line_box(bounds.top_right(), bounds.size.height),
+                caret_line_box(bounds.origin, rows.first_row_height),
+                caret_line_box(
+                    gpui::point(bounds.right(), bounds.bottom() - rows.last_row_height),
+                    rows.last_row_height,
+                ),
             ),
             cx,
         );
@@ -1029,6 +1072,12 @@ impl TextViewState {
         self.selectable
     }
 
+    /// Whether selectable text should show the I-beam now: always, unless the
+    /// [`super::TextView`] sets its own cursor, then only mid-drag.
+    pub(crate) fn shows_text_cursor(&self) -> bool {
+        self.hover_cursor.is_none() || self.is_selecting
+    }
+
     pub(crate) fn is_all_selected(&self) -> bool {
         self.select_all
     }
@@ -1049,6 +1098,26 @@ impl TextViewState {
                 ..selection
             }
         })
+    }
+}
+
+/// The rows a triple click selects as one paragraph: their union, and the
+/// heights of the first and last rows for the selection's carets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ParagraphRows {
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) first_row_height: Pixels,
+    pub(crate) last_row_height: Pixels,
+}
+
+impl ParagraphRows {
+    /// One row on its own.
+    pub(crate) fn single(bounds: Bounds<Pixels>) -> Self {
+        Self {
+            bounds,
+            first_row_height: bounds.size.height,
+            last_row_height: bounds.size.height,
+        }
     }
 }
 
@@ -2285,6 +2354,39 @@ mod tests {
             assert!(!state.has_view_selection());
             assert_eq!(state.selected_text(), "");
         });
+    }
+
+    /// A screen reader reads the rendered body, not the Markdown source, and
+    /// reads text set or streamed in once its parse lands.
+    #[gpui::test]
+    fn accessibility_text_follows_the_rendered_text(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("Hello **world**", cx)));
+        cx.run_until_parked();
+        let runs = |state: &Entity<TextViewState>, cx: &mut TestAppContext| {
+            state.update(cx, |state, _| state.accessibility_text_runs(1.).unwrap())
+        };
+
+        let first = runs(&state, cx);
+        assert_eq!(first.text().trim_end(), "Hello world");
+        assert_eq!(first.selection(), None);
+        // An unchanged document reuses its runs.
+        assert!(Rc::ptr_eq(&first, &runs(&state, cx)));
+
+        state.update(cx, |state, cx| state.push_str("\n\n- item", cx));
+        cx.run_until_parked();
+        assert_eq!(runs(&state, cx).text().trim_end(), "Hello world\nitem");
+
+        state.update(cx, |state, cx| state.set_text("Other", cx));
+        cx.run_until_parked();
+        assert_eq!(runs(&state, cx).text().trim_end(), "Other");
+
+        state.update(cx, |state, cx| state.select_all(cx));
+        let selected = runs(&state, cx);
+        assert_eq!(
+            selected.selection(),
+            Some((0, selected.text().chars().count()))
+        );
     }
 
     #[gpui::test]

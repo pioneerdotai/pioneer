@@ -168,3 +168,8 @@ internal = "Internal"
 verified = "Verified"
 community = "Community"
 untrusted = "Untrusted"
+
+[skills.settings]
+title = "Settings"
+enabled_description = "Make this skill available to agents in the current workspace."
+implicit_description = "Allow agents to apply this skill automatically even when it is not explicitly named in a request."

@@ -36,12 +36,7 @@ impl PreparedPayload {
     /// Keep the shell discriminator available when compaction resolves source
     /// identity without requesting any payload bytes.
     pub fn new_turn_item(text: &str) -> Result<Self> {
-        let fields = crate::json_fields::first_object_fields(text, &["storage"])?;
-        let shell = fields
-            .pointer("/storage/kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("shell");
-        Self::encode(text, shell)
+        Self::encode(text, crate::json_fields::shell_storage(text)?)
     }
 
     fn encode(text: &str, turn_item_shell: bool) -> Result<Self> {

@@ -38,10 +38,16 @@ use objc2_app_kit::{NSAutoresizingMaskOptions, NSEventType, NSViewLayerContentsR
 use objc2_foundation::{NSInteger, NSPoint, NSRect, NSSize};
 use parking_lot::Mutex;
 
+#[path = "composition_capture.rs"]
+mod capture;
+
+use capture::{PointerCapture, PointerOwner, PointerPhase, PointerRoute, route_pointer_event};
+
 use crate::{
-    renderer,
+    MetalFrames, renderer,
     window::{
-        MacWindowState, WINDOW_STATE_IVAR, drop_window_state, get_window_state, handle_view_event,
+        FrameSource, MacWindowState, WINDOW_STATE_IVAR, drop_window_state, get_window_state,
+        handle_view_event,
     },
 };
 
@@ -57,123 +63,6 @@ const NIL: Id = ptr::null_mut();
 
 /// The `GPUIOverlayView` class, registered by [`build_overlay_view_class`].
 static OVERLAY_VIEW_CLASS: AtomicPtr<AnyClass> = AtomicPtr::new(ptr::null_mut());
-static NATIVE_VIEW_CLASS: AtomicPtr<AnyClass> = AtomicPtr::new(ptr::null_mut());
-const NATIVE_PRESENTER_IVAR: &CStr = c"presentationHandler";
-type PresentationHandler = block2::RcBlock<dyn Fn() -> Bool>;
-
-// The native embedder installs a readiness handler on its own container. It is
-// called after GPUI releases its App/Window borrows, while the frame's Core
-// Animation transaction is still open. The platform never inspects the native
-// widget's implementation or its descendants.
-unsafe fn build_native_view_class() {
-    let class = if let Some(mut decl) = ClassBuilder::new(c"GPUINativeView", class!(NSView)) {
-        decl.add_ivar::<*mut c_void>(NATIVE_PRESENTER_IVAR);
-        unsafe {
-            decl.add_method(sel!(dealloc), dealloc_native_view as extern "C" fn(_, Sel));
-            decl.add_method(
-                sel!(setGpuiPresentationHandler:),
-                set_native_presentation_handler
-                    as extern "C" fn(_, Sel, *mut block2::Block<dyn Fn() -> Bool>),
-            );
-            decl.add_method(
-                sel!(gpuiPrepareForPresentation),
-                prepare_native_presentation as extern "C" fn(_, Sel) -> Bool,
-            );
-        }
-        decl.register()
-    } else {
-        AnyClass::get(c"GPUINativeView").map_or(ptr::null(), |class| class)
-    };
-    NATIVE_VIEW_CLASS.store(class.cast_mut(), Ordering::Release);
-}
-
-extern "C" fn set_native_presentation_handler(
-    this: &AnyObject,
-    _: Sel,
-    handler: *mut block2::Block<dyn Fn() -> Bool>,
-) {
-    unsafe {
-        let slot = ivar(this, NATIVE_PRESENTER_IVAR).load_ptr::<*mut c_void>(this);
-        let old = slot.read().cast::<PresentationHandler>();
-        let copied = block2::RcBlock::copy(handler)
-            .map(|handler| Box::into_raw(Box::new(handler)))
-            .unwrap_or(ptr::null_mut());
-        slot.write(copied.cast());
-        if !old.is_null() {
-            drop(Box::from_raw(old));
-        }
-    }
-}
-
-extern "C" fn prepare_native_presentation(this: &AnyObject, _: Sel) -> Bool {
-    // Clone before invoking: an embedder can release its surface from a callback.
-    let handler = unsafe {
-        let raw = (*ivar(this, NATIVE_PRESENTER_IVAR).load::<*mut c_void>(this))
-            .cast::<PresentationHandler>();
-        raw.as_ref().cloned()
-    };
-    handler.map_or(Bool::YES, |handler| handler.call(()))
-}
-
-extern "C" fn dealloc_native_view(this: &AnyObject, _: Sel) {
-    unsafe {
-        let raw = (*ivar(this, NATIVE_PRESENTER_IVAR).load::<*mut c_void>(this))
-            .cast::<PresentationHandler>();
-        if !raw.is_null() {
-            drop(Box::from_raw(raw));
-        }
-        let _: () = msg_send![super(this, class!(NSView)), dealloc];
-    }
-}
-
-/// Start one atomic frame across Metal and native layers. Nested AppKit
-/// transactions are intentional; only this explicit transaction is committed.
-pub(crate) fn begin_frame() {
-    unsafe {
-        let _: () = msg_send![class!(CATransaction), begin];
-    }
-}
-
-/// Native readiness is checked outside GPUI's frame callback, with no App
-/// borrow or window-state mutex held. All widgets prepare concurrently and
-/// share one deadline, rather than spending the budget once per HTML message.
-pub(crate) fn finish_frame(window_state: &Rc<Mutex<MacWindowState>>) {
-    let mut pending = {
-        let state = window_state.lock();
-        state
-            .fast_composition
-            .native_views
-            .iter()
-            .filter_map(|view| unsafe { objc2::rc::Retained::retain(*view as Id) })
-            .collect::<Vec<_>>()
-    };
-    let started = std::time::Instant::now();
-    loop {
-        pending.retain(|view| unsafe {
-            let supports: Bool =
-                msg_send![&**view, respondsToSelector: sel!(gpuiPrepareForPresentation)];
-            if !supports.as_bool() {
-                return false;
-            }
-            let ready: Bool = msg_send![&**view, gpuiPrepareForPresentation];
-            !ready.as_bool()
-        });
-        if pending.is_empty() || started.elapsed() >= std::time::Duration::from_millis(20) {
-            break;
-        }
-        // WebKit's presentation reply is delivered on the main run loop.
-        // Pump sources only, not AppKit's event-dispatch loop. A stalled native
-        // widget cannot retain the frame indefinitely.
-        unsafe {
-            let run_loop: Id = msg_send![class!(NSRunLoop), currentRunLoop];
-            let until: Id = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.001f64];
-            let _: Bool = msg_send![run_loop, runMode: &*objc2_foundation::NSDefaultRunLoopMode, beforeDate: until];
-        }
-    }
-    unsafe {
-        let _: () = msg_send![class!(CATransaction), commit];
-    }
-}
 
 /// A window's composition state: which surface the window's own view draws,
 /// and the views and renderers of its other GPUI surfaces.
@@ -190,11 +79,16 @@ pub(crate) struct MacComposition {
     native_views: Rc<Vec<usize>>,
     input_order: Rc<Vec<InputLayer>>,
     native_event: usize,
-    native_buttons: u64,
-    native_owner: Option<usize>,
+    pointer_capture: PointerCapture,
     input_forwarders: FxHashSet<usize>,
     event_result: gpui::DispatchEventResult,
     forwarding_scroll: bool,
+    /// The window's Metal display link, set aside while it holds native
+    /// views (see [`follow_native_views`]).
+    metal_frames: Option<Rc<MetalFrames>>,
+    /// Whether the window's renderers present in the Core Animation
+    /// transaction (see [`set_presents_with_transaction`]).
+    presents_with_transaction: bool,
 }
 
 impl MacComposition {
@@ -205,10 +99,11 @@ impl MacComposition {
             renderer_context,
             view_order: Vec::new(),
             native_views: Rc::new(Vec::new()),
+            metal_frames: None,
+            presents_with_transaction: false,
             input_order: Rc::new(Vec::new()),
             native_event: 0,
-            native_buttons: 0,
-            native_owner: None,
+            pointer_capture: PointerCapture::default(),
             input_forwarders: FxHashSet::default(),
             event_result: gpui::DispatchEventResult {
                 propagate: true,
@@ -234,9 +129,6 @@ struct MacGpuiSurface {
 
 /// Registers the `GPUIOverlayView` class, with the window's other classes.
 pub(crate) unsafe fn build_overlay_view_class() {
-    unsafe {
-        build_native_view_class();
-    }
     let class = if let Some(mut decl) = ClassBuilder::new(c"GPUIOverlayView", class!(NSView)) {
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_ivar::<*mut c_void>(OVERLAY_INPUT_IVAR);
@@ -363,13 +255,29 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         }
         return;
     }
+    let button = if observe {
+        let number: NSInteger = unsafe { msg_send![event, buttonNumber] };
+        1u64.checked_shl(number as u32).unwrap_or(0)
+    } else {
+        0
+    };
+    let up = matches!(
+        kind,
+        NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp
+    );
     let state = unsafe { get_window_state(this) };
     let (root, native_views, captured, has_forwarders) = {
-        let state = state.lock();
+        let mut state = state.lock();
+        if observe && !up {
+            state
+                .fast_composition
+                .pointer_capture
+                .reconcile_down(button);
+        }
         (
             state.native_view,
             state.fast_composition.native_views.clone(),
-            state.fast_composition.native_owner,
+            state.fast_composition.pointer_capture.owner(),
             !state.fast_composition.input_forwarders.is_empty(),
         )
     };
@@ -379,10 +287,6 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         }
         return;
     }
-    let up = matches!(
-        kind,
-        NSEventType::LeftMouseUp | NSEventType::RightMouseUp | NSEventType::OtherMouseUp
-    );
     // A press on the window's own chrome (the resize border, the titlebar
     // buttons) belongs to AppKit, as in a window without composition.
     // `root.hitTest` below cannot see the frame view, so a resize grabbed where
@@ -398,29 +302,43 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         }
         return;
     }
-    let button = if observe {
-        let number: NSInteger = unsafe { msg_send![event, buttonNumber] };
-        1u64.checked_shl(number as u32).unwrap_or(0)
-    } else {
-        0
-    };
     if up {
         let mut state = state.lock();
-        state.fast_composition.native_buttons &= !button;
-        if state.fast_composition.native_buttons == 0 {
-            state.fast_composition.native_owner = None;
-        }
+        state.fast_composition.pointer_capture.release(button);
     }
-    let native = if captured.is_some() && (dragged || up) {
-        captured
+    let phase = if up {
+        PointerPhase::Up
+    } else if observe {
+        PointerPhase::Down
+    } else if dragged {
+        PointerPhase::Drag
     } else {
-        unsafe {
+        PointerPhase::Other
+    };
+    if captured == Some(PointerOwner::Gpui) && phase == PointerPhase::Down {
+        state
+            .lock()
+            .fast_composition
+            .pointer_capture
+            .press(button, None);
+    }
+    // Captured GPUI secondary downs intentionally bypass AppKit's menuForEvent:
+    // path, just as GPUIView's rightMouseDown: dispatches handle_view_event
+    // directly. GPUI owns context-menu handling, not the native view underneath.
+    let native = match route_pointer_event(
+        captured,
+        phase,
+        || handle_view_event(unsafe { root.as_ref() }, sel!(sendEvent:), event),
+        || unsafe {
             let parent: Id = msg_send![root.as_ptr(), superview];
             let location: NSPoint = msg_send![event, locationInWindow];
             let point: NSPoint = msg_send![parent, convertPoint: location, fromView: NIL];
             let target: Id = msg_send![root.as_ptr(), hitTest: point];
             native_for_target(target, &native_views)
-        }
+        },
+    ) {
+        PointerRoute::Delivered => return,
+        PointerRoute::AppKit(native) => native,
     };
     let forward =
         native.is_some_and(|id| state.lock().fast_composition.input_forwarders.contains(&id));
@@ -429,8 +347,7 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
     // a popup and withheld the down event from the producer.
     if forward && observe && !up {
         let mut state = state.lock();
-        state.fast_composition.native_buttons |= button;
-        state.fast_composition.native_owner = native;
+        state.fast_composition.pointer_capture.press(button, native);
     }
     if native.is_some() && (observe || forward) {
         state.lock().fast_composition.event_result = gpui::DispatchEventResult {
@@ -458,10 +375,23 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
         if forward
             || (!(captured.is_some() && up) && (!result.propagate || result.default_prevented))
         {
+            if observe && !up && !forward && captured.is_none() {
+                // A consumed capture-phase down belongs to GPUI, not the view
+                // underneath the popup that capture may just have dismissed.
+                let mut state = state.lock();
+                state.fast_composition.pointer_capture.press(button, None);
+            }
             return;
         }
     }
     if native.is_none() {
+        if observe && !up && captured.is_none() {
+            state
+                .lock()
+                .fast_composition
+                .pointer_capture
+                .press(button, None);
+        }
         unsafe {
             let _: () = msg_send![super(this, superclass), sendEvent: event];
         }
@@ -470,17 +400,10 @@ fn send_window_event(this: &AnyObject, event: Id, superclass: &AnyClass) {
     let previous = {
         let mut state = state.lock();
         if observe && !up {
-            state.fast_composition.native_buttons |= button;
-            state.fast_composition.native_owner = native;
+            state.fast_composition.pointer_capture.press(button, native);
         }
         let previous = state.fast_composition.native_event;
-        // AppKit retains the down recipient through drag/up. A drag without a
-        // native press owner was not pre-dispatched above: crossing a WebView
-        // must not mark it as observed and discard AppKit's delivery back to
-        // the GPUI view. Native-origin drags keep the existing suppression.
-        if !dragged || captured.is_some() {
-            state.fast_composition.native_event = event as usize;
-        }
+        state.fast_composition.native_event = event as usize;
         previous
     };
     unsafe {
@@ -531,6 +454,34 @@ unsafe fn native_for_target(mut view: Id, native: &[usize]) -> Option<usize> {
         view = unsafe { msg_send![view, superview] };
     }
     None
+}
+
+/// AppKit may consume releases during deactivation or a native tracking loop.
+/// Relinquish both GPUI and native ownership before handing a gesture to AppKit.
+pub(crate) fn clear_pointer_capture(state: &Rc<Mutex<MacWindowState>>) {
+    state.lock().fast_composition.pointer_capture.clear();
+}
+
+pub(crate) fn window_activation_changed(state: &Rc<Mutex<MacWindowState>>, active: bool) {
+    if !active {
+        clear_pointer_capture(state);
+    }
+}
+
+pub(crate) fn start_window_move(state: &Rc<Mutex<MacWindowState>>) {
+    let window = {
+        let state = state.lock();
+        if state.simple_fullscreen_state.is_some() {
+            return;
+        }
+        state.native_window
+    };
+    clear_pointer_capture(state);
+    unsafe {
+        let app: Id = msg_send![class!(NSApplication), sharedApplication];
+        let event: Id = msg_send![app, currentEvent];
+        let _: () = msg_send![window, performWindowDragWithEvent: event];
+    }
 }
 
 pub(crate) fn native_event_observed(state: &MacWindowState, event: Id) -> bool {
@@ -740,12 +691,7 @@ pub(crate) fn create_native_surface(
     let parent = state.native_view;
 
     unsafe {
-        let class = NATIVE_VIEW_CLASS.load(Ordering::Acquire);
-        anyhow::ensure!(
-            !class.is_null(),
-            "native composition view class is unavailable"
-        );
-        let view: Id = msg_send![class, alloc];
+        let view: Id = msg_send![class!(NSView), alloc];
         let view: Id = msg_send![
             view,
             initWithFrame: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
@@ -895,9 +841,9 @@ pub(crate) fn set_composition_order(
                     .collect(),
             );
             if lock.fast_composition.native_views.is_empty() {
-                lock.fast_composition.native_buttons = 0;
-                lock.fast_composition.native_owner = None;
+                lock.fast_composition.pointer_capture.clear();
             }
+            follow_native_views(&mut lock, window_state);
             lock.fast_composition.view_order = view_order;
         }
         lock.fast_composition.input_forwarders.clear();
@@ -936,7 +882,6 @@ pub(crate) fn set_composition_order(
             let _: () = msg_send![view, setFrame: frame];
         }
     }
-    set_presents_with_transaction(&mut lock, false);
     Ok(())
 }
 
@@ -952,6 +897,7 @@ unsafe fn create_gpui_surface(
         state.fast_composition.renderer_context.clone(),
         &state.renderer,
     )?;
+    renderer.set_presents_with_transaction(state.fast_composition.presents_with_transaction);
     let input_regions = Rc::new(RefCell::new(Vec::<gpui::Hitbox>::new()));
     let native_view = state.native_view.as_ptr();
     let class = OVERLAY_VIEW_CLASS.load(Ordering::Acquire).cast_const();
@@ -995,13 +941,78 @@ unsafe fn create_gpui_surface(
     })
 }
 
+/// Paces the window's frames to fit its native views. A `CAMetalDisplayLink`
+/// presents each drawable a refresh after the Core Animation transaction
+/// that moves the window's native views, so they would lead the GPUI content
+/// around them by a frame while it scrolls. While the window holds native
+/// views it draws from the `CVDisplayLink` instead, presenting in that
+/// transaction (see [`present_for_native_views`]), and gets its Metal link
+/// back once they are gone. The switch waits for the frame being drawn to
+/// end: a Metal link attached during a frame would skip that frame.
+fn follow_native_views(state: &MacWindowState, window_state: &Rc<Mutex<MacWindowState>>) {
+    if !needs_other_frame_source(state) {
+        return;
+    }
+    let window_state = Rc::downgrade(window_state);
+    state
+        .foreground_executor
+        .spawn(async move {
+            if let Some(window_state) = window_state.upgrade() {
+                switch_frame_source(&mut window_state.lock(), &window_state);
+            }
+        })
+        .detach();
+}
+
+fn needs_other_frame_source(state: &MacWindowState) -> bool {
+    let native = !state.fast_composition.native_views.is_empty();
+    match &state.frame_source {
+        FrameSource::Metal(_) => native,
+        FrameSource::DisplayLink(_) => !native && state.fast_composition.metal_frames.is_some(),
+    }
+}
+
+fn switch_frame_source(state: &mut MacWindowState, window_state: &Rc<Mutex<MacWindowState>>) {
+    if !needs_other_frame_source(state) {
+        return;
+    }
+    let frame_source = match &state.frame_source {
+        FrameSource::Metal(metal_frames) => {
+            // Detached rather than paused, as `stop_display_link` does, so
+            // that the renderer takes the layer's own drawables again.
+            metal_frames.replace(None);
+            state.renderer.set_display_link_attached(false);
+            state.fast_composition.metal_frames = Some(metal_frames.clone());
+            FrameSource::DisplayLink(None)
+        }
+        FrameSource::DisplayLink(_) => {
+            let Some(metal_frames) = state.fast_composition.metal_frames.take() else {
+                return;
+            };
+            set_presents_with_transaction(state, false);
+            FrameSource::Metal(metal_frames)
+        }
+    };
+    // Replacing a `CVDisplayLink` source drops it, which leaves the registry.
+    state.frame_source = frame_source;
+    state.start_display_link(window_state);
+}
+
+/// Before a frame drawn from the `CVDisplayLink`: while the window holds
+/// native views, its drawables reach the screen in the Core Animation
+/// transaction that moves them.
+pub(crate) fn present_for_native_views(state: &mut MacWindowState) {
+    let native = !state.fast_composition.native_views.is_empty();
+    if state.fast_composition.presents_with_transaction != native {
+        set_presents_with_transaction(state, native);
+    }
+}
+
 /// Sets whether the window's renderer and every surface's present their
 /// drawables in a Core Animation transaction, as they do while AppKit waits
 /// for the window to draw.
 pub(crate) fn set_presents_with_transaction(state: &mut MacWindowState, enabled: bool) {
-    // Native geometry and WebKit's completed layer tree must become visible
-    // with the same Metal frame, including display-link driven frames.
-    let enabled = enabled || !state.fast_composition.native_views.is_empty();
+    state.fast_composition.presents_with_transaction = enabled;
     state.renderer.set_presents_with_transaction(enabled);
     for surface in state.fast_composition.gpui_surfaces.values_mut() {
         surface.renderer.set_presents_with_transaction(enabled);

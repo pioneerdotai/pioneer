@@ -1,206 +1,102 @@
+[package]
+description = "Behavior, interaction, and infrastructure foundations for GPUI applications."
+keywords = ["desktop", "gpui", "ui", "foundation"]
+license = "Apache-2.0"
+name = "gpui-base"
+# The examples are development tools that read fixtures from `crates/story`;
+# they stay out of the published package.
+exclude = ["examples/"]
+repository = "https://github.com/longbridge/gpui-kit"
+homepage = "https://gpui-kit.com"
+documentation = "https://docs.rs/gpui-base"
+version = "0.10.0"
+publish = true
+edition = "2024"
 
-["package"]
-"description" = "Behavior, interaction, and infrastructure foundations for GPUI applications."
-"keywords" = ["desktop", "gpui", "ui", "foundation"]
-"license" = "Apache-2.0"
-"name" = "gpui-base"
-"exclude" = ["examples/"]
-"repository" = "https://github.com/longbridge/gpui-kit"
-"homepage" = "https://gpui-kit.com"
-"documentation" = "https://docs.rs/gpui-base"
-"version" = "0.9.1"
-"publish" = true
-"edition" = "2024"
+[lib]
+doctest = false
 
-["lib"]
-"doctest" = false
+[[bench]]
+name = "motion"
+harness = false
 
-[["bench"]]
-"name" = "motion"
-"harness" = false
+[[bench]]
+name = "text_view_scroll"
+harness = false
 
-[["bench"]]
-"name" = "text_view_scroll"
-"harness" = false
+[features]
+gpui-fast = ["dep:gpui-fast"]
+decimal = ["dep:rust_decimal"]
+test-support = ["gpui/test-support", "gpui-fast?/test-support", "dep:image"]
+inspector = ["gpui_macros/inspector", "gpui/inspector", "gpui-fast?/inspector"]
 
-["features"]
-"gpui-fast" = ["dep:gpui-fast"]
-"decimal" = ["dep:rust_decimal"]
-"test-support" = ["gpui/test-support", "gpui-fast?/test-support"]
-"inspector" = ["gpui_macros/inspector", "gpui/inspector", "gpui-fast?/inspector"]
+[dependencies]
+anyhow = "1"
+aho-corasick = "1.1.3"
+data-url = "0.3"
+futures = "0.3"
+gpui = { "package" = "gpui-pre", "version" = "=0.3.12" }
+gpui-fast = { "package" = "gpui-fast", "version" = "0.1.17", "features" = ["windows-manifest-provided-by-host"], "optional" = true }
+image = { version = "0.25", optional = true }
+gpui_macros = { "package" = "gpui-pre-macros", "version" = "=0.3.12" }
+instant = { "version" = "0.1", "features" = ["wasm-bindgen"] }
+itertools = "0.13.0"
+jiff = "1.0"
+lsp-types = { "version" = "0.97.0", "features" = ["proposed"] }
+markdown = { version = "1.0.0", features = ["serde"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3.0"
+num-traits = "0.2"
+ropey = { "version" = "=2.0.0-beta.1", "features" = ["metric_chars", "metric_lines_lf", "metric_utf16"] }
+regex = "1"
+rust_decimal = { version = "1.37.0", optional = true }
+schemars = "1"
+serde = { "version" = "1.0.219", "features" = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+sum-tree = { "package" = "gpui-pre-sum-tree", "version" = "=0.3.12" }
+tracing = "0.1.41"
+sys-locale = "0.3"
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-segmentation = "1.12.0"
+web-time = "1"
 
-["dependencies"]
-"aho-corasick" = "1.1.3"
-"chrono" = "0.4.38"
-"data-url" = "0.3"
-"futures" = "0.3"
-"itertools" = "0.13.0"
-"html5ever" = "0.27"
-"markup5ever_rcdom" = "0.3.0"
-"num-traits" = "0.2"
-"regex" = "1"
-"sys-locale" = "0.3"
-"unicode-linebreak" = "0.1.5"
-"unicode-segmentation" = "1.12.0"
-"web-time" = "1"
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+smol = "2"
 
-["dependencies"."anyhow"]
-"version" = "1"
+[target.'cfg(target_family = "wasm")'.dependencies]
+async-channel = "2.3.1"
+# Read the current date from the browser, as `CalendarState::new` does.
+jiff = { version = "1.0", features = ["js"] }
 
-["dependencies"."gpui"]
-"package" = "gpui-pre"
-"version" = "=0.3.12"
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSAccessibility", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString"] }
 
-["dependencies"."gpui-fast"]
-"package" = "gpui-fast"
-"version" = "0.1.14"
-"features" = ["windows-manifest-provided-by-host"]
-"optional" = true
+[target.'cfg(target_os = "windows")'.dependencies]
+# The reduced-motion preference (SystemParametersInfoW).
+windows = { "features" = ["Wdk", "Wdk_System", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"], "version" = "0.58.0" }
 
-["dependencies"."gpui_macros"]
-"package" = "gpui-pre-macros"
-"version" = "=0.3.12"
+[target.'cfg(target_os = "linux")'.dependencies]
+# The reduced-motion preference, through the XDG desktop portal's Settings
+# interface. The same version and features `gpui-pre-linux` already pulls in.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "settings"] }
 
-["dependencies"."instant"]
-"version" = "0.1"
-"features" = ["wasm-bindgen"]
+[dev-dependencies]
+criterion = "0.8"
+gpui-base = { path = ".", features = ["test-support"] }
+gpui = { "package" = "gpui-pre", "version" = "=0.3.12", "features" = ["test-support", "bench-support"] }
+gpui-fast = { "package" = "gpui-fast", "version" = "0.1.17", "features" = ["windows-manifest-provided-by-host", "test-support", "bench-support"] }
+gpui_platform = { "package" = "gpui-pre-platform", "version" = "=0.3.12", "features" = ["font-kit", "x11", "wayland", "runtime_shaders", "bench-support"] }
+gpui-fast-platform = { "package" = "gpui-fast-platform", "version" = "0.1.17", "features" = ["font-kit", "x11", "wayland", "runtime_shaders", "bench-support"] }
+# Same minor version as `gpui`'s own, so the crate is shared instead of
+# compiled twice: the test-support image helpers build `Frame`s.
+image = "0.25"
+indoc = "2"
+reqwest_client = { "package" = "gpui-pre-reqwest-client", "version" = "=0.3.12" }
 
-["dependencies"."lsp-types"]
-"version" = "0.97.0"
-"features" = ["proposed"]
 
-["dependencies"."markdown"]
-"version" = "1.0.0"
-"features" = ["serde"]
-
-["dependencies"."ropey"]
-"version" = "=2.0.0-beta.1"
-"features" = ["metric_chars", "metric_lines_lf", "metric_utf16"]
-
-["dependencies"."rust_decimal"]
-"version" = "1.37.0"
-"optional" = true
-
-["dependencies"."schemars"]
-"version" = "1"
-
-["dependencies"."serde"]
-"version" = "1.0.219"
-"features" = ["derive"]
-
-["dependencies"."serde_json"]
-"version" = "1"
-
-["dependencies"."smallvec"]
-"version" = "1"
-
-["dependencies"."sum-tree"]
-"package" = "gpui-pre-sum-tree"
-"version" = "=0.3.12"
-
-["dependencies"."tracing"]
-"version" = "0.1.41"
-
-["target"]
-
-["target"."cfg(not(target_family = \"wasm\"))"]
-
-["target"."cfg(not(target_family = \"wasm\"))"."dependencies"]
-
-["target"."cfg(not(target_family = \"wasm\"))"."dependencies"."smol"]
-"version" = "2"
-
-["target"."cfg(target_family = \"wasm\")"]
-
-["target"."cfg(target_family = \"wasm\")"."dependencies"]
-"async-channel" = "2.3.1"
-
-["target"."cfg(target_os = \"macos\")"]
-
-["target"."cfg(target_os = \"macos\")"."dependencies"]
-"objc2" = "0.6"
-
-["target"."cfg(target_os = \"macos\")"."dependencies"."raw-window-handle"]
-"version" = "0.6.2"
-
-["target"."cfg(target_os = \"macos\")"."dependencies"."objc2-app-kit"]
-"version" = "0.3"
-"features" = ["NSAccessibility", "NSView", "NSWindow", "NSWorkspace"]
-
-["target"."cfg(target_os = \"macos\")"."dependencies"."objc2-foundation"]
-"version" = "0.3"
-"features" = ["NSGeometry", "NSString"]
-
-["target"."cfg(target_os = \"windows\")"]
-
-["target"."cfg(target_os = \"windows\")"."dependencies"]
-
-["target"."cfg(target_os = \"windows\")"."dependencies"."windows"]
-"features" = ["Wdk", "Wdk_System", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"]
-"version" = "0.58.0"
-
-["target"."cfg(target_os = \"linux\")"]
-
-["target"."cfg(target_os = \"linux\")"."dependencies"]
-
-["target"."cfg(target_os = \"linux\")"."dependencies"."ashpd"]
-"version" = "0.13"
-"default-features" = false
-"features" = ["async-io", "settings"]
-
-["dev-dependencies"]
-"criterion" = "0.8"
-"indoc" = "2"
-
-["dev-dependencies"."gpui-base"]
-"path" = "."
-"features" = ["test-support"]
-
-["dev-dependencies"."gpui"]
-"package" = "gpui-pre"
-"version" = "=0.3.12"
-"features" = ["test-support", "bench-support"]
-
-["dev-dependencies"."gpui-fast"]
-"package" = "gpui-fast"
-"version" = "0.1.14"
-"features" = ["windows-manifest-provided-by-host", "test-support", "bench-support"]
-
-["dev-dependencies"."gpui_platform"]
-"package" = "gpui-pre-platform"
-"version" = "=0.3.12"
-"features" = ["font-kit", "x11", "wayland", "runtime_shaders", "bench-support"]
-
-["dev-dependencies"."gpui-fast-platform"]
-"package" = "gpui-fast-platform"
-"version" = "0.1.14"
-"features" = ["font-kit", "x11", "wayland", "runtime_shaders", "bench-support"]
-
-["dev-dependencies"."reqwest_client"]
-"package" = "gpui-pre-reqwest-client"
-"version" = "=0.3.12"
-
-["lints"]
-
-["lints"."clippy"]
-"almost_complete_range" = "allow"
-"arc_with_non_send_sync" = "allow"
-"borrowed_box" = "allow"
-"dbg_macro" = "deny"
-"let_underscore_future" = "allow"
-"manual_is_multiple_of" = "allow"
-"map_entry" = "allow"
-"module_inception" = "allow"
-"non_canonical_partial_ord_impl" = "allow"
-"redundant_clone" = "deny"
-"reversed_empty_ranges" = "allow"
-"single_range_in_vec_init" = "allow"
-"todo" = "deny"
-"type_complexity" = "allow"
-"useless_conversion" = "allow"
-
-["lints"."clippy"."style"]
-"level" = "allow"
-"priority" = -1
-
-["workspace"]
+[workspace]

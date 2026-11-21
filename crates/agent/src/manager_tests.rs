@@ -5312,12 +5312,16 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         "recovered",
     );
     provider.fail_after_first = true;
-    let provider = Arc::new(provider);
+    let provider = Arc::new(UsageToolProvider(provider));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "empty-no-tool-round",
         provider.clone(),
     ));
     let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
+    let controller = Arc::new(RecordingContextBoundary::default());
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
     manager
         .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(Ok(
             MemoryToolMaterialization {
@@ -5511,7 +5515,16 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     .expect("provider recovery should start from the checkpoint");
                 recv_terminal_effect_preparation_until_completed(&mut durable_events, turn_id)
                     .await;
-                let requests = provider.snapshot_requests();
+                let requests = provider.0.snapshot_requests();
+                let inputs = controller.inputs.lock().unwrap();
+                assert_eq!(inputs[0].1, None);
+                assert_eq!(inputs[1].1, Some(12345));
+                assert_eq!(
+                    inputs[2].1,
+                    Some(12345),
+                    "same-turn recovery must keep the last measured input"
+                );
+                drop(inputs);
                 assert_eq!(
                     serde_json::to_value(&requests[1].tools).unwrap(),
                     serde_json::to_value(&requests.last().unwrap().tools).unwrap(),

@@ -3,10 +3,13 @@ mod json;
 mod loader;
 mod manifest;
 mod selection;
+mod source;
 pub use manifest::path as canonical_package_path;
 pub use manifest::{AppManifest, AppPresentation, ManifestError};
 pub use selection::{SelectionKind, SelectionPlan};
+pub use source::PreparedAppSource;
 
+pub use loader::load_source;
 pub use loader::{LoadedAppPackage, load, load_for_architecture};
 
 pub mod runtime;

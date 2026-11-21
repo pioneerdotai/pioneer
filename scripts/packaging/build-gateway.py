@@ -31,7 +31,7 @@ def build(args):
         raise ValueError(f"Gateway variant requires asset {expected}")
     if args.out.exists():
         raise ValueError(f"Build output already exists: {args.out}")
-    command = ["cargo", "build", "--locked", "--release", "-p", "pioneer-cli",
+    command = ["cargo", "build", "--timings", "--locked", "--release", "-p", "pioneer-cli",
                "--target", args.target, "--bin", "pioneer"]
     if args.variant == "computer-use":
         command += ["--features", "computer-use"]

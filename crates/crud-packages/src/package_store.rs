@@ -1392,6 +1392,22 @@ impl PackageStore {
         .await?;
         Ok(row.map(McpServerInstallationRecord::from))
     }
+
+    pub async fn find_mcp_server_installation_by_id(
+        &self,
+        scope_kind: &str,
+        scope_key: &str,
+        id: &str,
+    ) -> Result<Option<McpServerInstallationRecord>> {
+        let row = mcp_server_installation::find_mcp_server_installation_by_id(
+            &self.connection,
+            scope_kind,
+            scope_key,
+            id,
+        )
+        .await?;
+        Ok(row.map(McpServerInstallationRecord::from))
+    }
 }
 
 #[cfg(test)]

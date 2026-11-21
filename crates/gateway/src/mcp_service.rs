@@ -261,6 +261,36 @@ impl Drop for McpUpstreamCancellationGuard {
     }
 }
 
+struct GatewayMcpHttpResolver {
+    owner: std::sync::Weak<McpServiceInner>,
+}
+#[async_trait::async_trait]
+impl pioneer_mcp::McpHttpResolver for GatewayMcpHttpResolver {
+    async fn resolve(
+        &self,
+        installation_id: &str,
+        installation: &McpServerInstallation,
+        caller: Option<&pioneer_mcp::McpCaller>,
+    ) -> Result<pioneer_mcp::McpHttpTarget, McpRuntimeError> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| McpRuntimeError::failed("Gateway stopped"))?;
+        let processor = owner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            .ok_or_else(|| McpRuntimeError::failed("App runtime owner unavailable"))?;
+        processor
+            .resolve_pioneer_mcp_target(installation_id, installation, caller.is_some())
+            .await
+            .map_err(|error| {
+                McpRuntimeError::failed(format!("Pioneer App MCP resolution failed: {error}"))
+            })
+    }
+}
+
 struct GatewayMcpSecretResolver {
     gateway_secrets: Arc<GatewaySecrets>,
 }
@@ -481,7 +511,13 @@ impl McpService {
                     pioneer_tools::StaticPermissionApprovalBroker::default(),
                 )),
                 projection_persistence,
-                connector: RwLock::new(Arc::new(RmcpRuntimeConnector::with_oauth(Arc::new(oauth)))),
+                connector: RwLock::new(Arc::new(
+                    RmcpRuntimeConnector::with_oauth(Arc::new(oauth)).with_http_resolver(Arc::new(
+                        GatewayMcpHttpResolver {
+                            owner: owner.clone(),
+                        },
+                    )),
+                )),
                 lifecycle_gates: std::sync::Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(HashMap::new()),
@@ -1803,6 +1839,43 @@ impl McpService {
         self.inner.tasks.lock().await.contains_key(installation_id)
     }
 
+    /// Read the already admitted execution; never select or manufacture an Agent identity.
+    async fn pioneer_mcp_caller(
+        &self,
+        request: &pioneer_tools::McpToolCallRequest,
+    ) -> Result<pioneer_mcp::McpCaller, McpRuntimeError> {
+        let facts = async {
+            let authority = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+                &self.inner.crud_store,
+                &request.turn_id,
+            )
+            .await?;
+            anyhow::ensure!(
+                authority.workspace_id() == request.workspace_id,
+                "MCP caller workspace differs"
+            );
+            let db = self.inner.crud_store.database_connection();
+            let response = pioneer_crud::load_agent_turn_response(&db, &request.turn_id)
+                .await?
+                .context("MCP responding execution missing")?;
+            let agent = pioneer_crud::load_agent_execution(&db, &response.execution_id)
+                .await?
+                .context("MCP responding Agent missing")?;
+            anyhow::ensure!(
+                agent.workspace_id == request.workspace_id,
+                "MCP Agent workspace differs"
+            );
+            Ok::<_, anyhow::Error>(pioneer_mcp::McpCaller {
+                user_id: authority.initiating_principal_id().as_str().to_owned(),
+                agent_id: agent.agent_identity_id,
+            })
+        }
+        .await;
+        facts.map_err(|error| {
+            McpRuntimeError::failed(format!("Admitted Pioneer MCP caller unavailable: {error}"))
+        })
+    }
+
     async fn call_tool(
         &self,
         request: pioneer_tools::McpToolCallRequest,
@@ -2657,8 +2730,14 @@ impl McpService {
                         };
                         let raw_tool_name = command.request.raw_tool_name.clone();
                         let arguments = command.request.arguments.clone();
+                        let caller = if installation.is_pioneer() {
+                            match self.pioneer_mcp_caller(&command.request).await {
+                                Ok(caller) => Some(caller),
+                                Err(error) => { let _ = command.response_tx.send(Err(error)); continue; }
+                            }
+                        } else { None };
                         let result = session
-                            .call_tool(
+                            .call_tool_with_caller(
                                 raw_tool_name.as_str(),
                                 arguments,
                                 pioneer_mcp::McpInvocationBudget {
@@ -2666,6 +2745,7 @@ impl McpService {
                                 },
                                 Duration::from_millis(command.request.timeout_ms.max(1)),
                                 command.cancellation,
+                                caller,
                             )
                             .await;
                         if let Err(error) = &result

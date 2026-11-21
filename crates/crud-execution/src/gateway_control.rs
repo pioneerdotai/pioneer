@@ -346,6 +346,7 @@ impl GatewayControlRepository<'_> {
                         .column(column)
                         .filter(turn_item_attempt::Column::Status.eq("running"))
                         .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
+                        .filter(crate::turn_item_attempt::watchdog_eligible_attempt())
                         .filter(column.gt(at))
                         .order_by_asc(column)
                         .limit(1)

@@ -168,3 +168,8 @@ empty_audit = "Noch keine Prüfereignisse."
 [skills.catalog]
 source = "Quelle"
 trust = "Vertrauen"
+
+[skills.settings]
+title = "Einstellungen"
+enabled_description = "Stellt diesen Skill den Agenten im aktuellen Arbeitsbereich bereit."
+implicit_description = "Erlaubt Agenten, diesen Skill automatisch anzuwenden, auch wenn er in der Anfrage nicht ausdrücklich genannt wird."

@@ -386,32 +386,81 @@ async fn native_execution_window_transition_rejects_gaps_and_rolls_back_invalid_
             status: ExecutionWindowStatus::Running,
             started_at_unix_ms: continued.continued_at_unix_ms,
         };
-        store
-            .materialize_native_execution_window_transition(
-                NativeExecutionWindowTransition::Started {
-                    notification: second_started.clone(),
-                    window: NewTurnExecutionWindowRecord {
-                        workspace_id: second_started.workspace_id.clone(),
-                        thread_id: second_started.thread_id.clone(),
-                        turn_id: second_started.turn_id.clone(),
-                        window_index: second_started.window_index,
-                        status: ExecutionWindowStatus::Running,
-                        exhaustion_reason: None,
-                        agent_round_count: 0,
-                        tool_call_count: 0,
-                        provider_token_count: 0,
-                        metadata_json: serde_json::json!({
-                            "runtimeWindowId": second_started.window_id.clone(),
-                        }),
-                        started_at: timestamp + chrono::Duration::seconds(12),
+        let start = NativeExecutionWindowTransition::Started {
+            notification: second_started.clone(),
+            window: NewTurnExecutionWindowRecord {
+                workspace_id: second_started.workspace_id.clone(),
+                thread_id: second_started.thread_id.clone(),
+                turn_id: second_started.turn_id.clone(),
+                window_index: second_started.window_index,
+                status: ExecutionWindowStatus::Running,
+                exhaustion_reason: None,
+                agent_round_count: 0,
+                tool_call_count: 0,
+                provider_token_count: 0,
+                metadata_json: serde_json::json!({"runtimeWindowId": second_started.window_id}),
+                started_at: timestamp + chrono::Duration::seconds(12),
+            },
+            created_at: timestamp + chrono::Duration::seconds(12),
+            updated_at: timestamp + chrono::Duration::seconds(12),
+        };
+        // Pause a real durable append before the projection worker applies it.
+        let predecessor = store
+            .append_claimed_turn_event_projection_once(
+                crate::events::TurnEventPayload::ItemStarted(ItemStartedNotification {
+                    workspace_id: second_started.workspace_id.clone(),
+                    thread_id: second_started.thread_id.clone(),
+                    turn_id: second_started.turn_id.clone(),
+                    item: TurnItem::Reasoning {
+                        id: "resumed_reasoning".to_owned(),
+                        content: Vec::new(),
+                        summary: Vec::new(),
                     },
-                    created_at: timestamp + chrono::Duration::seconds(12),
-                    updated_at: timestamp + chrono::Duration::seconds(12),
+                }),
+                unix_to_datetime(1_700_000_113),
+                crate::store::events::event_preparation::TurnEventProjectionContext {
+                    item_started_deadlines: None,
+                    enqueue_optional_deliveries: true,
+                    cancellation_actor_id: None,
+                    native_cancellation: None,
+                    unactivated_terminal: None,
                 },
-                1_700_000_112,
+                "resumed_reasoning_projection".to_owned(),
+                &|| unix_to_datetime(1_700_000_114),
+                None,
+                None,
             )
             .await
-            .expect("started event should attach to the atomically-created continuation window");
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .materialize_native_execution_window_transition(start.clone(), 1_700_000_113)
+            .await
+            .expect_err("the continued window start must wait for the earlier event");
+        assert!(pending.is::<crate::ExecutionWindowStartProjectionPending>());
+        assert_eq!(
+            pioneer_crud_conversations::turn_event::max_sequence(&database, &second_started.turn_id)
+                .await
+                .unwrap(),
+            predecessor.sequence,
+        );
+        let replay = store
+            .replay_due_turn_event_projections(1_700_000_115, 1)
+            .await
+            .unwrap();
+        assert_eq!(replay.projected, 1);
+        for now in [1_700_000_115, 1_700_000_116] {
+            store
+                .materialize_native_execution_window_transition(start.clone(), now)
+                .await
+                .expect("the same window start should commit after its predecessor");
+        }
+        assert_eq!(
+            pioneer_crud_conversations::turn_event::max_sequence(&database, &second_started.turn_id)
+                .await
+                .unwrap(),
+            predecessor.sequence + 1,
+        );
 
         let future_started = TurnExecutionWindowStartedNotification {
             window_id: "runtime_window_4".to_owned(),

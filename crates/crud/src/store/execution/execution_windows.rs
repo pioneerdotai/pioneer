@@ -3,7 +3,8 @@ use crate::store::events::event_preparation::{
 };
 use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
-    CrudStore, NativeExecutionWindowTransition, NewTurnExecutionCheckpointRecord,
+    CrudStore, ExecutionWindowStartProjectionPending, NativeExecutionWindowTransition,
+    NewTurnExecutionCheckpointRecord,
     NewTurnExecutionWindowRecord, TurnExecutionCheckpointRecord, TurnExecutionDataCleanupRecord,
     TurnExecutionWindowRecord, TurnExecutionWindowStatsRecord,
     TurnExecutionWindowTerminalItemCountsRecord, TurnExecutionWindowUsageAggregateRecord,
@@ -109,12 +110,17 @@ impl CrudStore {
             .await
         }
         .await;
-        if let Ok(changed) = &result {
+        let changed = match &result {
+            Ok(changed) => Some(*changed),
+            Err(error) if error.is::<ExecutionWindowStartProjectionPending>() => Some(false),
+            Err(_) => None,
+        };
+        if let Some(changed) = changed {
             cleanup_change
-                .complete(&self.connection, *changed, &cleanup_turns)
+                .complete(&self.connection, changed, &cleanup_turns)
                 .await;
             for change in changes {
-                change.completed(*changed);
+                change.completed(changed);
             }
         }
         result.map(|_| ())

@@ -57,6 +57,7 @@ use std::{collections::BTreeMap, sync::Arc};
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, serde::Serialize)]
 pub struct AppViewPublication {
+    pub development: bool,
     pub state: String,
     pub url: Option<pioneer_protocol::AuthSecretString>,
     pub base_url: Option<pioneer_protocol::AuthSecretString>,
@@ -67,11 +68,30 @@ struct ViewEntry {
     stop: Option<std::sync::mpsc::SyncSender<()>>,
     package_revision: Option<i64>,
     execution_id: Option<String>,
+    observed_revision: Option<i64>,
+    observed_execution: Option<Option<String>>,
     closed: bool,
     workspace: String,
     app: String,
     epoch: (u64, u64, Option<u64>),
     publication: AppViewPublication,
+}
+impl ViewEntry {
+    fn can_publish(
+        &self,
+        epoch: (u64, u64, Option<u64>),
+        bootstrap: &pioneer_protocol::AppViewBootstrap,
+    ) -> bool {
+        !self.closed
+            && self.epoch == epoch
+            && (!bootstrap.development
+                || (self
+                    .observed_revision
+                    .is_none_or(|revision| revision == bootstrap.package_revision)
+                    && self.observed_execution.as_ref().is_none_or(|execution| {
+                        execution.as_deref() == Some(bootstrap.execution_id.as_str())
+                    })))
+    }
 }
 #[derive(Default)]
 pub(crate) struct AppViews {
@@ -106,11 +126,14 @@ impl crate::core::ClientCore {
                 stop: Some(stop),
                 package_revision: None,
                 execution_id: None,
+                observed_revision: None,
+                observed_execution: None,
                 closed: false,
                 workspace: workspace.clone(),
                 app: app.clone(),
                 epoch,
                 publication: AppViewPublication {
+                    development: false,
                     state: "loading".into(),
                     url: None,
                     base_url: None,
@@ -132,25 +155,15 @@ impl crate::core::ClientCore {
                 let lease = {
                     let mut views = core.app_views.lock().unwrap();
                     match result {
-                        Ok((url, base_url, bootstrap)) => {
+                        Ok((publication, bootstrap)) => {
                             if let Some(entry) = views
                                 .entries
                                 .get_mut(&ticket)
-                                .filter(|e| !e.closed && e.epoch == current_epoch)
+                                .filter(|e| e.can_publish(current_epoch, &bootstrap))
                             {
                                 entry.package_revision = Some(bootstrap.package_revision);
                                 entry.execution_id = Some(bootstrap.execution_id.clone());
-                                entry.publication = AppViewPublication {
-                                    state: "ready".into(),
-                                    url: Some(pioneer_protocol::AuthSecretString::new(
-                                        url.expose_url(),
-                                    )),
-                                    base_url: Some(pioneer_protocol::AuthSecretString::new(
-                                        base_url.expose_url(),
-                                    )),
-                                    title: bootstrap.title.clone(),
-                                    expires_at: Some(bootstrap.expires_at),
-                                };
+                                entry.publication = publication;
                             } else {
                                 if let Some(entry) = views.entries.get_mut(&ticket) {
                                     entry.stop.take();
@@ -238,6 +251,14 @@ impl crate::core::ClientCore {
             .values_mut()
             .filter(|e| e.workspace == event.workspace_id && e.app == event.app_id)
         {
+            // Opening can overlap a mutation or runtime revocation before its
+            // bootstrap arrives. Direct dev pages cannot rely on the release
+            // proxy to fence that stale response, so retain both event identities.
+            if event.runtime_only {
+                entry.observed_execution = Some(event.execution_id.clone());
+            } else {
+                entry.observed_revision = Some(event.revision);
+            }
             let changed = if event.runtime_only {
                 entry
                     .execution_id
@@ -329,11 +350,7 @@ impl crate::core::ClientCore {
         ticket: u64,
         workspace: &str,
         app: &str,
-    ) -> anyhow::Result<(
-        crate::transport::http::BrowserViewUrl,
-        crate::transport::http::BrowserViewUrl,
-        pioneer_protocol::AppViewBootstrap,
-    )> {
+    ) -> anyhow::Result<(AppViewPublication, pioneer_protocol::AppViewBootstrap)> {
         let epoch = self.provider_runtime_epoch();
         let sender = self.transport_runtime().ws_command_sender();
         let bound = sender.requests_for_connection(
@@ -395,29 +412,97 @@ impl crate::core::ClientCore {
                 },
                 crate::rpc::RPC_REQUEST_TIMEOUT,
             )?;
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(|_| anyhow::anyhow!("gateway_not_connected"))?;
-        anyhow::ensure!(self.provider_runtime_epoch() == epoch, "app_view_stale");
-        let url = crate::transport::http::BrowserViewUrl::resolve_app(
-            &access.gateway_base_url,
-            bootstrap.relative_url.expose_secret(),
-        )
-        .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
-        let token = bootstrap
-            .relative_url
-            .expose_secret()
-            .strip_prefix("/storage/app-views/")
-            .and_then(|tail| tail.split_once('/'))
-            .map(|(token, _)| token)
-            .ok_or_else(|| anyhow::anyhow!("app_view_invalid_url"))?;
-        let base_url = crate::transport::http::BrowserViewUrl::resolve_app(
-            &access.gateway_base_url,
-            &format!("/storage/app-views/{token}/"),
-        )
-        .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
-        Ok((url, base_url, bootstrap))
+        let publication = (|| {
+            let access = sender
+                .current_gateway_http_access()
+                .map_err(|_| anyhow::anyhow!("gateway_not_connected"))?;
+            anyhow::ensure!(self.provider_runtime_epoch() == epoch, "app_view_stale");
+            let local = self.active_gateway_endpoint().is_some_and(|endpoint| {
+                endpoint.kind == crate::gateway::types::GatewayEndpointKind::Local
+                    && endpoint.gateway_base_url == access.gateway_base_url
+            });
+            view_publication(&access.gateway_base_url, local, &bootstrap)
+        })();
+        match publication {
+            Ok(publication) => Ok((publication, bootstrap)),
+            Err(error) => {
+                // Validation/topology rejection happens after minting. Release
+                // the lease even though it will never be published to a shell.
+                let _: anyhow::Result<pioneer_protocol::AppViewLeaseResponse> =
+                    crate::rpc::send_json_rpc_request_typed(
+                        &bound,
+                        pioneer_protocol::constants::methods::APPS_CLOSE_VIEW,
+                        &pioneer_protocol::AppViewLeaseParams {
+                            relative_url: bootstrap.relative_url,
+                        },
+                        std::time::Duration::from_secs(5),
+                    );
+                Err(error)
+            }
+        }
     }
+}
+
+fn view_publication(
+    gateway: &crate::gateway::endpoint::GatewayBaseUrl,
+    local_gateway: bool,
+    bootstrap: &pioneer_protocol::AppViewBootstrap,
+) -> anyhow::Result<AppViewPublication> {
+    use crate::transport::http::BrowserViewUrl;
+    // Validate the entry and the grant root before publishing either URL.
+    let proxied = BrowserViewUrl::resolve_app(gateway, bootstrap.relative_url.expose_secret())
+        .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
+    let token = bootstrap
+        .relative_url
+        .expose_secret()
+        .strip_prefix("/storage/app-views/")
+        .and_then(|tail| tail.split_once('/'))
+        .map(|(token, _)| token)
+        .ok_or_else(|| anyhow::anyhow!("app_view_invalid_url"))?;
+    let base_url = BrowserViewUrl::resolve_app(gateway, &format!("/storage/app-views/{token}/"))
+        .map_err(|_| anyhow::anyhow!("app_view_invalid_url"))?;
+    let url = if bootstrap.development {
+        let gateway_url = url::Url::parse(gateway.as_str())?;
+        let dev = url::Url::parse(
+            bootstrap
+                .dev_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("app_view_invalid_url"))?,
+        )?;
+        let loopback = |url: &url::Url| match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        anyhow::ensure!(
+            local_gateway && loopback(&gateway_url),
+            "apps.dev_requires_local_desktop_gateway"
+        );
+        anyhow::ensure!(
+            dev.scheme() == "http" && loopback(&dev)
+                && dev.username().is_empty() && dev.password().is_none()
+                && dev.path() == "/" && dev.query().is_none() && dev.fragment().is_none()
+                && dev.port_or_known_default().is_some_and(|port| port != 0)
+                // Loopback aliases must not admit the Gateway's own listener.
+                && dev.port_or_known_default() != gateway_url.port_or_known_default(),
+            "app_view_invalid_url"
+        );
+        bootstrap.dev_url.clone().expect("validated dev URL")
+    } else {
+        anyhow::ensure!(bootstrap.dev_url.is_none(), "app_view_invalid_url");
+        proxied.expose_url().to_owned()
+    };
+    Ok(AppViewPublication {
+        development: bootstrap.development,
+        state: "ready".into(),
+        url: Some(pioneer_protocol::AuthSecretString::new(url)),
+        base_url: Some(pioneer_protocol::AuthSecretString::new(
+            base_url.expose_url(),
+        )),
+        title: bootstrap.title.clone(),
+        expires_at: Some(bootstrap.expires_at),
+    })
 }
 
 pub(crate) fn app_label(parent: &pioneer_protocol::PluginItem) -> String {
@@ -462,4 +547,152 @@ pub(crate) fn app_target_supported(
         "mcp" => policy.supports_mcp_tools,
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn bootstrap() -> pioneer_protocol::AppViewBootstrap {
+        pioneer_protocol::AppViewBootstrap {
+            development: true,
+            dev_url: Some("http://localhost:3000".into()),
+            package_revision: 7,
+            relative_url: pioneer_protocol::AuthSecretString::new(format!(
+                "/storage/app-views/{}/ignored-release-entry",
+                "A".repeat(43)
+            )),
+            expires_at: u64::MAX,
+            execution_id: "dev-execution".into(),
+            title: "Example (dev)".into(),
+        }
+    }
+
+    #[test]
+    fn dev_browser_location_is_the_registered_url_and_never_contains_its_lease() {
+        let gateway =
+            crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
+                .unwrap();
+        let mut bootstrap = bootstrap();
+        let first = view_publication(&gateway, true, &bootstrap).unwrap();
+        assert_eq!(
+            first.url.as_ref().unwrap().expose_secret(),
+            "http://localhost:3000"
+        );
+        let base = first.base_url.as_ref().unwrap().expose_secret();
+        assert!(base.starts_with("http://127.0.0.1:17878/storage/app-views/"));
+        assert!(base.ends_with('/'));
+        bootstrap.relative_url = pioneer_protocol::AuthSecretString::new(format!(
+            "/storage/app-views/{}/",
+            "B".repeat(43)
+        ));
+        let second = view_publication(&gateway, true, &bootstrap).unwrap();
+        assert_eq!(first.url, second.url);
+        assert_ne!(first.base_url, second.base_url);
+        // Installed Apps continue using the Gateway capability, including its
+        // base prefix, even when the Gateway registry entry is remote.
+        bootstrap.development = false;
+        bootstrap.dev_url = None;
+        let release = view_publication(&gateway, false, &bootstrap).unwrap();
+        assert!(
+            release
+                .url
+                .unwrap()
+                .expose_secret()
+                .starts_with("http://127.0.0.1:17878/storage/app-views/")
+        );
+        assert!(release.base_url.is_some());
+    }
+
+    #[test]
+    fn dev_opening_rejects_remote_topology_and_internal_or_unregistered_locations() {
+        let local =
+            crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
+                .unwrap();
+        let remote =
+            crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("https://gateway.example")
+                .unwrap();
+        assert!(view_publication(&local, false, &bootstrap()).is_err());
+        assert!(view_publication(&remote, true, &bootstrap()).is_err());
+        for url in [
+            None,
+            Some("http://localhost:17878"),
+            Some("http://localhost:17878/storage/app-views/x"),
+            Some("http://remote.example:3000"),
+            Some("http://user:secret@localhost:3000"),
+            Some("file:///tmp/index.html"),
+        ] {
+            let mut bootstrap = bootstrap();
+            bootstrap.dev_url = url.map(str::to_owned);
+            assert!(view_publication(&local, true, &bootstrap).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_views_retire_through_the_existing_revision_and_session_lifecycle() {
+        let core = crate::core::ClientCore::new();
+        let gateway =
+            crate::gateway::endpoint::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
+                .unwrap();
+        for runtime_only in [false, true] {
+            let (stop, stopped) = std::sync::mpsc::sync_channel(1);
+            core.app_views.lock().unwrap().entries.insert(
+                1,
+                ViewEntry {
+                    stop: Some(stop),
+                    package_revision: Some(7),
+                    execution_id: Some("dev-execution".into()),
+                    observed_revision: None,
+                    observed_execution: None,
+                    closed: false,
+                    workspace: "workspace".into(),
+                    app: "dev-app".into(),
+                    epoch: core.provider_runtime_epoch(),
+                    publication: view_publication(&gateway, true, &bootstrap()).unwrap(),
+                },
+            );
+            let mut event = pioneer_protocol::AppsChangedNotification {
+                workspace_id: "other-workspace".into(),
+                app_id: "dev-app".into(),
+                revision: 8,
+                runtime_only,
+                execution_id: None,
+            };
+            core.invalidate_app_views(&event);
+            assert!(core.app_view_publication(1).unwrap().url.is_some());
+            event.workspace_id = "workspace".into();
+            core.invalidate_app_views(&event);
+            let retired = core.app_view_publication(1).unwrap();
+            assert_eq!(retired.state, "unavailable");
+            assert!(retired.url.is_none());
+            assert!(retired.base_url.is_none());
+            assert!(matches!(
+                stopped.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ));
+            // Repeat the event before the RPC response identifies the opening
+            // view. A direct dev page must not publish that stale bootstrap.
+            let epoch = core.provider_runtime_epoch();
+            {
+                let mut views = core.app_views.lock().unwrap();
+                let opening = views.entries.get_mut(&1).unwrap();
+                opening.package_revision = None;
+                opening.execution_id = None;
+                opening.observed_revision = None;
+                opening.observed_execution = None;
+                opening.publication.state = "loading".into();
+                assert!(opening.can_publish(epoch, &bootstrap()));
+            }
+            core.invalidate_app_views(&event);
+            let views = core.app_views.lock().unwrap();
+            let opening = views.entries.get(&1).unwrap();
+            assert!(!opening.can_publish(epoch, &bootstrap()));
+            let mut release = bootstrap();
+            release.development = false;
+            release.dev_url = None;
+            assert!(opening.can_publish(epoch, &release));
+        }
+        core.retire_app_views();
+        assert!(core.app_view_publication(1).is_none());
+    }
 }

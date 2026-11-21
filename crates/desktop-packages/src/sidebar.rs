@@ -1,4 +1,5 @@
 use super::*;
+use crate::assets::PioneerIconName;
 use gpui_kit::assets::IconName as SidebarIcon;
 
 struct PluginsSidebar {
@@ -78,6 +79,27 @@ impl Render for PluginsSidebar {
                 .child(div().flex_1().min_h_0().child(component.sidebar))
                 .into_any_element();
         }
+        let open_app = selected
+            .as_ref()
+            .filter(|plugin| {
+                view.kind == pioneer_client::plugins::PackageKind::App
+                    && plugin.metadata.app.as_ref().is_some_and(|app| app.has_ui)
+            })
+            .map(|plugin| {
+                let open_owner = self.owner.clone();
+                let app_id = plugin.id.clone();
+                open_app_sidebar_action(!available || !plugin.enabled || (manage && busy), cx)
+                    .on_click(move |_, _, cx| {
+                        let _ = open_owner.update(cx, |view, cx| {
+                            if let Some(workspace_id) = view.workspace.clone() {
+                                cx.emit(PackageCatalogEvent::OpenApp {
+                                    workspace_id,
+                                    app_id: app_id.clone(),
+                                });
+                            }
+                        });
+                    })
+            });
         if let Some(plugin) = selected.filter(|_| manage) {
             if plugin.state != "removing" {
                 let update_owner = self.owner.clone();
@@ -188,6 +210,7 @@ impl Render for PluginsSidebar {
             .p_0()
             .gap_1()
             .when(view.selected.is_some(), |sidebar| sidebar.child(back))
+            .children(open_app.map(|button| v_flex().pt_4().px_2().child(button)))
             .child(actions)
             .into_any_element()
     }
@@ -236,6 +259,38 @@ fn sidebar_action(
                 .justify_start()
                 .gap_2()
                 .child(icon)
+                .child(pioneer_desktop_foundation::catalog_sidebar_label(label)),
+        )
+}
+
+fn open_app_sidebar_action(disabled: bool, cx: &App) -> Button {
+    let label = t!("apps.open_view").to_string();
+    let background = cx.theme().foreground;
+    let foreground = cx.theme().background;
+    Button::new("app-sidebar-open")
+        .ghost()
+        .justify_start()
+        .px_2()
+        .group("app-sidebar-open")
+        .disabled(disabled)
+        .accessibility_label(label.clone())
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_start()
+                .gap_2()
+                .child(
+                    div()
+                        .size_6()
+                        .rounded_full()
+                        .bg(background)
+                        .text_color(foreground)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(PioneerIconName::ArrowUpRight).size_3p5()),
+                )
                 .child(pioneer_desktop_foundation::catalog_sidebar_label(label)),
         )
 }

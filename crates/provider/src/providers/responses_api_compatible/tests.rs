@@ -3192,7 +3192,7 @@ async fn positional_declarations_preserve_wire_prefix_and_restore_without_delive
             AuthStyle::Bearer,
         );
         let mut req = request();
-        req.model = "gpt-5.4".into();
+        req.model = "gpt-6.2-sol".into();
         let initial =
             ToolDeclarations::reconcile(None, &req.messages, req.tools.as_deref().unwrap()).unwrap();
         req.tool_declarations = Some(initial.clone());
@@ -3337,15 +3337,13 @@ async fn positional_declarations_preserve_wire_prefix_and_restore_without_delive
             );
         }
         let frozen = serde_json::to_vec(&req.messages).unwrap();
-        for (name, root, model) in [
-            ("openai", "https://custom.example/v1", "gpt-5.4"),
-            ("openai", "https://api.openai.com/v1", "unknown"),
-            ("vercel", "https://api.openai.com/v1", "gpt-5.4"),
+        for (name, root) in [
+            ("openai", "https://custom.example/v1"),
+            ("vercel", "https://api.openai.com/v1"),
         ] {
             let fallback =
                 ResponsesApiCompatibleProvider::new(name, root, "fixture", AuthStyle::Bearer);
-            let mut switched = req.clone();
-            switched.model = model.into();
+            let switched = req.clone();
             assert!(
                 fallback
                     .prepare_input_budget(switched.clone())

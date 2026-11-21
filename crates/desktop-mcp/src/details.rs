@@ -3,7 +3,6 @@ use crate::table::*;
 use chrono::{Local, TimeZone};
 use gpui_kit::component::{
     StyledExt,
-    button::*,
     collapsible::Collapsible,
     scroll::ScrollableElement,
     separator::Separator,
@@ -39,11 +38,6 @@ impl McpCatalogView {
                 .into_any_element();
         };
 
-        let is_pending = self.is_mcp_pending(server.id.as_str());
-        let can_manage_capabilities = self
-            .principal_presentation_capabilities()
-            .can_manage_capabilities;
-        let desktop_entity = cx.entity().clone();
         let status_color = Self::mcp_status_color(server.status, cx);
         let meta_grid_columns = self.mcp_details_meta_grid_columns(window, cx);
 
@@ -54,75 +48,7 @@ impl McpCatalogView {
                 pioneer_desktop_foundation::CatalogDetailsHeader::new(
                     mcp_presentation::mcp_display_name(&server),
                 )
-                .status(Self::mcp_status_label(server.status), status_color)
-                .when(can_manage_capabilities, |this| {
-                    this.actions(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new(self.ui_id(&server.id, "enabled"))
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(server.policy.enabled, |this| this.primary())
-                                    .when(!server.policy.enabled, |this| this.outline())
-                                    .disabled(is_pending)
-                                    .label(t!("mcp.details.enabled").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let name = server.id.clone();
-                                        let next_enabled = !server.policy.enabled;
-                                        let implicit = server.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_mcp_policy(
-                                                    name.clone(),
-                                                    next_enabled,
-                                                    implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new(self.ui_id(&server.id, "implicit"))
-                                    .xsmall()
-                                    .compact()
-                                    .h_6()
-                                    .px_3()
-                                    .when(server.policy.allow_implicit_invocation, |this| {
-                                        this.primary()
-                                    })
-                                    .when(!server.policy.allow_implicit_invocation, |this| {
-                                        this.outline()
-                                    })
-                                    .disabled(is_pending)
-                                    .label(t!("mcp.details.implicit").to_string())
-                                    .on_click({
-                                        let desktop_entity = desktop_entity.clone();
-                                        let name = server.id.clone();
-                                        let enabled = server.policy.enabled;
-                                        let next_implicit =
-                                            !server.policy.allow_implicit_invocation;
-                                        move |_, _, cx| {
-                                            let _ = desktop_entity.update(cx, |view, cx| {
-                                                view.set_mcp_policy(
-                                                    name.clone(),
-                                                    enabled,
-                                                    next_implicit,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            });
-                                        }
-                                    }),
-                            ),
-                    )
-                }),
+                .status(Self::mcp_status_label(server.status), status_color),
             )
             .child(
                 v_flex()
@@ -146,7 +72,9 @@ impl McpCatalogView {
                     .child(Separator::horizontal())
                     .child(self.render_mcp_prompts_section(details, cx))
                     .child(Separator::horizontal())
-                    .child(self.render_mcp_audit_section(details, cx)),
+                    .child(self.render_mcp_audit_section(details, cx))
+                    .child(Separator::horizontal())
+                    .child(self.render_mcp_policy_settings(&server, cx)),
             )
             .into_any_element()
     }

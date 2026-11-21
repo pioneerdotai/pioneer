@@ -123,6 +123,9 @@ pub mod methods {
     pub const APPS_RENEW_VIEW: &str = "apps/renew_view";
     pub const APPS_CLOSE_VIEW: &str = "apps/close_view";
     pub const APPS_OPEN_VIEW: &str = "apps/open_view";
+    pub const APPS_DEV_ADD: &str = "apps/dev/add";
+    pub const APPS_DEV_LIST: &str = "apps/dev/list";
+    pub const APPS_DEV_REMOVE: &str = "apps/dev/remove";
     pub const APPS_LIST: &str = "apps/list";
     pub const APPS_DETAILS: &str = "apps/details";
     pub const APPS_CHANGED: &str = "apps/changed";
@@ -323,6 +326,9 @@ pub mod methods {
         APPS_OPEN_VIEW,
         APPS_LIST,
         APPS_DETAILS,
+        APPS_DEV_ADD,
+        APPS_DEV_LIST,
+        APPS_DEV_REMOVE,
         SKILLS_LIST,
         SKILLS_INSTALL,
         SKILLS_UPDATE,

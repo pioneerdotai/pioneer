@@ -534,7 +534,7 @@ async fn assert_native_replay_terminal_across_renewal(orphan: bool) {
             .unwrap();
     })
     .await
-    .expect("native renewal watchdog");
+    .unwrap_or_else(|_| panic!("native renewal watchdog elapsed (orphan={orphan})"));
 }
 
 #[pioneer_postgres_test::postgres_test]

@@ -82,7 +82,7 @@ pub(crate) fn bottom_bar(
                             .small()
                             .compact()
                             .child(
-                                Icon::new(PioneerIconName::Plugin)
+                                Icon::new(PioneerIconName::LayoutGridCircles)
                                     .size_3p5()
                                     .opacity(0.6)
                                     .when(route == MainRoute::Apps, |this| {

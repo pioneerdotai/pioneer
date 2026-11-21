@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::events::TurnEventPayload;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, entity::prelude::DateTimeWithTimeZone};
-use std::future::Future;
+use std::{fmt, future::Future};
 
 use crate::turn_execution_window::{
     self, NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord,
@@ -10,6 +10,19 @@ use crate::turn_execution_window::{
     PreparedTurnExecutionWindowStatsTransition, PreparedTurnExecutionWindowStatusTransition,
     TurnExecutionCheckpointKind, TurnExecutionWindowStatsRecord, execution_window_status_to_db,
 };
+
+/// A continued window is already durable, but an earlier event must be
+/// projected before the agent can acknowledge its start.
+#[derive(Debug)]
+pub struct ExecutionWindowStartProjectionPending;
+
+impl fmt::Display for ExecutionWindowStartProjectionPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("continued execution window start is waiting for an earlier turn event")
+    }
+}
+
+impl std::error::Error for ExecutionWindowStartProjectionPending {}
 
 #[derive(Debug, Clone)]
 pub enum NativeExecutionWindowTransition {
@@ -333,6 +346,14 @@ impl PreparedWindowTransition {
                             anyhow::bail!(
                                 "execution-window started replay does not match its committed continuation"
                             );
+                        }
+                        if pioneer_crud_conversations::event_projection::has_unprojected_event(
+                            transaction,
+                            notification.turn_id.as_str(),
+                        )
+                        .await?
+                        {
+                            return Err(ExecutionWindowStartProjectionPending.into());
                         }
                         append_event(transaction).await?;
                         return Ok(());

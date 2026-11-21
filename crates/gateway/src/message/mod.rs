@@ -771,6 +771,7 @@ pub struct MessageProcessor {
     skills_write_lock: Arc<tokio::sync::Mutex<()>>,
     plugin_mutation_locks: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     app_runtime: Arc<apps::runtime::AppRuntime>,
+    dev_apps: Arc<apps::dev::DevApps>,
     host_api: Arc<crate::host_api::HostApi>,
     cli_runtime_skill_destination_locks: CliRuntimeSkillDestinationLocks,
     #[cfg(test)]
@@ -1454,6 +1455,7 @@ impl MessageProcessor {
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             plugin_mutation_locks,
             app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            dev_apps: Arc::new(apps::dev::DevApps::default()),
             host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]
@@ -3084,6 +3086,7 @@ impl MessageProcessor {
         // Startup reconciliation is a bounded Maintenance DB action, not
         // an automatic installer replay. Unfinished parents remain closed.
         background.crud_store.interrupt_unfinished_plugins().await?;
+        self.start_dev_apps().await;
         self.start_app_runtimes().await;
 
         let task_runtime_stage =
@@ -5291,10 +5294,11 @@ impl MessageProcessor {
                     )
                     .await?
                 };
-            let prepared = crate::compaction::frozen::capture_prepared(
+            let prepared = crate::compaction::frozen::capture_task_runtime_prepared(
                 self.crud_store.as_ref(),
                 workspace_id,
                 thread_id,
+                turn_id,
                 &allowed,
                 history,
             )
@@ -5991,6 +5995,7 @@ impl MessageProcessor {
             skills_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             plugin_mutation_locks,
             app_runtime: Arc::new(apps::runtime::AppRuntime::default()),
+            dev_apps: Arc::new(apps::dev::DevApps::default()),
             host_api: Arc::new(crate::host_api::HostApi::default()),
             cli_runtime_skill_destination_locks: new_cli_runtime_skill_destination_locks(),
             #[cfg(test)]

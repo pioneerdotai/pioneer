@@ -3902,6 +3902,8 @@ mod tests {
                 &config,
                 service.clone(),
                 artifacts,
+                None,
+                None,
             )
             .await
             .unwrap();

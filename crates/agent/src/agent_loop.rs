@@ -6,6 +6,7 @@ use super::{
     TurnTaskSuccess, TurnToolProvider,
 };
 use crate::chat;
+use crate::compaction::controller::{NativeContext, NativeContextSession};
 use crate::hooks::{
     AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
     AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
@@ -1839,6 +1840,7 @@ fn spawn_turn_task(
 
             let NativeTurnRuntimeSnapshot {
                 context_controller,
+                context_measurement,
                 generation: _,
                 tool_loop_config,
                 mcp_tool_provider,
@@ -1855,8 +1857,8 @@ fn spawn_turn_task(
             let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
                 && context_controller.is_none();
             let context_session = context_controller.map(|controller| {
-                Arc::new(crate::compaction::controller::NativeContextSession::new(
-                    crate::compaction::controller::NativeContext {
+                Arc::new(NativeContextSession::with_turn_measurement(
+                    NativeContext {
                         context_budget: turn_request
                             .execution_security_snapshot
                             .as_ref()
@@ -1882,6 +1884,7 @@ fn spawn_turn_task(
                         cancellation: turn_control.cancellation_token(),
                     },
                     controller,
+                    context_measurement,
                 ))
             });
             let attempted = AssertUnwindSafe(turn_flow_future(execute_turn_flow(

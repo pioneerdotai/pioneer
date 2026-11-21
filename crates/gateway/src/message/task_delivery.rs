@@ -614,12 +614,30 @@ impl MessageProcessor {
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
-            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(delivered) => {
                 closing.finish(if promised {
                     Fact::Confirmed
                 } else {
                     Fact::Returned
                 });
+                if delivered.mode == TaskDeliveryMode::Thread
+                    && delivered.error_snapshot.is_none()
+                    && let (Some(thread), Some(turn)) = (
+                        delivered.target_thread_id.as_deref(),
+                        delivered.delivered_turn_id.as_deref(),
+                    )
+                {
+                    // The final text may already be visible. The acknowledged
+                    // delivery now authorizes its inline HTML publications.
+                    let item = pioneer_protocol::task_delivery_result_item_id(&delivered.id);
+                    self.notify_semantic_timeline_blocks_changed(
+                        &delivered.workspace_id,
+                        thread,
+                        vec![pioneer_crud::assistant_block_id(turn, &item)],
+                        Vec::new(),
+                    )
+                    .await;
+                }
                 if let Some(thread_id) = title_recovery {
                     self.recover_thread_title(thread_id).await;
                 }

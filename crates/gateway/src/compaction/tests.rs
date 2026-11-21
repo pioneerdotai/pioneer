@@ -9332,6 +9332,66 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         }),
         "the reused checkpoint must not accompany raw covered H"
     );
+    let processor = crate::message::MessageProcessor::new(
+        Arc::new(crate::thread::ThreadManager::new("gpt-4", "main-fixture")),
+        Arc::new(ProviderRegistry::new(|_| "fixture-key".into())),
+        Arc::new(crate::session::SessionManager::new()),
+        Arc::new(crate::workspace::WorkspaceManager::new(db.clone())),
+        Arc::new(f.store.clone()),
+        Arc::new(crate::secrets::GatewaySecrets::new(Arc::new(
+            pioneer_keystore::MemorySecretStore::new(),
+        ))),
+        crate::message::test_summary_config(),
+        crate::message::test_tool_loop_config(),
+    );
+    let hook = pioneer_agent::AgentTurnHookRuntimeContext {
+        conversation_thread_id: Some("thread".into()),
+        ..Default::default()
+    };
+    processor
+        .persist_turn_runtime_snapshot(
+            "context-e",
+            "ws",
+            "turn-e",
+            pioneer_protocol::ThreadMode::Agent,
+            &hook,
+            "gpt-4",
+            "main-fixture",
+            None,
+            &Default::default(),
+            &[],
+            &[],
+            &[],
+            &Default::default(),
+            &e_history,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+    let runtime = f
+        .store
+        .get_turn_runtime_snapshot("turn-e")
+        .await
+        .unwrap()
+        .unwrap();
+    let e_projection = super::frozen::prepare_runtime_history_for_execution(&f.store, &runtime)
+        .await
+        .unwrap();
+    let persisted_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "context-e", &e_projection.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        persisted_imports.iter().any(|grant| {
+            grant.source == retained_import.source
+                && grant.source_thread == retained_import.source_thread
+                && grant.output_ordinal == retained_import.output_ordinal
+        }),
+        "compaction must be able to verify the accepted import from the runtime snapshot"
+    );
+
     let e_context = NativeContext {
         context_budget: None,
         summary_context: None,

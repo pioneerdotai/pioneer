@@ -778,6 +778,17 @@ impl CrudStore {
             .await
     }
 
+    pub async fn find_mcp_server_installation_by_id(
+        &self,
+        scope_kind: &str,
+        scope_key: &str,
+        id: &str,
+    ) -> Result<Option<McpServerInstallationRecord>> {
+        self.package_store()
+            .find_mcp_server_installation_by_id(scope_kind, scope_key, id)
+            .await
+    }
+
     pub async fn delete_mcp_server_installation(
         &self,
         scope_kind: &str,

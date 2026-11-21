@@ -236,111 +236,17 @@ impl PackageCatalogView {
         )
         .icon(
             self.plugin_images
-                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark()))
-                .size_10(),
+                .element(plugin.metadata.logo_for_theme(cx.theme().mode.is_dark())),
         )
         .when_some(summary_status(plugin), |header, status| {
             header.status(status_label(status), status_color(status, cx))
         })
-        .when(
-            self.kind == pioneer_client::plugins::PackageKind::App,
-            |header| {
-                header.when_some(
-                    plugin.metadata.developer_name.clone(),
-                    |header, developer| header.owner(developer),
-                )
-            },
-        )
         .when_some(
             plugin
                 .metadata
                 .description_for_locale(plugin.description.as_deref(), &rust_i18n::locale()),
             |header, description| header.description(description),
-        )
-        .when(
-            !manage
-                && self.kind == pioneer_client::plugins::PackageKind::App
-                && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui),
-            |header| {
-                header.actions(
-                    Button::new("open-app-view-read")
-                        .small()
-                        .label(t!("apps.open_view").to_string())
-                        .disabled(!plugin.enabled)
-                        .on_click(cx.listener({
-                            let app_id = plugin.id.clone();
-                            move |view, _, _, cx| {
-                                if let Some(workspace_id) = view.workspace.clone() {
-                                    cx.emit(PackageCatalogEvent::OpenApp {
-                                        workspace_id,
-                                        app_id: app_id.clone(),
-                                    });
-                                }
-                            }
-                        })),
-                )
-            },
-        )
-        .when(manage, |header| {
-            header.actions(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .when(
-                        self.kind == pioneer_client::plugins::PackageKind::App
-                            && plugin.metadata.app.as_ref().is_some_and(|m| m.has_ui),
-                        |row| {
-                            row.child(
-                                Button::new("open-app-view")
-                                    .small()
-                                    .label(t!("apps.open_view").to_string())
-                                    .disabled(busy || !plugin.enabled)
-                                    .on_click(cx.listener({
-                                        let app_id = plugin.id.clone();
-                                        move |view, _, _, cx| {
-                                            if let Some(workspace_id) = view.workspace.clone() {
-                                                cx.emit(PackageCatalogEvent::OpenApp {
-                                                    workspace_id,
-                                                    app_id: app_id.clone(),
-                                                });
-                                            }
-                                        }
-                                    })),
-                            )
-                        },
-                    )
-                    .child(
-                        Button::new("plugin-header-enabled")
-                            .xsmall()
-                            .compact()
-                            .h_6()
-                            .px_3()
-                            .when(plugin.enabled, |button| button.primary())
-                            .when(!plugin.enabled, |button| button.outline())
-                            .disabled(busy || plugin.state != "installed")
-                            .label(t!("plugins.enabled").to_string())
-                            .on_click(cx.listener({
-                                let plugin = plugin.clone();
-                                move |view, _, _, cx| view.set_enabled(plugin.clone(), cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("plugin-header-implicit")
-                            .xsmall()
-                            .compact()
-                            .h_6()
-                            .px_3()
-                            .when(plugin.allow_implicit_invocation, |button| button.primary())
-                            .when(!plugin.allow_implicit_invocation, |button| button.outline())
-                            .disabled(busy || plugin.state != "installed")
-                            .label(t!("plugins.implicit").to_string())
-                            .on_click(cx.listener({
-                                let plugin = plugin.clone();
-                                move |view, _, _, cx| view.set_implicit(plugin.clone(), cx)
-                            })),
-                    ),
-            )
-        });
+        );
         let content = v_flex()
             .p_6()
             .gap_6()
@@ -416,7 +322,8 @@ impl PackageCatalogView {
                 manage,
                 busy,
                 cx,
-            ));
+            ))
+            .child(self.render_policy_settings(plugin, manage, busy, cx));
         v_flex()
             .size_full()
             .min_w_0()

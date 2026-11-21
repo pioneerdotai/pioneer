@@ -483,6 +483,51 @@ mod tests {
     fn snapshot() -> SourceSnapshot {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
     }
+
+    #[test]
+    fn generated_catalog_retains_picker_descriptions_from_each_source() {
+        let snapshot = snapshot();
+        let models_dev = snapshot.source_body(SOURCE_URLS[0]).unwrap();
+        let id = "gpt-5.4-pro";
+        let routed_id = "openai/gpt-5.4-pro";
+        let routed_description = |source_index: usize| {
+            snapshot.source_body(SOURCE_URLS[source_index]).unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == routed_id)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+        };
+        let generated = generate(&snapshot, true).unwrap();
+        let catalog = ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (provider, id, expected) in [
+            (
+                "openai",
+                id,
+                models_dev["openai"]["models"][id]["description"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            ("openrouter", routed_id, routed_description(1)),
+            ("vercel-ai-gateway", routed_id, routed_description(2)),
+        ] {
+            let mut model = super::super::tool_tests::discovered(id, None);
+            model.provider = provider.into();
+            catalog.enrich_picker_text(provider, std::slice::from_mut(&mut model));
+            assert_eq!(
+                model.description.as_deref(),
+                Some(expected.trim()),
+                "{provider}"
+            );
+        }
+    }
+
     fn differences(path: &str, actual: &Value, expected: &Value, out: &mut Vec<String>) {
         match (actual, expected) {
             (Value::Number(a), Value::Number(b)) if a.as_f64() == b.as_f64() => {}

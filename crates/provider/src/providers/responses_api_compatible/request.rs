@@ -20,18 +20,14 @@ impl ResponsesApiCompatibleProvider {
         &self,
         request: &ChatRequest,
     ) -> Option<crate::tool_declarations::ToolDeclarations> {
-        // Exact official authority + documented model contract, never aliases.
-        // https://developers.openai.com/api/docs/guides/tools-tool-search
-        // Narrow initial capability: unknown/new models remain full-list.
+        // Positional tool declarations use the public OpenAI Responses protocol.
         (self.name == "openai"
             && self.root == "https://api.openai.com/v1"
             && matches!(&self.auth, super::AuthStyle::Bearer)
-            && request.model == "gpt-5.4"
             && request
                 .messages
                 .iter()
-                .all(|message| message.content_parts.is_empty())
-            && crate::tools::policy::model_tool_support(&self.name, &request.model) != Some(false))
+                .all(|message| message.content_parts.is_empty()))
         .then(|| {
             request
                 .tools

@@ -164,3 +164,8 @@ recovering = "Die Verbindung ist vorübergehend nicht verfügbar. Pioneer versuc
 clear_sign_in = "Anmeldung zurücksetzen"
 prepare_failed = "Anmeldung konnte nicht vorbereitet werden. Schließen Sie die App, die den Rückrufport belegt, und versuchen Sie es erneut."
 client_auth_unsupported = "Die Authentifizierungsmethode dieses OAuth-Clients wird nicht unterstützt. Prüfen Sie seine Registrierung."
+
+[mcp.settings]
+title = "Einstellungen"
+enabled_description = "Stellt die Werkzeuge und Ressourcen dieses MCP-Servers im aktuellen Arbeitsbereich bereit."
+implicit_description = "Erlaubt Agenten, diesen MCP-Server automatisch zu verwenden, auch wenn er in der Anfrage nicht ausdrücklich genannt wird."

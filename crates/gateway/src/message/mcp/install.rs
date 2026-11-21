@@ -356,9 +356,32 @@ impl MessageProcessor {
             };
 
             if let Some(owner) = ownership {
+                let parent = self
+                    .crud_store
+                    .find_package_installation(&owner.plugin_id)
+                    .await
+                    .map_err(|_| {
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_PARAMS_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            "package unavailable",
+                            json!({}),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_PARAMS_CODE,
+                            MCP_ERROR_INVALID_REQUEST,
+                            "package unavailable",
+                            json!({}),
+                        )
+                    })?;
+                let expected_name = super::package::package_server_name(&parent, &owner.member_key);
                 if installation.scope_kind != McpScopeKind::Workspace
                     || installation.scope_key != workspace_id
-                    || installation.name != owner.member_key
+                    || installation.name != expected_name
                     || existing
                         .as_ref()
                         .is_some_and(|row| row.id.as_deref() != Some(owner.child_id.as_str()))

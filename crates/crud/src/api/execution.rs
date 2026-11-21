@@ -111,7 +111,9 @@ pub use pioneer_crud_execution::native_cancellation_context::{
     NativeCancellationContext, NativeCancellationContextUnavailable, UnactivatedTurnPhaseChanged,
 };
 pub use pioneer_crud_execution::native_event_cleanup::NativeEventCleanupMetrics;
-pub use pioneer_crud_execution::native_execution_window::NativeExecutionWindowTransition;
+pub use pioneer_crud_execution::native_execution_window::{
+    ExecutionWindowStartProjectionPending, NativeExecutionWindowTransition,
+};
 pub use pioneer_crud_execution::native_terminal_effect_outbox::{
     ClaimedNativeTerminalEffectRecord, HandlerCheckpointInvalid, NativeTerminalEffectClaimOutcome,
     NativeTerminalEffectStats, NativeTerminalEffectStatusRecord,

@@ -14,6 +14,7 @@ mod attachment;
 mod auth;
 pub(crate) mod authorization;
 mod bootstrap;
+mod browser_render;
 pub mod claude_mcp_conformance;
 #[doc(hidden)]
 pub mod cli_mcp_client_validation;
@@ -869,6 +870,8 @@ async fn run_gateway_until_shutdown_inner(
         &config,
         auth_service.clone(),
         message_processor.artifact_service.clone(),
+        Some(message_processor.clone()),
+        Some(identity_snapshot.clone()),
     )
     .await?;
     let handle = spawn_server(
@@ -1136,6 +1139,7 @@ async fn run_gateway_until_shutdown_inner(
     message_processor
         .shutdown_provider_readiness_supervisor()
         .await;
+    message_processor.shutdown_dev_apps().await;
     message_processor.shutdown_app_runtimes().await;
     message_processor.shutdown_skills_watcher().await;
     message_processor.shutdown_resilience_workers().await;
@@ -2034,4 +2038,19 @@ pub async fn inspect_applied_database_migrations(
     config: &pioneer_config::AppConfig,
 ) -> anyhow::Result<Option<Vec<String>>> {
     database::inspect_applied_migration_names(runtime_home, config).await
+}
+
+/// Invoke the running local Gateway through its authenticated operator channel.
+/// Source authoring is intentionally unavailable through remote topology here.
+pub async fn dev_app_operation(
+    config: &AppConfig,
+    runtime_home: &Path,
+    operation: pioneer_protocol::DevAppOperation,
+) -> Result<serde_json::Value> {
+    transport::local_operations::request(
+        runtime_home,
+        config,
+        transport::local_operations::Operation::DevApp(operation),
+    )
+    .await
 }

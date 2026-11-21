@@ -18,7 +18,7 @@ async fn shell_reference_reads_metadata_for_block_payload_and_handle_scope() {
     .await
     .unwrap();
     let wire = format!(
-        r#"{{"storage":{{"kind":"shell"}},"unrelated":"\u0000","output":"{}"}}"#,
+        r#"{{"storage":{{"kind":"shell","kind":"unrelated"}},"unrelated":"\u0000","output":"{}"}}"#,
         "🔧".repeat(65_536)
     );
     let body = PreparedPayload::new_turn_item(&wire).unwrap();

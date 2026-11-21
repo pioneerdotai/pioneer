@@ -32,8 +32,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+          cargo run --timings --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
             release-model-catalog/catalog.json
+
+      - name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing-*.html
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: upload-model-catalog
         uses: actions/upload-artifact@v6

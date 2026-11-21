@@ -1,3 +1,4 @@
+// Modified by Longbridge for gpui-fast.
 //! Frame pacing for macOS windows.
 //!
 //! On macOS 14 and later a window is paced by a `CAMetalDisplayLink` on its
@@ -313,6 +314,10 @@ impl MetalFrames {
         *self.source.borrow_mut() = source;
     }
 
+    pub(crate) fn set_paused(&self, paused: bool) {
+        crate::fast::display_link_lifecycle::set_metal_frames_paused(&self.source, paused);
+    }
+
     pub fn is_attached(&self) -> bool {
         self.source.borrow().is_some()
     }
@@ -329,6 +334,20 @@ impl MetalFrames {
 
     pub fn begin_frame(&self) {
         self.woken.set(false);
+    }
+
+    pub fn debug_state(&self) -> serde_json::Value {
+        let paused = self
+            .source
+            .try_borrow()
+            .ok()
+            .and_then(|source| source.as_ref().map(MetalFrameSource::is_paused));
+        serde_json::json!({
+            "kind": "CAMetalDisplayLink",
+            "attached": self.is_attached(),
+            "paused": paused,
+            "woken": self.woken.get(),
+        })
     }
 
     /// Ends an update, pausing the link if GPUI neither used its drawable nor
@@ -380,6 +399,14 @@ impl WindowFrameSource {
             subscribe(display_id, self.frame_requests.clone(), self.signal.clone())?;
         self.registration = Some((display_id, subscriber_id));
         Ok(())
+    }
+
+    pub fn debug_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "CVDisplayLink",
+            "attached": self.registration.is_some(),
+            "display_id": self.registration.map(|(display_id, _)| display_id),
+        })
     }
 
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {

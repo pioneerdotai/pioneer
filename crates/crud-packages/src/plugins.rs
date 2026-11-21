@@ -362,6 +362,11 @@ pub async fn insert_parent(
                 .inner_join(package_installation::Entity)
                 .filter(app_installation::Column::Slug.eq(&row.name))
                 .filter(package_installation::Column::WorkspaceId.eq(&row.workspace_id))
+                .filter(if row.source_upload_id.starts_with("dev:") {
+                    package_installation::Column::SourceUploadId.eq(&row.source_upload_id)
+                } else {
+                    package_installation::Column::SourceUploadId.not_like("dev:%")
+                })
                 .one(db)
                 .await?
                 .is_none(),

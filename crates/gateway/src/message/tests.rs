@@ -34566,17 +34566,26 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     };
     let turn = "cancel-transfer-turn";
     let start_id = generate_test_request_id("cancel-transfer", turn);
-    let start_processor = processor.clone();
     let start_context = sessions.connection_context(connection).await.unwrap();
-    let start_work = tokio::spawn(async move {
-        start_processor.process_owned_request(start_context, json!({
-            "jsonrpc":"2.0", "id":start_id, "method":"turn/start",
-            "params":{"thread_id":thread,"turn_id":turn,"input":[{"type":"text","text":"CURRENT CANCELLED INPUT"}],
-                "mode":"Agent","model":"gpt-5",
-                "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
-                "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-        }).to_string()).await;
-    });
+    let start_request = json!({
+        "jsonrpc":"2.0", "id":start_id, "method":"turn/start",
+        "params":{"thread_id":thread,"turn_id":turn,"input":[{"type":"text","text":"CURRENT CANCELLED INPUT"}],
+            "mode":"Agent","model":"gpt-5",
+            "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
+            "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
+    })
+    .to_string();
+    let mut start_work = if pause_summarizer {
+        let start_processor = processor.clone();
+        let task = tokio::spawn(async move {
+            start_processor
+                .process_owned_request(start_context, start_request)
+                .await;
+        });
+        super::message_future(async move { task.await.unwrap() })
+    } else {
+        processor.process_request(&start_context, &start_request)
+    };
     if pause_summarizer {
         let summarizer_started = timeout(Duration::from_secs(180), async {
             while summary.call_count() == 0 {
@@ -34624,9 +34633,14 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
         .expect("paused foreground summarizer should forward its live heartbeat");
     } else {
         let background_cancel = background_lease.as_ref().unwrap().cancellation();
-        timeout(Duration::from_secs(180), background_cancel.cancelled())
-            .await
-            .expect("foreground transfer should reach the coordinator");
+        // Drive the request to the real coordinator wait, then leave it parked
+        // so Stop must complete without help from the preparation's cleanup.
+        tokio::select! {
+            reached = timeout(Duration::from_secs(180), background_cancel.cancelled()) => {
+                reached.expect("foreground transfer should reach the coordinator");
+            }
+            () = &mut start_work => panic!("foreground transfer should wait for the coordinator"),
+        }
     }
     if shutdown {
         processor.shutdown_cli_runtime_manager().await;
@@ -34642,8 +34656,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     }
     timeout(Duration::from_secs(5), start_work)
         .await
-        .expect("cancelled preparation must join before the session can continue")
-        .unwrap();
+        .expect("cancelled preparation must join before the session can continue");
     assert!(
         cli.turn_starts.lock().await.is_empty(),
         "provider start is forbidden after Stop"
@@ -92856,6 +92869,20 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
             ),
         }
     };
+    let abandoned = make_item("usage-abandoned", None, None, false);
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: abandoned.clone(),
+                },
+            })
+            .await
+    );
+
     let mut restored = Vec::new();
     for (id, input, output, complete) in [
         ("usage-failed", Some(100), Some(2), false),
@@ -92891,6 +92918,55 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
     assert_eq!(totals.known_input_tokens, 220);
     assert_eq!(totals.known_output_tokens, 2);
     assert_eq!(totals.missing_input_attempts, 1);
+
+    let now = chrono::Utc::now().timestamp();
+    let timeout_scope = pioneer_crud::GatewayControlWake::Timeouts;
+    assert_eq!(
+        store
+            .next_gateway_control_deadline_for(&timeout_scope, now)
+            .await
+            .unwrap(),
+        None,
+        "an unfinished usage observation must not schedule a watchdog wake"
+    );
+    // Simulate a persisted deadline from a Gateway running the old policy.
+    assert!(
+        store
+            .configure_turn_item_attempt_deadlines(
+                turn,
+                abandoned.item_id(),
+                now,
+                Some(now + 30),
+                Some(now + 30),
+                Some(now + 120),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .next_gateway_control_deadline_for(&timeout_scope, now)
+            .await
+            .unwrap(),
+        None,
+        "a persisted usage deadline must not schedule a watchdog wake"
+    );
+    let (timed_out, _) = processor
+        .poll_timeout_candidate_page_for_turn(turn, now + 121, 64, None)
+        .await
+        .unwrap();
+    assert!(timed_out.is_empty());
+    assert_eq!(store.count_recovery_jobs_for_turn(turn).await.unwrap(), 0);
+    let (_, persisted_turn) = store.get_turn(thread, turn).await.unwrap().unwrap();
+    assert_eq!(persisted_turn.status, TurnStatus::InProgress);
+    assert_eq!(
+        store
+            .get_turn_item(turn, abandoned.item_id())
+            .await
+            .unwrap(),
+        Some(abandoned)
+    );
+
     let context = store
         .compaction_source_page(
             &workspace,

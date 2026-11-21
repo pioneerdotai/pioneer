@@ -142,6 +142,19 @@ fn parse_server(name: &str, value: &Value, context: &InstallParseContext) -> Mcp
         ));
     }
 
+    let pioneer = string_field(object, "type") == Some("pioneer");
+    if pioneer
+        && (has_command
+            || !has_url
+            || object.contains_key("oauth")
+            || object.contains_key("headers"))
+    {
+        diagnostics.push(McpValidationDiagnostic::error(
+            "invalid_pioneer_target",
+            "Pioneer App MCP requires a runtime URL and Gateway-owned authentication",
+            Some(format!("$.mcpServers.{name}")),
+        ));
+    }
     let enabled = parse_enabled(name, object, context.default_enabled, &mut diagnostics);
     let allow_implicit_invocation = parse_allow_implicit_invocation(
         name,
@@ -256,7 +269,10 @@ fn parse_server(name: &str, value: &Value, context: &InstallParseContext) -> Mcp
     }
 
     let transport = transport.expect("transport must be present when diagnostics have no errors");
-    let source_ref = source_ref(name, &transport);
+    let mut source_ref = source_ref(name, &transport);
+    if pioneer {
+        source_ref["type"] = json!("pioneer");
+    }
     let secret_refs = secrets
         .iter()
         .map(|secret| McpSecretRef {
@@ -386,6 +402,18 @@ fn parse_http_transport(
         diagnostics.push(McpValidationDiagnostic::error(
             "credential_bearing_url",
             "MCP URLs cannot contain userinfo, query parameters, or fragments; pass credentials through secret-backed headers",
+            Some(format!("$.mcpServers.{name}.url")),
+        ));
+        return None;
+    }
+
+    let pioneer = string_field(object, "type") == Some("pioneer");
+    let runtime_host = parsed.host_str() == Some("pioneer-app-runtime.internal");
+    if pioneer != runtime_host
+        || (pioneer && (parsed.scheme() != "http" || parsed.port().is_some()))
+    {
+        diagnostics.push(McpValidationDiagnostic::error(
+            "invalid_pioneer_target", "type pioneer requires http://pioneer-app-runtime.internal/<MCP path>; the runtime host is reserved",
             Some(format!("$.mcpServers.{name}.url")),
         ));
         return None;

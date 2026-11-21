@@ -120,6 +120,20 @@ pub async fn find_mcp_server_installation<C: ConnectionTrait>(
         })
 }
 
+pub async fn find_mcp_server_installation_by_id<C: ConnectionTrait>(
+    db: &C,
+    scope_kind: &str,
+    scope_key: &str,
+    id: &str,
+) -> Result<Option<mcp_server_installation::Model>> {
+    mcp_server_installation::Entity::find_by_id(id.to_owned())
+        .filter(mcp_server_installation::Column::ScopeKind.eq(scope_kind.to_owned()))
+        .filter(mcp_server_installation::Column::ScopeKey.eq(scope_key.to_owned()))
+        .one(db)
+        .await
+        .context("failed to query MCP server installation by ID")
+}
+
 pub async fn delete_mcp_server_installation<C: ConnectionTrait>(
     db: &C,
     scope_kind: &str,

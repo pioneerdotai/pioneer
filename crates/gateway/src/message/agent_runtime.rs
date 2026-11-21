@@ -2254,6 +2254,10 @@ impl MessageProcessor {
                 };
                 let commit_started = Instant::now();
                 let typed_commit = match &event {
+                    AgentDurableEvent::TurnExecutionWindowStarted { notification } => Some(
+                        self.commit_execution_window_started(notification.clone())
+                            .await,
+                    ),
                     AgentDurableEvent::TurnInterrupted {
                         thread_id,
                         turn_id,
@@ -5340,6 +5344,62 @@ impl MessageProcessor {
         self.thread_episodic_index_executor.wake();
     }
 
+    async fn commit_execution_window_started(
+        &self,
+        notification: pioneer_protocol::TurnExecutionWindowStartedNotification,
+    ) -> Result<(), DurableCommitRejection> {
+        let thread_id = notification.thread_id.clone();
+        let turn_id = notification.turn_id.clone();
+        let event_timestamp = now_timestamp_secs();
+        let event_time = db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000));
+        let window = pioneer_crud::NewTurnExecutionWindowRecord {
+            workspace_id: notification.workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            turn_id: turn_id.clone(),
+            window_index: notification.window_index,
+            status: notification.status,
+            exhaustion_reason: None,
+            agent_round_count: 0,
+            tool_call_count: 0,
+            provider_token_count: 0,
+            metadata_json: execution_window_started_metadata(notification.window_id.as_str()),
+            started_at: db_timestamp_from_unix_ms(notification.started_at_unix_ms),
+        };
+        match self
+            .crud_store
+            .materialize_native_execution_window_transition(
+                pioneer_crud::NativeExecutionWindowTransition::Started {
+                    window,
+                    notification,
+                    created_at: event_time,
+                    updated_at: event_time,
+                },
+                event_timestamp,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.is::<pioneer_crud::ExecutionWindowStartProjectionPending>() => {
+                Err(DurableCommitRejection::retryable(
+                    DurableCommitRejection::EXECUTION_WINDOW_START_PROJECTION_PENDING,
+                    "continued execution window start is waiting for an earlier turn event",
+                ))
+            }
+            Err(error) => {
+                self.report_legacy_turn_failure(
+                    thread_id,
+                    turn_id,
+                    format!("failed to persist turn/execution_window/started: {error:#}"),
+                )
+                .await;
+                Err(DurableCommitRejection::retryable(
+                    "projection_failed",
+                    "gateway could not project the durable agent event",
+                ))
+            }
+        }
+    }
+
     fn persist_durable_agent_event_with_cli_blocked_guard<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -5704,13 +5764,14 @@ impl MessageProcessor {
                 }
                 let event_timestamp = now_timestamp_secs();
                 let item_id = notification.item.item_id().to_owned();
-                let deadlines = self
-                    .timeout_supervisor
-                    .deadlines_for_item(&notification.item, event_timestamp);
+                let deadlines = (!notification.item.is_provider_usage_observation()).then(|| {
+                    self.timeout_supervisor
+                        .deadlines_for_item(&notification.item, event_timestamp)
+                });
                 if let Err(error) = message_future(self.materialize_native_agent_turn_event(
                     pioneer_crud::CanonicalTurnEventPayload::ItemStarted(notification.clone()),
                     event_timestamp,
-                    Some(deadlines),
+                    deadlines,
                 ))
                 .await
                 {
@@ -5740,7 +5801,7 @@ impl MessageProcessor {
                     turn_id = notification.turn_id,
                     item_id,
                     item_type = ?notification.item.item_type(),
-                    "registered item attempt deadlines during item/started projection"
+                    "persisted item/started projection"
                 );
                 true
             }),
@@ -5961,52 +6022,8 @@ impl MessageProcessor {
                     true
                 })
             }
-            AgentDurableEvent::TurnExecutionWindowStarted { notification } => {
-                message_future(async move {
-                    let thread_id = notification.thread_id.clone();
-                    let turn_id = notification.turn_id.clone();
-                    let event_timestamp = now_timestamp_secs();
-                    let event_time =
-                        db_timestamp_from_unix_ms(event_timestamp.saturating_mul(1000));
-                    if let Err(error) = self
-                        .crud_store
-                        .materialize_native_execution_window_transition(
-                            pioneer_crud::NativeExecutionWindowTransition::Started {
-                                window: pioneer_crud::NewTurnExecutionWindowRecord {
-                                    workspace_id: notification.workspace_id.clone(),
-                                    thread_id: notification.thread_id.clone(),
-                                    turn_id: notification.turn_id.clone(),
-                                    window_index: notification.window_index,
-                                    status: notification.status,
-                                    exhaustion_reason: None,
-                                    agent_round_count: 0,
-                                    tool_call_count: 0,
-                                    provider_token_count: 0,
-                                    metadata_json: execution_window_started_metadata(
-                                        notification.window_id.as_str(),
-                                    ),
-                                    started_at: db_timestamp_from_unix_ms(
-                                        notification.started_at_unix_ms,
-                                    ),
-                                },
-                                notification,
-                                created_at: event_time,
-                                updated_at: event_time,
-                            },
-                            event_timestamp,
-                        )
-                        .await
-                    {
-                        self.report_legacy_turn_failure(
-                            thread_id.clone(),
-                            turn_id.clone(),
-                            format!("failed to persist turn/execution_window/started: {error:#}"),
-                        )
-                        .await;
-                        return false;
-                    }
-                    true
-                })
+            AgentDurableEvent::TurnExecutionWindowStarted { .. } => {
+                unreachable!("window start uses the typed commit path")
             }
             AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
                 message_future(async move {

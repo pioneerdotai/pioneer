@@ -217,3 +217,39 @@ async fn mcp_installation_catalog_and_audit_round_trip() -> Result<()> {
     })
     .await
 }
+
+#[tokio::test]
+async fn mcp_installation_id_lookup_preserves_workspace_and_scope_boundaries() -> Result<()> {
+    with_database(async |fixture| {
+        let database = fixture.connect().await?;
+        let mut installation = sample_mcp_installation("saved-public-name");
+        installation.id = Some("M".repeat(21));
+        let id = mcp_server_installation::upsert_mcp_server_installation(
+            &database,
+            &installation,
+            at(0),
+            at(0),
+        )
+        .await?;
+        let found = mcp_server_installation::find_mcp_server_installation_by_id(
+            &database,
+            &installation.scope_kind,
+            &installation.scope_key,
+            &id,
+        )
+        .await?
+        .unwrap();
+        assert_eq!(found.name, "saved-public-name");
+        for (kind, scope) in [("workspace", "foreign-workspace"), ("user", "ws_mcp")] {
+            assert!(
+                mcp_server_installation::find_mcp_server_installation_by_id(
+                    &database, kind, scope, &id,
+                )
+                .await?
+                .is_none()
+            );
+        }
+        Ok(())
+    })
+    .await
+}

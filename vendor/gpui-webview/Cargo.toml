@@ -9,7 +9,7 @@ repository = "https://github.com/longbridge/gpui-kit/tree/main/crates/webview"
 readme = "README.md"
 edition = "2024"
 publish = true
-version = "0.9.1"
+version = "0.10.0"
 
 
 [features]
@@ -24,15 +24,14 @@ doctest = false
 
 [dependencies]
 anyhow = "1"
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", branch = "main", default-features = false }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "4373234ff46df3a3227972788a41dc6603d352ce", version = "0.10.0", default-features = false }
 log = "0.4"
 wry = { version = "0.53.3", package = "lb-wry" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-block2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAppearance", "NSColor", "NSView"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSDate", "NSRunLoop"], optional = true }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAppearance", "NSView"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdkx11 = "0.18"

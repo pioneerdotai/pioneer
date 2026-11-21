@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppDevConnection",
+  "type": "object",
+  "properties": {
+    "diagnostic": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "project",
+    "url",
+    "state"
+  ]
+}
