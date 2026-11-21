@@ -1,7 +1,7 @@
 //! Compaction operation authority and bounded admission.
 
 use anyhow::{Result, ensure};
-use pioneer_compaction::OperationSnapshot;
+use pioneer_compaction::{FORMAT_VERSION, OperationSnapshot};
 use pioneer_entity::{compaction_context, compaction_execution_stop, compaction_operation, turn};
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
@@ -216,4 +216,105 @@ pub async fn compaction_operation<C: ConnectionTrait>(
         .one(db)
         .await?
         .map(OperationRecord::from))
+}
+
+pub async fn compaction_head<C: ConnectionTrait>(db: &C, owner: &str) -> Result<Option<String>> {
+    let row = compaction_context::Entity::find_by_id(owner)
+        .one(db)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(row) => {
+            ensure!(
+                row.format_version == i64::from(FORMAT_VERSION),
+                "unsupported working-context version"
+            );
+            Ok(row.head)
+        }
+    }
+}
+
+/// This is the only admission of a provider attempt. Counters survive restart.
+pub async fn compaction_claim_attempt<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    expected_attempts: i64,
+    now_ms: i64,
+    transient_retry: bool,
+    correction: bool,
+) -> Result<bool> {
+    let result = compaction_operation::Entity::update_many()
+        .col_expr(
+            compaction_operation::Column::Attempts,
+            Expr::col(compaction_operation::Column::Attempts).add(Expr::val(1_i64)),
+        )
+        .col_expr(
+            compaction_operation::Column::TransientRetries,
+            Expr::col(compaction_operation::Column::TransientRetries)
+                .add(Expr::Value((transient_retry as i64).into())),
+        )
+        .col_expr(
+            compaction_operation::Column::Correction,
+            Expr::col(compaction_operation::Column::Correction)
+                .add(Expr::Value((correction as i64).into())),
+        )
+        .filter(
+            Expr::col(compaction_operation::Column::Id)
+                .eq(Expr::Value(id.into()))
+                .and(Expr::col(compaction_operation::Column::Status).eq(Expr::val("running")))
+                .and(
+                    Expr::col(compaction_operation::Column::Attempts)
+                        .eq(Expr::Value(expected_attempts.into())),
+                )
+                .and(
+                    Expr::col(compaction_operation::Column::DeadlineMs)
+                        .gt(Expr::Value(now_ms.into())),
+                )
+                .and(
+                    Expr::col(compaction_operation::Column::TransientRetries)
+                        .add(Expr::Value((transient_retry as i64).into()))
+                        .lte(Expr::val(2_i64)),
+                )
+                .and(
+                    Expr::col(compaction_operation::Column::Correction)
+                        .add(Expr::Value((correction as i64).into()))
+                        .lte(Expr::val(1_i64)),
+                ),
+        )
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn compaction_finish<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    status: &str,
+    outcome: &str,
+) -> Result<bool> {
+    ensure!(
+        ["failed", "cancelled", "stale"].contains(&status),
+        "invalid terminal transition"
+    );
+    ensure!(
+        outcome.len() <= 128,
+        "outcome must be a bounded classification"
+    );
+    let changed = compaction_operation::Entity::update_many()
+        .col_expr(
+            compaction_operation::Column::Status,
+            Expr::Value(status.into()),
+        )
+        .col_expr(
+            compaction_operation::Column::Outcome,
+            Expr::Value(outcome.into()),
+        )
+        .filter(
+            Expr::col(compaction_operation::Column::Id)
+                .eq(Expr::Value(id.into()))
+                .and(Expr::col(compaction_operation::Column::Status).eq(Expr::val("running"))),
+        )
+        .exec(db)
+        .await?;
+    Ok(changed.rows_affected > 0)
 }

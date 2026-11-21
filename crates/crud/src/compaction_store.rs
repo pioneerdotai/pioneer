@@ -1,7 +1,7 @@
 //! CrudStore facade; persistence operations live in repositories.
 use crate::compaction::{
-    AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
-    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputCursor, DeliveredTaskOutputPage,
+    AcceptedTaskBasis, CanonicalFragment, CheckpointEdges, CheckpointMetadata, CommitOutcome,
+    CompletedHistoryCheck, DeliveredTaskOutputCursor, DeliveredTaskOutputPage,
     DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
     HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
     PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
@@ -76,8 +76,15 @@ impl CrudStore {
         kind: PagedSource,
         after: i64,
     ) -> Result<SourcePage> {
-        repositories::compaction::compaction_source_page(self, workspace, thread, turn, kind, after)
-            .await
+        repositories::compaction::compaction_source_page(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            kind,
+            after,
+        )
+        .await
     }
     /// Discover versioned identities without materializing already covered
     /// payloads. The projection fetches only its uncovered sources afterward.
@@ -90,7 +97,12 @@ impl CrudStore {
         after: i64,
     ) -> Result<SourcePage> {
         repositories::compaction::compaction_source_metadata_page(
-            self, workspace, thread, turn, kind, after,
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            kind,
+            after,
         )
         .await
     }
@@ -104,7 +116,7 @@ impl CrudStore {
         capture_order: i64,
     ) -> Result<SourcePage> {
         repositories::compaction::compaction_source_metadata_page_at_fence(
-            self,
+            &self.connection,
             workspace,
             thread,
             turn,
@@ -146,28 +158,12 @@ impl CrudStore {
         turn: &str,
         id: &str,
     ) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
-        repositories::compaction::compaction_item_created_at(self, workspace, thread, turn, id)
-            .await
-    }
-    pub(crate) async fn compaction_source_page_inner(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        kind: PagedSource,
-        after: i64,
-        include_payload: bool,
-        capture_order: i64,
-    ) -> Result<SourcePage> {
-        repositories::compaction::compaction_source_page_inner(
+        repositories::compaction::compaction_item_created_at(
             &self.connection,
             workspace,
             thread,
             turn,
-            kind,
-            after,
-            include_payload,
-            capture_order,
+            id,
         )
         .await
     }
@@ -445,27 +441,6 @@ impl CrudStore {
         character_offset: u64,
     ) -> Result<Option<CanonicalFragment>> {
         repositories::compaction::compaction_source_fragment(
-            self,
-            workspace,
-            thread,
-            turn,
-            id,
-            expected_revision,
-            character_offset,
-        )
-        .await
-    }
-    pub(crate) async fn compaction_payload_fragment(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        id: &str,
-        expected_revision: Option<&str>,
-        character_offset: u64,
-        kind: CanonicalSource,
-    ) -> Result<Option<CanonicalFragment>> {
-        repositories::compaction::compaction_payload_fragment(
             &self.connection,
             workspace,
             thread,
@@ -473,7 +448,6 @@ impl CrudStore {
             id,
             expected_revision,
             character_offset,
-            kind,
         )
         .await
     }
@@ -584,7 +558,7 @@ impl CrudStore {
         character_offset: u64,
     ) -> Result<Option<CanonicalFragment>> {
         repositories::compaction::compaction_tool_result_fragment(
-            self,
+            &self.connection,
             workspace,
             thread,
             turn,
@@ -603,7 +577,7 @@ impl CrudStore {
     ) -> Result<Option<CanonicalFragment>> {
         self.run_scoped_database_quantum(|| async {
             repositories::compaction::compaction_reference_fragment(
-                self,
+                &self.connection,
                 workspace,
                 thread,
                 reference,
@@ -621,7 +595,10 @@ impl CrudStore {
     ) -> Result<Option<String>> {
         self.run_scoped_database_quantum(|| async {
             repositories::compaction::compaction_reference_payload(
-                self, workspace, thread, reference,
+                &self.connection,
+                workspace,
+                thread,
+                reference,
             )
             .await
         })
@@ -635,7 +612,10 @@ impl CrudStore {
     ) -> Result<(usize, Vec<String>)> {
         self.run_scoped_database_quantum(|| async {
             repositories::compaction::compaction_reference_payload_batch(
-                self, workspace, thread, references,
+                &self.connection,
+                workspace,
+                thread,
+                references,
             )
             .await
         })

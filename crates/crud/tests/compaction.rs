@@ -35,96 +35,10 @@ async fn store_recording_statements(statements: Option<RecordedStatements>) -> C
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn history_capture_and_checkpoint_preserve_compressed_event_across_a_fence() {
+async fn checkpoint_publication_preserves_compressed_event() {
     let store = store().await;
     let wire = format!(r#"{{"text":"{}"}}"#, "retained original 🌍".repeat(4096));
     let source = source_with_storage(&store, "first", 1, &wire, true).await;
-    let db = store.database_connection();
-    let backed = db.query_one_raw(Statement::from_string(DbBackend::Postgres,
-        "SELECT p.original_bytes, EXISTS (SELECT 1 FROM portable_payload_part b WHERE b.payload_id=p.id AND b.codec=1) AS compressed
-         FROM turn_event e JOIN portable_payload_value p ON p.id=e.payload_payload_id WHERE e.id='first'"
-    )).await.unwrap().unwrap();
-    assert_eq!(
-        backed.try_get::<i64>("", "original_bytes").unwrap(),
-        wire.len() as i64
-    );
-    assert!(backed.try_get::<bool>("", "compressed").unwrap());
-    let first = store
-        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
-        .await
-        .unwrap()
-        .entries
-        .remove(0)
-        .reference;
-    let fence = store.compaction_history_read_fence().await.unwrap();
-    let before = store
-        .compaction_history_turn_page("ws", "thread", "", &fence)
-        .await
-        .unwrap();
-    assert_eq!(before.len(), 1);
-    source_with_storage(
-        &store,
-        "later",
-        2,
-        r#"{"text":"after the captured fence"}"#,
-        true,
-    )
-    .await;
-    let after = store
-        .compaction_history_turn_page("ws", "thread", "", &fence)
-        .await
-        .unwrap();
-    assert_eq!(after.len(), before.len());
-    let (before, after) = (&before[0], &after[0]);
-    assert_eq!(after.id, before.id);
-    assert_eq!(after.created_at, before.created_at);
-    assert_eq!(after.creation_order, before.creation_order);
-    assert_eq!(after.legacy_creation_order, before.legacy_creation_order);
-    assert_eq!(after.status, before.status);
-    assert_eq!(after.turn_kind, before.turn_kind);
-    assert_eq!(after.send_mode, before.send_mode);
-    assert_eq!(after.input_high_water, before.input_high_water);
-    assert_eq!(after.event_high_water, before.event_high_water);
-    assert_eq!(after.context_high_water, before.context_high_water);
-    assert_eq!(after.event_high_water, 1);
-    let next_fence = store.compaction_history_read_fence().await.unwrap();
-    assert_eq!(
-        store
-            .compaction_history_turn_page("ws", "thread", "", &next_fence)
-            .await
-            .unwrap()[0]
-            .event_high_water,
-        2
-    );
-    assert!(
-        store
-            .compaction_history_turn_page("other", "thread", "", &fence)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .compaction_history_turn_page("ws", "thread", &after.id, &fence)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let mut rebuilt = String::new();
-    let mut offset = 0;
-    loop {
-        let page = store
-            .compaction_reference_fragment("ws", "thread", &first, offset)
-            .await
-            .unwrap()
-            .unwrap();
-        rebuilt.push_str(&page.text);
-        match page.next_character {
-            Some(next) => offset = next,
-            None => break,
-        }
-    }
-    assert_eq!(rebuilt.as_bytes(), wire.as_bytes());
     let checkpoint = candidate(&store, "compressed-history", None, &source).await;
     assert_eq!(
         store
@@ -141,133 +55,6 @@ async fn history_capture_and_checkpoint_preserve_compressed_event_across_a_fence
             .unwrap(),
         checkpoint.id
     );
-}
-
-#[pioneer_postgres_test::postgres_test]
-async fn exact_tool_item_reads_preserve_canonical_revisions_with_compression() {
-    use pioneer_crud_conversations::turn_item::{ItemWrite, upsert};
-    use pioneer_crud_payloads::storage::PreparedPayload;
-
-    for compressed in [false, true] {
-        let store = store().await;
-        let db = store.database_connection();
-        for id in ["compressed", "inline"] {
-            if compressed {
-                let wire = serde_json::json!({
-                    "storage": {"kind": "shell"},
-                    "output": "retained result 🌍".repeat(8_192),
-                })
-                .to_string();
-                let body = PreparedPayload::new_turn_item(&wire).unwrap();
-                let now = chrono::Utc::now().fixed_offset();
-                let tx = db.begin().await.unwrap();
-                upsert(
-                    &tx,
-                    ItemWrite {
-                        id: id.into(),
-                        turn_id: "turn".into(),
-                        item_id: id.into(),
-                        item_type: "command_execution".into(),
-                        status: Some("completed".into()),
-                        created_at: now,
-                        updated_at: now,
-                    },
-                    &body,
-                )
-                .await
-                .unwrap();
-                tx.commit().await.unwrap();
-                let blocks = db.query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "SELECT count(*) AS n FROM portable_payload_part WHERE payload_id=$1 AND codec=1",
-                    [body.id().into()],
-                )).await.unwrap().unwrap();
-                assert!(blocks.try_get::<i64>("", "n").unwrap() > 1);
-            } else {
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-                    r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ($1,'turn',$2,'command_execution','completed','{"storage":{"kind":"shell"},"output":"retained result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
-                    [id.into(), id.into()])).await.unwrap();
-            }
-        }
-        // Both committed representations have revisions from the canonical
-        // insert trigger and must be readable through the query-only pool.
-        for id in ["compressed", "inline"] {
-            let reference = store
-                .compaction_tool_item_reference("ws", "thread", "turn", id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(reference.version, "item-revision:1");
-            let fragment = store
-                .compaction_reference_fragment("ws", "thread", &reference, 0)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(fragment.text.contains("retained result"));
-            assert_eq!(fragment.reference, reference);
-            assert_eq!(
-                store
-                    .compaction_replay_item_id("ws", "thread", &reference)
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some(id)
-            );
-            for (workspace, thread) in [("other", "thread"), ("ws", "other")] {
-                assert!(
-                    store
-                        .compaction_reference_fragment(workspace, thread, &reference, 0)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
-                assert!(
-                    store
-                        .compaction_replay_item_id(workspace, thread, &reference)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
-            }
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-                "UPDATE turn_item SET payload=to_jsonb(json_build_object('storage',json_build_object('kind','shell'),'output','changed result'))::json,payload_payload_id=NULL WHERE id=$1", [id.into()]
-            )).await.unwrap();
-            assert!(
-                store
-                    .compaction_reference_fragment("ws", "thread", &reference, 0)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                store
-                    .compaction_replay_item_id("ws", "thread", &reference)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            let current = store
-                .compaction_tool_result_fragment("ws", "thread", "turn", id, None, 0)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(current.text.contains("changed result"));
-            assert_ne!(current.reference.version, reference.version);
-            db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "DELETE FROM turn_item WHERE id=$1",
-                [id.into()],
-            ))
-            .await
-            .unwrap();
-            assert!(
-                store
-                    .compaction_reference_fragment("ws", "thread", &current.reference, 0)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    }
 }
 
 async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> SourceAssertion {
@@ -288,26 +75,8 @@ async fn source_with_storage(
     };
     let db = store.database_connection();
     if portable {
-        use pioneer_crud_conversations::turn_event;
-        let prepared = pioneer_crud_payloads::storage::PreparedPayload::new(&wire).unwrap();
-        let tx = db.begin().await.unwrap();
-        turn_event::lock_stream(&tx, "turn").await.unwrap();
-        turn_event::insert(
-            &tx,
-            turn_event::NewEvent {
-                id,
-                thread_id: "thread",
-                turn_id: "turn",
-                sequence,
-                event_type: "fixture",
-                idempotency_key: id,
-                created_at: chrono::Utc::now().fixed_offset(),
-            },
-            &prepared,
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
+        pioneer_crud_compaction::plan_test_support::seed_portable_event(&db, id, sequence, &wire)
+            .await;
     } else {
         db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
             "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ($1,'thread','turn',$2,'fixture',$3::text::json,CURRENT_TIMESTAMP)",
@@ -618,7 +387,7 @@ async fn legacy_apply_ignores_coarse_epoch_changes_behind_previous_checkpoint() 
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn durable_retry_budget_and_exact_candidate_idempotency() {
+async fn exact_candidate_idempotency() {
     let store = store().await;
     let s = source(&store, "source", 1, "original").await;
     let cp = candidate(&store, "op", None, &s).await;
@@ -627,50 +396,8 @@ async fn durable_retry_budget_and_exact_candidate_idempotency() {
     forged.summary = "different result".into();
     assert!(store.compaction_save_candidate(&forged, 0).await.is_err());
     assert!(store.compaction_apply(&forged, None, &[s]).await.is_err());
-    assert!(
-        store
-            .compaction_claim_attempt("op", 0, 20, false, false)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .compaction_claim_attempt("op", 0, 20, false, false)
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .compaction_claim_attempt("op", 1, 20, true, false)
-            .await
-            .unwrap()
-    );
-    let restarted = CrudStore::new(store.database_connection());
-    assert!(
-        restarted
-            .compaction_claim_attempt("op", 2, 20, true, true)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !restarted
-            .compaction_claim_attempt("op", 3, 20, true, false)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !restarted
-            .compaction_claim_attempt("op", 3, 20, false, true)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !restarted
-            .compaction_claim_attempt("op", 3, (10 + OPERATION_MILLIS) as i64, false, false)
-            .await
-            .unwrap()
-    );
 }
+
 #[pioneer_postgres_test::postgres_test]
 async fn poison_source_progress_and_scope_are_bounded() {
     let store = store().await;

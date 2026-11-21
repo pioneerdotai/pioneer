@@ -191,6 +191,41 @@ async fn seed_runner(db: &impl ConnectionTrait) -> Result<()> {
 }
 
 #[tokio::test]
+async fn durable_retry_budget_survives_pool_reopen() -> Result<()> {
+    use pioneer_crud_compaction::operations::{compaction_claim_attempt, compaction_operation};
+
+    with_database(async |fixture| {
+        let first = fixture.connect().await?;
+        seed_runner(&first).await?;
+        assert!(compaction_claim_attempt(&first, "operation", 0, 20, false, false).await?);
+        assert!(!compaction_claim_attempt(&first, "operation", 0, 20, false, false).await?);
+        assert!(compaction_claim_attempt(&first, "operation", 1, 20, true, false).await?);
+        first.close().await?;
+
+        let restarted = fixture.connect().await?;
+        assert!(compaction_claim_attempt(&restarted, "operation", 2, 20, true, true).await?);
+        assert!(!compaction_claim_attempt(&restarted, "operation", 3, 20, true, false).await?);
+        assert!(!compaction_claim_attempt(&restarted, "operation", 3, 20, false, true).await?);
+        let operation = compaction_operation(&restarted, "operation")
+            .await?
+            .context("admitted compaction operation")?;
+        assert!(
+            !compaction_claim_attempt(
+                &restarted,
+                "operation",
+                3,
+                operation.deadline_ms,
+                false,
+                false,
+            )
+            .await?
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn runner_activation_is_idempotent_and_freezes_the_complete_manifest() -> Result<()> {
     use pioneer_compaction::SourceRef;
     use pioneer_crud_compaction::runner_repository::{ManifestEntry, compaction_runner_state};

@@ -1,6 +1,7 @@
 //! Compaction repositories that participate in the caller's transaction.
 
 pub mod background;
+pub mod canonical_history;
 pub mod checkpoint_projection;
 pub mod checkpoint_topology;
 pub mod child_history;
