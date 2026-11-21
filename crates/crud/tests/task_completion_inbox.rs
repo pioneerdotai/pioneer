@@ -848,62 +848,6 @@ async fn publication_intervals_use_operation_time_and_preserve_continuous_partic
     assert_eq!(unread(&store, B).await, 2);
 }
 
-#[pioneer_postgres_test::postgres_test]
-async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_runs() {
-    let (_dir, store, _writer) = fixture().await;
-    let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared(
-        "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<513)
-         INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at)
-         SELECT 'active-'||lpad(n::text,4,'0'),'W0000000000000000000I','workspace','W0000000000000000000I','T0000000000000000000P','system','running','Task','Goal',0,'{}'::json,'{}'::jsonb,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM ids",
-    ).await.unwrap();
-    for (suffix, status) in [("-starting", "starting"), ("-running", "running")] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
-             SELECT id || $1,id,id || $1,1,$3,$2,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM task",
-            [suffix.into(), status.into(), (if status == "starting" { 1_i64 } else { 2_i64 }).into()],
-        )).await.unwrap();
-    }
-    let principal = pioneer_protocol::PrincipalId::new(A).unwrap();
-    let first = pioneer_crud::list_running_task_scopes(
-        &db,
-        access(A).workspace_id,
-        &["T0000000000000000000P".into()],
-        &principal,
-        "",
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        first.scopes.len(),
-        512,
-        "all four scope batches must survive LIMIT"
-    );
-    assert_eq!(first.after_task_id.as_deref(), Some("active-0512"));
-    let filtered = pioneer_crud::list_running_task_scopes(
-        &db,
-        access(A).workspace_id,
-        &["missing".into()],
-        &principal,
-        "",
-    )
-    .await
-    .unwrap();
-    assert!(filtered.scopes.is_empty());
-    assert_eq!(filtered.after_task_id, first.after_task_id);
-    let second = pioneer_crud::list_running_task_scopes(
-        &db,
-        access(A).workspace_id,
-        &["T0000000000000000000P".into()],
-        &principal,
-        filtered.after_task_id.as_deref().unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(second.scopes.len(), 1);
-    assert_eq!(second.scopes[0].0.task_id, "active-0513");
-}
-
 // Durable facts are deliberately seeded independently of current Task policy.
 // Keep valid JSON while exercising unusable linkage or recipient evidence.
 async fn inbox_contracts(

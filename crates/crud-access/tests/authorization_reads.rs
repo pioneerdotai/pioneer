@@ -372,3 +372,80 @@ async fn thread_start_scope_distinguishes_missing_existing_and_parent_mismatch()
     .await
     .unwrap();
 }
+
+#[pioneer_postgres_test::postgres_test]
+async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_runs() {
+    use pioneer_crud_access::authorization_scope::list_running_task_scopes;
+    use pioneer_protocol::PrincipalId;
+
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = SqliteDatabase::new(
+        fixture.connect_read_only().await.unwrap(),
+        fixture.connection().clone(),
+    )
+    .maintenance();
+    assert!(db.reader_query_only_enabled().await.unwrap());
+    db.execute_unprepared(
+        "INSERT INTO gateway_identity(id,singleton_key,identity_bootstrap_version)
+             VALUES('G00000000000000000001',1,1);
+         INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key)
+             VALUES('P0000000000000000000A','G00000000000000000001','user','member','active','A','a','a');
+         INSERT INTO workspace(id,name,is_active,is_current)
+             VALUES('W0000000000000000000I','Inbox',TRUE,FALSE);
+         INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class)
+             VALUES('T0000000000000000000P','W0000000000000000000I','Public thread','','agent','m','p','active','user','workspace');
+         INSERT INTO workspace_membership
+             (principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at)
+             VALUES('P0000000000000000000A','W0000000000000000000I','system',now(),now());",
+    ).await.unwrap();
+    db.execute_unprepared(
+        "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<513)
+         INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at)
+         SELECT 'active-'||lpad(n::text,4,'0'),'W0000000000000000000I','workspace','W0000000000000000000I','T0000000000000000000P','system','running','Task','Goal',0,'{}'::json,'{}'::jsonb,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM ids",
+    ).await.unwrap();
+    for (suffix, status) in [("-starting", "starting"), ("-running", "running")] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
+             SELECT id || $1,id,id || $1,1,$3,$2,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM task",
+            [suffix.into(), status.into(), (if status == "starting" { 1_i64 } else { 2_i64 }).into()],
+        )).await.unwrap();
+    }
+    let principal = PrincipalId::new("P0000000000000000000A").unwrap();
+    let first = list_running_task_scopes(
+        &db,
+        "W0000000000000000000I",
+        &["T0000000000000000000P".into()],
+        &principal,
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.scopes.len(),
+        512,
+        "all four scope batches must survive LIMIT"
+    );
+    assert_eq!(first.after_task_id.as_deref(), Some("active-0512"));
+    let filtered = list_running_task_scopes(
+        &db,
+        "W0000000000000000000I",
+        &["missing".into()],
+        &principal,
+        "",
+    )
+    .await
+    .unwrap();
+    assert!(filtered.scopes.is_empty());
+    assert_eq!(filtered.after_task_id, first.after_task_id);
+    let second = list_running_task_scopes(
+        &db,
+        "W0000000000000000000I",
+        &["T0000000000000000000P".into()],
+        &principal,
+        filtered.after_task_id.as_deref().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.scopes.len(), 1);
+    assert_eq!(second.scopes[0].0.task_id, "active-0513");
+}
