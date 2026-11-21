@@ -421,6 +421,14 @@ impl AuthorityBoundProvider {
         {
             catalog.enrich_for_tool_scope(self.inner.name(), &mut models, self.use_public_catalog);
         }
+        // Display labels can use the public snapshot without borrowing runtime
+        // metadata from it (notably for Vercel's authority-native discovery).
+        if self.use_public_catalog
+            && !matches!(self.inner.name(), "local" | "custom")
+            && let Some(catalog) = catalog
+        {
+            catalog.enrich_picker_text(self.inner.name(), &mut models);
+        }
         if purpose == ModelPurpose::Chat {
             for model in &mut models {
                 model.service_modes = if self.use_public_catalog {
@@ -1845,7 +1853,7 @@ mod tests {
                 "id":"fixture-native-model","name":"Fixture","provider":"openai",
                 "api":"openai-responses","baseUrl":"https://api.openai.com/v1",
                 "contextWindow":4096,"maxTokens":1024,"reasoning":false,"input":["text"],"cost":{},
-                "sourceMetadata":{"type":"chat","api":{"chat-completions":{}},
+                "sourceMetadata":{"description":"Catalog description","type":"chat","api":{"chat-completions":{}},
                     "modalities":{"input":["text"],"output":["text"]}}
             }}})
             .to_string(),
@@ -1869,11 +1877,19 @@ mod tests {
         let public = wrapper(true);
         let private = wrapper(false);
         let mut model = crate::catalog::tool_tests::discovered("fixture-native-model", Some(false));
+        model.name = Some("Native name".into());
+        model.description = Some("Native description".into());
+        let selected =
+            public.select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name.as_deref(), Some("Fixture"));
         assert_eq!(
-            public
-                .select_discovery(ModelPurpose::Chat, vec![model.clone()], Some(&catalog))
-                .len(),
-            1
+            selected[0].description.as_deref(),
+            Some("Catalog description")
+        );
+        assert_eq!(
+            public.input_admission.model(&model.id).unwrap().name,
+            model.name
         );
         assert!(
             private
@@ -1894,12 +1910,13 @@ mod tests {
                 .is_empty()
         );
         model.capabilities.chat = Some(true);
-        assert_eq!(
-            private
-                .select_discovery(ModelPurpose::Chat, vec![model.clone()], None)
-                .len(),
-            1
-        );
+        for (authority, snapshot) in [(&private, Some(&catalog)), (&public, None)] {
+            let selected =
+                authority.select_discovery(ModelPurpose::Chat, vec![model.clone()], snapshot);
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].name, model.name);
+            assert_eq!(selected[0].description, model.description);
+        }
         model.capabilities.chat = Some(false);
         assert!(
             public
@@ -2588,7 +2605,7 @@ mod tests {
 
     #[test]
     fn vercel_authority_discovery_preserves_unknowns_against_public_catalog() {
-        let raw = serde_json::json!({"id":"private/model","type":"language","tags":["tool-use"],"context_window":12345,"max_tokens":500,"modalities":{"input":["text","image"],"output":["text"]},"pricing":{"input":"0.000002"}});
+        let raw = serde_json::json!({"id":"private/model","name":"Catalog title","description":"Catalog description","type":"language","tags":["tool-use"],"context_window":12345,"max_tokens":500,"modalities":{"input":["text","image"],"output":["text"]},"pricing":{"input":"0.000002"}});
         let model = crate::catalog::generator::vercel_model(&raw).unwrap();
         let catalog = crate::catalog::ModelCatalog::parse(
             &serde_json::json!({"vercel-ai-gateway":{"private/model":model}}).to_string(),
@@ -2611,12 +2628,25 @@ mod tests {
         native.limits = Default::default();
         native.pricing = None;
         native.capabilities.input_modalities = None;
+        native.capabilities.chat = Some(true);
         let mut models = vec![native];
         wrapper.enrich_discovery(&catalog, &mut models);
         assert!(models[0].limits.context_window.is_none());
         assert!(models[0].pricing.is_none());
         assert!(models[0].capabilities.input_modalities.is_none());
         assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(models[0].description.is_none());
+
+        let selected =
+            wrapper.select_discovery(crate::selection::ModelPurpose::Chat, models, Some(&catalog));
+        assert_eq!(selected[0].name.as_deref(), Some("Catalog title"));
+        assert_eq!(
+            selected[0].description.as_deref(),
+            Some("Catalog description")
+        );
+        assert!(selected[0].limits.context_window.is_none());
+        assert!(selected[0].pricing.is_none());
+        assert!(selected[0].capabilities.input_modalities.is_none());
     }
 
     struct ToolDiscoveryProvider;
