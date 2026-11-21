@@ -3203,9 +3203,7 @@ pub(crate) async fn compaction_tool_result_fragment(
     if let Some(source) = source {
         // Malformed legacy JSON did not satisfy the old json_valid predicate.
         // Portable integrity failures have already propagated from hydration.
-        if super::turn_payload::json1_value(&source.payload).is_ok_and(|payload| {
-            payload.pointer("/storage/kind").and_then(|v| v.as_str()) == Some("shell")
-        }) {
+        if super::turn_payload::shell_storage(&source.payload).unwrap_or(false) {
             return store
                 .compaction_payload_fragment(
                     workspace,
@@ -4013,11 +4011,7 @@ async fn read_shell_item(
                 inline,
             )
             .await?;
-            let value = super::turn_payload::json1_value(&payload)?;
-            let is_shell = value
-                .pointer("/storage/kind")
-                .and_then(|kind| kind.as_str())
-                == Some("shell");
+            let is_shell = super::turn_payload::shell_storage(&payload)?;
             Ok(is_shell.then_some((id, item, revision)))
         })
         .await
