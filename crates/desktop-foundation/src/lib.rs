@@ -60,3 +60,6 @@ pub use settings_surface::{settings_divider, settings_group, settings_row, setti
 
 mod catalog_list;
 pub use catalog_list::reconcile_catalog_list;
+
+mod model_picker;
+pub use model_picker::{ApiProviderTitle, ModelPicker, ModelPickerChange, ModelPickerInput};

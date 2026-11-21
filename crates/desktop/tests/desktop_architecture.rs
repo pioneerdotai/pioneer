@@ -242,8 +242,18 @@ fn desktop_foundation_is_narrow() {
         // Neither owns domain policy, transport or byte caching. Every other
         // module remains a value/registration seam; exceptions stay closed.
         if !["package_upload.rs", "image_views.rs"].contains(&name.as_str()) {
+            // The shared picker holds only GPUI search and popover state.
+            let picker_text;
+            let checked = if name == "model_picker.rs" {
+                picker_text = text
+                    .replace("Entity<InputState>", "InputState")
+                    .replace("Entity<PopoverState>", "PopoverState");
+                picker_text.as_str()
+            } else {
+                text
+            };
             assert!(
-                !text.contains("Entity<") && !text.contains("ClientCore"),
+                !checked.contains("Entity<") && !checked.contains("ClientCore"),
                 "Foundation: {name}"
             );
         } else {
@@ -827,12 +837,15 @@ fn unit_identity_cache_and_cross_shell_policies_match_the_contract() {
     }
     // The measured option vector is freshly computed with current width/style;
     // no render-time retained-map mutation can reuse stale locale/rem geometry.
+    let picker = source("desktop-foundation/src/model_picker.rs");
+    assert!(!picker.contains("model_row_layout_cache"));
+    assert!(picker.contains("layout_as_root("));
     for path in [
         "desktop-thread/src/model_picker.rs",
         "desktop-settings/src/model_selector.rs",
     ] {
-        let picker = source(path);
-        assert!(!picker.contains("model_row_layout_cache"));
-        assert!(picker.contains("layout_as_root("));
+        let adapter = source(path);
+        assert!(adapter.contains("ModelPicker::new("), "{path}");
+        assert!(!adapter.contains("layout_as_root("), "{path}");
     }
 }

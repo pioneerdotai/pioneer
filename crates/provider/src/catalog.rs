@@ -370,6 +370,38 @@ impl ModelCatalog {
         self.models.get(&provider)?.get(id)
     }
 
+    /// Overlay display text only, for models already admitted by discovery.
+    pub(crate) fn enrich_picker_text(&self, provider: &str, models: &mut [ProviderModelInfo]) {
+        let Some(entries) = self.models.get(&catalog_provider(provider)) else {
+            return;
+        };
+        for model in models {
+            let Some(entry) = entries.get(&model.id) else {
+                continue;
+            };
+            let name = entry.name.trim();
+            let native_has_label = model
+                .name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&model.id));
+            // A catalog name synthesized from the ID should not erase a label.
+            if !name.is_empty() && (!name.eq_ignore_ascii_case(&model.id) || !native_has_label) {
+                model.name = Some(name.to_owned());
+            }
+            if let Some(description) = entry
+                .metadata
+                .get("sourceMetadata")
+                .and_then(|source| source.get("description"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                model.description = Some(description.to_owned());
+            }
+        }
+    }
+
     pub fn limits(&self, provider: &str, id: &str) -> CatalogLimits {
         let Some(model) = self.model(provider, id) else {
             return CatalogLimits {
@@ -803,6 +835,65 @@ mod tests {
                 "inputLimit":{"value":24000,"origin":{"kind":"source","expression":"provider input"}}
             }}}).to_string(),
         ).unwrap()
+    }
+
+    #[test]
+    fn picker_text_resolves_name_and_description_independently() {
+        let id = "aurora-unlisted-927";
+        let mut catalog = reasoning_catalog(serde_json::json!({}));
+        for (catalog_name, catalog_description, expected_name, expected_description) in [
+            (
+                " Catalog name ",
+                serde_json::json!("  "),
+                "Catalog name",
+                "Native description",
+            ),
+            (
+                id,
+                serde_json::json!(" Catalog description "),
+                "Native name",
+                "Catalog description",
+            ),
+            (
+                "  ",
+                serde_json::json!(42),
+                "Native name",
+                "Native description",
+            ),
+        ] {
+            let entry = catalog
+                .models
+                .get_mut("openai")
+                .unwrap()
+                .get_mut(id)
+                .unwrap();
+            entry.name = catalog_name.into();
+            entry.metadata.insert(
+                "sourceMetadata".into(),
+                serde_json::json!({"description":catalog_description}),
+            );
+            let native = |id: &str| {
+                let mut model = tool_tests::discovered(id, Some(false));
+                model.name = Some("Native name".into());
+                model.description = Some("Native description".into());
+                model
+            };
+            let mut models = [native(id), native("aurora-unlisted-928")];
+            catalog.enrich_picker_text("openai", &mut models);
+            assert_eq!(models[0].id, id);
+            assert_eq!(models[0].name.as_deref(), Some(expected_name));
+            assert_eq!(models[0].description.as_deref(), Some(expected_description));
+            assert_eq!(models[0].capabilities.tool_calling, Some(false));
+            assert_eq!(models[1].name.as_deref(), Some("Native name"));
+            assert_eq!(models[1].description.as_deref(), Some("Native description"));
+            let mut other_provider = [native(id)];
+            catalog.enrich_picker_text("anthropic", &mut other_provider);
+            assert_eq!(other_provider[0].name.as_deref(), Some("Native name"));
+            assert_eq!(
+                other_provider[0].description.as_deref(),
+                Some("Native description")
+            );
+        }
     }
 
     #[test]

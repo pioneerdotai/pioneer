@@ -772,7 +772,8 @@ impl DesktopShellView {
                 client,
             )),
             Arc::new(crate::thread_platform::DesktopThreadExternalNavigationPort),
-        );
+        )
+        .with_api_provider_title(pioneer_desktop_providers::api_provider_title);
         let thread = pioneer_desktop_thread::ThreadView::new(config, window, cx);
         self.thread_events = Some(cx.subscribe_in(
             &thread,

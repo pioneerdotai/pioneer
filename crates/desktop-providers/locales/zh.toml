@@ -357,6 +357,11 @@ description = "本地 vLLM 兼容 OpenAI API"
 title = "OSaurus"
 description = "本地 OSaurus 兼容 OpenAI API"
 
+[providers.catalog.custom]
+title = "自定义"
+
+[providers.catalog.local]
+title = "本地"
 
 [buttons]
 ok = "OK"
