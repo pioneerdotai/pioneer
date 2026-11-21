@@ -76,7 +76,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     # swapon acts on the runner VM. Only this setup service needs the capability.
     services:
-      swap:
+      swap: &linux-swap
         image: *linux-image
         credentials: *linux-registry-credentials
         volumes:
@@ -215,27 +215,35 @@ jobs:
             echo "::error::Build container swap limit is too low ($swap_limit bytes)"
             exit 1
           fi
+          mkdir -p target/ci-nextest
           /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use --timings \
-            --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
+            --archive-file target/ci-nextest/nextest-tests.tar.zst
 
       - name: build-postgres-test-runner
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked -p pioneer-postgres-test
-          cp target/debug/pioneer-postgres-test "$RUNNER_TEMP/pioneer-postgres-test"
+          cp target/debug/pioneer-postgres-test target/ci-nextest/pioneer-postgres-test
+          test -s target/ci-nextest/nextest-tests.tar.zst
+          test -x target/ci-nextest/pioneer-postgres-test
 
       - name: upload-workspace-tests
         id: upload-tests
         uses: actions/upload-artifact@v4
         with:
           name: linux-nextest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/nextest-tests.tar.zst
-            ${{ runner.temp }}/pioneer-postgres-test
+          # A single relative directory keeps both files at the ZIP root in
+          # both container and host jobs.
+          path: target/ci-nextest/
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+
+      - name: remove-nextest-staging-files
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: rm -f target/ci-nextest/nextest-tests.tar.zst target/ci-nextest/pioneer-postgres-test
 
       - name: upload-cargo-timings
         if: ${{ !cancelled() }}
@@ -256,8 +264,9 @@ jobs:
       packages: read
     timeout-minutes: 180
     env: *linux-env
-    services: &postgres-test-services
-      postgres:
+    services:
+      swap: *linux-swap
+      postgres: &postgres-test-service
         image: pgvector/pgvector:0.8.7-pg18-trixie
         env:
           POSTGRES_USER: pioneer_test
@@ -293,8 +302,12 @@ jobs:
 
       # A separate Cargo invocation keeps CU features out of these server owners.
       - name: cargo-nextest-default-server-contracts
-        env: &postgres-test-env
+        env:
           PIONEER_TEST_POSTGRES_ADMIN_URL: &postgres-test-url postgresql://pioneer_test:pioneer_test@postgres:5432/postgres
+          # This also links the large Gateway test binary. Limit concurrent
+          # Cargo builds as in the archive job while retaining two test threads.
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
         shell: bash
         run: |
           set -euo pipefail
@@ -316,7 +329,8 @@ jobs:
       packages: read
     timeout-minutes: 180
     env: *linux-env
-    services: *postgres-test-services
+    services:
+      postgres: *postgres-test-service
 
     steps:
       - *linux-checkout
@@ -331,7 +345,8 @@ jobs:
       - *linux-bindgen
 
       - name: cargo-test-doctests
-        env: *postgres-test-env
+        env:
+          PIONEER_TEST_POSTGRES_ADMIN_URL: *postgres-test-url
         shell: bash
         run: |
           set -euo pipefail
@@ -347,7 +362,8 @@ jobs:
       packages: read
     timeout-minutes: 180
     env: *linux-env
-    services: *postgres-test-services
+    services:
+      postgres: *postgres-test-service
     strategy:
       fail-fast: false
       matrix:
