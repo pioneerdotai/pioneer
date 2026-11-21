@@ -5732,13 +5732,14 @@ impl MessageProcessor {
                 }
                 let event_timestamp = now_timestamp_secs();
                 let item_id = notification.item.item_id().to_owned();
-                let deadlines = self
-                    .timeout_supervisor
-                    .deadlines_for_item(&notification.item, event_timestamp);
+                let deadlines = (!notification.item.is_provider_usage_observation()).then(|| {
+                    self.timeout_supervisor
+                        .deadlines_for_item(&notification.item, event_timestamp)
+                });
                 if let Err(error) = message_future(self.materialize_native_agent_turn_event(
                     pioneer_crud::CanonicalTurnEventPayload::ItemStarted(notification.clone()),
                     event_timestamp,
-                    Some(deadlines),
+                    deadlines,
                 ))
                 .await
                 {
@@ -5768,7 +5769,7 @@ impl MessageProcessor {
                     turn_id = notification.turn_id,
                     item_id,
                     item_type = ?notification.item.item_type(),
-                    "registered item attempt deadlines during item/started projection"
+                    "persisted item/started projection"
                 );
                 true
             }),

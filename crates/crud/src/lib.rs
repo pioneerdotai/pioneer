@@ -28619,6 +28619,7 @@ impl CrudStore {
         let rows = pioneer_entity::turn_item_attempt::Entity::find()
             .filter(pioneer_entity::turn_item_attempt::Column::Status.eq(ATTEMPT_STATUS_RUNNING))
             .filter(pioneer_entity::turn_item_attempt::Column::ExecutionClass.is_not_null())
+            .filter(turn_item_attempt::watchdog_eligible_attempt())
             .filter(
                 Condition::any()
                     .add(pioneer_entity::turn_item_attempt::Column::LeaseExpiresAt.is_null())

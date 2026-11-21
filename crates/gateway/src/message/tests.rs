@@ -91382,6 +91382,20 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
             ),
         }
     };
+    let abandoned = make_item("usage-abandoned", None, None, false);
+    assert!(
+        processor
+            .handle_durable_agent_event(AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: abandoned.clone(),
+                },
+            })
+            .await
+    );
+
     let mut restored = Vec::new();
     for (id, input, output, complete) in [
         ("usage-failed", Some(100), Some(2), false),
@@ -91417,6 +91431,55 @@ async fn provider_usage_items_persist_idempotently_without_entering_llm_history(
     assert_eq!(totals.known_input_tokens, 220);
     assert_eq!(totals.known_output_tokens, 2);
     assert_eq!(totals.missing_input_attempts, 1);
+
+    let now = chrono::Utc::now().timestamp();
+    let timeout_scope = pioneer_crud::GatewayControlWake::Timeouts;
+    assert_eq!(
+        store
+            .next_gateway_control_deadline_for(&timeout_scope, now)
+            .await
+            .unwrap(),
+        None,
+        "an unfinished usage observation must not schedule a watchdog wake"
+    );
+    // Simulate a persisted deadline from a Gateway running the old policy.
+    assert!(
+        store
+            .configure_turn_item_attempt_deadlines(
+                turn,
+                abandoned.item_id(),
+                now,
+                Some(now + 30),
+                Some(now + 30),
+                Some(now + 120),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .next_gateway_control_deadline_for(&timeout_scope, now)
+            .await
+            .unwrap(),
+        None,
+        "a persisted usage deadline must not schedule a watchdog wake"
+    );
+    let (timed_out, _) = processor
+        .poll_timeout_candidate_page_for_turn(turn, now + 121, 64, None)
+        .await
+        .unwrap();
+    assert!(timed_out.is_empty());
+    assert_eq!(store.count_recovery_jobs_for_turn(turn).await.unwrap(), 0);
+    let (_, persisted_turn) = store.get_turn(thread, turn).await.unwrap().unwrap();
+    assert_eq!(persisted_turn.status, TurnStatus::InProgress);
+    assert_eq!(
+        store
+            .get_turn_item(turn, abandoned.item_id())
+            .await
+            .unwrap(),
+        Some(abandoned)
+    );
+
     let context = store
         .compaction_source_page(
             &workspace,
