@@ -5549,6 +5549,18 @@ impl TurnItem {
         }
     }
 
+    pub fn is_provider_usage_observation(&self) -> bool {
+        matches!(
+            self,
+            Self::SystemEvent {
+                code: Some(code),
+                details: Some(details),
+                ..
+            } if code == "provider_usage"
+                && details["nativeMethod"] == "provider/usage/observed"
+        )
+    }
+
     /// Classifies execution once at the canonical item boundary. Supervisors
     /// consume the class persisted on the attempt and never need to infer
     /// operational semantics from presentation payloads.

@@ -43,6 +43,9 @@ pub struct DurableCommitRejection {
 }
 
 impl DurableCommitRejection {
+    pub const EXECUTION_WINDOW_START_PROJECTION_PENDING: &'static str =
+        "execution_window_start_projection_pending";
+
     pub const fn retryable(code: &'static str, message: &'static str) -> Self {
         Self {
             kind: DurableCommitRejectionKind::Retryable,

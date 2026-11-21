@@ -5,7 +5,7 @@ use pioneer_protocol::{
     TurnStatus,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, Func};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
     QuerySelect, Set,
@@ -454,6 +454,29 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
+/// Match the original start payload, which is retained for running and timed-out attempts.
+pub(crate) fn watchdog_eligible_attempt() -> Expr {
+    use turn_item_attempt::Column;
+
+    let payload = Expr::col(Column::Payload);
+    let is_system_event_with_json = Condition::all()
+        .add(Column::ItemType.eq(turn_item_type_to_db(TurnItemType::SystemEvent)))
+        .add(Expr::expr(
+            Func::cust(Alias::new("json_valid")).arg(payload.clone()),
+        ));
+    let field = |path: &str| {
+        Expr::expr(Func::cust(Alias::new("json_extract")).args([payload.clone(), Expr::val(path)]))
+    };
+    // Keep this marker aligned with TurnItem::is_provider_usage_observation.
+    let usage = field("$.code")
+        .eq("provider_usage")
+        .and(field("$.details.nativeMethod").eq("provider/usage/observed"));
+    let eligible = Expr::case(usage, false).finally(true);
+    Expr::case(is_system_event_with_json, Expr::expr(eligible))
+        .finally(true)
+        .into()
+}
+
 pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -511,6 +534,7 @@ pub(crate) async fn list_expired_running_attempt_page_scoped<C: ConnectionTrait>
         // Legacy attempts remain non-destructive until the background data
         // migration has assigned their authoritative execution class.
         .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
+        .filter(watchdog_eligible_attempt())
         .filter(
             Expr::col(turn_item_attempt::Column::HardDeadlineAt)
                 .lte(now)
@@ -973,6 +997,7 @@ pub async fn list_running_attempts_for_turn<C: ConnectionTrait>(
     let rows = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_item_attempt::Column::Status.eq(running))
+        .filter(watchdog_eligible_attempt())
         .order_by_asc(turn_item_attempt::Column::AttemptNumber)
         .all(db)
         .await
@@ -1311,6 +1336,7 @@ pub async fn list_timed_out_without_recovery_page<C: ConnectionTrait>(
     let mut query = turn_item_attempt::Entity::find()
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
         .filter(turn_item_attempt::Column::ExecutionClass.is_not_null())
+        .filter(watchdog_eligible_attempt())
         .filter(turn_item_attempt::Column::RecoveryAction.is_null())
         .filter(turn_item_attempt::Column::RecoverySuppressedReason.is_null());
     if let Some(after) = after {

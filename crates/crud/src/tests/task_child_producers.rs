@@ -202,22 +202,33 @@ async fn unknown_occurrence_generation_recovers_untracked_terminal_after_seed_eo
             .is_none()
     );
     assert!(!store.task_occurrence_tracking_is_typed().await.unwrap());
-    let now = chrono::Utc::now().timestamp();
+    // Discovery runs the compatibility audit before reading the due queue.
+    // Use the persisted deadline for the next pass, as the worker does.
+    let _ = store
+        .discover_task_run_occurrence_reconcile(AT, 32)
+        .await
+        .unwrap();
+    let due_at = parents::Entity::find_by_id(&run.id)
+        .one(&store.connection)
+        .await
+        .unwrap()
+        .expect("compatibility audit must replace missed producer")
+        .next_attempt_at;
     let candidates = store
-        .discover_task_run_occurrence_reconcile(now, 32)
+        .discover_task_run_occurrence_reconcile(due_at, 32)
         .await
         .unwrap();
     let candidate = candidates
         .iter()
         .find(|row| row.run_id == run.id)
-        .expect("compatibility audit must replace missed producer");
+        .expect("the replacement ticket must be discoverable at its deadline");
     let claim = store
-        .claim_task_run_occurrence_reconcile(candidate, &|| now)
+        .claim_task_run_occurrence_reconcile(candidate, &|| due_at)
         .await
         .unwrap()
         .unwrap();
     let outcome = store
-        .reconcile_claimed_task_run_occurrence(&claim, now)
+        .reconcile_claimed_task_run_occurrence(&claim, due_at)
         .await
         .unwrap();
     assert_eq!(outcome, TaskRunOccurrenceTerminalizationOutcome::Changed);
