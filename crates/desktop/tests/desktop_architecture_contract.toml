@@ -25,8 +25,8 @@ custom_elements = ["desktop-thread/src/timeline/markdown.rs:MarkdownLinkText"]
 # Catalog presentation: native MCP / Plugins headers and sidebar slots.
 # ImageViews: shared plugin catalogue / composer / timeline presentation leases.
 # Image publication and bounded byte/disk caching remain owned by Client.
-foundation_modules = ["avatar", "image_surface", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation", "catalog_details_header", "catalog_icon", "catalog_card", "image_views", "catalog_summary_card", "settings_surface", "catalog_list"]
-foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_card.rs", "catalog_details_header.rs", "catalog_icon.rs", "catalog_list.rs", "catalog_presentation.rs", "catalog_summary_card.rs", "identity.rs", "image_surface.rs", "image_views.rs", "lib.rs", "package_upload.rs", "settings_surface.rs"]
+foundation_modules = ["avatar", "image_surface", "binding", "catalog_binding", "identity", "package_upload", "catalog_presentation", "catalog_details_header", "catalog_icon", "catalog_card", "image_views", "catalog_summary_card", "settings_surface", "catalog_list", "model_picker"]
+foundation_sources = ["avatar.rs", "binding.rs", "catalog_binding.rs", "catalog_card.rs", "catalog_details_header.rs", "catalog_icon.rs", "catalog_list.rs", "catalog_presentation.rs", "catalog_summary_card.rs", "identity.rs", "image_surface.rs", "image_views.rs", "lib.rs", "model_picker.rs", "package_upload.rs", "settings_surface.rs"]
 # Framework creates this transient host through on_drag's Entity<W: Render> API.
 # Its value preview has no retained UI behavior or cache.
 framework_hosts = ["desktop-workspaces/src/drag_preview.rs:SidebarDragSession"]
@@ -154,7 +154,7 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-26" = { kind = "Entity", owner = "TimelineRowView", symbol = "WorkItemBodyView", file = "desktop-thread/src/timeline/row_view.rs" }
 "TUI-27" = { kind = "Entity", owner = "ThreadView", symbol = "ComposerView", file = "desktop-thread/src/composer/owner.rs" }
 "TUI-28" = { kind = "Behavior", owner = "ComposerView", symbol = "TextareaState", file = "desktop-thread/src/composer/owner.rs" }
-"TUI-29" = { kind = "Behavior", owner = "ComposerView", symbol = "Popover", file = "desktop-thread/src/model_picker.rs" }
+"TUI-29" = { kind = "Behavior", owner = "ComposerView", symbol = "Popover", file = "desktop-foundation/src/model_picker.rs" }
 "TUI-30" = { kind = "Entity", owner = "ComposerView", symbol = "VoiceInputView", file = "desktop-thread/src/composer/voice_owner.rs" }
 "TUI-31" = { kind = "Entity", owner = "ThreadView", symbol = "ThreadArtifactsView", file = "desktop-thread/src/artifacts/mod.rs" }
 "TUI-32" = { kind = "RenderOnce", owner = "ThreadArtifactsView", symbol = "ArtifactImagePreview", file = "desktop-thread/src/artifacts/view.rs" }
@@ -168,7 +168,7 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-40" = { kind = "RenderOnce", owner = "SettingsView", symbol = "DeviceActivationForm", file = "desktop-settings/src/device_activation_form.rs" }
 "TUI-41" = { kind = "Entity", owner = "SettingsView", symbol = "ProgressIndicatorView", file = "desktop-settings/src/progress.rs" }
 "TUI-42" = { kind = "Behavior", owner = "Root", symbol = "gpui_kit::open_window", file = "desktop/src/client_runtime/mod.rs" }
-"TUI-43" = { kind = "Behavior", owner = "Root", symbol = "Popover", file = "desktop-thread/src/model_picker.rs" }
+"TUI-43" = { kind = "Behavior", owner = "Root", symbol = "Popover", file = "desktop-foundation/src/model_picker.rs" }
 "TUI-44" = { kind = "Behavior", owner = "Root", symbol = "gpui_kit::init", file = "desktop/src/main.rs" }
 "TUI-45" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
 "TUI-46" = { kind = "RenderOnce", owner = "owning feature", symbol = "AvatarSurface", file = "desktop-foundation/src/avatar.rs" }

@@ -111,8 +111,16 @@ impl ComposerView {
             return;
         };
         let registrar = self.thread_bindings.registrar();
+        let api_provider_title = self.api_provider_title;
         let view = cx.new(|cx| {
-            crate::model_picker::ComposerModelPickerView::new(client, registrar, input, window, cx)
+            crate::model_picker::ComposerModelPickerView::new(
+                client,
+                registrar,
+                input,
+                api_provider_title,
+                window,
+                cx,
+            )
         });
         view.update(cx, |view, cx| view.open(window, cx));
         self.composer_model_picker = Some(view);

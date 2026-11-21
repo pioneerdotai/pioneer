@@ -357,6 +357,11 @@ description = "स्थानीय vLLM OpenAI-संगत API"
 title = "OSaurus"
 description = "स्थानीय OSaurus OpenAI-संगत API"
 
+[providers.catalog.custom]
+title = "कस्टम"
+
+[providers.catalog.local]
+title = "स्थानीय"
 
 [buttons]
 ok = "OK"

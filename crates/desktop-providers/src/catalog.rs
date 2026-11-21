@@ -12,12 +12,22 @@ impl ProviderCatalogEntry {
     }
 
     pub(super) fn title(&self) -> String {
-        t!(format!("providers.catalog.{}.title", self.id)).to_string()
+        api_provider_title(self.id).unwrap_or_else(|| self.id.to_owned())
     }
 
     pub(super) fn description(&self) -> String {
         t!(format!("providers.catalog.{}.description", self.id)).to_string()
     }
+}
+
+/// Look up the UI title without changing the ID used to select the provider.
+pub fn api_provider_title(provider_id: &str) -> Option<String> {
+    let id = client_provider_catalog::canonical_provider_id(provider_id);
+    crate::_rust_i18n_try_translate(
+        &rust_i18n::locale(),
+        format!("providers.catalog.{id}.title"),
+    )
+    .map(|title| title.into_owned())
 }
 
 pub(super) fn provider_catalog_entries() -> impl Iterator<Item = ProviderCatalogEntry> {

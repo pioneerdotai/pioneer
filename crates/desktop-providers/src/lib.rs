@@ -17,6 +17,7 @@ mod providers;
 mod queries;
 mod sidebar;
 mod view;
+pub use catalog::api_provider_title;
 pub use ports::{
     ProviderAvatarPort, ProviderCredentialPort, ProviderEffectCompletion, ProviderEffectIdentity,
     ProviderExternalNavigationPort, ProviderModelPickerPort, ProviderModelPickerRequest,

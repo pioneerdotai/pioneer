@@ -1,38 +1,30 @@
-use crate::binding::SettingsBinding;
 use crate::{
+    binding::SettingsBinding,
     buttons::{default_outline_button, default_primary_button},
     screen::SettingsScreenView,
 };
-use gpui_kit::component::{
-    Icon,
-    dialog::DialogFooter,
-    form::{Field, field, v_form},
-    input::{Input, InputState},
-    popover::{Popover, PopoverState},
-    scroll::Scrollbar,
-    separator::Separator,
-    theme::ActiveTheme,
+use gpui_kit::{
+    component::{Root, dialog::DialogFooter},
+    prelude::*,
     *,
 };
-use gpui_kit::{prelude::*, *};
 pub(crate) use pioneer_client::composer::model_selection::ModelSelectorSelection;
-use pioneer_client::providers::list::{ProviderModelSelectorMode, ProviderModelSelectorState};
-use pioneer_client::providers::presentation as provider_presentation;
-use pioneer_client::settings::model_picker::{
-    SettingsModelPickerIntent, SettingsModelPickerPublication,
+use pioneer_client::{
+    core::{ClientCore, ClientScope},
+    providers::{list::ProviderModelSelectorMode, presentation},
+    settings::model_picker::{SettingsModelPickerIntent, SettingsModelPickerPublication},
 };
-use pioneer_client::settings::types::ProviderModelInfo;
+use pioneer_desktop_foundation::{
+    ApiProviderTitle, ClientBindingRegistrar, ModelPicker, ModelPickerChange, ModelPickerInput,
+};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
-
-/// Minimum height of a model row in the virtual list (in pixels).
-const MODEL_ROW_MIN_HEIGHT: f32 = 32.0;
-/// Maximum visible height for the model virtual list.
-const MODEL_LIST_MAX_HEIGHT: f32 = 260.0;
-/// Fallback width of selector popovers before trigger width is measured.
-const SELECTOR_POPOVER_FALLBACK_WIDTH: f32 = 380.0;
 
 type ModelSelectorSaveCallback = Rc<
     dyn Fn(
@@ -41,41 +33,44 @@ type ModelSelectorSaveCallback = Rc<
         &mut Context<SettingsScreenView>,
     ) -> bool,
 >;
+type SaveSelection = Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>;
+type PickerPublication = Rc<RefCell<Arc<SettingsModelPickerPublication>>>;
 
 pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) title: String,
     pub(crate) selected_provider: Option<String>,
     pub(crate) selected_model: Option<String>,
     pub(crate) selected_reasoning_effort: Option<String>,
-    pub selected_context_window: Option<u64>,
-    pub selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
-    pub selected_context_authority: Option<String>,
+    pub(crate) selected_context_window: Option<u64>,
+    pub(crate) selected_service_mode: Option<pioneer_protocol::NativeServiceModeSelection>,
+    pub(crate) selected_context_authority: Option<String>,
     pub(crate) mode: ProviderModelSelectorMode,
     pub(crate) workspace_id: String,
-    pub(crate) client: std::sync::Arc<pioneer_client::core::ClientCore>,
+    pub(crate) client: Arc<ClientCore>,
     pub(crate) on_save: ModelSelectorSaveCallback,
 }
 
-/// Existing model dialog shared through Desktop's composition ports.
-/// The caller owns persistence; this dialog owns only the catalog selection.
+/// Settings-backed picker session. The caller owns persistence of the selection.
 pub struct SharedModelSelectorOptions {
     title: String,
     workspace_id: String,
-    client: std::sync::Arc<pioneer_client::core::ClientCore>,
-    bindings: std::sync::Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
+    client: Arc<ClientCore>,
+    bindings: Arc<dyn ClientBindingRegistrar>,
+    on_save: SaveSelection,
+    on_refresh: Rc<dyn Fn(&mut App)>,
     selection: ModelSelectorSelection,
     mode: ProviderModelSelectorMode,
     fixed_provider: bool,
-    on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
-    on_refresh: Rc<dyn Fn(&mut App)>,
+    api_provider_title: Option<ApiProviderTitle>,
 }
+
 impl SharedModelSelectorOptions {
     pub fn new(
         title: String,
         workspace_id: String,
-        client: std::sync::Arc<pioneer_client::core::ClientCore>,
-        bindings: std::sync::Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
-        on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
+        client: Arc<ClientCore>,
+        bindings: Arc<dyn ClientBindingRegistrar>,
+        on_save: SaveSelection,
     ) -> Self {
         Self {
             title,
@@ -83,10 +78,11 @@ impl SharedModelSelectorOptions {
             client,
             bindings,
             on_save,
+            on_refresh: Rc::new(|_| {}),
             selection: ModelSelectorSelection::default(),
             mode: ProviderModelSelectorMode::Chat,
             fixed_provider: false,
-            on_refresh: Rc::new(|_| {}),
+            api_provider_title: None,
         }
     }
     pub fn selection(mut self, selection: ModelSelectorSelection) -> Self {
@@ -105,14 +101,10 @@ impl SharedModelSelectorOptions {
         self.on_refresh = callback;
         self
     }
-}
-
-pub fn open_shared_model_selector(
-    options: SharedModelSelectorOptions,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    ModelSelectorDialog::open(options, window, cx);
+    pub fn with_api_provider_title(mut self, title: Option<ApiProviderTitle>) -> Self {
+        self.api_provider_title = title;
+        self
+    }
 }
 
 impl SettingsScreenView {
@@ -145,10 +137,11 @@ impl SettingsScreenView {
             model: options.selected_model,
             selected_reasoning_effort: options.selected_reasoning_effort,
             selected_context_window: options.selected_context_window,
-            selected_service_mode: options.selected_service_mode.clone(),
-            selected_context_authority: options.selected_context_authority.clone(),
+            selected_service_mode: options.selected_service_mode,
+            selected_context_authority: options.selected_context_authority,
         })
         .mode(options.mode)
+        .with_api_provider_title(self.config.platform.api_provider_title())
         .on_refresh(Rc::new(move |cx| {
             let _ = refresh_owner.update(cx, |_, cx| cx.notify());
         }));
@@ -156,103 +149,44 @@ impl SettingsScreenView {
     }
 }
 
-struct ModelSelectorDialog;
-
-#[derive(Clone)]
-struct ModelSelectorDialogState {
-    title: String,
-    on_refresh: Rc<dyn Fn(&mut App)>,
-    fixed_provider: Option<String>,
-    owner: Entity<ModelSelectorOwner>,
-    closed: Rc<Cell<bool>>,
-    client: std::sync::Arc<pioneer_client::core::ClientCore>,
-    picker_id: String,
-    generation: u64,
-    on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
-    value: Rc<RefCell<std::sync::Arc<SettingsModelPickerPublication>>>,
-    mode: ProviderModelSelectorMode,
-    provider_search_input: Entity<InputState>,
-    model_search_input: Entity<InputState>,
-    provider_scroll_handle: ScrollHandle,
-    reasoning_scroll_handle: ScrollHandle,
-    model_scroll_handle: VirtualListScrollHandle,
-    provider_trigger_width_px: Rc<RefCell<f32>>,
-    model_trigger_width_px: Rc<RefCell<f32>>,
-    reasoning_trigger_width_px: Rc<RefCell<f32>>,
-}
-
-impl ModelSelectorDialogState {
-    fn selector(&self) -> std::cell::Ref<'_, ProviderModelSelectorState> {
-        std::cell::Ref::map(self.value.borrow(), |value| &value.selector)
-    }
-    fn effort(&self) -> Option<String> {
-        self.value.borrow().selected_reasoning_effort.clone()
-    }
-    fn intent(&self, intent: SettingsModelPickerIntent) {
-        self.client.settings_model_picker_intent(intent);
-        if let Some(value) = self
-            .client
-            .settings_model_picker(&self.picker_id)
-            .filter(|value| value.owner_generation == self.generation)
-        {
-            *self.value.borrow_mut() = value;
-        }
-    }
-    fn set_effort(&self, effort: Option<String>) {
-        self.intent(SettingsModelPickerIntent::SelectReasoningEffort {
-            picker_id: self.picker_id.clone(),
-            expected_owner: self.generation,
-            effort,
-        });
-    }
-}
 struct ModelSelectorOwner {
-    client: std::sync::Weak<pioneer_client::core::ClientCore>,
+    client: Weak<ClientCore>,
     picker_id: String,
     generation: u64,
-    value: Rc<RefCell<std::sync::Arc<SettingsModelPickerPublication>>>,
+    value: PickerPublication,
     window: AnyWindowHandle,
     task: Option<Task<()>>,
-    binding: Option<std::sync::Arc<SettingsBinding>>,
+    binding: Option<Arc<SettingsBinding>>,
     closed: Rc<Cell<bool>>,
 }
+
 impl ModelSelectorOwner {
     fn new(
-        client: &std::sync::Arc<pioneer_client::core::ClientCore>,
-        bindings: &std::sync::Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
-        value: Rc<RefCell<std::sync::Arc<SettingsModelPickerPublication>>>,
+        client: &Arc<ClientCore>,
+        bindings: &Arc<dyn ClientBindingRegistrar>,
+        value: PickerPublication,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let picker_id = value.borrow().picker_id.clone();
         let generation = value.borrow().owner_generation;
         let binding = SettingsBinding::new(
-            vec![pioneer_client::core::ClientScope::SettingsModelPicker {
+            vec![ClientScope::SettingsModelPicker {
                 picker_id: picker_id.clone(),
             }],
             bindings,
         );
         let mut changed = binding.changed.subscribe();
         let handle = window.window_handle();
-        let client = std::sync::Arc::downgrade(client);
+        let client = Arc::downgrade(client);
         cx.new(|cx| {
             let task = cx.spawn(async move |owner: WeakEntity<Self>, cx| {
                 while changed.changed().await.is_ok() {
                     if handle
                         .update(cx, |_, window, cx| {
                             owner.update(cx, |owner, cx| {
-                                let next = owner.client.upgrade().and_then(|client| {
-                                    client.settings_model_picker(&owner.picker_id)
-                                });
-                                match next.filter(|value| {
-                                    value.owner_generation == owner.generation && !value.closed
-                                }) {
-                                    Some(next) => *owner.value.borrow_mut() = next,
-                                    None => owner.close(),
-                                }
-                                gpui_kit::component::Root::update(window, cx, |_, _, cx| {
-                                    cx.notify()
-                                });
+                                owner.pull();
+                                Root::update(window, cx, |_, _, cx| cx.notify());
                             })
                         })
                         .is_err()
@@ -273,11 +207,61 @@ impl ModelSelectorOwner {
             }
         })
     }
-    fn refresh(&self, cx: &mut App) {
+
+    fn pull(&mut self) {
+        let next = self
+            .client
+            .upgrade()
+            .and_then(|client| client.settings_model_picker(&self.picker_id));
+        match next.filter(|value| value.owner_generation == self.generation && !value.closed) {
+            Some(next) => *self.value.borrow_mut() = next,
+            None => self.close(),
+        }
+    }
+
+    fn change(&mut self, change: ModelPickerChange, cx: &mut App) {
+        if self.closed.get() {
+            return;
+        }
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        use SettingsModelPickerIntent as Intent;
+        let picker_id = self.picker_id.clone();
+        let expected_owner = self.generation;
+        client.settings_model_picker_intent(match change {
+            ModelPickerChange::Provider(provider) => Intent::SelectProvider {
+                picker_id,
+                expected_owner,
+                provider,
+            },
+            ModelPickerChange::Model(model) => Intent::SelectModel {
+                picker_id,
+                expected_owner,
+                model,
+            },
+            ModelPickerChange::ReasoningEffort(effort) => Intent::SelectReasoningEffort {
+                picker_id,
+                expected_owner,
+                effort,
+            },
+            ModelPickerChange::ServiceMode(id) => Intent::SelectServiceMode {
+                picker_id,
+                expected_owner,
+                id,
+            },
+            ModelPickerChange::ContextWindow(window) => Intent::SelectContextWindow {
+                picker_id,
+                expected_owner,
+                window,
+            },
+        });
+        self.pull();
         let _ = self.window.update(cx, |_, window, cx| {
-            gpui_kit::component::Root::update(window, cx, |_, _, cx| cx.notify())
+            Root::update(window, cx, |_, _, cx| cx.notify());
         });
     }
+
     fn close(&mut self) {
         if self.closed.replace(true) {
             return;
@@ -292,1248 +276,183 @@ impl ModelSelectorOwner {
         }
     }
 }
-impl Render for ModelSelectorOwner {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
-}
+
 impl Drop for ModelSelectorOwner {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-#[derive(gpui_kit::IntoElement)]
-struct SelectorPopoverTrigger {
-    id: ElementId,
-    label: SharedString,
-    icon: IconName,
-    selected: bool,
-    loading: bool,
-}
-
-impl SelectorPopoverTrigger {
-    fn new(id: impl Into<ElementId>, label: impl Into<SharedString>, icon: IconName) -> Self {
-        Self {
-            id: id.into(),
-            label: label.into(),
-            icon,
-            selected: false,
-            loading: false,
-        }
-    }
-
-    fn loading(mut self, loading: bool) -> Self {
-        self.loading = loading;
-        self
-    }
-}
-
-impl Selectable for SelectorPopoverTrigger {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-impl RenderOnce for SelectorPopoverTrigger {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme();
-
-        let border_color = if self.selected {
-            theme.primary.opacity(0.8)
-        } else {
-            theme.border
-        };
-
-        let bg_color = if self.selected {
-            theme.secondary.opacity(0.25)
-        } else {
-            theme.background
-        };
-
+impl Render for ModelSelectorOwner {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id(self.id)
-            .w_full()
-            .h_8()
-            .px_2()
-            .flex()
-            .items_center()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(border_color)
-            .bg(bg_color)
-            .text_color(theme.foreground)
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .child(div().flex_1().child(if self.loading {
-                        gpui_kit::component::spinner::Spinner::new()
-                            .with_size(gpui_kit::component::Size::Small)
-                            .color(theme.muted_foreground)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_sm()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(self.label)
-                            .into_any_element()
-                    }))
-                    .child(Icon::new(self.icon).size_3p5()),
-            )
     }
 }
 
-impl ModelSelectorDialog {
-    fn open(options: SharedModelSelectorOptions, window: &mut Window, cx: &mut App) {
-        static NEXT_PICKER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = NEXT_PICKER
-            .try_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
-            .expect("model picker identity exhausted");
-        let picker_id = format!("model-selector:{id}");
-        options
-            .client
-            .settings_model_picker_intent(SettingsModelPickerIntent::Open {
-                picker_id: picker_id.clone(),
-                workspace_id: options.workspace_id.clone(),
-                mode: options.mode,
-                selection: options.selection.clone(),
-            });
-        let Some(publication) = options
-            .client
-            .settings_model_picker(&picker_id)
-            .filter(|value| !value.closed)
-        else {
-            return;
-        };
-        let generation = publication.owner_generation;
-        let value = Rc::new(RefCell::new(publication));
-        let owner = ModelSelectorOwner::new(
-            &options.client,
-            &options.bindings,
-            value.clone(),
-            window,
-            cx,
-        );
-        let provider_search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("chat.composer.model.provider_placeholder").to_string())
-        });
-        let model_search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("chat.composer.model.model_placeholder").to_string())
-        });
-        let provider_scroll_handle = ScrollHandle::new();
-        let reasoning_scroll_handle = ScrollHandle::new();
-        let model_scroll_handle = VirtualListScrollHandle::new();
-        let provider_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
-        let model_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
-        let reasoning_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
-
-        let state = ModelSelectorDialogState {
-            closed: owner.read(cx).closed.clone(),
-            owner,
-            title: options.title,
-            on_refresh: options.on_refresh,
-            fixed_provider: options
-                .fixed_provider
-                .then(|| options.selection.provider.clone())
-                .flatten(),
-            client: options.client,
-            picker_id,
-            generation,
-            on_save: options.on_save,
-            value,
+pub fn open_shared_model_selector(
+    options: SharedModelSelectorOptions,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    static NEXT_PICKER: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_PICKER
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("model picker identity exhausted");
+    let picker_id = format!("model-selector:{id}");
+    let fixed_provider = options
+        .fixed_provider
+        .then(|| options.selection.provider.clone())
+        .flatten();
+    options
+        .client
+        .settings_model_picker_intent(SettingsModelPickerIntent::Open {
+            picker_id: picker_id.clone(),
+            workspace_id: options.workspace_id,
             mode: options.mode,
-            provider_search_input,
-            model_search_input,
-            provider_scroll_handle,
-            reasoning_scroll_handle,
-            model_scroll_handle,
-            provider_trigger_width_px,
-            model_trigger_width_px,
-            reasoning_trigger_width_px,
+            selection: options.selection,
+        });
+    let Some(publication) = options
+        .client
+        .settings_model_picker(&picker_id)
+        .filter(|value| !value.closed)
+    else {
+        return;
+    };
+    let generation = publication.owner_generation;
+    let value = Rc::new(RefCell::new(publication));
+    let owner = ModelSelectorOwner::new(
+        &options.client,
+        &options.bindings,
+        value.clone(),
+        window,
+        cx,
+    );
+    let closed = owner.read(cx).closed.clone();
+    let picker = ModelPicker::new(
+        options.mode,
+        fixed_provider.is_some(),
+        options.api_provider_title,
+        picker_text,
+        window,
+        cx,
+    );
+    let mode = options.mode;
+    let title = options.title;
+    let on_refresh = options.on_refresh;
+    let save: Rc<dyn Fn(&mut App) -> bool> = Rc::new(move |cx| {
+        let Some(selection) = options
+            .client
+            .settings_model_picker_selection(&picker_id, generation)
+        else {
+            return false;
         };
-
-        Self::show_model_selector_dialog(window, cx, state);
-    }
-
-    fn show_model_selector_dialog(
-        window: &mut Window,
-        cx: &mut App,
-        state: ModelSelectorDialogState,
-    ) {
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            if state.closed.get() {
-                return dialog
-                    .title(state.title.clone())
-                    .child(t!("settings.unavailable").to_string())
-                    .footer(
-                        DialogFooter::new().child(
-                            default_outline_button("model-selector-cancel")
-                                .label(t!("buttons.cancel").to_string())
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        ),
-                    );
-            }
-            let save_selection = Self::save_model_selector_selection(state.clone());
-            let provider_trigger_label = Self::provider_trigger_label(&state);
-            let model_trigger_label = Self::model_trigger_label(&state);
-            let model_trigger_loading = Self::model_trigger_loading(&state);
-
-            dialog
-                .on_close({
-                    let owner = state.owner.clone();
-                    move |_, _, cx| owner.update(cx, |owner, _| owner.close())
-                })
-                .gap_1()
-                .rounded_2xl()
-                .title(div().text_base().font_semibold().child(state.title.clone()))
-                .on_ok({
-                    let save_selection = save_selection.clone();
-                    move |_, _, cx| save_selection(cx)
-                })
-                .footer(DialogFooter::new().children({
-                    let save_selection = save_selection.clone();
-                    vec![
+        if fixed_provider
+            .as_ref()
+            .is_some_and(|expected| selection.provider.as_ref() != Some(expected))
+        {
+            return false;
+        }
+        (options.on_save)(selection, cx)
+    });
+    window.open_dialog(cx, move |dialog, _, _| {
+        if closed.get() {
+            return dialog
+                .title(title.clone())
+                .child(t!("settings.unavailable").to_string())
+                .footer(
+                    DialogFooter::new().child(
                         default_outline_button("model-selector-cancel")
                             .label(t!("buttons.cancel").to_string())
-                            .outline()
-                            .on_click(|_, window, cx| {
-                                window.close_dialog(cx);
-                            })
-                            .into_any_element(),
-                        default_primary_button("model-selector-save")
-                            .label(t!("buttons.save").to_string())
-                            .on_click({
-                                let save_selection = save_selection.clone();
-                                move |_, window, cx| {
-                                    if save_selection(cx) {
-                                        window.close_dialog(cx);
-                                    }
-                                }
-                            })
-                            .into_any_element(),
-                    ]
-                }))
-                .child(v_flex().w_full().pt_4().pb_5().child({
-                    let form = if state.fixed_provider.is_some() {
-                        v_form().child(
-                            field()
-                                .label(t!("chat.composer.model.provider_label").to_string())
-                                .child(div().text_sm().child(provider_trigger_label)),
-                        )
-                    } else {
-                        v_form().child(Self::render_provider_selector_section(
-                            state.clone(),
-                            provider_trigger_label,
-                        ))
-                    };
-                    let form = form.child(Self::render_model_selector_section(
-                        state.clone(),
-                        model_trigger_label,
-                        model_trigger_loading,
-                    ));
-
-                    let form = if let Some(service) =
-                        Self::render_service_selector_section(state.clone())
-                    {
-                        form.child(service)
-                    } else {
-                        form
-                    };
-                    let form = if let Some(context) =
-                        Self::render_context_selector_section(state.clone())
-                    {
-                        form.child(context)
-                    } else {
-                        form
-                    };
-                    if let Some(reasoning_section) =
-                        Self::render_reasoning_effort_selector_section(state.clone())
-                    {
-                        form.child(reasoning_section)
-                    } else {
-                        form
-                    }
-                }))
-        });
-    }
-
-    fn save_model_selector_selection(
-        state: ModelSelectorDialogState,
-    ) -> Rc<dyn Fn(&mut App) -> bool> {
-        Rc::new(move |cx| {
-            let Some(selection) = state
-                .client
-                .settings_model_picker_selection(&state.picker_id, state.generation)
-            else {
-                return false;
-            };
-            if state
-                .fixed_provider
-                .as_ref()
-                .is_some_and(|expected| selection.provider.as_ref() != Some(expected))
-            {
-                return false;
-            }
-            (state.on_save)(selection, cx)
-        })
-    }
-
-    fn provider_trigger_label(state: &ModelSelectorDialogState) -> String {
-        state
-            .selector()
-            .selected_provider_label()
-            .unwrap_or_else(|| t!("chat.composer.model.provider_placeholder").to_string())
-    }
-
-    fn model_trigger_label(state: &ModelSelectorDialogState) -> String {
-        let selector = state.selector();
-        match provider_presentation::model_selector_selected_model_display_state(
-            selector.selected_model(),
-            selector.models(),
-            selector.loading_models(),
-        ) {
-            provider_presentation::ProviderModelDisplayState::Label(label) => label,
-            provider_presentation::ProviderModelDisplayState::Loading
-            | provider_presentation::ProviderModelDisplayState::Missing => {
-                t!("chat.composer.model.model_placeholder").to_string()
-            }
-        }
-    }
-
-    fn model_trigger_loading(state: &ModelSelectorDialogState) -> bool {
-        let selector = state.selector();
-        matches!(
-            provider_presentation::model_selector_selected_model_display_state(
-                selector.selected_model(),
-                selector.models(),
-                selector.loading_models(),
-            ),
-            provider_presentation::ProviderModelDisplayState::Loading
-        )
-    }
-
-    fn reasoning_effort_rows(
-        state: &ModelSelectorDialogState,
-    ) -> Vec<provider_presentation::ReasoningEffortRow> {
-        if matches!(state.mode, ProviderModelSelectorMode::Transcription) {
-            return Vec::new();
-        }
-        let selector = state.selector();
-        let Some(selected_model) = selector.selected_model() else {
-            return Vec::new();
-        };
-        let Some(model) = selector
-            .models()
-            .iter()
-            .find(|model| model.id.as_str() == selected_model)
-        else {
-            return Vec::new();
-        };
-        let selected_effort = state.effort();
-        let mut rows = provider_presentation::reasoning_effort_rows_for_model(
-            model,
-            selected_effort.as_deref(),
-        );
-        if state
-            .value
-            .borrow()
-            .selected_service_mode
-            .as_ref()
-            .is_some_and(|mode| mode.id == "pro")
-        {
-            rows.retain(|row| !matches!(row.effort.as_str(), "none" | "off"));
-        }
-        rows
-    }
-
-    fn reasoning_effort_trigger_label(
-        rows: &[provider_presentation::ReasoningEffortRow],
-        configured: Option<&str>,
-    ) -> String {
-        rows.iter()
-            .find(|row| row.selected)
-            .map(|row| row.label.clone())
-            .or_else(|| configured.map(str::to_owned))
-            .unwrap_or_else(|| t!("chat.composer.model.reasoning_default").to_string())
-    }
-
-    fn clear_dialog_reasoning_effort(state: &ModelSelectorDialogState) {
-        state.set_effort(None);
-    }
-
-    fn render_provider_selector_section(
-        state: ModelSelectorDialogState,
-        provider_trigger_label: String,
-    ) -> Field {
-        let provider_trigger_width_px = state.provider_trigger_width_px.clone();
-        let refresh = state.on_refresh.clone();
-        field()
-            .label(t!("chat.composer.model.provider_label").to_string())
-            .child(
-                div()
-                    .w_full()
-                    .relative()
-                    .child(
-                        Popover::new("model-provider-popover")
-                            .trigger_style(StyleRefinement::default().w_full())
-                            .anchor(Anchor::TopLeft)
-                            .p_0()
-                            .trigger(SelectorPopoverTrigger::new(
-                                "model-provider-trigger",
-                                provider_trigger_label,
-                                IconName::ChevronsUpDown,
-                            ))
-                            .content(move |_, _, popover_cx| {
-                                Self::render_provider_popover_content(state.clone(), popover_cx)
-                            }),
-                    )
-                    .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                let measured_width = bounds.size.width.max(px(1.)).as_f32();
-                                let mut cached_width = provider_trigger_width_px.borrow_mut();
-                                if (measured_width - *cached_width).abs() > 1.0 {
-                                    *cached_width = measured_width;
-                                    refresh(cx);
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                     ),
-            )
-    }
-
-    fn render_provider_popover_content(
-        state: ModelSelectorDialogState,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> AnyElement {
-        let popover_entity: Entity<PopoverState> = popover_cx.entity();
-        let theme = popover_cx.theme();
-        let muted_fg = theme.muted_foreground;
-        let muted_bg = theme.muted;
-        let foreground = theme.foreground;
-        let ghost_hover = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.2).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.1).opacity(0.8)
-        };
-        let ghost_active = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.3).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.2).opacity(0.8)
-        };
-        let popover_width =
-            px((*state.provider_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
-
-        let (provider_rows, is_loading, current_selected) = {
-            let selector = state.selector();
-            (
-                selector.provider_rows(),
-                selector.loading_providers(),
-                selector.selected_provider().map(str::to_owned),
-            )
-        };
-        let search_text = state
-            .provider_search_input
-            .read(popover_cx)
-            .value()
-            .to_owned();
-
-        let search = search_text.trim().to_ascii_lowercase();
-        let filtered = provider_rows
-            .into_iter()
-            .filter(|provider| {
-                search.is_empty()
-                    || provider.id.to_ascii_lowercase().contains(search.as_str())
-                    || provider
-                        .label
-                        .to_ascii_lowercase()
-                        .contains(search.as_str())
-            })
-            .collect::<Vec<_>>();
-
-        let mut content = v_flex()
-            .w(popover_width)
-            .child(render_selector_filter_form(&state.provider_search_input))
-            .child(Separator::horizontal());
-
-        let mut list = v_flex()
-            .id("provider-popover-list")
-            .max_h(px(200.))
-            .overflow_y_scroll()
-            .track_scroll(&state.provider_scroll_handle);
-
-        if is_loading {
-            list = list.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(t!("chat.composer.model.loading_providers").to_string()),
-            );
-        } else if filtered.is_empty() {
-            list = list.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(t!("chat.composer.model.no_providers").to_string()),
-            );
-        } else {
-            for provider in filtered {
-                let is_active = current_selected.as_deref() == Some(provider.id.as_str());
-                let provider_id = provider.id.clone();
-                let provider_label = provider.label.clone();
-                let row_state = state.clone();
-                let popover_entity = popover_entity.clone();
-                let id: SharedString = format!("provider-opt-{}", provider.id).into();
-
-                list = list.child(
-                    div()
-                        .id(id)
-                        .w_full()
-                        .cursor_pointer()
-                        .px_2()
-                        .py_1p5()
-                        .text_sm()
-                        .text_color(foreground)
-                        .when(is_active, |d| d.bg(muted_bg))
-                        .hover(move |d| d.bg(ghost_hover))
-                        .active(move |d| d.bg(ghost_active))
-                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                            window.prevent_default();
-                        })
-                        .on_click(move |_, window, cx| {
-                            Self::on_provider_selected(
-                                row_state.clone(),
-                                popover_entity.clone(),
-                                provider_id.clone(),
-                                window,
-                                cx,
-                            );
-                        })
-                        .child(provider_label),
                 );
-            }
         }
-
-        content = content.child(
-            div().relative().child(list).child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(Scrollbar::vertical(&state.provider_scroll_handle)),
-            ),
-        );
-        content.into_any_element()
-    }
-
-    fn on_provider_selected(
-        state: ModelSelectorDialogState,
-        popover_entity: Entity<PopoverState>,
-        provider_name: String,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        state.intent(SettingsModelPickerIntent::SelectProvider {
-            picker_id: state.picker_id.clone(),
-            expected_owner: state.generation,
-            provider: provider_name,
+        let on_change = owner.clone();
+        let on_close = owner.clone();
+        let refresh = on_refresh.clone();
+        let ok = save.clone();
+        let save = save.clone();
+        let controls = picker.render(picker_input(&value.borrow(), mode), move |action, cx| {
+            on_change.update(cx, |owner, cx| owner.change(action, cx));
+            refresh(cx);
         });
+        dialog
+            .gap_1()
+            .rounded_2xl()
+            .title(div().text_base().font_semibold().child(title.clone()))
+            .on_close(move |_, _, cx| on_close.update(cx, |owner, _| owner.close()))
+            .on_ok(move |_, _, cx| ok(cx))
+            .footer(DialogFooter::new().children(vec![
+                    default_outline_button("model-selector-cancel")
+                        .label(t!("buttons.cancel").to_string())
+                        .outline()
+                        .on_click(|_, window, cx| window.close_dialog(cx))
+                        .into_any_element(),
+                    default_primary_button("model-selector-save")
+                        .label(t!("buttons.save").to_string())
+                        .on_click(move |_, window, cx| {
+                            if save(cx) {
+                                window.close_dialog(cx);
+                            }
+                        })
+                        .into_any_element(),
+                ]))
+            .child(controls)
+    });
+}
 
-        let _ = popover_entity.update(cx, |state, cx| {
-            state.dismiss(window, cx);
-        });
-
-        state.owner.update(cx, |owner, cx| owner.refresh(cx));
-    }
-
-    fn render_model_selector_section(
-        state: ModelSelectorDialogState,
-        model_trigger_label: String,
-        model_trigger_loading: bool,
-    ) -> Field {
-        let model_trigger_width_px = state.model_trigger_width_px.clone();
-        let refresh = state.on_refresh.clone();
-        field()
-            .label(t!("chat.composer.model.model_label").to_string())
-            .child(
-                div()
-                    .w_full()
-                    .relative()
-                    .child(
-                        Popover::new("model-model-popover")
-                            .trigger_style(StyleRefinement::default().w_full())
-                            .anchor(Anchor::TopLeft)
-                            .p_0()
-                            .trigger(
-                                SelectorPopoverTrigger::new(
-                                    "model-model-trigger",
-                                    model_trigger_label,
-                                    IconName::ChevronsUpDown,
-                                )
-                                .loading(model_trigger_loading),
-                            )
-                            .content(move |_, window, popover_cx| {
-                                Self::render_model_popover_content(
-                                    state.clone(),
-                                    window,
-                                    popover_cx,
-                                )
-                            }),
-                    )
-                    .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                let measured_width = bounds.size.width.max(px(1.)).as_f32();
-                                let mut cached_width = model_trigger_width_px.borrow_mut();
-                                if (measured_width - *cached_width).abs() > 1.0 {
-                                    *cached_width = measured_width;
-                                    refresh(cx);
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    ),
-            )
-    }
-
-    fn render_service_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
-        let rows = state.value.borrow().service_rows.clone();
-        if rows.is_empty() {
-            return None;
-        }
-        let mut choices = v_flex().gap_1().w_full();
-        if (state.value.borrow().selected_service_mode.is_some()
-            && !rows.iter().any(|row| row.selected))
-            || rows.iter().any(|row| row.selected && !row.available)
-        {
-            choices = choices.child(
-                div()
-                    .text_sm()
-                    .child(t!("chat.composer.model.service_invalid").to_string()),
-            );
-        }
-        for row in rows {
-            let next = state.clone();
-            let id = row.id.clone();
-            let label = if id == "standard" {
-                t!("chat.composer.model.service_standard").to_string()
-            } else {
-                row.label
-            };
-            choices = choices.child(
-                default_outline_button(SharedString::from(format!("service-mode-{}", id)))
-                    .w_full()
-                    .label(label)
-                    .selected(row.selected)
-                    .disabled(!row.available)
-                    .on_click(move |_, _, cx| {
-                        next.intent(SettingsModelPickerIntent::SelectServiceMode {
-                            picker_id: next.picker_id.clone(),
-                            expected_owner: next.generation,
-                            id: id.clone(),
-                        });
-                        (next.on_refresh)(cx);
-                    }),
-            );
-        }
-        Some(
-            field()
-                .label(t!("chat.composer.model.service_label").to_string())
-                .child(choices),
-        )
-    }
-
-    fn render_context_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
-        let rows = state.value.borrow().context_rows.clone();
-        if rows.is_empty() {
-            return None;
-        }
-        let invalid = state.value.borrow().selected_context_window.is_some()
-            && !rows.iter().any(|row| row.selected);
-        let mut choices = v_flex().gap_1().w_full();
-        if invalid {
-            choices = choices.child(
-                div()
-                    .text_sm()
-                    .child(t!("chat.composer.model.context_invalid").to_string()),
-            );
-        }
-        for row in rows {
-            let next = state.clone();
-            let window = row.window;
-            let label = if window.is_none() {
-                t!(
-                    "chat.composer.model.context_auto",
-                    tokens = row.tokens.to_string()
-                )
-                .to_string()
-            } else {
-                t!(
-                    "chat.composer.model.context_up_to",
-                    tokens = row.tokens.to_string()
-                )
-                .to_string()
-            };
-            choices = choices.child(
-                default_outline_button(SharedString::from(format!(
-                    "context-window-{}",
-                    window.map_or_else(|| "auto".into(), |v| v.to_string())
-                )))
-                .w_full()
-                .label(label)
-                .selected(row.selected)
-                .on_click(move |_, _, cx| {
-                    next.intent(SettingsModelPickerIntent::SelectContextWindow {
-                        picker_id: next.picker_id.clone(),
-                        expected_owner: next.generation,
-                        window,
-                    });
-                    (next.on_refresh)(cx);
-                }),
-            );
-        }
-        Some(
-            field()
-                .label(t!("chat.composer.model.context_label").to_string())
-                .child(choices),
-        )
-    }
-
-    fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
-        if state.value.borrow().default_reasoning_only {
-            let next = state.clone();
-            return Some(
-                field()
-                    .label(t!("chat.composer.model.reasoning_label").to_string())
-                    .child(
-                        default_outline_button("service-default-reasoning")
-                            .label(t!("chat.composer.model.reasoning_default").to_string())
-                            .selected(state.value.borrow().selected_reasoning_effort.is_none())
-                            .on_click(move |_, _, cx| {
-                                next.intent(SettingsModelPickerIntent::SelectReasoningEffort {
-                                    picker_id: next.picker_id.clone(),
-                                    expected_owner: next.generation,
-                                    effort: None,
-                                });
-                                (next.on_refresh)(cx);
-                            }),
-                    ),
-            );
-        }
-        let rows = Self::reasoning_effort_rows(&state);
-        if rows.is_empty() {
-            return None;
-        }
-
-        let reasoning_trigger_width_px = state.reasoning_trigger_width_px.clone();
-        let refresh = state.on_refresh.clone();
-        let trigger_label =
-            Self::reasoning_effort_trigger_label(rows.as_slice(), state.effort().as_deref());
-
-        Some(
-            field()
-                .label(t!("chat.composer.model.reasoning_label").to_string())
-                .child(
-                    div()
-                        .w_full()
-                        .relative()
-                        .child(
-                            Popover::new("model-reasoning-effort-popover")
-                                .trigger_style(StyleRefinement::default().w_full())
-                                .anchor(Anchor::TopLeft)
-                                .p_0()
-                                .trigger(SelectorPopoverTrigger::new(
-                                    "model-reasoning-effort-trigger",
-                                    trigger_label,
-                                    IconName::ChevronsUpDown,
-                                ))
-                                .content(move |_, _, popover_cx| {
-                                    Self::render_reasoning_effort_popover_content(
-                                        state.clone(),
-                                        popover_cx,
-                                    )
-                                }),
-                        )
-                        .child(
-                            canvas(
-                                move |bounds, _, cx| {
-                                    let measured_width = bounds.size.width.max(px(1.)).as_f32();
-                                    let mut cached_width = reasoning_trigger_width_px.borrow_mut();
-                                    if (measured_width - *cached_width).abs() > 1.0 {
-                                        *cached_width = measured_width;
-                                        refresh(cx);
-                                    }
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        ),
-                ),
-        )
-    }
-
-    fn render_reasoning_effort_popover_content(
-        state: ModelSelectorDialogState,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> AnyElement {
-        let popover_entity: Entity<PopoverState> = popover_cx.entity();
-        let theme = popover_cx.theme();
-        let foreground = theme.foreground;
-        let muted_bg = theme.muted;
-        let ghost_hover = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.2).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.1).opacity(0.8)
-        };
-        let ghost_active = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.3).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.2).opacity(0.8)
-        };
-        let popover_width =
-            px((*state.reasoning_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
-        let rows = Self::reasoning_effort_rows(&state);
-
-        let mut list = v_flex()
-            .id("reasoning-effort-popover-list")
-            .max_h(px(200.))
-            .overflow_y_scroll()
-            .track_scroll(&state.reasoning_scroll_handle);
-        let default_selected = state.effort().is_none();
-        let default_state = state.clone();
-        let default_popover_entity = popover_entity.clone();
-
-        list = list.child(
-            div()
-                .id("reasoning-effort-opt-default")
-                .w_full()
-                .cursor_pointer()
-                .px_2()
-                .py_1p5()
-                .text_sm()
-                .text_color(foreground)
-                .when(default_selected, |d| d.bg(muted_bg))
-                .hover(move |d| d.bg(ghost_hover))
-                .active(move |d| d.bg(ghost_active))
-                .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                    window.prevent_default();
-                })
-                .on_click(move |_, window, cx| {
-                    Self::clear_dialog_reasoning_effort(&default_state);
-                    let _ = default_popover_entity.update(cx, |popover, cx| {
-                        popover.dismiss(window, cx);
-                    });
-                    default_state
-                        .owner
-                        .update(cx, |owner, cx| owner.refresh(cx));
-                })
-                .child(t!("chat.composer.model.reasoning_default").to_string()),
-        );
-
-        for row in rows {
-            let row_state = state.clone();
-            let popover_entity = popover_entity.clone();
-            let effort = row.effort.clone();
-            let id: SharedString = format!("reasoning-effort-opt-{}", row.effort).into();
-
-            list = list.child(
-                div()
-                    .id(id)
-                    .w_full()
-                    .cursor_pointer()
-                    .px_2()
-                    .py_1p5()
-                    .text_sm()
-                    .text_color(foreground)
-                    .when(row.selected, |d| d.bg(muted_bg))
-                    .hover(move |d| d.bg(ghost_hover))
-                    .active(move |d| d.bg(ghost_active))
-                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                        window.prevent_default();
-                    })
-                    .on_click(move |_, window, cx| {
-                        if Self::reasoning_effort_rows(&row_state)
-                            .iter()
-                            .any(|row| row.effort == effort)
-                        {
-                            row_state.set_effort(Some(effort.clone()));
-                        }
-                        let _ = popover_entity.update(cx, |popover, cx| {
-                            popover.dismiss(window, cx);
-                        });
-                        row_state.owner.update(cx, |owner, cx| owner.refresh(cx));
-                    })
-                    .child(row.label),
-            );
-        }
-
-        v_flex()
-            .w(popover_width)
-            .child(
-                div().relative().child(list).child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(Scrollbar::vertical(&state.reasoning_scroll_handle)),
-                ),
-            )
-            .into_any_element()
-    }
-
-    fn render_model_popover_content(
-        state: ModelSelectorDialogState,
-        window: &mut Window,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> AnyElement {
-        let popover_entity: Entity<PopoverState> = popover_cx.entity();
-        let theme = popover_cx.theme();
-        let muted_fg = theme.muted_foreground;
-        let foreground = theme.foreground;
-        let muted_bg = theme.muted;
-        let ghost_hover = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.2).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.1).opacity(0.8)
-        };
-        let ghost_active = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.3).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.2).opacity(0.8)
-        };
-        let popover_width =
-            px((*state.model_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
-
-        let (model_list, is_loading, error_text) = {
-            let selector = state.selector();
-            (
-                selector.models().to_vec(),
-                selector.loading_models(),
-                selector.error().map(str::to_owned),
-            )
-        };
-        let search_text = state.model_search_input.read(popover_cx).value().to_owned();
-        let has_error = error_text.is_some();
-
-        let filtered: Vec<ProviderModelInfo> =
-            provider_presentation::filter_model_selector_models(&model_list, &search_text);
-        let filtered = Rc::new(filtered);
-
-        let mut content = v_flex()
-            .w(popover_width)
-            .child(render_selector_filter_form(&state.model_search_input))
-            .child(Separator::horizontal());
-
-        if is_loading {
-            content = content.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(t!("chat.composer.model.loading_models").to_string()),
-            );
-        } else if has_error {
-            let err_text = error_text.unwrap_or_default();
-            content = content.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(t!("chat.composer.model.load_error", error = err_text).to_string()),
-            );
-        } else if filtered.is_empty() {
-            content = content.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(muted_fg)
-                    .child(t!("chat.composer.model.no_models").to_string()),
-            );
-        } else {
-            content = content.child(Self::render_model_virtual_list(
-                state.clone(),
-                filtered,
-                popover_entity,
-                foreground,
-                muted_bg,
-                ghost_hover,
-                ghost_active,
-                popover_width,
-                window,
-                popover_cx,
-            ));
-        }
-
-        content.into_any_element()
-    }
-
-    fn render_model_virtual_list(
-        state: ModelSelectorDialogState,
-        filtered_models: Rc<Vec<ProviderModelInfo>>,
-        popover_entity: Entity<PopoverState>,
-        foreground: Hsla,
-        muted_bg: Hsla,
-        ghost_hover: Hsla,
-        ghost_active: Hsla,
-        row_width: Pixels,
-        window: &mut Window,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> AnyElement {
-        let item_sizes = Self::measure_model_virtual_list_item_sizes(
-            state.clone(),
-            filtered_models.as_ref(),
-            popover_entity.clone(),
-            foreground,
-            muted_bg,
-            ghost_hover,
-            ghost_active,
-            row_width,
-            window,
-            popover_cx,
-        );
-        let visible_height = item_sizes
-            .iter()
-            .map(|item_size| item_size.height.as_f32())
-            .sum::<f32>()
-            .min(MODEL_LIST_MAX_HEIGHT);
-        let scroll_handle = state.model_scroll_handle.clone();
-
-        div()
-            .h(px(visible_height))
-            .relative()
-            .overflow_hidden()
-            .child(
-                v_virtual_list(
-                    state.owner.clone(),
-                    "model-virtual-list",
-                    item_sizes,
-                    move |_view, visible_range, _window, _cx| {
-                        visible_range
-                            .filter_map(|ix| {
-                                filtered_models.get(ix).map(|model| {
-                                    Self::render_model_virtual_list_row(
-                                        state.clone(),
-                                        popover_entity.clone(),
-                                        ix,
-                                        model,
-                                        foreground,
-                                        muted_bg,
-                                        ghost_hover,
-                                        ghost_active,
-                                    )
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .with_sizing_behavior(ListSizingBehavior::Auto)
-                .track_scroll(&scroll_handle),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(Scrollbar::vertical(&scroll_handle)),
-            )
-            .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn measure_model_virtual_list_item_sizes(
-        state: ModelSelectorDialogState,
-        filtered_models: &[ProviderModelInfo],
-        popover_entity: Entity<PopoverState>,
-        foreground: Hsla,
-        muted_bg: Hsla,
-        ghost_hover: Hsla,
-        ghost_active: Hsla,
-        row_width: Pixels,
-        window: &mut Window,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> Rc<Vec<gpui_kit::Size<Pixels>>> {
-        Rc::new(
-            filtered_models
-                .iter()
-                .enumerate()
-                .map(|(ix, model)| {
-                    let mut row = Self::render_model_virtual_list_row(
-                        state.clone(),
-                        popover_entity.clone(),
-                        ix,
-                        model,
-                        foreground,
-                        muted_bg,
-                        ghost_hover,
-                        ghost_active,
-                    );
-                    let measured = row.layout_as_root(
-                        size(
-                            AvailableSpace::Definite(row_width),
-                            AvailableSpace::MaxContent,
-                        ),
-                        window,
-                        popover_cx,
-                    );
-                    let measured_height = measured.height.max(px(MODEL_ROW_MIN_HEIGHT));
-                    gpui_kit::size(px(0.), measured_height)
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_model_virtual_list_row(
-        state: ModelSelectorDialogState,
-        popover_entity: Entity<PopoverState>,
-        _ix: usize,
-        model: &ProviderModelInfo,
-        foreground: Hsla,
-        muted_bg: Hsla,
-        ghost_hover: Hsla,
-        ghost_active: Hsla,
-    ) -> AnyElement {
-        let model_id = model.id.clone();
-        let display_name = provider_presentation::model_selector_model_display_name(model);
-        let secondary_text = provider_presentation::model_selector_model_secondary_text(model);
-        let transcription = (state.mode == ProviderModelSelectorMode::Transcription)
-            .then(|| provider_presentation::transcription_model_selector_presentation(model))
-            .flatten();
-        let is_active = state.selector().selected_model() == Some(model_id.as_str());
-        let id: SharedString = format!(
-            "model-selector:{}:{}:{}:{model_id}:row",
-            state.owner.entity_id(),
-            state.value.borrow().workspace_id,
-            model.provider
-        )
-        .into();
-
-        div()
-            .id(id)
-            .w_full()
-            .min_h(px(MODEL_ROW_MIN_HEIGHT))
-            .cursor_pointer()
-            .py_1p5()
-            .px_2()
-            .text_color(foreground)
-            .when(is_active, |d| d.bg(muted_bg))
-            .hover(move |d| d.bg(ghost_hover))
-            .active(move |d| d.bg(ghost_active))
-            .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                window.prevent_default();
+fn picker_input(
+    input: &SettingsModelPickerPublication,
+    mode: ProviderModelSelectorMode,
+) -> ModelPickerInput {
+    let service_mode = input
+        .selected_service_mode
+        .as_ref()
+        .map(|mode| mode.id.clone());
+    let mut reasoning_rows = if mode == ProviderModelSelectorMode::Transcription {
+        Vec::new()
+    } else {
+        input
+            .selector
+            .selected_model()
+            .and_then(|selected| {
+                input
+                    .selector
+                    .models()
+                    .iter()
+                    .find(|model| model.id == selected)
             })
-            .on_click(move |_, window, cx| {
-                state.intent(SettingsModelPickerIntent::SelectModel {
-                    picker_id: state.picker_id.clone(),
-                    expected_owner: state.generation,
-                    model: model_id.clone(),
-                });
-                let _ = popover_entity.update(cx, |popover, cx| {
-                    popover.dismiss(window, cx);
-                });
-                state.owner.update(cx, |owner, cx| owner.refresh(cx));
+            .map(|model| {
+                presentation::reasoning_effort_rows_for_model(
+                    model,
+                    input.selected_reasoning_effort.as_deref(),
+                )
             })
-            .child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .whitespace_normal()
-                                    .child(display_name),
-                            )
-                            .when(
-                                transcription
-                                    .as_ref()
-                                    .is_some_and(|details| details.recommended),
-                                |row| {
-                                    row.child(
-                                        div()
-                                            .flex_none()
-                                            .px_1()
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(foreground.opacity(0.5))
-                                            .text_size(px(10.))
-                                            .font_medium()
-                                            .child(
-                                                t!("settings.voice_input.recommended").to_string(),
-                                            ),
-                                    )
-                                },
-                            ),
-                    )
-                    .when_some(secondary_text, |d, secondary_text| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .whitespace_normal()
-                                .line_height(relative(1.3))
-                                .opacity(0.6)
-                                .child(secondary_text),
-                        )
-                    })
-                    .when_some(transcription, |d, details| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .whitespace_normal()
-                                .line_height(relative(1.3))
-                                .opacity(0.75)
-                                .child(format!(
-                                    "{} | {} | {}",
-                                    details.engine, details.download_size, details.language_summary
-                                )),
-                        )
-                    }),
-            )
-            .into_any_element()
+            .unwrap_or_default()
+    };
+    if service_mode.as_deref() == Some("pro") {
+        reasoning_rows.retain(|row| !matches!(row.effort.as_str(), "none" | "off"));
+    }
+    ModelPickerInput {
+        selector: input.selector.clone(),
+        reasoning_rows,
+        service_rows: input.service_rows.clone(),
+        context_rows: input.context_rows.clone(),
+        selected_reasoning_effort: input.selected_reasoning_effort.clone(),
+        selected_service_mode_id: service_mode,
+        selected_context_window: input.selected_context_window,
+        default_reasoning_only: input.default_reasoning_only,
     }
 }
 
-fn render_selector_filter_form(search: &Entity<InputState>) -> AnyElement {
-    v_form()
-        .child(
-            field()
-                .label_indent(false)
-                .child(Input::new(search).appearance(false).px_2().min_w_0()),
-        )
-        .into_any_element()
+fn picker_text(key: &str) -> String {
+    if key == "recommended" {
+        t!("settings.voice_input.recommended").to_string()
+    } else {
+        t!(format!("chat.composer.model.{key}")).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1559,6 +478,7 @@ mod tests {
             })
         }
     }
+
     #[gpui_kit::test]
     fn picker_retains_one_binding_and_explicit_close_fences_reopened_owner(
         cx: &mut gpui_kit::TestAppContext,
@@ -1573,14 +493,7 @@ mod tests {
                 picker_id: "dialog".into(),
                 workspace_id: "workspace".into(),
                 mode: ProviderModelSelectorMode::Embeddings,
-                selection: ModelSelectorSelection {
-                    provider: None,
-                    model: None,
-                    selected_reasoning_effort: None,
-                    selected_context_window: None,
-                    selected_service_mode: None,
-                    selected_context_authority: None,
-                },
+                selection: ModelSelectorSelection::default(),
             })
         };
         open();
@@ -1607,28 +520,21 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn model_selector_transcription_recommended_badge_is_localized() {
-        let source = include_str!("model_selector.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production source exists");
-
-        assert!(source.contains("settings.voice_input.recommended"));
-        assert!(!source.contains(".child(\"Recommended\")"));
+        assert_eq!(
+            super::picker_text("recommended"),
+            t!("settings.voice_input.recommended").as_ref(),
+        );
     }
 
     #[::core::prelude::v1::test]
     fn model_selector_dialog_render_never_reenters_the_desktop_entity() {
-        let source = include_str!("model_selector.rs")
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production source exists");
-        let render = source
-            .split("fn show_model_selector_dialog")
-            .nth(1)
+        let render = include_str!("model_selector.rs")
+            .split_once("window.open_dialog(cx, move |dialog, _, _|")
             .expect("dialog render exists")
-            .split("fn save_model_selector_selection")
-            .next()
-            .expect("dialog render has a boundary");
+            .1
+            .split_once("fn picker_input(")
+            .expect("dialog render has a boundary")
+            .0;
 
         assert!(!render.contains("desktop_entity"));
         assert!(!render.contains(".read(cx)"));
