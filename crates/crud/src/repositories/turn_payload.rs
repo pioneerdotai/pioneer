@@ -179,30 +179,54 @@ impl PreparedInlineItem {
 /// keeps the last duplicate, which would change existing SQL predicates when
 /// their portable inputs are decoded outside database capacity.
 pub(crate) fn json1_value(text: &str) -> Result<serde_json::Value> {
-    json1_value_selected(text, None)
+    json1_value_selected(text, JsonSelection::All)
 }
 
 /// Extract top-level JSON1 fields without deserializing unrelated retained output.
 /// Ignored values are still checked for JSON syntax; top-level duplicate labels keep the first value.
 pub(crate) fn json1_fields(text: &str, fields: &[&str]) -> Result<serde_json::Value> {
-    json1_value_selected(text, Some(fields))
+    json1_value_selected(text, JsonSelection::Fields(fields))
 }
 
-fn json1_value_selected(text: &str, fields: Option<&[&str]>) -> Result<serde_json::Value> {
-    use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+pub(crate) fn shell_storage(text: &str) -> Result<bool> {
+    let value = json1_value_selected(text, JsonSelection::Path(&["storage", "kind"]))?;
+    Ok(value
+        .pointer("/storage/kind")
+        .and_then(|kind| kind.as_str())
+        == Some("shell"))
+}
+
+#[derive(Clone, Copy)]
+enum JsonSelection<'a> {
+    All,
+    Fields(&'a [&'a str]),
+    Path(&'a [&'a str]),
+}
+
+fn json1_value_selected(text: &str, selection: JsonSelection<'_>) -> Result<serde_json::Value> {
+    use serde::de::{
+        self, Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor,
+    };
     use serde_json::Value;
     struct First(Value);
     impl<'de> Deserialize<'de> for First {
         fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-            deserialize_first(d, None)
+            deserialize_first(d, JsonSelection::All)
+        }
+    }
+    struct PathSeed<'a>(&'a [&'a str]);
+    impl<'de> DeserializeSeed<'de> for PathSeed<'_> {
+        type Value = First;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> std::result::Result<First, D::Error> {
+            deserialize_first(d, JsonSelection::Path(self.0))
         }
     }
     fn deserialize_first<'de, D: Deserializer<'de>>(
         d: D,
-        fields: Option<&[&str]>,
+        selection: JsonSelection<'_>,
     ) -> std::result::Result<First, D::Error> {
         struct FirstVisitor<'a> {
-            fields: Option<&'a [&'a str]>,
+            selection: JsonSelection<'a>,
         }
         impl<'de> Visitor<'de> for FirstVisitor<'_> {
             type Value = First;
@@ -237,7 +261,7 @@ fn json1_value_selected(text: &str, fields: Option<&[&str]>) -> Result<serde_jso
                 self,
                 mut seq: A,
             ) -> std::result::Result<First, A::Error> {
-                if self.fields.is_some() {
+                if !matches!(self.selection, JsonSelection::All) {
                     while seq.next_element::<de::IgnoredAny>()?.is_some() {}
                     return Ok(First(Value::Array(Vec::new())));
                 }
@@ -253,29 +277,33 @@ fn json1_value_selected(text: &str, fields: Option<&[&str]>) -> Result<serde_jso
             ) -> std::result::Result<First, A::Error> {
                 let mut out = serde_json::Map::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    if self.fields.is_some_and(|fields| {
-                        !fields.contains(&key.as_str()) || out.contains_key(&key)
-                    }) {
-                        map.next_value::<de::IgnoredAny>()?;
-                        continue;
-                    }
-                    // Selected objects are extracted as JSON and then decoded
-                    // normally, matching the old json_extract + from_str path.
-                    let v = if self.fields.is_some() {
-                        map.next_value::<Value>()?
-                    } else {
-                        let First(v) = map.next_value()?;
-                        v
+                    let v = match self.selection {
+                        JsonSelection::All => map.next_value::<First>()?.0,
+                        JsonSelection::Fields(fields)
+                            if fields.contains(&key.as_str()) && !out.contains_key(&key) =>
+                        {
+                            // Selected fields match the old json_extract + from_str path.
+                            map.next_value::<Value>()?
+                        }
+                        JsonSelection::Path([field, rest @ ..])
+                            if *field == key && !out.contains_key(&key) =>
+                        {
+                            map.next_value_seed(PathSeed(rest))?.0
+                        }
+                        _ => {
+                            map.next_value::<de::IgnoredAny>()?;
+                            continue;
+                        }
                     };
                     out.entry(key).or_insert(v);
                 }
                 Ok(First(Value::Object(out)))
             }
         }
-        d.deserialize_any(FirstVisitor { fields })
+        d.deserialize_any(FirstVisitor { selection })
     }
     let mut deserializer = serde_json::Deserializer::from_str(text);
-    let value = deserialize_first(&mut deserializer, fields)?;
+    let value = deserialize_first(&mut deserializer, selection)?;
     deserializer.end()?;
     Ok(value.0)
 }

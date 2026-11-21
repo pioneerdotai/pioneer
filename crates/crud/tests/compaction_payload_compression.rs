@@ -1686,6 +1686,80 @@ fn stage_one_completion() -> pioneer_protocol::ItemCompletedNotification {
 }
 
 #[tokio::test]
+async fn archived_shell_item_preserves_lookup_and_replay() {
+    let (_file, store, _writer) = fixture().await;
+    let db = store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event")
+        .await
+        .unwrap();
+    let payload = serde_json::json!({
+        "storage": {"kind": "shell", "stdout": "retained command output\n".repeat(600)}
+    });
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn_item SET payload=? WHERE id='item'",
+        [payload.to_string().into()],
+    ))
+    .await
+    .unwrap();
+
+    let reference = store
+        .compaction_tool_item_reference("ws", "thread", "turn", "item")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut progress = pioneer_crud::PortablePayloadProgress::default();
+    for _ in 0..500 {
+        if !progress.quantum(&store).await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM turn_item i JOIN portable_payload p ON p.id=i.payload_payload_id WHERE i.id='item' AND p.raw=0 AND p.retired=0",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        store
+            .compaction_replay_item_id("ws", "thread", &reference)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("item")
+    );
+    assert_eq!(
+        store
+            .compaction_tool_item_reference("ws", "thread", "turn", "item")
+            .await
+            .unwrap(),
+        Some(reference.clone())
+    );
+    assert!(
+        store
+            .compaction_replay_item_id("ws", "other-thread", &reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    db.execute_unprepared(
+        "UPDATE turn_item SET payload='{\"storage\":{\"kind\":\"shell\",\"stdout\":\"new result\"}}' WHERE id='item'",
+    )
+    .await
+    .unwrap();
+    assert!(
+        store
+            .compaction_replay_item_id("ws", "thread", &reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn portable_turn_payload_real_producer_restart_retry_and_corruption() {
     let (file, store, writer) = fixture().await;
     // Remove the unrelated noncanonical fixture bodies. The real producer below
