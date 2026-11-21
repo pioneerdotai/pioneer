@@ -1,5 +1,9 @@
 use crate::buttons::{default_outline_button, default_primary_button};
-use gpui_kit::{component::dialog::DialogFooter, prelude::*, *};
+use gpui_kit::{
+    component::{StyledExt, WindowExt, dialog::DialogFooter},
+    prelude::*,
+    *,
+};
 use pioneer_client::{
     composer::model_picker::{ComposerModelPickerIntent, ComposerModelPickerPublication},
     composer::store::ComposerOperationIdentity,

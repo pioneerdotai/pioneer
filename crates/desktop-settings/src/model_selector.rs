@@ -4,7 +4,7 @@ use crate::{
     screen::SettingsScreenView,
 };
 use gpui_kit::{
-    component::{Root, dialog::DialogFooter},
+    component::{Root, StyledExt, WindowExt, dialog::DialogFooter},
     prelude::*,
     *,
 };
