@@ -17,7 +17,7 @@ if __name__ == "__main__":
     if args.out.exists():
         raise ValueError(f"Build output already exists: {args.out}")
     for package in ("pioneer-desktop", "pioneer-app-updater"):
-        subprocess.run(["cargo", "build", "--locked", "--release", "-p", package,
+        subprocess.run(["cargo", "build", "--timings", "--locked", "--release", "-p", package,
                         "--target", args.target], check=True)
     suffix = ".exe" if args.target.endswith("windows-msvc") else ""
     binaries = [Path("target") / args.target / "release" / (name + suffix)

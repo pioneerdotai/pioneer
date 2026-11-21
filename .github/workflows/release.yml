@@ -99,8 +99,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+          cargo run --timings --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
             release-model-catalog/catalog.json
+
+      - name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing-*.html
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: upload-model-catalog
         uses: actions/upload-artifact@v6
@@ -130,13 +140,13 @@ jobs:
             asset_name: pioneer-linux-aarch64.AppImage
             update_asset_name: pioneer-linux-aarch64.AppImage
             appimagetool_arch: aarch64
-          - os: macos-15-intel
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             asset: pioneer-gateway-macos-x86_64.zip
             cu_asset: pioneer-gateway-macos-x86_64-computer-use-package.zip
             asset_name: Pioneer-x86_64.dmg
             update_asset_name: Pioneer-x86_64.app.zip
-          - os: macos-15
+          - os: macos-26
             target: aarch64-apple-darwin
             asset: pioneer-gateway-macos-aarch64.gz
             cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip

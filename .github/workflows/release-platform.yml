@@ -78,12 +78,30 @@ jobs:
         with:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-default-v2
           cache-workspace-crates: false
+      - name: restore-intel-compiler-cache
+        if: fromJSON(inputs.platform).target == 'x86_64-apple-darwin'
+        continue-on-error: true
+        uses: ./.github/actions/restore-release-compiler-cache
       - name: compile-gateway
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "default"
           --asset "${{ fromJSON(inputs.platform).asset }}"
           --out release-gateway
+      - name: save-intel-compiler-cache
+        if: env.RELEASE_COMPILE_STARTED != ''
+        continue-on-error: true
+        uses: ./.github/actions/save-release-compiler-cache
+      - &release-timings
+        name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-${{ fromJSON(inputs.platform).target }}-${{ github.job }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing-*.html
+          retention-days: 7
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -131,12 +149,21 @@ jobs:
         with:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-v2
           cache-workspace-crates: false
+      - name: restore-intel-compiler-cache
+        if: fromJSON(inputs.platform).target == 'x86_64-apple-darwin'
+        continue-on-error: true
+        uses: ./.github/actions/restore-release-compiler-cache
       - name: compile-gateway
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "computer-use"
           --asset "${{ fromJSON(inputs.platform).cu_asset }}"
           --out release-gateway
+      - name: save-intel-compiler-cache
+        if: env.RELEASE_COMPILE_STARTED != ''
+        continue-on-error: true
+        uses: ./.github/actions/save-release-compiler-cache
+      - *release-timings
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -187,6 +214,7 @@ jobs:
           cache-workspace-crates: false
       - name: compile-desktop-and-updater
         run: python scripts/packaging/build-desktop.py --target "${{ fromJSON(inputs.platform).target }}" --out release-desktop
+      - *release-timings
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
