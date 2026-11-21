@@ -221,6 +221,7 @@ artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/art
 "desktop-skills:CatalogSidebar" = ["Render", "SkillsCatalogView", "TUI-38"]
 "desktop-skills:SkillManagementRowView" = ["Render", "SkillsCatalogView", "TUI-38"]
 # One generic delivery view, mounted by both independent features.
+"desktop-foundation:PickerTrigger" = ["RenderOnce", "ComposerModelPickerView / Settings", "TUI-29"]
 "desktop-foundation:UploadView" = ["Render", "SkillsCatalogView / PackageCatalogView", "TUI-38"]
 "desktop-packages:PluginsSidebar" = ["Render", "PackageCatalogView", "TUI-48"]
 "desktop-settings:ActivationView" = ["Render", "SettingsView", "TUI-40"]
