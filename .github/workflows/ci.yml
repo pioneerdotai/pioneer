@@ -89,7 +89,7 @@ jobs:
         entrypoint: /bin/sh
         command: >-
           -ec "umask 077 &&
-          dd if=/dev/zero of=/swap/archive bs=1M count=8192 status=none &&
+          dd if=/dev/zero of=/swap/archive bs=1M count=16384 status=none &&
           mkswap /swap/archive &&
           swapon /swap/archive &&
           touch /tmp/swap-ready &&
@@ -170,6 +170,8 @@ jobs:
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
       - name: archive-workspace-tests
+        env:
+          CARGO_BUILD_JOBS: 4
         shell: bash
         run: |
           set -euo pipefail
@@ -199,12 +201,12 @@ jobs:
           # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
           trap 'exit 143' TERM
           archive_resources
-          # mkswap reserves one header page from the 8 GiB file.
-          required_swap_kib=$((8 * 1024 * 1024 - $(getconf PAGESIZE) / 1024))
+          # mkswap reserves one header page from the 16 GiB file.
+          required_swap_kib=$((16 * 1024 * 1024 - $(getconf PAGESIZE) / 1024))
           awk -v required="$required_swap_kib" '
             /^SwapTotal:/ { total = $2 }
             END { exit !(total >= required) }
-          ' /proc/meminfo || { echo "::error::8 GiB runner swap is unavailable"; exit 1; }
+          ' /proc/meminfo || { echo "::error::16 GiB runner swap is unavailable"; exit 1; }
           swap_limit=$(cat /sys/fs/cgroup/memory.swap.max)
           if [[ "$swap_limit" != max ]] && (( swap_limit < required_swap_kib * 1024 )); then
             echo "::error::Build container swap limit is too low ($swap_limit bytes)"
