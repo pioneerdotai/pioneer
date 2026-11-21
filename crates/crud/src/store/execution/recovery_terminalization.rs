@@ -1,23 +1,25 @@
-use pioneer_crud_access::turn_execution::turn_status_from_db;
 use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TURN_EVENT_PROJECTION_LEASE_SECS,
     prepare_projected_turn_event_for_permanent_storage,
 };
 use crate::store::execution::recovery_settlement;
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     ClaimedRecoveryTerminalizationRecord, CrudStore, GatewayControlWake,
     RecoveryTerminalCleanupPlan, RecoveryTerminalizationApplyOutcome,
     RecoveryTerminalizationClaimDisposition, compaction, terminal_cleanup,
 };
 use anyhow::{Context, Result, bail};
+use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_conversations::turn_reads;
-use pioneer_crud_execution::recovery_terminalization_outbox::PermanentRecoveryTerminalizationError;
+use pioneer_crud_execution::recovery_terminalization_outbox::{
+    self, PermanentRecoveryTerminalizationError,
+};
 use pioneer_crud_execution::recovery_terminalization_plan::PreparedRecoveryTerminalizationOutcome;
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{native_terminal_effect_outbox, recovery_job};
 use pioneer_protocol::{Thread, Turn};
-use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::TransactionTrait;
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 impl CrudStore {
     pub async fn claim_due_recovery_terminalizations(
@@ -57,7 +59,7 @@ impl CrudStore {
         let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
-                execution::mark_failed(
+                recovery_terminalization_outbox::mark_failed(
                     &self.connection,
                     record.recovery_job_id.as_str(),
                     record.claim_token.as_str(),
@@ -265,7 +267,7 @@ impl CrudStore {
                         "failed to begin superseded recovery terminalization transaction",
                     )?;
                     let result = async {
-                        execution::require_claim_revision(
+                        recovery_terminalization_outbox::require_claim_revision(
                             &transaction,
                             &record.recovery_job_id,
                             &record.claim_token,
@@ -365,7 +367,7 @@ impl CrudStore {
                 .await
                 .context("failed to begin recovery terminalization transaction")?;
             let result = async {
-                execution::require_claim_revision(
+                recovery_terminalization_outbox::require_claim_revision(
                     &transaction,
                     &record.recovery_job_id,
                     &record.claim_token,

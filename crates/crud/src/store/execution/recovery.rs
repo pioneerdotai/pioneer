@@ -1,4 +1,3 @@
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     AtomicRecoveryJobEnqueueOutcome, ClaimedRecoveryActivation, CrudStore, GatewayControlWake,
     RecoveryJobRecord, TaskOwnedTurnResumeOutcome, TurnExecutionRecord, TurnLivenessRecord,
@@ -11,7 +10,8 @@ use pioneer_crud_execution::blocked_recovery_resume::{
 };
 use pioneer_crud_execution::recovery_job::recovery_job_record_from_model;
 use pioneer_crud_execution::recovery_store::RecoveryChange;
-use pioneer_crud_execution::{recovery_job, turn_execution};
+use pioneer_crud_execution::time::unix_to_datetime;
+use pioneer_crud_execution::{recovery_job, recovery_terminalization_outbox, turn_execution};
 use pioneer_protocol::{
     ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
     Task, TaskRun, Turn, TurnItemType, TurnStatus,
@@ -595,7 +595,7 @@ impl CrudStore {
                     return Ok(BlockedTurnRecoveryResumeOutcome::NotFound);
                 }
 
-                execution::cancel_undelivered_for_job(
+                recovery_terminalization_outbox::cancel_undelivered_for_job(
                     &tx,
                     job.id.as_str(),
                     "superseded by explicit blocked Turn resume",

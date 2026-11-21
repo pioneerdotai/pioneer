@@ -1,4 +1,3 @@
-use pioneer_crud_access::turn_execution::turn_status_from_db;
 use crate::store::execution::agent_transactions;
 use crate::{
     AgentDelegationRouteInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
@@ -9,12 +8,13 @@ use crate::{
     revoke_agent_delegation_route,
 };
 use anyhow::{Context, Result};
+use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_execution::{agent_delegation_route, turn_execution};
 use pioneer_protocol::{
     Task, TaskError, TaskResult, TaskRunExecution, TaskRunExecutionStatus, Turn, TurnStatus,
 };
-use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::TransactionTrait;
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 impl CrudStore {
     pub async fn create_agent_delegation_route(
@@ -321,11 +321,11 @@ impl CrudStore {
         initiator: Option<(&str, &str, &str)>,
     ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
         let change = pioneer_crud_tasks::work_change::TaskWorkChange::new(&self.connection);
-        let before =
-            pioneer_crud_execution::execution_reads::find_agent_execution_status(
-                &self.connection, root_execution_id,
-            )
-                .await?;
+        let before = pioneer_crud_execution::execution_reads::find_agent_execution_status(
+            &self.connection,
+            root_execution_id,
+        )
+        .await?;
         let task_result = async {
             self.run_serialized_write(|| {
                 let finished_at = finished_at.clone();
@@ -370,11 +370,11 @@ impl CrudStore {
         }
         .await;
         if task_result.is_ok() {
-            let after =
-                pioneer_crud_execution::execution_reads::find_agent_execution_status(
-                &self.connection, root_execution_id,
+            let after = pioneer_crud_execution::execution_reads::find_agent_execution_status(
+                &self.connection,
+                root_execution_id,
             )
-                    .await?;
+            .await?;
             change.completed(before != after);
         }
         task_result

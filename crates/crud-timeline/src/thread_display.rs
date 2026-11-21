@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use pioneer_crud_conversations::{
     protocol_projection::{attach_thread_composer_snapshot, thread_from_db_model},
-    thread_metadata, thread_state, turn_order,
+    thread_metadata, thread_state, turn_order, turn_reads,
     values::turn_kind_to_db,
 };
 use pioneer_protocol::{PrincipalId, Thread, TurnKind};

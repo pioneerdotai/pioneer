@@ -1,12 +1,9 @@
 use crate::events::TurnEventPayload;
-use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_live_turn_event;
-use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TurnEventProjectionContext,
     prepare_turn_event_for_permanent_storage, serialize_turn_event_projection_context,
 };
 use crate::store::events::projection_receipts;
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     AppendedTurnEvent, CrudStore, TurnExecutionStatus, UnactivatedTurnPhaseChanged, compaction,
     finalize_agent_execution, load_agent_execution, load_agent_turn_response, terminal_cleanup,
@@ -19,10 +16,13 @@ use pioneer_crud_execution::event_storage_validation::{
 };
 use pioneer_crud_execution::gateway_control::event_wakes;
 use pioneer_crud_execution::native_cancellation_context;
+use pioneer_crud_execution::time::unix_to_datetime;
+use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use pioneer_crud_execution::{
     cli_runtime_binding, event_append as turn_event, execution_admission_lease,
     native_terminal_effect_outbox, turn_execution, turn_item_attempt,
 };
+use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_live_turn_event;
 use pioneer_protocol::{Task, Turn, TurnStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
@@ -277,13 +277,9 @@ impl CrudStore {
                 )
                 .await?;
             }
-            project_semantic_timeline_live_turn_event(
-                transaction,
-                &appended_event,
-                timeline_item,
-            )
-            .await
-            .context("failed to project turn event to semantic timeline")?;
+            project_semantic_timeline_live_turn_event(transaction, &appended_event, timeline_item)
+                .await
+                .context("failed to project turn event to semantic timeline")?;
 
             if !projection_receipts::mark_projected_claimed(
                 transaction,

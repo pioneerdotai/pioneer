@@ -2,12 +2,12 @@ use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TURN_EVENT_PROJECTION_LEASE_SECS,
     prepare_projected_turn_event_for_permanent_storage,
 };
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{CanonicalTurnEventPayload, CrudStore};
 use anyhow::{Result, ensure};
 use pioneer_crud_compaction::background::CompletedHistoryCheck;
 use pioneer_crud_compaction::lifecycle::{LifecycleAdmission, PreparedCompactionLifecycle};
 use pioneer_crud_conversations::turn_event_reads::find_event_model_by_idempotency_key;
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_entity::turn_event;
 use sea_orm::TransactionTrait;
 
@@ -429,9 +429,7 @@ pub(crate) async fn repair_lifecycle(
             .await;
     };
     let created_at = unix_to_datetime(timestamp_secs);
-    let expires = unix_to_datetime(
-        timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
-    );
+    let expires = unix_to_datetime(timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
     prepared.validate_publication(&event)?;
     let projected = PreparedLifecycleEvent::prepare(store, event, created_at).await?;
     // No operation-wide retry after a potentially committed claim.
@@ -457,9 +455,7 @@ pub(crate) async fn compaction_materialize_lifecycle(
     let admission =
         LifecycleAdmission::prepare(&store.connection, operation, generation, &event).await?;
     let created_at = unix_to_datetime(timestamp_secs);
-    let expires = unix_to_datetime(
-        timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
-    );
+    let expires = unix_to_datetime(timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
     let projected = PreparedLifecycleEvent::prepare(store, event, created_at).await?;
     let tx = store.connection.begin().await?;
     admission.revalidate(&tx).await?;

@@ -2232,27 +2232,6 @@ impl CompactionStore {
             .await
     }
 
-    pub(crate) async fn compaction_failed_delivery_command(
-        &self,
-        workspace: &str,
-        thread: &str,
-        command: Option<&str>,
-        source: Option<&SourceRef>,
-        event_fence: i64,
-        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
-    ) -> Result<Option<String>> {
-        crate::history::compaction_failed_delivery_command(
-            &self.connection,
-            workspace,
-            thread,
-            command,
-            source,
-            event_fence,
-            before,
-        )
-        .await
-    }
-
     pub async fn compaction_history_causal_boundary(
         &self,
         workspace: &str,

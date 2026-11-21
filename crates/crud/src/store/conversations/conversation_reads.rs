@@ -1,19 +1,19 @@
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     AgentWorkGraphProjectionTarget, ConversationEntry, CrudStore, MarkThreadReadRequest,
     ProjectionPageAnchor, SavedHistoryKey, SavedHistoryRow, SavedHistorySnapshot,
-    ThreadEpisodicCanonicalItem,
-    ThreadHistorySnapshot, ThreadTimelineApprovalScope, TurnMessageGuard, TurnWorkOwner,
-    count_unread_message_blocks_for_threads, find_thread_timeline_block_by_sort_key,
-    find_turn_work_item_projection, find_turn_work_item_projection_by_order_key,
-    find_turn_work_projection, list_thread_timeline_blocks_page,
-    list_turn_work_item_projections_by_ids, list_turn_work_items_page,
-    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
+    ThreadEpisodicCanonicalItem, ThreadHistorySnapshot, ThreadTimelineApprovalScope,
+    TurnMessageGuard, TurnWorkOwner, count_unread_message_blocks_for_threads,
+    find_thread_timeline_block_by_sort_key, find_turn_work_item_projection,
+    find_turn_work_item_projection_by_order_key, find_turn_work_projection,
+    list_thread_timeline_blocks_page, list_turn_work_item_projections_by_ids,
+    list_turn_work_items_page, load_agent_work_graph_projection_for_turn,
+    load_agent_work_graph_projection_target,
 };
 use anyhow::Result;
 use pioneer_crud_access::policy;
 use pioneer_crud_conversations::thread_metadata;
 use pioneer_crud_conversations::turn_reads;
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_protocol::{
     PrincipalId, PromptManifest, SandboxMode, Thread, ThreadReadResponse, Turn, TurnItem,
     TurnItemType, TurnItemsResponse, UserInput,
@@ -456,7 +456,8 @@ impl CrudStore {
         thread_id: &str,
     ) -> Result<Option<String>> {
         pioneer_crud_conversations::turn_order::latest_turn_id_by_creation_order(
-            &self.connection, thread_id,
+            &self.connection,
+            thread_id,
         )
         .await
     }
@@ -479,7 +480,9 @@ impl CrudStore {
         source_turn_id: &str,
     ) -> Result<Vec<String>> {
         pioneer_crud_conversations::turn_order::turn_ids_after_by_creation_order(
-            &self.connection, thread_id, source_turn_id,
+            &self.connection,
+            thread_id,
+            source_turn_id,
         )
         .await
     }

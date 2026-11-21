@@ -2,13 +2,16 @@
 //! only unowned canonical preview results may become compact diagnostics.
 use crate::CrudStore;
 use anyhow::Result;
-use pioneer_crud_artifacts::html_preview_receipts::HtmlPreviewReceipts;
+use pioneer_crud_artifacts::html_preview_receipts::{
+    HtmlPreviewArchiveWitness, HtmlPreviewReceipts,
+};
 use pioneer_crud_artifacts::preview_retirement::{
     PreviewArtifactScan, PreviewCandidate, PreviewRetirementGuard, retire_preview,
 };
 use pioneer_crud_compaction::preview_frozen_index;
 use pioneer_crud_compaction::preview_frozen_index::{PreviewImportIndex, unowned};
 use sea_orm::ConnectionTrait;
+use std::{future::Future, pin::Pin};
 
 async fn index_quantum(
     store: &CrudStore,
@@ -100,28 +103,30 @@ impl HtmlPreviewRetentionProgress {
 struct FrozenPreviewGuard<'a>(&'a pioneer_crud_compaction::frozen_lifetime::ReaderCounts);
 
 impl PreviewRetirementGuard for FrozenPreviewGuard<'_> {
-    async fn unowned<'a, C: ConnectionTrait + 'a>(
+    fn unowned<'a, C: ConnectionTrait + 'a>(
         &'a self,
         db: &'a C,
         workspace: &'a str,
         thread: &'a str,
         turn: &'a str,
         release: &'a pioneer_sqlite::WorkSignal,
-    ) -> Result<bool> {
-        let root_execution = pioneer_crud_execution::canonical_id::canonical_agent_id(
-            'E',
-            &format!("root-agent-turn\0{turn}"),
-        );
-        unowned(
-            db,
-            workspace,
-            thread,
-            turn,
-            &root_execution,
-            self.0,
-            release,
-        )
-        .await
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let root_execution = pioneer_crud_execution::canonical_id::canonical_agent_id(
+                'E',
+                &format!("root-agent-turn\0{turn}"),
+            );
+            unowned(
+                db,
+                workspace,
+                thread,
+                turn,
+                &root_execution,
+                self.0,
+                release,
+            )
+            .await
+        })
     }
 }
 

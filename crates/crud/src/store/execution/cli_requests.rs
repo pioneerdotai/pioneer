@@ -5,8 +5,8 @@ use crate::{
     TransitionCliRuntimePendingRequestDelivery,
 };
 use anyhow::{Context, Result};
-use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_pending_request;
 use pioneer_crud_execution::cli_runtime_binding;
+use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_pending_request;
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
@@ -22,29 +22,32 @@ impl CrudStore {
             self.control_work_change("gateway.control", &control_wakes),
             self.control_work_change("gateway.cli", &control_wakes),
         ];
-        let cli_result = async {
-            self.run_serialized_write(|| async {
-                let transaction =
-                    self.connection.begin().await.context(
+        let cli_result =
+            async {
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request create transaction",
                     )?;
-                let record =
-                    cli_runtime_binding::create_pending_request(&transaction, request.clone())
-                        .await?;
-                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
-                    .await
-                {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
-                }
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit CLI runtime pending request create transaction")?;
-                Ok(record)
-            })
-            .await
-        }
-        .await;
+                    let record =
+                        cli_runtime_binding::create_pending_request(&transaction, request.clone())
+                            .await?;
+                    if let Err(error) =
+                        project_cli_runtime_pending_request(&*transaction, &record).await
+                    {
+                        return Err(crate::store::connection::rollback_preserving_error(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request create transaction",
+                    )?;
+                    Ok(record)
+                })
+                .await
+            }
+            .await;
         if cli_result.is_ok() {
             for cli_change in cli_changes {
                 cli_change.completed(cli_result.is_ok());
@@ -74,10 +77,14 @@ impl CrudStore {
                 let record =
                     cli_runtime_binding::open_pending_request(&transaction, request.clone())
                         .await?;
-                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
-                    .await
+                if let Err(error) =
+                    project_cli_runtime_pending_request(&*transaction, &record).await
                 {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
+                    return Err(crate::store::connection::rollback_preserving_error(
+                        transaction,
+                        error,
+                    )
+                    .await);
                 }
                 transaction
                     .commit()
@@ -134,10 +141,14 @@ impl CrudStore {
                     &authorization,
                 )
                 .await?;
-                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
-                    .await
+                if let Err(error) =
+                    project_cli_runtime_pending_request(&*transaction, &record).await
                 {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
+                    return Err(crate::store::connection::rollback_preserving_error(
+                        transaction,
+                        error,
+                    )
+                    .await);
                 }
                 transaction
                     .commit()
@@ -254,10 +265,14 @@ impl CrudStore {
                     cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
                         .await?;
                 if let Some(record) = &record
-                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
-                        .await
+                    && let Err(error) =
+                        project_cli_runtime_pending_request(&*transaction, record).await
                 {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
+                    return Err(crate::store::connection::rollback_preserving_error(
+                        transaction,
+                        error,
+                    )
+                    .await);
                 }
                 transaction
                     .commit()
@@ -299,10 +314,14 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
-                        .await
+                    && let Err(error) =
+                        project_cli_runtime_pending_request(&*transaction, record).await
                 {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
+                    return Err(crate::store::connection::rollback_preserving_error(
+                        transaction,
+                        error,
+                    )
+                    .await);
                 }
                 transaction
                     .commit()
@@ -345,10 +364,14 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
-                        .await
+                    && let Err(error) =
+                        project_cli_runtime_pending_request(&*transaction, record).await
                 {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
+                    return Err(crate::store::connection::rollback_preserving_error(
+                        transaction,
+                        error,
+                    )
+                    .await);
                 }
                 transaction
                     .commit()
@@ -378,35 +401,38 @@ impl CrudStore {
             self.control_work_change("gateway.control", &control_wakes),
             self.control_work_change("gateway.cli", &control_wakes),
         ];
-        let cli_result = async {
-            let request_id = request_id.to_owned();
-            self.run_serialized_write(|| async {
-                let transaction =
-                    self.connection.begin().await.context(
+        let cli_result =
+            async {
+                let request_id = request_id.to_owned();
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request cancel transaction",
                     )?;
-                let record = cli_runtime_binding::cancel_pending_request(
-                    &transaction,
-                    request_id.clone(),
-                    response_json.clone(),
-                    updated_at,
-                )
-                .await?;
-                if let Some(record) = &record
-                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
-                        .await
-                {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
-                }
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit CLI runtime pending request cancel transaction")?;
-                Ok(record)
-            })
-            .await
-        }
-        .await;
+                    let record = cli_runtime_binding::cancel_pending_request(
+                        &transaction,
+                        request_id.clone(),
+                        response_json.clone(),
+                        updated_at,
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) =
+                            project_cli_runtime_pending_request(&*transaction, record).await
+                    {
+                        return Err(crate::store::connection::rollback_preserving_error(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request cancel transaction",
+                    )?;
+                    Ok(record)
+                })
+                .await
+            }
+            .await;
         if cli_result.is_ok() {
             for cli_change in cli_changes {
                 cli_change.completed(cli_result.as_ref().is_ok_and(|changed| changed.is_some()));
@@ -426,35 +452,38 @@ impl CrudStore {
             self.control_work_change("gateway.control", &control_wakes),
             self.control_work_change("gateway.cli", &control_wakes),
         ];
-        let cli_result = async {
-            let request_id = request_id.to_owned();
-            self.run_serialized_write(|| async {
-                let transaction =
-                    self.connection.begin().await.context(
+        let cli_result =
+            async {
+                let request_id = request_id.to_owned();
+                self.run_serialized_write(|| async {
+                    let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request expire transaction",
                     )?;
-                let record = cli_runtime_binding::expire_pending_request(
-                    &transaction,
-                    request_id.clone(),
-                    response_json.clone(),
-                    updated_at,
-                )
-                .await?;
-                if let Some(record) = &record
-                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
-                        .await
-                {
-                    return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
-                }
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit CLI runtime pending request expire transaction")?;
-                Ok(record)
-            })
-            .await
-        }
-        .await;
+                    let record = cli_runtime_binding::expire_pending_request(
+                        &transaction,
+                        request_id.clone(),
+                        response_json.clone(),
+                        updated_at,
+                    )
+                    .await?;
+                    if let Some(record) = &record
+                        && let Err(error) =
+                            project_cli_runtime_pending_request(&*transaction, record).await
+                    {
+                        return Err(crate::store::connection::rollback_preserving_error(
+                            transaction,
+                            error,
+                        )
+                        .await);
+                    }
+                    transaction.commit().await.context(
+                        "failed to commit CLI runtime pending request expire transaction",
+                    )?;
+                    Ok(record)
+                })
+                .await
+            }
+            .await;
         if cli_result.is_ok() {
             for cli_change in cli_changes {
                 cli_change.completed(cli_result.as_ref().is_ok_and(|changed| changed.is_some()));

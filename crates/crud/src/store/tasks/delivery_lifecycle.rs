@@ -81,7 +81,9 @@ impl CrudStore {
                     .append_task_cancellation_quantum(events, at, action, actor_id)
                     .await;
             }
-            for chunk in events.chunks(pioneer_crud_tasks::event_pipeline::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE) {
+            for chunk in
+                events.chunks(pioneer_crud_tasks::event_pipeline::MAX_ATOMIC_TASK_EVENT_BATCH_SIZE)
+            {
                 appended.extend(
                     self.append_task_cancellation_quantum(
                         chunk.to_vec(),

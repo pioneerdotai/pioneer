@@ -11,10 +11,10 @@ use pioneer_entity::{
     compaction_operation_projection as projection, compaction_runner_plan as plan,
     compaction_runner_state as runner,
 };
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, OnConflict};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set, TransactionTrait,
+    RelationTrait, TransactionTrait,
 };
 
 use crate::{
@@ -321,16 +321,16 @@ async fn write_raw_ownership<C: ConnectionTrait>(
                 .one(db)
                 .await?
                 .is_none()
-                && coverage::Entity::find()
+                && compaction_coverage::Entity::find()
                     .select_only()
                     .expr(Expr::val(1_i64))
                     .join(
                         JoinType::InnerJoin,
-                        coverage::Relation::CompactionCheckpoint.def()
+                        compaction_coverage::Relation::CompactionCheckpoint.def(),
                     )
-                    .filter(checkpoint::Column::OperationId.eq(&checkpoint.operation_id))
-                    .filter(coverage::Column::SourceScope.eq(&source.scope))
-                    .filter(coverage::Column::SourceId.eq(&source.id))
+                    .filter(compaction_checkpoint::Column::OperationId.eq(&checkpoint.operation_id))
+                    .filter(compaction_coverage::Column::SourceScope.eq(&source.scope))
+                    .filter(compaction_coverage::Column::SourceId.eq(&source.id))
                     .limit(1)
                     .into_tuple::<i64>()
                     .one(db)

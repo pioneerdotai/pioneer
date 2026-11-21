@@ -292,16 +292,31 @@ async fn cli_runtime_execution_segments_enforce_attempt_ownership_and_sequence()
         };
         let mapping = InputMapping::prepare(&binding.input_mapping_json, false)?;
         let tx = db.begin().await?;
-        let ((_, attempt), _) =
-            prepare_initial_attempt(&tx, &binding, "cli-attempt-segments", 1, mapping, &InlineRoot)
-                .await
-                .expect("initial CLI runtime attempt should prepare");
+        let ((_, attempt), _) = prepare_initial_attempt(
+            &tx,
+            &binding,
+            "cli-attempt-segments",
+            1,
+            mapping,
+            &InlineRoot,
+        )
+        .await
+        .expect("initial CLI runtime attempt should prepare");
         tx.commit().await?;
 
         let tx = db.begin().await?;
-        activate_attempt(&tx, turn_id, attempt.id.as_str(), submission_id, None, now, None, None)
-            .await
-            .expect("initial CLI runtime attempt should activate");
+        activate_attempt(
+            &tx,
+            turn_id,
+            attempt.id.as_str(),
+            submission_id,
+            None,
+            now,
+            None,
+            None,
+        )
+        .await
+        .expect("initial CLI runtime attempt should activate");
         tx.commit().await?;
 
         let (_, _, first) = store

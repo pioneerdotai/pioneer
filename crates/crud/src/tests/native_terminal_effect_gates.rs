@@ -801,7 +801,8 @@ async fn legacy_completion_observes_parent_projected_earlier_in_atomic_batch() {
             .await
             .unwrap()
             .unwrap();
-        let parent = pioneer_crud_tasks::task_run_turn::task_run_turn_from_db_model(parent).unwrap();
+        let parent =
+            pioneer_crud_tasks::task_run_turn::task_run_turn_from_db_model(parent).unwrap();
         // Leave real Task/run/Turn parents, then create their TaskRunTurn through A.
         // B must see A without serializing the legacy candidate under the writer.
         pioneer_entity::task_run_turn::Entity::delete_by_id(&parent.id)

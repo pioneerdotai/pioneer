@@ -1,7 +1,5 @@
 //! CRUD integration coverage for the completed-run inbox and access boundaries.
-use pioneer_crud::{
-    CrudStore, TaskCompletionInboxAccess, count_unread_task_completion_inbox,
-};
+use pioneer_crud::{CrudStore, TaskCompletionInboxAccess, count_unread_task_completion_inbox};
 use pioneer_postgres_test::{TestDatabase, scoped_database};
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};

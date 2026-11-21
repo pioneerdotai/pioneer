@@ -92,7 +92,9 @@ pub async fn find_event_model_by_id(
     db: &impl ConnectionTrait,
     event_id: &str,
 ) -> Result<Option<turn_event::Model>> {
-    Ok(turn_event::Entity::find_by_id(event_id.to_owned()).one(db).await?)
+    Ok(turn_event::Entity::find_by_id(event_id.to_owned())
+        .one(db)
+        .await?)
 }
 
 pub async fn find_event_by_id(

@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, VecDeque},
     future::Future,
+    pin::Pin,
 };
 
 /// The owner of frozen reader holds must recheck them with the durable retention
@@ -35,7 +36,7 @@ pub trait PreviewRetirementGuard: Sync {
         thread: &'a str,
         turn: &'a str,
         release: &'a WorkSignal,
-    ) -> impl Future<Output = Result<bool>> + Send + 'a;
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
 }
 
 #[derive(Default)]

@@ -6,12 +6,14 @@ pub async fn find_agent_execution_status(
     db: &impl ConnectionTrait,
     execution_id: &str,
 ) -> Result<Option<String>> {
-    Ok(pioneer_entity::agent_execution::Entity::find_by_id(execution_id.to_owned())
-        .select_only()
-        .column(pioneer_entity::agent_execution::Column::Status)
-        .into_tuple::<String>()
-        .one(db)
-        .await?)
+    Ok(
+        pioneer_entity::agent_execution::Entity::find_by_id(execution_id.to_owned())
+            .select_only()
+            .column(pioneer_entity::agent_execution::Column::Status)
+            .into_tuple::<String>()
+            .one(db)
+            .await?,
+    )
 }
 
 pub async fn load_agent_execution_resource_state<C: ConnectionTrait>(

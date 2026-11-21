@@ -20,8 +20,8 @@ use crate::turn_mcp_projection::{
 use crate::turn_skill_binding::TurnSkillBindingRecord;
 use crate::turn_skill_binding::turn_skill_binding_record_from_model;
 use crate::{
-    McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord, PackageRecord,
-    plugins,
+    McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
+    PackageRecord, plugins,
 };
 use crate::{
     mcp_installation_transactions, mcp_server_installation, skill_installation, skill_lifecycle,

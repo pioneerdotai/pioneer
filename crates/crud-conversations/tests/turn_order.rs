@@ -33,9 +33,14 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
     let scoped = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
     let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap();
     assert_eq!(
-        turn_before_launch_and_intervening_by_creation_order(&scoped, "thread", "launch", "occurrence")
-            .await
-            .unwrap(),
+        turn_before_launch_and_intervening_by_creation_order(
+            &scoped,
+            "thread",
+            "launch",
+            "occurrence"
+        )
+        .await
+        .unwrap(),
         Some((Some("a".to_owned()), true)),
     );
     // The range query that locates the next timestamp must seek through
@@ -102,9 +107,14 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
         .unwrap();
     // Insertion ordinals preserve the tie order when no creation sequence exists.
     assert_eq!(
-        turn_before_launch_and_intervening_by_creation_order(&scoped, "thread", "launch", "occurrence")
-            .await
-            .unwrap(),
+        turn_before_launch_and_intervening_by_creation_order(
+            &scoped,
+            "thread",
+            "launch",
+            "occurrence"
+        )
+        .await
+        .unwrap(),
         Some((Some("a".to_owned()), true)),
     );
 }

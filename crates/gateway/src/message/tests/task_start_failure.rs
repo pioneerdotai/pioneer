@@ -524,6 +524,11 @@ async fn run_gateway_start_failure(
     ] {
         assert!(!encoded.contains(marker));
     }
+    if matches!(case, PreparationFailure::ChildPersistence) {
+        // An optional delivery can still own a claim after the run fails.
+        // Join Gateway workers before the fixture closes the PostgreSQL pools.
+        processor.shutdown_resilience_workers().await;
+    }
     (Some(error), run_id)
 }
 
@@ -628,7 +633,9 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
                 assert!(
                     fields["error"]
                         .as_str()
-                        .is_some_and(|error| error.contains("pioneer9 child failure persistence"))
+                        .is_some_and(|error| error.contains("pioneer9 child failure persistence")),
+                    "unexpected optional delivery error: {:?}",
+                    fields.get("error")
                 );
             }
             report => panic!("unexpected diagnostic in Task start fixture: {report:?}"),

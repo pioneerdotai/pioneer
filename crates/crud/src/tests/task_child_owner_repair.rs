@@ -226,7 +226,9 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
             // A stale sequence CAS is allowed only by unwinding the entire
             // source transaction; never retry its old RR snapshot in place.
             assert!(
-                error.downcast_ref::<pioneer_crud_conversations::turn_payload::PreflightRace>().is_some()
+                error
+                    .downcast_ref::<pioneer_crud_conversations::turn_payload::PreflightRace>()
+                    .is_some()
                     || pioneer_sqlite::is_retryable_database_conflict(&error)
             );
             source.rollback().await.unwrap();

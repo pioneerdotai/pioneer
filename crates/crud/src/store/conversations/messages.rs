@@ -2,7 +2,6 @@ use crate::events::TurnEventPayload;
 use crate::store::events::event_preparation::{
     TURN_EVENT_PROJECTION_LEASE_SECS, prepare_projected_turn_event_for_permanent_storage,
 };
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     CrudStore, DeleteTurnMessageRequest, DeleteTurnMessageResult, EditTurnMessageRequest,
     GatewayControlWake, compaction, list_turn_message_revisions, terminal_cleanup,
@@ -13,6 +12,7 @@ use pioneer_crud_conversations::message_commands::{
     MessageDeletePreparation, prepare_message_delete, prepare_message_edit,
     revalidate_message_delete, revalidate_message_edit,
 };
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_protocol::{Turn, TurnMessageEditedEvent, TurnMessageRevision};
 use sea_orm::TransactionTrait;
 
@@ -93,7 +93,11 @@ impl CrudStore {
                         .context("failed to commit Turn message edit transaction")?;
                     Ok(event)
                 }
-                Err(error) => Err(crate::store::connection::rollback_preserving_error(transaction, error).await),
+                Err(error) => Err(crate::store::connection::rollback_preserving_error(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         }
         .await;
@@ -200,7 +204,11 @@ impl CrudStore {
                         .context("failed to commit Turn message delete transaction")?;
                     Ok(result)
                 }
-                Err(error) => Err(crate::store::connection::rollback_preserving_error(transaction, error).await),
+                Err(error) => Err(crate::store::connection::rollback_preserving_error(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         }
         .await;

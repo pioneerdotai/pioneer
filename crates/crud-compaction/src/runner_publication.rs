@@ -282,20 +282,23 @@ pub(crate) async fn compaction_apply_runner(
     };
     let applied = state.applied(checkpoint)?;
     let encoded = serde_json::to_string(&applied)?;
-    store
-        .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
-        .await?;
-    let prepared = store
-        .run_scoped_database_quantum(|| {
-            prepare_runner_publication(
-                store,
-                operation,
-                checkpoint,
-                state.generation,
-                expected_head,
-            )
-        })
-        .await?;
+    crate::runner_writes::prepare_checkpoint_ancestry(
+        &store.connection,
+        operation,
+        checkpoint,
+        state.generation,
+    )
+    .await?;
+    let prepared = crate::sweep_work::retry_conflict(|| {
+        prepare_runner_publication(
+            store,
+            operation,
+            checkpoint,
+            state.generation,
+            expected_head,
+        )
+    })
+    .await?;
     #[cfg(any(test, feature = "test-support"))]
     pause_publication_test_hook(
         store.connection.runtime_identity(),

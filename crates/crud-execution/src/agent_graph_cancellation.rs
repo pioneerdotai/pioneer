@@ -7,7 +7,7 @@ use pioneer_entity::{
     turn_cli_runtime_binding,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::Query;
+use sea_orm::sea_query::{ExprTrait, Query};
 use sea_orm::{ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect};
 use std::collections::BTreeMap;
 

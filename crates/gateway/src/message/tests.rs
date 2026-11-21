@@ -10792,7 +10792,9 @@ async fn setup_progress_delta_harness(
     let item_id = item.item_id().to_owned();
 
     let (connection_id, rx) = if subscribe {
-        let (tx, rx) = crate::session::test_support::outbound_channel(16);
+        // Keep enough room for the lifecycle burst before the fixture starts
+        // draining an item delta. Queue saturation has its own tests.
+        let (tx, rx) = crate::session::test_support::outbound_channel(128);
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         thread_manager

@@ -1,5 +1,4 @@
 use crate::store::conversations::thread_writes;
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     CliRuntimeThreadBindingRecord, CrudStore, NewThreadMembership, PersistedThreadAccessClass,
     PrivateThreadParticipantMutation, ResolvedThreadAgentsDocRecord, ThreadAgentsDocRecord,
@@ -10,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::thread_metadata;
 use pioneer_crud_conversations::{thread_agents_doc, thread_tree};
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, Thread, ThreadFolder, ThreadPlacement,
 };

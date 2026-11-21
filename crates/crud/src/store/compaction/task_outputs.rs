@@ -90,27 +90,6 @@ impl CrudStore {
             .await
     }
 
-    pub(crate) async fn compaction_failed_delivery_command(
-        &self,
-        workspace: &str,
-        thread: &str,
-        command: Option<&str>,
-        source: Option<&SourceRef>,
-        event_fence: i64,
-        before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
-    ) -> Result<Option<String>> {
-        self.compaction_store()
-            .compaction_failed_delivery_command(
-                workspace,
-                thread,
-                command,
-                source,
-                event_fence,
-                before,
-            )
-            .await
-    }
-
     /// First accepted manifest wins across retries. This is one metadata write;
     /// source materialization/hashing occurred before acquiring the writer.
     /// All prepared identities are revalidated in the INSERT predicate. This

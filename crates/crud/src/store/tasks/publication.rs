@@ -636,7 +636,11 @@ impl CrudStore {
                         .context("failed to commit atomic Task creation transaction")?;
                     Ok(materialize_task_events(appended_events))
                 }
-                Err(error) => Err(crate::store::connection::rollback_preserving_error(transaction, error).await),
+                Err(error) => Err(crate::store::connection::rollback_preserving_error(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         }
         .await;

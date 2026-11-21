@@ -1,6 +1,4 @@
-use crate::{
-    CrudStore, NewTurnLlmContextEntry, TurnLlmContextAppendOutcome, TurnLlmContextEntry,
-};
+use crate::{CrudStore, NewTurnLlmContextEntry, TurnLlmContextAppendOutcome, TurnLlmContextEntry};
 use anyhow::{Context, Result};
 use sea_orm::TransactionTrait;
 use std::collections::BTreeMap;

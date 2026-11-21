@@ -4,7 +4,6 @@ use super::event_projection::{TurnEventProjectionFailureOutcome, TurnEventProjec
 use crate::store::events::event_preparation::{
     TURN_EVENT_PROJECTION_LEASE_SECS, deserialize_turn_event_projection_context,
 };
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{CrudStore, compaction};
 use anyhow::{Context, Result, bail};
 use pioneer_crud_conversations::event_projection;
@@ -14,6 +13,7 @@ pub use pioneer_crud_conversations::projection_stream::{
     TurnProjectionStreamHealth, TurnProjectionStreamStateRecord,
 };
 use pioneer_crud_execution::event_append as turn_event;
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_protocol::Turn;
 use sea_orm::TransactionTrait;
 

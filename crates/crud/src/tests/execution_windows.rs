@@ -439,9 +439,12 @@ async fn native_execution_window_transition_rejects_gaps_and_rolls_back_invalid_
             .expect_err("the continued window start must wait for the earlier event");
         assert!(pending.is::<crate::ExecutionWindowStartProjectionPending>());
         assert_eq!(
-            pioneer_crud_conversations::turn_event::max_sequence(&database, &second_started.turn_id)
-                .await
-                .unwrap(),
+            pioneer_crud_conversations::turn_event::max_sequence(
+                &database,
+                &second_started.turn_id
+            )
+            .await
+            .unwrap(),
             predecessor.sequence,
         );
         let replay = store
@@ -456,9 +459,12 @@ async fn native_execution_window_transition_rejects_gaps_and_rolls_back_invalid_
                 .expect("the same window start should commit after its predecessor");
         }
         assert_eq!(
-            pioneer_crud_conversations::turn_event::max_sequence(&database, &second_started.turn_id)
-                .await
-                .unwrap(),
+            pioneer_crud_conversations::turn_event::max_sequence(
+                &database,
+                &second_started.turn_id
+            )
+            .await
+            .unwrap(),
             predecessor.sequence + 1,
         );
 

@@ -5,12 +5,12 @@ use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TURN_EVENT_PROJECTION_LEASE_SECS,
     prepare_projected_turn_event_for_permanent_storage,
 };
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     CrudStore, TaskRunOccurrenceClock, TaskRunOccurrenceReconcileCandidate,
     TaskRunOccurrenceReconcileClaim, TaskRunOccurrenceTerminalizationOutcome,
 };
 use anyhow::{Context, Result};
+use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_tasks::occurrence_reconcile as queue;
 use pioneer_crud_tasks::run_occurrence::{
     OccurrencePreparation, OccurrenceRepairPreparation, OccurrenceSourceFacts,
@@ -200,7 +200,11 @@ impl CrudStore {
                     )?;
                     Ok(outcome)
                 }
-                Err(error) => Err(crate::store::connection::rollback_preserving_error(transaction, error).await),
+                Err(error) => Err(crate::store::connection::rollback_preserving_error(
+                    transaction,
+                    error,
+                )
+                .await),
             }
         }
         .await;

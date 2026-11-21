@@ -5,7 +5,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 pub async fn insert_skill_upload_session<C: ConnectionTrait>(
