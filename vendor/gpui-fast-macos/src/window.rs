@@ -438,6 +438,10 @@ unsafe fn build_window_class(name: &CStr, superclass: &AnyClass) -> *const AnyCl
             window_will_enter_fullscreen as extern "C" fn(_, Sel, *mut AnyObject),
         );
         decl.add_method(
+            sel!(windowDidFailToEnterFullScreen:),
+            window_did_fail_to_enter_fullscreen as extern "C" fn(_, Sel, *mut AnyObject),
+        );
+        decl.add_method(
             sel!(windowWillExitFullScreen:),
             window_will_exit_fullscreen as extern "C" fn(_, Sel, *mut AnyObject),
         );
@@ -559,7 +563,7 @@ const NS_APPLICATION_PRESENTATION_AUTO_HIDE_MENU_BAR: NSUInteger = 1 << 2;
 
 // State captured when entering simple (borderless) fullscreen, used to restore
 // the window on exit.
-struct SimpleFullscreenState {
+pub(crate) struct SimpleFullscreenState {
     frame: NSRect,
     bounds: Bounds<Pixels>,
     style_mask: NSWindowStyleMask,
@@ -643,7 +647,7 @@ unsafe fn apply_simple_fullscreen_plan(
 
 /// What paces a window's frames. The choice depends only on the OS version,
 /// so it is made once per window.
-enum FrameSource {
+pub(crate) enum FrameSource {
     /// macOS 14+: a `CAMetalDisplayLink` that hands out each frame's drawable.
     Metal(Rc<MetalFrames>),
     /// Earlier systems: the shared `CVDisplayLink` registry, joined on first start.
@@ -652,16 +656,16 @@ enum FrameSource {
 
 pub(crate) struct MacWindowState {
     handle: AnyWindowHandle,
-    foreground_executor: ForegroundExecutor,
+    pub(crate) foreground_executor: ForegroundExecutor,
     background_executor: BackgroundExecutor,
-    native_window: *mut AnyObject,
+    pub(crate) native_window: *mut AnyObject,
     pub(crate) native_view: NonNull<AnyObject>,
     pub(crate) fast_composition: crate::fast::composition::MacComposition,
     blurred_view: Option<*mut AnyObject>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
-    frame_source: FrameSource,
+    pub(crate) frame_source: FrameSource,
     pub(crate) renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     pub(crate) event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -681,6 +685,7 @@ pub(crate) struct MacWindowState {
     last_left_mouse_down_event: Option<Retained<AnyObject>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
+    native_titlebar_visible: bool,
     traffic_light_frames: Option<TrafficLightFrames>,
     pre_fullscreen_traffic_light_frames: Option<TrafficLightFrames>,
     transparent_titlebar: bool,
@@ -697,7 +702,7 @@ pub(crate) struct MacWindowState {
     app_owns_titlebar_drag: bool,
     fullscreen_restore_bounds: Bounds<Pixels>,
     is_exiting_fullscreen: bool,
-    simple_fullscreen_state: Option<SimpleFullscreenState>,
+    pub(crate) simple_fullscreen_state: Option<SimpleFullscreenState>,
     move_tab_to_new_window_callback: Option<Box<dyn FnMut()>>,
     merge_all_windows_callback: Option<Box<dyn FnMut()>>,
     select_next_tab_callback: Option<Box<dyn FnMut()>>,
@@ -712,6 +717,10 @@ pub(crate) struct MacWindowState {
 
 impl MacWindowState {
     fn move_traffic_light(&mut self) {
+        if !self.native_titlebar_visible {
+            self.update_native_titlebar_visibility();
+        }
+
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() && !self.is_exiting_fullscreen {
                 self.restore_traffic_light();
@@ -767,6 +776,46 @@ impl MacWindowState {
                 buttons.close.updateTrackingAreas();
                 buttons.minimize.updateTrackingAreas();
                 buttons.zoom.updateTrackingAreas();
+            }
+        }
+    }
+
+    fn update_native_titlebar_visibility(&self) {
+        let Some(close_button) = self
+            .native_window()
+            .standardWindowButton(NSWindowButton::CloseButton)
+        else {
+            return;
+        };
+        if let Some(titlebar_container) = Self::titlebar_container(&close_button) {
+            titlebar_container.setHidden(!self.native_titlebar_visible);
+        }
+    }
+
+    fn apply_fullscreen_titlebar_opacity(&self) {
+        let min_version = NSOperatingSystemVersion {
+            majorVersion: 15,
+            minorVersion: 3,
+            patchVersion: 0,
+        };
+
+        if is_macos_version_at_least(min_version) {
+            unsafe {
+                let _: () = msg_send![self.native_window, setTitlebarAppearsTransparent: Bool::NO];
+            }
+        }
+    }
+
+    fn restore_windowed_titlebar_transparency(&self) {
+        let min_version = NSOperatingSystemVersion {
+            majorVersion: 15,
+            minorVersion: 3,
+            patchVersion: 0,
+        };
+
+        if is_macos_version_at_least(min_version) && self.transparent_titlebar {
+            unsafe {
+                let _: () = msg_send![self.native_window, setTitlebarAppearsTransparent: Bool::YES];
             }
         }
     }
@@ -830,7 +879,7 @@ impl MacWindowState {
 
     /// `window_state` is the handle this state lives in; a Metal link holds it
     /// weakly to deliver frames.
-    fn start_display_link(&mut self, window_state: &Rc<Mutex<MacWindowState>>) {
+    pub(crate) fn start_display_link(&mut self, window_state: &Rc<Mutex<MacWindowState>>) {
         self.stop_display_link();
         if !self
             .native_window()
@@ -847,37 +896,9 @@ impl MacWindowState {
                 let main_thread =
                     crate::main_thread_marker().expect("macOS windows require the main thread");
                 let window_state = Rc::downgrade(window_state);
-                let pending = Rc::new(Cell::new(false));
-                let generation = Rc::new(());
                 let source = MetalFrameSource::new(layer, main_thread, move |update| {
-                    if pending.replace(true) {
-                        return;
-                    }
-                    let pending = pending.clone();
-                    let generation = Rc::downgrade(&generation);
-                    let window_state = window_state.clone();
-                    let update = update.retain();
-                    let frame = RcBlock::new(move || {
-                        // Fullscreen/occlusion can replace the source before this runs.
-                        if generation.upgrade().is_some()
-                            && let Some(window_state) = window_state.upgrade()
-                        {
-                            let closed = window_state.lock().closed.load(Ordering::Acquire);
-                            if !closed {
-                                metal_frame(&window_state, &update);
-                            }
-                        }
-                        pending.set(false);
-                    });
-                    // finish_frame can service WebKit IPC. Doing so inside the
-                    // Metal display-link callback reenters QuartzCore's display
-                    // timer and can crash while fullscreen replaces its link.
-                    // Keep the drawable alive and render after that callback returns.
-                    unsafe {
-                        let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
-                        let modes =
-                            NSArray::from_slice(&[&*objc2_foundation::NSRunLoopCommonModes]);
-                        let _: () = msg_send![run_loop, performInModes: &*modes, block: &*frame];
+                    if let Some(window_state) = window_state.upgrade() {
+                        metal_frame(&window_state, update);
                     }
                 });
                 if let Some(source) = source {
@@ -900,7 +921,7 @@ impl MacWindowState {
         }
     }
 
-    fn stop_display_link(&mut self) {
+    pub(crate) fn stop_display_link(&mut self) {
         match &mut self.frame_source {
             FrameSource::Metal(metal_frames) => {
                 if metal_frames.is_attached() {
@@ -1178,6 +1199,7 @@ impl MacWindow {
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
+                native_titlebar_visible: true,
                 traffic_light_frames: None,
                 pre_fullscreen_traffic_light_frames: None,
                 transparent_titlebar: titlebar
@@ -1693,6 +1715,12 @@ impl PlatformWindow for MacWindow {
             }
             let _: () = msg_send![unarchiver, release];
         }
+    }
+
+    fn set_native_titlebar_visibility(&self, visible: bool) {
+        let mut state = self.0.lock();
+        state.native_titlebar_visible = visible;
+        state.update_native_titlebar_visibility();
     }
 
     fn set_traffic_light_position(&self, position: Point<Pixels>) {
@@ -2228,6 +2256,56 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn debug_state(&self) -> serde_json::Value {
+        let state = self.0.lock();
+        let window = state.native_window();
+        let screen: *mut AnyObject = unsafe { msg_send![state.native_window, screen] };
+        let frame = window.frame();
+        let layer = state.renderer.layer().map(|layer| {
+            let drawable_size = layer.drawableSize();
+            serde_json::json!({
+                "drawable_size": [drawable_size.width, drawable_size.height],
+                "contents_scale": layer.contentsScale(),
+            })
+        });
+        serde_json::json!({
+            "window_number": window.windowNumber(),
+            "occlusion_state_visible": window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::Visible),
+            "is_visible": window.isVisible(),
+            "is_key_window": window.isKeyWindow(),
+            "is_main_window": window.isMainWindow(),
+            "is_miniaturized": window.isMiniaturized(),
+            "is_on_active_space": window.isOnActiveSpace(),
+            "screen_display_id": display_id_for_screen(screen),
+            "frame": [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height],
+            "backing_scale_factor": window.backingScaleFactor(),
+            "frame_source": match &state.frame_source {
+                FrameSource::Metal(metal_frames) => metal_frames.debug_state(),
+                FrameSource::DisplayLink(Some(frame_source)) => frame_source.debug_state(),
+                FrameSource::DisplayLink(None) => serde_json::json!({
+                    "kind": "CVDisplayLink",
+                    "attached": false,
+                }),
+            },
+            "renderer": {
+                "display_link_attached": state.renderer.is_display_link_attached(),
+                "presents_with_transaction": state.renderer.presents_with_transaction(),
+                "layer": layer,
+            },
+            "request_frame_callback_installed": state.request_frame_callback.is_some(),
+            "last_reported_visibility": state
+                .last_visibility
+                .map(|visibility| format!("{visibility:?}")),
+            "activated_at_least_once": state.activated_least_once,
+            "cursor": {
+                "cached_style": state.cursor_style,
+                "cached_visible": state.cursor_visible.load(Ordering::Relaxed),
+            },
+        })
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().foreground_executor.clone();
         executor
@@ -2312,17 +2390,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn start_window_move(&self) {
-        let this = self.0.lock();
-        if this.simple_fullscreen_state.is_some() {
-            return;
-        }
-        let window = this.native_window;
-
-        unsafe {
-            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let event: *mut AnyObject = msg_send![app, currentEvent];
-            let _: () = msg_send![window, performWindowDragWithEvent: event];
-        }
+        crate::fast::composition::start_window_move(&self.0);
     }
 
     fn can_start_external_drag(&self) -> bool {
@@ -2428,6 +2496,7 @@ impl PlatformWindow for MacWindow {
                 return false;
             }
 
+            crate::fast::composition::clear_pointer_capture(&self.0);
             let session: *mut AnyObject = msg_send![
                 native_view,
                 beginDraggingSessionWithItems: dragging_items,
@@ -2620,17 +2689,13 @@ fn add_mouse_tracking_area(native_view: &NSView) {
     native_view.addTrackingArea(&tracking_area);
 }
 
-extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
-    // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
-    // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
-    // below is a valid NSCursor.
+/// # Safety
+///
+/// Must be called on the AppKit main thread.
+pub(crate) unsafe fn native_cursor(style: CursorStyle) -> *mut AnyObject {
+    // SAFETY: Each selector is an `NSCursor` class method returning a cursor.
     unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
-
-        let window_state = get_window_state(this);
-        let cursor_style = window_state.lock().cursor_style;
-
-        let cursor: *mut AnyObject = match cursor_style {
+        match style {
             CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
             CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
             CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
@@ -2664,7 +2729,21 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
-        };
+        }
+    }
+}
+
+extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
+    // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
+    // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
+    // below is a valid NSCursor.
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
+
+        let window_state = get_window_state(this);
+        let cursor_style = window_state.lock().cursor_style;
+
+        let cursor = native_cursor(cursor_style);
 
         let bounds: NSRect = msg_send![this, bounds];
         let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
@@ -3119,9 +3198,9 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
         .contains(NSWindowOcclusionState::Visible)
     {
         lock.move_traffic_light();
-        lock.start_display_link(&window_state);
+        crate::fast::display_link_lifecycle::visibility_changed(&mut lock, &window_state, true);
     } else {
-        lock.stop_display_link();
+        crate::fast::display_link_lifecycle::visibility_changed(&mut lock, &window_state, false);
     }
     drop(lock);
     // The only visibility source: AppKit posts this for covering, minimizing,
@@ -3141,37 +3220,22 @@ extern "C" fn window_will_enter_fullscreen(this: &AnyObject, _: Sel, _: *mut Any
     lock.is_exiting_fullscreen = false;
     lock.pre_fullscreen_traffic_light_frames = lock.traffic_light_frames;
     lock.restore_traffic_light();
+    lock.apply_fullscreen_titlebar_opacity();
+}
 
-    let min_version = NSOperatingSystemVersion {
-        majorVersion: 15,
-        minorVersion: 3,
-        patchVersion: 0,
-    };
-
-    if is_macos_version_at_least(min_version) {
-        unsafe {
-            let _: () = msg_send![lock.native_window, setTitlebarAppearsTransparent: Bool::NO];
-        }
-    }
+extern "C" fn window_did_fail_to_enter_fullscreen(this: &AnyObject, _: Sel, _: *mut AnyObject) {
+    let window_state = unsafe { get_window_state(this) };
+    let mut lock = window_state.as_ref().lock();
+    lock.restore_windowed_titlebar_transparency();
+    lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
+    lock.move_traffic_light();
 }
 
 extern "C" fn window_will_exit_fullscreen(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.is_exiting_fullscreen = true;
-
-    let min_version = NSOperatingSystemVersion {
-        majorVersion: 15,
-        minorVersion: 3,
-        patchVersion: 0,
-    };
-
-    if is_macos_version_at_least(min_version) && lock.transparent_titlebar {
-        unsafe {
-            let _: () = msg_send![lock.native_window, setTitlebarAppearsTransparent: Bool::YES];
-        }
-    }
-
+    lock.restore_windowed_titlebar_transparency();
     lock.move_traffic_light();
 }
 
@@ -3179,6 +3243,9 @@ extern "C" fn window_did_fail_to_exit_fullscreen(this: &AnyObject, _: Sel, _: *m
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.is_exiting_fullscreen = false;
+    if lock.is_fullscreen() {
+        lock.apply_fullscreen_titlebar_opacity();
+    }
     lock.restore_traffic_light();
 }
 
@@ -3302,6 +3369,7 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
 
     let executor = lock.foreground_executor.clone();
     drop(lock);
+    crate::fast::composition::window_activation_changed(&window_state, is_active);
 
     let a11y_events = {
         let mut lock = window_state.lock();
@@ -3327,7 +3395,6 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 crate::fast::composition::set_presents_with_transaction(&mut lock, true);
                 lock.stop_display_link();
-                crate::fast::composition::begin_frame();
                 drop(lock);
                 callback(RequestFrameOptions {
                     signal_at,
@@ -3335,7 +3402,6 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
                     ..Default::default()
                 });
 
-                crate::fast::composition::finish_frame(&window_state);
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 crate::fast::composition::set_presents_with_transaction(&mut lock, false);
@@ -3456,7 +3522,6 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     if let Some(mut callback) = lock.request_frame_callback.take() {
         crate::fast::composition::set_presents_with_transaction(&mut lock, true);
         lock.stop_display_link();
-        crate::fast::composition::begin_frame();
         drop(lock);
         callback(RequestFrameOptions {
             signal_at,
@@ -3464,7 +3529,6 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
             ..Default::default()
         });
 
-        crate::fast::composition::finish_frame(&window_state);
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         crate::fast::composition::set_presents_with_transaction(&mut lock, false);
@@ -3486,14 +3550,13 @@ extern "C" fn step(view: *mut c_void) {
             (None, FrameRequestSource::NativeCallback),
             |(at, source)| (Some(at), source),
         );
-        crate::fast::composition::begin_frame();
+        crate::fast::composition::present_for_native_views(&mut lock);
         drop(lock);
         callback(RequestFrameOptions {
             signal_at,
             signal_source,
             ..Default::default()
         });
-        crate::fast::composition::finish_frame(&window_state);
         window_state.lock().request_frame_callback = Some(callback);
     }
 }
@@ -3512,7 +3575,6 @@ fn metal_frame(
         return;
     };
     lock.renderer.set_frame_drawable(Some(update.drawable()));
-    crate::fast::composition::begin_frame();
     drop(lock);
     metal_frames.begin_frame();
     callback(RequestFrameOptions {
@@ -3520,7 +3582,6 @@ fn metal_frame(
         signal_source: FrameRequestSource::NativeCallback,
         ..Default::default()
     });
-    crate::fast::composition::finish_frame(window_state);
     let mut lock = window_state.lock();
     lock.request_frame_callback = Some(callback);
     // A frame with nothing to draw leaves its drawable unused; releasing it

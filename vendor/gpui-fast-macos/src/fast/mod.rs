@@ -9,3 +9,5 @@
 //! tests — is written here, one file per topic.
 
 pub(crate) mod composition;
+pub(crate) mod display_link_lifecycle;
+pub(crate) mod menu;

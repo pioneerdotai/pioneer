@@ -36,7 +36,6 @@ impl NativeWebViewSurface {
                 let original_parent = view.superview().context("WebView has no parent")?;
                 let container = &*(parent as *const NSView);
                 container.addSubview(&view);
-                super::macos::install_presentation_handler(webview, container);
                 Ok(original_parent)
             }
         })();
@@ -119,7 +118,11 @@ impl NativeWebViewSurface {
                 let result = self.window.update(cx, |_, window, _| {
                     window
                         .enable_window_composition()?
-                        .remove_surface(self.surface.id())
+                        .remove_surface(self.surface.id())?;
+                    // The rendered frame still blocks pointer input where the surface was,
+                    // so draw again for hover and clicks to reach the elements beneath.
+                    window.refresh();
+                    anyhow::Ok(())
                 });
                 if let Ok(Err(error)) = result {
                     log::warn!("cannot release WebView composition surface: {error:#}");
