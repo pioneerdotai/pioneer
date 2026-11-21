@@ -1,15 +1,21 @@
 //! Process-local hints for the existing durable execution owner. This is not
 //! a lease authority: only a fresh DB observation can establish Empty.
-use crate::TurnExecutionRecord;
+use crate::turn_execution::{self, TurnExecutionRecord};
+use anyhow::{Context, Result};
+use pioneer_sqlite::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+    is_retryable_database_conflict, retry_with_backoff,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Clone, Default)]
-pub(crate) struct Registries(Arc<Mutex<HashMap<String, Arc<Registry>>>>);
+pub struct Registries(Arc<Mutex<HashMap<String, Arc<Registry>>>>);
 
 impl Registries {
-    pub(crate) fn owner(&self, owner: &str) -> Arc<Registry> {
+    pub fn owner(&self, owner: &str) -> Arc<Registry> {
         self.0
             .lock()
             .unwrap()
@@ -23,7 +29,52 @@ impl Registries {
             .clone()
     }
 
-    pub(crate) fn changing(&self, owner: &str) -> OwnershipChange {
+    pub fn notification(&self, owner: &str) -> Arc<Notify> {
+        self.owner(owner).notification.clone()
+    }
+
+    pub fn release_wake(&self) -> ReleaseWake {
+        ReleaseWake(self.clone())
+    }
+
+    /// True means a fresh database observation permits the owner to park.
+    pub async fn supervise(
+        &self,
+        db: &SqliteDatabase,
+        owner_id: &str,
+        lease_seconds: i64,
+    ) -> Result<bool> {
+        let registry = self.owner(owner_id);
+        let (generation, unknown, empty) = registry.observation();
+        if empty {
+            return Ok(true);
+        }
+
+        let result = async {
+            // A cancelled caller can leave a COMMIT in flight on another
+            // pooled session. Finish dispatched writes before a fresh read
+            // can publish Empty. The generation also fences new acquisitions.
+            if unknown {
+                db.settle_dispatched_writes()
+                    .await
+                    .context("settle outstanding execution ownership writes")?;
+            }
+            let affected = renew(db, owner_id, lease_seconds).await?;
+            if unknown || affected == 0 {
+                let active = turn_execution::list_owned_active(db, owner_id, 200).await?;
+                registry.reconstruct(generation, active);
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            registry.unknown();
+            return Err(error);
+        }
+        Ok(registry.observation().2)
+    }
+
+    pub fn changing(&self, owner: &str) -> OwnershipChange {
         let registry = self.owner(owner);
         {
             let mut state = registry.state.lock().unwrap();
@@ -38,10 +89,21 @@ impl Registries {
     }
 }
 
+/// Extend active receipts using the PostgreSQL clock at each UPDATE attempt.
+pub async fn renew(db: &SqliteDatabase, owner: &str, lease_seconds: i64) -> Result<u64> {
+    retry_with_backoff(
+        || turn_execution::heartbeat_owner(db, owner, lease_seconds),
+        is_retryable_database_conflict,
+        DEFAULT_LOCK_RETRY_ATTEMPTS,
+        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await
+}
+
 /// Terminal outcomes wake heartbeat owners after their outer transaction has
 /// released capacity. No witness is removed, so stale release cannot erase a
 /// newer ownership fence. Empty owners simply remain parked without SQL.
-pub(crate) struct ReleaseWake(pub(crate) Registries);
+pub struct ReleaseWake(Registries);
 impl Drop for ReleaseWake {
     fn drop(&mut self) {
         let notifications = self
@@ -85,13 +147,13 @@ impl State {
 }
 
 #[derive(Default)]
-pub(crate) struct Registry {
+pub struct Registry {
     owner_id: String,
     state: Mutex<State>,
-    pub(crate) notification: Arc<Notify>,
+    notification: Arc<Notify>,
 }
 impl Registry {
-    pub(crate) fn observation(&self) -> (u64, bool, bool) {
+    pub fn observation(&self) -> (u64, bool, bool) {
         let state = self.state.lock().unwrap();
         if let Ownership::Owned(witnesses) = &state.ownership {
             debug_assert!(!witnesses.is_empty());
@@ -103,7 +165,7 @@ impl Registry {
         )
     }
 
-    pub(crate) fn reconstruct(&self, generation: u64, rows: Vec<TurnExecutionRecord>) {
+    fn reconstruct(&self, generation: u64, rows: Vec<TurnExecutionRecord>) {
         let mut state = self.state.lock().unwrap();
         if state.generation != generation || state.in_flight != 0 {
             return;
@@ -119,7 +181,7 @@ impl Registry {
         };
     }
 
-    pub(crate) fn unknown(&self) {
+    fn unknown(&self) {
         let mut state = self.state.lock().unwrap();
         state.advance();
         state.ownership = Ownership::Unknown;
@@ -131,11 +193,11 @@ impl Registry {
 /// revisit the durable owner. No terminal callback removes an identity: the
 /// existing heartbeat's zero result triggers a fresh read to clear the registry, fenced
 /// against every newer acquisition. A stale release cannot erase a reacquire.
-pub(crate) struct OwnershipChange(Arc<Registry>, std::sync::atomic::AtomicBool);
+pub struct OwnershipChange(Arc<Registry>, std::sync::atomic::AtomicBool);
 impl OwnershipChange {
     /// Called synchronously after commit and before the producer can return or
     /// launch execution. The durable owner generation is the registration fence.
-    pub(crate) fn register(&self, execution: &TurnExecutionRecord) {
+    pub fn register(&self, execution: &TurnExecutionRecord) {
         if execution.owner_id != self.0.owner_id || !execution.status.is_active() {
             return;
         }
@@ -231,9 +293,9 @@ mod tests {
             turn_id: "turn".into(),
             thread_id: "thread".into(),
             workspace_id: "workspace".into(),
-            executor_kind: crate::TurnExecutorKind::ApiProvider,
+            executor_kind: turn_execution::TurnExecutorKind::ApiProvider,
             executor_key: None,
-            status: crate::TurnExecutionStatus::Running,
+            status: turn_execution::TurnExecutionStatus::Running,
             owner_id: "owner".into(),
             owner_generation: 2,
             lease_until: now,

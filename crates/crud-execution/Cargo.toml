@@ -20,6 +20,7 @@ pioneer-sqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
@@ -27,4 +28,3 @@ sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 [dev-dependencies]
 pioneer-migration.workspace = true
 pioneer-postgres-test.workspace = true
-tokio.workspace = true

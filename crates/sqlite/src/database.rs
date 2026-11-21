@@ -437,7 +437,9 @@ impl SqliteDatabase {
         self.writer.work_signal(domain)
     }
 
-    pub(crate) async fn settle_dispatched_writes(&self) -> Result<(), DbErr> {
+    /// Fence outstanding PostgreSQL operations before reading after an
+    /// ambiguous commit. The current write class controls admission.
+    pub async fn settle_dispatched_writes(&self) -> Result<(), DbErr> {
         self.writer.settle_dispatched_writes(self.write_class).await
     }
 

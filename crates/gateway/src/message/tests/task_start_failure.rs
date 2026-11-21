@@ -1093,13 +1093,28 @@ async fn create_cli_child_with_attachment_and_write_policy(
                     .turn_get(&child.thread_id, &child.turn_id)
                     .await
                     .is_some_and(|(_, turn)| turn.status == TurnStatus::InProgress)
-                && harness
+                && let Some(guard) = harness
                     .crud_store
                     .cli_runtime_blocked_turn_guard(&binding, &expected_native)
                     .await
                     .unwrap()
-                    .is_some()
+                && let Some(window) = harness
+                    .crud_store
+                    .latest_turn_execution_window(&child.turn_id)
+                    .await
+                    .unwrap()
+                && window.status == pioneer_protocol::ExecutionWindowStatus::Running
+                && window.metadata_json["runtimeWindowId"].as_str()
+                    == Some(guard.attempt_id.as_str())
             {
+                // The native start ACK and active binding can precede the
+                // execution-window commit. Let launch release its transition
+                // before the fixture publishes a result or completes the turn.
+                let _launch = processor
+                    .cli_runtime_turn_resume_transition(&child.turn_id)
+                    .await
+                    .unwrap()
+                    .expect("activated child has a launch transition");
                 return TestChildRuntimeAnchor {
                     child_thread_id: scope.child_thread_id,
                     child_turn_id: child.turn_id,
@@ -1112,7 +1127,7 @@ async fn create_cli_child_with_attachment_and_write_policy(
         }
     })
     .await
-    .expect("initial CLI child must publish its active native attempt and load its turn within 30 seconds");
+    .expect("initial CLI child must commit its running native window within 30 seconds");
     assert_eq!(
         harness.cli_session.turn_starts.lock().await.len(),
         activations + 1

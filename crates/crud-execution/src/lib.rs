@@ -21,6 +21,7 @@ pub mod cli_mcp_item;
 pub mod cli_runtime_attempts;
 pub mod cli_runtime_binding;
 pub mod execution_admission_lease;
+pub mod execution_heartbeat;
 pub mod execution_reads;
 pub mod hook_run;
 pub mod input_mapping;

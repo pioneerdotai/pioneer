@@ -18,7 +18,7 @@ pub use cli_mcp_call::{CliMcpCallIdentity, is_managed_cli_mcp_item};
 pub use codex_retry_notice::{
     CodexRetryNoticeRead, CodexRetryNoticeTarget, codex_retry_notice_item_id,
 };
-mod execution_heartbeat;
+use pioneer_crud_execution::execution_heartbeat;
 mod frozen_lifetime;
 mod gateway_control;
 pub use gateway_control::{GatewayControlConnection, GatewayControlWake};
@@ -6517,7 +6517,7 @@ impl CrudStore {
         ]
         .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
-            let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
+            let _release_wake = self.execution_heartbeats.release_wake();
             anyhow::ensure!(
                 notification.turn.id == expected.turn_id
                     && notification.thread_id == expected.thread_id
@@ -7617,7 +7617,7 @@ impl CrudStore {
         let result = async {
             let _release_wake =
                 matches!(&transition, NativeExecutionWindowTransition::Blocked { .. })
-                    .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
+                    .then(|| self.execution_heartbeats.release_wake());
             let created_at = unix_to_datetime(event_timestamp_secs);
             let claim_expires_at = unix_to_datetime(
                 event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS),
@@ -11626,77 +11626,18 @@ impl CrudStore {
         &self,
         owner_id: &str,
     ) -> std::sync::Arc<tokio::sync::Notify> {
-        self.execution_heartbeats
-            .owner(owner_id)
-            .notification
-            .clone()
+        self.execution_heartbeats.notification(owner_id)
     }
 
     /// Returns true only when an authoritative observation permits parking.
-    /// Owned cycles perform the existing UPDATE without a preceding SELECT.
     pub async fn supervise_turn_execution_heartbeat(
         &self,
         owner_id: &str,
         lease_seconds: i64,
     ) -> Result<bool> {
-        let registry = self.execution_heartbeats.owner(owner_id);
-        let (generation, unknown, empty) = registry.observation();
-        if empty {
-            return Ok(true);
-        }
-        if unknown {
-            // A cancelled acquisition can drop its Rust guard/permit AFTER
-            // sending COMMIT but BEFORE SQLx finishes it. A reader SELECT alone
-            // can then see empty too early. Settle through the existing writer
-            // first: the single physical writer connection processes this
-            // UPDATE only after its preceding COMMIT/rollback commands. Pool
-            // return also pings that connection before making it reusable.
-            // Acquisitions racing this settlement invalidate generation (or
-            // retain in_flight), so only the following fresh read can park us.
-            // Cancellation/error before both operations leaves Unknown.
-            if let Err(error) = self
-                .heartbeat_turn_executions_owned_by(owner_id, lease_seconds)
-                .await
-            {
-                registry.unknown();
-                return Err(error);
-            }
-            match turn_execution::list_owned_active(&self.connection, owner_id, 200).await {
-                Ok(executions) => {
-                    registry.reconstruct(generation, executions);
-                    return Ok(registry.observation().2);
-                }
-                Err(error) => {
-                    registry.unknown();
-                    // Renewal already ran; a failed read never proves Empty.
-                    return Err(error);
-                }
-            }
-        }
-        let (generation, _, _) = registry.observation();
-        match self
-            .heartbeat_turn_executions_owned_by(owner_id, lease_seconds)
+        self.execution_heartbeats
+            .supervise(&self.connection, owner_id, lease_seconds)
             .await
-        {
-            Ok(0) => {
-                // MySQL may report changed rather than matched rows. A zero
-                // UPDATE is therefore only a hint to revalidate, never proof
-                // of Empty. This read happens only on that exceptional path.
-                match turn_execution::list_owned_active(&self.connection, owner_id, 200).await {
-                    Ok(executions) => registry.reconstruct(generation, executions),
-                    Err(error) => {
-                        registry.unknown();
-                        return Err(error);
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                registry.unknown();
-                return Err(error);
-            }
-        }
-        Ok(registry.observation().2)
     }
 
     /// Extend active receipts using the database clock at each UPDATE attempt.
@@ -11705,12 +11646,7 @@ impl CrudStore {
         owner_id: &str,
         lease_seconds: i64,
     ) -> Result<u64> {
-        let owner_id = owner_id.to_owned();
-        self.run_serialized_write(|| async {
-            turn_execution::heartbeat_owner(&self.connection, owner_id.as_str(), lease_seconds)
-                .await
-        })
-        .await
+        execution_heartbeat::renew(&self.connection, owner_id, lease_seconds).await
     }
 
     /// Initial native handoff CAS, fenced against accepted terminal and exact
@@ -12250,7 +12186,7 @@ impl CrudStore {
             crate::task_events::TaskTurnChange::begin(&self.connection, vec![turn_id.to_owned()])
                 .await?;
         let result = async {
-            let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
+            let _release_wake = self.execution_heartbeats.release_wake();
             let turn_id = turn_id.to_owned();
             self.run_serialized_write(|| async {
                 // Decode the prepared item and materialize both canonical event
@@ -17162,9 +17098,8 @@ impl CrudStore {
                 )
                 .await?;
                 let result = async {
-                    let _release_wake = (!matches!(status, TurnStatus::InProgress)).then(|| {
-                        execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone())
-                    });
+                    let _release_wake = (!matches!(status, TurnStatus::InProgress))
+                        .then(|| self.execution_heartbeats.release_wake());
                     self.run_serialized_write(|| async {
                         let updated_at = unix_to_datetime(event_timestamp_secs);
                         let transaction = self
@@ -24742,7 +24677,7 @@ impl CrudStore {
         let native_change = self.connection.work_signal("maintenance.native").changing();
         let child_change = self.connection.work_signal("tasks.lifecycle").changing();
         let control_result = async {
-        let _release_wake = execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone());
+        let _release_wake = self.execution_heartbeats.release_wake();
         let record = record.clone();
         self.run_serialized_write(|| async {
             let created_at = unix_to_datetime(event_timestamp_secs);
@@ -26764,7 +26699,7 @@ impl CrudStore {
         let _release_wake = (events
             .iter()
             .any(|event| terminal_turn_execution_status_for_event(event).is_some()))
-        .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
+        .then(|| self.execution_heartbeats.release_wake());
         let _ownership_change = execution
             .as_ref()
             .map(|execution| self.execution_heartbeats.changing(&execution.owner_id));
@@ -27444,7 +27379,7 @@ impl CrudStore {
             .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _release_wake = (terminal_turn_execution_status_for_event(&event).is_some())
-                .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
+                .then(|| self.execution_heartbeats.release_wake());
             let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
             let projection_context_json =
                 serialize_turn_event_projection_context(&projection_context, event.id())?;
@@ -27742,7 +27677,7 @@ impl CrudStore {
             let result = async {
         let _release_wake = (terminal_turn_execution_status_for_event(&appended_event.payload)
             .is_some())
-        .then(|| execution_heartbeat::ReleaseWake(self.execution_heartbeats.clone()));
+        .then(|| self.execution_heartbeats.release_wake());
         let mut projection = self
             .projector
             .prepare(
@@ -51898,12 +51833,12 @@ mod tests {
             }
         }
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-        let writer = fixture.connect_with_limit(1).await.unwrap();
+        let writer = fixture.connect_with_limit(2).await.unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
         let boundary = Arc::new(WriterBoundary::default());
         let database = SqliteDatabase::from_executor(
             reader,
-            SqliteWriteExecutor::with_observer(writer, boundary.clone()),
+            SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone()),
         );
         database.validate_reader().await.unwrap();
         let store = CrudStore::new(database);
@@ -52026,11 +51961,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), wake.notified())
             .await
             .unwrap();
+        // An independent session of the real writer pool remains available
+        // while the first backend is still inside its cancelled caller's COMMIT.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.execute_unprepared("SELECT 1"),
+        )
+        .await
+        .expect("another writer is available before the ownership fence")
+        .unwrap();
         boundary.armed.store(true, Ordering::SeqCst);
         let heartbeat = store.supervise_turn_execution_heartbeat(owner, 30);
         tokio::pin!(heartbeat);
-        // Pre-fix heartbeat completes with Empty here, before attempting a
-        // writer operation. The repaired owner waits for physical settlement.
+        // An UPDATE on the second session alone cannot settle the first
+        // session's COMMIT. Wait for the scoped writer admission and poll the
+        // heartbeat while the server-side COMMIT blocker still holds.
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut heartbeat => panic!("parked before late COMMIT settled: {result:?}"),
@@ -52039,6 +51984,12 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut heartbeat)
+                .await
+                .is_err(),
+            "owner must keep waiting while the first backend is still committing"
+        );
         blocker.commit().await.unwrap();
         assert!(
             !tokio::time::timeout(Duration::from_secs(5), &mut heartbeat)
