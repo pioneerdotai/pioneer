@@ -563,6 +563,13 @@ impl CrudStore {
             entry.turn_id == turn && entry.item_id.as_deref() == Some(item),
             "recovery result scope mismatch"
         );
+        anyhow::ensure!(
+            self.compaction_tool_item_reference(workspace, thread, turn, item)
+                .await?
+                .as_ref()
+                == Some(terminal_source),
+            "terminal shell source changed before recovery commit"
+        );
         let delivery_key = format!("shell-recovery-v1:{item}");
         let changes = [
             self.connection.work_signal("tasks.lifecycle").changing(),
@@ -575,8 +582,10 @@ impl CrudStore {
                 let delivery_key = delivery_key.clone();
                 async move {
                     let transaction = self.connection.begin().await?;
+                    // The source revision fences logical payload changes.
+                    // Archival leaves it intact, so only metadata is needed here.
                     anyhow::ensure!(
-                        repositories::compaction::compaction_tool_item_reference(
+                        repositories::compaction::compaction_item_reference(
                             &transaction,
                             workspace,
                             thread,
@@ -740,29 +749,19 @@ impl CrudStore {
         item: &str,
     ) -> Result<Option<SourceRef>> {
         repositories::compaction::compaction_tool_item_reference(
-            &self.connection,
-            workspace,
-            thread,
-            turn,
-            item,
+            self, workspace, thread, turn, item,
         )
         .await
     }
     /// Resolve a saved shell result or frozen provider representation to its tool
-    /// item. Read identity metadata only and require the exact live revision.
+    /// item. Require the exact live revision.
     pub async fn compaction_replay_item_id(
         &self,
         workspace: &str,
         thread: &str,
         source: &SourceRef,
     ) -> Result<Option<String>> {
-        repositories::compaction::compaction_replay_item_id(
-            &self.connection,
-            workspace,
-            thread,
-            source,
-        )
-        .await
+        repositories::compaction::compaction_replay_item_id(self, workspace, thread, source).await
     }
     pub async fn compaction_item_reference(
         &self,

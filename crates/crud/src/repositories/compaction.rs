@@ -3979,107 +3979,94 @@ pub(crate) async fn compaction_context_reference_for_item<C: ConnectionTrait>(
     })
     .transpose()
 }
-pub(crate) async fn compaction_tool_item_reference<C: ConnectionTrait>(
-    db: &C,
+// Resolve a single scoped row before decoding its logical payload. Portable
+// rows can expose an empty inline projection while the archive holds the item.
+async fn read_shell_item(
+    store: &CrudStore,
+    projection: CanonicalProjection<turn_item::Entity, ()>,
+    predicate: Expr,
+) -> Result<Option<(String, String, i64)>> {
+    let query = projection
+        .query
+        .select_only()
+        .column(turn_item::Column::Id)
+        .column(turn_item::Column::ItemId)
+        .expr(projection.revision)
+        .column(turn_item::Column::Payload)
+        .column(turn_item::Column::PayloadPayloadId)
+        .filter(predicate)
+        .limit(1);
+    store
+        .run_scoped_database_quantum(|| async {
+            let Some((id, item, revision, inline, payload_id)) = query
+                .clone()
+                .into_tuple::<(String, String, i64, String, Option<String>)>()
+                .one(&store.connection)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let payload = super::portable_payload::hydrate(
+                &store.connection,
+                super::portable_payload::Family::TurnItem,
+                payload_id.as_deref(),
+                inline,
+            )
+            .await?;
+            let value = super::turn_payload::json1_value(&payload)?;
+            let is_shell = value
+                .pointer("/storage/kind")
+                .and_then(|kind| kind.as_str())
+                == Some("shell");
+            Ok(is_shell.then_some((id, item, revision)))
+        })
+        .await
+}
+
+pub(crate) async fn compaction_tool_item_reference(
+    store: &CrudStore,
     workspace: &str,
     thread: &str,
     turn: &str,
     item: &str,
 ) -> Result<Option<SourceRef>> {
-    let row = turn_item::Entity::find()
-        .select_only()
-        .join(
-            JoinType::InnerJoin,
-            turn_item::Entity::belongs_to(turn::Entity)
-                .from(turn_item::Column::TurnId)
-                .to(turn::Column::Id)
-                .into(),
-        )
-        .join(
-            JoinType::InnerJoin,
-            turn::Entity::belongs_to(thread::Entity)
-                .from(turn::Column::ThreadId)
-                .to(thread::Column::Id)
-                .into(),
-        )
-        .join(
-            JoinType::LeftJoin,
-            turn_item::Entity::belongs_to(compaction_item_revision::Entity)
-                .from(turn_item::Column::Id)
-                .to(compaction_item_revision::Column::SourceId)
-                .into(),
-        )
-        .expr(Expr::col((turn_item::Entity, turn_item::Column::Id)))
-        .expr_as(
-            Expr::expr(Func::cust(Alias::new("coalesce")).args([
-                Expr::col((
-                    compaction_item_revision::Entity,
-                    compaction_item_revision::Column::Revision,
-                )),
-                Expr::val(1_i64),
-            ])),
-            "revision",
-        )
-        .filter(
-            Expr::col((thread::Entity, thread::Column::WorkspaceId))
-                .eq(Expr::Value(workspace.into()))
-                .and(Expr::col((thread::Entity, thread::Column::Id)).eq(Expr::Value(thread.into())))
-                .and(
-                    Expr::col((turn_item::Entity, turn_item::Column::TurnId))
-                        .eq(Expr::Value(turn.into())),
-                )
-                .and(
-                    Expr::col((turn_item::Entity, turn_item::Column::ItemId))
-                        .eq(Expr::Value(item.into())),
-                )
-                .and(
-                    Expr::expr(Func::cust(Alias::new("json_extract")).args([
-                        Expr::col((turn_item::Entity, turn_item::Column::Payload)),
-                        Expr::val("$.storage.kind"),
-                    ]))
-                    .eq(Expr::val("shell")),
-                ),
-        )
-        .limit(1)
-        .into_tuple::<(String, i64)>()
-        .one(db)
-        .await?;
-    row.map(|(id, revision)| {
-        Ok(SourceRef {
-            scope: format!("item:{turn}"),
-            id,
-            version: format!("item-revision:{}", revision),
-        })
-    })
-    .transpose()
+    Ok(read_shell_item(
+        store,
+        turn_item_projection(workspace, thread, turn),
+        turn_item::Column::ItemId.eq(item),
+    )
+    .await?
+    .map(|(id, _, revision)| SourceRef {
+        scope: format!("item:{turn}"),
+        id,
+        version: format!("item-revision:{revision}"),
+    }))
 }
 
-/// Resolve a saved shell result or frozen provider representation to its tool
-/// item. Read identity metadata only and require the exact live revision.
-pub(crate) async fn compaction_replay_item_id<C: ConnectionTrait>(
-    db: &C,
+/// Find the tool item for a saved shell result or provider representation.
+/// Replay requires the exact live revision.
+pub(crate) async fn compaction_replay_item_id(
+    store: &CrudStore,
     workspace: &str,
     thread: &str,
     source: &SourceRef,
 ) -> Result<Option<String>> {
     if let Some(turn) = source.scope.strip_prefix("item:") {
-        replay_item_id(
-            db,
-            turn_item_projection(workspace, thread, turn),
-            turn_item::Column::ItemId,
-            Expr::expr(Func::cust(Alias::new("json_extract")).args([
-                Expr::col((turn_item::Entity, turn_item::Column::Payload)),
-                Expr::val("$.storage.kind"),
-            ]))
-            .eq("shell"),
-            workspace,
-            thread,
-            source,
-        )
-        .await
+        let Ok(revision) = exact_canonical_revision(source, CanonicalSource::ToolItem) else {
+            return Ok(None);
+        };
+        let projection = turn_item_projection(workspace, thread, turn);
+        let current = projection
+            .id
+            .eq(&source.id)
+            .and(projection.revision.clone().eq(revision))
+            .and(projection.present.clone().eq(1_i64));
+        Ok(read_shell_item(store, projection, current)
+            .await?
+            .map(|(_, item, _)| item))
     } else if let Some(turn) = source.scope.strip_prefix("context:") {
         replay_item_id(
-            db,
+            &store.connection,
             turn_llm_context_projection(workspace, thread, turn),
             turn_llm_context::Column::ItemId,
             turn_llm_context::Column::Source.eq("tool_result_v2"),
