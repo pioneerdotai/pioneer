@@ -10,7 +10,7 @@ use pioneer_crud_execution::{
     time::unix_to_datetime,
 };
 use pioneer_entity::compaction_history_check as check;
-use pioneer_postgres_test::with_database;
+use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{
     ItemCompletedNotification, TurnCompletedNotification, TurnItem, TurnStatus,
 };

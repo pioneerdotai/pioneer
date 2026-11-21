@@ -235,7 +235,6 @@ async fn timeout_transition_rejects_candidate_stale_after_heartbeat() {
         assert_eq!(row.status.as_deref(), Some("in_progress"));
         assert_eq!(row.active_attempt_status.as_deref(), Some("running"));
         let payload: TurnItem = pioneer_crud_conversations::turn_payload::decode_item(&row)
-            .await
             .expect("payload should decode");
         assert!(matches!(
             payload,

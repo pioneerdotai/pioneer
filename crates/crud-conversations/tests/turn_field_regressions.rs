@@ -4,7 +4,7 @@ use pioneer_crud_conversations::{
 };
 use pioneer_protocol::*;
 use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Set, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Set, Statement, TransactionTrait};
 
 fn unix_to_datetime(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
     chrono::DateTime::from_timestamp(seconds, 0)
@@ -61,9 +61,11 @@ async fn old_turn_without_permission_profile_reads_as_defaulted_full_access() {
             turns: Vec::new(),
         };
         let at = unix_to_datetime(timestamp);
-        upsert_thread_with_creator(&store, &thread, &PersistedActorRef::System, at, at)
+        let tx = store.begin().await?;
+        upsert_thread_with_creator(&tx, &thread, &PersistedActorRef::System, at, at)
             .await
             .expect("thread should persist");
+        tx.commit().await?;
 
         let now = unix_to_datetime(timestamp);
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
@@ -132,9 +134,11 @@ async fn unknown_permission_profile_columns_read_as_defaulted_full_access() {
             turns: Vec::new(),
         };
         let at = unix_to_datetime(timestamp);
-        upsert_thread_with_creator(&store, &thread, &PersistedActorRef::System, at, at)
+        let tx = store.begin().await?;
+        upsert_thread_with_creator(&tx, &thread, &PersistedActorRef::System, at, at)
             .await
             .expect("thread should persist");
+        tx.commit().await?;
 
         let now = unix_to_datetime(timestamp);
         pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
@@ -227,9 +231,10 @@ async fn update_turn_prompt_manifest_roundtrips_via_prompt_manifest_json() {
 
         let at = unix_to_datetime(timestamp);
         let creator = PersistedActorRef::System;
-        upsert_thread_with_creator(&store, &thread, &creator, at, at).await?;
+        let tx = store.begin().await?;
+        upsert_thread_with_creator(&tx, &thread, &creator, at, at).await?;
         let projected = pioneer_crud_conversations::turn_writes::prepare_projected_turn_upsert(
-            &store,
+            &tx,
             &turn.id,
             &thread.id,
             &turn,
@@ -242,8 +247,8 @@ async fn update_turn_prompt_manifest_roundtrips_via_prompt_manifest_json() {
             at,
         )
         .await?;
-        pioneer_crud_conversations::turn_writes::apply_prepared_turn_upsert(&store, projected)
-            .await?;
+        pioneer_crud_conversations::turn_writes::apply_prepared_turn_upsert(&tx, projected).await?;
+        tx.commit().await?;
 
         let manifest = PromptManifest {
             compiler_version: "0.1.0-test".to_owned(),

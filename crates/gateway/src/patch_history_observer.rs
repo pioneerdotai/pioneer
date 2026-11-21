@@ -1,10 +1,9 @@
-//! Synchronous commit-observer adapter for the gateway's asynchronous SQLite
-//! history store.
+//! Synchronous commit-observer adapter for the Gateway's PostgreSQL history store.
 //!
 //! The patch executor is intentionally synchronous and invokes its observer
-//! while the complete target lock set is held.  This adapter bridges that
-//! boundary with a short-lived current-thread Tokio runtime on a dedicated OS
-//! thread.  The important ordering is preserved: bounded writer capacity is
+//! while the complete target lock set is held. The executor runs on a blocking
+//! thread and the observer drives database I/O on the Gateway runtime to keep
+//! pooled connections usable after the call. Bounded writer capacity is
 //! reserved before locks, while the exact intent and commit ordinal are
 //! persisted only after locks and under-lock revalidation, then progress is
 //! journaled and the immutable record is promoted before releasing them.
@@ -25,6 +24,7 @@ use pioneer_tools::apply_patch::{
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const PATCH_HISTORY_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +35,7 @@ static PATCH_HISTORY_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 /// Reserve one bounded history-writer slot before the executor acquires any
 /// workspace target lock.  The permit is held by the observer until the
 /// terminal result has been durably promoted (or the observer is dropped), so
-/// a full SQLite/snapshot writer lane fails closed instead of allowing an
+/// a full PostgreSQL/snapshot writer lane fails closed instead of allowing an
 /// unbounded number of under-lock database waits.
 pub(crate) async fn reserve_patch_history_capacity() -> Result<OwnedSemaphorePermit> {
     let semaphore = PATCH_HISTORY_ADMISSION
@@ -57,6 +57,7 @@ async fn reserve_patch_history_capacity_from(
 #[derive(Clone)]
 pub(crate) struct SqlitePatchObserver {
     db: SqliteDatabase,
+    runtime: Handle,
     identity: InvocationIdentity,
     _admission_permit: Arc<OwnedSemaphorePermit>,
     inner: DurableCommitObserver,
@@ -70,6 +71,7 @@ impl SqlitePatchObserver {
     ) -> Self {
         Self {
             db: db.into(),
+            runtime: Handle::current(),
             identity,
             _admission_permit: Arc::new(admission_permit),
             inner: DurableCommitObserver::new(
@@ -82,7 +84,7 @@ impl SqlitePatchObserver {
     fn db_error(error: anyhow::Error) -> ObserverError {
         ObserverError::new(
             ObserverErrorCode::Storage,
-            format!("SQLite patch history: {error:#}"),
+            format!("PostgreSQL patch history: {error:#}"),
         )
     }
 
@@ -138,6 +140,25 @@ impl SqlitePatchObserver {
         }
     }
 
+    fn run_sync_db<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(SqliteDatabase) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let work = pioneer_observability::work::WorkCarrier::child(
+            pioneer_observability::work::Boundary::Database,
+            pioneer_observability::work::WorkKind::Database,
+            pioneer_observability::work::Trigger::Lifecycle,
+            pioneer_observability::work::ExecutorRole::Blocking,
+        );
+        let db = self.db.clone();
+        self.runtime.block_on(work.scope_result(async move {
+            tokio::time::timeout(PATCH_HISTORY_SYNC_TIMEOUT, operation(db))
+                .await
+                .context("synchronous patch history operation timed out")?
+        }))
+    }
+
     pub(crate) async fn project_live(
         db: SqliteDatabase,
         thread_id: String,
@@ -188,19 +209,20 @@ impl CommitObserver for SqlitePatchObserver {
             ));
         }
         let identity_for_db = identity.clone();
-        let state = run_sync_db(self.db.clone(), move |db| async move {
-            let store = SqliteAppliedPatchStore::new(db.clone());
-            let record = store.get(&identity_for_db).await?;
-            let delta = match &record {
-                Some(record) => Some(store.materialize_delta(record).await?),
-                None => None,
-            };
-            let intent = SqliteCommitIntentStore::new(db)
-                .get(&identity_for_db)
-                .await?;
-            Ok((record, intent, delta))
-        })
-        .map_err(Self::db_error)?;
+        let state = self
+            .run_sync_db(move |db| async move {
+                let store = SqliteAppliedPatchStore::new(db.clone());
+                let record = store.get(&identity_for_db).await?;
+                let delta = match &record {
+                    Some(record) => Some(store.materialize_delta(record).await?),
+                    None => None,
+                };
+                let intent = SqliteCommitIntentStore::new(db)
+                    .get(&identity_for_db)
+                    .await?;
+                Ok((record, intent, delta))
+            })
+            .map_err(Self::db_error)?;
         if let Some(record) = state.0 {
             if record.plan_fingerprint != plan_fingerprint {
                 return Err(ObserverError::new(
@@ -264,36 +286,37 @@ impl CommitObserver for SqlitePatchObserver {
         }
         let identity_for_db = identity.clone();
         let admission_for_db = admission.clone();
-        let state = run_sync_db(self.db.clone(), move |db| async move {
-            let applied = SqliteAppliedPatchStore::new(db.clone())
-                .get(&identity_for_db)
-                .await?;
-            let delta = match &applied {
-                Some(record) => Some(
-                    SqliteAppliedPatchStore::new(db.clone())
-                        .materialize_delta(record)
-                        .await?,
-                ),
-                None => None,
-            };
-            let intent = SqliteCommitIntentStore::new(db)
-                .get(&identity_for_db)
-                .await?;
-            if let Some(record) = applied {
-                return Ok((Some(record), intent, delta));
-            }
-            if let Some(intent) = intent {
-                if intent.plan_fingerprint != admission_for_db.plan_fingerprint
-                    || intent.planned_operation_fingerprints
-                        != admission_for_db.operation_fingerprints
-                {
-                    bail!("invocation identity was reused for a different immutable plan");
+        let state = self
+            .run_sync_db(move |db| async move {
+                let applied = SqliteAppliedPatchStore::new(db.clone())
+                    .get(&identity_for_db)
+                    .await?;
+                let delta = match &applied {
+                    Some(record) => Some(
+                        SqliteAppliedPatchStore::new(db.clone())
+                            .materialize_delta(record)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                let intent = SqliteCommitIntentStore::new(db)
+                    .get(&identity_for_db)
+                    .await?;
+                if let Some(record) = applied {
+                    return Ok((Some(record), intent, delta));
                 }
-                return Ok((None, Some(intent), None));
-            }
-            Ok((None, None, None))
-        })
-        .map_err(Self::db_error)?;
+                if let Some(intent) = intent {
+                    if intent.plan_fingerprint != admission_for_db.plan_fingerprint
+                        || intent.planned_operation_fingerprints
+                            != admission_for_db.operation_fingerprints
+                    {
+                        bail!("invocation identity was reused for a different immutable plan");
+                    }
+                    return Ok((None, Some(intent), None));
+                }
+                Ok((None, None, None))
+            })
+            .map_err(Self::db_error)?;
         if let Some(record) = state.0 {
             if record.plan_fingerprint != admission.plan_fingerprint {
                 return Err(ObserverError::new(
@@ -346,17 +369,18 @@ impl CommitObserver for SqlitePatchObserver {
 
         let identity_for_db = identity.clone();
         let admission_for_db = admission.clone();
-        let outcome = run_sync_db(self.db.clone(), move |db| async move {
-            SqliteCommitIntentStore::new(db)
-                .begin_next_owned(
-                    identity_for_db,
-                    admission_for_db.plan_fingerprint,
-                    admission_for_db.operation_fingerprints,
-                    admission_for_db.recovery_plan,
-                )
-                .await
-        })
-        .map_err(Self::db_error)?;
+        let outcome = self
+            .run_sync_db(move |db| async move {
+                SqliteCommitIntentStore::new(db)
+                    .begin_next_owned(
+                        identity_for_db,
+                        admission_for_db.plan_fingerprint,
+                        admission_for_db.operation_fingerprints,
+                        admission_for_db.recovery_plan,
+                    )
+                    .await
+            })
+            .map_err(Self::db_error)?;
         let intent = match outcome {
             pioneer_tools::apply_patch::history::BeginNextOutcome::Inserted(intent) => intent,
             pioneer_tools::apply_patch::history::BeginNextOutcome::Existing(intent) => {
@@ -397,7 +421,7 @@ impl CommitObserver for SqlitePatchObserver {
             "pioneer",
             "thread_history",
         );
-        if let Err(error) = run_sync_db(self.db.clone(), {
+        if let Err(error) = self.run_sync_db({
             let identity = identity.clone();
             move |db| async move {
                 pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(db)
@@ -409,7 +433,7 @@ impl CommitObserver for SqlitePatchObserver {
             // Convert the failed storage reservation into a terminal no-change
             // marker so a later retry cannot mistake it for permission to
             // execute the patch.
-            let _ = run_sync_db(self.db.clone(), {
+            let _ = self.run_sync_db({
                 let identity = identity.clone();
                 move |db| async move {
                     let store = SqliteCommitIntentStore::new(db);
@@ -425,7 +449,7 @@ impl CommitObserver for SqlitePatchObserver {
             self.inner
                 .seed_admission_with_admission(identity, intent.commit_ordinal, admission)
         {
-            let _ = run_sync_db(self.db.clone(), {
+            let _ = self.run_sync_db({
                 let identity = identity.clone();
                 move |db| async move {
                     let store = SqliteCommitIntentStore::new(db);
@@ -440,7 +464,7 @@ impl CommitObserver for SqlitePatchObserver {
         match self.inner.admit(identity, admission) {
             Ok(admission) => Ok(admission),
             Err(error) => {
-                let _ = run_sync_db(self.db.clone(), {
+                let _ = self.run_sync_db({
                     let identity = identity.clone();
                     move |db| async move {
                         let store = SqliteCommitIntentStore::new(db);
@@ -473,7 +497,7 @@ impl CommitObserver for SqlitePatchObserver {
                     "local patch intent disappeared after a committed operation",
                 )
             })?;
-        run_sync_db(self.db.clone(), move |db| async move {
+        self.run_sync_db(move |db| async move {
             SqliteCommitIntentStore::new(db)
                 .update_progress(&intent)
                 .await
@@ -502,7 +526,7 @@ impl CommitObserver for SqlitePatchObserver {
         let should_record =
             !report.delta.is_empty() || matches!(status, ExecutionStatus::CommitStateUncertain);
         let persist_started = std::time::Instant::now();
-        let persisted = run_sync_db(self.db.clone(), move |db| async move {
+        let persisted = self.run_sync_db(move |db| async move {
             let intent_store = SqliteCommitIntentStore::new(db.clone());
             let applied_store = SqliteAppliedPatchStore::new(db.clone());
             let existing_record = applied_store.get(&identity_for_db).await?;
@@ -675,7 +699,7 @@ impl CommitObserver for SqlitePatchObserver {
             Ok(()) => {
                 if should_record {
                     patch_telemetry().record_applied_record_append(persist_started.elapsed());
-                    if let Ok(metrics) = run_sync_db(self.db.clone(), |db| async move {
+                    if let Ok(metrics) = self.run_sync_db(|db| async move {
                         pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(db)
                             .metrics()
                             .await
@@ -717,13 +741,14 @@ impl CommitObserver for SqlitePatchObserver {
     {
         let local = self.inner.record(identity)?;
         let identity_for_db = identity.clone();
-        let durable = run_sync_db(self.db.clone(), move |db| async move {
-            SqliteAppliedPatchStore::new(db)
-                .get(&identity_for_db)
-                .await
-                .context("load promoted patch record")
-        })
-        .map_err(Self::db_error)?;
+        let durable = self
+            .run_sync_db(move |db| async move {
+                SqliteAppliedPatchStore::new(db)
+                    .get(&identity_for_db)
+                    .await
+                    .context("load promoted patch record")
+            })
+            .map_err(Self::db_error)?;
         match durable {
             Some(record) => Ok(Some((
                 record,
@@ -744,7 +769,7 @@ impl CommitObserver for SqlitePatchObserver {
             ));
         }
         let identity_for_db = identity.clone();
-        run_sync_db(self.db.clone(), move |db| async move {
+        self.run_sync_db(move |db| async move {
             // A projection row by itself is not evidence that this record was
             // included: a record can be durably promoted while projection
             // repair is still pending.  Reconstruct the monotonic stream
@@ -886,43 +911,6 @@ fn replay_diagnostic(
         path: None,
         guard_horizon: None,
     }
-}
-
-fn run_sync_db<T, F, Fut>(db: SqliteDatabase, operation: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce(SqliteDatabase) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T>> + Send + 'static,
-{
-    let work = pioneer_observability::work::WorkCarrier::child(
-        pioneer_observability::work::Boundary::StdThread,
-        pioneer_observability::work::WorkKind::Database,
-        pioneer_observability::work::Trigger::Lifecycle,
-        pioneer_observability::work::ExecutorRole::StdThread,
-    );
-    let join = std::thread::Builder::new()
-        .name("apply-patch-history".to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("build synchronous patch history runtime")?;
-            let _runtime_observer = pioneer_observability::runtime::register(
-                runtime.handle(),
-                pioneer_observability::runtime::RuntimeRole::GatewayPatch,
-            );
-            _runtime_observer.block_on(
-                &runtime,
-                work.scope_result(async move {
-                    tokio::time::timeout(PATCH_HISTORY_SYNC_TIMEOUT, operation(db))
-                        .await
-                        .context("synchronous patch history operation timed out")?
-                }),
-            )
-        })
-        .context("spawn synchronous patch history worker")?;
-    join.join()
-        .map_err(|_| anyhow!("synchronous patch history worker panicked"))?
 }
 
 #[cfg(test)]

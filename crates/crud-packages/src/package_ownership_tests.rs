@@ -2275,7 +2275,7 @@ async fn test_store_with_workspace(workspace_id: &str) -> PackageStore {
 
 #[tokio::test]
 async fn dev_app_identity_schema_restores_release_guard_and_refuses_unsafe_downgrade() {
-    use pioneer_migration::{Migrator, MigratorTrait};
+    use migration::{Migrator, MigratorTrait};
 
     pioneer_postgres_test::with_database(async |fixture| {
         let store = postgres_store_with_workspace(fixture, "ws-dev-schema").await;

@@ -1321,7 +1321,7 @@ async fn utf8_metadata_does_not_fetch_payload_before_admission() {
                 );
             }
             assert_eq!(
-                pioneer_crud_tasks::event_log::EventPayload::read(&mut stored).unwrap(),
+                crate::event_log::EventPayload::read(&mut stored).unwrap(),
                 *original,
             );
         }

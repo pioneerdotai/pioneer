@@ -7,7 +7,7 @@ use crate::{
     test_support::{
         execution::{
             attach_test_agent_execution_contract, drain_custom_publisher_fanout,
-            ensure_test_agent_identity,
+            ensure_test_agent_identity, seed_task_owned_resume_conflict, seed_task_resume_thread,
         },
         task_projection::{NoFrozenOutput, sample_task, sample_task_run},
     },
@@ -22,18 +22,18 @@ use sea_orm::{ConnectionTrait, DbBackend, Set, Statement};
 async fn resume_fixture(
     fixture: &pioneer_postgres_test::TestDatabase,
     workspace: &str,
-    thread_id: &str,
 ) -> TaskEventStore<NoFrozenOutput> {
     let writer = fixture.connection();
     for statement in [
-        Statement::from_string(DbBackend::Postgres, "UPDATE workspace SET is_current = FALSE WHERE is_current"),
-        Statement::from_sql_and_values(DbBackend::Postgres,
+        Statement::from_string(
+            DbBackend::Postgres,
+            "UPDATE workspace SET is_current = FALSE WHERE is_current",
+        ),
+        Statement::from_sql_and_values(
+            DbBackend::Postgres,
             "INSERT INTO workspace(id,name,is_active,is_current) VALUES ($1,'Resume fixture',TRUE,TRUE)",
-            [workspace.into()]),
-        Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class)
-             VALUES ($1,$2,'','agent','model','provider','active','task_run','internal')",
-            [thread_id.into(), workspace.into()]),
+            [workspace.into()],
+        ),
     ] {
         writer.execute_raw(statement).await.unwrap();
     }
@@ -46,8 +46,13 @@ async fn resume_fixture(
 #[tokio::test]
 async fn task_owned_blocked_turn_resume_reopens_the_full_aggregate() {
     pioneer_postgres_test::with_database(async |fixture| {
-        let store =
-            resume_fixture(fixture, "ws_task_owned_resume", "thread_task_owned_resume").await;
+        let store = resume_fixture(fixture, "ws_task_owned_resume").await;
+        seed_task_resume_thread(
+            &store.connection,
+            "ws_task_owned_resume",
+            "thread_task_owned_resume",
+        )
+        .await;
         let timestamp = 1_700_010_000;
         ensure_test_agent_identity(&store.connection, "ws_task_owned_resume", timestamp).await;
         let thread_id = "thread_task_owned_resume";
@@ -324,128 +329,10 @@ async fn task_owned_resume_conflict_fixture(
     String,
     String,
 ) {
-    let timestamp = 1_700_011_000;
-    let thread_id = format!("thread_task_owned_{suffix}");
-    let turn_id = format!("turn_task_owned_{suffix}");
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let store = resume_fixture(&fixture, workspace_id, &thread_id).await;
-    ensure_test_agent_identity(&store.connection, workspace_id, timestamp).await;
-
-    let mut task = sample_task(timestamp);
-    task.id = format!("task_task_owned_{suffix}");
-    task.workspace_id = workspace_id.to_owned();
-    task.status = TaskStatus::Blocked;
-    let mut run = sample_task_run(timestamp);
-    run.id = format!("run_task_owned_{suffix}");
-    run.task_id = task.id.clone();
-    run.trigger_id = None;
-    run.run_group_id = run.id.clone();
-    run.status = TaskRunStatus::Blocked;
-
-    store
-        .append_task_events(
-            vec![
-                TaskEventPayload::TaskCreated { task: task.clone() },
-                TaskEventPayload::RunCreated {
-                    run: run.clone(),
-                    agent_spec: None,
-                },
-            ],
-            timestamp,
-        )
-        .await
-        .expect("blocked conflict fixture should project");
-    let execution = TaskExecutionStore::new(&store.connection)
-        .reserve_execution_for_run(run.id.as_str(), TaskExecutorKind::Agent, timestamp + 1)
-        .await
-        .expect("conflict fixture execution should reserve");
-    attach_test_agent_execution_contract(
-        &store.connection,
-        task.workspace_id.as_str(),
-        task.id.as_str(),
-        run.id.as_str(),
-        execution.id.as_str(),
-        thread_id.as_str(),
-        timestamp + 1,
-    )
-    .await;
-    TaskExecutionStore::new(&store.connection)
-        .mark_execution_terminal(
-            execution.id.as_str(),
-            TaskRunExecutionStatus::Blocked,
-            timestamp + 2,
-            None,
-            None,
-        )
-        .await
-        .expect("conflict fixture execution should block");
-    TaskChildWorkRepository::new(&store.connection)
-        .upsert_task_run_turn(TaskRunTurn {
-            id: format!("task_run_turn_task_owned_{suffix}"),
-            task_id: task.id.clone(),
-            run_id: run.id.clone(),
-            execution_id: Some(execution.id),
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-            kind: TaskRunTurnKind::Initial,
-            round: 0,
-            sequence: 0,
-            status: TaskRunTurnStatus::Blocked,
-            reviews_candidate_id: None,
-            requested_by_candidate_id: None,
-            requested_by_review_event_id: None,
-            created_at: timestamp + 2,
-            started_at: Some(timestamp + 2),
-            completed_at: Some(timestamp + 3),
-        })
-        .await
-        .expect("conflict fixture run turn should persist");
-    pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
-        id: Set(turn_id.clone()),
-        thread_id: Set(thread_id.clone()),
-        status: Set("blocked".to_owned()),
-        turn_kind: Set("conversation".to_owned()),
-        origin: Set("system".to_owned()),
-        prompt_manifest_json: Set("{}".to_owned()),
-        created_at: Set(unix_to_datetime(timestamp + 2)),
-        updated_at: Set(unix_to_datetime(timestamp + 3)),
-        ..Default::default()
-    })
-    .exec(&store.connection)
-    .await
-    .expect("conflict fixture child turn should persist");
-    let wake = Arc::new(Notify::new());
-    let recovery = RecoveryStore::new(&store.connection, &wake);
-    let job = recovery
-        .enqueue_recovery_job(
-            turn_id.clone(),
-            format!("task_owned_{suffix}_item"),
-            TurnItemType::Reasoning,
-            None,
-            RecoveryTrigger::Timeout,
-            RecoveryAction::BlockResumable,
-            Some("task child blocked".to_owned()),
-            None,
-            None,
-            None,
-            0,
-            0,
-            serde_json::json!({}),
-            serde_json::json!({"base_backoff_secs": 0, "max_wall_clock_secs": 60}),
-            timestamp + 4,
-        )
-        .await
-        .expect("conflict fixture recovery job should enqueue");
-    recovery
-        .mark_recovery_job_terminal(
-            job.id.as_str(),
-            RecoveryJobStatus::Blocked,
-            Some("task child blocked".to_owned()),
-            timestamp + 5,
-        )
-        .await
-        .expect("conflict fixture recovery job should block");
-
+    let store = resume_fixture(&fixture, workspace_id).await;
+    let (task, run, job, thread_id, turn_id) =
+        seed_task_owned_resume_conflict(&store.connection, workspace_id, suffix).await;
     (store, task, run, job, thread_id, turn_id)
 }
 

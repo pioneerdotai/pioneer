@@ -172,25 +172,7 @@ fn reference(source: SourceRef, thread: &str, context: Option<&str>) -> FrozenMe
     .unwrap()
 }
 
-fn import_digest(proofs: &[FrozenImportRecord]) -> Sha256 {
-    let mut digest = Sha256::new();
-    for proof in proofs {
-        let bytes = serde_json::to_vec(proof).unwrap();
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
-    }
-    digest
-}
-
-async fn manifest(
-    f: &Fixture<'_>,
-    id: &str,
-    owner: &str,
-    messages: &[FrozenMessageRef],
-    proofs: &[FrozenImportRecord],
-    declared: usize,
-    expected: Option<&str>,
-) {
+async fn manifest(f: &Fixture<'_>, id: &str, owner: &str, messages: &[FrozenMessageRef]) {
     let mut digest = Sha256::new();
     for message in messages {
         let bytes = serde_json::to_vec(message).unwrap();
@@ -198,21 +180,14 @@ async fn manifest(
         digest.update(bytes);
     }
     f.db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES($1,'ws',$2,$3,$4,$4,$5,$5,$6,1)",
-        [id.into(),owner.into(),hex::encode(digest.finalize()).into(),(messages.len() as i64).into(),(declared as i64).into(),expected.map(str::to_owned).unwrap_or_else(||hex::encode(import_digest(proofs).finalize())).into()]
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES($1,'ws',$2,$3,$4,$4,0,0,$5,1)",
+        [id.into(),owner.into(),hex::encode(digest.finalize()).into(),(messages.len() as i64).into(),hex::encode(Sha256::digest([])).into()]
     )).await.unwrap();
     for (ordinal, message) in messages.iter().enumerate() {
         let json = serde_json::to_string(message).unwrap();
         f.db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
             "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES($1,$2,$3,$4)",
             [id.into(),(ordinal as i64).into(),json.clone().into(),(json.len() as i64).into()]
-        )).await.unwrap();
-    }
-    for (ordinal, proof) in proofs.iter().enumerate() {
-        let json = serde_json::to_string(proof).unwrap();
-        f.db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_thread,source_scope,source_id,source_version,proof_json,bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            [id.into(),(ordinal as i64).into(),(proof.message_ordinal as i64).into(),proof.source_thread.clone().into(),proof.source.scope.clone().into(),proof.source.id.clone().into(),proof.source.version.clone().into(),json.clone().into(),(json.len() as i64).into()]
         )).await.unwrap();
     }
 }
@@ -456,7 +431,7 @@ async fn io_witness_zero_cas_corrupt_expired_and_unavailable_are_distinct() {
             f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
                 .await;
             if mode != "missing-header" {
-                manifest(&f, "w", "parent", &[], &[], 0, None).await;
+                manifest(&f, "w", "parent", &[]).await;
             }
             let mut reference = reference(
                 SourceRef {
@@ -1015,7 +990,7 @@ async fn io_witness_repair_ignores_verified_and_expired_history() {
             ("verified", false, Some("a".repeat(64))),
             ("expired", true, None),
         ] {
-            manifest(&f, id, "parent", &[], &[], 0, None).await;
+            manifest(&f, id, "parent", &[]).await;
             frozen_result::Entity::insert(frozen_result::ActiveModel {
                 manifest_id: Set(id.into()),
                 ordinal: Set(0),

@@ -1,4 +1,5 @@
 use super::*;
+use pioneer_crud_execution::recovery_terminalization_outbox;
 use pioneer_crud_execution::turn_item_terminal::tool_call_status;
 
 #[tokio::test]
@@ -469,7 +470,10 @@ async fn recovery_terminalization_cancels_claim_superseded_by_authoritative_term
             .await
             .expect("outbox lookup should succeed")
             .expect("outbox audit row should remain");
-        assert_eq!(outbox.status, execution::STATUS_CANCELLED);
+        assert_eq!(
+            outbox.status,
+            recovery_terminalization_outbox::STATUS_CANCELLED
+        );
         assert!(outbox.claim_token.is_none());
         assert!(
             outbox
@@ -602,7 +606,10 @@ async fn already_terminal_recovery_consumes_legacy_row_without_rewriting_committ
             .await
             .expect("terminalization lookup should succeed")
             .expect("terminalization audit row should remain");
-        assert_eq!(delivered.status, execution::STATUS_DELIVERED);
+        assert_eq!(
+            delivered.status,
+            recovery_terminalization_outbox::STATUS_DELIVERED
+        );
         let retained_effect =
             pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
                 .one(&store.connection)

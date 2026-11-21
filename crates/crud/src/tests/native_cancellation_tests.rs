@@ -1487,15 +1487,6 @@ async fn native_cancellation_task_resume_clears_only_confirmed_blocked_and_rolls
         let ws = format!("ws_task_{suffix}");
         let (store, task, _, job, thread_id, turn_id) =
             task_owned_resume_conflict_fixture(&ws, suffix).await;
-        // Repair the older aggregate-only fixture with its real Thread owner so
-        // canonical projection and its marker obey production scope checks.
-        let (_, mut thread, _) =
-            test_store_with_started_turn(&ws, "fixture_thread", "fixture_turn").await;
-        thread.id = thread_id.clone();
-        store
-            .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
-            .await
-            .unwrap();
         let (_, turn) = store.get_turn(&thread_id, &turn_id).await.unwrap().unwrap();
         store
             .materialize_turn_events_atomically(

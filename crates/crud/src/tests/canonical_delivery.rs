@@ -159,7 +159,7 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+    let observer = Arc::new(FixtureDatabaseObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
         SqliteWriteExecutor::with_observer(writer, observer.clone()),
@@ -432,53 +432,4 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     );
     drop(events);
     database.close().await.unwrap();
-}
-
-#[derive(Default)]
-struct OptionalDeliveryDatabaseObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
-    enqueued: tokio::sync::Notify,
-}
-
-impl pioneer_sqlite::SqliteReadObserver for OptionalDeliveryDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
-            self.reads.lock().unwrap().push(class);
-        }
-    }
-}
-
-impl pioneer_sqlite::SqliteWriteObserver for OptionalDeliveryDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
-        self.events.lock().unwrap().push(event);
-        if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
-            self.enqueued.notify_one();
-        }
-    }
-}
-
-impl OptionalDeliveryDatabaseObserver {
-    async fn wait_for_enqueued(&self, count: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let ready = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|event| {
-                        matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
-                    })
-                    .count()
-                    >= count;
-                if ready {
-                    break;
-                }
-                self.enqueued.notified().await;
-            }
-        })
-        .await
-        .expect("delivery claims should reach the writer queue");
-    }
 }

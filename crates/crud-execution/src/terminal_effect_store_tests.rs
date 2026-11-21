@@ -1457,13 +1457,18 @@ async fn native_lifecycle_health_probe_commits_and_reports_stale_turn_and_termin
         db.execute_unprepared(
             "INSERT INTO workspace (id,name) VALUES ('ws_native_health','Native health');
              INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status)
-                 VALUES ('thr_native_health','ws_native_health','','agent','gpt-5.4','openai','active');
-             INSERT INTO turn (id,thread_id,status) VALUES
-                 ('turn_native_health','thr_native_health','in_progress'),
-                 ('turn_cli_health_control','thr_native_health','in_progress')",
+                 VALUES ('thr_native_health','ws_native_health','','agent','gpt-5.4','openai','active')",
         ).await?;
-        let store = TerminalEffectStore::new(&db);
         let created_at = unix_to_datetime(1_700_000_000);
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
+            "INSERT INTO turn (id,thread_id,status,created_at,updated_at) VALUES
+                 ($1,$2,'in_progress',$3,$3),
+                 ('turn_cli_health_control',$2,'in_progress',$3,$3)",
+            [turn_id.into(), thread_id.into(), created_at.into()],
+        ))
+        .await?;
+        let store = TerminalEffectStore::new(&db);
         crate::turn_execution::insert_immutable(
             &db,
             crate::turn_execution::NewTurnExecution {

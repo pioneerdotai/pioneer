@@ -2367,11 +2367,14 @@ async fn publication_preflight(
     let RunnerPhase::Commit { checkpoint } = &state.phase else {
         panic!("publication fixture is not in Commit")
     };
-    fixture
-        .store
-        .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
-        .await
-        .unwrap();
+    crate::runner_writes::prepare_checkpoint_ancestry(
+        &fixture.store.connection,
+        operation,
+        checkpoint,
+        state.generation,
+    )
+    .await
+    .unwrap();
     prepare_runner_publication(
         &fixture.store,
         operation,
@@ -3483,8 +3486,11 @@ async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_histori
         if before {
             f.db().execute_unprepared(sql).await.unwrap();
         }
-        let mut hook =
-            arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+        let mut hook = arm_publication_test_hook(
+            &f.store.connection,
+            operation,
+            PublicationTestPause::ProofSeal,
+        );
         let store = f.store.clone();
         let task =
             tokio::spawn(
@@ -3527,8 +3533,11 @@ async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_histori
                     .is_err()
             );
         } else {
-            let mut hook =
-                arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+            let mut hook = arm_publication_test_hook(
+                &f.store.connection,
+                operation,
+                PublicationTestPause::ProofSeal,
+            );
             let store = f.store.clone();
             let task = tokio::spawn(async move {
                 store.compaction_apply_runner(operation, &state, None).await
@@ -3578,8 +3587,11 @@ async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() 
                 .await
                 .unwrap();
         } else {
-            let mut hook =
-                arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+            let mut hook = arm_publication_test_hook(
+                &f.store.connection,
+                operation,
+                PublicationTestPause::ProofSeal,
+            );
             let store = f.store.clone();
             let saved = state.clone();
             let task = tokio::spawn(async move {
@@ -3845,7 +3857,11 @@ async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actua
     let f = fixture().await;
     let operation = "seal-incoming";
     let state = publication_foreign_fanout(&f, operation, 2).await;
-    let mut hook = arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+    let mut hook = arm_publication_test_hook(
+        &f.store.connection,
+        operation,
+        PublicationTestPause::ProofSeal,
+    );
     let store = f.store.clone();
     let task =
         tokio::spawn(async move { store.compaction_apply_runner(operation, &state, None).await });

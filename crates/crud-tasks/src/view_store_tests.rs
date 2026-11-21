@@ -706,7 +706,7 @@ async fn task_review_projector_replays_new_runtime_events_idempotently() {
             ..candidate.clone()
         };
 
-        let events = vec![
+        let payloads = vec![
             TaskEventPayload::TaskRunThreadBindingCreated {
                 binding: binding.clone(),
             },
@@ -739,11 +739,11 @@ async fn task_review_projector_replays_new_runtime_events_idempotently() {
         ];
 
         events
-            .append_task_events(events.clone(), timestamp + 10)
+            .append_task_events(payloads.clone(), timestamp + 10)
             .await
             .expect("new runtime events should project");
         events
-            .append_task_events(events, timestamp + 10)
+            .append_task_events(payloads, timestamp + 10)
             .await
             .expect("replay should be idempotent");
 
@@ -848,7 +848,7 @@ async fn task_review_projector_replays_legacy_child_thread_linked_json() {
             artifacts: Vec::new(),
             completed_by_run_id: Some(run.id.clone()),
         };
-        let events = vec![
+        let payloads = vec![
             TaskEventPayload::RunCreated {
                 run: run.clone(),
                 agent_spec: None,
@@ -862,11 +862,11 @@ async fn task_review_projector_replays_legacy_child_thread_linked_json() {
             },
         ];
         events
-            .append_task_events(events.clone(), timestamp + 10)
+            .append_task_events(payloads.clone(), timestamp + 10)
             .await
             .expect("legacy events should project");
         events
-            .append_task_events(events, timestamp + 10)
+            .append_task_events(payloads, timestamp + 10)
             .await
             .expect("legacy replay should be idempotent");
         let binding = store

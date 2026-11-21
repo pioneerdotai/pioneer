@@ -691,6 +691,7 @@ async fn episodic_canonical_payload_repair_commits_job_and_fences_stale_payload(
         .unwrap();
         let payload = serde_json::to_string(&item("repaired")).unwrap();
         let episodic = store
+            .memory_store()
             .prepare_terminal_payload_episodic_save(&row, &payload)
             .await
             .unwrap()
@@ -716,6 +717,7 @@ async fn episodic_canonical_payload_repair_commits_job_and_fences_stale_payload(
         assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Queued);
         let stale_payload = serde_json::to_string(&item("stale repair")).unwrap();
         let stale = store
+            .memory_store()
             .prepare_terminal_payload_episodic_save(&row, &stale_payload)
             .await
             .unwrap()
@@ -853,14 +855,14 @@ async fn episodic_requeue_source_fixture() -> (
     Thread,
     Turn,
     ThreadEpisodicIndexJobRecord,
-    Arc<OptionalDeliveryDatabaseObserver>,
+    Arc<FixtureDatabaseObserver>,
 ) {
     use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
+    let observer = Arc::new(FixtureDatabaseObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
         SqliteWriteExecutor::with_observer(writer, observer.clone()),

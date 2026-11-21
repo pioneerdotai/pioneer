@@ -3,6 +3,7 @@ use super::*;
 use crate::agent_action_commit::{AgentCommitInput, revalidate_agent_route_for_commit};
 use crate::agent_actions::AgentActionInput;
 use crate::agent_execution::load_agent_execution;
+use crate::agent_grant::agent_execution_grant_fingerprint;
 use crate::agent_identity::{SOURCE_EPHEMERAL, load_agent_presentation_snapshot};
 use crate::agent_identity_catalog::{CliRuntimeIdentitySeed, sync_cli_runtime_identity_catalog};
 use crate::time::utc_now;

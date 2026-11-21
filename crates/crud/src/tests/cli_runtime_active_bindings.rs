@@ -1,4 +1,6 @@
 use super::*;
+use pioneer_entity::turn_cli_runtime_binding as binding;
+use sea_orm::ActiveModelTrait;
 use std::time::Duration;
 
 async fn terminal_guard_fixture() -> (CrudStore, crate::CliRuntimeTurnTerminalGuard) {

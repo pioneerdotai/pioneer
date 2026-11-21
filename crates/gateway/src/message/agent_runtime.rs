@@ -238,7 +238,7 @@ fn turn_llm_context_delivery_key(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn native_patch_history_from_item(
+async fn native_patch_history_from_item(
     item: &pioneer_protocol::TurnItem,
 ) -> Result<Option<(AppliedPatchRecord, [u8; 32], AppliedPatchDelta)>> {
     let pioneer_protocol::TurnItem::FileChange {
@@ -287,10 +287,10 @@ fn native_patch_history_from_item(
     // references.  During the same process, the tool runtime can hand the
     // exact committed prefix to the lifecycle consumer through its bounded
     // registry; this avoids copying source bytes through protocol items while
-    // still preserving partial-step history.  After restart the SQLite intent
+    // still preserving partial-step history. After restart the PostgreSQL intent
     // recovery plan remains the authoritative fallback.
     if let Some((_, committed_changes)) =
-        pioneer_tools::native_patch_history_record(&record.identity)
+        pioneer_tools::native_patch_history_record(&record.identity).await
     {
         if !committed_changes.is_empty() {
             delta = AppliedPatchDelta::from_changes(committed_changes);
@@ -3684,7 +3684,7 @@ impl MessageProcessor {
         turn_id: &str,
         item: &pioneer_protocol::TurnItem,
     ) -> Result<()> {
-        let parsed = native_patch_history_from_item(item)?;
+        let parsed = native_patch_history_from_item(item).await?;
         let Some((record, plan_fingerprint, delta)) = parsed else {
             // If terminal observer publication failed after the durable record
             // was inserted, the model-visible item may not contain a history

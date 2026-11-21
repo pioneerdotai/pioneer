@@ -56,12 +56,7 @@ impl Fixture {
             [id.into(), status.into()],
         )).await?;
         if completed {
-            self.db.execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "INSERT INTO turn_event_projection_stream_state(turn_id,thread_id,status,projected_through_sequence,created_at,updated_at)
-                VALUES($1,'thread-cleanup','healthy',2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-                [id.into()],
-            )).await?;
+            crate::test_fixture::seed_healthy_projection(&self.db, "thread-cleanup", id).await?;
         }
         self.bind(id, "codex", if completed { "completed" } else { "running" })
             .await

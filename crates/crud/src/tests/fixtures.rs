@@ -544,3 +544,67 @@ pub(super) fn safe_web_fetch_item(item_id: &str) -> TurnItem {
         observation: None,
     }
 }
+
+#[derive(Default)]
+pub(super) struct FixtureDatabaseObserver {
+    pub(super) reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+    pub(super) events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    enqueued: tokio::sync::Notify,
+}
+
+impl pioneer_sqlite::SqliteReadObserver for FixtureDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+            self.reads.lock().unwrap().push(class);
+        }
+    }
+}
+
+impl pioneer_sqlite::SqliteWriteObserver for FixtureDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+        self.events.lock().unwrap().push(event);
+        if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+            self.enqueued.notify_one();
+        }
+    }
+}
+
+impl FixtureDatabaseObserver {
+    pub(super) async fn wait_for_enqueued(&self, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let ready = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| {
+                        matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                    })
+                    .count()
+                    >= count;
+                if ready {
+                    break;
+                }
+                self.enqueued.notified().await;
+            }
+        })
+        .await
+        .expect("delivery claims should reach the writer queue");
+    }
+}
+
+pub(super) async fn task_owned_resume_conflict_fixture(
+    workspace_id: &str,
+    suffix: &str,
+) -> (CrudStore, Task, TaskRun, RecoveryJobRecord, String, String) {
+    let store = test_store_with_workspace(workspace_id).await;
+    let (task, run, job, thread, turn) =
+        pioneer_crud_tasks::test_support::execution::seed_task_owned_resume_conflict(
+            &store.connection,
+            workspace_id,
+            suffix,
+        )
+        .await;
+    (store, task, run, job, thread, turn)
+}

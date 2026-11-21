@@ -3,7 +3,7 @@ use pioneer_protocol::{
     TurnItem,
 };
 use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Set, Statement, TransactionTrait};
 
 pub(crate) async fn fixture_event_scope(
     fixture: &pioneer_postgres_test::TestDatabase,
@@ -66,6 +66,24 @@ pub(crate) fn safe_web_fetch_item(item_id: &str) -> TurnItem {
         outcome: None,
         observation: None,
     }
+}
+
+pub(crate) async fn seed_healthy_projection(
+    db: &impl ConnectionTrait,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    use pioneer_entity::turn_event_projection_stream_state as stream;
+    stream::Entity::insert(stream::ActiveModel {
+        turn_id: Set(turn_id.to_owned()),
+        thread_id: Set(thread_id.to_owned()),
+        status: Set("healthy".to_owned()),
+        projected_through_sequence: Set(2),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
 }
 
 use crate::cli_runtime_binding::FrozenBindingRoot;

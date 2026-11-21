@@ -48,10 +48,10 @@ async fn cached_read_shapes_rebind_ranges_and_do_not_cache_eligibility() {
     let eligible = eligible.with_maintenance_access();
     let unexpired = unexpired.with_maintenance_access();
 
-    assert!(discard_preflight(&eligible, "cp-1").await.unwrap());
-    assert!(!discard_preflight(&eligible, "missing").await.unwrap());
-    assert!(!discard_preflight(&unexpired, "cp-1").await.unwrap());
-    assert!(discard_preflight(&eligible, "cp-1").await.unwrap());
+    assert!(discard_preflight(&eligible.connection, "cp-1").await.unwrap());
+    assert!(!discard_preflight(&eligible.connection, "missing").await.unwrap());
+    assert!(!discard_preflight(&unexpired.connection, "cp-1").await.unwrap());
+    assert!(discard_preflight(&eligible.connection, "cp-1").await.unwrap());
 
     let tail = read_queries::discard_page(&eligible.connection, "cp-0", "cp-1")
         .await

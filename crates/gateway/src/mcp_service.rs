@@ -4244,11 +4244,11 @@ impl McpService {
                     );
                 }
             };
-            Some(SqlitePatchObserver::new(
+            Some(Arc::new(SqlitePatchObserver::new(
                 self.inner.crud_store.database_connection(),
                 identity.clone(),
                 admission_permit,
-            ))
+            )))
         } else {
             None
         };
@@ -4260,9 +4260,8 @@ impl McpService {
             let identity = patch_identity
                 .as_ref()
                 .expect("managed apply_patch identity should be present");
-            let observer = history_observer
-                .as_ref()
-                .expect("managed apply_patch observer should be present");
+            let observer =
+                history_observer.expect("managed apply_patch observer should be present");
             pioneer_tools::handlers::ApplyPatchHandler
                 .handle_with_source_and_observer(
                     invocation,

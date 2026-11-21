@@ -19,7 +19,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
@@ -835,17 +835,20 @@ async fn heartbeat_lease_payload_progress_and_identical_upserts_do_not_refresh_d
         .unwrap();
     let before = pending_row(&agent_store, &agent_run.id).await.unwrap();
     assert!(
-        agent_store
+        crate::execution_store::TaskExecutionStore::new(&agent_store.connection)
             .heartbeat_execution_for_agent_attempt(&agent_id, 1, AT + 20, None)
             .await
             .unwrap()
             .is_some()
     );
     assert!(
-        agent_store
-            .record_agent_execution_progress(&agent_id, 1, "{}", AT + 21, None)
-            .await
-            .unwrap()
+        pioneer_crud_execution::turn_ownership::TurnOwnership::new(
+            &agent_store.connection,
+            &Default::default(),
+        )
+        .record_agent_execution_progress(&agent_id, 1, "{}", AT + 21, None)
+        .await
+        .unwrap()
     );
     sql(
         &agent_store,

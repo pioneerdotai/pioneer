@@ -1,5 +1,6 @@
 //! Recovery boundaries that only update durable compaction lifecycle state.
 use super::*;
+use crate::lifecycle_pending::CompactionLifecycleClaim;
 use crate::store::CompactionStore;
 use pioneer_compaction::ModelBudget;
 use pioneer_entity::compaction_lifecycle_pending as pending;

@@ -844,10 +844,13 @@ async fn terminal_turn_supersedes_a_stale_prepared_finalization_during_reconcili
             TurnFinalizationCommitOutcome::SupersededByTerminalStatus(TurnStatus::Interrupted)
         );
         assert!(
-            turn_finalization::find_by_turn_id(&store.connection, turn_id)
-                .await
-                .expect("finalization lookup should succeed")
-                .is_none(),
+            pioneer_crud_conversations::turn_finalization::find_by_turn_id(
+                &store.connection,
+                turn_id
+            )
+            .await
+            .expect("finalization lookup should succeed")
+            .is_none(),
             "superseded finalization intent must be removed"
         );
         Ok(())
@@ -912,7 +915,7 @@ async fn later_failed_turn_supersedes_a_prepared_native_finalization() {
         .expect("later failure should win atomically");
 
     assert!(
-        turn_finalization::find_by_turn_id(&store.connection, turn_id)
+        pioneer_crud_conversations::turn_finalization::find_by_turn_id(&store.connection, turn_id)
             .await
             .expect("finalization intent lookup should succeed")
             .is_none(),
@@ -1068,10 +1071,13 @@ async fn native_finalization_rejects_a_stale_attached_task_revision() {
             "unexpected stale task fence error: {error:#}"
         );
         assert!(
-            turn_finalization::find_by_turn_id(&store.connection, notification.turn_id.as_str())
-                .await
-                .expect("finalization intent lookup should succeed")
-                .is_none()
+            pioneer_crud_conversations::turn_finalization::find_by_turn_id(
+                &store.connection,
+                notification.turn_id.as_str()
+            )
+            .await
+            .expect("finalization intent lookup should succeed")
+            .is_none()
         );
 
         let current = store

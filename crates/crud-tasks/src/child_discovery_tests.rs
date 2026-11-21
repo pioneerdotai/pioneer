@@ -23,14 +23,17 @@ async fn upsert_thread(
     thread: &Thread,
     actor: PersistedActorRef,
 ) -> Result<bool> {
-    pioneer_crud_conversations::thread_mutations::upsert_thread_with_creator(
-        db,
+    let tx = db.begin().await?;
+    let changed = pioneer_crud_conversations::thread_mutations::upsert_thread_with_creator(
+        &tx,
         thread,
         &actor,
         unix_to_datetime(thread.created_at),
         unix_to_datetime(thread.updated_at),
     )
-    .await
+    .await?;
+    tx.commit().await?;
+    Ok(changed)
 }
 
 async fn upsert_turn(
@@ -47,7 +50,7 @@ async fn upsert_turn(
         db, id, thread, turn, None, None, None, None, None, false, created_at, updated_at,
     )
     .await?;
-    apply_prepared_turn_upsert(db, prepared).await
+    apply_prepared_turn_upsert(db, prepared).await.map(|_| ())
 }
 
 fn sample_thread(workspace_id: &str, thread_id: &str, timestamp: i64) -> Thread {

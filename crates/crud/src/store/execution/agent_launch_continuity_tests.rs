@@ -214,7 +214,10 @@ async fn empty_task_resume_action_wakes_control_after_commit_and_exact_replay_pa
         graph.grant.grant_json = grant.to_string();
         graph.grant.grant_fingerprint =
             agent_execution_grant_fingerprint(&graph.grant.grant_json).unwrap();
-        store.commit_agent_execution_graph(&graph).await.unwrap();
+        store
+            .commit_agent_execution_graph(graph.clone())
+            .await
+            .unwrap();
 
         let mut task = crate::tests::sample_task(graph.contract_now);
         task.workspace_id = "continuity-workspace".into();

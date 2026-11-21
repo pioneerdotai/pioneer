@@ -56,7 +56,7 @@ use crate::{
 pub(crate) use fixtures::postgres_store_with_workspace;
 use fixtures::*;
 use migration::{Migrator, MigratorTrait};
-use pioneer_crud_conversations::{read_model_repair, turn_finalization};
+use pioneer_crud_conversations::read_model_repair;
 use pioneer_crud_execution::attempt_values::ATTEMPT_STATUS_COMPLETED;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{

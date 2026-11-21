@@ -3,7 +3,7 @@ use crate::{
     cli_runtime_binding::{NewCliRuntimeTurnBinding, upsert_turn_binding},
     input_mapping::InputMapping,
     native_events::{NativeEventRepository, NewCliRuntimeNativeEvent},
-    test_fixture::InlineInput,
+    test_fixture::{InlineInput, seed_healthy_projection},
     time::unix_to_datetime,
 };
 use anyhow::{Context, Result};
@@ -114,6 +114,9 @@ impl Fixture {
             [id.into(), (if completed { "completed" } else { "in_progress" }).into(),
              unix_to_datetime(NOW).into()],
         )).await?;
+        if completed {
+            seed_healthy_projection(&self.foreground, "thread-cleanup", id).await?;
+        }
         self.bind(id, "codex", if completed { "completed" } else { "running" })
             .await
     }

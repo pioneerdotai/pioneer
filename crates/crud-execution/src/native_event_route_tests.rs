@@ -220,6 +220,7 @@ async fn native_event_cleanup_keeps_active_and_lifecycle_events() {
             .exec(&db)
             .await
             .expect("turn should update to terminal status");
+            crate::test_fixture::seed_healthy_projection(&db, thread_id, turn_id).await?;
         }
 
         for (turn_id, status) in [
