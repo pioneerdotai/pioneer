@@ -6,10 +6,11 @@ use pioneer_protocol::{
 };
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::sea_query::{Expr, ExprTrait, LockType};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -169,12 +170,13 @@ enum CandidateGateState {
     Rejected(CandidateGateMetadata),
 }
 
-pub async fn prepare<C: ConnectionTrait>(
-    db: &C,
+pub async fn prepare(
+    db: &DatabaseTransaction,
     prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
-    prepare_with_policy(db, prepared, now, true).await
+    let turn_scope = lock_preparation_turn(db, &prepared.preparation.turn_id).await?;
+    prepare_with_policy(db, prepared, now, true, turn_scope).await
 }
 
 /// A terminal adapter retries the same observed completion after reconnect.
@@ -195,11 +197,11 @@ pub async fn post_turn_batch_exists<C: ConnectionTrait>(
         != 0)
 }
 
-/// Called inside the writer transaction. Preserve unrelated cleanup obligations
-/// and recheck the read-side existence hint under the serialized writer.
-pub async fn prepare_post_turn_once<C: ConnectionTrait>(
-    db: &C,
+/// Preserve unrelated cleanup obligations and the first snapshot for this batch.
+pub async fn prepare_post_turn_once(
+    db: &DatabaseTransaction,
     prepared: PreparedNativeTerminalEffectPreparation,
+    expected_cli_attempt_index: i64,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
     let input = &prepared.preparation;
@@ -208,6 +210,13 @@ pub async fn prepare_post_turn_once<C: ConnectionTrait>(
         || input.effects[0].effect_id != format!("{}:terminal-effect:post-turn", input.turn_id)
     {
         bail!("post-turn preparation requires exactly one canonical hook obligation");
+    }
+    let turn_scope = lock_preparation_turn(db, &input.turn_id).await?;
+    let attempt = crate::cli_runtime_attempts::latest_turn_attempt(db, &input.turn_id)
+        .await?
+        .context("CLI post-turn attempt is missing")?;
+    if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
+        bail!("CLI post-turn preparation belongs to an obsolete attempt");
     }
     if let Some(existing) =
         native_terminal_effect_outbox::Entity::find_by_id(input.effects[0].effect_id.clone())
@@ -219,14 +228,14 @@ pub async fn prepare_post_turn_once<C: ConnectionTrait>(
             return Ok(());
         }
     }
-    prepare_with_policy(db, prepared, now, false).await
+    prepare_with_policy(db, prepared, now, false, turn_scope).await
 }
 
 /// Merge a recovery-owned obligation without superseding a hook/cleanup plan
-/// already prepared by the live actor. This is used only inside the canonical
-/// recovery terminalization transaction.
-pub async fn prepare_supplemental<C: ConnectionTrait>(
-    db: &C,
+/// already prepared by the live actor. The caller commits this preparation
+/// before reading the canonical recovery activation plan.
+pub async fn prepare_supplemental(
+    db: &DatabaseTransaction,
     prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
 ) -> Result<()> {
@@ -236,6 +245,7 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
         effects,
         compacted_payload_sha256,
     } = prepared;
+    let turn_scope = lock_preparation_turn(db, &preparation.turn_id).await?;
     if crate::native_cancellation_context::has_accepted(db, &preparation.turn_id).await? {
         bail!("recovery supplemental preparation was superseded by accepted native cancellation");
     }
@@ -246,17 +256,7 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
         bail!("supplemental recovery effects must be terminal-commit task cleanup obligations");
     }
 
-    let turn_row = turn::Entity::find_by_id(preparation.turn_id.clone())
-        .one(db)
-        .await
-        .context("failed to load supplemental terminal-effect Turn")?
-        .with_context(|| {
-            format!(
-                "supplemental terminal-effect Turn `{}` does not exist",
-                preparation.turn_id
-            )
-        })?;
-    if turn_row.status == "in_progress" {
+    if turn_scope.1 == "in_progress" {
         return prepare_with_policy(
             db,
             PreparedNativeTerminalEffectPreparation {
@@ -267,10 +267,11 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
             },
             now,
             false,
+            turn_scope,
         )
         .await;
     }
-    if turn_row.thread_id != preparation.thread_id {
+    if turn_scope.0 != preparation.thread_id {
         bail!("supplemental terminal-effect preparation has a mismatched thread scope");
     }
     let thread_row = thread::Entity::find_by_id(preparation.thread_id.clone())
@@ -395,11 +396,29 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn prepare_with_policy<C: ConnectionTrait>(
-    db: &C,
+async fn lock_preparation_turn(
+    db: &DatabaseTransaction,
+    turn_id: &str,
+) -> Result<(String, String)> {
+    // Order preparation with other producers and with the status update in
+    // terminal projection. Foreign-key checks can still take KEY SHARE.
+    turn::Entity::find_by_id(turn_id)
+        .select_only()
+        .columns([turn::Column::ThreadId, turn::Column::Status])
+        .lock(LockType::NoKeyUpdate)
+        .into_tuple()
+        .one(db)
+        .await
+        .context("failed to lock terminal-effect Turn")?
+        .with_context(|| format!("terminal-effect Turn `{turn_id}` does not exist"))
+}
+
+async fn prepare_with_policy(
+    db: &DatabaseTransaction,
     prepared: PreparedNativeTerminalEffectPreparation,
     now: DateTimeWithTimeZone,
     supersede_omitted_effects: bool,
+    (thread_id, turn_status): (String, String),
 ) -> Result<()> {
     let PreparedNativeTerminalEffectPreparation {
         preparation,
@@ -408,17 +427,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
         compacted_payload_sha256,
     } = prepared;
 
-    let turn_row = turn::Entity::find_by_id(preparation.turn_id.clone())
-        .one(db)
-        .await
-        .context("failed to load terminal-effect Turn")?
-        .with_context(|| {
-            format!(
-                "terminal-effect Turn `{}` does not exist",
-                preparation.turn_id
-            )
-        })?;
-    if turn_row.thread_id != preparation.thread_id {
+    if thread_id != preparation.thread_id {
         bail!("terminal-effect preparation has a mismatched thread scope");
     }
     let thread_row = thread::Entity::find_by_id(preparation.thread_id.clone())
@@ -435,7 +444,7 @@ async fn prepare_with_policy<C: ConnectionTrait>(
         bail!("terminal-effect preparation has a mismatched workspace scope");
     }
 
-    let terminal = turn_row.status != "in_progress";
+    let terminal = turn_status != "in_progress";
     if !terminal
         && crate::native_cancellation_context::has_accepted(db, &preparation.turn_id).await?
     {
@@ -2745,6 +2754,102 @@ pub async fn load_status(
 mod tests {
     use super::*;
     use pioneer_postgres_test::with_database;
+
+    #[tokio::test]
+    async fn concurrent_post_turn_preparation_preserves_the_first_committed_snapshot() -> Result<()>
+    {
+        use sea_orm::{DbBackend, Statement};
+        use std::time::Duration;
+
+        with_database(async |fixture| {
+            let writer = fixture.connection();
+            writer.execute_unprepared(
+                "INSERT INTO workspace(id,name) VALUES ('ws','Terminal effect');
+                 INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+                 VALUES ('thread','ws','','agent','model','provider','active');
+                 INSERT INTO turn(id,thread_id,status) VALUES
+                    ('committed','thread','in_progress'), ('rolled-back','thread','in_progress');
+                 INSERT INTO turn_cli_runtime_attempt
+                    (id,turn_id,attempt_index,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at)
+                 VALUES ('attempt-commit','committed',1,'runtime','codex','native','starting',now(),now()),
+                        ('attempt-rollback','rolled-back',1,'runtime','codex','native','starting',now(),now());",
+            ).await?;
+            let other = fixture.connect_with_limit(1).await?;
+            let observer = fixture.connect_read_only().await?;
+            let now = unix_to_datetime(1_700_005_000);
+            for (turn_id, commit_first) in [("committed", true), ("rolled-back", false)] {
+                let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+                let prepare_snapshot = |answer: &str| prepare_input(NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:observed-completion"),
+                    workspace_id: "ws".to_owned(),
+                    thread_id: "thread".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: NativeTerminalEffectKind::PostTurnHook,
+                        gate: NativeTerminalEffectGate::TerminalCommit,
+                        payload: NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({"answer": answer}),
+                            runtime_snapshot: serde_json::json!({"schema_version": 1}),
+                        },
+                        max_attempts: 3,
+                    }],
+                });
+                let preferred = prepare_snapshot("first")?;
+                let replay = prepare_snapshot("second")?;
+                let first = writer.begin().await?;
+                let first_pid: i32 = first.query_one_raw(Statement::from_string(
+                    DbBackend::Postgres, "SELECT pg_backend_pid() AS pid",
+                )).await?.context("first writer PID")?.try_get("", "pid")?;
+                prepare_post_turn_once(&first, preferred, 1, now).await?;
+
+                let competing_writer = other.clone();
+                let (pid_tx, pid_rx) = tokio::sync::oneshot::channel();
+                let competing = tokio::spawn(async move {
+                    let second = competing_writer.begin().await?;
+                    let pid: i32 = second.query_one_raw(Statement::from_string(
+                        DbBackend::Postgres, "SELECT pg_backend_pid() AS pid",
+                    )).await?.context("second writer PID")?.try_get("", "pid")?;
+                    pid_tx.send(pid).expect("competing writer has an observer");
+                    prepare_post_turn_once(&second, replay, 1, now).await?;
+                    second.commit().await?;
+                    Ok::<_, anyhow::Error>(())
+                });
+                let second_pid = tokio::time::timeout(Duration::from_secs(5), pid_rx).await??;
+                assert_ne!(first_pid, second_pid);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let waiting: bool = observer.query_one_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT $1 = ANY(pg_blocking_pids($2)) AS waiting",
+                            [first_pid.into(), second_pid.into()],
+                        )).await?.context("competing writer lock state")?.try_get("", "waiting")?;
+                        if waiting {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.context("competing preparation must wait for the first writer")??;
+                if commit_first {
+                    first.commit().await?;
+                } else {
+                    first.rollback().await?;
+                }
+                tokio::time::timeout(Duration::from_secs(5), competing).await???;
+                let saved = native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                    .one(writer).await?.context("one durable preparation")?;
+                let NativeTerminalEffectPayload::PostTurnHook { request, .. } =
+                    serde_json::from_str(&saved.payload_json)?
+                else {
+                    panic!("prepared post-turn payload");
+                };
+                assert_eq!(request["answer"], if commit_first { "first" } else { "second" });
+                assert_eq!(saved.status, STATUS_PREPARED);
+            }
+            Ok(())
+        }).await
+    }
 
     #[tokio::test]
     async fn malformed_terminal_effect_is_quarantined_without_poisoning_valid_batch_claims()

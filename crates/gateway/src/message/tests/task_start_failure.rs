@@ -604,16 +604,42 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
     let ((_, _), events) = capture_task_start(run_gateway_start_failure(
         PreparationFailure::ChildPersistence,
     ));
-    assert_eq!(
-        events.len(),
-        2,
-        "original admission and new persistence failure each get ERROR: {:?}",
-        events
-            .iter()
-            .map(|event| (&event.logger, &event.message))
-            .collect::<Vec<_>>()
-    );
     assert_safe_events(&events);
+    let mut stages = Vec::new();
+    for event in &events {
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("each report must include tracing fields");
+        };
+        match (event.logger.as_deref(), event.message.as_deref()) {
+            (Some("pioneer_tasks::start_failure"), Some("Task preparation or launch failed")) => {
+                let stage = fields["stage"].as_str().expect("Task start stage");
+                if stage == "executor_start" {
+                    assert_eq!(fields["postgres_sqlstate"], json!("P0001"));
+                }
+                stages.push(stage);
+            }
+            (
+                Some("pioneer_gateway::message::agent_runtime"),
+                Some("native turn-event optional delivery worker failed"),
+            ) => {
+                // The worker can encounter the same injected task_event
+                // trigger on another PostgreSQL session before this test ends.
+                assert!(
+                    fields["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("pioneer9 child failure persistence"))
+                );
+            }
+            report => panic!("unexpected diagnostic in Task start fixture: {report:?}"),
+        }
+    }
+    stages.sort_unstable();
+    assert_eq!(
+        stages,
+        ["cli_admission", "executor_start"],
+        "each distinct Task start failure gets one ERROR"
+    );
 }
 
 #[test]

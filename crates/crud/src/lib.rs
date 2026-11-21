@@ -23892,24 +23892,15 @@ impl CrudStore {
         expected_cli_attempt_index: i64,
         now_unix: i64,
     ) -> Result<()> {
-        let turn_id = preparation.turn_id.clone();
         let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
         self.run_serialized_write(|| {
             let prepared = prepared.clone();
-            let turn_id = turn_id.clone();
             async move {
                 let tx = self.connection.begin().await?;
-                // Transcript preparation happens outside DB capacity. Fence
-                // the attempt so obsolete callbacks cannot replace its successor.
-                let attempt = cli_runtime_binding::latest_turn_attempt(&tx, &turn_id)
-                    .await?
-                    .context("CLI post-turn attempt is missing")?;
-                if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
-                    bail!("CLI post-turn preparation belongs to an obsolete attempt");
-                }
                 native_terminal_effect_outbox::prepare_post_turn_once(
                     &tx,
                     prepared,
+                    expected_cli_attempt_index,
                     unix_to_datetime(now_unix),
                 )
                 .await?;
@@ -24826,13 +24817,17 @@ impl CrudStore {
             // terminal event activates them. Persist that bounded preparation
             // before the atomic terminal transaction, then rebuild the exact
             // activation fence from the resulting reader-visible state.
+            let preparation_tx = self.connection.begin().await
+                .context("failed to begin recovery terminal cleanup preparation")?;
             native_terminal_effect_outbox::prepare_supplemental(
-                &self.connection,
+                &preparation_tx,
                 prepared.terminal_effects.clone(),
                 created_at,
             )
             .await
             .context("failed to prepare recovery terminal cleanup")?;
+            preparation_tx.commit().await
+                .context("failed to commit recovery terminal cleanup preparation")?;
             if let Some(terminal_event) = prepared.terminal_event.as_mut() {
                 terminal_event.terminal_effect_activation = Some(
                     native_terminal_effect_outbox::prepare_activation_for_terminal(
