@@ -1,7 +1,7 @@
 //! Exact Turn, input, item and history-window reads on the caller's connection.
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item};
-use pioneer_protocol::{TurnKind, TurnStatus, TurnWorkOwner};
+use pioneer_protocol::{Turn, TurnItemType, TurnKind, TurnStatus, TurnWorkOwner, UserInput};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
@@ -9,6 +9,10 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
 };
 
+use std::collections::HashMap;
+
+use crate::protocol_projection::{decode_turn_input_model, thread_snapshot_turn_from_db_model};
+use crate::turn_item::turn_item_type_from_db;
 use crate::values::{turn_kind_to_db, turn_status_to_db};
 
 pub const TURN_MESSAGE_GUARD_PAGE_ROWS: usize = 128;
@@ -654,4 +658,128 @@ pub async fn find_completed_turns_for_thread<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to query completed turns for thread")
+}
+
+pub async fn get_turn_location(
+    db: &impl ConnectionTrait,
+    turn_id: &str,
+) -> Result<Option<(String, String)>> {
+    let Some(turn_model) = find_turn_by_id(db, turn_id).await? else {
+        return Ok(None);
+    };
+    let Some(thread_model) =
+        crate::thread_metadata::find_thread_by_id(db, turn_model.thread_id.as_str()).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((turn_model.thread_id, thread_model.workspace_id)))
+}
+
+pub async fn get_turn_for_thread(
+    db: &pioneer_sqlite::SqliteDatabase,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<(String, pioneer_protocol::Turn)>> {
+    let Some(thread_model) = crate::thread_metadata::find_thread_by_id(db, thread_id).await? else {
+        return Ok(None);
+    };
+
+    let Some(turn_model) = find_turn_by_thread_and_id(db, thread_id, turn_id).await? else {
+        return Ok(None);
+    };
+
+    Ok(crate::protocol_projection::turn_from_db_model(turn_model)?
+        .map(|turn| (thread_model.workspace_id, turn)))
+}
+
+pub async fn get_turns_by_thread_and_ids(
+    db: &impl ConnectionTrait,
+    thread_id: &str,
+    turn_ids: &[String],
+) -> Result<HashMap<String, Turn>> {
+    let rows = find_turns_by_thread_and_ids(db, thread_id, turn_ids).await?;
+    rows.into_iter()
+        .filter_map(|row| match thread_snapshot_turn_from_db_model(row) {
+            Ok(Some(turn)) => Some(Ok((turn.id.clone(), turn))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+pub async fn get_turn_inputs(db: &impl ConnectionTrait, turn_id: &str) -> Result<Vec<UserInput>> {
+    let rows = find_turn_inputs(db, turn_id).await?;
+    let mut inputs = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        inputs.push(decode_turn_input_model(row)?);
+    }
+
+    Ok(inputs)
+}
+
+pub async fn get_turn_inputs_for_turns(
+    db: &impl ConnectionTrait,
+    turn_ids: &[String],
+) -> Result<HashMap<String, Vec<UserInput>>> {
+    let rows = find_turn_inputs_for_turns(db, turn_ids).await?;
+    let mut inputs_by_turn = turn_ids
+        .iter()
+        .cloned()
+        .map(|turn_id| (turn_id, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for row in rows {
+        let turn_id = row.turn_id.clone();
+        inputs_by_turn
+            .entry(turn_id)
+            .or_default()
+            .push(decode_turn_input_model(row)?);
+    }
+    Ok(inputs_by_turn)
+}
+
+pub async fn get_turn_item_type(
+    db: &impl ConnectionTrait,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<TurnItemType>> {
+    let value = find_turn_item_type(db, turn_id, item_id).await?;
+    Ok(match value {
+        Some(value) => {
+            Some(turn_item_type_from_db(value.as_str()).unwrap_or(TurnItemType::DynamicToolCall))
+        }
+        None => None,
+    })
+}
+
+pub async fn get_turn_item(
+    db: &pioneer_sqlite::SqliteDatabase,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<pioneer_protocol::TurnItem>> {
+    let Some(model) = find_turn_item(db, turn_id, item_id).await? else {
+        return Ok(None);
+    };
+    let parsed = crate::turn_payload::decode_item(&model).with_context(|| {
+        format!("failed to decode turn_item payload for turn `{turn_id}` item `{item_id}`")
+    })?;
+    Ok(Some(parsed))
+}
+
+pub async fn list_decoded_turn_items_by_type(
+    db: &pioneer_sqlite::SqliteDatabase,
+    turn_id: &str,
+    item_type: &str,
+) -> Result<Vec<pioneer_protocol::TurnItem>> {
+    let rows = list_turn_items_by_type(db, turn_id, item_type).await?;
+    rows.into_iter()
+        .map(|model| {
+            crate::turn_payload::decode_item(&model).with_context(|| {
+                format!(
+                    "failed to decode turn item payload for turn `{turn_id}` item `{}`",
+                    model.item_id
+                )
+            })
+        })
+        .collect()
 }

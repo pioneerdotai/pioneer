@@ -1,21 +1,14 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use pioneer_entity::{thread, turn};
 use pioneer_protocol::{NativeContextBudget, NativeSummaryContext, TurnExecutionSecuritySnapshot};
-use sea_orm::sea_query::{Alias, Expr, ExprTrait};
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 use serde_json::Value;
 
-pub use pioneer_crud_access::turn_execution::authorization_context_as_text;
-
-pub fn authorization_context_value(json: &str) -> Result<Expr> {
-    let json = json.trim();
-    ensure!(
-        !json.is_empty(),
-        "execution authorization context must not be empty"
-    );
-    // A bound text-to-json cast retains the serialized authorization bytes.
-    Ok(Expr::val(json).cast_as(Alias::new("json")))
-}
+pub use pioneer_crud_access::turn_execution::{
+    authorization_context_as_text, authorization_context_value,
+    set_turn_execution_authorization_context,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnExecutionSecuritySnapshotRecord {
@@ -114,23 +107,6 @@ pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
         version,
         snapshot,
     }))
-}
-
-pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    context_json: &str,
-) -> Result<bool> {
-    let update_result = turn::Entity::update_many()
-        .filter(turn::Column::Id.eq(turn_id.to_owned()))
-        .col_expr(
-            turn::Column::ExecutionAuthorizationContextJson,
-            authorization_context_value(context_json)?,
-        )
-        .exec(db)
-        .await
-        .context("failed to update turn execution authorization context")?;
-    Ok(update_result.rows_affected > 0)
 }
 
 /// Pin an uninitialized Native context or supply its missing service mode.

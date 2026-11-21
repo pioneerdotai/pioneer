@@ -182,3 +182,25 @@ pub fn provider_failure_stage_from_db(value: &str) -> Option<ProviderFailureStag
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::recovery_job_status_to_db;
+    use pioneer_crud_access::policy::sandbox_mode_to_db;
+    use pioneer_crud_conversations::values::turn_status_to_db;
+    use pioneer_protocol::{RecoveryJobStatus, SandboxMode, TurnStatus};
+
+    #[test]
+    fn db_values_are_snake_case() {
+        assert_eq!(sandbox_mode_to_db(SandboxMode::FullAccess), "full_access");
+        assert_eq!(turn_status_to_db(TurnStatus::InProgress), "in_progress");
+        assert_eq!(turn_status_to_db(TurnStatus::Completed), "completed");
+        assert_eq!(turn_status_to_db(TurnStatus::Failed), "failed");
+        assert_eq!(turn_status_to_db(TurnStatus::Interrupted), "interrupted");
+        assert_eq!(turn_status_to_db(TurnStatus::Blocked), "blocked");
+        assert_eq!(
+            recovery_job_status_to_db(RecoveryJobStatus::Blocked),
+            "blocked"
+        );
+    }
+}

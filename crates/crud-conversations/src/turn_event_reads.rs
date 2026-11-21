@@ -6,6 +6,19 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
 };
 
+/// Read the stored event row for an exact idempotency check.
+pub async fn find_event_model_by_idempotency_key<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<turn_event::Model>> {
+    Ok(turn_event::Entity::find()
+        .filter(turn_event::Column::TurnId.eq(turn_id))
+        .filter(turn_event::Column::IdempotencyKey.eq(idempotency_key))
+        .one(db)
+        .await?)
+}
+
 /// The existing canonical item index is written in the acceptance transaction,
 /// independently of the projection watermark. No payload decoding is needed.
 fn accepted_item_completions(
@@ -73,6 +86,13 @@ pub fn appended_event_from_model(model: turn_event::Model) -> Result<AppendedTur
         was_inserted: false,
         created_at: model.created_at,
     })
+}
+
+pub async fn find_event_model_by_id(
+    db: &impl ConnectionTrait,
+    event_id: &str,
+) -> Result<Option<turn_event::Model>> {
+    Ok(turn_event::Entity::find_by_id(event_id.to_owned()).one(db).await?)
 }
 
 pub async fn find_event_by_id(

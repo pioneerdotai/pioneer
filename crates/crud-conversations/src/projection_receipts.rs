@@ -448,3 +448,53 @@ pub async fn cleanup_quantum(
     }
     result
 }
+
+#[derive(Clone, Copy)]
+pub struct ProjectionReceiptRepository<'a> {
+    connection: &'a pioneer_sqlite::SqliteDatabase,
+}
+
+impl<'a> ProjectionReceiptRepository<'a> {
+    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+        Self { connection }
+    }
+
+    pub async fn projection_receipt_cleanup_upper_bound(self) -> Result<Option<String>> {
+        upper_bound(self.connection).await
+    }
+
+    pub async fn cleanup_projection_receipts_quantum(
+        self,
+        after_turn_id: Option<&str>,
+        through_turn_id: Option<&str>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        self.cleanup_projection_receipts_quantum_inner(after_turn_id, through_turn_id, None)
+            .await
+    }
+
+    pub async fn cleanup_projection_receipts_for_turn(
+        self,
+        turn_id: &str,
+        through_sequence: Option<i64>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        self.cleanup_projection_receipts_quantum_inner(
+            None,
+            None,
+            Some((turn_id, through_sequence)),
+        )
+        .await
+    }
+
+    async fn cleanup_projection_receipts_quantum_inner(
+        self,
+        after_turn_id: Option<&str>,
+        through_turn_id: Option<&str>,
+        addressed: Option<(&str, Option<i64>)>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        cleanup_quantum(self.connection, after_turn_id, through_turn_id, addressed).await
+    }
+}
+
+#[cfg(test)]
+#[path = "projection_receipt_cleanup_tests.rs"]
+mod cleanup_tests;

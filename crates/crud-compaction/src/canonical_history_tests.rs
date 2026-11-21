@@ -217,3 +217,38 @@ async fn history_capture_preserves_compressed_event_across_a_fence() {
     }
     assert_eq!(rebuilt.as_bytes(), wire.as_bytes());
 }
+
+#[pioneer_postgres_test::postgres_test]
+async fn poison_source_progress_and_scope_are_bounded() {
+    let db = fixture().await;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload)
+             VALUES ('huge','thread','turn',1,'fixture',to_json($1::text)),
+                    ('next','thread','turn',2,'fixture',to_json('small'::text))",
+        ["x".repeat(SOURCE_PAGE_BYTES + 1).into()],
+    ))
+    .await
+    .unwrap();
+    let page = compaction_source_page(&db, "ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap();
+    assert!(page.entries[0].incomplete);
+    assert_eq!(page.entries[1].payload.as_deref(), Some(r#""small""#));
+    assert_eq!(page.next_sequence, 2);
+    assert!(
+        compaction_source_page(&db, "other", "thread", "turn", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        db.read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    assert_eq!(
+        db.write_class(),
+        pioneer_sqlite::SqliteWriteClass::Maintenance
+    );
+}

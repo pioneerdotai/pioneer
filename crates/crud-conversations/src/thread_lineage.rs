@@ -145,3 +145,18 @@ pub async fn list_children_page<C: ConnectionTrait>(
         .await
         .context("failed to list child lineage page")
 }
+
+pub fn task_thread_lineage_from_db_model(
+    model: pioneer_entity::thread_lineage::Model,
+) -> TaskThreadLineage {
+    TaskThreadLineage {
+        child_thread_id: model.child_thread_id,
+        parent_thread_id: model.parent_thread_id,
+        root_thread_id: model.root_thread_id,
+        depth: model.depth,
+        origin_kind: model.origin_kind,
+        created_by_thread_id: model.created_by_thread_id,
+        created_by_turn_id: model.created_by_turn_id,
+        created_at: model.created_at.timestamp(),
+    }
+}

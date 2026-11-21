@@ -1,6 +1,6 @@
 //! PostgreSQL regressions for server unread activation and access boundaries.
 use super::*;
-use crate::repositories::unread_start;
+use pioneer_crud_conversations::unread_start;
 use pioneer_entity::{gateway_identity, unread_message_position};
 use pioneer_protocol::{AgentMessagePhase, ThreadVisibility};
 
@@ -66,7 +66,7 @@ impl Fixture {
         let mut thread = sample_thread(WS, THREAD, NOW);
         thread.visibility = Some(ThreadVisibility::Workspace);
         let tx = store.connection.begin().await.unwrap();
-        crate::repositories::thread::insert_user_thread_with_creator(
+        crate::store::conversations::thread_writes::insert_user_thread_with_creator(
             &tx,
             &thread,
             &PersistedActorRef::Principal(owner.clone()),
@@ -169,7 +169,7 @@ impl Fixture {
         id: &str,
     ) -> pioneer_protocol::ThreadReadPosition {
         let block =
-            crate::repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
+            pioneer_crud_conversations::thread_timeline_projection::find_thread_timeline_block_by_id(
                 &self.store.connection,
                 thread,
                 &crate::assistant_block_id(turn, id),
@@ -469,7 +469,7 @@ async fn grants_regrants_and_visibility_use_actual_access_not_first_open() {
             .await;
         assert_eq!(f.count(&f.member, PRIVATE).await, 1);
         let tx = f.store.connection.begin().await.unwrap();
-        crate::repositories::thread::update_user_thread_management(
+        crate::store::conversations::thread_writes::update_user_thread_management(
             &tx,
             WS,
             PRIVATE,
@@ -500,7 +500,7 @@ async fn grants_regrants_and_visibility_use_actual_access_not_first_open() {
         // Removing/regranting private access captures a new boundary, while an
         // idempotent add preserves the current one. Return to private first.
         let tx = f.store.connection.begin().await.unwrap();
-        crate::repositories::thread::update_user_thread_management(
+        crate::store::conversations::thread_writes::update_user_thread_management(
             &tx,
             WS,
             PRIVATE,
@@ -597,7 +597,7 @@ async fn replay_edits_and_projection_rebuild_reuse_first_completion_position() {
             .await
             .unwrap();
         let block =
-            crate::repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
+            pioneer_crud_conversations::thread_timeline_projection::find_thread_timeline_block_by_id(
                 &f.store.connection,
                 THREAD,
                 &crate::assistant_block_id(turn, "html-only"),

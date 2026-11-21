@@ -111,6 +111,21 @@ pub struct AgentExecutionGraphCommitResult {
     pub queue_position: Option<u64>,
 }
 
+/// Observe the exact resource and queue rows used by graph admission.
+pub async fn graph_scheduling_facts(
+    db: &DatabaseTransaction,
+    input: &AgentExecutionGraphCommitInput,
+) -> Result<crate::agent_graph_resources::GraphSchedulingFacts> {
+    crate::agent_graph_resources::graph_scheduling_facts(
+        db,
+        &input.child_resource_state.id,
+        &input.root_execution_id,
+        &input.child_execution.id,
+        input.child_resource_state.attempt_generation,
+    )
+    .await
+}
+
 /// Atomically materialize the agent domain execution graph used by a durable
 /// agent Task occurrence.  The graph rows are immutable/idempotent; only the
 /// child resource state and its permit/queue placement are changed when this
@@ -1176,3 +1191,7 @@ pub async fn commit_agent_action_resources(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "agent_graph_launch_tests.rs"]
+mod launch_tests;

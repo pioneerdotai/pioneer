@@ -4,7 +4,9 @@ use pioneer_entity::thread;
 use pioneer_protocol::{ThreadStatus, TurnAuthorSnapshot};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func};
-use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
+};
 
 use crate::collaboration::validate_turn_author_snapshot;
 use crate::values::thread_status_to_db;
@@ -103,6 +105,18 @@ pub async fn touch_thread_for_completed_message_prepared<C: ConnectionTrait>(
     Ok(())
 }
 
+pub async fn find_thread_workspace<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    Ok(thread::Entity::find_by_id(thread_id.to_owned())
+        .select_only()
+        .column(thread::Column::WorkspaceId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+
 pub async fn find_thread_by_id<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -191,6 +205,20 @@ pub async fn update_thread_name_if_changed<C: ConnectionTrait>(
         .context("failed to conditionally update thread name")?;
 
     Ok(true)
+}
+
+pub async fn get_thread_summary(
+    db: &impl ConnectionTrait,
+    thread_id: &str,
+) -> Result<Option<(String, i64)>> {
+    let model = find_thread_by_id(db, thread_id).await?;
+    match model {
+        Some(m) => match m.summary {
+            Some(s) if !s.is_empty() => Ok(Some((s, m.summary_turn_count.unwrap_or(0)))),
+            _ => Ok(None),
+        },
+        None => Ok(None),
+    }
 }
 
 pub async fn update_thread_summary<C: ConnectionTrait>(

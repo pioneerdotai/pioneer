@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
+pioneer-crud-signals.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

@@ -252,3 +252,13 @@ pub fn record_from_bytes(
         history_json,
     }
 }
+
+pub async fn get_scoped(
+    connection: &pioneer_sqlite::SqliteDatabase,
+    run_id: &str,
+) -> Result<Option<TaskRunConversationSnapshotRecord>> {
+    let reader = connection.begin_read().await?;
+    let captured = capture_snapshot(&reader, run_id).await?;
+    reader.commit().await?;
+    captured.map(|capture| capture.into_record()).transpose()
+}

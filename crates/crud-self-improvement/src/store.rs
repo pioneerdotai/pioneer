@@ -741,3 +741,116 @@ fn unix_to_datetime(value: i64) -> DateTimeWithTimeZone {
         .unwrap_or_else(Utc::now)
         .fixed_offset()
 }
+
+use crate::SelfImprovementSourceTurnRecord;
+use crate::canonical_history::SelfImprovementFrozenSourceRange;
+use pioneer_crud_conversations::canonical_turn_event::CanonicalTurnEventRecord;
+use pioneer_crud_packages::agent_skill::AgentSkillVersionSnapshotRecord;
+
+impl SelfImprovementStore {
+    pub async fn reconcile_self_improvement_history_cursor(
+        &self,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let maintenance = self.with_maintenance_access();
+        let Some(state) =
+            crate::self_improvement_workspace_state::find(&maintenance.connection, workspace_id)
+                .await?
+        else {
+            return Ok(());
+        };
+        if state.effective_enabled_at.is_none() || state.cursor_source_id == 0 {
+            return Ok(());
+        }
+        let sources =
+            crate::source_turn::list_after_cursor(&maintenance.connection, workspace_id, 0, 0, 1)
+                .await?;
+        let Some(earliest) = sources
+            .first()
+            .map(|source| source.id)
+            .filter(|id| *id <= state.cursor_source_id)
+        else {
+            return Ok(());
+        };
+        maintenance
+            .run_serialized_write(|| async {
+                let transaction = maintenance.connection.begin().await?;
+                let result =
+                    crate::history_cursor::rewind_idle(&transaction, &state, earliest).await;
+                match result {
+                    Ok(()) => {
+                        transaction.commit().await?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            })
+            .await
+    }
+
+    pub async fn list_self_improvement_source_turns_after(
+        &self,
+        workspace_id: &str,
+        cursor_source_id: i64,
+        effective_enabled_at_unix: i64,
+        limit: u64,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        crate::source_turn::list_after_cursor(
+            &self.connection,
+            workspace_id,
+            cursor_source_id,
+            effective_enabled_at_unix,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn list_frozen_self_improvement_source_range(
+        &self,
+        workspace_id: &str,
+        source_lower_exclusive: i64,
+        source_upper_inclusive: i64,
+        effective_enabled_at_unix: i64,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        crate::source_turn::list_frozen_range(
+            &self.connection,
+            workspace_id,
+            source_lower_exclusive,
+            source_upper_inclusive,
+            effective_enabled_at_unix,
+        )
+        .await
+    }
+
+    pub async fn list_canonical_turn_events_for_self_improvement(
+        &self,
+        frozen_range: &SelfImprovementFrozenSourceRange,
+    ) -> Result<Vec<CanonicalTurnEventRecord>> {
+        crate::canonical_history::list_for_frozen_range(&self.connection, frozen_range).await
+    }
+
+    pub async fn self_improvement_processed_history_date(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<i64>> {
+        crate::source_turn::processed_history_date(&self.connection, workspace_id).await
+    }
+
+    pub async fn recent_processed_self_improvement_sources(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        crate::source_turn::recent_processed_sources(&self.connection, workspace_id).await
+    }
+
+    pub async fn list_active_agent_skill_versions(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<AgentSkillVersionSnapshotRecord>> {
+        pioneer_crud_packages::agent_skill::list_active_versions(&self.connection, workspace_id)
+            .await
+    }
+}

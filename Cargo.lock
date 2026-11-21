@@ -11431,6 +11431,7 @@ dependencies = [
  "pioneer-crud-payloads",
  "pioneer-crud-self-improvement",
  "pioneer-crud-tasks",
+ "pioneer-crud-timeline",
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
@@ -11458,7 +11459,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
- "pioneer-crud-artifacts",
  "pioneer-entity",
  "pioneer-postgres-test",
  "pioneer-protocol",
@@ -11474,8 +11474,12 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-util",
  "hex",
+ "pioneer-compaction",
+ "pioneer-crud-access",
  "pioneer-crud-conversations",
+ "pioneer-crud-signals",
  "pioneer-entity",
  "pioneer-migration",
  "pioneer-postgres-test",
@@ -11486,6 +11490,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -11504,6 +11509,7 @@ dependencies = [
  "pioneer-crud-payloads",
  "pioneer-crud-tasks",
  "pioneer-entity",
+ "pioneer-migration",
  "pioneer-observability",
  "pioneer-postgres-test",
  "pioneer-protocol",
@@ -11513,6 +11519,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -11548,6 +11555,7 @@ dependencies = [
  "pioneer-crud-access",
  "pioneer-crud-conversations",
  "pioneer-crud-payloads",
+ "pioneer-crud-signals",
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
@@ -11569,6 +11577,7 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-util",
  "hex",
  "pioneer-crud-conversations",
  "pioneer-entity",
@@ -11590,6 +11599,8 @@ dependencies = [
  "chrono",
  "hex",
  "pioneer-apps",
+ "pioneer-crud-access",
+ "pioneer-crud-signals",
  "pioneer-entity",
  "pioneer-migration",
  "pioneer-postgres-test",
@@ -11626,9 +11637,11 @@ dependencies = [
  "chrono",
  "pioneer-crud-access",
  "pioneer-crud-conversations",
+ "pioneer-crud-execution",
  "pioneer-crud-packages",
  "pioneer-crud-tasks",
  "pioneer-entity",
+ "pioneer-migration",
  "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-sqlite",
@@ -11638,24 +11651,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-crud-signals"
+version = "0.73.0"
+dependencies = [
+ "pioneer-entity",
+ "pioneer-sqlite",
+ "sea-orm",
+ "serde_json",
+]
+
+[[package]]
 name = "pioneer-crud-tasks"
 version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures-util",
+ "hex",
  "pioneer-crud-access",
  "pioneer-crud-conversations",
  "pioneer-crud-execution",
  "pioneer-crud-payloads",
  "pioneer-entity",
+ "pioneer-migration",
  "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pioneer-crud-timeline"
+version = "0.73.0"
+dependencies = [
+ "anyhow",
+ "pioneer-crud-access",
+ "pioneer-crud-artifacts",
+ "pioneer-crud-conversations",
+ "pioneer-crud-execution",
+ "pioneer-crud-tasks",
+ "pioneer-entity",
+ "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
+ "sea-orm",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

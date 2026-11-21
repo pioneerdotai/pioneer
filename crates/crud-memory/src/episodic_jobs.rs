@@ -567,7 +567,7 @@ impl MemoryStore {
         .await
     }
 
-    pub async fn claim_thread_episodic_index_job_from_snapshot(
+    pub(crate) async fn claim_thread_episodic_index_job_once(
         &self,
         snapshot: &ThreadEpisodicIndexJobRecord,
         now_unix: i64,

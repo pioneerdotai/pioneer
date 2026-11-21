@@ -320,3 +320,7 @@ pub async fn fail_turn_event_delivery(
     }
     projection_result
 }
+
+#[cfg(test)]
+#[path = "delivery_service_tests.rs"]
+mod tests;

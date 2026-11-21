@@ -15,15 +15,64 @@ use crate::{
     agent_memory_repair_job, convention::*, memory::*, util::unix_to_datetime,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Default)]
+pub struct EpisodicClaimTestState {
+    pub(crate) episodic_ambiguous_claim_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    episodic_claim_fault: std::sync::Arc<std::sync::Mutex<Option<(String, &'static str)>>>,
+    pub(crate) episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl EpisodicClaimTestState {
+    pub fn make_next_episodic_claim_commit_ambiguous_for_test(&self) {
+        self.episodic_ambiguous_claim_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn inject_episodic_claim_fault_for_test(&self, job_id: &str, point: &'static str) {
+        *self.episodic_claim_fault.lock().unwrap() = Some((job_id.to_owned(), point));
+    }
+
+    pub fn episodic_claim_discoveries_for_test(&self) -> u64 {
+        self.episodic_claim_discoveries
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn take_episodic_claim_fault_for_test(&self, id: &str, point: &str) -> bool {
+        let mut fault = self.episodic_claim_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(job, stage)| job == id && *stage == point)
+        {
+            fault.take();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct MemoryStore {
     pub(crate) connection: SqliteDatabase,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) episodic_claim_test_state: EpisodicClaimTestState,
 }
 
 impl MemoryStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            #[cfg(any(test, feature = "test-support"))]
+            episodic_claim_test_state: Default::default(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_episodic_claim_test_state(mut self, state: &EpisodicClaimTestState) -> Self {
+        self.episodic_claim_test_state = state.clone();
+        self
     }
 
     pub(crate) async fn retry_write<T, F, Fut>(&self, operation: F) -> Result<T>

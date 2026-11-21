@@ -1,6 +1,6 @@
 //! Transactional producer regressions; external code acceptance gate CLOSED.
 use super::*;
-use crate::repositories::task;
+use pioneer_crud_tasks::task;
 use pioneer_entity::task_child_reconcile_scope as scope;
 use sea_orm::{EntityTrait, TransactionTrait};
 

@@ -1141,3 +1141,7 @@ pub async fn count_turn_work_items<C: ConnectionTrait>(
         .await
         .with_context(|| format!("failed to count work item projections for turn `{turn_id}`"))
 }
+
+#[cfg(test)]
+#[path = "thread_timeline_unread_tests.rs"]
+mod unread_tests;

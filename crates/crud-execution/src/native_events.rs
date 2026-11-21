@@ -222,3 +222,131 @@ fn native_event_record_from_model(
         created_at: model.created_at,
     })
 }
+
+pub struct NativeEventRepository<'a> {
+    connection: &'a pioneer_sqlite::SqliteDatabase,
+}
+
+impl<'a> NativeEventRepository<'a> {
+    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+        Self { connection }
+    }
+
+    async fn run_serialized_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        pioneer_sqlite::retry_with_backoff(
+            || operation(),
+            pioneer_sqlite::is_retryable_database_conflict,
+            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
+            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
+    }
+}
+
+use crate::gateway_control::{GatewayControlWake, control_work_change};
+
+impl NativeEventRepository<'_> {
+    pub async fn append_cli_runtime_native_event(
+        &self,
+        event: NewCliRuntimeNativeEvent,
+    ) -> Result<CliRuntimeNativeEventRecord> {
+        let control_wakes = event
+            .turn_id
+            .as_ref()
+            .map(|id| vec![GatewayControlWake::Activity(id.clone())])
+            .unwrap_or_default();
+        let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
+        let cli_changes = [
+            control_work_change(self.connection, "gateway.control", &control_wakes),
+            control_work_change(self.connection, "gateway.cli", &control_wakes),
+        ];
+        let cli_result = async {
+            let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
+            let maintenance_result = async {
+                self.run_serialized_write(|| async {
+                    append_native_event(self.connection, event.clone()).await
+                })
+                .await
+            }
+            .await;
+            let maintenance_changed = maintenance_result.is_ok();
+            if maintenance_result.is_ok() {
+                cleanup_change
+                    .complete(self.connection, maintenance_changed, &cleanup_turns)
+                    .await;
+            }
+            maintenance_result
+        }
+        .await;
+        if cli_result.is_ok() {
+            for cli_change in cli_changes {
+                cli_change.completed(cli_result.is_ok());
+            }
+        }
+        cli_result
+    }
+
+    pub async fn append_cli_runtime_native_event_if_absent(
+        &self,
+        event: NewCliRuntimeNativeEvent,
+    ) -> Result<CliRuntimeNativeEventRecord> {
+        let control_wakes = event
+            .turn_id
+            .as_ref()
+            .map(|id| vec![GatewayControlWake::Activity(id.clone())])
+            .unwrap_or_default();
+        let cleanup_turns = event.turn_id.iter().cloned().collect::<Vec<_>>();
+        let cli_changes = [
+            control_work_change(self.connection, "gateway.control", &control_wakes),
+            control_work_change(self.connection, "gateway.cli", &control_wakes),
+        ];
+        let cli_result = async {
+            let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
+            let maintenance_result = async {
+                self.run_serialized_write(|| async {
+                    append_native_event_if_absent_with_outcome(self.connection, event.clone()).await
+                })
+                .await
+            }
+            .await;
+            let maintenance_changed = maintenance_result
+                .as_ref()
+                .is_ok_and(|(_, changed)| *changed);
+            if maintenance_result.is_ok() {
+                cleanup_change
+                    .complete(self.connection, maintenance_changed, &cleanup_turns)
+                    .await;
+            }
+            maintenance_result
+        }
+        .await;
+        if let Ok((_, changed)) = &cli_result {
+            for cli_change in cli_changes {
+                cli_change.completed(*changed);
+            }
+        }
+        cli_result.map(|(record, _)| record)
+    }
+
+    pub async fn list_cli_runtime_native_events(
+        &self,
+        filter: CliRuntimeNativeEventListFilter,
+    ) -> Result<Vec<CliRuntimeNativeEventRecord>> {
+        list_native_events(self.connection, filter).await
+    }
+
+    pub async fn latest_cli_runtime_native_event(
+        &self,
+        filter: CliRuntimeNativeEventListFilter,
+    ) -> Result<Option<CliRuntimeNativeEventRecord>> {
+        latest_native_event(self.connection, filter).await
+    }
+}
+
+#[cfg(test)]
+#[path = "native_event_route_tests.rs"]
+mod route_tests;

@@ -122,6 +122,14 @@ pub async fn current_completion_sequence<C: ConnectionTrait>(db: &C) -> Result<i
         .map_err(Into::into)
 }
 
+pub struct InboxCompletionOrder;
+
+impl pioneer_crud_access::thread_participants::CompletionOrder for InboxCompletionOrder {
+    async fn current<'a>(&'a self, tx: &'a sea_orm::DatabaseTransaction) -> Result<i64> {
+        current_completion_sequence(tx).await
+    }
+}
+
 /// Allocate after transition validation, in the same transaction as the run
 /// projection. Rollback and replay retain the original order.
 pub async fn next_completion_sequence<C: ConnectionTrait>(db: &C) -> Result<i64> {

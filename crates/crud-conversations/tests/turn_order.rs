@@ -2,6 +2,7 @@ use pioneer_crud_conversations::turn_order::{
     latest_turn_id_by_creation_order, turn_before_launch_and_intervening_by_creation_order,
     turn_ids_after_by_creation_order,
 };
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
 #[pioneer_postgres_test::postgres_test]
@@ -29,9 +30,10 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
     )
     .await
     .unwrap();
+    let scoped = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
     let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap();
     assert_eq!(
-        turn_before_launch_and_intervening_by_creation_order(db, "thread", "launch", "occurrence")
+        turn_before_launch_and_intervening_by_creation_order(&scoped, "thread", "launch", "occurrence")
             .await
             .unwrap(),
         Some((Some("a".to_owned()), true)),
@@ -83,14 +85,14 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
         "tie-breaking must be confined to the indexed timestamp bucket: {bucket_plan:#?}"
     );
     assert_eq!(
-        latest_turn_id_by_creation_order(db, "thread")
+        latest_turn_id_by_creation_order(&scoped, "thread")
             .await
             .unwrap()
             .as_deref(),
         Some("future")
     );
     assert_eq!(
-        turn_ids_after_by_creation_order(db, "thread", "a")
+        turn_ids_after_by_creation_order(&scoped, "thread", "a")
             .await
             .unwrap(),
         vec!["launch", "occurrence", "future"]
@@ -100,7 +102,7 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
         .unwrap();
     // Insertion ordinals preserve the tie order when no creation sequence exists.
     assert_eq!(
-        turn_before_launch_and_intervening_by_creation_order(db, "thread", "launch", "occurrence")
+        turn_before_launch_and_intervening_by_creation_order(&scoped, "thread", "launch", "occurrence")
             .await
             .unwrap(),
         Some((Some("a".to_owned()), true)),

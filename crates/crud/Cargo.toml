@@ -7,7 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-test-support = ["pioneer-crud-memory/test-support"]
+test-support = ["pioneer-crud-memory/test-support", "pioneer-crud-artifacts/test-support", "pioneer-crud-compaction/test-support", "pioneer-crud-tasks/test-support"]
 
 [dependencies]
 zstd.workspace = true
@@ -23,6 +23,7 @@ pioneer-crud-packages.workspace = true
 pioneer-crud-payloads.workspace = true
 pioneer-crud-self-improvement.workspace = true
 pioneer-crud-tasks.workspace = true
+pioneer-crud-timeline.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
 pioneer-entity.workspace = true
@@ -43,6 +44,9 @@ uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+pioneer-crud-timeline = { workspace = true, features = ["test-support"] }
+pioneer-crud-artifacts = { workspace = true, features = ["test-support"] }
+pioneer-crud-execution = { workspace = true, features = ["test-support"] }
 pioneer-crud-conversations = { workspace = true, features = ["test-support"] }
 pioneer-crud-compaction = { workspace = true, features = ["test-support"] }
 pioneer-crud-memory = { workspace = true, features = ["test-support"] }

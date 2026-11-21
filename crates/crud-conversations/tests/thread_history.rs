@@ -9,8 +9,8 @@ use pioneer_crud_conversations::{
 use pioneer_crud_payloads::storage::PreparedPayload;
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, PersistedActorRef, PromptManifest,
-    PromptManifestProfile, SandboxMode, ThreadHistoryEventPayload, TurnCompletedNotification,
-    TurnItem, TurnStatus,
+    PromptManifestProfile, SandboxMode, ThreadHistoryEventPayload, ToolCallStatus,
+    TurnCompletedNotification, TurnItem, TurnStatus,
 };
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::Expr;
@@ -210,6 +210,137 @@ async fn thread_history_decodes_legacy_cli_runtime_codex_manifest_without_losing
             &history.events[3].payload,
             ThreadHistoryEventPayload::ItemUpdated { item, .. } if item == &after_item
         ));
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+fn safe_web_fetch_item(item_id: &str) -> TurnItem {
+    use pioneer_protocol::{
+        ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload,
+    };
+
+    TurnItem::WebFetch {
+        id: item_id.to_owned(),
+        tool_name: "web_fetch".to_owned(),
+        arguments: serde_json::json!({"url": "https://example.com"}),
+        status: ToolCallStatus::InProgress,
+        recovery_policy: None,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("web_fetch"),
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::Metadata {
+            metadata: ToolMetadata::from_json(serde_json::json!({
+                "url": "https://example.com",
+                "statusCode": 200
+            })),
+        },
+        recovery: None,
+        url: Some("https://example.com".to_owned()),
+        final_url: Some("https://example.com".to_owned()),
+        status_code: Some(200),
+        content_type: Some("text/html".to_owned()),
+        extract_mode: None,
+        resolved_mode: None,
+        bytes_received: Some(1024),
+        elapsed_ms: Some(42),
+        truncated: Some(serde_json::json!(false)),
+        title: Some("Example Domain".to_owned()),
+        word_count: Some(12),
+        links: Vec::new(),
+        success: None,
+        outcome: None,
+        observation: None,
+    }
+}
+
+#[tokio::test]
+async fn thread_history_never_exposes_retained_turn_llm_context() {
+    pioneer_postgres_test::with_database(async |fixture| {
+        use pioneer_crud_conversations::turn_context::{NewTurnLlmContextEntry, insert};
+        use pioneer_protocol::ToolOutputPolicySnapshot;
+
+        let connection = fixture.connection();
+        let db = SqliteDatabase::new(fixture.connect_read_only().await?, connection.clone());
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_history_llm_context";
+        let thread_id = "thr_history_llm_context";
+        let turn_id = "turn_history_llm_context";
+        let item_id = "item_history_llm_context";
+        connection.execute_unprepared(
+            "INSERT INTO workspace(id,name) VALUES ('ws_history_llm_context','History');
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+             VALUES ('thr_history_llm_context','ws_history_llm_context','','agent','m','p','active');
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin)
+             VALUES ('turn_history_llm_context','thr_history_llm_context','in_progress','conversation','user');",
+        ).await?;
+        let thread = pioneer_entity::thread::Entity::find_by_id(thread_id)
+            .one(&db).await?.context("thread fixture")?;
+        let turn = pioneer_entity::turn::Entity::find_by_id(turn_id)
+            .one(&db).await?.context("turn fixture")?;
+        append(
+            &db, 1, timestamp,
+            TurnEventPayload::TurnStarted(CanonicalTurnStartedEventPayload {
+                thread: thread_from_db_model(thread)?.context("thread DTO fixture")?,
+                sandbox_mode: SandboxMode::FullAccess,
+                turn: turn_from_db_model(turn)?.context("turn DTO fixture")?,
+                input: Vec::new(),
+                actor: Some(PersistedActorRef::System),
+                reasoning_effort: None,
+                work_owner: Default::default(),
+            }),
+        ).await?;
+
+        let mut completed_item = safe_web_fetch_item(item_id);
+        if let TurnItem::WebFetch {
+            status, success, ..
+        } = &mut completed_item
+        {
+            *status = ToolCallStatus::Completed;
+            *success = Some(true);
+        }
+        append(
+                &db, 2, timestamp + 1,
+                TurnEventPayload::ItemCompleted(ItemCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: completed_item,
+                }),
+            )
+            .await
+            .expect("safe completed item should persist");
+
+        let tx = db.begin().await?;
+        insert(&tx, NewTurnLlmContextEntry {
+                turn_id: turn_id.to_owned(),
+                item_id: Some(item_id.to_owned()),
+                attempt_id: Some("1".to_owned()),
+                sequence: 1,
+                source: "tool_result".to_owned(),
+                tool_name: Some("web_fetch".to_owned()),
+                payload: serde_json::json!({
+                    "output": "SECRET_WEB_FETCH_BODY_SENTINEL"
+                })
+                .to_string(),
+                output_policy_snapshot: serde_json::json!(ToolOutputPolicySnapshot::for_tool_name(
+                    "web_fetch"
+                ))
+                .to_string(),
+                created_at: chrono::DateTime::from_timestamp(timestamp + 2, 0).unwrap().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .expect("retained llm context should persist");
+        tx.commit().await?;
+
+        let history = get_thread_history(&db, thread_id, Some(16))
+            .await
+            .expect("thread history query should succeed")
+            .expect("thread history should exist");
+        let history_json = serde_json::to_string(&history.events)
+            .expect("thread history should serialize for leakage assertion");
+        assert!(!history_json.contains("SECRET_WEB_FETCH_BODY_SENTINEL"));
         Ok(())
     })
     .await

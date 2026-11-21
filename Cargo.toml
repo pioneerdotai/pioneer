@@ -39,7 +39,9 @@ members = [
   "crates/crud-packages",
   "crates/crud-payloads",
   "crates/crud-self-improvement",
+  "crates/crud-signals",
   "crates/crud-tasks",
+  "crates/crud-timeline",
   "crates/entity",
   "crates/migration",
   "crates/postgres",
@@ -110,7 +112,9 @@ pioneer-crud-memory = { path = "crates/crud-memory" }
 pioneer-crud-packages = { path = "crates/crud-packages" }
 pioneer-crud-payloads = { path = "crates/crud-payloads" }
 pioneer-crud-self-improvement = { path = "crates/crud-self-improvement" }
+pioneer-crud-signals = { path = "crates/crud-signals" }
 pioneer-crud-tasks = { path = "crates/crud-tasks" }
+pioneer-crud-timeline = { path = "crates/crud-timeline" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
 pioneer-postgres = { path = "crates/postgres" }

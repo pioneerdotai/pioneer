@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use crate::time::{deadline_unix_seconds, unix_to_datetime};
 
-pub const NATIVE_RETENTION_WAKE_KEY: &str = "native-retention";
+pub use pioneer_crud_signals::gateway_control::NATIVE_RETENTION_WAKE_KEY;
 
 pub const STATUS_PREPARED: &str = "prepared";
 pub const STATUS_WAITING_ACCEPTANCE: &str = "waiting_acceptance";

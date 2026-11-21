@@ -1,13 +1,16 @@
 //! Publication, before-image and PostgreSQL retry regressions for child work.
 use super::*;
-use crate::repositories::{task_child_producers as producers, turn_llm_context as context};
+use pioneer_crud_tasks::task_child_producers as producers;
 use pioneer_entity::{task_child_reconcile_pending as point, task_child_reconcile_scope as scope};
 use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 
 const AT: i64 = 1_700_000_000;
 
-fn entry(id: &str, sequence: i64) -> context::NewTurnLlmContextEntry {
-    context::NewTurnLlmContextEntry {
+fn entry(
+    id: &str,
+    sequence: i64,
+) -> pioneer_crud_conversations::turn_context::NewTurnLlmContextEntry {
+    pioneer_crud_conversations::turn_context::NewTurnLlmContextEntry {
         turn_id: id.into(),
         item_id: None,
         attempt_id: None,
@@ -30,9 +33,12 @@ async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status()
         // No Turn and no Link: publication must retain an obligation even when
         // neither cross-table dependency exists in the source transaction.
         let tx = db.begin().await.unwrap();
-        context::insert_turn_llm_context(&tx, entry("late-birth", 1))
-            .await
-            .unwrap();
+        crate::store::conversations::context_writes::insert_turn_llm_context(
+            &tx,
+            entry("late-birth", 1),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let old = point::Entity::find_by_id("late-birth")
             .one(&db)
@@ -46,12 +52,18 @@ async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status()
             .unwrap();
         assert!(store.finish_child_point(&claim, None, true).await.unwrap());
         let tx = db.begin().await.unwrap();
-        context::delete_turn_llm_context_for_turn(&tx, "late-birth")
-            .await
-            .unwrap();
-        context::insert_turn_llm_context(&tx, entry("late-birth", 2))
-            .await
-            .unwrap();
+        pioneer_crud_conversations::context_cleanup::delete_turn_llm_context_for_turn(
+            &tx,
+            "late-birth",
+        )
+        .await
+        .unwrap();
+        crate::store::conversations::context_writes::insert_turn_llm_context(
+            &tx,
+            entry("late-birth", 2),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         let fresh = point::Entity::find_by_id("late-birth")
             .one(&db)
@@ -63,9 +75,12 @@ async fn late_capsule_birth_survives_prior_ack_without_link_or_terminal_status()
         assert!(!store.finish_child_point(&claim, None, true).await.unwrap());
         // Further payload appends do not wake/replace the existing obligation.
         let tx = db.begin().await.unwrap();
-        context::insert_turn_llm_context(&tx, entry("late-birth", 3))
-            .await
-            .unwrap();
+        crate::store::conversations::context_writes::insert_turn_llm_context(
+            &tx,
+            entry("late-birth", 3),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(
             point::Entity::find_by_id("late-birth")
@@ -94,7 +109,7 @@ async fn stale_advisory_locator_is_revised_before_no_record_ack() {
             .unwrap();
         let db = store.database_connection();
         let tx = db.begin().await.unwrap();
-        turn::upsert_turn(
+        crate::store::conversations::turn_writes::upsert_turn(
             &tx,
             "locator-turn",
             &header.id,
@@ -106,7 +121,7 @@ async fn stale_advisory_locator_is_revised_before_no_record_ack() {
         )
         .await
         .unwrap();
-        crate::repositories::task_child_work::enqueue_point(&tx, "stale-thread", "locator-turn", AT)
+        pioneer_crud_tasks::child_work::enqueue_point(&tx, "stale-thread", "locator-turn", AT)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -174,7 +189,7 @@ async fn old_wrong_locator_claim_cannot_rotate_new_canonical_revision_or_lease()
         let mut terminal = sample_turn("moved-claim-turn");
         terminal.status = TurnStatus::Completed;
         let init = db.begin().await.unwrap();
-        turn::upsert_turn(
+        crate::store::conversations::turn_writes::upsert_turn(
             &init,
             &terminal.id,
             "claim-thread-a",
@@ -201,7 +216,7 @@ async fn old_wrong_locator_claim_cannot_rotate_new_canonical_revision_or_lease()
 
         // A real domain move publishes B while the old consumer still holds A.
         let moved = db.begin().await.unwrap();
-        turn::upsert_turn(
+        crate::store::conversations::turn_writes::upsert_turn(
             &moved,
             &terminal.id,
             "claim-thread-b",
@@ -266,7 +281,7 @@ async fn old_wrong_locator_claim_cannot_rotate_new_canonical_revision_or_lease()
 
 async fn seed_capsule_parent<C: sea_orm::ConnectionTrait>(db: &C, id: &str, thread_id: &str) {
     let header = sample_thread("ws_task", thread_id, AT);
-    crate::repositories::thread::upsert_thread_with_creator(
+    crate::store::conversations::thread_writes::upsert_thread_with_creator(
         db,
         &header,
         &PersistedActorRef::System,
@@ -275,7 +290,7 @@ async fn seed_capsule_parent<C: sea_orm::ConnectionTrait>(db: &C, id: &str, thre
     )
     .await
     .unwrap();
-    turn::upsert_turn(
+    crate::store::conversations::turn_writes::upsert_turn(
         db,
         id,
         thread_id,
@@ -304,7 +319,7 @@ async fn postgres_workspace_restore_after_drained_scope_publishes_again() {
     let mut b = a.clone();
     b.workspace_id = "ws_task_b".into();
     async fn write(db: &impl sea_orm::ConnectionTrait, row: &Thread) -> anyhow::Result<()> {
-        crate::repositories::thread::upsert_thread_with_creator(
+        crate::store::conversations::thread_writes::upsert_thread_with_creator(
             db,
             row,
             &PersistedActorRef::System,
@@ -362,7 +377,7 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
         let thread_id = pioneer_protocol::generate_id(21);
         let header = sample_thread("ws_task", &thread_id, AT);
         let init = db.begin().await.unwrap();
-        crate::repositories::thread::upsert_thread_with_creator(
+        crate::store::conversations::thread_writes::upsert_thread_with_creator(
             &init,
             &header,
             &PersistedActorRef::System,
@@ -374,7 +389,7 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
         if turn_existed {
             let mut pending = sample_turn(&id);
             pending.status = TurnStatus::InProgress;
-            turn::upsert_turn(
+            crate::store::conversations::turn_writes::upsert_turn(
                 &init,
                 &id,
                 &thread_id,
@@ -401,7 +416,7 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
         let other = db.begin().await.unwrap();
         let mut terminal = sample_turn(&id);
         terminal.status = TurnStatus::Completed;
-        turn::upsert_turn(
+        crate::store::conversations::turn_writes::upsert_turn(
             &other,
             &id,
             &thread_id,
@@ -417,15 +432,22 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
         other.commit().await.unwrap();
         // The no-capsule ACK drains the prior publication before source commit.
         point::Entity::delete_by_id(&id).exec(db).await.unwrap();
-        let birth = context::insert_turn_llm_context(&source, entry(&id, 1)).await;
+        let birth = crate::store::conversations::context_writes::insert_turn_llm_context(
+            &source,
+            entry(&id, 1),
+        )
+        .await;
         if turn_existed {
             let conflict = birth.unwrap_err();
             assert!(pioneer_sqlite::is_retryable_database_conflict(&conflict));
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();
-            context::insert_turn_llm_context(&retry, entry(&id, 1))
-                .await
-                .unwrap();
+            crate::store::conversations::context_writes::insert_turn_llm_context(
+                &retry,
+                entry(&id, 1),
+            )
+            .await
+            .unwrap();
             retry.commit().await.unwrap();
         } else {
             birth.unwrap();
@@ -462,36 +484,6 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
     }
 }
 
-#[tokio::test]
-async fn ambiguous_transport_outcome_is_not_replayed() {
-    pioneer_postgres_test::with_database(async |fixture| {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let store = postgres_store_with_workspace(fixture, "ws_task").await;
-
-        let attempts = AtomicUsize::new(0);
-        let result: anyhow::Result<()> =
-            store
-                .run_serialized_write(|| {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    async {
-                        Err(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(
-                            std::sync::Arc::new(sea_orm::sqlx::Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                "unknown commit outcome",
-                            ))),
-                        ))
-                        .into())
-                    }
-                })
-                .await;
-        assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
 #[pioneer_postgres_test::postgres_test]
 async fn postgres_serialization_abort_rolls_back_entire_transaction_before_replay() {
     use sea_orm::sea_query::Expr;
@@ -505,7 +497,7 @@ async fn postgres_serialization_abort_rolls_back_entire_transaction_before_repla
     let id = pioneer_protocol::generate_id(21);
     let init = db.begin().await.unwrap();
     let row = sample_thread("ws_task", &id, AT);
-    crate::repositories::thread::upsert_thread_with_creator(
+    crate::store::conversations::thread_writes::upsert_thread_with_creator(
         &init,
         &row,
         &PersistedActorRef::System,
@@ -538,7 +530,11 @@ async fn postgres_serialization_abort_rolls_back_entire_transaction_before_repla
                         .is_none(),
                     "the previous attempt's context write must roll back",
                 );
-                context::insert_turn_llm_context(&tx, entry(id, 1)).await?;
+                crate::store::conversations::context_writes::insert_turn_llm_context(
+                    &tx,
+                    entry(id, 1),
+                )
+                .await?;
                 if attempt == 0 {
                     pioneer_entity::thread::Entity::update_many()
                         .filter(pioneer_entity::thread::Column::Id.eq(id))
@@ -573,27 +569,6 @@ async fn postgres_serialization_abort_rolls_back_entire_transaction_before_repla
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn postgres_driver_distinguishes_retryable_sqlstates() {
-    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = fixture.connection();
-    for (state, retry) in [
-        ("40001", true),
-        ("40P01", true),
-        ("55P03", false),
-        ("P0001", false),
-    ] {
-        let sql = format!(
-            "DO $$ BEGIN RAISE EXCEPTION 'classifier fixture' USING ERRCODE = '{state}'; END $$"
-        );
-        let error = db.execute_unprepared(&sql).await.unwrap_err().into();
-        assert_eq!(
-            pioneer_sqlite::is_retryable_database_conflict(&error),
-            retry
-        );
-    }
-}
-
-#[pioneer_postgres_test::postgres_test]
 async fn postgres_context_recreation_after_cleanup_is_birth_not_payload_append() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     postgres_store_with_workspace(&fixture, "ws_task").await;
@@ -601,7 +576,7 @@ async fn postgres_context_recreation_after_cleanup_is_birth_not_payload_append()
     let id = pioneer_protocol::generate_id(21);
     let init = db.begin().await.unwrap();
     seed_capsule_parent(&init, &id, &pioneer_protocol::generate_id(21)).await;
-    context::insert_turn_llm_context(&init, entry(&id, 1))
+    crate::store::conversations::context_writes::insert_turn_llm_context(&init, entry(&id, 1))
         .await
         .unwrap();
     init.commit().await.unwrap();
@@ -620,7 +595,7 @@ async fn postgres_context_recreation_after_cleanup_is_birth_not_payload_append()
     // Exercise the source-side consequence of a committed cleanup. Domain
     // authorization itself has separate primary cleanup regressions.
     let cleanup = db.begin().await.unwrap();
-    context::delete_turn_llm_context_for_turn(&cleanup, &id)
+    pioneer_crud_conversations::context_cleanup::delete_turn_llm_context_for_turn(&cleanup, &id)
         .await
         .unwrap();
     point::Entity::delete_by_id(&id)
@@ -628,13 +603,16 @@ async fn postgres_context_recreation_after_cleanup_is_birth_not_payload_append()
         .await
         .unwrap();
     cleanup.commit().await.unwrap();
-    let conflict = context::insert_turn_llm_context(&source, entry(&id, 2))
-        .await
-        .unwrap_err();
+    let conflict = crate::store::conversations::context_writes::insert_turn_llm_context(
+        &source,
+        entry(&id, 2),
+    )
+    .await
+    .unwrap_err();
     assert!(pioneer_sqlite::is_retryable_database_conflict(&conflict));
     source.rollback().await.unwrap();
     let retry = db.begin().await.unwrap();
-    context::insert_turn_llm_context(&retry, entry(&id, 2))
+    crate::store::conversations::context_writes::insert_turn_llm_context(&retry, entry(&id, 2))
         .await
         .unwrap();
     retry.commit().await.unwrap();

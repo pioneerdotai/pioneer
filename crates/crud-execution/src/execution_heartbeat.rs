@@ -326,3 +326,29 @@ mod tests {
         assert!(!owner.observation().2);
     }
 }
+
+#[cfg(test)]
+mod parked_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parked_heartbeat_has_no_database_dependency_but_bootstrap_errors_are_unknown() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let db = SqliteDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connection().clone(),
+            );
+            let registries = Registries::default();
+            assert!(registries.supervise(&db, "empty-owner", 30).await.unwrap());
+            db.clone().close().await.unwrap();
+            // A parked cycle must not substitute either a SELECT or UPDATE for
+            // the old heartbeat. Both would fail against this closed runtime.
+            assert!(registries.supervise(&db, "empty-owner", 30).await.unwrap());
+            assert!(registries.supervise(&db, "new-owner", 30).await.is_err());
+            assert!(registries.owner("new-owner").observation().1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+}

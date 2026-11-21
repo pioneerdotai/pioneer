@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use pioneer_entity::turn;
 use pioneer_protocol::{PersistedActorRef, TurnKind, TurnStatus, TurnWorkOwner};
-use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 
 use crate::identity::actor_ref_from_db;
@@ -12,6 +12,33 @@ pub fn authorization_context_as_text() -> Expr {
         turn::Column::ExecutionAuthorizationContextJson,
     ))
     .cast_as("text")
+}
+
+pub fn authorization_context_value(json: &str) -> Result<Expr> {
+    let json = json.trim();
+    ensure!(
+        !json.is_empty(),
+        "execution authorization context must not be empty"
+    );
+    // A bound text-to-json cast retains the serialized authorization bytes.
+    Ok(Expr::val(json).cast_as(Alias::new("json")))
+}
+
+pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    context_json: &str,
+) -> Result<bool> {
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionAuthorizationContextJson,
+            authorization_context_value(context_json)?,
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution authorization context")?;
+    Ok(update_result.rows_affected > 0)
 }
 
 /// Durable facts used by execution binding checks, without presentation or
@@ -170,4 +197,29 @@ pub async fn find_turn_execution_authorization_contexts<C: ConnectionTrait>(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_status_from_db;
+    use pioneer_protocol::TurnStatus;
+
+    #[test]
+    fn turn_status_parser_accepts_snake_case_only() {
+        assert_eq!(
+            turn_status_from_db("in_progress"),
+            Some(TurnStatus::InProgress)
+        );
+        assert_eq!(
+            turn_status_from_db("completed"),
+            Some(TurnStatus::Completed)
+        );
+        assert_eq!(turn_status_from_db("failed"), Some(TurnStatus::Failed));
+        assert_eq!(
+            turn_status_from_db("interrupted"),
+            Some(TurnStatus::Interrupted)
+        );
+        assert_eq!(turn_status_from_db("blocked"), Some(TurnStatus::Blocked));
+        assert_eq!(turn_status_from_db("InProgress"), None);
+    }
 }

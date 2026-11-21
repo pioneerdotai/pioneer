@@ -423,7 +423,7 @@ impl<'db> HtmlPreviewIoQueue<'db> {
         Self { connection }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -1216,3 +1216,7 @@ pub async fn callback_ack<C: ConnectionTrait>(db: &C, row: &work::Model) -> Resu
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "html_preview_io_tests.rs"]
+mod tests;

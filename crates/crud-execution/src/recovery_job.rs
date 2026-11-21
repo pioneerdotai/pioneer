@@ -1281,3 +1281,59 @@ pub async fn clear_diagnostic_stop_reason<C: ConnectionTrait>(db: &C, job_id: &s
 
 #[cfg(test)]
 mod tests;
+
+pub fn recovery_job_record_from_model(
+    model: pioneer_entity::recovery_job::Model,
+) -> RecoveryJobRecord {
+    use crate::recovery_values::{
+        provider_failure_class_from_db, provider_failure_stage_from_db, recovery_action_from_db,
+        recovery_job_status_from_db, recovery_trigger_from_db,
+    };
+    RecoveryJobRecord {
+        last_failure_attempt_id: model.last_failure_attempt_id,
+        diagnostic: model
+            .diagnostic
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
+        id: model.id,
+        turn_id: model.turn_id,
+        item_id: model.item_id,
+        item_type: pioneer_crud_conversations::turn_item::turn_item_type_from_db(
+            model.item_type.as_str(),
+        )
+        .unwrap_or(TurnItemType::DynamicToolCall),
+        source_attempt_id: model.source_attempt_id,
+        status: recovery_job_status_from_db(model.status.as_str())
+            .unwrap_or(RecoveryJobStatus::Pending),
+        trigger: recovery_trigger_from_db(model.trigger.as_str())
+            .unwrap_or(RecoveryTrigger::Unknown),
+        action: recovery_action_from_db(model.action.as_str())
+            .unwrap_or(RecoveryAction::RetryAttempt),
+        reason: model.reason,
+        error_class: model
+            .error_class
+            .as_deref()
+            .and_then(provider_failure_class_from_db),
+        transport_stage: model
+            .transport_stage
+            .as_deref()
+            .and_then(provider_failure_stage_from_db),
+        retry_after_ms: model.retry_after_ms,
+        provider_attempt_number: model.provider_attempt_number,
+        policy_json: serde_json::from_str(&model.policy).unwrap_or_else(|_| serde_json::json!({})),
+        policy_snapshot: serde_json::from_str(&model.policy_snapshot)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        last_error: model.last_error,
+        run_count: model.run_count,
+        max_attempts: model.max_attempts,
+        scheduled_at_unix: model.scheduled_at.timestamp(),
+        next_run_at_unix: model.next_run_at.timestamp(),
+        updated_at_unix: model.updated_at.timestamp(),
+        claim_token: model.claim_token,
+        active_attempt_id: model.active_attempt_id,
+        active_attempt_started_at_unix: model
+            .active_attempt_started_at
+            .map(|timestamp| timestamp.timestamp()),
+        resolution_pending: model.resolution_pending,
+    }
+}

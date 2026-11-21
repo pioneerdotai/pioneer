@@ -23,6 +23,25 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
+pub async fn require_claim_revision(
+    db: &impl ConnectionTrait,
+    job_id: &str,
+    claim_token: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<()> {
+    let row = recovery_terminalization_outbox::Entity::find_by_id(job_id.to_owned())
+        .one(db)
+        .await?
+        .context("recovery terminalization outbox row disappeared")?;
+    anyhow::ensure!(
+        row.status == STATUS_DELIVERING
+            && row.claim_token.as_deref() == Some(claim_token)
+            && row.updated_at == updated_at,
+        "recovery terminalization claim is no longer owned"
+    );
+    Ok(())
+}
+
 pub const STATUS_PENDING: &str = "pending";
 pub const STATUS_DELIVERING: &str = "delivering";
 pub const STATUS_FAILED: &str = "failed";

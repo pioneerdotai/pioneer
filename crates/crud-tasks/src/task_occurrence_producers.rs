@@ -388,3 +388,7 @@ pub async fn agent_change<C: ConnectionTrait>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "task_occurrence_producer_race_tests.rs"]
+mod race_tests;

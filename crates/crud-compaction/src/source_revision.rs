@@ -389,10 +389,7 @@ pub async fn compaction_reference_thread<C: ConnectionTrait>(
     .map(|row| row.thread_id))
 }
 
-pub(crate) fn published_checkpoint_in_workspace(
-    workspace: &str,
-    id: &str,
-) -> Select<checkpoint::Entity> {
+pub(crate) fn published_checkpoint(id: &str) -> Select<checkpoint::Entity> {
     let completed = Query::select()
         .expr(Expr::val(1_i64))
         .from(operation::Entity)
@@ -406,14 +403,6 @@ pub(crate) fn published_checkpoint_in_workspace(
         .to_owned();
     checkpoint::Entity::find_by_id(id)
         .select_only()
-        .join(
-            JoinType::InnerJoin,
-            checkpoint::Entity::belongs_to(context::Entity)
-                .from(checkpoint::Column::Owner)
-                .to(context::Column::Owner)
-                .into(),
-        )
-        .filter(context::Column::WorkspaceId.eq(workspace))
         .filter(checkpoint::Column::FormatVersion.eq(1_i64))
         .filter(
             checkpoint::Column::Status
@@ -423,6 +412,21 @@ pub(crate) fn published_checkpoint_in_workspace(
                     .and(Expr::exists(completed))),
         )
         .limit(1)
+}
+
+pub(crate) fn published_checkpoint_in_workspace(
+    workspace: &str,
+    id: &str,
+) -> Select<checkpoint::Entity> {
+    published_checkpoint(id)
+        .join(
+            JoinType::InnerJoin,
+            checkpoint::Entity::belongs_to(context::Entity)
+                .from(checkpoint::Column::Owner)
+                .to(context::Column::Owner)
+                .into(),
+        )
+        .filter(context::Column::WorkspaceId.eq(workspace))
 }
 
 fn checkpoint_payload_query(

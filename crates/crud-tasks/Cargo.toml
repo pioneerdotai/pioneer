@@ -11,6 +11,8 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
 pioneer-crud-access.workspace = true
 pioneer-crud-conversations.workspace = true
 pioneer-crud-execution.workspace = true
@@ -20,9 +22,11 @@ pioneer-protocol.workspace = true
 pioneer-sqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 
 [dev-dependencies]
+pioneer-migration.workspace = true
 pioneer-postgres-test.workspace = true
 tokio.workspace = true

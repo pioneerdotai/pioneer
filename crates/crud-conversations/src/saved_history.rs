@@ -253,3 +253,34 @@ pub async fn revision<C: ConnectionTrait>(
     .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(parts.join(":"))
 }
+
+pub async fn saved_history_start(
+    db: &pioneer_sqlite::SqliteDatabase,
+    thread_id: &str,
+) -> Result<Option<(SavedHistorySnapshot, SavedHistoryKey, String)>> {
+    let read = db.begin_read().await?;
+    let snapshot = snapshot(&read, thread_id).await?;
+    let newest = page(&read, thread_id, None, None, 1, &snapshot).await?;
+    let result = if let Some(row) = newest.into_iter().next() {
+        let revision = revision(&read, thread_id, &row.key, &snapshot).await?;
+        Some((snapshot, row.key, revision))
+    } else {
+        None
+    };
+    read.commit().await?;
+    Ok(result)
+}
+
+pub async fn saved_history_input(
+    db: &pioneer_sqlite::SqliteDatabase,
+    turn_id: &str,
+    input_id: &str,
+) -> Result<Option<pioneer_protocol::UserInput>> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    pioneer_entity::turn_input::Entity::find_by_id(input_id.to_owned())
+        .filter(pioneer_entity::turn_input::Column::TurnId.eq(turn_id))
+        .one(db)
+        .await?
+        .map(crate::protocol_projection::decode_turn_input_model)
+        .transpose()
+}

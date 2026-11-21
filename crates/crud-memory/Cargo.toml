@@ -11,6 +11,7 @@ test-support = []
 [dependencies]
 anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-util.workspace = true
 hex.workspace = true
 pioneer-crud-conversations.workspace = true
 pioneer-entity.workspace = true

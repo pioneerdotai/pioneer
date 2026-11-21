@@ -31,6 +31,16 @@ debugging, see the root [diagnostics scope](../../AGENTS.md#diagnostics).
 - For schema changes read [migration rules](../migration/AGENTS.md); new tables
   require [generated Entity](../entity/AGENTS.md) before their ordinary CRUD.
 
+## CRUD package boundaries
+
+- Keep `CrudStore` entry points and their transaction helpers together in
+  `src/store`. Import domain repositories from the crates that own them.
+  Keep compatibility exports in domain modules under `src/api/`.
+  Use `src/api.rs` to assemble the facade and preserve existing public paths.
+- Domain repositories and their test targets use the scoped pool or passed
+  transaction directly. Keep the facade outside their dependency graphs.
+  Shared commit notifications live in `pioneer-crud-signals`.
+
 ## Background Invalidation
 
 Follow the root [background contract](../../AGENTS.md#background-work-and-idle).

@@ -90,6 +90,22 @@ fn bounded_ids(rows: Vec<Candidate>) -> (Vec<String>, i64) {
     }
     (ids, bytes)
 }
+pub async fn run_quantum(db: &SqliteDatabase) -> Result<NativeEventCleanupMetrics> {
+    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+    if db.read_class() != SqliteReadClass::Maintenance
+        || db.write_class() != SqliteWriteClass::Maintenance
+    {
+        anyhow::bail!("background database quantum requires maintenance-scoped reads and writes");
+    }
+    pioneer_sqlite::retry_with_backoff(
+        || run(db, chrono::Utc::now().timestamp_micros()),
+        pioneer_sqlite::is_retryable_database_conflict,
+        pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
+        std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await
+}
+
 pub async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventCleanupMetrics> {
     let now = std::cmp::max(now, 1);
     let started = Instant::now();
@@ -259,3 +275,7 @@ pub async fn deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
     Ok(due
         .map(|micros| micros.div_euclid(1_000_000) + i64::from(micros.rem_euclid(1_000_000) != 0)))
 }
+
+#[cfg(test)]
+#[path = "native_event_cleanup/retention_tests.rs"]
+mod retention_tests;

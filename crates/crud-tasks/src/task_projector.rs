@@ -1694,17 +1694,7 @@ mod tests {
     use pioneer_sqlite::SqliteDatabase;
     use sea_orm::TransactionTrait;
 
-    struct NoFrozenOutput;
-
-    impl TaskOutputBinder for NoFrozenOutput {
-        async fn bind<'a, C: ConnectionTrait>(
-            &'a self,
-            _: &'a C,
-            _: &'a TaskDelivery,
-        ) -> Result<()> {
-            anyhow::bail!("test does not queue a delivery")
-        }
-    }
+    use crate::test_support::task_projection::NoFrozenOutput;
 
     #[tokio::test]
     async fn task_blocked_projection_pauses_active_triggers_atomically() -> Result<()> {

@@ -16,9 +16,70 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait,
-    ExprTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    ExprTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::BTreeMap;
+
+pub async fn create_route(
+    db: &pioneer_sqlite::SqliteDatabase,
+    input: &AgentDelegationRouteInput,
+) -> Result<agent_delegation_route::Model> {
+    let tx = db
+        .begin()
+        .await
+        .context("failed to begin Agent route creation transaction")?;
+    let route = insert_agent_delegation_route(&tx, input).await?;
+    tx.commit()
+        .await
+        .context("failed to commit Agent route creation")?;
+    Ok(route)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn revoke_route(
+    db: &pioneer_sqlite::SqliteDatabase,
+    route_id: &str,
+    expected_generation: i64,
+    expected_policy_generation: i64,
+    authority_actor_json: &str,
+    authority_fingerprint: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let tx = db
+        .begin()
+        .await
+        .context("failed to begin Agent route revocation transaction")?;
+    let revoked = revoke_agent_delegation_route(
+        &tx,
+        route_id,
+        expected_generation,
+        expected_policy_generation,
+        authority_actor_json,
+        authority_fingerprint,
+        now,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("failed to commit Agent route revocation")?;
+    Ok(revoked)
+}
+
+pub async fn expire_prepared_routes(
+    db: &pioneer_sqlite::SqliteDatabase,
+    prepared: &PreparedAgentDelegationRouteExpiryBatch,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let tx = db
+        .begin()
+        .await
+        .context("failed to begin Agent route expiry transaction")?;
+    let expired = apply_prepared_agent_delegation_route_expiry_batch(&tx, prepared, now).await?;
+    tx.commit()
+        .await
+        .context("failed to commit Agent route expiry")?;
+    Ok(expired)
+}
 
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
 const AGENT_ROUTE_EXPIRY_BATCH_SIZE: u64 = 512;

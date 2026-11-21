@@ -130,6 +130,19 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         .context("upserted turn_runtime_snapshot row is missing")
 }
 
+pub async fn find_frozen_manifest_id(
+    db: &impl ConnectionTrait,
+    turn_id: &str,
+) -> Result<Option<String>> {
+    Ok(turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
+        .select_only()
+        .column(turn_runtime_snapshot::Column::FrozenManifestId)
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await?
+        .flatten())
+}
+
 pub async fn find_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

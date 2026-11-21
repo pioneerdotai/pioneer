@@ -621,3 +621,29 @@ pub async fn append_prepared_turn_status_history<C: ConnectionTrait>(
         .context("failed to append turn status history")?;
     Ok(())
 }
+
+/// Encode the protocol manifest before write admission.
+pub async fn write_turn_prompt_manifest(
+    db: &pioneer_sqlite::SqliteDatabase,
+    thread_id: &str,
+    turn_id: &str,
+    manifest: &pioneer_protocol::PromptManifest,
+    event_timestamp_secs: i64,
+) -> Result<bool> {
+    let columns = crate::protocol_projection::build_turn_prompt_manifest_columns(manifest)?;
+    pioneer_sqlite::retry_with_backoff(
+        || {
+            update_turn_prompt_manifest(
+                db,
+                thread_id,
+                turn_id,
+                &columns,
+                crate::values::unix_to_datetime(event_timestamp_secs),
+            )
+        },
+        pioneer_sqlite::is_retryable_database_conflict,
+        pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
+        std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await
+}

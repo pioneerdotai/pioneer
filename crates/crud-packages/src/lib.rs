@@ -1,5 +1,8 @@
 //! Package repositories share the caller’s connection or transaction.
 
+#[cfg(test)]
+extern crate self as pioneer_crud_packages;
+
 pub mod agent_skill;
 pub mod mcp_audit_event;
 pub mod mcp_installation_transactions;
@@ -7,6 +10,7 @@ pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub mod native_skill_audit_bundle;
 pub mod package_record;
+pub mod package_store;
 pub mod plugin_metadata;
 pub mod plugins;
 pub mod skill_audit_event;
@@ -126,4 +130,5 @@ pub mod skill_records;
 pub mod skill_upload_session;
 pub mod skill_workspace_policy;
 pub mod turn_mcp_binding;
+pub mod turn_mcp_projection;
 pub mod turn_skill_binding;

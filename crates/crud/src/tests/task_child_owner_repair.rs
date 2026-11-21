@@ -18,9 +18,9 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
     let init = db.begin().await.unwrap();
     let mut task = sample_task(now.timestamp());
     task.id = task_id.clone();
-    crate::repositories::task::upsert_prepared_task(
+    pioneer_crud_tasks::task::upsert_prepared_task(
         &init,
-        crate::repositories::task::prepare_task_projection(&task).unwrap(),
+        pioneer_crud_tasks::task::prepare_task_projection(&task).unwrap(),
     )
     .await
     .unwrap();
@@ -31,11 +31,11 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
     run.status = TaskRunStatus::Running;
     run.completed_at = None;
     run.trigger_id = None;
-    crate::repositories::task_run::upsert_run(&init, &run)
+    pioneer_crud_tasks::task_run::upsert_run(&init, &run)
         .await
         .unwrap();
     let thread = sample_thread("ws_task", &thread_id, now.timestamp());
-    crate::repositories::thread::upsert_thread_with_creator(
+    crate::store::conversations::thread_writes::upsert_thread_with_creator(
         &init,
         &thread,
         &pioneer_protocol::PersistedActorRef::System,
@@ -47,9 +47,11 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
     let mut parent = sample_turn(&id);
     parent.turn_kind = pioneer_protocol::TurnKind::TaskRun;
     parent.status = pioneer_protocol::TurnStatus::Blocked;
-    crate::repositories::turn::upsert_turn(&init, &id, &thread_id, &parent, None, None, now, now)
-        .await
-        .unwrap();
+    crate::store::conversations::turn_writes::upsert_turn(
+        &init, &id, &thread_id, &parent, None, None, now, now,
+    )
+    .await
+    .unwrap();
     init.commit().await.unwrap();
     let source = db
         .begin_with_config(Some(sea_orm::IsolationLevel::RepeatableRead), None)
@@ -77,9 +79,11 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
     // in_progress. Its producer knows the pair is consistent/nonterminal.
     let other = db.begin().await.unwrap();
     parent.status = pioneer_protocol::TurnStatus::InProgress;
-    crate::repositories::turn::upsert_turn(&other, &id, &thread_id, &parent, None, None, now, now)
-        .await
-        .unwrap();
+    crate::store::conversations::turn_writes::upsert_turn(
+        &other, &id, &thread_id, &parent, None, None, now, now,
+    )
+    .await
+    .unwrap();
     other.commit().await.unwrap();
     assert!(
         parents::Entity::find_by_id(&id)
@@ -89,7 +93,7 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
             .is_none()
     );
     let error =
-        crate::repositories::task_run::update_run_status(&source, &id, TaskRunStatus::Blocked, now)
+        pioneer_crud_tasks::task_run::update_run_status(&source, &id, TaskRunStatus::Blocked, now)
             .await
             .unwrap_err();
     assert!(pioneer_sqlite::is_retryable_database_conflict(&error));
@@ -104,7 +108,7 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
         "running"
     );
     let retry = db.begin().await.unwrap();
-    crate::repositories::task_run::update_run_status(&retry, &id, TaskRunStatus::Blocked, now)
+    pioneer_crud_tasks::task_run::update_run_status(&retry, &id, TaskRunStatus::Blocked, now)
         .await
         .unwrap();
     retry.commit().await.unwrap();
@@ -127,9 +131,8 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
     );
     // Distinct RR boundary: a mapping born after the agent transaction's
     // snapshot can have its first ticket drained before agent finalization.
-    use crate::repositories::{
-        agent_domain, agent_identity_catalog, task_run_execution as executions,
-    };
+    use pioneer_crud_execution::agent_identity_catalog;
+    use pioneer_crud_tasks::task_run_execution as executions;
     use pioneer_entity::{
         agent_identity, task_occurrence_reconcile_pending as contracts,
         task_run_execution as mapping,
@@ -145,9 +148,9 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
         .await
         .unwrap()
         .unwrap();
-    agent_domain::insert_agent_execution(
+    pioneer_crud_tasks::agent_execution_binding::insert_agent_execution(
         &init,
-        &agent_domain::AgentExecutionInput {
+        &pioneer_crud_execution::agent_execution::AgentExecutionInput {
             id: execution_id.clone(),
             workspace_id: "ws_task".into(),
             agent_identity_id: identity.id,
@@ -210,23 +213,33 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
         .exec(&db)
         .await
         .unwrap();
-    let outcome =
-        agent_domain::finalize_agent_execution(&source, &execution_id, "succeeded", now).await;
+    let outcome = pioneer_crud_tasks::terminal::finalize_agent_execution(
+        &source,
+        &execution_id,
+        "succeeded",
+        now,
+    )
+    .await;
     match outcome {
         Ok(true) => source.commit().await.unwrap(),
         Err(error) => {
             // A stale sequence CAS is allowed only by unwinding the entire
             // source transaction; never retry its old RR snapshot in place.
             assert!(
-                error.downcast_ref::<crate::util::PreflightRace>().is_some()
+                error.downcast_ref::<pioneer_crud_conversations::turn_payload::PreflightRace>().is_some()
                     || pioneer_sqlite::is_retryable_database_conflict(&error)
             );
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();
             assert!(
-                agent_domain::finalize_agent_execution(&retry, &execution_id, "succeeded", now)
-                    .await
-                    .unwrap()
+                pioneer_crud_tasks::terminal::finalize_agent_execution(
+                    &retry,
+                    &execution_id,
+                    "succeeded",
+                    now
+                )
+                .await
+                .unwrap()
             );
             retry.commit().await.unwrap();
         }

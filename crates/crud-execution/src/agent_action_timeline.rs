@@ -48,6 +48,17 @@ fn exact_timeline_target_keys(
         .collect())
 }
 
+pub async fn action_has_timeline_target<C: ConnectionTrait>(
+    db: &C,
+    action_id: &str,
+) -> Result<bool> {
+    Ok(agent_action_timeline_target::Entity::find()
+        .filter(agent_action_timeline_target::Column::ActionId.eq(action_id))
+        .one(db)
+        .await?
+        .is_some())
+}
+
 pub async fn bind_agent_action_timeline_target<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

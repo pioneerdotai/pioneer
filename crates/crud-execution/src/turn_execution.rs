@@ -1,10 +1,39 @@
 use anyhow::{Context, Result, bail};
+use pioneer_crud_conversations::events::TurnEventPayload;
+use pioneer_protocol::TurnStatus;
 use pioneer_entity::turn_execution;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
+
+pub fn terminal_turn_execution_status(status: TurnStatus) -> Option<TurnExecutionStatus> {
+    match status {
+        TurnStatus::InProgress => None,
+        TurnStatus::Completed => Some(TurnExecutionStatus::Completed),
+        TurnStatus::Failed => Some(TurnExecutionStatus::Failed),
+        TurnStatus::Interrupted => Some(TurnExecutionStatus::Interrupted),
+        TurnStatus::Blocked => Some(TurnExecutionStatus::Blocked),
+    }
+}
+
+pub fn terminal_turn_execution_status_for_event(
+    event: &TurnEventPayload,
+) -> Option<TurnExecutionStatus> {
+    match event {
+        TurnEventPayload::TurnCompleted(notification) => {
+            terminal_turn_execution_status(notification.turn.status)
+        }
+        TurnEventPayload::TurnFailed(notification) => {
+            terminal_turn_execution_status(notification.turn.status)
+        }
+        TurnEventPayload::TurnBlocked(notification) => {
+            terminal_turn_execution_status(notification.turn.status)
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnExecutorKind {

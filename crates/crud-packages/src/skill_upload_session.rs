@@ -56,6 +56,23 @@ pub async fn find_skill_upload_session<C: ConnectionTrait>(
         .with_context(|| format!("failed to query skill upload session `{upload_id}`"))
 }
 
+/// Earliest future expiry after processing the currently eligible uploads.
+pub async fn next_skill_upload_deadline<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+) -> Result<Option<i64>> {
+    Ok(skill_upload_session::Entity::find()
+        .select_only()
+        .column(skill_upload_session::Column::ExpiresAtUnix)
+        .filter(skill_upload_session::Column::Status.is_in(["receiving", "finalized"]))
+        .filter(skill_upload_session::Column::ExpiresAtUnix.gt(now))
+        .order_by_asc(skill_upload_session::Column::ExpiresAtUnix)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?)
+}
+
 pub async fn list_expired_skill_upload_sessions<C: ConnectionTrait>(
     db: &C,
     now_unix: i64,

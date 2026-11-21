@@ -15,3 +15,7 @@ pub fn deadline_unix_seconds(value: DateTimeWithTimeZone) -> i64 {
         .timestamp()
         .saturating_add(i64::from(value.timestamp_subsec_nanos() != 0))
 }
+
+pub fn utc_now() -> DateTimeWithTimeZone {
+    Utc::now().fixed_offset()
+}

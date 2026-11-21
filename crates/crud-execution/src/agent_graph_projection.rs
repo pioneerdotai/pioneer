@@ -271,3 +271,70 @@ fn agent_work_node_state(
 
 #[cfg(test)]
 mod tests;
+
+/// An empty agent-created thread has no Conversation turn from which to
+/// restore composer reasoning. Its creator execution stores the immutable
+/// applied selection; reading it neither creates identity nor grants authority.
+pub async fn empty_agent_thread_reasoning<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(thread) = thread::Entity::find_by_id(thread_id.to_owned())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(pioneer_protocol::PersistedActorRef::AgentExecution(execution_id)) =
+        pioneer_crud_access::identity::actor_ref_from_db(
+            thread.created_by_actor_kind.as_deref(),
+            thread.created_by_actor_id.as_deref(),
+        )?
+    else {
+        return Ok(None);
+    };
+    let Some(execution) = agent_execution::Entity::find_by_id(execution_id.to_string())
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if execution.workspace_id != thread.workspace_id {
+        bail!("thread creator execution workspace differs");
+    }
+    let selection: pioneer_protocol::AgentExecutionSelection =
+        serde_json::from_str(&execution.requested_profile_selection_json)
+            .context("thread creator execution selection is invalid")?;
+    Ok(selection.reasoning.map(|reasoning| reasoning.effort))
+}
+
+/// Bounded list projection counterpart of empty_agent_thread_reasoning. The
+/// caller already read the immutable thread creators in its list query.
+pub async fn agent_thread_creator_reasoning<C: ConnectionTrait>(
+    db: &C,
+    execution_ids: &[&str],
+) -> Result<std::collections::BTreeMap<String, (String, Option<String>)>> {
+    if execution_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let executions = agent_execution::Entity::find()
+        .filter(agent_execution::Column::Id.is_in(execution_ids.iter().copied()))
+        .all(db)
+        .await?;
+    // The query released its reader before parsing the saved selections.
+    executions
+        .into_iter()
+        .map(|execution| {
+            let selection: pioneer_protocol::AgentExecutionSelection =
+                serde_json::from_str(&execution.requested_profile_selection_json)
+                    .context("thread creator execution selection is invalid")?;
+            Ok((
+                execution.id,
+                (
+                    execution.workspace_id,
+                    selection.reasoning.map(|reasoning| reasoning.effort),
+                ),
+            ))
+        })
+        .collect()
+}

@@ -12,6 +12,7 @@ pub mod identity;
 pub mod membership;
 pub mod task_activity;
 pub mod task_scope;
+pub mod thread_participants;
 pub mod turn_execution;
 pub mod workspace;
 

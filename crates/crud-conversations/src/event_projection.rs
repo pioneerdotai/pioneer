@@ -634,3 +634,41 @@ async fn mark_claimed_failure_with_status<C: ConnectionTrait>(
 
     Ok(affected)
 }
+
+pub async fn mark_projected_claimed(
+    db: &DatabaseTransaction,
+    event_id: &str,
+    turn_id: &str,
+    sequence: i64,
+    claim_token: &str,
+    projected_at: DateTimeWithTimeZone,
+) -> Result<Option<crate::projection_stream::StreamChange>> {
+    let affected =
+        mark_claim_projected(db, event_id, turn_id, sequence, claim_token, projected_at).await?;
+    if !affected {
+        return Ok(None);
+    }
+    let Some(after) = crate::projection_stream::advance_projected_through(
+        db,
+        turn_id,
+        sequence - 1,
+        sequence,
+        projected_at,
+    )
+    .await?
+    else {
+        let stored_sequence = crate::projection_stream::find(db, turn_id)
+            .await?
+            .map(|stream| stream.projected_through_sequence);
+        anyhow::bail!(
+            "projection watermark for Turn `{turn_id}` did not advance atomically from `{}` through `{sequence}` while completing event `{event_id}`; stored watermark: {stored_sequence:?}",
+            sequence - 1
+        );
+    };
+    let mut before = after.clone();
+    before.projected_through_sequence = sequence - 1;
+    Ok(Some(crate::projection_stream::StreamChange {
+        before: Some(before),
+        after: Some(after),
+    }))
+}

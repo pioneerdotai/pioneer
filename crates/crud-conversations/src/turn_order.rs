@@ -172,10 +172,13 @@ async fn cli_adjacent_timestamp<C: ConnectionTrait>(
     .transpose()
 }
 
-pub async fn latest_turn_id_by_creation_order<C: ConnectionTrait>(
-    db: &C,
+pub async fn latest_turn_id_by_creation_order(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
 ) -> Result<Option<String>> {
+    // The timestamp seek and tie-breaker must see one reader snapshot.
+    let snapshot = db.begin_read().await?;
+    let db = &snapshot;
     let Some(timestamp) = cli_adjacent_timestamp(db, thread_id, None, true).await? else {
         return Ok(None);
     };
@@ -185,12 +188,15 @@ pub async fn latest_turn_id_by_creation_order<C: ConnectionTrait>(
         .next())
 }
 
-pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionTrait>(
-    db: &C,
+pub async fn turn_before_launch_and_intervening_by_creation_order(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
     launch_turn_id: &str,
     allowed_task_run_turn_id: &str,
 ) -> Result<Option<(Option<String>, bool)>> {
+    // Hold one snapshot across the launch boundary and the adjoining buckets.
+    let snapshot = db.begin_read().await?;
+    let db = &snapshot;
     let Some(launch) = cli_turn_order_key(db, thread_id, launch_turn_id).await? else {
         return Ok(None);
     };
@@ -247,11 +253,14 @@ pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionT
     Ok(Some((previous, intervening)))
 }
 
-pub async fn turn_ids_after_by_creation_order<C: ConnectionTrait>(
-    db: &C,
+pub async fn turn_ids_after_by_creation_order(
+    db: &pioneer_sqlite::SqliteDatabase,
     thread_id: &str,
     source_turn_id: &str,
 ) -> Result<Vec<String>> {
+    // Hold one snapshot across bounded metadata buckets to keep retry ordering stable.
+    let snapshot = db.begin_read().await?;
+    let db = &snapshot;
     const MAX_FORK_RETRY_ATTEMPTS: usize = 128;
     let Some(source) = cli_turn_order_key(db, thread_id, source_turn_id).await? else {
         return Ok(Vec::new());

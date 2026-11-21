@@ -160,3 +160,153 @@ async fn independent_context_writers_serialize_sequence_and_delivery_keys() -> R
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn turn_llm_context_repository_round_trips_and_cleans_terminal_turns() {
+    use pioneer_crud_conversations::context_cleanup::{
+        delete_expired_turn_llm_context, delete_turn_llm_context_for_terminal_turns,
+        delete_turn_llm_context_for_turn,
+    };
+    use pioneer_crud_conversations::turn_context::insert;
+    use pioneer_protocol::ToolOutputPolicySnapshot;
+
+    with_database(async |fixture| {
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .fixed_offset();
+        let db = pioneer_sqlite::SqliteDatabase::new(
+            fixture.connect_read_only().await?,
+            fixture.connection().clone(),
+        );
+        seed(&db).await?;
+        let active_turn_id = TURN;
+        let terminal_turn_id = "turn_llm_terminal";
+        db.execute_unprepared(
+            "INSERT INTO turn(id,thread_id,status) VALUES ('turn_llm_terminal','thread','completed')",
+        ).await?;
+
+        let read_file_policy =
+            serde_json::to_string(&ToolOutputPolicySnapshot::for_tool_name("read_file"))
+                .expect("policy should serialize");
+        let shell_policy =
+            serde_json::to_string(&ToolOutputPolicySnapshot::for_tool_name("exec_command"))
+                .expect("policy should serialize");
+        let future_expiry = chrono::Utc::now().fixed_offset() + chrono::Duration::days(1);
+        let expired_expiry = chrono::Utc::now().fixed_offset() - chrono::Duration::days(1);
+
+        for (turn_id, sequence, tool_name, payload, policy) in [
+            (
+                active_turn_id,
+                2,
+                "read_file",
+                r#"{"kind":"text","text":"later"}"#,
+                read_file_policy.as_str(),
+            ),
+            (
+                active_turn_id,
+                1,
+                "exec_command",
+                r#"{"kind":"text","text":"earlier"}"#,
+                shell_policy.as_str(),
+            ),
+            (
+                terminal_turn_id,
+                1,
+                "web_fetch",
+                r#"{"kind":"text","text":"temporary"}"#,
+                read_file_policy.as_str(),
+            ),
+        ] {
+            let tx = db.begin().await?;
+            insert(&tx, NewTurnLlmContextEntry {
+                    turn_id: turn_id.to_owned(),
+                    item_id: Some(format!("item_{sequence}")),
+                    attempt_id: Some(format!("attempt_{sequence}")),
+                    sequence,
+                    source: "tool_result".to_owned(),
+                    tool_name: Some(tool_name.to_owned()),
+                    payload: payload.to_owned(),
+                    output_policy_snapshot: policy.to_owned(),
+                    created_at: timestamp + chrono::Duration::seconds(sequence),
+                    expires_at: Some(future_expiry),
+                })
+                .await
+                .expect("llm context row should insert");
+            tx.commit().await?;
+        }
+        let tx = db.begin().await?;
+        insert(&tx, NewTurnLlmContextEntry {
+                turn_id: active_turn_id.to_owned(),
+                item_id: Some("item_expired".to_owned()),
+                attempt_id: Some("attempt_expired".to_owned()),
+                sequence: 3,
+                source: "tool_result".to_owned(),
+                tool_name: Some("read_file".to_owned()),
+                payload: r#"{"kind":"text","text":"expired"}"#.to_owned(),
+                output_policy_snapshot: read_file_policy.clone(),
+                created_at: timestamp + chrono::Duration::seconds(3),
+                expires_at: Some(expired_expiry),
+            })
+            .await
+            .expect("expired llm context row should insert");
+        tx.commit().await?;
+
+        let active_rows = list_turn_llm_context(&db, active_turn_id)
+            .await
+            .expect("active context should list");
+        assert_eq!(
+            active_rows
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(active_rows[0].tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(active_rows[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(active_rows[2].item_id.as_deref(), Some("item_expired"));
+
+        let deleted_expired = delete_expired_turn_llm_context(&db)
+            .await
+            .expect("expired cleanup should succeed");
+        assert_eq!(deleted_expired, 1);
+        assert_eq!(
+            list_turn_llm_context(&db, active_turn_id)
+                .await
+                .expect("active context should survive expired cleanup")
+                .len(),
+            2
+        );
+
+        let deleted_terminal = delete_turn_llm_context_for_terminal_turns(&db)
+            .await
+            .expect("terminal cleanup should succeed");
+        assert_eq!(deleted_terminal, 1);
+        assert!(
+            list_turn_llm_context(&db, terminal_turn_id)
+                .await
+                .expect("terminal context should list")
+                .is_empty()
+        );
+        assert_eq!(
+            list_turn_llm_context(&db, active_turn_id)
+                .await
+                .expect("active context should survive terminal cleanup")
+                .len(),
+            2
+        );
+
+        let deleted_active = delete_turn_llm_context_for_turn(&db, active_turn_id)
+            .await
+            .expect("turn cleanup should succeed");
+        assert_eq!(deleted_active, 2);
+        assert!(
+            list_turn_llm_context(&db, active_turn_id)
+                .await
+                .expect("active context should list after delete")
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}

@@ -224,3 +224,110 @@ impl PreparedArtifactIngest {
         })
     }
 }
+
+pub type ArtifactIngestGuard = (u64, tokio_util::sync::CancellationToken);
+
+/// Validate caller authorization before the Artifact write set uses the transaction.
+pub async fn authorize_artifact_ingest(
+    transaction: pioneer_sqlite::SqliteTransaction,
+    commit_guard: Option<&ArtifactIngestGuard>,
+) -> anyhow::Result<pioneer_sqlite::SqliteTransaction> {
+    use pioneer_crud_access::policy_generation::current_policy_generation_on;
+    if let Some((generation, cancel)) = commit_guard {
+        if cancel.is_cancelled() {
+            transaction.rollback().await?;
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "HTML invocation cancelled before commit".into(),
+            }
+            .into());
+        }
+        let current = current_policy_generation_on(&transaction)
+            .await
+            .map_err(|error| ArtifactCrudError::InvalidRequest {
+                message: format!("HTML authorization unavailable: {error}"),
+            })?;
+        if current.get() != *generation {
+            transaction.rollback().await?;
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "HTML authorization changed before commit; retry under current policy"
+                    .into(),
+            }
+            .into());
+        }
+    }
+    Ok(transaction)
+}
+
+pub struct ArtifactIngestStore<'a> {
+    connection: &'a pioneer_sqlite::SqliteDatabase,
+    io_wake: &'a tokio::sync::Notify,
+}
+
+impl<'a> ArtifactIngestStore<'a> {
+    pub fn new(
+        connection: &'a pioneer_sqlite::SqliteDatabase,
+        io_wake: &'a tokio::sync::Notify,
+    ) -> Self {
+        Self {
+            connection,
+            io_wake,
+        }
+    }
+
+    pub async fn commit_without_publication(
+        &self,
+        prepared: PreparedArtifactIngest,
+        commit_guard: Option<ArtifactIngestGuard>,
+    ) -> anyhow::Result<IngestedArtifactRecord> {
+        use anyhow::{Context, ensure};
+        use sea_orm::TransactionTrait;
+        ensure!(
+            prepared.publication_target().is_none(),
+            "HTML publication requires a timeline commit"
+        );
+        let maintenance = self.connection.work_signal("maintenance.html").changing();
+        let queue = crate::html_preview_io::HtmlPreviewIoQueue::new(self.connection);
+        let result = queue
+            .run_serialized_write(|| {
+                let prepared = prepared.clone();
+                let commit_guard = commit_guard.clone();
+                async move {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin artifact ingest transaction")?;
+                    let transaction =
+                        authorize_artifact_ingest(transaction, commit_guard.as_ref()).await?;
+                    let record = match prepared.apply(&transaction).await {
+                        Ok(record) => record,
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error.into());
+                        }
+                    };
+                    if commit_guard
+                        .as_ref()
+                        .is_some_and(|(_, cancel)| cancel.is_cancelled())
+                    {
+                        transaction.rollback().await?;
+                        anyhow::bail!("HTML invocation cancelled before commit");
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit artifact ingest transaction")?;
+                    Ok(record)
+                }
+            })
+            .await;
+        if result.is_ok() {
+            if prepared.has_released_copies() {
+                self.io_wake.notify_one();
+                self.connection.work_signal("maintenance.html").notify();
+            }
+            maintenance.completed(true);
+        }
+        result
+    }
+}
