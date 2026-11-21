@@ -1,5 +1,5 @@
 use crate::mcp_audit_event;
-use crate::mcp_server_catalog_snapshot::{self, McpServerCatalogSnapshotRecord};
+use crate::mcp_server_catalog_snapshot;
 use crate::skill_audit_event::SkillAuditEventRecord;
 use crate::skill_audit_event::{self, skill_audit_event_record_from_model};
 use crate::skill_dependency_snapshot::{self, SkillDependencySnapshotRecord};
@@ -19,7 +19,10 @@ use crate::turn_mcp_projection::{
 };
 use crate::turn_skill_binding::TurnSkillBindingRecord;
 use crate::turn_skill_binding::turn_skill_binding_record_from_model;
-use crate::{McpAuditEventRecord, McpServerInstallationRecord, PackageRecord, plugins};
+use crate::{
+    McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord, PackageRecord,
+    plugins,
+};
 use crate::{
     mcp_installation_transactions, mcp_server_installation, skill_installation, skill_lifecycle,
     skill_upload_session, skill_workspace_policy, turn_skill_binding,

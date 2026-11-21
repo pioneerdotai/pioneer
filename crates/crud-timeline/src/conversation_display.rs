@@ -404,6 +404,29 @@ impl<'a> ConversationDisplayStore<'a> {
             .await
     }
 
+    pub async fn get_turns_for_summary(
+        &self,
+        thread_id: &str,
+        skip: u64,
+        take: u64,
+    ) -> Result<Vec<ConversationEntry>> {
+        if take == 0 {
+            return Ok(Vec::new());
+        }
+
+        let turns = turn::find_completed_turns_for_thread(self.connection, thread_id).await?;
+        let entries = self
+            .build_ordered_conversation_entries(&turns, &BTreeMap::new(), None)
+            .await?;
+        let entries = self
+            .project_causally_closed_conversation_entries(thread_id, entries)
+            .await?;
+        let skip = usize::try_from(skip).unwrap_or(usize::MAX);
+        let take = usize::try_from(take).unwrap_or(usize::MAX);
+
+        Ok(entries.into_iter().skip(skip).take(take).collect())
+    }
+
     async fn project_causally_closed_conversation_entries(
         &self,
         thread_id: &str,

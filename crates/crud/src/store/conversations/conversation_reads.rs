@@ -18,7 +18,7 @@ use pioneer_protocol::{
     PrincipalId, PromptManifest, SandboxMode, Thread, ThreadReadResponse, Turn, TurnItem,
     TurnItemType, TurnItemsResponse, UserInput,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 impl CrudStore {
     pub async fn mark_thread_read(
@@ -530,22 +530,9 @@ impl CrudStore {
         skip: u64,
         take: u64,
     ) -> Result<Vec<ConversationEntry>> {
-        if take == 0 {
-            return Ok(Vec::new());
-        }
-
-        let turns =
-            turn_reads::find_completed_turns_for_thread(&self.connection, thread_id).await?;
-        let entries = self
-            .build_ordered_conversation_entries(&turns, &BTreeMap::new(), None)
-            .await?;
-        let entries = self
-            .project_causally_closed_conversation_entries(thread_id, entries)
-            .await?;
-        let skip = usize::try_from(skip).unwrap_or(usize::MAX);
-        let take = usize::try_from(take).unwrap_or(usize::MAX);
-
-        Ok(entries.into_iter().skip(skip).take(take).collect())
+        self.conversation_display_store()
+            .get_turns_for_summary(thread_id, skip, take)
+            .await
     }
 
     pub async fn get_thread_history(

@@ -1,4 +1,5 @@
 use crate::DB_ID_LEN;
+use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_turn_binding_state;
 use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_conversations::values::turn_status_to_db;
 use crate::events::TurnEventPayload;
@@ -68,8 +69,8 @@ impl CrudStore {
                     )
                     .await?;
                 if inserted {
-                    self.project_cli_runtime_turn_binding_state(
-                        &transaction,
+                    project_cli_runtime_turn_binding_state(
+                        &*transaction,
                         &stored_binding.turn_id,
                         stored_binding.updated_at,
                     )
@@ -162,8 +163,8 @@ impl CrudStore {
                             )
                             .await?;
                         if inserted {
-                            self.project_cli_runtime_turn_binding_state(
-                                &tx,
+                            project_cli_runtime_turn_binding_state(
+                                &*tx,
                                 &binding.0.turn_id,
                                 binding.0.updated_at,
                             )
@@ -241,8 +242,8 @@ impl CrudStore {
                             )
                             .await?;
                         if inserted {
-                            self.project_cli_runtime_turn_binding_state(
-                                &transaction,
+                            project_cli_runtime_turn_binding_state(
+                                &*transaction,
                                 &binding.0.turn_id,
                                 prepared_at,
                             )
@@ -351,8 +352,8 @@ impl CrudStore {
                         execution_lease_until,
                     )
                     .await?;
-                self.project_cli_runtime_turn_binding_state(
-                    &transaction,
+                project_cli_runtime_turn_binding_state(
+                    &*transaction,
                     &binding.0.turn_id,
                     projection_at,
                 )
@@ -715,8 +716,8 @@ impl CrudStore {
                 // Binding remains discoverable until the shared terminal cleanup.
                 // If its consumer is cancelled after commit, canonical status plus
                 // this same terminal attempt lets the next active round repair it.
-                self.project_cli_runtime_turn_binding_state(
-                    &transaction,
+                project_cli_runtime_turn_binding_state(
+                    &*transaction,
                     &expected.turn_id,
                     created_at,
                 )
@@ -951,8 +952,8 @@ impl CrudStore {
                     capture_mapping,
                 )
                 .await?;
-                self.project_cli_runtime_turn_binding_state(
-                    &transaction,
+                project_cli_runtime_turn_binding_state(
+                    &*transaction,
                     stored_binding.turn_id.as_str(),
                     completed_at,
                 )

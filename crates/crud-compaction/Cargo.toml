@@ -10,6 +10,7 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 hex.workspace = true
 pioneer-compaction.workspace = true
 pioneer-crud-artifacts.workspace = true

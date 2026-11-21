@@ -37,7 +37,7 @@ use super::{
     list_abandoned_runtime_draft_artifact_ids, lock_gateway_singleton,
     message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
     resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
-    tool_call_status, upsert_thread_timeline_block, work_item_projection_id,
+    upsert_thread_timeline_block, work_item_projection_id,
 };
 use pioneer_crud_execution::attempt_values::ATTEMPT_STATUS_COMPLETED;
 use pioneer_crud_execution::time::unix_to_datetime;

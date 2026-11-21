@@ -5,6 +5,7 @@ use crate::{
     TransitionCliRuntimePendingRequestDelivery,
 };
 use anyhow::{Context, Result};
+use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_pending_request;
 use pioneer_crud_execution::cli_runtime_binding;
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -30,8 +31,7 @@ impl CrudStore {
                 let record =
                     cli_runtime_binding::create_pending_request(&transaction, request.clone())
                         .await?;
-                if let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, &record)
+                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
                     .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -74,8 +74,7 @@ impl CrudStore {
                 let record =
                     cli_runtime_binding::open_pending_request(&transaction, request.clone())
                         .await?;
-                if let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, &record)
+                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
                     .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -135,8 +134,7 @@ impl CrudStore {
                     &authorization,
                 )
                 .await?;
-                if let Err(error) = self
-                    .project_cli_runtime_pending_request(&transaction, &record)
+                if let Err(error) = project_cli_runtime_pending_request(&*transaction, &record)
                     .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -256,8 +254,7 @@ impl CrudStore {
                     cli_runtime_binding::resolve_pending_request(&transaction, resolution.clone())
                         .await?;
                 if let Some(record) = &record
-                    && let Err(error) = self
-                        .project_cli_runtime_pending_request(&transaction, record)
+                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
                         .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -302,8 +299,7 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = self
-                        .project_cli_runtime_pending_request(&transaction, record)
+                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
                         .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -349,8 +345,7 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = self
-                        .project_cli_runtime_pending_request(&transaction, record)
+                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
                         .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -398,8 +393,7 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = self
-                        .project_cli_runtime_pending_request(&transaction, record)
+                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
                         .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);
@@ -447,8 +441,7 @@ impl CrudStore {
                 )
                 .await?;
                 if let Some(record) = &record
-                    && let Err(error) = self
-                        .project_cli_runtime_pending_request(&transaction, record)
+                    && let Err(error) = project_cli_runtime_pending_request(&*transaction, record)
                         .await
                 {
                     return Err(crate::store::connection::rollback_preserving_error(transaction, error).await);

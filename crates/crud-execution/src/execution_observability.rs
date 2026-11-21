@@ -1,14 +1,11 @@
 //! Immutable, scoped operation revisions. Financial evidence is retained apart
 //! from transcript payloads; all access uses the caller's database class.
+use crate::retry::run_serialized_write;
 use anyhow::{Context, Result, ensure};
 use pioneer_crud_conversations::{events::TurnEventPayload, turn_context::NewTurnLlmContextEntry};
 use pioneer_entity::{
     agent_execution, execution_observation as fact, execution_tariff as tariff, task, thread, turn,
     workspace,
-};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
-    retry_with_backoff,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
@@ -18,8 +15,6 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::future::Future;
-use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionObservationInput {
@@ -529,20 +524,6 @@ impl<'a, C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'
     pub fn new(connection: &'a C) -> Self {
         Self { connection }
     }
-
-    pub(crate) async fn run_serialized_write<F, Fut>(&self, operation: F) -> Result<()>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        retry_with_backoff(
-            operation,
-            is_retryable_database_conflict,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
-    }
 }
 
 impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C> {
@@ -550,7 +531,7 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
         &self,
         prepared: PreparedExecutionObservation,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             commit(&tx, &prepared).await?;
             tx.commit().await?;

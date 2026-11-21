@@ -1,16 +1,13 @@
 //! Durable ownership and activation fences for native execution.
 use crate::execution_heartbeat::Registries;
 use crate::gateway_control::{GatewayControlWake, control_work_change};
+use crate::retry::run_serialized_write;
 use crate::time::{unix_to_datetime, utc_now};
 use crate::turn_execution::{self, TurnExecutionRecord};
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::projection_receipts::has_accepted_terminal;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_retryable_database_conflict, retry_with_backoff,
-};
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::TransactionTrait;
-use std::{future::Future, time::Duration};
 
 pub struct TurnOwnership<'a> {
     connection: &'a SqliteDatabase,
@@ -25,20 +22,6 @@ impl<'a> TurnOwnership<'a> {
         }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        retry_with_backoff(
-            operation,
-            is_retryable_database_conflict,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
-    }
-
     pub async fn mark_turn_execution_running_current(
         &self,
         expected: &TurnExecutionRecord,
@@ -48,7 +31,7 @@ impl<'a> TurnOwnership<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 if has_accepted_terminal(&tx, &expected.turn_id).await? {
                     return Ok(false);
@@ -84,7 +67,7 @@ impl<'a> TurnOwnership<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
                     return Ok(false);
@@ -130,7 +113,7 @@ impl<'a> TurnOwnership<'a> {
         let control_result = async {
             let turn_id = turn_id.to_owned();
             let owner_id = owner_id.to_owned();
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 turn_execution::mark_running_owned(
                     self.connection,
                     turn_id.as_str(),
@@ -153,7 +136,7 @@ impl<'a> TurnOwnership<'a> {
         &self,
         expected: &TurnExecutionRecord,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             if has_accepted_terminal(&tx, &expected.turn_id).await? {
                 return Ok(false);
@@ -205,7 +188,7 @@ impl<'a> TurnOwnership<'a> {
             let _ownership_change = self.execution_heartbeats.changing(new_owner_id);
             let expected = expected.clone();
             let new_owner_id = new_owner_id.to_owned();
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -250,22 +233,21 @@ impl<'a> TurnOwnership<'a> {
             "gateway.control",
             &[GatewayControlWake::Resources],
         );
-        let result = self
-            .run_serialized_write(|| async {
-                let transaction = self.connection.begin().await?;
-                let changed = crate::agent_execution::record_agent_execution_progress(
-                    &transaction,
-                    execution_id,
-                    expected_attempt_generation,
-                    progress_frontier_json,
-                    unix_to_datetime(progress_at),
-                    idle_deadline_at.map(unix_to_datetime),
-                )
-                .await?;
-                transaction.commit().await?;
-                Ok(changed)
-            })
-            .await;
+        let result = run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
+            let changed = crate::agent_execution::record_agent_execution_progress(
+                &transaction,
+                execution_id,
+                expected_attempt_generation,
+                progress_frontier_json,
+                unix_to_datetime(progress_at),
+                idle_deadline_at.map(unix_to_datetime),
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(changed)
+        })
+        .await;
         if let Ok(changed) = &result {
             change.completed(*changed);
         }

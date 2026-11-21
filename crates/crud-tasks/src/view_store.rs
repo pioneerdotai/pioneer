@@ -66,6 +66,72 @@ impl<'a> TaskViewStore<'a> {
             .await
     }
 
+    pub async fn get_task_runs(&self, task_id: &str) -> Result<Vec<TaskRun>> {
+        task_run::list_runs_by_task(self.connection, task_id)
+            .await?
+            .into_iter()
+            .map(task_run_from_db_model)
+            .collect()
+    }
+
+    pub async fn list_task_runs_by_status(
+        &self,
+        status: TaskRunStatus,
+        limit: u64,
+    ) -> Result<Vec<TaskRun>> {
+        task_run::list_runs_by_status(self.connection, status, limit)
+            .await?
+            .into_iter()
+            .map(task_run_from_db_model)
+            .collect()
+    }
+
+    pub async fn list_due_retry_task_runs(&self, now: i64, limit: u64) -> Result<Vec<TaskRun>> {
+        task_run::list_due_retry_runs(self.connection, unix_to_datetime(now), limit)
+            .await?
+            .into_iter()
+            .map(task_run_from_db_model)
+            .collect()
+    }
+
+    pub async fn list_task_write_locks_by_run(&self, run_id: &str) -> Result<Vec<TaskWriteLock>> {
+        write_lock::list_locks_by_run(self.connection, run_id)
+            .await?
+            .into_iter()
+            .map(task_write_lock_from_db_model)
+            .collect()
+    }
+
+    pub async fn list_active_task_write_locks(
+        &self,
+        workspace_id: &str,
+        now: i64,
+        limit: u64,
+    ) -> Result<Vec<TaskWriteLock>> {
+        write_lock::list_active_locks_for_workspace(
+            self.connection,
+            workspace_id,
+            unix_to_datetime(now),
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(task_write_lock_from_db_model)
+        .collect()
+    }
+
+    pub async fn list_stale_task_write_locks(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> Result<Vec<TaskWriteLock>> {
+        write_lock::list_stale_locks(self.connection, unix_to_datetime(now), limit)
+            .await?
+            .into_iter()
+            .map(task_write_lock_from_db_model)
+            .collect()
+    }
+
     pub async fn get_task(&self, task_id: &str) -> Result<Option<TaskGetResponse>> {
         let Some(task_model) = task::find_task_by_id(self.connection, task_id).await? else {
             return Ok(None);
@@ -77,11 +143,7 @@ impl<'a> TaskViewStore<'a> {
             .into_iter()
             .map(task_trigger_from_db_model)
             .collect::<Result<Vec<_>>>()?;
-        let runs = task_run::list_runs_by_task(self.connection, task_id)
-            .await?
-            .into_iter()
-            .map(task_run_from_db_model)
-            .collect::<Result<Vec<_>>>()?;
+        let runs = self.get_task_runs(task_id).await?;
         let agent_specs = task_agent_spec::list_agent_specs_by_task(self.connection, task_id)
             .await?
             .into_iter()

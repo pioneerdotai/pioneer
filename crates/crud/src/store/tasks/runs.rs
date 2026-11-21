@@ -1,6 +1,5 @@
 //! Execution state, run bindings, and dispatch admission.
 
-use pioneer_crud_execution::time::unix_to_datetime;
 use crate::{
     AppendedTaskEvent, CrudStore, TaskRunChildAnchor, TaskRuntimeInvariantSnapshot,
     TerminalTaskOccurrenceMismatch, TerminalTaskOccurrenceMismatchPage,
@@ -8,9 +7,6 @@ use crate::{
     scan_terminal_task_occurrence_mismatches,
 };
 use anyhow::Result;
-use pioneer_crud_tasks::task_run::task_run_from_db_model;
-use pioneer_crud_tasks::write_lock::task_write_lock_from_db_model;
-use pioneer_crud_tasks::{task_run, write_lock as task_write_lock};
 use pioneer_protocol::{
     TaskExecutorKind, TaskRun, TaskRunExecution, TaskRunStatus, TaskRunThreadBinding, TaskRunTurn,
     TaskRunTurnStatus, TaskWriteLock,
@@ -19,11 +15,7 @@ use std::collections::HashMap;
 
 impl CrudStore {
     pub async fn get_task_runs(&self, task_id: &str) -> Result<Vec<TaskRun>> {
-        task_run::list_runs_by_task(&self.connection, task_id)
-            .await?
-            .into_iter()
-            .map(task_run_from_db_model)
-            .collect()
+        self.task_view_store().get_task_runs(task_id).await
     }
 
     pub async fn get_task_run(&self, run_id: &str) -> Result<Option<TaskRun>> {
@@ -321,27 +313,21 @@ impl CrudStore {
         status: TaskRunStatus,
         limit: u64,
     ) -> Result<Vec<TaskRun>> {
-        task_run::list_runs_by_status(&self.connection, status, limit)
-            .await?
-            .into_iter()
-            .map(task_run_from_db_model)
-            .collect()
+        self.task_view_store()
+            .list_task_runs_by_status(status, limit)
+            .await
     }
 
     pub async fn list_due_retry_task_runs(&self, now: i64, limit: u64) -> Result<Vec<TaskRun>> {
-        task_run::list_due_retry_runs(&self.connection, unix_to_datetime(now), limit)
-            .await?
-            .into_iter()
-            .map(task_run_from_db_model)
-            .collect()
+        self.task_view_store()
+            .list_due_retry_task_runs(now, limit)
+            .await
     }
 
     pub async fn list_task_write_locks_by_run(&self, run_id: &str) -> Result<Vec<TaskWriteLock>> {
-        task_write_lock::list_locks_by_run(&self.connection, run_id)
-            .await?
-            .into_iter()
-            .map(task_write_lock_from_db_model)
-            .collect()
+        self.task_view_store()
+            .list_task_write_locks_by_run(run_id)
+            .await
     }
 
     pub async fn list_active_task_write_locks(
@@ -350,16 +336,9 @@ impl CrudStore {
         now: i64,
         limit: u64,
     ) -> Result<Vec<TaskWriteLock>> {
-        task_write_lock::list_active_locks_for_workspace(
-            &self.connection,
-            workspace_id,
-            unix_to_datetime(now),
-            limit,
-        )
-        .await?
-        .into_iter()
-        .map(task_write_lock_from_db_model)
-        .collect()
+        self.task_view_store()
+            .list_active_task_write_locks(workspace_id, now, limit)
+            .await
     }
 
     pub async fn list_stale_task_write_locks(
@@ -367,11 +346,9 @@ impl CrudStore {
         now: i64,
         limit: u64,
     ) -> Result<Vec<TaskWriteLock>> {
-        task_write_lock::list_stale_locks(&self.connection, unix_to_datetime(now), limit)
-            .await?
-            .into_iter()
-            .map(task_write_lock_from_db_model)
-            .collect()
+        self.task_view_store()
+            .list_stale_task_write_locks(now, limit)
+            .await
     }
 
     pub async fn get_task_run_turns_by_sources(

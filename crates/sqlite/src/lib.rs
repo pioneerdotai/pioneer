@@ -54,6 +54,28 @@ impl SqliteAdmissionSnapshot {
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
 pub const DEFAULT_LOCK_RETRY_BASE_DELAY_MS: u64 = 20;
 
+/// Run one observed database attempt, returning the original result.
+pub async fn run_database_attempt<T, E, Fut>(operation: Fut) -> Result<T, E>
+where
+    Fut: Future<Output = Result<T, E>>,
+{
+    database_attempt_context(&pioneer_observability::work::capture(), 0)
+        .scope_result(Box::pin(operation))
+        .await
+}
+
+fn database_attempt_context(
+    parent: &pioneer_observability::work::WorkCarrier,
+    attempt: usize,
+) -> pioneer_observability::work::WorkCarrier {
+    parent
+        .execution_child(
+            pioneer_observability::work::WorkKind::Database,
+            pioneer_observability::work::ExecutorRole::Foreign,
+        )
+        .with_attempt(attempt.saturating_add(1).min(u16::MAX as usize) as u16)
+}
+
 pub async fn retry_with_backoff<T, E, F, Fut, P>(
     mut operation: F,
     is_retryable: P,
@@ -67,12 +89,7 @@ where
 {
     let parent = pioneer_observability::work::capture();
     for attempt in 0..=retry_attempts {
-        let carrier = parent
-            .execution_child(
-                pioneer_observability::work::WorkKind::Database,
-                pioneer_observability::work::ExecutorRole::Foreign,
-            )
-            .with_attempt(attempt.saturating_add(1).min(u16::MAX as usize) as u16);
+        let carrier = database_attempt_context(&parent, attempt);
         let operation: Pin<Box<Fut>> = Box::pin(operation());
         match carrier.scope_result(operation).await {
             Ok(value) => return Ok(value),

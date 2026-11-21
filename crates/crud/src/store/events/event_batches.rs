@@ -1,4 +1,5 @@
 use crate::events::TurnEventPayload;
+use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_turn_binding_state;
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TURN_EVENT_PROJECTION_LEASE_SECS,
@@ -402,8 +403,8 @@ impl CrudStore {
             // Refresh within this same atomic admission so a visible CLI child
             // already shows its queued state, even without a runtime binding.
             if execution.executor_kind == TurnExecutorKind::CliRuntime {
-                self.project_cli_runtime_turn_binding_state(
-                    &transaction,
+                project_cli_runtime_turn_binding_state(
+                    &*transaction,
                     &execution.turn_id,
                     created_at,
                 )

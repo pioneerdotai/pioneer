@@ -209,7 +209,7 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
         let native_turn = value["_pioneer_observation"]["native_turn_id"]
             .as_str()
             .map(str::to_owned);
-        self.run_serialized_write(|| async {
+        crate::retry::run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             // The first journal revision has no row to lock. SeaORM has no
             // transaction-scoped advisory lock API for this compare-and-set.

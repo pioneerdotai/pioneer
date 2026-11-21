@@ -3,6 +3,7 @@ use crate::html_preview::archive_result;
 use crate::html_preview_retention_queries::{
     self as queries, bytes, col, json as json_field, revision,
 };
+use crate::visibility::temporary_preview_predicate;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
     artifact, artifact_binding, artifact_blob, artifact_external_ref, artifact_projection,

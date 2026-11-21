@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use pioneer_crud::CrudStore;
 use pioneer_postgres_test::with_database;
 use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
@@ -28,11 +27,7 @@ async fn unknown_commit_is_visible_before_background_discovery() -> Result<()> {
             .await?;
 
         let writer = fixture.connect_with_limit(2).await?;
-        let store = CrudStore::new(SqliteDatabase::new(
-            fixture.connect_read_only().await?,
-            writer.clone(),
-        ));
-        let scoped = store.database_connection();
+        let scoped = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let change = scoped.work_signal("commit-wake");
         let mut wake = change.subscribe();
         wake.begin_pass(&scoped).await?;

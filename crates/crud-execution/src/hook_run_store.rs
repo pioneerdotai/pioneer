@@ -4,14 +4,11 @@ use crate::hook_run::{
     HookRunCompletionRecord, HookRunRecord, NewHookAuditEventRecord, NewHookRunAttemptRecord,
     NewHookRunRecord, RecoverableHookRunRecord,
 };
+use crate::retry::run_serialized_write;
 use anyhow::Result;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_retryable_database_conflict, retry_with_backoff,
-};
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use std::{future::Future, time::Duration};
 
 pub struct HookRunStore<'a> {
     connection: &'a SqliteDatabase,
@@ -22,20 +19,6 @@ impl<'a> HookRunStore<'a> {
         Self { connection }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        retry_with_backoff(
-            operation,
-            is_retryable_database_conflict,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
-    }
-
     pub async fn create_hook_run(
         &self,
         run: NewHookRunRecord,
@@ -43,7 +26,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<HookRunRecord> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let run = run.clone();
                 let now = now.clone();
                 async move { hook_run::create_hook_run(self.connection, run, now).await }
@@ -87,7 +70,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let now = now.clone();
                 async move { hook_run::mark_hook_run_running(self.connection, run_id, now).await }
             })
@@ -108,7 +91,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let completion = completion.clone();
                 let now = now.clone();
                 async move {
@@ -131,7 +114,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<HookRunAttemptRecord> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let attempt = attempt.clone();
                 let now = now.clone();
                 async move {
@@ -159,7 +142,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunAttemptRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let completion = completion.clone();
                 let now = now.clone();
                 async move {
@@ -210,7 +193,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let schedule = schedule.clone();
                 let now = now.clone();
                 async move {
@@ -234,7 +217,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let completion = completion.clone();
                 let now = now.clone();
                 async move {
@@ -267,7 +250,7 @@ impl<'a> HookRunStore<'a> {
     ) -> Result<Option<HookRunRecord>> {
         let change = self.connection.work_signal("hooks").changing();
         let result = async {
-            self.run_serialized_write(|| {
+            run_serialized_write(|| {
                 let completion = completion.clone();
                 let now = now.clone();
                 async move {
@@ -289,7 +272,7 @@ impl<'a> HookRunStore<'a> {
         records: Vec<NewHookAuditEventRecord>,
         now: DateTimeWithTimeZone,
     ) -> Result<Vec<HookAuditEventRecord>> {
-        self.run_serialized_write(|| {
+        run_serialized_write(|| {
             let records = records.clone();
             let now = now.clone();
             async move { hook_run::append_hook_audit_events(self.connection, records, now).await }

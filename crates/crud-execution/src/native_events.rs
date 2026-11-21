@@ -1,4 +1,5 @@
 //! Scoped native runtime journal rows and idempotent append.
+use crate::retry::run_serialized_write;
 use anyhow::{Context, Result};
 use pioneer_entity::cli_runtime_native_event;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -231,20 +232,6 @@ impl<'a> NativeEventRepository<'a> {
     pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
         Self { connection }
     }
-
-    async fn run_serialized_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        pioneer_sqlite::retry_with_backoff(
-            || operation(),
-            pioneer_sqlite::is_retryable_database_conflict,
-            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
-    }
 }
 
 use crate::gateway_control::{GatewayControlWake, control_work_change};
@@ -267,7 +254,7 @@ impl NativeEventRepository<'_> {
         let cli_result = async {
             let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
             let maintenance_result = async {
-                self.run_serialized_write(|| async {
+                run_serialized_write(|| async {
                     append_native_event(self.connection, event.clone()).await
                 })
                 .await
@@ -307,7 +294,7 @@ impl NativeEventRepository<'_> {
         let cli_result = async {
             let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
             let maintenance_result = async {
-                self.run_serialized_write(|| async {
+                run_serialized_write(|| async {
                     append_native_event_if_absent_with_outcome(self.connection, event.clone()).await
                 })
                 .await

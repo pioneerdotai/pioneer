@@ -1,4 +1,5 @@
 use crate::events::TurnEventPayload;
+use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_live_turn_event;
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use crate::store::events::event_preparation::{
     PreparedProjectedTurnEvent, TurnEventProjectionContext,
@@ -176,7 +177,7 @@ impl CrudStore {
                         self.turn_projector
                             .project_prepared(transaction, &appended_event, projection)
                             .await?;
-                        self.project_semantic_timeline_live_turn_event(
+                        project_semantic_timeline_live_turn_event(
                             transaction,
                             &appended_event,
                             timeline_item,
@@ -276,7 +277,7 @@ impl CrudStore {
                 )
                 .await?;
             }
-            self.project_semantic_timeline_live_turn_event(
+            project_semantic_timeline_live_turn_event(
                 transaction,
                 &appended_event,
                 timeline_item,
@@ -758,8 +759,7 @@ impl CrudStore {
         }
 
         if !superseded_observation
-            && let Err(error) = self
-                .project_semantic_timeline_live_turn_event(&transaction, &appended_event, timeline_item)
+            && let Err(error) = project_semantic_timeline_live_turn_event(&*transaction, &appended_event, timeline_item)
                 .await
                 .context("failed to project turn event to semantic timeline")
         {

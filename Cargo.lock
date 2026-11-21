@@ -11500,6 +11500,7 @@ name = "pioneer-crud-compaction"
 version = "0.73.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures-util",
  "hex",
  "pioneer-compaction",
@@ -11690,6 +11691,7 @@ name = "pioneer-crud-timeline"
 version = "0.73.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "pioneer-crud-access",
  "pioneer-crud-artifacts",
  "pioneer-crud-conversations",

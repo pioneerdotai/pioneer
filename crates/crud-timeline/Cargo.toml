@@ -22,6 +22,7 @@ sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 pioneer-crud-access = { workspace = true, features = ["test-support"] }
 pioneer-postgres-test.workspace = true
 tokio.workspace = true

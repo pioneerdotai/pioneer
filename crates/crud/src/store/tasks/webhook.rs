@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use pioneer_crud_tasks::event_records::materialize_task_events;
 use pioneer_crud_tasks::webhook_admission;
 pub use pioneer_crud_tasks::webhook_admission::TaskWebhookAdmissionSnapshot;
-use pioneer_crud_tasks::work_change::TaskWorkChange;
+use pioneer_crud_tasks::work_change::{TaskWorkChange, inserted_task_events};
 use pioneer_protocol::{Task, TaskEventPayload, TaskOccurrenceContract, TaskRun, TaskTrigger};
 use sea_orm::{DatabaseTransaction, TransactionTrait};
 

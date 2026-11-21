@@ -7,7 +7,8 @@ use crate::cli_runtime_store::{
 use crate::gateway_control::{GatewayControlWake, control_work_change};
 use crate::recovery_job::{self, RecoveryJobRecord, recovery_job_record_from_model};
 use crate::recovery_terminalization_outbox;
-use crate::recovery_values::recovery_job_status_from_db;
+use crate::recovery_values::{recovery_action_to_db, recovery_job_status_from_db};
+use crate::retry::run_serialized_write;
 use crate::time::unix_to_datetime;
 use crate::turn_execution::{self, TurnExecutionRecord};
 use crate::turn_item_attempt;
@@ -17,15 +18,12 @@ use pioneer_protocol::{
     ProviderFailureClass, ProviderFailureStage, RecoveryAction, RecoveryJobStatus, RecoveryTrigger,
     TurnItemType, TurnStatus,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_retryable_database_conflict, retry_with_backoff,
-};
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     TransactionTrait, prelude::DateTimeWithTimeZone,
 };
-use std::{future::Future, sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 /// A retained hint for the existing recovery_job consumer. The guard is
@@ -67,20 +65,6 @@ impl<'a> RecoveryStore<'a> {
             #[cfg(test)]
             watchdog_preparation_gate: Default::default(),
         }
-    }
-
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        retry_with_backoff(
-            operation,
-            is_retryable_database_conflict,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await
     }
 
     /// short writer transaction; CLI ownership proof remains independent.
@@ -146,7 +130,7 @@ impl<'a> RecoveryStore<'a> {
                     release.notified().await;
                 }
             }
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 if !cli_runtime_recovery_transition_allowed(
                     &tx,
@@ -271,7 +255,7 @@ impl<'a> RecoveryStore<'a> {
         let changes = ["gateway.control", "recovery.due"]
             .map(|domain| control_work_change(self.connection, domain, &control_wakes));
         let result = async {
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let now = unix_to_datetime(now_unix);
                 let retry_delay_secs = retry_after_ms
                     .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
@@ -385,7 +369,7 @@ impl<'a> RecoveryStore<'a> {
             .map(|domain| control_work_change(self.connection, domain, &control_wakes));
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -478,7 +462,7 @@ impl<'a> RecoveryStore<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 turn_item_attempt::mark_recovery_action(
                     self.connection,
                     attempt_id,
@@ -514,12 +498,11 @@ impl<'a> RecoveryStore<'a> {
             .and_then(|secs| now_unix.checked_add(secs))
             .map(unix_to_datetime)
             .unwrap_or(now);
-        let jobs = self
-            .run_serialized_write(|| async {
-                recovery_job::claim_due_job_ids(self.connection, &candidates, now, claim_expires_at)
-                    .await
-            })
-            .await?;
+        let jobs = run_serialized_write(|| async {
+            recovery_job::claim_due_job_ids(self.connection, &candidates, now, claim_expires_at)
+                .await
+        })
+        .await?;
         Ok(jobs
             .into_iter()
             .map(recovery_job_record_from_model)
@@ -640,7 +623,7 @@ impl<'a> RecoveryStore<'a> {
     }
 
     pub async fn get_recovery_job(&self, job_id: &str) -> Result<Option<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             Ok(recovery_job::find_job_by_id(self.connection, job_id)
                 .await?
                 .map(recovery_job_record_from_model))
@@ -711,7 +694,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 if !cli_runtime_recovery_transition_allowed(
                     &tx,
@@ -772,7 +755,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 if !cli_runtime_recovery_transition_allowed(&tx, job_id, cli_source.as_ref(), None)
                     .await?
@@ -820,7 +803,7 @@ impl<'a> RecoveryStore<'a> {
             .map(|domain| control_work_change(self.connection, domain, &control_wakes));
         let result = async {
             let last_error_value = last_error.clone();
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 recovery_job::mark_claimed_job_retrying(
                     self.connection,
                     job_id,
@@ -856,7 +839,7 @@ impl<'a> RecoveryStore<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let outcome = recovery_job::mark_claimed_job_active(
                     self.connection,
                     job_id,
@@ -902,7 +885,7 @@ impl<'a> RecoveryStore<'a> {
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
             let last_error_value = last_error.clone();
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 recovery_job::release_claimed_job(
                     self.connection,
                     job_id,
@@ -955,7 +938,7 @@ impl<'a> RecoveryStore<'a> {
         let result = async {
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
             let last_error_value = last_error.clone();
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -1050,7 +1033,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -1129,7 +1112,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -1220,7 +1203,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -1322,7 +1305,7 @@ impl<'a> RecoveryStore<'a> {
             let cli_source = self
                 .prepare_cli_runtime_recovery_outcome_source(job_id)
                 .await?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self
                     .connection
                     .begin()
@@ -1392,7 +1375,7 @@ impl<'a> RecoveryStore<'a> {
         now_unix: i64,
         lease_until_unix: i64,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix).await?
             {
@@ -1439,7 +1422,7 @@ impl<'a> RecoveryStore<'a> {
                 "unexpected native pre-start recovery outcome"
             );
             let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-            self.run_serialized_write(|| async {
+            run_serialized_write(|| async {
                 let tx = self.connection.begin().await?;
                 if !native_recovery_start_transition_allowed(&tx, execution, recovery, now_unix)
                     .await?
@@ -1536,7 +1519,7 @@ impl<'a> RecoveryStore<'a> {
         &self,
         turn_id: &str,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             let jobs = recovery_job::find_open_jobs_by_turn(self.connection, turn_id).await?;
             Ok(jobs
                 .into_iter()
@@ -1550,7 +1533,7 @@ impl<'a> RecoveryStore<'a> {
         &self,
         turn_id: &str,
     ) -> Result<Option<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
+        run_serialized_write(|| async {
             Ok(
                 recovery_job::find_unresolved_job_by_turn(self.connection, turn_id)
                     .await?

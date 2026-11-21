@@ -13,12 +13,9 @@ use pioneer_crud_conversations::{thread_agents_doc, thread_tree};
 use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, Thread, ThreadFolder, ThreadPlacement,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, retry_with_backoff,
-};
+use pioneer_sqlite::run_database_attempt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
 use std::collections::HashMap;
-use std::time::Duration;
 
 impl CrudStore {
     /// Persists a thread through the normal write path.
@@ -366,22 +363,17 @@ impl CrudStore {
         folder_id: Option<&str>,
         actor_id: Option<&str>,
     ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
-        retry_with_backoff(
-            || async {
-                thread_agents_doc::ThreadAgentsDocRepository::new()
-                    .create_draft(
-                        &self.connection,
-                        workspace_id,
-                        folder_id,
-                        thread_agents_doc::now(),
-                        actor_id,
-                    )
-                    .await
-            },
-            |_| false,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
+        run_database_attempt(async {
+            thread_agents_doc::ThreadAgentsDocRepository::new()
+                .create_draft(
+                    &self.connection,
+                    workspace_id,
+                    folder_id,
+                    thread_agents_doc::now(),
+                    actor_id,
+                )
+                .await
+        })
         .await
     }
 
@@ -394,25 +386,20 @@ impl CrudStore {
         actor_id: Option<&str>,
         save_reason: ThreadAgentsDocSaveReason,
     ) -> thread_agents_doc::ThreadAgentsDocResult<ThreadAgentsDocRecord> {
-        retry_with_backoff(
-            || async {
-                thread_agents_doc::ThreadAgentsDocRepository::new()
-                    .save_content(
-                        &self.connection,
-                        workspace_id,
-                        folder_id,
-                        content,
-                        expected_version,
-                        thread_agents_doc::now(),
-                        actor_id,
-                        save_reason,
-                    )
-                    .await
-            },
-            |_| false,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
+        run_database_attempt(async {
+            thread_agents_doc::ThreadAgentsDocRepository::new()
+                .save_content(
+                    &self.connection,
+                    workspace_id,
+                    folder_id,
+                    content,
+                    expected_version,
+                    thread_agents_doc::now(),
+                    actor_id,
+                    save_reason,
+                )
+                .await
+        })
         .await
     }
 
@@ -423,23 +410,18 @@ impl CrudStore {
         expected_version: Option<i64>,
         actor_id: Option<&str>,
     ) -> thread_agents_doc::ThreadAgentsDocResult<Option<ThreadAgentsDocRecord>> {
-        retry_with_backoff(
-            || async {
-                thread_agents_doc::ThreadAgentsDocRepository::new()
-                    .archive(
-                        &self.connection,
-                        workspace_id,
-                        folder_id,
-                        expected_version,
-                        thread_agents_doc::now(),
-                        actor_id,
-                    )
-                    .await
-            },
-            |_| false,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
+        run_database_attempt(async {
+            thread_agents_doc::ThreadAgentsDocRepository::new()
+                .archive(
+                    &self.connection,
+                    workspace_id,
+                    folder_id,
+                    expected_version,
+                    thread_agents_doc::now(),
+                    actor_id,
+                )
+                .await
+        })
         .await
     }
 

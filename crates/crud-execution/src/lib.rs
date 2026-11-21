@@ -50,6 +50,7 @@ pub mod recovery_terminalization_outbox;
 pub mod recovery_terminalization_plan;
 pub mod recovery_values;
 pub mod recovery_watchdog;
+mod retry;
 pub mod time;
 pub mod timeout_recovery;
 pub mod tool_output;

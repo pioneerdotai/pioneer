@@ -1,3 +1,4 @@
+use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_snapshot_turn_item;
 use pioneer_crud_conversations::turn_item::turn_item_type_to_db;
 use crate::events::TurnEventPayload;
 use pioneer_crud_execution::time::unix_to_datetime;
@@ -129,8 +130,8 @@ impl CrudStore {
                     prepared_item.preserve_uncommitted_source_status(&transaction).await?;
                     pioneer_crud_conversations::turn_item::upsert_prepared_turn_item(&transaction, prepared_item).await?;
                     self.commit_episodic_source_save(&transaction, &episodic_source, updated_at).await?;
-                    self.project_semantic_timeline_snapshot_turn_item(
-                        &transaction,
+                    project_semantic_timeline_snapshot_turn_item(
+                        &*transaction,
                         notification.turn_id.as_str(),
                         notification.item.item_id(),
                         source_sequence,
