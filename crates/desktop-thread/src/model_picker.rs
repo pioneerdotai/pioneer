@@ -66,11 +66,12 @@ struct ModelSelectorDialogState {
     provider_search_input: Entity<InputState>,
     model_search_input: Entity<InputState>,
     provider_scroll_handle: ScrollHandle,
-    reasoning_scroll_handle: ScrollHandle,
     model_scroll_handle: VirtualListScrollHandle,
     provider_trigger_width_px: Rc<RefCell<f32>>,
     model_trigger_width_px: Rc<RefCell<f32>>,
-    reasoning_trigger_width_px: Rc<RefCell<f32>>,
+    reasoning_popover: ChoicePopover,
+    service_popover: ChoicePopover,
+    context_popover: ChoicePopover,
 }
 impl ModelSelectorDialogState {
     fn send(&self, intent: ComposerModelPickerIntent, cx: &mut App) {
@@ -142,11 +143,12 @@ impl ComposerModelPickerView {
                     .placeholder(t!("chat.composer.model.model_placeholder").to_string())
             }),
             provider_scroll_handle: ScrollHandle::new(),
-            reasoning_scroll_handle: ScrollHandle::new(),
             model_scroll_handle: VirtualListScrollHandle::new(),
             provider_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
             model_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
-            reasoning_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
+            reasoning_popover: ChoicePopover::new("reasoning-effort"),
+            service_popover: ChoicePopover::new("service-tier"),
+            context_popover: ChoicePopover::new("context-window"),
         };
         Self {
             client,
@@ -253,7 +255,7 @@ impl ComposerModelPickerView {
                             .into_any_element(),
                     ]))
                 .child(v_flex().w_full().pt_4().pb_5().child({
-                    let form = v_form()
+                    let mut form = v_form()
                         .child(Self::render_provider_selector_section(
                             state.clone(),
                             provider_trigger_label,
@@ -263,25 +265,17 @@ impl ComposerModelPickerView {
                             model_trigger_label,
                             model_trigger_loading,
                         ));
-                    let form = if let Some(service) =
-                        Self::render_service_selector_section(state.clone())
+                    if let Some(reasoning) = Self::render_reasoning_effort_selector_section(&state)
                     {
-                        form.child(service)
-                    } else {
-                        form
-                    };
-                    let form = if let Some(context) =
-                        Self::render_context_selector_section(state.clone())
-                    {
-                        form.child(context)
-                    } else {
-                        form
-                    };
-                    if let Some(reasoning) = Self::render_reasoning_effort_selector_section(state) {
-                        form.child(reasoning)
-                    } else {
-                        form
+                        form = form.child(reasoning);
                     }
+                    if let Some(service) = Self::render_service_selector_section(&state) {
+                        form = form.child(service);
+                    }
+                    if let Some(context) = Self::render_context_selector_section(&state) {
+                        form = form.child(context);
+                    }
+                    form
                 }))
         });
     }
@@ -327,17 +321,6 @@ impl ComposerModelPickerView {
             return Vec::new();
         }
         state.input.reasoning_rows.clone()
-    }
-
-    fn reasoning_effort_trigger_label(
-        rows: &[provider_presentation::ReasoningEffortRow],
-        configured: Option<&str>,
-    ) -> String {
-        rows.iter()
-            .find(|row| row.selected)
-            .map(|row| row.label.clone())
-            .or_else(|| configured.map(str::to_owned))
-            .unwrap_or_else(|| t!("chat.composer.model.reasoning_default").to_string())
     }
 
     fn render_provider_selector_section(
@@ -585,113 +568,111 @@ impl ComposerModelPickerView {
             )
     }
 
-    fn render_service_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
-        let rows = state.input.service_rows.clone();
+    fn render_service_selector_section(state: &ModelSelectorDialogState) -> Option<Field> {
+        let rows = &state.input.service_rows;
         if rows.is_empty() {
             return None;
         }
-        let mut choices = v_flex().gap_1().w_full();
-        if (state.input.selected_service_mode.is_some() && !rows.iter().any(|row| row.selected))
-            || rows.iter().any(|row| row.selected && !row.available)
-        {
-            choices = choices.child(
-                div()
-                    .text_sm()
-                    .child(t!("chat.composer.model.service_invalid").to_string()),
-            );
-        }
-        for row in rows {
-            let next = state.clone();
-            let id = row.id.clone();
-            let label = if id == "standard" {
-                t!("chat.composer.model.service_standard").to_string()
-            } else {
-                row.label
-            };
-            choices = choices.child(
-                default_outline_button(SharedString::from(format!("service-mode-{}", id)))
-                    .w_full()
-                    .label(label)
-                    .selected(row.selected)
-                    .disabled(!row.available)
-                    .on_click(move |_, _, cx| {
-                        next.send(
-                            ComposerModelPickerIntent::SelectServiceMode {
-                                identity: next.input.identity.clone(),
-                                id: id.clone(),
-                            },
-                            cx,
-                        );
-                    }),
-            );
-        }
+        let configured = state.input.selected_service_mode.as_ref();
+        let invalid = (configured.is_some() && !rows.iter().any(|row| row.selected))
+            || rows.iter().any(|row| row.selected && !row.available);
+        let choices = rows
+            .iter()
+            .map(|row| ChoicePopoverRow {
+                id: format!("service-mode-{}", row.id).into(),
+                label: if row.id == "standard" {
+                    t!("chat.composer.model.service_standard").to_string()
+                } else {
+                    row.label.clone()
+                },
+                selected: row.selected,
+                available: row.available,
+                intent: ComposerModelPickerIntent::SelectServiceMode {
+                    identity: state.input.identity.clone(),
+                    id: row.id.clone(),
+                },
+            })
+            .collect();
         Some(
             field()
                 .label(t!("chat.composer.model.service_label").to_string())
-                .child(choices),
+                .child(state.service_popover.render(
+                    state.owner.clone(),
+                    configured.map(|mode| mode.id.clone()),
+                    choices,
+                ))
+                .when(invalid, |field| {
+                    field.child(
+                        div()
+                            .text_sm()
+                            .child(t!("chat.composer.model.service_invalid").to_string()),
+                    )
+                }),
         )
     }
 
-    fn render_context_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
-        let rows = state.input.context_rows.clone();
+    fn render_context_selector_section(state: &ModelSelectorDialogState) -> Option<Field> {
+        let rows = &state.input.context_rows;
         if rows.is_empty() {
             return None;
         }
-        let invalid =
-            state.input.selected_context_window.is_some() && !rows.iter().any(|row| row.selected);
-        let mut choices = v_flex().gap_1().w_full();
-        if invalid {
-            choices = choices.child(
-                div()
-                    .text_sm()
-                    .child(t!("chat.composer.model.context_invalid").to_string()),
-            );
-        }
-        for row in rows {
-            let next = state.clone();
-            let window = row.window;
-            let label = if window.is_none() {
-                t!(
-                    "chat.composer.model.context_auto",
-                    tokens = row.tokens.to_string()
-                )
-                .to_string()
-            } else {
-                t!(
-                    "chat.composer.model.context_up_to",
-                    tokens = row.tokens.to_string()
-                )
-                .to_string()
-            };
-            choices = choices.child(
-                default_outline_button(SharedString::from(format!(
+        let configured = state.input.selected_context_window;
+        let invalid = configured.is_some() && !rows.iter().any(|row| row.selected);
+        let choices = rows
+            .iter()
+            .map(|row| ChoicePopoverRow {
+                id: format!(
                     "context-window-{}",
-                    window.map_or_else(|| "auto".into(), |v| v.to_string())
-                )))
-                .w_full()
-                .label(label)
-                .selected(row.selected)
-                .on_click(move |_, _, cx| {
-                    next.send(
-                        ComposerModelPickerIntent::SelectContextWindow {
-                            identity: next.input.identity.clone(),
-                            window,
-                        },
-                        cx,
-                    );
-                }),
-            );
-        }
+                    row.window.map_or_else(|| "auto".into(), |v| v.to_string())
+                )
+                .into(),
+                label: Self::context_window_label(row.window.is_none(), row.tokens),
+                selected: row.selected,
+                available: true,
+                intent: ComposerModelPickerIntent::SelectContextWindow {
+                    identity: state.input.identity.clone(),
+                    window: row.window,
+                },
+            })
+            .collect();
         Some(
             field()
                 .label(t!("chat.composer.model.context_label").to_string())
-                .child(choices),
+                .child(state.context_popover.render(
+                    state.owner.clone(),
+                    configured.map(|tokens| Self::context_window_label(false, tokens)),
+                    choices,
+                ))
+                .when(invalid, |field| {
+                    field.child(
+                        div()
+                            .text_sm()
+                            .child(t!("chat.composer.model.context_invalid").to_string()),
+                    )
+                }),
         )
     }
 
-    fn render_reasoning_effort_selector_section(state: ModelSelectorDialogState) -> Option<Field> {
+    fn context_window_label(auto: bool, tokens: u64) -> String {
+        if auto {
+            t!(
+                "chat.composer.model.context_auto",
+                tokens = tokens.to_string()
+            )
+            .to_string()
+        } else {
+            t!(
+                "chat.composer.model.context_up_to",
+                tokens = tokens.to_string()
+            )
+            .to_string()
+        }
+    }
+
+    fn render_reasoning_effort_selector_section(state: &ModelSelectorDialogState) -> Option<Field> {
         if state.input.default_reasoning_only {
-            let next = state.clone();
+            let owner = state.owner.clone();
+            let identity = state.input.identity.clone();
             return Some(
                 field()
                     .label(t!("chat.composer.model.reasoning_label").to_string())
@@ -700,188 +681,55 @@ impl ComposerModelPickerView {
                             .label(t!("chat.composer.model.reasoning_default").to_string())
                             .selected(state.input.selected_reasoning_effort.is_none())
                             .on_click(move |_, _, cx| {
-                                next.send(
-                                    ComposerModelPickerIntent::SelectReasoningEffort {
-                                        identity: next.input.identity.clone(),
-                                        effort: None,
-                                    },
-                                    cx,
-                                );
+                                let _ = owner.update(cx, |view, cx| {
+                                    view.send(
+                                        ComposerModelPickerIntent::SelectReasoningEffort {
+                                            identity: identity.clone(),
+                                            effort: None,
+                                        },
+                                        cx,
+                                    );
+                                });
                             }),
                     ),
             );
         }
-        let rows = Self::reasoning_effort_rows(&state);
+        let rows = Self::reasoning_effort_rows(state);
         if rows.is_empty() {
             return None;
         }
 
-        let reasoning_trigger_width_px = state.reasoning_trigger_width_px.clone();
-        let owner = state.owner.clone();
-        let trigger_label = Self::reasoning_effort_trigger_label(
-            rows.as_slice(),
-            state.input.selected_reasoning_effort.as_deref(),
-        );
+        let choices = std::iter::once(ChoicePopoverRow {
+            id: "reasoning-effort-opt-default".into(),
+            label: t!("chat.composer.model.reasoning_default").to_string(),
+            selected: state.input.selected_reasoning_effort.is_none(),
+            available: true,
+            intent: ComposerModelPickerIntent::SelectReasoningEffort {
+                identity: state.input.identity.clone(),
+                effort: None,
+            },
+        })
+        .chain(rows.into_iter().map(|row| ChoicePopoverRow {
+            id: format!("reasoning-effort-opt-{}", row.effort).into(),
+            label: row.label,
+            selected: row.selected,
+            available: true,
+            intent: ComposerModelPickerIntent::SelectReasoningEffort {
+                identity: state.input.identity.clone(),
+                effort: Some(row.effort),
+            },
+        }))
+        .collect();
 
         Some(
             field()
                 .label(t!("chat.composer.model.reasoning_label").to_string())
-                .child(
-                    div()
-                        .w_full()
-                        .relative()
-                        .child(
-                            Popover::new("model-reasoning-effort-popover")
-                                .trigger_style(StyleRefinement::default().w_full())
-                                .anchor(Anchor::TopLeft)
-                                .p_0()
-                                .trigger(SelectorPopoverTrigger::new(
-                                    "model-reasoning-effort-trigger",
-                                    trigger_label,
-                                    IconName::ChevronsUpDown,
-                                ))
-                                .content(move |_, _, popover_cx| {
-                                    Self::render_reasoning_effort_popover_content(
-                                        state.clone(),
-                                        popover_cx,
-                                    )
-                                }),
-                        )
-                        .child(
-                            canvas(
-                                move |bounds, _, cx| {
-                                    let measured_width = bounds.size.width.max(px(1.)).as_f32();
-                                    let mut cached_width = reasoning_trigger_width_px.borrow_mut();
-                                    if (measured_width - *cached_width).abs() > 1.0 {
-                                        *cached_width = measured_width;
-                                        let _ = owner.update(cx, |_view, cx| {
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        ),
-                ),
+                .child(state.reasoning_popover.render(
+                    state.owner.clone(),
+                    state.input.selected_reasoning_effort.clone(),
+                    choices,
+                )),
         )
-    }
-
-    fn render_reasoning_effort_popover_content(
-        state: ModelSelectorDialogState,
-        popover_cx: &mut Context<PopoverState>,
-    ) -> AnyElement {
-        let popover_entity: Entity<PopoverState> = popover_cx.entity();
-        let theme = popover_cx.theme();
-        let foreground = theme.foreground;
-        let muted_bg = theme.muted;
-        let ghost_hover = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.2).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.1).opacity(0.8)
-        };
-        let ghost_active = if theme.mode.is_dark() {
-            theme.secondary.lighten(0.3).opacity(0.8)
-        } else {
-            theme.secondary.darken(0.2).opacity(0.8)
-        };
-        let popover_width =
-            px((*state.reasoning_trigger_width_px.borrow()).max(SELECTOR_POPOVER_FALLBACK_WIDTH));
-        let rows = Self::reasoning_effort_rows(&state);
-
-        let mut list = v_flex()
-            .id("reasoning-effort-popover-list")
-            .max_h(px(200.))
-            .overflow_y_scroll()
-            .track_scroll(&state.reasoning_scroll_handle);
-        let default_selected = state.input.selected_reasoning_effort.is_none();
-        let default_state = state.clone();
-        let default_popover_entity = popover_entity.clone();
-
-        list = list.child(
-            div()
-                .id("reasoning-effort-opt-default")
-                .w_full()
-                .cursor_pointer()
-                .px_2()
-                .py_1p5()
-                .text_sm()
-                .text_color(foreground)
-                .when(default_selected, |d| d.bg(muted_bg))
-                .hover(move |d| d.bg(ghost_hover))
-                .active(move |d| d.bg(ghost_active))
-                .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                    window.prevent_default();
-                })
-                .on_click(move |_, window, cx| {
-                    default_state.send(
-                        ComposerModelPickerIntent::SelectReasoningEffort {
-                            identity: default_state.input.identity.clone(),
-                            effort: None,
-                        },
-                        cx,
-                    );
-                    let _ = default_popover_entity.update(cx, |popover, cx| {
-                        popover.dismiss(window, cx);
-                    });
-                    let _ = default_state.owner.update(cx, |_, cx| cx.notify());
-                })
-                .child(t!("chat.composer.model.reasoning_default").to_string()),
-        );
-
-        for row in rows {
-            let row_state = state.clone();
-            let popover_entity = popover_entity.clone();
-            let effort = row.effort.clone();
-            let id: SharedString = format!("reasoning-effort-opt-{}", row.effort).into();
-
-            list = list.child(
-                div()
-                    .id(id)
-                    .w_full()
-                    .cursor_pointer()
-                    .px_2()
-                    .py_1p5()
-                    .text_sm()
-                    .text_color(foreground)
-                    .when(row.selected, |d| d.bg(muted_bg))
-                    .hover(move |d| d.bg(ghost_hover))
-                    .active(move |d| d.bg(ghost_active))
-                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
-                        window.prevent_default();
-                    })
-                    .on_click(move |_, window, cx| {
-                        row_state.send(
-                            ComposerModelPickerIntent::SelectReasoningEffort {
-                                identity: row_state.input.identity.clone(),
-                                effort: Some(effort.clone()),
-                            },
-                            cx,
-                        );
-                        let _ = popover_entity.update(cx, |popover, cx| {
-                            popover.dismiss(window, cx);
-                        });
-                        let _ = row_state.owner.update(cx, |_, cx| cx.notify());
-                    })
-                    .child(row.label),
-            );
-        }
-
-        v_flex()
-            .w(popover_width)
-            .child(
-                div().relative().child(list).child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(Scrollbar::vertical(&state.reasoning_scroll_handle)),
-                ),
-            )
-            .into_any_element()
     }
 
     fn render_model_popover_content(
@@ -1217,6 +1065,152 @@ impl Drop for ComposerModelPickerView {
         self.retire();
     }
 }
+struct ChoicePopoverRow {
+    id: SharedString,
+    label: String,
+    selected: bool,
+    available: bool,
+    intent: ComposerModelPickerIntent,
+}
+
+#[derive(Clone)]
+struct ChoicePopover {
+    id: &'static str,
+    trigger_width_px: Rc<RefCell<f32>>,
+    scroll_handle: ScrollHandle,
+}
+
+impl ChoicePopover {
+    fn new(id: &'static str) -> Self {
+        Self {
+            id,
+            trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
+            scroll_handle: ScrollHandle::new(),
+        }
+    }
+
+    fn render(
+        &self,
+        owner: WeakEntity<ComposerModelPickerView>,
+        configured_label: Option<String>,
+        rows: Vec<ChoicePopoverRow>,
+    ) -> Div {
+        let trigger_label = rows
+            .iter()
+            .find(|row| row.selected)
+            .map(|row| row.label.clone())
+            .or(configured_label)
+            .or_else(|| rows.first().map(|row| row.label.clone()))
+            .unwrap_or_default();
+        let id = self.id;
+        let layout = self.clone();
+        let trigger_width_px = self.trigger_width_px.clone();
+        let content_owner = owner.clone();
+
+        div()
+            .w_full()
+            .relative()
+            .child(
+                Popover::new(SharedString::from(format!("model-{id}-popover")))
+                    .trigger_style(StyleRefinement::default().w_full())
+                    .anchor(Anchor::TopLeft)
+                    .p_0()
+                    .trigger(SelectorPopoverTrigger::new(
+                        SharedString::from(format!("model-{id}-trigger")),
+                        trigger_label,
+                        IconName::ChevronsUpDown,
+                    ))
+                    .content(move |_, _, cx| layout.render_content(&content_owner, &rows, cx)),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        let measured_width = bounds.size.width.max(px(1.)).as_f32();
+                        let mut cached_width = trigger_width_px.borrow_mut();
+                        if (measured_width - *cached_width).abs() > 1.0 {
+                            *cached_width = measured_width;
+                            let _ = owner.update(cx, |_, cx| cx.notify());
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+    }
+
+    fn render_content(
+        &self,
+        owner: &WeakEntity<ComposerModelPickerView>,
+        rows: &[ChoicePopoverRow],
+        cx: &mut Context<PopoverState>,
+    ) -> AnyElement {
+        let popover = cx.entity();
+        let theme = cx.theme();
+        let ghost_hover = if theme.mode.is_dark() {
+            theme.secondary.lighten(0.2).opacity(0.8)
+        } else {
+            theme.secondary.darken(0.1).opacity(0.8)
+        };
+        let ghost_active = if theme.mode.is_dark() {
+            theme.secondary.lighten(0.3).opacity(0.8)
+        } else {
+            theme.secondary.darken(0.2).opacity(0.8)
+        };
+
+        let list = v_flex()
+            .id(SharedString::from(format!("{}-popover-list", self.id)))
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .children(rows.iter().map(|row| {
+                div()
+                    .id(row.id.clone())
+                    .w_full()
+                    .px_2()
+                    .py_1p5()
+                    .text_sm()
+                    .text_color(if row.available {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .when(row.selected, |d| d.bg(theme.muted))
+                    .when(row.available, |d| {
+                        let owner = owner.clone();
+                        let popover = popover.clone();
+                        let intent = row.intent.clone();
+                        d.cursor_pointer()
+                            .hover(move |d| d.bg(ghost_hover))
+                            .active(move |d| d.bg(ghost_active))
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
+                                window.prevent_default();
+                            })
+                            .on_click(move |_, window, cx| {
+                                let _ = owner.update(cx, |view, cx| view.send(intent.clone(), cx));
+                                popover.update(cx, |popover, cx| popover.dismiss(window, cx));
+                            })
+                    })
+                    .child(row.label.clone())
+            }));
+
+        v_flex()
+            .w(px(*self.trigger_width_px.borrow()))
+            .child(
+                div().relative().child(list).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(Scrollbar::vertical(&self.scroll_handle)),
+                ),
+            )
+            .into_any_element()
+    }
+}
+
 #[derive(gpui_kit::IntoElement)]
 struct SelectorPopoverTrigger {
     id: ElementId,
