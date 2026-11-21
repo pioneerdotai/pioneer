@@ -2,6 +2,7 @@
 //! bookkeeping never borrows the critical scope of the domain repair.
 use anyhow::Result;
 use pioneer_entity::{task_run, task_run_occurrence_reconcile_pending as pending, turn, workspace};
+use pioneer_protocol::{TaskRunStatus, TurnStatus};
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, Query, SelectStatement, SimpleExpr};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -128,6 +129,21 @@ fn mismatch_query(run_id: &str) -> SelectStatement {
             t(turn::Column::Status).into(),
         ))
         .to_owned()
+}
+
+/// The authoritative terminal status for the occurrence Turn of a finished run.
+pub const fn terminal_turn_status(run: TaskRunStatus) -> Option<TurnStatus> {
+    match run {
+        TaskRunStatus::Succeeded => Some(TurnStatus::Completed),
+        TaskRunStatus::Failed | TaskRunStatus::TimedOut => Some(TurnStatus::Failed),
+        TaskRunStatus::Blocked => Some(TurnStatus::Blocked),
+        TaskRunStatus::Cancelled => Some(TurnStatus::Interrupted),
+        TaskRunStatus::Queued
+        | TaskRunStatus::Starting
+        | TaskRunStatus::Running
+        | TaskRunStatus::Waiting
+        | TaskRunStatus::WaitingReview => None,
+    }
 }
 
 // A separate expression keeps NULL/unknown semantics testable without
@@ -361,4 +377,102 @@ pub async fn next_deadline<C: ConnectionTrait>(db: &C) -> Result<Option<i64>> {
         .into_tuple::<i64>()
         .one(db)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{task_occurrence_producers, test_support::occurrence::seed_occurrence_pair};
+    use pioneer_postgres_test::with_database;
+    use sea_orm::DbBackend;
+
+    #[tokio::test]
+    async fn predicate_matrix_and_unknown_null_semantics_match_original_sql() -> Result<()> {
+        with_database(async |database| {
+            let db = database.connection();
+            seed_occurrence_pair(db).await;
+            const RUN: &str = "occurrence-run";
+            db.execute_unprepared(
+                "INSERT INTO turn (id, thread_id, status, turn_kind)
+                 VALUES ('occurrence-run', 'parent-thread', 'in_progress', 'task_run')",
+            )
+            .await?;
+            for (run_status, target) in [
+                ("succeeded", Some(("completed", TurnStatus::Completed))),
+                ("failed", Some(("failed", TurnStatus::Failed))),
+                ("timed_out", Some(("failed", TurnStatus::Failed))),
+                ("blocked", Some(("blocked", TurnStatus::Blocked))),
+                ("cancelled", Some(("interrupted", TurnStatus::Interrupted))),
+                ("running", None),
+                ("unknown", None),
+            ] {
+                assert_eq!(
+                    crate::status::task_run_status_from_db(run_status)
+                        .and_then(terminal_turn_status),
+                    target.map(|(_, status)| status),
+                );
+                let tx = db.begin().await?;
+                let before = task_run::Entity::find_by_id(RUN).one(&tx).await?.unwrap();
+                task_run::Entity::update_many()
+                    .filter(task_run::Column::Id.eq(RUN))
+                    .col_expr(task_run::Column::Status, Expr::val(run_status))
+                    .exec(&tx)
+                    .await?;
+                let after = task_run::Entity::find_by_id(RUN).one(&tx).await?.unwrap();
+                task_occurrence_producers::run_change(&tx, Some(&before), Some(&after)).await?;
+                tx.commit().await?;
+                for status in [
+                    "in_progress",
+                    "completed",
+                    "failed",
+                    "blocked",
+                    "interrupted",
+                    "unknown",
+                ] {
+                    let tx = db.begin().await?;
+                    let before = turn::Entity::find_by_id(RUN).one(&tx).await?.unwrap();
+                    turn::Entity::update_many()
+                        .filter(turn::Column::Id.eq(RUN))
+                        .col_expr(turn::Column::Status, Expr::val(status))
+                        .exec(&tx)
+                        .await?;
+                    let after = turn::Entity::find_by_id(RUN).one(&tx).await?.unwrap();
+                    task_occurrence_producers::turn_change(&tx, Some(&before), Some(&after))
+                        .await?;
+                    tx.commit().await?;
+                    let expected = target.is_some_and(|(target, _)| target != status);
+                    assert_eq!(
+                        pending::Entity::find_by_id(RUN).one(db).await?.is_some(),
+                        expected,
+                        "{run_status}/{status}",
+                    );
+                    assert_eq!(is_mismatch(db, RUN).await?, expected);
+                }
+            }
+            // Check NULL without weakening the production tables' NOT NULL constraints.
+            for (run, turn, expected) in [
+                (None, Some("failed"), false),
+                (Some("succeeded"), None, false),
+                (Some("unknown"), Some("failed"), false),
+                (Some("succeeded"), Some("unknown"), true),
+                (Some("blocked"), Some("blocked"), false),
+            ] {
+                let query = Query::select()
+                    .expr(Expr::val(1))
+                    .and_where(mismatch_status_predicate(
+                        Expr::val(run).into(),
+                        Expr::val(turn).into(),
+                    ))
+                    .to_owned();
+                assert_eq!(
+                    db.query_one_raw(DbBackend::Postgres.build(&query))
+                        .await?
+                        .is_some(),
+                    expected,
+                );
+            }
+            Ok(())
+        })
+        .await
+    }
 }

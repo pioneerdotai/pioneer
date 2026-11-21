@@ -168,9 +168,10 @@ impl GatewayMemoryRuntime {
 mod scope_contract_tests {
     use super::*;
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn scoped_turn_grants_stable_owners_but_not_global_or_foreign_memory() {
-        let store = Arc::new(CrudStore::new(sea_orm::DatabaseConnection::default()));
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let store = Arc::new(CrudStore::new(fixture.connection()));
         let runtime = GatewayMemoryRuntime::disabled(store);
         let turn = MemoryTurnContext {
             workspace_id: "workspace".to_owned(),

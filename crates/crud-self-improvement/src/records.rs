@@ -1,3 +1,4 @@
+use pioneer_protocol::SkillId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfImprovementWorkspaceStateRecord {
     pub workspace_id: String,
@@ -112,4 +113,129 @@ impl SelfImprovementRunRecord {
             pipeline_contract_version: self.pipeline_contract_version.clone(),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillEvidenceTime {
+    /// Oldest of the newest supporting message dates, one per selected observation.
+    pub confirmed_at_unix: i64,
+    /// Newest actual supporting message, never the time of learning/version creation.
+    pub latest_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillCreate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
+    pub skill_id: SkillId,
+    pub version_id: String,
+    pub slug: String,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillUpdate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
+    pub skill_id: SkillId,
+    pub expected_active_version_id: String,
+    pub version_id: String,
+    pub version_number: i64,
+    pub slug: String,
+    pub candidate_key: String,
+    pub display_name: String,
+    pub skill_markdown: String,
+    pub instruction_body: String,
+    pub when_to_use: String,
+    pub when_not_to_use: String,
+    pub fingerprint: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedAgentSkillRollback {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
+    pub skill_id: SkillId,
+    pub expected_active_version_id: String,
+    pub target_parent_version_id: String,
+    pub candidate_key: String,
+    pub source_turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfImprovementNoChangeReason {
+    NoCandidate,
+    ReviewerRejected,
+    HostValidationRejected,
+    ModelContractRejected,
+}
+
+impl SelfImprovementNoChangeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCandidate => "no_candidate",
+            Self::ReviewerRejected => "reviewer_rejected",
+            Self::HostValidationRejected => "host_validation_rejected",
+            Self::ModelContractRejected => "model_contract_rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfImprovementFinalOutcome {
+    AcceptedCreate(AcceptedAgentSkillCreate),
+    AcceptedUpdate(AcceptedAgentSkillUpdate),
+    AcceptedRollback(AcceptedAgentSkillRollback),
+    NoChange {
+        reason: SelfImprovementNoChangeReason,
+        reason_codes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeSelfImprovementRunInput {
+    pub fence: SelfImprovementRunFence,
+    pub authority: SelfImprovementFinalizationAuthority,
+    pub outcome: SelfImprovementFinalOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfImprovementFinalizationConflict {
+    SkillIdentity,
+    VersionIdentity,
+    Slug,
+    Fingerprint,
+    Candidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeSelfImprovementRunResult {
+    Applied {
+        skill_id: SkillId,
+        version_id: String,
+    },
+    NoChange {
+        reason: SelfImprovementNoChangeReason,
+    },
+    AlreadyFinalized,
+    Stale,
+    Conflict(SelfImprovementFinalizationConflict),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfImprovementSourceTurnRecord {
+    pub id: i64,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub parent_turn_created_at_unix: i64,
+    pub task_delivery_id: Option<String>,
+    pub terminal_event_id: String,
+    pub terminal_at_unix: i64,
+    pub created_at_unix: i64,
 }

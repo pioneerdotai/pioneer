@@ -245,25 +245,13 @@ impl CrudStore {
         } else {
             None
         };
-        let (desired_status, desired_error) = match run_status {
-            TaskRunStatus::Succeeded => (TurnStatus::Completed, None),
-            TaskRunStatus::Failed | TaskRunStatus::TimedOut => {
-                (TurnStatus::Failed, desired_error.clone())
+        let Some(desired_status) = queue::terminal_turn_status(run_status) else {
+            if background {
+                return Ok(Preparation::Unchanged(
+                    TaskRunOccurrenceTerminalizationOutcome::StaleClaim,
+                ));
             }
-            TaskRunStatus::Blocked => (TurnStatus::Blocked, desired_error.clone()),
-            TaskRunStatus::Cancelled => (TurnStatus::Interrupted, desired_error.clone()),
-            TaskRunStatus::Queued
-            | TaskRunStatus::Starting
-            | TaskRunStatus::Running
-            | TaskRunStatus::Waiting
-            | TaskRunStatus::WaitingReview => {
-                if background {
-                    return Ok(Preparation::Unchanged(
-                        TaskRunOccurrenceTerminalizationOutcome::StaleClaim,
-                    ));
-                }
-                bail!("active TaskRun cannot terminalize its occurrence Turn");
-            }
+            bail!("active TaskRun cannot terminalize its occurrence Turn");
         };
         let Some(prepared_turn_model) =
             turn::find_turn_by_id(&self.connection, run_id.as_str()).await?

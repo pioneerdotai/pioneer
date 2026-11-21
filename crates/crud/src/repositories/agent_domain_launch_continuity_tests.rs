@@ -1,6 +1,8 @@
 use super::*;
+use pioneer_crud_execution::agent_action_commit::revalidate_agent_route_for_commit;
 use pioneer_postgres_test::TestDatabase;
 use sea_orm::{ActiveModelTrait, PaginatorTrait};
+use sha2::{Digest, Sha256};
 
 async fn store(fixture: &TestDatabase) -> crate::CrudStore {
     crate::tests::postgres_store_with_workspace(fixture, "continuity-workspace").await
@@ -703,7 +705,7 @@ async fn capsule_route_commit_revalidates_saved_receipt_against_current_route() 
             .await
             .unwrap()
             .unwrap();
-        db.execute_raw(Statement::from_sql_and_values(
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Postgres,
             "INSERT INTO agent_execution (id, workspace_id, agent_identity_id,
                         identity_source_revision, identity_source_fingerprint, home_root_thread_id,

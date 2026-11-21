@@ -4167,12 +4167,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fallible_collections"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11464,7 +11458,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
- "pioneer-crud-execution",
+ "pioneer-crud-artifacts",
  "pioneer-entity",
  "pioneer-postgres-test",
  "pioneer-protocol",
@@ -11480,14 +11474,20 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
+ "pioneer-crud-conversations",
  "pioneer-entity",
  "pioneer-migration",
  "pioneer-postgres-test",
  "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -11495,14 +11495,25 @@ name = "pioneer-crud-compaction"
 version = "0.73.0"
 dependencies = [
  "anyhow",
+ "futures-util",
+ "hex",
  "pioneer-compaction",
+ "pioneer-crud-artifacts",
+ "pioneer-crud-conversations",
+ "pioneer-crud-execution",
  "pioneer-crud-payloads",
  "pioneer-crud-tasks",
  "pioneer-entity",
+ "pioneer-observability",
  "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
+ "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -11512,6 +11523,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "pioneer-crud-access",
  "pioneer-crud-payloads",
  "pioneer-entity",
  "pioneer-postgres-test",
@@ -11522,6 +11534,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -11532,16 +11545,22 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "pioneer-crud-access",
+ "pioneer-crud-conversations",
  "pioneer-crud-payloads",
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
  "pioneer-postgres-test",
  "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -11551,6 +11570,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "pioneer-crud-conversations",
  "pioneer-entity",
  "pioneer-postgres-test",
  "pioneer-protocol",
@@ -11568,14 +11588,17 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "pioneer-apps",
  "pioneer-entity",
  "pioneer-migration",
  "pioneer-postgres-test",
  "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 
@@ -11601,8 +11624,14 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "pioneer-crud-access",
+ "pioneer-crud-conversations",
+ "pioneer-crud-packages",
+ "pioneer-crud-tasks",
  "pioneer-entity",
  "pioneer-postgres-test",
+ "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
  "serde_json",
  "tokio",
@@ -11615,15 +11644,18 @@ dependencies = [
  "anyhow",
  "chrono",
  "pioneer-crud-access",
+ "pioneer-crud-conversations",
  "pioneer-crud-execution",
  "pioneer-crud-payloads",
  "pioneer-entity",
  "pioneer-postgres-test",
  "pioneer-protocol",
+ "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -11918,6 +11950,8 @@ dependencies = [
  "pioneer-compaction",
  "pioneer-config",
  "pioneer-crud",
+ "pioneer-crud-payloads",
+ "pioneer-crud-tasks",
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-keystore",
@@ -12172,6 +12206,7 @@ version = "0.73.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "pioneer-entity",
  "pioneer-migration",
  "pioneer-postgres-test-macros",
  "process-wrap",
@@ -12299,7 +12334,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "env_logger 0.11.11",
- "fs4",
  "futures-util",
  "lazy_static",
  "log",
@@ -12307,17 +12341,15 @@ dependencies = [
  "names",
  "owning_ref",
  "pioneer-observability",
+ "pioneer-postgres-test",
  "pretty_assertions",
  "rand 0.10.3",
- "rusqlite",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
- "sqlite-vec",
  "tokio",
  "tracing",
- "zstd 0.14.3",
 ]
 
 [[package]]
@@ -13908,30 +13940,6 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rsqlite-vfs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
-dependencies = [
- "hashbrown 0.16.1",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
-dependencies = [
- "bitflags 2.13.2",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "libsqlite3-sys",
- "smallvec",
- "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -15756,27 +15764,6 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "sqlite-vec"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ec77b84fb8dd5f0f8def127226db83b5d1152c5bf367f09af03998b76ba554a"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "sqlite-wasm-rs"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
-dependencies = [
- "cc",
- "js-sys",
- "rsqlite-vfs",
- "wasm-bindgen",
 ]
 
 [[package]]

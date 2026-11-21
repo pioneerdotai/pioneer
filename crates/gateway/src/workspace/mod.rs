@@ -3,7 +3,7 @@ use pioneer_entity::workspace;
 use pioneer_protocol::Workspace;
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_sqlite_lock_message, retry_with_backoff,
+    is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::ConnectionTrait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
@@ -27,6 +27,7 @@ pub enum WorkspaceError {
     WorkspaceNotFound(String),
     WorkspaceInactive(String),
     Internal(String),
+    DatabaseConflict(String),
 }
 
 impl std::fmt::Display for WorkspaceError {
@@ -39,7 +40,7 @@ impl std::fmt::Display for WorkspaceError {
             }
             Self::WorkspaceNotFound(id) => write!(f, "workspace `{id}` does not exist"),
             Self::WorkspaceInactive(id) => write!(f, "workspace `{id}` is not active"),
-            Self::Internal(message) => f.write_str(message),
+            Self::Internal(message) | Self::DatabaseConflict(message) => f.write_str(message),
         }
     }
 }
@@ -99,7 +100,7 @@ impl WorkspaceManager {
             .list_active_workspace_page(after)
             .await
             .map_err(|error| {
-                WorkspaceError::Internal(format!("failed to page active workspaces: {error}"))
+                workspace_storage_error(error, "failed to page active workspaces".to_owned())
             })
     }
 
@@ -120,7 +121,7 @@ impl WorkspaceManager {
             let models = workspace_repository::list(&self.connection)
                 .await
                 .map_err(|error| {
-                    WorkspaceError::Internal(format!("failed to query workspaces: {error}"))
+                    workspace_storage_error(error, "failed to query workspaces".to_owned())
                 })?;
 
             Ok(models.into_iter().map(model_to_workspace).collect())
@@ -145,9 +146,10 @@ impl WorkspaceManager {
                 .await
                 .map(|models| models.into_iter().map(model_to_workspace).collect())
                 .map_err(|error| {
-                    WorkspaceError::Internal(format!(
-                        "failed to query authorized workspaces: {error}"
-                    ))
+                    workspace_storage_error(
+                        error,
+                        "failed to query authorized workspaces".to_owned(),
+                    )
                 })
         })
         .await
@@ -175,9 +177,10 @@ impl WorkspaceManager {
         }
         .await;
         let (model, inserted) = result.map_err(|error| {
-            WorkspaceError::Internal(format!(
-                "failed to create workspace `{workspace_id}`: {error:#}"
-            ))
+            workspace_storage_error(
+                error,
+                format!("failed to create workspace `{workspace_id}`"),
+            )
         })?;
         if inserted {
             self.changes.committed();
@@ -209,21 +212,23 @@ impl WorkspaceManager {
                         Ok(model_to_workspace(model))
                     }
                     Err(insert_error) => {
-                        let existing = workspace::Entity::find_by_id(
-                            DEFAULT_WORKSPACE_ID.to_owned(),
-                        )
-                        .one(&self.connection)
-                        .await
-                        .map_err(|error| {
-                            WorkspaceError::Internal(format!(
-                                "failed to query default workspace after insert failure: {error}"
-                            ))
-                        })?;
+                        let existing =
+                            workspace::Entity::find_by_id(DEFAULT_WORKSPACE_ID.to_owned())
+                                .one(&self.connection)
+                                .await
+                                .map_err(|error| {
+                                    workspace_storage_error(
+                                        error,
+                                        "failed to query default workspace after insert failure"
+                                            .to_owned(),
+                                    )
+                                })?;
 
                         let Some(existing) = existing else {
-                            return Err(WorkspaceError::Internal(format!(
-                                "failed to ensure default workspace: {insert_error}"
-                            )));
+                            return Err(workspace_storage_error(
+                                insert_error,
+                                "failed to ensure default workspace".to_owned(),
+                            ));
                         };
 
                         if existing.is_active && existing.is_current {
@@ -236,9 +241,11 @@ impl WorkspaceManager {
                         active.is_current = Set(true);
 
                         let updated = active.update(&self.connection).await.map_err(|error| {
-                            WorkspaceError::Internal(format!(
-                                "failed to activate default workspace after insert failure: {error}"
-                            ))
+                            workspace_storage_error(
+                                error,
+                                "failed to activate default workspace after insert failure"
+                                    .to_owned(),
+                            )
                         })?;
 
                         self.changes.committed();
@@ -254,10 +261,13 @@ impl WorkspaceManager {
         )
         .await
         .map_err(|error| {
-            WorkspaceError::Internal(format!(
-                "failed to seed reserved Pioneer identity for workspace `{}`: {error:#}",
-                workspace.id
-            ))
+            workspace_storage_error(
+                error,
+                format!(
+                    "failed to seed reserved Pioneer identity for workspace `{}`",
+                    workspace.id
+                ),
+            )
         })?;
         Ok(workspace)
     }
@@ -279,9 +289,10 @@ impl WorkspaceManager {
                 list_active_workspaces_for_principal(&self.connection, proof.principal_id())
                     .await
                     .map_err(|error| {
-                        WorkspaceError::Internal(format!(
-                            "failed to query authorized default workspace: {error}"
-                        ))
+                        workspace_storage_error(
+                            error,
+                            "failed to query authorized default workspace".to_owned(),
+                        )
                     })?
                     .into_iter()
                     .map(model_to_workspace)
@@ -310,23 +321,25 @@ impl WorkspaceManager {
         self.run_with_retry(|| async {
             let workspace_id = normalize_workspace_id(requested_workspace_id)?;
             let transaction = self.connection.begin().await.map_err(|error| {
-                WorkspaceError::Internal(format!(
-                    "failed to start workspace select transaction: {error}"
-                ))
+                workspace_storage_error(
+                    error,
+                    "failed to start workspace select transaction".to_owned(),
+                )
             })?;
 
             workspace_repository::lock_current_selection(&transaction)
                 .await
                 .map_err(|error| {
-                    WorkspaceError::Internal(format!("lock workspace selection: {error:#}"))
+                    workspace_storage_error(error, "lock workspace selection".to_owned())
                 })?;
             let model = find_active_workspace(&transaction, workspace_id.as_str()).await?;
 
             if model.is_current {
                 transaction.commit().await.map_err(|error| {
-                    WorkspaceError::Internal(format!(
-                        "failed to commit workspace select transaction: {error}"
-                    ))
+                    workspace_storage_error(
+                        error,
+                        "failed to commit workspace select transaction".to_owned(),
+                    )
                 })?;
                 return Ok(model_to_workspace(model));
             }
@@ -337,12 +350,13 @@ impl WorkspaceManager {
                 chrono::Utc::now().fixed_offset(),
             )
             .await
-            .map_err(|error| WorkspaceError::Internal(format!("select workspace: {error:#}")))?;
+            .map_err(|error| workspace_storage_error(error, "select workspace".to_owned()))?;
 
             transaction.commit().await.map_err(|error| {
-                WorkspaceError::Internal(format!(
-                    "failed to commit workspace select transaction: {error}"
-                ))
+                workspace_storage_error(
+                    error,
+                    "failed to commit workspace select transaction".to_owned(),
+                )
             })?;
 
             self.changes.committed();
@@ -383,7 +397,7 @@ impl WorkspaceManager {
                 chrono::Utc::now().fixed_offset(),
             )
             .await
-            .map_err(|error| WorkspaceError::Internal(format!("rename workspace: {error:#}")))?;
+            .map_err(|error| workspace_storage_error(error, "rename workspace".to_owned()))?;
 
             self.changes.committed();
             Ok(model_to_workspace(updated))
@@ -398,7 +412,7 @@ impl WorkspaceManager {
     {
         retry_with_backoff(
             operation,
-            is_workspace_sqlite_lock_error,
+            |error| matches!(error, WorkspaceError::DatabaseConflict(_)),
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
@@ -424,9 +438,7 @@ where
     let model = workspace_repository::find(connection, workspace_id)
         .await
         .map_err(|error| {
-            WorkspaceError::Internal(format!(
-                "failed to query workspace `{workspace_id}`: {error}"
-            ))
+            workspace_storage_error(error, format!("failed to query workspace `{workspace_id}`"))
         })?;
 
     let Some(model) = model else {
@@ -472,12 +484,12 @@ fn model_to_workspace(model: workspace::Model) -> Workspace {
     }
 }
 
-fn is_workspace_sqlite_lock_error(error: &WorkspaceError) -> bool {
-    let WorkspaceError::Internal(message) = error else {
-        return false;
-    };
-
-    is_sqlite_lock_message(message)
+fn workspace_storage_error(error: impl Into<anyhow::Error>, message: String) -> WorkspaceError {
+    if is_retryable_database_conflict(&error.into()) {
+        WorkspaceError::DatabaseConflict(message)
+    } else {
+        WorkspaceError::Internal(message)
+    }
 }
 
 #[cfg(test)]

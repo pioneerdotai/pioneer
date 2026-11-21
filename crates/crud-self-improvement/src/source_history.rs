@@ -4,7 +4,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, Condition as Cond, ConnectionTrait, EntityTrait, JoinType, QueryFilter,
-    QuerySelect, Select,
+    QueryOrder, QuerySelect, Select,
 };
 
 pub const SOURCE_ORIGINS: [&str; 3] = ["collaborative", "direct_message", "user"];
@@ -177,4 +177,38 @@ pub fn prepare_source_turn_check(
         expected_count,
         query,
     }))
+}
+
+pub async fn source_head<C: ConnectionTrait>(db: &C, workspace_id: &str) -> Result<i64> {
+    Ok(self_improvement_source_turn::Entity::find()
+        .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .order_by_desc(self_improvement_source_turn::Column::Id)
+        .one(db)
+        .await
+        .with_context(|| {
+            format!("failed to read self-improvement source head for workspace `{workspace_id}`")
+        })?
+        .map(|row| row.id)
+        .unwrap_or(0))
+}
+
+pub async fn contains_source_id<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    source_id: i64,
+) -> Result<bool> {
+    if source_id <= 0 {
+        return Ok(false);
+    }
+    Ok(self_improvement_source_turn::Entity::find_by_id(source_id)
+        .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .one(db)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to verify self-improvement source `{source_id}` for workspace \
+                     `{workspace_id}`"
+            )
+        })?
+        .is_some())
 }

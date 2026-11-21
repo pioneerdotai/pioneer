@@ -12,6 +12,7 @@ use anyhow::Result;
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
 use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
+use sea_orm::TransactionTrait;
 
 impl CrudStore {
     pub async fn compaction_assert_history_scope(
@@ -37,69 +38,14 @@ impl CrudStore {
         turn: &str,
         item: &str,
     ) -> Result<Option<serde_json::Value>> {
-        repositories::compaction::tool_result_access_source(self, workspace, thread, turn, item)
-            .await
-    }
-
-    /// One restart-safe, payload-free page of legacy history preparation.
-    /// Dropping the caller cancels work; a later caller resumes its durable cursor.
-    pub async fn compaction_prepare_history_quantum(
-        &self,
-        workspace: &str,
-        thread: &str,
-    ) -> Result<bool> {
-        let change = self.connection.work_signal("compaction").changing();
-        let result = async {
-            self.run_scoped_database_quantum(|| {
-                repositories::compaction_preparation::quantum(self, workspace, thread)
-            })
-            .await
-        }
-        .await;
-        if let Ok((_, changed)) = &result {
-            change.completed(*changed);
-        }
-        result.map(|(ready, _)| ready)
-    }
-
-    pub async fn compaction_history_prepared(&self, workspace: &str, thread: &str) -> Result<bool> {
-        repositories::compaction_preparation::ready(self, workspace, thread).await
-    }
-
-    /// Register one bounded provider-context page for a single retained turn.
-    /// This intentionally does not advance the thread-wide preparation cursor.
-    pub async fn compaction_prepare_turn_context_quantum(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        after_sequence: i64,
-    ) -> Result<Option<i64>> {
-        self.run_scoped_database_quantum(|| {
-            repositories::compaction_preparation::turn_context_quantum(
-                self,
-                workspace,
-                thread,
-                turn,
-                after_sequence,
-            )
-        })
+        pioneer_crud_conversations::tool_result_access::tool_result_access_source(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            item,
+        )
         .await
-    }
-
-    /// Explicit, bounded legacy registration for exact sources that are not
-    /// covered by sequenced history discovery (notably frozen tool items).
-    pub async fn compaction_prepare_references(
-        &self,
-        workspace: &str,
-        source_thread: &str,
-        sources: &[SourceRef],
-    ) -> Result<()> {
-        for batch in sources.chunks(repositories::compaction::SOURCE_PAGE_ROWS as usize) {
-            repositories::compaction_preparation::references(self, workspace, source_thread, batch)
-                .await?;
-        }
-        Ok(())
     }
 
     /// Pin append-only discovery to a bounded high water mark. Edits remain
@@ -233,7 +179,13 @@ impl CrudStore {
     ) -> Result<OperationRecord> {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
-            repositories::compaction::compaction_admit(self, workspace, thread, snapshot).await
+            repositories::compaction::compaction_admit(
+                &self.connection,
+                workspace,
+                thread,
+                snapshot,
+            )
+            .await
         }
         .await;
         if result.is_ok() {
@@ -251,7 +203,7 @@ impl CrudStore {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
             repositories::compaction::compaction_admit_for_turn(
-                self,
+                &self.connection,
                 workspace,
                 thread,
                 snapshot,
@@ -993,11 +945,12 @@ impl CrudStore {
         owner_thread: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<()> {
-        repositories::compaction::frozen::compaction_begin_frozen_history(
-            self,
+        self.compaction_begin_frozen_history_with_imports(
             workspace,
             owner_thread,
             descriptor,
+            0,
+            pioneer_crud_compaction::frozen_import::EMPTY_FROZEN_IMPORT_SHA256,
         )
         .await
     }
@@ -1052,7 +1005,7 @@ impl CrudStore {
         let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let maintenance_result = async {
             repositories::compaction::frozen::compaction_append_frozen_history(
-                self,
+                &self.connection,
                 workspace,
                 owner_thread,
                 manifest,
@@ -1087,7 +1040,8 @@ impl CrudStore {
     ) -> Result<bool> {
         use repositories::compaction::frozen;
         use sea_orm::TransactionTrait;
-        let layout_check = frozen::ReadyLayoutCheck::prepare(self, &descriptor.manifest_id).await?;
+        let layout_check =
+            frozen::ReadyLayoutCheck::prepare(&self.connection, &descriptor.manifest_id).await?;
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
             let finished = frozen::compaction_finish_frozen_history(
@@ -1115,7 +1069,7 @@ impl CrudStore {
         descriptor: &FrozenHistoryRef,
     ) -> Result<crate::FrozenReadHold> {
         let layout_check = repositories::compaction::frozen::ReadyLayoutCheck::prepare(
-            self,
+            &self.connection,
             &descriptor.manifest_id,
         )
         .await?;
@@ -1475,7 +1429,10 @@ impl CrudStore {
         source: &SourceRef,
     ) -> Result<Option<String>> {
         repositories::compaction::history::compaction_task_delivery_command(
-            self, workspace, thread, source,
+            &self.connection,
+            workspace,
+            thread,
+            source,
         )
         .await
     }
@@ -1526,7 +1483,11 @@ impl CrudStore {
         fence: &HistoryReadFence,
     ) -> Result<HistoryCausalBoundary> {
         repositories::compaction::history::compaction_history_causal_boundary(
-            self, workspace, thread, turn, fence,
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            fence,
         )
         .await
     }
@@ -1734,7 +1695,12 @@ impl CrudStore {
         operation: &str,
         entries: &[ManifestEntry],
     ) -> Result<()> {
-        repositories::compaction::runner::compaction_append_manifest(self, operation, entries).await
+        repositories::compaction::runner::compaction_append_manifest(
+            &self.connection,
+            operation,
+            entries,
+        )
+        .await
     }
     pub async fn compaction_manifest_sources_current(&self, operation: &str) -> Result<bool> {
         repositories::compaction::runner::compaction_manifest_sources_current(
@@ -1750,8 +1716,12 @@ impl CrudStore {
     ) -> Result<()> {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
-            repositories::compaction::runner::compaction_activate_runner(self, operation, initial)
-                .await
+            repositories::compaction::runner::compaction_activate_runner(
+                &self.connection,
+                operation,
+                initial,
+            )
+            .await
         }
         .await;
         if let Ok(changed) = &result {
@@ -1770,7 +1740,7 @@ impl CrudStore {
         deadline_ms: u64,
     ) -> Result<bool> {
         repositories::compaction::runner::compaction_resume_deadline(
-            self,
+            &self.connection,
             operation,
             execution_turn,
             deadline_ms,
@@ -1786,7 +1756,7 @@ impl CrudStore {
         deadline_ms: u64,
     ) -> Result<bool> {
         repositories::compaction::runner::compaction_resume_invalid_completion(
-            self,
+            &self.connection,
             operation,
             execution_turn,
             deadline_ms,
@@ -1849,9 +1819,11 @@ impl CrudStore {
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let changes = ["compaction", "maintenance.html"]
             .map(|domain| self.connection.work_signal(domain).changing());
-        let result =
-            repositories::compaction::runner::compaction_reconcile_runner_state(self, operation)
-                .await;
+        let result = repositories::compaction::runner::compaction_reconcile_runner_state(
+            &self.connection,
+            operation,
+        )
+        .await;
         if let Ok((_, changed)) = &result {
             let frozen_keys = vec![format!("o:{}", operation)];
             frozen_change.completed_keys(if *changed { &frozen_keys } else { &[] });
@@ -1889,7 +1861,11 @@ impl CrudStore {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
             repositories::compaction::runner::compaction_runner_transition(
-                self, operation, expected, next, candidate,
+                &self.connection,
+                operation,
+                expected,
+                next,
+                candidate,
             )
             .await
         }
@@ -1977,13 +1953,16 @@ impl CrudStore {
     ) -> Result<()> {
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
-        let maintenance_result = async {
-            repositories::compaction::source_projection::compaction_bind_source_projection(
-                self, operation, descriptor,
-            )
-            .await
-        }
-        .await;
+        let prepared =
+            repositories::compaction::source_projection::PreparedSourceProjection::new(descriptor)?;
+        let maintenance_result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                prepared.bind(&tx, operation).await?;
+                tx.commit().await?;
+                Ok(())
+            })
+            .await;
         let maintenance_changed = maintenance_result.is_ok();
         if maintenance_result.is_ok() {
             let frozen_keys = vec![format!("o:{}", operation)];
@@ -2061,8 +2040,12 @@ impl CrudStore {
         workspace: &str,
         delivery: &str,
     ) -> Result<Option<TaskDeliveryOutputSnapshot>> {
-        repositories::compaction::task_output::compaction_delivery_output(self, workspace, delivery)
-            .await
+        repositories::compaction::task_output::compaction_delivery_output(
+            &self.connection,
+            workspace,
+            delivery,
+        )
+        .await
     }
     /// Select at most one local delivery Turn and 127 event metadata rows.
     /// Callers order acknowledgements by capture_order across all local pages
@@ -2113,7 +2096,12 @@ impl CrudStore {
         digest: &str,
     ) -> Result<Option<FrozenHistoryRef>> {
         repositories::compaction_frozen_storage::equivalent(
-            self, workspace, owner, descriptor, imports, digest,
+            &self.connection,
+            workspace,
+            owner,
+            descriptor,
+            imports,
+            digest,
         )
         .await
     }
@@ -2138,34 +2126,24 @@ impl CrudStore {
                 .map(|(ordinal, p)| serde_json::to_string(&p.record_at(*ordinal)))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let messages = repositories::compaction_frozen_storage::prepare(
-                self, workspace, owner, manifest, 0, &refs,
+                &self.connection,
+                workspace,
+                owner,
+                manifest,
+                0,
+                &refs,
             )
             .await?;
             let imports = repositories::compaction_frozen_storage::prepare(
-                self, workspace, owner, manifest, 1, &proofs,
+                &self.connection,
+                workspace,
+                owner,
+                manifest,
+                1,
+                &proofs,
             )
             .await?;
-            use pioneer_entity::compaction_frozen_layout as layout;
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
-            let registered = |kind| {
-                sea_orm::sea_query::Expr::exists(
-                    layout::Entity::find()
-                        .select_only()
-                        .column(layout::Column::ManifestId)
-                        .filter(layout::Column::ManifestId.eq(manifest))
-                        .filter(layout::Column::Kind.eq(kind))
-                        .into_query(),
-                )
-            };
-            pioneer_entity::compaction_frozen_history::Entity::update_many()
-                .col_expr(
-                    pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
-                    sea_orm::sea_query::Expr::val(1_i64),
-                )
-                .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
-                .filter(registered(0))
-                .filter(registered(1))
-                .exec(&self.connection)
+            repositories::compaction::frozen::mark_storage_registered(&self.connection, manifest)
                 .await?;
             Ok((messages, imports))
         }
@@ -2187,7 +2165,8 @@ impl CrudStore {
         &self,
         progress: &mut crate::FrozenStorageLifetimeProgress,
     ) -> Result<bool> {
-        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access(), progress)
+        progress
+            .convert_storage(&self.with_maintenance_access().connection)
             .await
     }
 }
@@ -2239,7 +2218,15 @@ impl CrudStore {
         revision: i64,
         now: i64,
     ) -> Result<Option<pioneer_entity::compaction_history_check::Model>> {
-        repositories::compaction::background::claim_history_check(self, id, revision, now).await
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            let claimed =
+                repositories::compaction::background::claim_history_check(&tx, id, revision, now)
+                    .await?;
+            tx.commit().await?;
+            Ok(claimed)
+        })
+        .await
     }
     pub async fn compaction_begin_history_attempt(
         &self,
@@ -2270,11 +2257,22 @@ impl CrudStore {
     ) -> Result<bool> {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
-            // Serialize before database admission. No history, output or raw error.
+            // Prepare bounded diagnostics before database admission.
             let json = serde_json::to_string(diagnostic)?;
-            repositories::compaction::background::record_history_result(
-                self, id, revision, failures, outcome, &json, now,
-            )
+            anyhow::ensure!(json.len() <= 4096, "history diagnostic exceeds bound");
+            let diagnostic: serde_json::Value = serde_json::from_str(&json)?;
+            self.run_serialized_write(|| {
+                let diagnostic = diagnostic.clone();
+                async move {
+                    let tx = self.connection.begin().await?;
+                    let recorded = repositories::compaction::background::record_history_result(
+                        &tx, id, revision, failures, outcome, diagnostic, now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    Ok(recorded)
+                }
+            })
             .await
         }
         .await;

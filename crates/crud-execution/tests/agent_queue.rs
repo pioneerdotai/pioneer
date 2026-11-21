@@ -82,3 +82,93 @@ async fn fair_queue_selects_eligible_branch_heads_before_limiting_and_obeys_capa
     })
     .await
 }
+
+#[tokio::test]
+async fn promotion_rechecks_the_fair_head_after_waiting_for_the_root() -> Result<()> {
+    use pioneer_crud_execution::agent_graph_admission::{
+        ExecutionChangeSink, promote_queued_agent_executions,
+    };
+    use pioneer_entity::{agent_execution, agent_work_queue};
+    use sea_orm::{DbBackend, Statement, TransactionTrait};
+    use std::time::Duration;
+
+    struct NoRelatedWrites;
+    impl ExecutionChangeSink for NoRelatedWrites {
+        async fn agent_changed<'a, C: ConnectionTrait>(
+            &'a self,
+            _: &'a C,
+            _: Option<&'a agent_execution::Model>,
+            _: Option<&'a agent_execution::Model>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    for commit_first in [true, false] {
+        with_database(async |fixture| {
+            let db = fixture.connection();
+            db.execute_unprepared(
+                "INSERT INTO workspace (id, name) VALUES ('w', 'Workspace');
+                 INSERT INTO agent_identity (id, workspace_id, source_kind, source_id, source_fingerprint)
+                 VALUES ('I00000000000000000001','w','ephemeral','fixture','fingerprint');
+                 INSERT INTO agent_execution
+                    (id,workspace_id,agent_identity_id,identity_source_revision,identity_source_fingerprint,
+                     home_root_thread_id,work_graph_root_execution_id,requested_identity_selection_json,
+                     requested_profile_selection_json,authorization_context_fingerprint,status)
+                 VALUES ('E00000000000000000001','w','I00000000000000000001',1,'fingerprint','thread','E00000000000000000001','{}','{}','auth','running'),
+                        ('E00000000000000000002','w','I00000000000000000001',1,'fingerprint','thread','E00000000000000000001','{}','{}','auth','queued');
+                 INSERT INTO agent_work_resource_scope (root_execution_id,max_concurrency,aggregate_usage_json)
+                 VALUES ('E00000000000000000001',1,'{}');
+                 INSERT INTO agent_work_branch_schedule (root_execution_id,branch_key) VALUES ('E00000000000000000001','branch');
+                 INSERT INTO agent_work_queue (id,root_execution_id,execution_id,branch_key,enqueue_sequence)
+                 VALUES ('Q00000000000000000001','E00000000000000000001','E00000000000000000002','branch',1);
+                 INSERT INTO agent_execution_resource_state
+                    (id,execution_id,status,progress_frontier_json,local_usage_json,branch_key,fair_order)
+                 VALUES ('S00000000000000000001','E00000000000000000002','queued','{}','{}','branch',0);",
+            ).await?;
+            let now = chrono::Utc::now().fixed_offset();
+            let first = db.begin().await?;
+            assert_eq!(promote_queued_agent_executions(&first, now, 1, 5, 10, &NoRelatedWrites).await?.len(), 1);
+
+            let other = fixture.connect().await?;
+            let second = other.begin().await?;
+            let pid: i32 = second
+                .query_one_raw(Statement::from_string(DbBackend::Postgres, "SELECT pg_backend_pid()"))
+                .await?.context("missing second backend")?.try_get_by_index(0)?;
+            let writer = tokio::spawn(async move {
+                let promoted = promote_queued_agent_executions(&second, now, 1, 5, 10, &NoRelatedWrites).await?;
+                second.commit().await?;
+                Ok::<_, anyhow::Error>(promoted)
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres, "SELECT cardinality(pg_blocking_pids($1)) > 0",
+                        [pid.into()],
+                    )).await?.context("missing root lock observation")?.try_get_by_index(0)?;
+                    if waiting {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.context("second writer did not wait for the root")??;
+            if commit_first {
+                first.commit().await?;
+            } else {
+                first.rollback().await?;
+            }
+            assert_eq!(writer.await??.len(), usize::from(!commit_first));
+            assert_eq!(
+                agent_work_queue::Entity::find_by_id("Q00000000000000000001").one(&other).await?.context("missing queue row")?.state,
+                "claimed",
+            );
+            assert_eq!(
+                agent_execution::Entity::find_by_id("E00000000000000000002").one(&other).await?.context("missing child")?.status,
+                "running",
+            );
+            other.close().await?;
+            Ok(())
+        }).await?;
+    }
+    Ok(())
+}

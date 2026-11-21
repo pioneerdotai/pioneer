@@ -179,11 +179,7 @@ async fn insert_root(store: &CrudStore, descriptor: &FrozenHistoryRef, kind: usi
 }
 
 fn assert_unprepared(preparation: &ExpiryPreparation) {
-    assert_eq!(preparation.layout_kind, 0);
-    assert!(preparation.layout.is_none());
-    assert!(!preparation.operations_done && preparation.operations_after.is_empty());
-    assert!(!preparation.checkpoints_done && preparation.checkpoint_after.is_empty());
-    assert!(preparation.reverse.is_none());
+    assert!(preparation.is_unprepared());
 }
 
 #[pioneer_postgres_test::postgres_test]
@@ -225,14 +221,13 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
         routes.clear();
         let mut accounting = SweepAccounting::default();
         assert_eq!(
-            preparation
-                .step(&store.with_maintenance_access(), &mut accounting)
+            expiry_step(&mut preparation, &store.with_maintenance_access(), &mut accounting)
                 .await
                 .unwrap(),
             held,
             "kind={kind}, status={status}"
         );
-        assert!(preparation.roots_checked);
+        assert!(preparation.roots_checked());
         assert_unprepared(&preparation);
         assert_eq!(accounting.held, u64::from(held));
         assert_eq!(accounting.expired + accounting.refused, 0);
@@ -265,25 +260,25 @@ async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
         assert!(progress.expiry_quantum(&store).await.unwrap());
         for _ in 0..64 {
             let preparation = progress.expiry.as_ref().unwrap();
-            if preparation.layout_kind == 2
-                && preparation.operations_done
-                && preparation.checkpoints_done
+            if preparation.completed_layouts() == 2
+                && preparation.operations_checked()
+                && preparation.checkpoints_checked()
             {
                 break;
             }
             progress.expiry_quantum(&store).await.unwrap();
         }
         let mut preparation = progress.expiry.take().unwrap();
-        assert!(preparation.roots_checked);
-        assert_eq!(preparation.layout_kind, 2);
-        assert!(preparation.operations_done && preparation.checkpoints_done);
+        assert!(preparation.roots_checked());
+        assert_eq!(preparation.completed_layouts(), 2);
+        assert!(preparation.operations_checked() && preparation.checkpoints_checked());
         if late_root {
             insert_root(&store, &descriptor, 1).await;
         }
         // Returning an early hold here would incorrectly bypass this writer.
         routes.clear();
         let mut accounting = SweepAccounting::default();
-        assert!(preparation.step(&store, &mut accounting).await.unwrap());
+        assert!(expiry_step(&mut preparation, &store, &mut accounting).await.unwrap());
         assert_eq!(accounting.expired, u64::from(!late_root));
         assert_eq!(accounting.held, u64::from(late_root));
         assert!(routes.reads.lock().unwrap().is_empty());
@@ -327,7 +322,7 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
     let mut html = database.work_signal("maintenance.html.release").subscribe();
     routes.clear();
     let mut accounting = SweepAccounting::default();
-    assert!(preparation.step(&store, &mut accounting).await.unwrap());
+    assert!(expiry_step(&mut preparation, &store, &mut accounting).await.unwrap());
     assert_eq!(accounting.held, 1);
     assert_eq!(accounting.expired, 0);
     assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
@@ -346,7 +341,7 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
         "HTML did not wait on this hold"
     );
     let mut preparation = prepared_expiry(&store).await;
-    assert!(preparation.step(&store, &mut accounting).await.unwrap());
+    assert!(expiry_step(&mut preparation, &store, &mut accounting).await.unwrap());
     assert_eq!(accounting.expired, 1);
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
@@ -356,9 +351,9 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     let (store, routes, descriptor) = observed_fixture().await;
     insert_root(&store, &descriptor, 1).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    progress.scope.done = true;
-    progress.pass_done = [true, false, false, true, true, true];
-    progress.phase = 2;
+
+    progress.pass_done = [false, false, true, true];
+    progress.phase = 1;
     routes.clear();
     assert!(progress.quantum(&store).await.unwrap());
     // Discovery and root admission share a page. A hold needs no individual
@@ -368,9 +363,9 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     assert_eq!(progress.expiry_after, "origin");
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.accounting.expired, 0);
-    progress.phase = 2;
+    progress.phase = 1;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(progress.pass_done[2] && progress.expiry_after.is_empty());
+    assert!(progress.pass_done[1] && progress.expiry_after.is_empty());
     store
         .connection
         .execute_unprepared("DELETE FROM turn_runtime_snapshot WHERE turn_id='turn'")
@@ -380,12 +375,12 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     let interval = Duration::from_secs(60);
     progress.revisit_completed_cleanup(now, interval);
     progress.revisit_completed_cleanup(now + interval - Duration::from_secs(1), interval);
-    assert!(progress.pass_done[2]);
+    assert!(progress.pass_done[1]);
     progress.revisit_completed_cleanup(now + interval, interval);
-    assert!(!progress.pass_done[2]);
-    progress.phase = 2;
+    assert!(!progress.pass_done[1]);
+    progress.phase = 1;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(progress.expiry.as_ref().unwrap().roots_checked);
+    assert!(progress.expiry.as_ref().unwrap().roots_checked());
     for _ in 0..64 {
         if progress.expiry.is_none() {
             break;
@@ -413,18 +408,18 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
 async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
     let (store, routes, descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    progress.scope.done = true;
+
     store
         .connection
         .execute_unprepared("ALTER TABLE compaction_task_output RENAME TO unavailable_output")
         .await
         .unwrap();
     routes.clear();
-    progress.phase = 2;
+    progress.phase = 1;
     let error = progress.quantum(&store).await.unwrap_err();
     assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
     assert!(progress.expiry_after.is_empty());
-    assert!(!progress.pass_done[2]);
+    assert!(!progress.pass_done[1]);
     assert!(progress.expiry.is_none() && progress.expiry_pending.is_empty());
     assert_eq!(
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
@@ -438,9 +433,9 @@ async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
         .unwrap();
     insert_root(&store, &descriptor, 4).await;
     routes.clear();
-    progress.phase = 2;
+    progress.phase = 1;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(progress.expiry.is_none() && !progress.pass_done[2]);
+    assert!(progress.expiry.is_none() && !progress.pass_done[1]);
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.expiry_after, "origin");
     routes.assert_reads(SqliteReadOutcome::Ok, 1);
@@ -451,12 +446,12 @@ async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
 async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capacity() {
     let (store, routes, _descriptor) = observed_fixture().await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    progress.scope.done = true;
+
     assert!(progress.expiry_quantum(&store).await.unwrap());
     let maintenance = store.with_maintenance_access();
     let reader = maintenance.connection.begin_read().await.unwrap();
     routes.clear();
-    progress.phase = 2;
+    progress.phase = 1;
     let mut pending = Box::pin(progress.quantum(&store));
     tokio::time::timeout(Duration::from_secs(2), async {
         tokio::select! {
@@ -468,9 +463,9 @@ async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capa
     .unwrap();
     drop(pending);
     assert_eq!(progress.expiry_after, "origin");
-    assert!(!progress.pass_done[2]);
+    assert!(!progress.pass_done[1]);
     let attempt = progress.expiry.as_ref().unwrap();
-    assert!(attempt.roots_checked);
+    assert!(attempt.roots_checked());
     assert_unprepared(attempt);
     assert_eq!(
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
@@ -531,7 +526,7 @@ async fn negative_preflight_keeps_concurrent_expiry_availability_guard() {
         .await
         .unwrap();
     let mut accounting = SweepAccounting::default();
-    let error = preparation.step(&store, &mut accounting).await.unwrap_err();
+    let error = expiry_step(&mut preparation, &store, &mut accounting).await.unwrap_err();
     assert!(error.to_string().starts_with("frozen_input_expired:"));
     assert_eq!(
         (accounting.expired, accounting.held, accounting.refused),
@@ -570,6 +565,10 @@ async fn expiry_prefetched_stale_header_cannot_authorize_expiration() {
         .exec(&tx)
         .await
         .unwrap();
+    tx.execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,created_at,updated_at)
+         VALUES('replacement-owner','ws','','agent','m','p','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+    ).await.unwrap();
     replacement.owner_thread = Set("replacement-owner".into());
     history::Entity::insert(replacement)
         .exec(&tx)
@@ -611,7 +610,20 @@ async fn expiry_pages_skip_holds_without_per_header_work_or_writer() {
         )).await.unwrap();
         store.connection.execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) VALUES($1,'task','run','ws','thread','turn',$1)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at)
+             VALUES($1,'thread','failed','task_run','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [id.clone().into()],
+        )).await.unwrap();
+        let sequence = i64::from(index + 1);
+        store.connection.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status)
+             VALUES($1,'task','run','thread',$1,'revision',$2,$2,'failed')",
+            [id.clone().into(), sequence.into()],
+        )).await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO compaction_task_output(task_run_turn_id,task_id,run_id,workspace_id,source_thread,source_turn,manifest_id) VALUES($1,'task','run','ws','thread',$1,$1)",
             [id.into()],
         )).await.unwrap();
     }

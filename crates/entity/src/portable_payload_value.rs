@@ -16,6 +16,7 @@ pub struct Model {
     pub codec: Option<i16>,
     #[sea_orm(column_type = "VarBinary(StringLen::None)", nullable)]
     pub body: Option<Vec<u8>>,
+    pub turn_item_shell: bool,
     #[sea_orm(has_many)]
     pub portable_payload_parts: HasMany<super::portable_payload_part::Entity>,
     #[sea_orm(has_one)]

@@ -658,9 +658,16 @@ async fn reviewed_task_in(
     (created, candidate)
 }
 
-#[tokio::test]
-async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arriving_during_preparation()
- {
+#[test]
+fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arriving_during_preparation()
+{
+    run_large_history_message_test(
+        "accepted deliveries with late parent work",
+        accepted_deliveries_with_late_parent_work(),
+    );
+}
+
+async fn accepted_deliveries_with_late_parent_work() {
     pioneer_postgres_test::with_database(async |fixture| {
         let provider = Arc::new(CaptureSummaryProvider::new(
             r#"<task_result>{"summary":"accepted task fact","data":{"answer":"ok"}}</task_result>"#,
@@ -715,7 +722,8 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
 
         let mut frozen = Vec::new();
         for goal in ["first-result", "second-result"] {
-            let (task, candidate) = reviewed_task(&harness, goal, Some("delivery-root")).await;
+            let (task, candidate) =
+                Box::pin(reviewed_task(&harness, goal, Some("delivery-root"))).await;
             let run = task.run.as_ref().unwrap();
             let snapshot = harness
                 .crud_store
@@ -840,8 +848,12 @@ async fn accepted_deliveries_coalesce_keep_frozen_outputs_and_preserve_work_arri
             .unwrap()
             .unwrap();
         assert!(claimed.revision > revision_before);
-        let (third, candidate) =
-            reviewed_task(&harness, "third-result", Some("delivery-root")).await;
+        let (third, candidate) = Box::pin(reviewed_task(
+            &harness,
+            "third-result",
+            Some("delivery-root"),
+        ))
+        .await;
         let third_run = third.run.as_ref().unwrap();
         accept_candidate(
             &harness,
@@ -1177,18 +1189,18 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl()
     let input_timestamp = chrono::DateTime::from_timestamp(original_input, 0).unwrap();
     let db = harness.crud_store.database_connection();
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE turn SET created_at=? WHERE id='composer-human-question'",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE turn SET created_at=$1 WHERE id='composer-human-question'",
         [input_timestamp.into()],
     ))
     .await
     .unwrap();
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-        "UPDATE turn_event SET created_at=? WHERE turn_id='composer-human-question' AND event_type='turn/started'",
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "UPDATE turn_event SET created_at=$1 WHERE turn_id='composer-human-question' AND event_type='turn/started'",
         [input_timestamp.into()],
     )).await.unwrap();
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_root_activity SET last_user_activity_ms=? WHERE thread_id='composer-warm-root'",
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "UPDATE compaction_root_activity SET last_user_activity_ms=$1 WHERE thread_id='composer-warm-root'",
         [(original_input * 1000).into()],
     )).await.unwrap();
     let activity = harness
@@ -1457,8 +1469,8 @@ async fn hidden_composer_defers_root_warmup_until_its_answer_is_delivered_impl()
         .first()
         .expect("actual Composer delivery must be acknowledged");
     let acknowledgement = harness.crud_store.database_connection().query_one_raw(
-        sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-            "SELECT e.created_at FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=? AND e.event_type='item/completed' AND r.item_id=? AND r.present=1 AND r.projection_revision=r.revision ORDER BY e.sequence LIMIT 1",
+        sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+            "SELECT e.created_at FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=$1 AND e.event_type='item/completed' AND r.item_id=$2 AND r.present=1 AND r.projection_revision=r.revision ORDER BY e.sequence LIMIT 1",
             [receipt.delivered_turn_id.clone().unwrap().into(), pioneer_protocol::task_delivery_result_item_id(&receipt.id).into()],
         )
     ).await.unwrap().expect("exact published Composer acknowledgement");

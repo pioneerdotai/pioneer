@@ -403,10 +403,8 @@ mod tests {
                 assert_eq!(
                     scalar_string(
                         &harness.database,
-                        "SELECT group_concat(workspace_id, ',') AS value FROM (\
-                            SELECT workspace_id FROM workspace_membership \
-                            WHERE principal_id='P0000000000000000000A' ORDER BY workspace_id\
-                         )"
+                        "SELECT string_agg(workspace_id, ',' ORDER BY workspace_id) AS value \
+                         FROM workspace_membership WHERE principal_id='P0000000000000000000A'"
                     )
                     .await,
                     format!("{WORKSPACE_RED_ID},{WORKSPACE_BLUE_ID}")
@@ -414,10 +412,8 @@ mod tests {
                 assert_eq!(
                     scalar_string(
                         &harness.database,
-                        "SELECT group_concat(workspace_id, ',') AS value FROM (\
-                            SELECT workspace_id FROM workspace_membership \
-                            WHERE principal_id='P0000000000000000000B' ORDER BY workspace_id\
-                         )"
+                        "SELECT string_agg(workspace_id, ',' ORDER BY workspace_id) AS value \
+                         FROM workspace_membership WHERE principal_id='P0000000000000000000B'"
                     )
                     .await,
                     format!("{WORKSPACE_RED_ID},{WORKSPACE_GREEN_ID}")
@@ -446,13 +442,10 @@ mod tests {
                 assert_eq!(
                     scalar_string(
                         &harness.database,
-                        "SELECT group_concat(access_class, ',') AS value FROM (\
-                            SELECT access_class FROM thread \
-                            WHERE id IN ('T00000000000000000001','T00000000000000000002',\
+                        "SELECT string_agg(access_class, ',' ORDER BY id) AS value \
+                            FROM thread WHERE id IN ('T00000000000000000001','T00000000000000000002',\
                                          'T00000000000000000003','T00000000000000000004',\
-                                         'T00000000000000000005','T00000000000000000006') \
-                            ORDER BY id\
-                         )"
+                                         'T00000000000000000005','T00000000000000000006')"
                     )
                     .await,
                     "private,private,workspace,internal,private,private"
@@ -476,7 +469,9 @@ mod tests {
                 assert_eq!(
                     scalar_i64(
                         &harness.database,
-                        "SELECT COUNT(*) AS value FROM pragma_foreign_key_check"
+                        "SELECT COUNT(*) AS value FROM pg_constraint \
+                         WHERE contype = 'f' AND connamespace = 'public'::regnamespace \
+                           AND NOT convalidated"
                     )
                     .await,
                     0

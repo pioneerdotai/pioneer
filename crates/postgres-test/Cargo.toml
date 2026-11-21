@@ -16,3 +16,6 @@ sea-orm = { workspace = true, features = ["runtime-tokio-rustls", "sqlx-postgres
 tokio.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+pioneer-entity.workspace = true

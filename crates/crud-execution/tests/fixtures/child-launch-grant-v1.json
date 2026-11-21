@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "identities": [
+    {
+      "id": "A00000000000000000001",
+      "source_kind": "native_agent",
+      "display_name": "Pioneer",
+      "nickname": "pioneer",
+      "source_revision": 3,
+      "source_fingerprint": "generation-a"
+    }
+  ],
+  "allowInheritParentIdentity": false,
+  "allowServerDerivedEphemeral": false,
+  "profiles": [
+    {
+      "id": "P00000000000000000003",
+      "compatibleAgentIdentityIds": [
+        "A00000000000000000001"
+      ],
+      "backend": "api_provider",
+      "providerId": "provider-opaque",
+      "modelId": "model-opaque",
+      "providerDisplayName": "Provider",
+      "modelDisplayName": "Model",
+      "allowedReasoning": [
+        {
+          "effort": "medium"
+        }
+      ],
+      "allowedPermissionProfiles": [
+        "full_access"
+      ],
+      "catalogGeneration": 4,
+      "policyGeneration": 5,
+      "fingerprint": "profile-fingerprint"
+    }
+  ],
+  "allowInheritParentProfile": false,
+  "skillIds": [],
+  "mcpServerIds": [],
+  "maxPermissionProfile": {
+    "mode": "supervised",
+    "effective_policy": {
+      "default_behavior": "ask",
+      "file_read": "allow",
+      "file_write": "ask",
+      "shell_command": "ask",
+      "network": "ask",
+      "mcp_read": "allow",
+      "mcp_write_or_unknown": "ask",
+      "dynamic_skill_tool": "ask",
+      "computer_use": "ask",
+      "task_subagent": "ask"
+    }
+  },
+  "maxReasoning": {
+    "allowed": [
+      {
+        "effort": "medium"
+      }
+    ]
+  },
+  "fingerprint": "fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3"
+}

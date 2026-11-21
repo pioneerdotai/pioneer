@@ -1,135 +1,12 @@
 //! Plugin ownership and native lifecycle regressions.
-use super::tests::{
-    pack_skill_record, postgres_store_with_workspace, skill_pack_record, test_store_with_workspace,
-};
+use super::tests::{postgres_store_with_workspace, test_store_with_workspace};
 use super::*;
 
 use sea_orm::ConnectionTrait;
 
-fn parent(id: &str, workspace: &str) -> crate::PackageRecord {
-    crate::PackageRecord {
-        kind: crate::PackageKind::Plugin,
-        app_manifest_json: None,
-        app_localizations_json: None,
-        operation_error_json: None,
-        id: id.into(),
-        workspace_id: workspace.into(),
-        name: "same-name".into(),
-        version: None,
-        source_upload_id: format!("upload-{id}"),
-        package_path: format!("/managed/plugins/{id}/package"),
-        data_path: format!("/managed/plugins/{id}/data"),
-        package_fingerprint: "tree".into(),
-        enabled: true,
-        allow_implicit_invocation: false,
-        state: "installing".into(),
-        revision: 1,
-        display_name: None,
-        short_description: None,
-        description: None,
-        long_description: None,
-        developer_name: None,
-        author_name: None,
-        author_email: None,
-        author_url: None,
-        homepage: None,
-        repository: None,
-        documentation_url: None,
-        support_url: None,
-        privacy_policy_url: None,
-        terms_of_service_url: None,
-        license: None,
-        category: None,
-        brand_color: None,
-        logo_path: None,
-        logo_revision: None,
-        composer_icon_path: None,
-        composer_icon_revision: None,
-        pending_json: None,
-        last_error: None,
-        created_at: util::unix_to_datetime(1),
-        updated_at: util::unix_to_datetime(1),
-    }
-}
-fn ownership(parent: &str, child: &str, key: &str) -> PluginOwnershipWrite {
-    PluginOwnershipWrite {
-        kind: pioneer_protocol::PackageKind::Plugin,
-        plugin_id: parent.into(),
-        expected_revision: 1,
-        member_key: key.into(),
-        member_path: Some(format!("skills/{key}")),
-        package_fingerprint: "member-tree".into(),
-        child_id: child.into(),
-    }
-}
-fn skill(id: char, workspace: &str) -> SkillInstallationRecord {
-    let mut row = pack_skill_record(
-        id,
-        &skill_pack_record('P', "unused", workspace),
-        "same-slug",
-    );
-    row.pack_id = None;
-    row.pack_member_key = None;
-    row
-}
-fn policy(row: &SkillInstallationRecord) -> WorkspaceSkillPolicyRecord {
-    WorkspaceSkillPolicyRecord {
-        id: format!("policy-{}", row.skill_id),
-        workspace_id: row.scope_key.clone(),
-        skill_id: row.skill_id.clone(),
-        enabled: Some(false),
-        allow_implicit_invocation: Some(false),
-    }
-}
-fn skill_audit(row: &SkillInstallationRecord) -> SkillAuditEventRecord {
-    SkillAuditEventRecord {
-        turn_id: None,
-        skill_id: row.skill_id.clone(),
-        skill_owner: None,
-        skill_slug: row.slug.clone(),
-        source_kind: row.source_kind.clone(),
-        action: "install".into(),
-        decision: "accepted".into(),
-        reason_code: None,
-        details_json: "{}".into(),
-        created_at_unix: 1,
-    }
-}
-fn mcp(id: &str, workspace: &str, name: &str) -> McpServerInstallationRecord {
-    McpServerInstallationRecord {
-        id: Some(id.into()),
-        scope_kind: "workspace".into(),
-        scope_key: workspace.into(),
-        name: name.into(),
-        display_name: None,
-        source_kind: "config".into(),
-        source_ref: "{}".into(),
-        transport_kind: "stdio".into(),
-        transport_json: "{}".into(),
-        auth_json: "{}".into(),
-        secret_refs_json: "[]".into(),
-        enabled: false,
-        allow_implicit_invocation: false,
-        required: false,
-        fingerprint: "native".into(),
-        updated_at_unix: 1,
-    }
-}
-fn mcp_audit(row: &McpServerInstallationRecord) -> McpAuditEventRecord {
-    McpAuditEventRecord {
-        turn_id: None,
-        server_installation_id: None,
-        server_name: row.name.clone(),
-        raw_tool_name: None,
-        callable_name: None,
-        catalog_version: None,
-        action: "install".into(),
-        decision: "allowed".into(),
-        reason_code: None,
-        details_json: "{}".into(),
-        created_at_unix: 1,
-    }
-}
+#[path = "../../crud-packages/tests/support/plugin_ownership.rs"]
+mod plugin_fixture;
+use plugin_fixture::*;
 
 #[tokio::test]
 async fn package_update_retains_native_identity_policy_overrides_and_successful_sibling() {
@@ -593,8 +470,7 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     store
         .database_connection()
         .execute_unprepared(
-            "CREATE TRIGGER fail_plugin_ready BEFORE UPDATE OF package_selection_json ON turn \
-         BEGIN SELECT RAISE(ABORT,'fixture ready write failure'); END;",
+            "CREATE FUNCTION fail_plugin_ready() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture ready write failure'; END $$; CREATE TRIGGER fail_plugin_ready BEFORE UPDATE OF package_selection_json ON turn FOR EACH ROW EXECUTE FUNCTION fail_plugin_ready()",
         )
         .await
         .unwrap();
@@ -610,7 +486,9 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_plugin_ready")
+        .execute_unprepared(
+            "DROP TRIGGER fail_plugin_ready ON turn; DROP FUNCTION fail_plugin_ready()",
+        )
         .await
         .unwrap();
     store
@@ -667,150 +545,6 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
             .unwrap()
             .phase,
         "prepared"
-    );
-}
-#[tokio::test]
-async fn native_skill_policy_audit_and_ownership_commit_together_without_upload() {
-    pioneer_postgres_test::with_database(async |fixture| {
-        let store = postgres_store_with_workspace(fixture, "ws").await;
-        store
-            .insert_plugin_installation(&parent("plugin-a", "ws"))
-            .await
-            .unwrap();
-        let row = skill('A', "ws");
-        let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
-        assert!(
-            store
-                .install_skill_lifecycle_with_ownership(
-                    &row,
-                    &policy(&row),
-                    &[skill_audit(&row)],
-                    None,
-                    Some(&owner),
-                    1
-                )
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            store
-                .find_skill_installation(&row.skill_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .skill_id,
-            row.skill_id
-        );
-        assert_eq!(
-            store
-                .find_skill_plugin_owner(&row.skill_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .package_id,
-            "plugin-a"
-        );
-        // Genuine settings remain in the native row/policy, not in plugin_component.
-        assert_eq!(
-            store
-                .list_plugin_components("plugin-a")
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        let restarted = CrudStore::new(store.database_connection());
-        assert!(
-            restarted
-                .find_skill_plugin_owner(&row.skill_id)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-#[pioneer_postgres_test::postgres_test]
-async fn failed_ownership_insert_rolls_back_native_rows_policies_and_audits() {
-    let store = test_store_with_workspace("ws").await;
-    store
-        .insert_plugin_installation(&parent("plugin-a", "ws"))
-        .await
-        .unwrap();
-    // Inject a failure specifically at the final link publication, after the
-    // native child/policy/audit writes, using the scoped SQLite writer.
-    store.database_connection().execute_unprepared("CREATE TRIGGER fail_plugin_link BEFORE INSERT ON package_component BEGIN SELECT RAISE(ABORT,'injected link failure'); END;").await.unwrap();
-    let row = skill('A', "ws");
-    let owner = ownership("plugin-a", row.skill_id.as_str(), "one");
-    assert!(
-        store
-            .install_skill_lifecycle_with_ownership(
-                &row,
-                &policy(&row),
-                &[skill_audit(&row)],
-                None,
-                Some(&owner),
-                1
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .find_skill_installation(&row.skill_id)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .list_plugin_components("plugin-a")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .list_workspace_skill_policies("ws")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .list_skill_audit_event_records(&row.skill_id, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let row = mcp("mcp-a", "ws", "internal-a");
-    let owner = ownership("plugin-a", "mcp-a", "server");
-    assert!(
-        store
-            .upsert_mcp_server_installation_with_audit_and_ownership(
-                &row,
-                &mcp_audit(&row),
-                Some(&owner),
-                1
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .find_mcp_server_installation("workspace", "ws", "internal-a")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .list_recent_mcp_audit_event_records("internal-a", 10)
-            .await
-            .unwrap()
-            .is_empty()
     );
 }
 #[tokio::test]
@@ -894,13 +628,8 @@ async fn foreign_scope_stale_revision_and_native_name_collision_cannot_publish()
     .unwrap();
 }
 #[pioneer_postgres_test::postgres_test]
-async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks_with_fk_off() {
+async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks() {
     let store = test_store_with_workspace("ws").await;
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     for (parent_id, id) in [("plugin-a", 'A'), ("plugin-b", 'B')] {
         store
             .insert_plugin_installation(&parent(parent_id, "ws"))
@@ -1030,58 +759,15 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
                 .len(),
         1
     );
-    // Same physical writer, independent query-only reader: B can observe r1
-    // while A's accepted r2 is not committed yet. An app mutex is not involved.
-    use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
-    use sea_orm::{ConnectOptions, Database, Set, TransactionTrait};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-    #[derive(Default)]
-    struct QueueBoundary {
-        armed: AtomicBool,
-        enqueued: tokio::sync::Notify,
-    }
-    impl SqliteWriteObserver for QueueBoundary {
-        fn observe(&self, event: SqliteWriteEvent) {
-            if matches!(event, SqliteWriteEvent::Enqueued { .. })
-                && self.armed.swap(false, Ordering::SeqCst)
-            {
-                self.enqueued.notify_one();
-            }
-        }
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("parent-cas.sqlite");
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options.max_connections(1);
-    let writer = Database::connect(options).await.unwrap();
-    let boundary = Arc::new(QueueBoundary::default());
-    let executor =
-        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone());
-    executor
-        .run_migrations::<migration::Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    // Runtime settings, applied only to this disposable fixture database.
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    writer
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options.max_connections(2).map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-    });
-    let reader = Database::connect(options).await.unwrap();
-    let database = SqliteDatabase::from_executor(reader, executor);
+    // Observe a real PostgreSQL row-lock wait on an independent writer.
+    use pioneer_sqlite::SqliteDatabase;
+    use sea_orm::{DbBackend, Set, Statement, TransactionTrait};
+    use std::time::Duration;
+
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let database = SqliteDatabase::new(reader, writer);
     database.validate_reader().await.unwrap();
     let store = CrudStore::new(database);
     let db = store.database_connection().begin().await.unwrap();
@@ -1089,7 +775,7 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
         id: Set("ws".into()),
         name: Set("CAS fixture".into()),
         is_active: Set(true),
-        is_current: Set(true),
+        is_current: Set(false),
         created_at: Set(util::unix_to_datetime(1)),
         updated_at: Set(util::unix_to_datetime(1)),
     })
@@ -1129,24 +815,54 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
             .revision,
         1
     );
-    let maintenance = store.with_maintenance_access();
-    let mut second = Box::pin(maintenance.begin_plugin_mutation(
-        "ws",
-        "cas-parent",
-        1,
-        "updating",
-        true,
-        "{\"owner\":\"B\"}",
-    ));
-    boundary.armed.store(true, Ordering::SeqCst);
-    tokio::select! {
-        result = &mut second => panic!("writer is still held: {result:?}"),
-        _ = boundary.enqueued.notified() => {}
-    }
+    let competing_writer = fixture.connect_with_limit(1).await.unwrap();
+    let pid: i32 = competing_writer
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "pid")
+        .unwrap();
+    let maintenance = CrudStore::new(SqliteDatabase::new(
+        fixture.connect_read_only().await.unwrap(),
+        competing_writer,
+    ))
+    .with_maintenance_access();
+    let second = tokio::spawn(async move {
+        maintenance
+            .begin_plugin_mutation("ws", "cas-parent", 1, "updating", true, "{\"owner\":\"B\"}")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = fixture
+                .connection()
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT cardinality(pg_blocking_pids($1)) > 0 AS waiting",
+                    [pid.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "waiting")
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the competing writer must wait on the plugin row");
     db.commit().await.unwrap();
     assert!(
         second
             .await
+            .unwrap()
             .unwrap_err()
             .to_string()
             .contains("plugins.stale")
@@ -1292,7 +1008,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
             .await
             .unwrap();
         let mut owned_update = owned.clone();
-        owned_update.transport_json = "owned-update".into();
+        owned_update.transport_json = r#"{"command":"owned-update"}"#.into();
         assert_eq!(
             store
                 .upsert_mcp_server_installation_with_audit_and_ownership(
@@ -1307,7 +1023,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
             "the genuine owned update remains allowed"
         );
         let mut attempt = owned.clone();
-        attempt.transport_json = "foreign-change".into();
+        attempt.transport_json = r#"{"command":"foreign-change"}"#.into();
         assert!(
             store
                 .upsert_mcp_server_installation_with_audit(&attempt, &mcp_audit(&attempt), 4,)
@@ -1352,7 +1068,7 @@ async fn standalone_mcp_names_work_while_owned_adoption_is_rejected() {
                 .unwrap()
                 .unwrap()
                 .transport_json,
-            "owned-update"
+            r#"{"command":"owned-update"}"#
         );
         assert_eq!(
             store
@@ -1810,8 +1526,7 @@ async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
     store
         .database_connection()
         .execute_unprepared(
-            "CREATE TRIGGER c1_native_audit_failure BEFORE INSERT ON mcp_audit_event \
-         BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END",
+            "CREATE FUNCTION c1_native_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture audit failure'; END $$; CREATE TRIGGER c1_native_audit_failure BEFORE INSERT ON mcp_audit_event FOR EACH ROW EXECUTE FUNCTION c1_native_audit_failure()",
         )
         .await
         .unwrap();
@@ -1857,7 +1572,7 @@ async fn native_policy_audit_override_and_parent_commit_marker_are_atomic() {
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER c1_native_audit_failure")
+        .execute_unprepared("DROP TRIGGER c1_native_audit_failure ON mcp_audit_event; DROP FUNCTION c1_native_audit_failure()")
         .await
         .unwrap();
     let mut malformed = mcp_audit(&edited);
@@ -2068,8 +1783,7 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
     store
         .database_connection()
         .execute_unprepared(
-            "CREATE TRIGGER c1_skill_audit_failure BEFORE INSERT ON skill_audit_event \
-         BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END",
+            "CREATE FUNCTION c1_skill_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture audit failure'; END $$; CREATE TRIGGER c1_skill_audit_failure BEFORE INSERT ON skill_audit_event FOR EACH ROW EXECUTE FUNCTION c1_skill_audit_failure()",
         )
         .await
         .unwrap();
@@ -2100,7 +1814,7 @@ async fn owned_skill_policy_and_user_removal_revalidate_in_the_native_writer() {
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER c1_skill_audit_failure")
+        .execute_unprepared("DROP TRIGGER c1_skill_audit_failure ON skill_audit_event; DROP FUNCTION c1_skill_audit_failure()")
         .await
         .unwrap();
     assert!(

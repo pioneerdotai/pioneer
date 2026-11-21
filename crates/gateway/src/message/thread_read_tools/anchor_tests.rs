@@ -248,7 +248,7 @@ async fn both_anchor_continuations_become_stale_after_edit_or_delete() {
             let sql = if delete {
                 "UPDATE turn SET message_revision=message_revision+1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='anchor-turn'"
             } else {
-                "UPDATE turn_item SET payload=replace(payload,'\"text\":\"a\"','\"text\":\"edited\"') WHERE item_id='a'"
+                "UPDATE turn_item SET payload=replace(payload::text,'\"text\":\"a\"','\"text\":\"edited\"')::json WHERE item_id='a'"
             };
             harness.database.execute_unprepared(sql).await.unwrap();
             for (cursor, direction) in [

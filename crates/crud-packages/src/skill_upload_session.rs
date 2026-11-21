@@ -1,3 +1,4 @@
+use crate::skill_records::SkillUploadSessionRecord;
 use anyhow::{Context, Result};
 use pioneer_entity::skill_upload_session;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -169,4 +170,27 @@ pub async fn transition_skill_upload_status<C: ConnectionTrait>(
         )
     })?;
     Ok(result.rows_affected == 1)
+}
+
+pub fn skill_upload_session_record_from_model(
+    model: pioneer_entity::skill_upload_session::Model,
+) -> SkillUploadSessionRecord {
+    SkillUploadSessionRecord {
+        purpose: model.purpose,
+        upload_id: model.upload_id,
+        workspace_id: model.workspace_id,
+        connection_id: u64::try_from(model.connection_id).unwrap_or_default(),
+        status: model.status,
+        file_name: model.file_name,
+        archive_format: model.archive_format,
+        compressed_size_bytes: u64::try_from(model.compressed_size_bytes).unwrap_or_default(),
+        received_bytes: u64::try_from(model.received_bytes).unwrap_or_default(),
+        sha256: model.sha256,
+        payload_path: model.payload_path,
+        created_at_unix: model.created_at_unix,
+        expires_at_unix: model.expires_at_unix,
+        finalized_at_unix: model.finalized_at_unix,
+        consumed_at_unix: model.consumed_at_unix,
+        aborted_at_unix: model.aborted_at_unix,
+    }
 }

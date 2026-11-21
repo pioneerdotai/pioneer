@@ -158,3 +158,21 @@ pub async fn delete_workspace_skill_policy<C: ConnectionTrait>(
 
     Ok(result.rows_affected == 1)
 }
+
+pub fn workspace_skill_policy_record_from_model(
+    model: skill_workspace_policy::Model,
+) -> Result<crate::skill_records::WorkspaceSkillPolicyRecord> {
+    let skill_id = SkillId::new(model.skill_id.clone()).with_context(|| {
+        format!(
+            "workspace skill policy key `{}` is not a valid SkillId",
+            model.skill_id
+        )
+    })?;
+    Ok(crate::skill_records::WorkspaceSkillPolicyRecord {
+        id: model.id,
+        workspace_id: model.workspace_id,
+        skill_id,
+        enabled: model.enabled,
+        allow_implicit_invocation: model.allow_implicit_invocation,
+    })
+}

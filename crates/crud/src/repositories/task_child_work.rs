@@ -10,185 +10,35 @@ use sea_orm::{
     TransactionTrait,
 };
 
-const PAGE: u64 = 32;
-const LEASE: i64 = 60;
 fn token() -> String {
     generate_id(32)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChildScope {
-    Task(String),
-    Run(String),
-    Group {
-        task_id: String,
-        run_group_id: String,
-    },
-    ChildThread(String),
-    CreatorTurn {
-        thread_id: String,
-        turn_id: String,
-    },
-    CreatorThread(String),
-    AcceptedSource(String),
-    ParentThread(String),
-    #[cfg(test)]
-    HistoricalSeed,
-}
-impl ChildScope {
-    fn locator(&self) -> (&'static str, String) {
-        match self {
-            Self::Task(k) => ("task", k.clone()),
-            Self::Run(k) => ("run", k.clone()),
-            Self::Group {
-                task_id,
-                run_group_id,
-            } => (
-                "task+run-group",
-                serde_json::to_string(&(task_id, run_group_id)).expect("string pair"),
-            ),
-            Self::ChildThread(k) => ("child-thread", k.clone()),
-            Self::CreatorTurn { thread_id, turn_id } => (
-                "creator-turn",
-                serde_json::to_string(&(thread_id, turn_id)).expect("string pair"),
-            ),
-            Self::CreatorThread(k) => ("creator-thread", k.clone()),
-            Self::AcceptedSource(k) => ("accepted-source", k.clone()),
-            Self::ParentThread(k) => ("parent-thread", k.clone()),
-            #[cfg(test)]
-            Self::HistoricalSeed => ("historical-seed", "v1".into()),
-        }
-    }
-}
-
+use pioneer_crud_tasks::child_scopes::{
+    self, ChildScopeRace, defer_child_scope_snapshot, expand_child_scope_page,
+};
+pub use pioneer_crud_tasks::child_scopes::{ChildScope, enqueue_scope};
 pub use pioneer_crud_tasks::child_work::enqueue_point;
-
-// Discovery is not a new domain revision. Repeated compatibility/seed pages
-// must not steal a live claim or wake an unchanged parked dependency. A legacy
-// selector has already proved eligibility, so it may revive a parked ticket
-// after an unrecognized old writer supplied its missing dependency.
-async fn ensure_discovered_point<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-    now: i64,
-    revive_parked: bool,
-) -> Result<()> {
-    let current = point::Entity::find_by_id(turn_id).one(db).await?;
-    if current.as_ref().is_none_or(|row| {
-        row.thread_id != thread_id || (revive_parked && row.next_attempt_at.is_none())
-    }) {
-        enqueue_point(db, thread_id, turn_id, now).await?;
-    }
-    Ok(())
-}
-
-pub async fn enqueue_scope<C: ConnectionTrait>(db: &C, input: ChildScope, now: i64) -> Result<()> {
-    let (kind, key) = input.locator();
-    pioneer_crud_tasks::child_work::enqueue_scope(db, kind, &key, now).await
-}
-
-fn point_fence(row: &point::Model) -> sea_orm::Condition {
-    let mut c = sea_orm::Condition::all()
-        .add(point::Column::TurnId.eq(&row.turn_id))
-        .add(point::Column::Revision.eq(&row.revision));
-    c = if let Some(t) = &row.claim_token {
-        c.add(point::Column::ClaimToken.eq(t))
-    } else {
-        c.add(point::Column::ClaimToken.is_null())
-    };
-    if let Some(due) = row.next_attempt_at {
-        c.add(point::Column::NextAttemptAt.eq(due))
-    } else {
-        c.add(point::Column::NextAttemptAt.is_null())
-    }
-}
-fn scope_fence(row: &scope::Model) -> sea_orm::Condition {
-    let mut c = sea_orm::Condition::all()
-        .add(scope::Column::ScopeKind.eq(&row.scope_kind))
-        .add(scope::Column::ScopeKey.eq(&row.scope_key))
-        .add(scope::Column::IncarnationToken.eq(&row.incarnation_token));
-    c = if let Some(t) = &row.claim_token {
-        c.add(scope::Column::ClaimToken.eq(t))
-    } else {
-        c.add(scope::Column::ClaimToken.is_null())
-    };
-    if let Some(due) = row.next_attempt_at {
-        c.add(scope::Column::NextAttemptAt.eq(due))
-    } else {
-        c.add(scope::Column::NextAttemptAt.is_null())
-    }
-}
-
-fn scope_pass_fence(row: &scope::Model) -> sea_orm::Condition {
-    let mut fence = scope_fence(row);
-    for (column, value) in [
-        (scope::Column::PassRevision, &row.pass_revision),
-        (scope::Column::Cursor, &row.cursor),
-        (scope::Column::UpperWatermark, &row.upper_watermark),
-    ] {
-        fence = if let Some(value) = value {
-            fence.add(column.eq(value))
-        } else {
-            fence.add(column.is_null())
-        };
-    }
-    fence
-}
+use pioneer_crud_tasks::child_work::{self, point_fence};
 
 impl CrudStore {
     pub async fn discover_child_points(&self, now: i64, limit: u64) -> Result<Vec<point::Model>> {
-        self.discover_child_points_after(now, limit, None).await
+        child_work::discover_child_points(&self.connection, now, limit).await
     }
-    /// Rotate through the indexed due set even when a poison head cannot be
-    /// deferred. The caller retains this advisory cursor only, never ownership.
+
     pub async fn discover_child_points_after(
         &self,
         now: i64,
         limit: u64,
         after: Option<(i64, &str)>,
     ) -> Result<Vec<point::Model>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let query = point::Entity::find()
-            .filter(point::Column::NextAttemptAt.lte(now))
-            .order_by_asc(point::Column::NextAttemptAt)
-            .order_by_asc(point::Column::TurnId)
-            .limit(limit.min(PAGE));
-        if let Some((due, id)) = after {
-            let rows = query
-                .clone()
-                .filter(
-                    sea_orm::Condition::any()
-                        .add(point::Column::NextAttemptAt.gt(due))
-                        .add(
-                            sea_orm::Condition::all()
-                                .add(point::Column::NextAttemptAt.eq(due))
-                                .add(point::Column::TurnId.gt(id)),
-                        ),
-                )
-                .all(&self.connection)
-                .await?;
-            if !rows.is_empty() {
-                return Ok(rows);
-            }
-        }
-        Ok(query.all(&self.connection).await?)
+        child_work::discover_child_points_after(&self.connection, now, limit, after).await
     }
-    /// Finite advisory pass boundary. No ownership or writer admission.
+
     pub async fn child_point_due_upper(&self, now: i64) -> Result<Option<(i64, String)>> {
-        Ok(point::Entity::find()
-            .select_only()
-            .columns([point::Column::NextAttemptAt, point::Column::TurnId])
-            .filter(point::Column::NextAttemptAt.lte(now))
-            .order_by_desc(point::Column::NextAttemptAt)
-            .order_by_desc(point::Column::TurnId)
-            .into_tuple::<(i64, String)>()
-            .one(&self.connection)
-            .await?)
+        child_work::child_point_due_upper(&self.connection, now).await
     }
-    /// An empty suffix ends this pass; it never silently wraps into new growth.
+
     pub async fn discover_child_points_in_pass(
         &self,
         now: i64,
@@ -196,61 +46,20 @@ impl CrudStore {
         after: Option<&(i64, String)>,
         upper: &(i64, String),
     ) -> Result<Vec<point::Model>> {
-        let mut query = point::Entity::find()
-            .filter(point::Column::NextAttemptAt.lte(now))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(point::Column::NextAttemptAt.lt(upper.0))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(point::Column::NextAttemptAt.eq(upper.0))
-                            .add(point::Column::TurnId.lte(&upper.1)),
-                    ),
-            );
-        if let Some((due, id)) = after {
-            query = query.filter(
-                sea_orm::Condition::any()
-                    .add(point::Column::NextAttemptAt.gt(*due))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(point::Column::NextAttemptAt.eq(*due))
-                            .add(point::Column::TurnId.gt(id)),
-                    ),
-            );
-        }
-        Ok(query
-            .order_by_asc(point::Column::NextAttemptAt)
-            .order_by_asc(point::Column::TurnId)
-            .limit(limit.min(PAGE))
-            .all(&self.connection)
-            .await?)
+        child_work::discover_child_points_in_pass(&self.connection, now, limit, after, upper).await
     }
-    /// Exact-snapshot independent deferral after claim/ACK failure. An unknown
-    /// committed claim has a different token/deadline and cannot be cleared by
-    /// its old preclaim snapshot. No row is inserted/recreated by this helper.
+
     pub async fn defer_child_point_snapshot<F: Fn() -> i64 + Sync>(
         &self,
         snapshot: &point::Model,
         clock: &F,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let due = clock().saturating_add(2);
-            let changed = point::Entity::update_many()
-                .filter(point_fence(snapshot))
-                .col_expr(point::Column::NextAttemptAt, Expr::value(due))
-                .col_expr(
-                    point::Column::ClaimToken,
-                    Expr::value(Option::<String>::None),
-                )
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            tx.commit().await?;
-            Ok(changed == 1)
+        self.run_serialized_write(|| {
+            child_work::defer_child_point_snapshot(&self.connection, snapshot, clock)
         })
         .await
     }
+
     pub async fn claim_child_point(
         &self,
         candidate: &point::Model,
@@ -258,590 +67,85 @@ impl CrudStore {
     ) -> Result<Option<point::Model>> {
         self.claim_child_point_with_clock(candidate, &|| now).await
     }
+
     pub async fn claim_child_point_with_clock<F: Fn() -> i64 + Sync>(
         &self,
         candidate: &point::Model,
         clock: &F,
     ) -> Result<Option<point::Model>> {
-        if candidate.next_attempt_at.is_none_or(|due| due > clock()) {
-            return Ok(None);
-        }
-        self.run_serialized_write(|| async {
-            let claim = token();
-            let tx = self.connection.begin().await?;
-            let reserved_at = clock();
-            let until = reserved_at.saturating_add(LEASE);
-            let affected = point::Entity::update_many()
-                .filter(point_fence(candidate))
-                .filter(point::Column::NextAttemptAt.lte(reserved_at))
-                .col_expr(point::Column::ClaimToken, Expr::value(&claim))
-                .col_expr(point::Column::NextAttemptAt, Expr::value(until))
-                .col_expr(
-                    point::Column::AttemptCount,
-                    Expr::value(candidate.attempt_count.saturating_add(1)),
-                )
-                .exec(&tx)
-                .await?
-                .rows_affected;
-            tx.commit().await?;
-            Ok((affected == 1).then(|| {
-                let mut row = candidate.clone();
-                row.claim_token = Some(claim);
-                row.next_attempt_at = Some(until);
-                row.attempt_count = row.attempt_count.saturating_add(1);
-                row
-            }))
+        self.run_serialized_write(|| {
+            child_work::claim_child_point_with_clock(&self.connection, candidate, clock)
         })
         .await
     }
-    /// None parks a proven durable dependency. Runtime-local waits use a timed
-    /// retry. An ACK from an older producer revision cannot remove new work.
+
     pub async fn finish_child_point(
         &self,
         claim: &point::Model,
         retry_at: Option<i64>,
         done: bool,
     ) -> Result<bool> {
-        ensure!(claim.claim_token.is_some(), "unclaimed child ACK");
-        self.run_serialized_write(|| async {
-            let rows = if done {
-                point::Entity::delete_many()
-                    .filter(point_fence(claim))
-                    .exec(&self.connection)
-                    .await?
-                    .rows_affected
-            } else {
-                point::Entity::update_many()
-                    .filter(point_fence(claim))
-                    .col_expr(
-                        point::Column::ClaimToken,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .col_expr(point::Column::NextAttemptAt, Expr::value(retry_at))
-                    .exec(&self.connection)
-                    .await?
-                    .rows_affected
-            };
-            Ok(rows == 1)
+        self.run_serialized_write(|| {
+            child_work::finish_child_point(&self.connection, claim, retry_at, done)
         })
         .await
     }
 }
 
-#[derive(Debug)]
-enum Output {
-    Scope(ChildScope),
-    Point(String, String),
-}
-struct Item {
-    cursor: String,
-    output: Output,
-}
-
-// Each scope has its own indexed keyset. No global history JOIN is used by
-// steady-state discovery. Upper is captured in the same short transaction as
-// pass_revision. A fresh pass catches insertions behind an existing cursor.
-async fn page<C: ConnectionTrait>(
-    db: &C,
-    row: &scope::Model,
-    upper_only: bool,
-) -> Result<Vec<Item>> {
-    use pioneer_entity::{
-        task, task_run, task_run_conversation_snapshot as accepted, task_run_turn as link, turn,
-    };
-    use sea_orm::{Condition, Order};
-    let order = if upper_only { Order::Desc } else { Order::Asc };
-    let limit = if upper_only { 1 } else { PAGE };
-    let lower = if upper_only {
-        None
-    } else {
-        row.cursor.as_deref()
-    };
-    let upper = if upper_only {
-        None
-    } else {
-        row.upper_watermark.as_deref()
-    };
-    macro_rules! keyset {
-        ($q:expr, $col:expr) => {{
-            let mut q = $q;
-            if let Some(k) = lower {
-                q = q.filter($col.gt(k));
-            }
-            if let Some(k) = upper {
-                q = q.filter($col.lte(k));
-            }
-            q.order_by($col, order.clone()).limit(limit)
-        }};
-    }
-    let mut out = Vec::new();
-    match row.scope_kind.as_str() {
-        "task" => {
-            let q = task_run::Entity::find().filter(task_run::Column::TaskId.eq(&row.scope_key));
-            for id in keyset!(q, task_run::Column::Id)
-                .select_only()
-                .column(task_run::Column::Id)
-                .into_tuple::<String>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id.clone(),
-                    output: Output::Scope(ChildScope::Run(id)),
-                });
-            }
-        }
-        "task+run-group" => {
-            let (task_id, group): (String, String) = serde_json::from_str(&row.scope_key)?;
-            let mut q = task_run::Entity::find()
-                .filter(task_run::Column::TaskId.eq(task_id))
-                .filter(task_run::Column::RunGroupId.eq(group));
-            if let Some(k) = lower {
-                q = q.filter(task_run::Column::AttemptNumber.gt(k.parse::<i64>()?));
-            }
-            if let Some(k) = upper {
-                q = q.filter(task_run::Column::AttemptNumber.lte(k.parse::<i64>()?));
-            }
-            for (id, n) in q
-                .select_only()
-                .columns([task_run::Column::Id, task_run::Column::AttemptNumber])
-                .order_by(task_run::Column::AttemptNumber, order)
-                .limit(limit)
-                .into_tuple::<(String, i64)>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: n.to_string(),
-                    output: Output::Scope(ChildScope::Run(id)),
-                });
-            }
-        }
-        "run" => {
-            let mut q = link::Entity::find().filter(link::Column::RunId.eq(&row.scope_key));
-            if let Some(k) = lower {
-                q = q.filter(link::Column::Sequence.gt(k.parse::<i64>()?));
-            }
-            if let Some(k) = upper {
-                q = q.filter(link::Column::Sequence.lte(k.parse::<i64>()?));
-            }
-            for (thread, id, n) in q
-                .select_only()
-                .columns([
-                    link::Column::ThreadId,
-                    link::Column::TurnId,
-                    link::Column::Sequence,
-                ])
-                .order_by(link::Column::Sequence, order)
-                .limit(limit)
-                .into_tuple::<(String, String, i64)>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: n.to_string(),
-                    output: Output::Point(thread, id),
-                });
-            }
-        }
-        "child-thread" => {
-            let q = link::Entity::find().filter(link::Column::ThreadId.eq(&row.scope_key));
-            for (id, thread, turn) in keyset!(q, link::Column::Id)
-                .select_only()
-                .columns([
-                    link::Column::Id,
-                    link::Column::ThreadId,
-                    link::Column::TurnId,
-                ])
-                .into_tuple::<(String, String, String)>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id,
-                    output: Output::Point(thread, turn),
-                });
-            }
-        }
-        "creator-turn" => {
-            let (thread, id): (String, String) = serde_json::from_str(&row.scope_key)?;
-            let q = task::Entity::find()
-                .filter(task::Column::CreatedByThreadId.eq(thread))
-                .filter(task::Column::CreatedByTurnId.eq(id));
-            for id in keyset!(q, task::Column::Id)
-                .select_only()
-                .column(task::Column::Id)
-                .into_tuple::<String>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id.clone(),
-                    output: Output::Scope(ChildScope::Task(id)),
-                });
-            }
-        }
-        "creator-thread" => {
-            // NULL creators cannot provide positive launch authority.
-            let mut q = task::Entity::find()
-                .filter(task::Column::CreatedByThreadId.eq(&row.scope_key))
-                .filter(task::Column::CreatedByTurnId.is_not_null());
-            if let Some(k) = lower {
-                let (creator, id): (String, String) = serde_json::from_str(k)?;
-                q = q.filter(
-                    Condition::any()
-                        .add(task::Column::CreatedByTurnId.gt(&creator))
-                        .add(
-                            Condition::all()
-                                .add(task::Column::CreatedByTurnId.eq(creator))
-                                .add(task::Column::Id.gt(id)),
-                        ),
-                );
-            }
-            if let Some(k) = upper {
-                let (creator, id): (String, String) = serde_json::from_str(k)?;
-                q = q.filter(
-                    Condition::any()
-                        .add(task::Column::CreatedByTurnId.lt(&creator))
-                        .add(
-                            Condition::all()
-                                .add(task::Column::CreatedByTurnId.eq(creator))
-                                .add(task::Column::Id.lte(id)),
-                        ),
-                );
-            }
-            for (creator, id) in q
-                .select_only()
-                .columns([task::Column::CreatedByTurnId, task::Column::Id])
-                .order_by(task::Column::CreatedByTurnId, order.clone())
-                .order_by(task::Column::Id, order)
-                .limit(limit)
-                .into_tuple::<(String, String)>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: serde_json::to_string(&(creator, &id))?,
-                    output: Output::Scope(ChildScope::Task(id)),
-                });
-            }
-        }
-        "accepted-source" => {
-            let q =
-                accepted::Entity::find().filter(accepted::Column::SourceTurnId.eq(&row.scope_key));
-            for id in keyset!(q, accepted::Column::RunId)
-                .select_only()
-                .column(accepted::Column::RunId)
-                .into_tuple::<String>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id.clone(),
-                    output: Output::Scope(ChildScope::Run(id)),
-                });
-            }
-        }
-        "parent-thread" => {
-            let q = turn::Entity::find()
-                .filter(turn::Column::ThreadId.eq(&row.scope_key))
-                .filter(turn::Column::TurnKind.eq("task_run"));
-            for id in keyset!(q, turn::Column::Id)
-                .select_only()
-                .column(turn::Column::Id)
-                .into_tuple::<String>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id.clone(),
-                    output: Output::Scope(ChildScope::Run(id)),
-                });
-            }
-        }
-        "historical-seed" => {
-            // Walk the existing link PK, not an IN-subquery that may materialize
-            // the entire child history once per page. Point processing performs
-            // current terminal/ownership selection through exact indexed reads.
-            let q = link::Entity::find();
-            for (id, thread, turn) in keyset!(q, link::Column::Id)
-                .select_only()
-                .columns([
-                    link::Column::Id,
-                    link::Column::ThreadId,
-                    link::Column::TurnId,
-                ])
-                .into_tuple::<(String, String, String)>()
-                .all(db)
-                .await?
-            {
-                out.push(Item {
-                    cursor: id,
-                    output: Output::Point(thread, turn),
-                });
-            }
-        }
-        _ => anyhow::bail!("unknown child scope kind"),
-    }
-    Ok(out)
-}
-
 impl CrudStore {
-    /// Advisory read first: an idle poll never reserves the writer. Seed is
-    /// owned by Gateway startup migration lifecycle, not the live worker.
-    pub async fn expand_child_scope(&self, now: i64, seed: bool) -> Result<bool> {
-        self.expand_child_scope_with_clock(&|| now, seed).await
+    /// Advisory read first: an idle poll never reserves the writer.
+    pub async fn expand_child_scope(&self, now: i64) -> Result<bool> {
+        self.expand_child_scope_with_clock(&|| now).await
     }
     pub async fn expand_child_scope_with_clock<F: Fn() -> i64 + Sync>(
         &self,
         clock: &F,
-        seed: bool,
     ) -> Result<bool> {
-        let Some(candidate) = self.discover_child_scope_after(clock(), seed, None).await? else {
+        let Some(candidate) = self.discover_child_scope_after(clock(), None).await? else {
             return Ok(false);
         };
-        self.expand_child_scope_candidate_with_clock(&candidate, clock, seed)
+        self.expand_child_scope_candidate_with_clock(&candidate, clock)
             .await
     }
-    /// Advisory indexed discovery only. Seed has a separate durable owner and
-    /// never participates in live rotation.
     pub async fn discover_child_scope_after(
         &self,
         now: i64,
-        seed: bool,
         after: Option<&(i64, String, String)>,
     ) -> Result<Option<scope::Model>> {
-        let base = scope::Entity::find()
-            .filter(scope::Column::NextAttemptAt.lte(now))
-            .filter(if seed {
-                scope::Column::ScopeKind.eq("historical-seed")
-            } else {
-                scope::Column::ScopeKind.ne("historical-seed")
-            })
-            .order_by_asc(scope::Column::NextAttemptAt)
-            .order_by_asc(scope::Column::ScopeKind)
-            .order_by_asc(scope::Column::ScopeKey);
-        let mut query = base.clone();
-        if !seed {
-            if let Some((due, kind, key)) = after {
-                query = query.filter(
-                    sea_orm::Condition::any()
-                        .add(scope::Column::NextAttemptAt.gt(*due))
-                        .add(
-                            sea_orm::Condition::all()
-                                .add(scope::Column::NextAttemptAt.eq(*due))
-                                .add(scope::Column::ScopeKind.gt(kind.clone())),
-                        )
-                        .add(
-                            sea_orm::Condition::all()
-                                .add(scope::Column::NextAttemptAt.eq(*due))
-                                .add(scope::Column::ScopeKind.eq(kind.clone()))
-                                .add(scope::Column::ScopeKey.gt(key.clone())),
-                        ),
-                );
-            }
-        }
-        let mut candidate = query.one(&self.connection).await?;
-        if candidate.is_none() && !seed && after.is_some() {
-            candidate = base.one(&self.connection).await?;
-        }
-        Ok(candidate)
+        child_scopes::discover_child_scope_after(&self.connection, now, after).await
     }
+
     pub async fn child_scope_due_upper(&self, now: i64) -> Result<Option<(i64, String, String)>> {
-        Ok(scope::Entity::find()
-            .select_only()
-            .columns([
-                scope::Column::NextAttemptAt,
-                scope::Column::ScopeKind,
-                scope::Column::ScopeKey,
-            ])
-            .filter(scope::Column::NextAttemptAt.lte(now))
-            .filter(scope::Column::ScopeKind.ne("historical-seed"))
-            .order_by_desc(scope::Column::NextAttemptAt)
-            .order_by_desc(scope::Column::ScopeKind)
-            .order_by_desc(scope::Column::ScopeKey)
-            .into_tuple::<(i64, String, String)>()
-            .one(&self.connection)
-            .await?)
+        child_scopes::child_scope_due_upper(&self.connection, now).await
     }
+
     pub async fn discover_child_scope_in_pass(
         &self,
         now: i64,
         after: Option<&(i64, String, String)>,
         upper: &(i64, String, String),
     ) -> Result<Option<scope::Model>> {
-        let mut query = scope::Entity::find()
-            .filter(scope::Column::NextAttemptAt.lte(now))
-            .filter(scope::Column::ScopeKind.ne("historical-seed"))
-            .filter(
-                sea_orm::Condition::any()
-                    .add(scope::Column::NextAttemptAt.lt(upper.0))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(scope::Column::NextAttemptAt.eq(upper.0))
-                            .add(scope::Column::ScopeKind.lt(&upper.1)),
-                    )
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(scope::Column::NextAttemptAt.eq(upper.0))
-                            .add(scope::Column::ScopeKind.eq(&upper.1))
-                            .add(scope::Column::ScopeKey.lte(&upper.2)),
-                    ),
-            );
-        if let Some((due, kind, key)) = after {
-            query = query.filter(
-                sea_orm::Condition::any()
-                    .add(scope::Column::NextAttemptAt.gt(*due))
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(scope::Column::NextAttemptAt.eq(*due))
-                            .add(scope::Column::ScopeKind.gt(kind)),
-                    )
-                    .add(
-                        sea_orm::Condition::all()
-                            .add(scope::Column::NextAttemptAt.eq(*due))
-                            .add(scope::Column::ScopeKind.eq(kind))
-                            .add(scope::Column::ScopeKey.gt(key)),
-                    ),
-            );
-        }
-        Ok(query
-            .order_by_asc(scope::Column::NextAttemptAt)
-            .order_by_asc(scope::Column::ScopeKind)
-            .order_by_asc(scope::Column::ScopeKey)
-            .one(&self.connection)
-            .await?)
+        child_scopes::discover_child_scope_in_pass(&self.connection, now, after, upper).await
     }
+
     pub async fn expand_child_scope_candidate_with_clock<F: Fn() -> i64 + Sync>(
         &self,
         candidate: &scope::Model,
         clock: &F,
-        seed: bool,
     ) -> Result<bool> {
         let outcome = self
             .run_serialized_write(|| async {
                 let claim = token();
                 let tx = self.connection.begin().await?;
-                let now = clock();
-                if scope::Entity::update_many()
-                    .filter(scope_fence(&candidate))
-                    .filter(scope::Column::NextAttemptAt.lte(now))
-                    .col_expr(
-                        scope::Column::AttemptCount,
-                        Expr::value(candidate.attempt_count.saturating_add(1)),
-                    )
-                    .col_expr(scope::Column::ClaimToken, Expr::value(&claim))
-                    .col_expr(
-                        scope::Column::NextAttemptAt,
-                        Expr::value(now.saturating_add(LEASE)),
-                    )
-                    .exec(&tx)
-                    .await?
-                    .rows_affected
-                    != 1
-                {
-                    tx.rollback().await?;
-                    return Ok(true);
-                }
-                let mut current = scope::Entity::find()
-                    .filter(scope::Column::ScopeKind.eq(candidate.scope_kind.clone()))
-                    .filter(scope::Column::ScopeKey.eq(candidate.scope_key.clone()))
-                    .one(&tx)
-                    .await?
-                    .expect("claimed scope exists");
-                let claimed = current.clone();
-                if current.pass_revision.is_none() {
-                    current.pass_revision = Some(current.requested_revision.clone());
-                    current.cursor = None;
-                    current.upper_watermark = page(&tx, &current, true)
-                        .await?
-                        .first()
-                        .map(|item| item.cursor.clone());
-                }
-                let items = if current.upper_watermark.is_some() {
-                    page(&tx, &current, false).await?
-                } else {
-                    Vec::new()
-                };
-                let last = items.last().map(|item| item.cursor.clone());
-                let eof = items.len() < PAGE as usize;
-                for item in items {
-                    match item.output {
-                        Output::Scope(input) => enqueue_scope(&tx, input, now).await?,
-                        Output::Point(thread, id) => {
-                            if seed {
-                                ensure_discovered_point(&tx, &thread, &id, now, false).await?;
-                            } else {
-                                enqueue_point(&tx, &thread, &id, now).await?;
-                            }
-                        }
+                let result = expand_child_scope_page(&tx, candidate, &claim, clock()).await;
+                match result {
+                    Ok(true) => tx.commit().await?,
+                    Ok(false) => tx.rollback().await?,
+                    Err(error) if error.is::<ChildScopeRace>() => {
+                        return Err(crate::util::PreflightRace.into());
                     }
+                    Err(error) => return Err(error),
                 }
-                // Lock-free CAS still fences ABA and prior holders. Producer writes
-                // serialize on this row; a changed request is never acknowledged.
-                let mut update = scope::Entity::update_many().filter(scope_pass_fence(&claimed));
-                if eof && current.pass_revision.as_ref() == Some(&current.requested_revision) {
-                    if seed {
-                        update = update.col_expr(
-                            scope::Column::NextAttemptAt,
-                            Expr::value(Option::<i64>::None),
-                        );
-                    } else {
-                        if !(scope::Entity::delete_many()
-                            .filter(scope_pass_fence(&claimed))
-                            .filter(
-                                scope::Column::RequestedRevision.eq(&current.requested_revision),
-                            )
-                            .exec(&tx)
-                            .await?
-                            .rows_affected
-                            == 1)
-                        {
-                            return Err(crate::util::PreflightRace.into());
-                        }
-                        tx.commit().await?;
-                        return Ok(true);
-                    }
-                } else {
-                    update = update.col_expr(scope::Column::NextAttemptAt, Expr::value(now));
-                }
-                if eof {
-                    update = update
-                        .col_expr(
-                            scope::Column::PassRevision,
-                            Expr::value(Option::<String>::None),
-                        )
-                        .col_expr(scope::Column::Cursor, Expr::value(Option::<String>::None))
-                        .col_expr(
-                            scope::Column::UpperWatermark,
-                            Expr::value(Option::<String>::None),
-                        );
-                } else {
-                    update = update
-                        .col_expr(
-                            scope::Column::PassRevision,
-                            Expr::value(current.pass_revision.clone()),
-                        )
-                        .col_expr(scope::Column::Cursor, Expr::value(last))
-                        .col_expr(
-                            scope::Column::UpperWatermark,
-                            Expr::value(current.upper_watermark.clone()),
-                        );
-                }
-                if !(update
-                    .filter(scope::Column::RequestedRevision.eq(&current.requested_revision))
-                    .col_expr(
-                        scope::Column::ClaimToken,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .exec(&tx)
-                    .await?
-                    .rows_affected
-                    == 1)
-                {
-                    return Err(crate::util::PreflightRace.into());
-                }
-                tx.commit().await?;
                 Ok(true)
             })
             .await;
@@ -851,20 +155,7 @@ impl CrudStore {
             // against the advisory snapshot before this independent deferral.
             let deferred = self
                 .run_serialized_write(|| async {
-                    scope::Entity::update_many()
-                        .filter(scope_fence(&candidate))
-                        .filter(scope::Column::RequestedRevision.eq(&candidate.requested_revision))
-                        .col_expr(
-                            scope::Column::NextAttemptAt,
-                            Expr::value(clock().saturating_add(2)),
-                        )
-                        .col_expr(
-                            scope::Column::ClaimToken,
-                            Expr::value(Option::<String>::None),
-                        )
-                        .exec(&self.connection)
-                        .await?;
-                    Ok(())
+                    defer_child_scope_snapshot(&self.connection, candidate, clock()).await
                 })
                 .await;
             if let Err(deferral) = deferred {
@@ -1171,186 +462,8 @@ impl CrudStore {
     }
 }
 
-/// SQLSTATE/engine conditions that require restarting the entire transaction.
-/// Other errors, including ambiguous transport/commit failures, are not races.
-pub(crate) fn is_transaction_retry(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let Some(error) = cause.downcast_ref::<sea_orm::DbErr>() else {
-            return false;
-        };
-        let runtime = match error {
-            sea_orm::DbErr::Query(r) | sea_orm::DbErr::Exec(r) => r,
-            _ => return false,
-        };
-        if let sea_orm::RuntimeErr::SqlxError(error) = runtime {
-            if let sea_orm::sqlx::Error::Database(error) = error.as_ref() {
-                if matches!(error.code().as_deref(), Some("40001" | "40P01")) {
-                    return true;
-                }
-                #[cfg(feature = "mysql")]
-                if let Some(mysql) =
-                    error.try_downcast_ref::<sea_orm::sqlx::mysql::MySqlDatabaseError>()
-                {
-                    return matches!(mysql.number(), 1205 | 1213);
-                }
-                return false;
-            }
-        }
-        false
-    })
-}
-
-impl CrudStore {
-    pub async fn child_work_queues_ready(&self) -> Result<bool> {
-        Ok(self
-            .child_seed_outcome(chrono::Utc::now().timestamp())
-            .await?
-            == ChildSeedOutcome::CommittedDone)
-    }
-    pub async fn discover_legacy_child_work(&self, limit: u64) -> Result<()> {
-        let rows = self
-            .list_unreconciled_terminal_task_child_turns(limit.min(PAGE))
-            .await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        self.run_serialized_write(|| async {
-            let tx = self.connection.begin().await?;
-            let now = chrono::Utc::now().timestamp();
-            for row in &rows {
-                use pioneer_entity::turn;
-                // Historical discovery was outside this transaction. Fence the
-                // current source locator before it can replace a moved ticket.
-                let mut query = turn::Entity::find_by_id(&row.turn_id)
-                    .filter(turn::Column::ThreadId.eq(&row.thread_id))
-                    .select_only()
-                    .column(turn::Column::Id);
-                if tx.get_database_backend() != sea_orm::DbBackend::Sqlite {
-                    query = query.lock_exclusive();
-                }
-                if query.into_tuple::<String>().one(&tx).await?.is_some() {
-                    ensure_discovered_point(&tx, &row.thread_id, &row.turn_id, now, true).await?;
-                }
-            }
-            tx.commit().await?;
-            Ok(())
-        })
-        .await
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChildSeedOutcome {
-    CommittedDone,
-    Progress,
-    Deferred { retry_at: i64 },
-    Claimed { expires_at: i64 },
-    Missing,
-}
-fn seed_outcome(row: Option<&scope::Model>, now: i64) -> Result<ChildSeedOutcome> {
-    let Some(row) = row else {
-        return Ok(ChildSeedOutcome::Missing);
-    };
-    let Some(deadline) = row.next_attempt_at else {
-        ensure!(
-            row.claim_token.is_none()
-                && row.pass_revision.is_none()
-                && row.cursor.is_none()
-                && row.upper_watermark.is_none(),
-            "unfinished child seed has no retry deadline"
-        );
-        return Ok(ChildSeedOutcome::CommittedDone);
-    };
-    if deadline > now {
-        if row.claim_token.is_some() {
-            Ok(ChildSeedOutcome::Claimed {
-                expires_at: deadline,
-            })
-        } else {
-            Ok(ChildSeedOutcome::Deferred { retry_at: deadline })
-        }
-    } else {
-        Ok(ChildSeedOutcome::Progress)
-    }
-}
-impl CrudStore {
-    pub async fn child_seed_outcome(&self, now: i64) -> Result<ChildSeedOutcome> {
-        let row = scope::Entity::find()
-            .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
-            .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
-            .one(&self.connection)
-            .await?;
-        seed_outcome(row.as_ref(), now)
-    }
-    /// One owned seed quantum. Only the committed EOF marker means Done;
-    /// an empty due probe or a future lease does not complete bootstrap.
-    pub async fn seed_child_work_with_clock<F: Fn() -> i64 + Sync>(
-        &self,
-        clock: &F,
-    ) -> Result<ChildSeedOutcome> {
-        let row = scope::Entity::find()
-            .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
-            .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
-            .one(&self.connection)
-            .await?;
-        let outcome = seed_outcome(row.as_ref(), clock())?;
-        if outcome != ChildSeedOutcome::Progress {
-            return Ok(outcome);
-        }
-        let row = row.expect("progress has a locator");
-        match self
-            .expand_child_scope_candidate_with_clock(&row, clock, true)
-            .await
-        {
-            Ok(_) => self.child_seed_outcome(clock()).await,
-            Err(error) => {
-                // A committed deferral or an unknown successful claim remains
-                // owned by this runner until its deadline, never reported done.
-                let observed = scope::Entity::find()
-                    .filter(scope::Column::ScopeKind.eq("historical-seed".to_owned()))
-                    .filter(scope::Column::ScopeKey.eq("v1".to_owned()))
-                    .one(&self.connection)
-                    .await;
-                match observed {
-                    Ok(fresh) => match seed_outcome(fresh.as_ref(), clock()) {
-                        Ok(ChildSeedOutcome::Progress) if fresh.as_ref() != Some(&row) => {
-                            Ok(ChildSeedOutcome::Progress)
-                        }
-                        Ok(
-                            state @ (ChildSeedOutcome::Deferred { .. }
-                            | ChildSeedOutcome::Claimed { .. }
-                            | ChildSeedOutcome::CommittedDone
-                            | ChildSeedOutcome::Missing),
-                        ) => Ok(state),
-                        _ => Err(error),
-                    },
-                    Err(_) => Err(error),
-                }
-            }
-        }
-    }
-}
-
 impl CrudStore {
     pub async fn next_task_child_work_deadline(&self) -> Result<Option<i64>> {
-        let point = point::Entity::find()
-            .select_only()
-            .column(point::Column::NextAttemptAt)
-            .filter(point::Column::NextAttemptAt.is_not_null())
-            .order_by_asc(point::Column::NextAttemptAt)
-            .limit(1)
-            .into_tuple::<i64>()
-            .one(&self.connection)
-            .await?;
-        let scope = scope::Entity::find()
-            .select_only()
-            .column(scope::Column::NextAttemptAt)
-            .filter(scope::Column::NextAttemptAt.is_not_null())
-            .order_by_asc(scope::Column::NextAttemptAt)
-            .limit(1)
-            .into_tuple::<i64>()
-            .one(&self.connection)
-            .await?;
-        Ok(point.into_iter().chain(scope).min())
+        child_scopes::next_task_child_work_deadline(&self.connection).await
     }
 }

@@ -1639,8 +1639,8 @@ fn classify_execution_failure(error: &anyhow::Error) -> RunExecutionFailure {
     if is_retryable_database_conflict(error) {
         return RunExecutionFailure {
             disposition: RunFailureDisposition::RetryInfrastructure,
-            error_class: "sqlite_busy",
-            reason_code: "sqlite_retry_exhausted",
+            error_class: "postgres_contention",
+            reason_code: "postgres_retry_exhausted",
         };
     }
     RunExecutionFailure {
@@ -2490,8 +2490,8 @@ mod tests {
         assert_eq!(retry_backoff_seconds(i64::MAX), 900);
     }
 
-    #[test]
-    fn retry_classification_keeps_infrastructure_contract_and_authority_distinct() {
+    #[pioneer_postgres_test::postgres_test]
+    async fn retry_classification_keeps_infrastructure_contract_and_authority_distinct() {
         for class in [
             ProviderFailureClass::NetworkTransient,
             ProviderFailureClass::RateLimit,
@@ -2527,13 +2527,15 @@ mod tests {
             RunFailureDisposition::RetryInfrastructure
         );
 
-        let sqlite_busy = anyhow::anyhow!("database is locked");
-        let sqlite_failure = classify_execution_failure(&sqlite_busy);
+        let conflict = crate::tests::postgres_failures::rejected_snapshot()
+            .await
+            .unwrap();
+        let database_failure = classify_execution_failure(&conflict.into());
         assert_eq!(
-            sqlite_failure.disposition,
+            database_failure.disposition,
             RunFailureDisposition::RetryInfrastructure
         );
-        assert_eq!(sqlite_failure.error_class, "sqlite_busy");
+        assert_eq!(database_failure.error_class, "postgres_contention");
 
         let contract = run_execution_error(
             RunFailureDisposition::FailWithoutInfrastructureRetry,

@@ -200,3 +200,125 @@ async fn large_unicode_output_keeps_immutable_chunks_and_retry_identity() -> Res
     })
     .await
 }
+
+#[tokio::test]
+async fn tool_output_chunks_are_scoped_ordered_and_idempotent() -> Result<()> {
+    with_database(async |fixture| {
+        let writer = fixture.connection();
+        seed(writer).await?;
+        let mut n = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "command".into(),
+            delta: "same text\n".into(),
+            stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        };
+        record_output(writer, "chunk-a", &n).await.unwrap();
+        record_output(writer, "chunk-a", &n).await.unwrap();
+        record_output(writer, "chunk-b", &n).await.unwrap();
+        n.stream = Some(pioneer_protocol::ItemDeltaStream::Stderr);
+        n.delta = "failure detail".into();
+        record_output(writer, "chunk-c", &n).await.unwrap();
+        assert!(record_output(writer, "chunk-a", &n).await.is_err());
+        n.thread_id = "other".into();
+        assert!(record_output(writer, "bad", &n).await.is_err());
+        let reopened = fixture.connect_read_only().await?;
+        let rows = page(&reopened, "workspace", "thread", "turn", "command", 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1.text, "same text\n");
+        assert_eq!(rows[1].1.text, "same text\n");
+        assert_eq!(rows[2].1.text, "failure detail");
+        assert!(
+            page(&reopened, "foreign", "thread", "turn", "command", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            page(
+                &reopened,
+                "workspace",
+                "thread",
+                "turn",
+                "command",
+                rows[2].0
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies() -> Result<()> {
+    with_database(async |fixture| {
+        let writer = fixture.connection();
+        seed(writer).await?;
+        let original = "вывод🦀\n".repeat(30000);
+        let n = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "large".into(),
+            delta: original.clone(),
+            stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+            payload: Some(serde_json::json!({"truncated":false})),
+            markdown: None,
+            markdown_version: None,
+        };
+        record_output(writer, "large", &n).await.unwrap();
+        assert!(
+            chunk::Entity::find()
+                .filter(chunk::Column::TextEncoding.eq(1_i16))
+                .filter(Expr::cust("octet_length(text) < text_original_bytes"))
+                .count(writer)
+                .await?
+                > 0
+        );
+        record_output(writer, "large", &n).await.unwrap();
+        let rows = page(writer, "workspace", "thread", "turn", "large", 0)
+            .await
+            .unwrap();
+        assert!(rows.len() > 1);
+        let mut conflicting = n.clone();
+        conflicting.delta.truncate(195000);
+        assert!(record_output(writer, "large", &conflicting).await.is_err());
+        assert!(rows.iter().all(|(_, row)| row.text.len() <= 128 * 1024));
+        assert_eq!(
+            rows.iter()
+                .map(|(_, row)| row.text.as_str())
+                .collect::<String>(),
+            original
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, row)| row.metadata.is_some())
+                .count(),
+            1
+        );
+        assert!(
+            page(
+                writer,
+                "workspace",
+                "thread",
+                "turn",
+                "large",
+                rows.last().unwrap().0
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        Ok(())
+    })
+    .await
+}

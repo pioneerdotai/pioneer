@@ -5,6 +5,7 @@
 //! The owner retains those separately and waits on gateway.control. Due queue
 //! entries blocked by capacity/proof do not manufacture an immediate deadline.
 use crate::{CrudStore, Result, unix_to_datetime};
+use pioneer_crud_execution::native_terminal_effect_outbox::NATIVE_RETENTION_WAKE_KEY;
 use pioneer_entity::{
     agent_work_queue, native_terminal_effect_outbox, recovery_job, recovery_terminalization_outbox,
     skill_upload_session, turn_execution, turn_item_attempt,
@@ -63,7 +64,7 @@ impl GatewayControlWake {
             Self::Skills => "skills".into(),
             Self::Ledger => "ledger".into(),
             Self::Terminalization => "terminalization".into(),
-            Self::NativeRetention => "native-retention".into(),
+            Self::NativeRetention => NATIVE_RETENTION_WAKE_KEY.into(),
         }
     }
 
@@ -102,7 +103,7 @@ impl GatewayControlWake {
             "skills" => Self::Skills,
             "ledger" => Self::Ledger,
             "terminalization" => Self::Terminalization,
-            "native-retention" => Self::NativeRetention,
+            NATIVE_RETENTION_WAKE_KEY => Self::NativeRetention,
             _ => return None,
         })
     }
@@ -219,7 +220,7 @@ impl CrudStore {
 }
 
 /// Adapter for exported repository operations that also serve raw-connection
-/// fixtures. Production SQLite mutations use the runtime handle. Transaction
+/// fixtures. Production PostgreSQL mutations use the runtime handle. Transaction
 /// primitives cannot notify before commit; their CrudStore owner holds the guard.
 pub trait GatewayControlConnection: sea_orm::ConnectionTrait {
     fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange>;

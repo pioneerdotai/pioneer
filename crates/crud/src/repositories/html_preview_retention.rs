@@ -9,7 +9,7 @@ use pioneer_entity::{
     html_preview_frozen_turn as frozen_turn, thread as thread_entity, turn as turn_entity,
     turn_input, turn_llm_context,
 };
-use sea_orm::sea_query::{BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query};
+use sea_orm::sea_query::{BinOper, Expr, ExprTrait, JoinType, OnConflict, Order, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
     Set, TransactionTrait,
@@ -18,6 +18,11 @@ use sea_orm::{
 pub(super) mod queries;
 use queries::{bytes, col, json as json_field, revision};
 use serde_json::{Value, json};
+
+pub use pioneer_crud_artifacts::html_preview::archive_result;
+pub(crate) use pioneer_crud_artifacts::html_preview::{
+    PreparedPreviewInputAdoption, preview_result_was_released, retain_preview_input,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 
@@ -54,6 +59,7 @@ async fn index_quantum(
             ("h", history::Column::ImportCount),
             ("h", history::Column::ImportsSha256),
         ])
+        .expr_as(col("i", frozen_index::Column::Unknown), "unknown")
         .expr_as(col("i", frozen_index::Column::NextOrdinal), "next_ordinal")
         .limit(1)
         .to_owned();
@@ -89,7 +95,38 @@ async fn index_quantum(
     let count: i64 = row.try_get("", "message_count")?;
     let identity: String = row.try_get("", "identity_sha256")?;
     let next: i64 = row.try_get("", "next_ordinal")?;
-    if next == count && row.try_get::<i64>("", "import_count")? > 0 {
+    let import_count: i64 = row.try_get("", "import_count")?;
+    if row.try_get::<i64>("", "unknown")? == 1 {
+        if import_count > 0 {
+            // Repeat the entire walk so a previously uncertain page cannot
+            // disappear from the proof. Incomplete markers retain media while
+            // the bounded recheck is in progress.
+            let restarted = store
+                .run_serialized_write(|| async {
+                    let changed = frozen_index::Entity::update_many()
+                        .col_expr(frozen_index::Column::NextOrdinal, Expr::val(0))
+                        .col_expr(frozen_index::Column::Complete, Expr::val(0))
+                        .col_expr(frozen_index::Column::Unknown, Expr::val(0))
+                        .filter(frozen_index::Column::ManifestId.eq(&id))
+                        .filter(frozen_index::Column::WorkspaceId.eq(&workspace))
+                        .filter(frozen_index::Column::IdentitySha256.eq(&identity))
+                        .filter(frozen_index::Column::MessageCount.eq(count))
+                        .filter(frozen_index::Column::NextOrdinal.eq(next))
+                        .filter(frozen_index::Column::Ready.eq(1))
+                        .filter(frozen_index::Column::Expired.eq(0))
+                        .filter(frozen_index::Column::Unknown.eq(1))
+                        .exec(&store.connection)
+                        .await?;
+                    Ok(changed.rows_affected == 1)
+                })
+                .await?;
+            if restarted {
+                *after = previous_after;
+            }
+        }
+        return Ok(true);
+    }
+    if next == count && import_count > 0 {
         *imports = Some(PreviewImportIndex {
             header: PreviewImportHeader {
                 manifest: id.clone(),
@@ -97,7 +134,7 @@ async fn index_quantum(
                 owner,
                 identity,
                 messages: count,
-                count: u64::try_from(row.try_get::<i64>("", "import_count")?)?,
+                count: u64::try_from(import_count)?,
                 expected: row.try_get("", "imports_sha256")?,
             },
             next: 0,
@@ -216,9 +253,7 @@ async fn index_quantum(
                 .col_expr(frozen_index::Column::NextOrdinal, Expr::val(end))
                 .col_expr(
                     frozen_index::Column::Complete,
-                    Expr::val(i64::from(
-                        end == count && row.try_get::<i64>("", "import_count")? == 0,
-                    )),
+                    Expr::val(i64::from(end == count && import_count == 0)),
                 )
                 .col_expr(frozen_index::Column::Unknown, Expr::val(i64::from(unknown)))
                 .filter(frozen_index::Column::ManifestId.eq(&id))
@@ -285,13 +320,11 @@ async fn index_quantum(
             Ok(changed == 1)
         })
         .await?;
-    change.completed(
-        changed && !unknown && end == count && row.try_get::<i64>("", "import_count")? == 0,
-    );
+    change.completed(changed && !unknown && end == count && import_count == 0);
     if changed && !results.is_empty() {
         store.notify_html_preview_io_work();
     }
-    if !unknown && (end < count || row.try_get::<i64>("", "import_count")? > 0) {
+    if changed && !unknown && (end < count || import_count > 0) {
         *after = previous_after;
     }
     Ok(true)
@@ -372,9 +405,12 @@ async fn index_import_quantum(
                 .page
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("preview dependency import page is missing"))?;
-            let target =
-                super::checkpoint_proofs::target_reference(store, id, proof.message_ordinal)
-                    .await?;
+            let target = super::checkpoint_proofs::target_reference(
+                &store.connection,
+                id,
+                proof.message_ordinal,
+            )
+            .await?;
             let checkpoint = match target.sources.as_slice() {
                 [s] if s.scope.starts_with("checkpoint:") => Some(s),
                 _ => None,
@@ -550,41 +586,6 @@ async fn unowned<C: ConnectionTrait>(
         }
     }
     Ok(true)
-}
-
-/// Compact only the exact canonical preview result. Pairing, name, call id,
-/// diagnostics and ordered result remain; no source/image bytes are copied.
-pub fn archive_result(payload: &str) -> Result<String> {
-    let mut view: Value = serde_json::from_str(payload)?;
-    ensure!(
-        view["kind"] == "json" && view["truncated"] == false,
-        "incomplete canonical preview result"
-    );
-    let message = &mut view["value"];
-    ensure!(
-        message["role"] == "tool"
-            && message["name"] == "html_preview"
-            && message["tool_call_id"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-        "preview result identity mismatch"
-    );
-    let mut diagnostics: Value = serde_json::from_str(
-        message["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("preview result content is not JSON"))?,
-    )?;
-    let object = diagnostics
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("preview diagnostics are not an object"))?;
-    object.remove("llm_context");
-    object.insert(
-        "previewRetention".into(),
-        json!("released; temporary images are no longer retained"),
-    );
-    message["content"] = serde_json::to_string(&diagnostics)?.into();
-    message.as_object_mut().unwrap().remove("content_parts");
-    Ok(serde_json::to_string(&view)?)
 }
 
 // Compact advisory discovery only. Metadata stays behind the individual byte
@@ -780,6 +781,7 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             .eq(call),
         )
         // Source plus six frames, with one sentinel to reject ambiguity.
+        .order_by_asc(artifact::Column::Id)
         .limit(8)
         .all(&store.connection)
         .await?;
@@ -968,7 +970,12 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
             // Recheck mutable adoption/version/identity assumptions inside commit.
             for ((a, v), b) in artifacts.iter().zip(&versions).zip(&bindings) {
                 ensure!(
-                    artifact::Entity::find_by_id(&a.id).one(&tx).await?.as_ref() == Some(a),
+                    artifact::Entity::find_by_id(&a.id)
+                        .lock_exclusive()
+                        .one(&tx)
+                        .await?
+                        .as_ref()
+                        == Some(a),
                     "preview artifact changed"
                 );
                 ensure!(
@@ -1041,8 +1048,8 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
                     )
                     .exec(&tx)
                     .await?;
-                // FK enforcement is disabled in production. Explicitly detach all
-                // byte owners in this transaction; never rely on ON DELETE CASCADE.
+                // Clear the live references and publish the release marker in the
+                // same transaction before removing the version.
                 artifact_external_ref::Entity::delete_many()
                     .filter(artifact_external_ref::Column::ArtifactId.eq(&a.id))
                     .filter(artifact_external_ref::Column::WorkspaceId.eq(&a.workspace_id))
@@ -1114,15 +1121,12 @@ impl CrudStore {
         workspace: &str,
         key: &str,
     ) -> Result<bool> {
-        let owners = artifact_blob::Entity::find()
-            .select_only()
-            .column(artifact_blob::Column::Id)
-            .filter(artifact_blob::Column::WorkspaceId.eq(workspace))
-            .filter(artifact_blob::Column::StorageKey.eq(key))
-            .filter(queries::blob_has_owners("artifact_blob"))
-            .limit(1)
-            .into_query();
-        Ok(self.connection.query_one(&owners).await?.is_none())
+        pioneer_crud_artifacts::html_preview_discovery::artifact_storage_key_is_unreferenced(
+            &self.connection,
+            workspace,
+            key,
+        )
+        .await
     }
 
     /// Bounded keyset discovery. Advance after a failed filesystem deletion too;
@@ -1135,9 +1139,12 @@ impl CrudStore {
         String,
         Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
     )> {
-        let upper = self.html_preview_blob_frontier().await?;
-        self.html_preview_gc_blob_page_through(after, cutoff_ms, &upper)
-            .await
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_gc_blob_page(
+            &self.connection,
+            after,
+            cutoff_ms,
+        )
+        .await
     }
     pub async fn html_preview_gc_blob_page_through(
         &self,
@@ -1148,62 +1155,24 @@ impl CrudStore {
         String,
         Vec<(String, super::artifact::ArtifactGcBlobCandidateRecord)>,
     )> {
-        // Page the source rows first, even if every blob still has owners.
-        // This bounds work independently of the number of GC candidates.
-        let cutoff = chrono::DateTime::from_timestamp_millis(cutoff_ms)
-            .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
-            .fixed_offset();
-        let orphan = col("b", artifact_blob::Column::CreatedAt)
-            .lte(cutoff)
-            .and(Func::coalesce([
-                json_field(
-                    col("b", artifact_blob::Column::MetadataJson),
-                    &["htmlToolTemporary"],
-                )
-                .is_in(["1", "true"]),
-                Expr::val(false),
-            ]))
-            .and(queries::blob_has_owners("b").not());
-        let query = Query::select()
-            .from_as(artifact_blob::Entity, "b")
-            .columns([
-                ("b", artifact_blob::Column::WorkspaceId),
-                ("b", artifact_blob::Column::Id),
-                ("b", artifact_blob::Column::StorageKey),
-                ("b", artifact_blob::Column::SizeBytes),
-            ])
-            .expr_as(orphan, "orphan")
-            .and_where(col("b", artifact_blob::Column::Id).gt(after))
-            .and_where(col("b", artifact_blob::Column::Id).lte(upper))
-            .order_by(("b", artifact_blob::Column::Id), Order::Asc)
-            .limit(16)
-            .to_owned();
-        let rows = self.connection.query_all(&query).await?;
-        let mut next = String::new();
-        let mut candidates = Vec::new();
-        for row in rows {
-            next = row.try_get("", "id")?;
-            if row.try_get::<bool>("", "orphan")? {
-                candidates.push((
-                    row.try_get("", "workspace_id")?,
-                    super::artifact::ArtifactGcBlobCandidateRecord {
-                        blob_id: next.clone(),
-                        storage_key: row.try_get("", "storage_key")?,
-                        size_bytes: std::cmp::max(row.try_get::<i64>("", "size_bytes")?, 0) as u64,
-                    },
-                ));
-            }
-        }
-        Ok((next, candidates))
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_gc_blob_page_through(
+            &self.connection,
+            after,
+            cutoff_ms,
+            upper,
+        )
+        .await
     }
     #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_released_copies_page(
         &self,
         after: &str,
     ) -> Result<(String, Option<(String, String)>)> {
-        let upper = self.html_preview_artifact_frontier().await?;
-        self.html_preview_released_copies_page_through(after, &upper)
-            .await
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_released_copies_page(
+            &self.connection,
+            after,
+        )
+        .await
     }
     #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_released_copies_page_through(
@@ -1211,60 +1180,12 @@ impl CrudStore {
         after: &str,
         upper: &str,
     ) -> Result<(String, Option<(String, String)>)> {
-        let query = artifact::Entity::find()
-            .select_only()
-            .columns([
-                artifact::Column::Id,
-                artifact::Column::WorkspaceId,
-                artifact::Column::CurrentVersionId,
-            ])
-            .column_as(bytes(Expr::col(artifact::Column::MetadataJson)), "bytes")
-            .column_as(
-                Expr::from(Func::cust(sea_orm::sea_query::Alias::new("substr")).args([
-                    Expr::col(artifact::Column::MetadataJson),
-                    Expr::val(1),
-                    Expr::val(1048576),
-                ])),
-                "metadata_json",
-            )
-            .filter(artifact::Column::Id.gt(after))
-            .filter(artifact::Column::Id.lte(upper))
-            .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
-            .filter(
-                Expr::col(artifact::Column::CreatedByActorId)
-                    .eq(Expr::Constant("html_preview".into())),
-            )
-            .order_by_asc(artifact::Column::Id)
-            .limit(1)
-            .into_query();
-        let row = self.connection.query_one(&query).await?;
-        let Some(row) = row else {
-            return Ok((String::new(), None));
-        };
-        let id: String = row.try_get("", "id")?;
-        if row
-            .try_get::<Option<String>>("", "current_version_id")?
-            .is_some()
-        {
-            return Ok((id, None));
-        }
-        if row.try_get::<i64>("", "bytes")? > 1048576 {
-            tracing::warn!("HTML preview retained oversized copy metadata");
-            return Ok((id, None));
-        }
-        let metadata: String = row.try_get("", "metadata_json")?;
-        let parsed: Value = match serde_json::from_str(&metadata) {
-            Ok(value) => value,
-            Err(_) => return Ok((id, None)),
-        };
-        if parsed["htmlTool"]["retention"] != "released"
-            || parsed["htmlTool"]["releasedCopies"]
-                .as_array()
-                .is_none_or(|paths| paths.is_empty())
-        {
-            return Ok((id, None));
-        }
-        Ok((id, Some((row.try_get("", "workspace_id")?, metadata))))
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_released_copies_page_through(
+            &self.connection,
+            after,
+            upper,
+        )
+        .await
     }
 
     pub async fn finish_html_preview_copy_cleanup(
@@ -1319,8 +1240,7 @@ impl CrudStore {
             // SQL text equality can be case-insensitive. Lock the current
             // source (FOR UPDATE on PostgreSQL/MySQL), then compare exact bytes
             // in Rust before publishing prepared cleanup and ACK. A locking
-            // read also avoids an old InnoDB Repeatable Read snapshot. SQLite
-            // uses the existing serialized writer transaction instead.
+            // read returns the committed row after competing writers settle.
             let current = artifact::Entity::find_by_id(id)
                 .select_only()
                 .columns([
@@ -1328,13 +1248,7 @@ impl CrudStore {
                     artifact::Column::CurrentVersionId,
                     artifact::Column::MetadataJson,
                 ])
-                .filter(
-                    super::html_preview_io_work::io_bytes(
-                        tx.get_database_backend(),
-                        Expr::col(artifact::Column::MetadataJson),
-                    )
-                    .lte(1048576),
-                )
+                .filter(queries::bytes(Expr::col(artifact::Column::MetadataJson)).lte(1048576))
                 .lock_exclusive()
                 .into_tuple::<(String, Option<String>, String)>()
                 .one(&tx)
@@ -1376,190 +1290,6 @@ impl CrudStore {
         })
         .await
     }
-}
-
-/// Late durable delivery/retry must observe the same archived representation
-/// after a release commit; it cannot republish deleted image dependencies.
-pub(crate) async fn preview_result_was_released<C: ConnectionTrait>(
-    db: &C,
-    turn: &str,
-    call: &str,
-) -> Result<bool> {
-    let query = artifact::Entity::find()
-        .select_only()
-        .column(artifact::Column::Id)
-        .filter(Expr::col(artifact::Column::CreatedByKind).eq(Expr::Constant("tool".into())))
-        .filter(
-            Expr::col(artifact::Column::CreatedByActorId).eq(Expr::Constant("html_preview".into())),
-        )
-        .filter(artifact::Column::CurrentVersionId.is_null())
-        .filter(
-            json_field(
-                Expr::col(artifact::Column::MetadataJson),
-                &["htmlTool", "turnId"],
-            )
-            .eq(turn),
-        )
-        .filter(
-            json_field(
-                Expr::col(artifact::Column::MetadataJson),
-                &["htmlTool", "callId"],
-            )
-            .eq(call),
-        )
-        .filter(
-            json_field(
-                Expr::col(artifact::Column::MetadataJson),
-                &["htmlTool", "retention"],
-            )
-            .eq("released"),
-        )
-        .limit(1)
-        .into_query();
-    Ok(db.query_one(&query).await?.is_some())
-}
-
-/// A supported canonical UserInput is a real adoption even when Message edits
-/// do not create a UserMessage item. Prepare IDs outside the projection commit;
-/// ordinary artifacts keep their existing binding behavior.
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedPreviewInputAdoption {
-    turn: String,
-    artifact: String,
-    version: Option<String>,
-    binding: String,
-    index: i64,
-    at: chrono::DateTime<chrono::FixedOffset>,
-}
-impl PreparedPreviewInputAdoption {
-    pub(crate) fn new(
-        turn: &str,
-        artifact: &str,
-        version: Option<&str>,
-        index: i64,
-        at: chrono::DateTime<chrono::FixedOffset>,
-    ) -> Self {
-        Self {
-            turn: turn.into(),
-            artifact: artifact.into(),
-            version: version.map(str::to_owned),
-            binding: pioneer_protocol::generate_id(21),
-            index,
-            at,
-        }
-    }
-}
-
-pub(crate) async fn retain_preview_input<C: ConnectionTrait>(
-    db: &C,
-    input: &PreparedPreviewInputAdoption,
-) -> Result<()> {
-    let query = Query::select()
-        .from_as(artifact::Entity, "a")
-        .columns([
-            ("a", artifact::Column::WorkspaceId),
-            ("a", artifact::Column::CurrentVersionId),
-        ])
-        .column(("t", turn_entity::Column::ThreadId))
-        .expr_as(
-            col("th", thread_entity::Column::WorkspaceId),
-            "target_workspace",
-        )
-        .join_as(
-            JoinType::InnerJoin,
-            turn_entity::Entity,
-            "t",
-            col("t", turn_entity::Column::Id).eq(&input.turn),
-        )
-        .join_as(
-            JoinType::InnerJoin,
-            thread_entity::Entity,
-            "th",
-            col("th", thread_entity::Column::Id).eq(col("t", turn_entity::Column::ThreadId)),
-        )
-        .and_where(col("a", artifact::Column::Id).eq(&input.artifact))
-        .and_where(col("a", artifact::Column::CreatedByKind).eq("tool"))
-        .and_where(col("a", artifact::Column::CreatedByActorId).eq("html_preview"))
-        .limit(1)
-        .to_owned();
-    let row = db.query_one(&query).await?;
-    let Some(row) = row else {
-        return Ok(());
-    };
-    let workspace: String = row.try_get("", "workspace_id")?;
-    ensure!(
-        row.try_get::<String>("", "target_workspace")? == workspace,
-        "preview input crosses workspace"
-    );
-    let thread: String = row.try_get("", "thread_id")?;
-    let version = input
-        .version
-        .clone()
-        .or(row.try_get::<Option<String>>("", "current_version_id")?)
-        .ok_or_else(|| anyhow::anyhow!("released preview input is unavailable"))?;
-    let available = artifact_version::Entity::find_by_id(&version)
-        .select_only()
-        .column(artifact_version::Column::Id)
-        .filter(artifact_version::Column::ArtifactId.eq(&input.artifact))
-        .filter(artifact_version::Column::WorkspaceId.eq(&workspace))
-        .into_query();
-    let available = db.query_one(&available).await?;
-    ensure!(
-        available.is_some(),
-        "released preview input version is unavailable"
-    );
-    // An immutable real UserInput binding is the existing adoption path. The
-    // current input projection remains authoritative for Message rendering.
-    let existing = artifact_binding::Entity::find()
-        .select_only()
-        .column(artifact_binding::Column::Id)
-        .filter(artifact_binding::Column::ArtifactId.eq(&input.artifact))
-        .filter(artifact_binding::Column::ArtifactVersionId.eq(&version))
-        .filter(artifact_binding::Column::WorkspaceId.eq(&workspace))
-        .filter(artifact_binding::Column::ThreadId.eq(&thread))
-        .filter(artifact_binding::Column::TurnId.eq(&input.turn))
-        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
-        .filter(artifact_binding::Column::Direction.eq("input"))
-        .into_query();
-    let values = Query::select()
-        .exprs([
-            Expr::val(input.binding.clone()),
-            Expr::val(input.artifact.clone()),
-            Expr::val(version),
-            Expr::val(workspace),
-            Expr::val(thread),
-            Expr::val(input.turn.clone()),
-            Expr::val("user_input"),
-            Expr::val("input"),
-            Expr::val(input.index),
-            Expr::val("user"),
-            Expr::val(input.at),
-            Expr::val("{}"),
-        ])
-        .and_where(Expr::exists(existing).not())
-        .to_owned();
-    db.execute(
-        &Query::insert()
-            .into_table(artifact_binding::Entity)
-            .columns([
-                artifact_binding::Column::Id,
-                artifact_binding::Column::ArtifactId,
-                artifact_binding::Column::ArtifactVersionId,
-                artifact_binding::Column::WorkspaceId,
-                artifact_binding::Column::ThreadId,
-                artifact_binding::Column::TurnId,
-                artifact_binding::Column::BindingKind,
-                artifact_binding::Column::Direction,
-                artifact_binding::Column::ItemIndex,
-                artifact_binding::Column::Role,
-                artifact_binding::Column::CreatedAt,
-                artifact_binding::Column::MetadataJson,
-            ])
-            .select_from(values)?
-            .to_owned(),
-    )
-    .await?;
-    Ok(())
 }
 
 /// A bounded, derived verification receipt, not a second history payload.
@@ -1979,10 +1709,7 @@ impl CrudStore {
         )
         .select_only()
         .column_as(
-            super::html_preview_io_work::io_bytes(
-                self.connection.get_database_backend(),
-                Expr::col(frozen_result::Column::ReferenceJson),
-            ),
+            queries::bytes(Expr::col(frozen_result::Column::ReferenceJson)),
             "bytes",
         )
         .into_tuple::<i64>()
@@ -1995,13 +1722,7 @@ impl CrudStore {
             claim.source_id().to_owned(),
             claim.row.ordinal,
         )
-        .filter(
-            super::html_preview_io_work::io_bytes(
-                self.connection.get_database_backend(),
-                Expr::col(frozen_result::Column::ReferenceJson),
-            )
-            .lte(524288),
-        )
+        .filter(queries::bytes(Expr::col(frozen_result::Column::ReferenceJson)).lte(524288))
         .one(&self.connection)
         .await?
         else {
@@ -2097,13 +1818,7 @@ impl CrudStore {
             .select_only()
             .column(turn_llm_context::Column::Payload)
             .filter(Expr::exists(canonical))
-            .filter(
-                super::html_preview_io_work::io_bytes(
-                    self.connection.get_database_backend(),
-                    Expr::col(turn_llm_context::Column::Payload),
-                )
-                .lte(524288),
-            )
+            .filter(queries::bytes(Expr::col(turn_llm_context::Column::Payload)).lte(524288))
             .into_tuple::<String>()
             .one(&self.connection)
             .await?;
@@ -2162,10 +1877,7 @@ impl CrudStore {
         let length = turn_llm_context::Entity::find_by_id(&row.source_id)
             .select_only()
             .column_as(
-                super::html_preview_io_work::io_bytes(
-                    self.connection.get_database_backend(),
-                    Expr::col(turn_llm_context::Column::Payload),
-                ),
+                queries::bytes(Expr::col(turn_llm_context::Column::Payload)),
                 "bytes",
             )
             .into_tuple::<i64>()
@@ -2182,70 +1894,11 @@ impl CrudStore {
         &self,
         claim: &crate::HtmlPreviewIoClaim,
     ) -> Result<crate::HtmlPreviewIoSource<(String, String)>> {
-        use crate::HtmlPreviewIoSource as Source;
-        ensure!(claim.row.family == "copies", "invalid copies family");
-        if !claim.has_valid_point_locator() {
-            return Ok(Source::Quarantine);
-        }
-        // Header and length are compact; oversized metadata is never materialized.
-        let header = artifact::Entity::find_by_id(claim.source_id())
-            .select_only()
-            .column(artifact::Column::WorkspaceId)
-            .column(artifact::Column::CurrentVersionId)
-            .column_as(
-                super::html_preview_io_work::io_bytes(
-                    self.connection.get_database_backend(),
-                    Expr::col(artifact::Column::MetadataJson),
-                ),
-                "bytes",
-            )
-            .into_tuple::<(String, Option<String>, i64)>()
-            .one(&self.connection)
-            .await?;
-        let Some((workspace, current, length)) = header else {
-            return Ok(Source::Obsolete);
-        };
-        if workspace != claim.row.workspace_id {
-            return Ok(Source::Quarantine);
-        }
-        if current.is_some() {
-            return Ok(Source::Obsolete);
-        }
-        if length > 1048576 {
-            return Ok(Source::Quarantine);
-        }
-        let metadata = artifact::Entity::find_by_id(claim.source_id())
-            .select_only()
-            .column(artifact::Column::MetadataJson)
-            .filter(artifact::Column::WorkspaceId.eq(&workspace))
-            .filter(artifact::Column::CurrentVersionId.is_null())
-            .filter(artifact::Column::CreatedByKind.eq("tool"))
-            .filter(artifact::Column::CreatedByActorId.eq("html_preview"))
-            .filter(
-                super::html_preview_io_work::io_bytes(
-                    self.connection.get_database_backend(),
-                    Expr::col(artifact::Column::MetadataJson),
-                )
-                .lte(1048576),
-            )
-            .into_tuple::<String>()
-            .one(&self.connection)
-            .await?;
-        let Some(metadata) = metadata else {
-            return Ok(Source::Retry);
-        };
-        let parsed: Value = match serde_json::from_str(&metadata) {
-            Ok(value) => value,
-            Err(_) => return Ok(Source::Quarantine),
-        };
-        if parsed["htmlTool"]["retention"] != "released"
-            || parsed["htmlTool"]["releasedCopies"]
-                .as_array()
-                .is_none_or(|a| a.is_empty())
-        {
-            return Ok(Source::Obsolete);
-        }
-        Ok(Source::Ready((workspace, metadata)))
+        pioneer_crud_artifacts::html_preview_discovery::load_html_preview_io_copies(
+            &self.connection,
+            claim,
+        )
+        .await
     }
 }
 
@@ -2257,29 +1910,12 @@ impl CrudStore {
         grace_ms: i64,
         pass_cutoff_ms: i64,
     ) -> Result<Option<i64>> {
-        let cutoff = chrono::DateTime::from_timestamp_millis(pass_cutoff_ms)
-            .ok_or_else(|| anyhow::anyhow!("invalid artifact GC cutoff"))?
-            .fixed_offset();
-        let created = artifact_blob::Entity::find()
-            .select_only()
-            .column(artifact_blob::Column::CreatedAt)
-            .filter(artifact_blob::Column::CreatedAt.gt(cutoff))
-            .filter(
-                json_field(
-                    Expr::col(artifact_blob::Column::MetadataJson),
-                    &["htmlToolTemporary"],
-                )
-                .is_in(["1", "true"]),
-            )
-            .filter(queries::blob_has_owners("artifact_blob").not())
-            .order_by_asc(artifact_blob::Column::CreatedAt)
-            .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
-            .one(&self.connection)
-            .await?;
-        Ok(created.map(|at| {
-            let ms = at.timestamp_millis().saturating_add(grace_ms);
-            ms.div_euclid(1000) + i64::from(ms.rem_euclid(1000) != 0)
-        }))
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_gc_deadline(
+            &self.connection,
+            grace_ms,
+            pass_cutoff_ms,
+        )
+        .await
     }
 }
 
@@ -2287,38 +1923,20 @@ impl CrudStore {
     /// Capture once per keyset pass. Later source commits remain invalidations
     /// for the following pass, including changes behind its current cursor.
     pub async fn html_preview_artifact_frontier(&self) -> Result<String> {
-        Ok(artifact::Entity::find()
-            .select_only()
-            .column(artifact::Column::Id)
-            .order_by_desc(artifact::Column::Id)
-            .into_tuple::<String>()
-            .one(&self.connection)
-            .await?
-            .unwrap_or_default())
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_artifact_frontier(
+            &self.connection,
+        )
+        .await
     }
     pub async fn html_preview_blob_frontier(&self) -> Result<String> {
-        Ok(artifact_blob::Entity::find()
-            .select_only()
-            .column(artifact_blob::Column::Id)
-            .order_by_desc(artifact_blob::Column::Id)
-            .into_tuple::<String>()
-            .one(&self.connection)
-            .await?
-            .unwrap_or_default())
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_blob_frontier(&self.connection)
+            .await
     }
     #[cfg(any(test, feature = "test-support"))]
     pub async fn html_preview_witness_frontier(&self) -> Result<(String, i64)> {
-        Ok(frozen_result::Entity::find()
-            .select_only()
-            .columns([
-                frozen_result::Column::ManifestId,
-                frozen_result::Column::Ordinal,
-            ])
-            .order_by_desc(frozen_result::Column::ManifestId)
-            .order_by_desc(frozen_result::Column::Ordinal)
-            .into_tuple::<(String, i64)>()
-            .one(&self.connection)
-            .await?
-            .unwrap_or_default())
+        pioneer_crud_artifacts::html_preview_discovery::html_preview_witness_frontier(
+            &self.connection,
+        )
+        .await
     }
 }

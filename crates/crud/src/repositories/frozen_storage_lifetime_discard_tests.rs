@@ -30,9 +30,7 @@ async fn ready(store: &CrudStore) {
         .await
         .unwrap();
     assert!(
-        prepared_expiry(store)
-            .await
-            .step(store, &mut SweepAccounting::default())
+        expiry_step(&mut prepared_expiry(store).await, store, &mut SweepAccounting::default())
             .await
             .unwrap()
     );
@@ -171,7 +169,15 @@ async fn unusable_runner_refuses_one_visit_without_hiding_later_work() {
                         .unwrap();
                 }
                 "invalid_utf8" => {
-                    store.connection.execute_unprepared("UPDATE compaction_runner_state SET state=CAST(X'80' AS TEXT) WHERE operation_id='op'").await.unwrap();
+                    let error = store.connection.execute_unprepared(
+                        "UPDATE compaction_runner_state SET state=convert_from(decode('80','hex'),'UTF8')::json WHERE operation_id='op'",
+                    ).await.unwrap_err();
+                    assert!(error.to_string().contains("invalid byte sequence"));
+                    // Preserve the worker check with a stored value whose JSON
+                    // is valid but cannot be decoded as a RunnerState.
+                    store.connection.execute_unprepared(
+                        r#"UPDATE compaction_runner_state SET state='"not-a-runner-state"'::json WHERE operation_id='op'"#,
+                    ).await.unwrap();
                 }
                 "oversize" | "invalid" => {
                     // Character length is below 256 KiB; actual UTF-8 bytes exceed it.
@@ -188,7 +194,7 @@ async fn unusable_runner_refuses_one_visit_without_hiding_later_work() {
                         assert!(json.chars().count() < 256 * 1024 && json.len() > 256 * 1024);
                         json
                     } else {
-                        "{".into()
+                        r#""not-a-runner-state""#.into()
                     };
                     store
                         .connection
@@ -324,9 +330,9 @@ async fn late_read_uses_current_status_generation_and_binding_and_writer_recheck
                 assert_eq!(current.manifest, "replacement");
                 assert_eq!(current.generation, Some(0));
                 while !prepared.reverse.done() {
-                    prepared.reverse.step(&store).await.unwrap();
+                    prepared.reverse.step(&store.connection).await.unwrap();
                 }
-                assert!(!prepared.reverse.reachable);
+                assert!(!prepared.reverse.reachable());
                 prepared.cleanup(&store).await.unwrap();
             } else {
                 let current = prepare_discard_candidate(&store, "cp-2").await.unwrap();
@@ -615,7 +621,7 @@ async fn sparse_physical_pages_yield_without_false_eof_and_keep_tail_after_clean
                     .filter_map(|(id, _)| id.as_ref())
                     .map(String::len)
                     .sum::<usize>()
-                    <= META_ROWS as usize * SCOPE_PAGE_KEY_BYTES as usize
+                    <= META_ROWS as usize * DISCARD_PAGE_KEY_BYTES as usize
             );
         }
         // cp-0 is refused for its incoming edge. The next quantum would need the
@@ -666,8 +672,8 @@ async fn physical_eof_and_periodic_revisit_find_new_eligibility_behind_cursor() 
         let mut progress = FrozenStorageLifetimeProgress::default();
         // Keep another discovery family unfinished so the real periodic cleanup
         // revisit path, rather than a test-only cursor reset, reopens discard.
-        progress.scope.done = true;
-        progress.pass_done = [true, false, true, true, false, true];
+
+        progress.pass_done = [false, true, true, false];
         for id in ["cp-0", "cp-1", "cp-2"] {
             assert!(progress.discard_quantum(&store).await.unwrap());
             assert_eq!(progress.discard_after, id);
@@ -689,16 +695,16 @@ async fn physical_eof_and_periodic_revisit_find_new_eligibility_behind_cursor() 
             .execute_unprepared("UPDATE compaction_operation SET status='failed' WHERE id='op'")
             .await
             .unwrap();
-        progress.phase = 4;
+        progress.phase = 3;
         assert!(progress.quantum(&store).await.unwrap());
-        assert!(progress.pass_done[4] && progress.discard_after.is_empty());
+        assert!(progress.pass_done[3] && progress.discard_after.is_empty());
         let now = Instant::now();
         let interval = Duration::from_secs(60);
         progress.revisit_completed_cleanup(now, interval);
         progress.revisit_completed_cleanup(now + interval, interval);
-        assert!(!progress.pass_done[4]);
+        assert!(!progress.pass_done[3]);
         for _ in 0..64 {
-            progress.phase = 4;
+            progress.phase = 3;
             assert!(progress.quantum(&store).await.unwrap());
             if value(&store, "compaction_checkpoint_event_input", "cp-1").await == 0 {
                 break;
@@ -720,8 +726,8 @@ async fn oversized_page_sentinel_reseeks_after_error_without_skipping_tail() {
      pioneer_postgres_test::with_database(async |fixture| {
         let (store, _) = postgres_fixture(fixture, false).await;
         ready(&store).await;
-        let huge = format!("a-{}", "雪".repeat(SCOPE_PAGE_KEY_BYTES as usize / 3 + 1));
-        assert!(huge.len() > SCOPE_PAGE_KEY_BYTES as usize);
+        let huge = format!("a-{}", "雪".repeat(DISCARD_PAGE_KEY_BYTES as usize / 3 + 1));
+        assert!(huge.len() > DISCARD_PAGE_KEY_BYTES as usize);
         private_key(&store, &huge, 2, "applied").await;
         private_key(&store, "b-tail", 3, "applied").await;
         let mut progress = FrozenStorageLifetimeProgress::default();
@@ -780,13 +786,15 @@ async fn unsealed_writer_fences_owner_scope_and_status_after_discovery() {
                 .unwrap()
                 .unwrap();
             while !prepared.reverse.done() {
-                prepared.reverse.step(&store).await.unwrap();
+                prepared.reverse.step(&store.connection).await.unwrap();
             }
-            assert!(!prepared.reverse.reachable);
+            assert!(!prepared.reverse.reachable());
             let sql = match change {
-                "owner" => "UPDATE compaction_checkpoint SET owner='changed-owner' WHERE id='cp-2'",
+                "owner" => "INSERT INTO compaction_context(owner,workspace_id,thread_id)
+                    SELECT 'changed-owner',workspace_id,thread_id FROM compaction_context WHERE owner='owner';
+                    UPDATE compaction_checkpoint SET owner='changed-owner' WHERE id='cp-2'",
                 "operation_owner" => {
-                    "UPDATE compaction_operation SET owner='changed-owner' WHERE id='later-op'"
+                    "INSERT INTO compaction_context(owner,workspace_id,thread_id) SELECT 'changed-owner',workspace_id,thread_id FROM compaction_context WHERE owner='owner'; UPDATE compaction_operation SET owner='changed-owner' WHERE id='later-op'"
                 }
                 // Use a separate unsealed context, because cp-1 seals 'owner'.
                 "workspace" | "thread" => {
@@ -810,12 +818,14 @@ async fn unsealed_writer_fences_owner_scope_and_status_after_discovery() {
                         .unwrap()
                         .unwrap();
                     while !prepared.reverse.done() {
-                        prepared.reverse.step(&store).await.unwrap();
+                        prepared.reverse.step(&store.connection).await.unwrap();
                     }
                     if change == "workspace" {
                         "UPDATE compaction_context SET workspace_id='other' WHERE owner='unsealed'"
                     } else {
-                        "UPDATE compaction_context SET thread_id='other' WHERE owner='unsealed'"
+                        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+                         VALUES('other','ws','','agent','m','p','active');
+                         UPDATE compaction_context SET thread_id='other' WHERE owner='unsealed'"
                     }
                 }
                 "checkpoint_status" => {

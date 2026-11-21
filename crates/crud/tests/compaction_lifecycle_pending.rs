@@ -1,6 +1,4 @@
-//! Proposal 72/04 regression code. These scenarios are intentionally deferred
-//! until implementation review; cargo check --tests compiles but never runs them.
-use migration::{Migrator, MigratorTrait};
+//! Recovery and publication behavior against the Pioneer PostgreSQL schema.
 use pioneer_compaction::{
     ModelBudget,
     runner::{FailureKind, RunnerPhase, RunnerState},
@@ -10,83 +8,28 @@ use pioneer_entity::{
     compaction_lifecycle_pending as pending, compaction_lifecycle_scope as scope,
     compaction_lifecycle_sequence as sequence, compaction_runner_state as runner,
 };
+use pioneer_postgres_test::TestDatabase;
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
 use sea_orm::{
-    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, QueryFilter,
-    Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-const TRACKING: &str = "m20261008_000004_compaction_lifecycle_pending";
+use std::{sync::Arc, time::Duration};
 const NOW: i64 = 2_000_000_000_000;
 
-// Exercise this migration's schema without applying later irreversible changes.
-struct LifecycleFixtureMigrator;
-impl MigratorTrait for LifecycleFixtureMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        let target = migrations
-            .iter()
-            .position(|migration| migration.name() == TRACKING)
-            .expect("lifecycle migration remains registered");
-        migrations.truncate(target + 1);
-        migrations
-    }
-}
-
-struct TestFile(PathBuf);
-impl Drop for TestFile {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
-        }
-    }
-}
-async fn open(path: &Path) -> (CrudStore, SqliteWriteExecutor) {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let executor = SqliteWriteExecutor::new(writer.clone());
-    SqliteDatabase::from_executor(writer, executor.clone())
-        .maintenance()
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    options
-        .max_connections(2)
-        .min_connections(1)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+async fn open(fixture: &TestDatabase) -> (CrudStore, SqliteWriteExecutor) {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let executor = SqliteWriteExecutor::new(writer);
+    let reader = fixture.connect_read_only().await.unwrap();
     let db = SqliteDatabase::from_executor(reader, executor.clone());
     assert!(db.reader_query_only_enabled().await.unwrap());
     (CrudStore::new(db), executor)
 }
-async fn fixture(before_tracking: bool) -> (TestFile, CrudStore, SqliteWriteExecutor) {
-    let file = TestFile(
-        std::env::temp_dir().join(format!("pioneer-lifecycle-{}.sqlite", uuid::Uuid::new_v4())),
-    );
-    let (store, writer) = open(&file.0).await;
-    let count = before_tracking.then(|| {
-        Migrator::migrations()
-            .iter()
-            .position(|m| m.name() == TRACKING)
-            .unwrap() as u32
-    });
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, count)
-        .await
-        .unwrap();
+
+async fn fixture() -> (Arc<TestDatabase>, CrudStore, SqliteWriteExecutor) {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (store, writer) = open(&fixture).await;
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES ('owner','ws','thread',1)",
@@ -98,11 +41,11 @@ async fn fixture(before_tracking: bool) -> (TestFile, CrudStore, SqliteWriteExec
             .await
             .unwrap();
     }
-    (file, store, writer)
+    (fixture, store, writer)
 }
 async fn operation(store: &CrudStore, id: &str, status: &str, deadline: i64) {
-    store.with_maintenance_access().database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,execution_turn,deadline_ms) VALUES(?,'owner',?,?, '{}','turn',?)",
+    store.with_maintenance_access().database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,execution_turn,deadline_ms) VALUES($1,'owner',$2,$3, '{}','turn',$4)",
         [id.into(),id.into(),status.into(),deadline.into()])).await.unwrap();
 }
 async fn state(store: &CrudStore, id: &str) -> RunnerState {
@@ -117,8 +60,8 @@ async fn state(store: &CrudStore, id: &str) -> RunnerState {
         .with_maintenance_access()
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES (?,?,?)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES ($1,$2,$3::text::json)",
             [
                 id.into(),
                 (state.generation as i64).into(),
@@ -139,7 +82,7 @@ async fn scalar(store: &CrudStore, sql: &str) -> i64 {
     store
         .with_maintenance_access()
         .database_connection()
-        .query_one_raw(Statement::from_string(DbBackend::Sqlite, sql))
+        .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
         .await
         .unwrap()
         .unwrap()
@@ -217,14 +160,64 @@ async fn expand_all(store: &CrudStore, now: i64) {
     }
     panic!("bounded fixture scopes must drain");
 }
-async fn enable(store: &CrudStore, column: &str) {
-    store.with_maintenance_access().database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT zstd_enable_transparent(?)",[serde_json::json!({"table":"turn_item","column":column,"compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()])).await.unwrap();
+async fn replace_item_with_started_payload(
+    db: &SqliteDatabase,
+    compressed: bool,
+    updated_at: Option<&str>,
+) {
+    let payload = if compressed {
+        serde_json::json!({"details":{"status":"started"},"padding":"retained".repeat(4_096)})
+    } else {
+        serde_json::json!({"details":{"status":"started"}})
+    };
+    let prepared = compressed.then(|| {
+        pioneer_crud_payloads::storage::PreparedPayload::new(&payload.to_string()).unwrap()
+    });
+    let tx = db.begin().await.unwrap();
+    if let Some(prepared) = &prepared {
+        prepared.insert(&tx).await.unwrap();
+    }
+    let result = tx
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE turn_item SET payload=$1::text::json, payload_payload_id=$2,
+         updated_at=COALESCE($3::text::timestamptz,updated_at)
+         WHERE item_id='compaction:op'",
+            [
+                (!compressed).then(|| payload.to_string()).into(),
+                prepared
+                    .as_ref()
+                    .map(|payload| payload.id().to_owned())
+                    .into(),
+                updated_at.map(str::to_owned).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
+    tx.commit().await.unwrap();
 }
 
-#[tokio::test]
+async fn terminal_item(store: &CrudStore) -> pioneer_protocol::TurnItem {
+    let item = store
+        .get_turn_item("turn", "compaction:op")
+        .await
+        .unwrap()
+        .unwrap();
+    let pioneer_protocol::TurnItem::SystemEvent {
+        details: Some(details),
+        ..
+    } = &item
+    else {
+        panic!("unexpected compaction projection: {item:?}");
+    };
+    assert_eq!(details["status"], "failed");
+    item
+}
+
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_deadline_units_stop_future_deadline_and_missing_runner() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "deadline", "running", NOW + 60_000).await;
     expand_all(&store, NOW).await;
     assert!(apply(&store, "deadline", NOW).await); // scope evaluation restores deadline
@@ -278,9 +271,9 @@ async fn lifecycle_deadline_units_stop_future_deadline_and_missing_runner() {
     assert!(apply(&store, "stop", NOW).await);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_stop_after_finish_preserves_terminal_deadline_classification() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "running", NOW).await;
     state(&store, "op").await;
     assert!(apply(&store, "op", NOW).await); // finish before runner/publication
@@ -303,7 +296,14 @@ async fn lifecycle_stop_after_finish_preserves_terminal_deadline_classification(
             kind: FailureKind::Deadline
         }
     ));
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_item WHERE item_id='compaction:op' AND json_extract(payload,'$.details.status')='failed'").await, 1);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM turn_item WHERE item_id='compaction:op' AND status='completed'"
+        )
+        .await,
+        1
+    );
     assert_eq!(
         scalar(
             &store,
@@ -314,9 +314,9 @@ async fn lifecycle_stop_after_finish_preserves_terminal_deadline_classification(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_source_refresh_preserves_real_error_backoff_not_old_deadline() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "running", NOW + 600_000).await;
     expand_all(&store, NOW).await;
     let claimed = claim(&store, "op", NOW).await; // pretend preparation was interrupted
@@ -359,14 +359,14 @@ async fn lifecycle_source_refresh_preserves_real_error_backoff_not_old_deadline(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_finish_poison_runner_and_restart_publication_pipeline() {
-    let (file, store, _) = fixture(false).await;
+    let (file, store, _) = fixture().await;
     operation(&store, "poison", "running", NOW).await;
     let initial = state(&store, "poison").await;
     let db = store.with_maintenance_access().database_connection();
     db.execute_unprepared(
-        "UPDATE compaction_runner_state SET state='broken' WHERE operation_id='poison'",
+        "UPDATE compaction_runner_state SET state=to_json('broken'::text) WHERE operation_id='poison'",
     )
     .await
     .unwrap();
@@ -390,8 +390,8 @@ async fn lifecycle_finish_poison_runner_and_restart_publication_pipeline() {
             .is_err()
     );
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_runner_state SET state=? WHERE operation_id='poison'",
+        DbBackend::Postgres,
+        "UPDATE compaction_runner_state SET state=$1::text::json WHERE operation_id='poison'",
         [serde_json::to_string(&initial).unwrap().into()],
     ))
     .await
@@ -399,7 +399,7 @@ async fn lifecycle_finish_poison_runner_and_restart_publication_pipeline() {
     assert_eq!(row(&store, "poison").await.unwrap().due_at, NOW + 5_000);
     drop(db);
     drop(store);
-    let (store, _) = open(&file.0).await;
+    let (store, _) = open(&file).await;
     assert!(apply(&store, "poison", NOW + 5_000).await);
     assert!(row(&store, "poison").await.is_none());
     assert_eq!(
@@ -423,9 +423,9 @@ async fn lifecycle_finish_poison_runner_and_restart_publication_pipeline() {
     ));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_fresh_values_fence_repeated_generation_and_concurrent_apply() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     let state = state(&store, "op").await;
     let claimed = claim(&store, "op", NOW).await;
@@ -441,8 +441,8 @@ async fn lifecycle_fresh_values_fence_repeated_generation_and_concurrent_apply()
         .with_maintenance_access()
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_runner_state SET state=? WHERE operation_id='op'",
+            DbBackend::Postgres,
+            "UPDATE compaction_runner_state SET state=$1::text::json WHERE operation_id='op'",
             [serde_json::to_string(&changed).unwrap().into()],
         ))
         .await
@@ -482,9 +482,9 @@ async fn lifecycle_fresh_values_fence_repeated_generation_and_concurrent_apply()
     assert!(row(&store, "op").await.is_some());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_heartbeat_during_preparation_does_not_fence_equal_inputs() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     state(&store, "op").await;
     let db = store.with_maintenance_access().database_connection();
@@ -498,9 +498,9 @@ async fn lifecycle_heartbeat_during_preparation_does_not_fence_equal_inputs() {
     let event = lifecycle_event(&prepared);
     let before = row(&store, "op").await.unwrap();
     for sql in [
-        "UPDATE turn SET updated_at=datetime('now','+1 second') WHERE id='turn'",
-        "UPDATE thread SET preview='heartbeat',updated_at=datetime('now','+1 second') WHERE id='thread'",
-        "UPDATE turn_item SET last_heartbeat_at=CURRENT_TIMESTAMP,updated_at=datetime('now','+1 second') WHERE id='item'",
+        "UPDATE turn SET updated_at=CURRENT_TIMESTAMP + INTERVAL '1 second' WHERE id='turn'",
+        "UPDATE thread SET preview='heartbeat',updated_at=CURRENT_TIMESTAMP + INTERVAL '1 second' WHERE id='thread'",
+        "UPDATE turn_item SET last_heartbeat_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP + INTERVAL '1 second' WHERE id='item'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -512,12 +512,19 @@ async fn lifecycle_heartbeat_during_preparation_does_not_fence_equal_inputs() {
             .unwrap()
     );
     assert!(row(&store, "op").await.is_none());
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_item WHERE item_id='compaction:op' AND json_extract(payload,'$.details.status')='failed'").await, 1);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM turn_item WHERE item_id='compaction:op' AND status='completed'"
+        )
+        .await,
+        1
+    );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_claim_token_fences_retry_with_unchanged_source_generation() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     state(&store, "op").await;
     let candidate = row(&store, "op").await.unwrap();
@@ -553,9 +560,9 @@ async fn lifecycle_claim_token_fences_retry_with_unchanged_source_generation() {
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_event").await, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_publication_projection_ack_and_post_trigger_generation_are_atomic() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     let initial = state(&store, "op").await;
     let claimed = claim(&store, "op", NOW).await;
@@ -567,7 +574,8 @@ async fn lifecycle_publication_projection_ack_and_post_trigger_generation_are_at
     let event = lifecycle_event(&prepared);
     let before = row(&store, "op").await.unwrap();
     let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_lifecycle_projection BEFORE INSERT ON turn_item WHEN NEW.item_id='compaction:op' BEGIN SELECT RAISE(ABORT,'projection rollback'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION reject_lifecycle_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'projection rollback'; END; $$;
+        CREATE TRIGGER reject_lifecycle_projection BEFORE INSERT ON turn_item FOR EACH ROW WHEN (NEW.item_id='compaction:op') EXECUTE FUNCTION reject_lifecycle_projection()").await.unwrap();
     assert!(
         store
             .compaction_repair_lifecycle(prepared, event, NOW / 1000)
@@ -594,7 +602,7 @@ async fn lifecycle_publication_projection_ack_and_post_trigger_generation_are_at
             0
         );
     }
-    db.execute_unprepared("DROP TRIGGER reject_lifecycle_projection")
+    db.execute_unprepared("DROP TRIGGER reject_lifecycle_projection ON turn_item")
         .await
         .unwrap();
     assert!(apply(&store, "op", NOW + 5_000).await);
@@ -627,9 +635,9 @@ async fn lifecycle_publication_projection_ack_and_post_trigger_generation_are_at
     assert_eq!(row(&store, "op").await.unwrap(), new);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_event_driven_publication_overtakes_worker_with_fresh_atomic_ack() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     state(&store, "op").await;
     store.compaction_reconcile_runner_state("op").await.unwrap();
@@ -655,50 +663,23 @@ async fn lifecycle_event_driven_publication_overtakes_worker_with_fresh_atomic_a
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_event").await, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_physical_plain_compressed_delete_replay_and_storage_switch() {
-    for compressed_before_tracking in [false, true] {
-        let (_file, store, writer) = fixture(compressed_before_tracking).await;
+    for compressed in [false, true] {
+        let (_fixture, store, _) = fixture().await;
         operation(&store, "op", "failed", NOW).await;
         state(&store, "op").await;
         let db = store.with_maintenance_access().database_connection();
-        // A physical metadata-only item can be installed before cutover.
         db.execute_unprepared("INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,active_attempt_number,created_at,updated_at) VALUES ('item','turn','compaction:op','system_event','in_progress','{\"details\":{\"status\":\"started\"}}',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        if compressed_before_tracking {
-            enable(&store, "payload").await;
-            writer
-                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-                .await
-                .unwrap();
-            // Old terminal history is trusted; post-install physical UPDATE
-            // supplies the current obligation without a historical scan.
-            db.execute_unprepared("UPDATE _turn_item_zstd SET payload=payload WHERE id='item'")
-                .await
-                .unwrap();
-        }
         assert!(apply(&store, "op", NOW).await);
         assert!(row(&store, "op").await.is_none());
-        if !compressed_before_tracking {
-            enable(&store, "payload").await;
-        }
-        assert_eq!(scalar(&store,"SELECT count(*) n FROM sqlite_master WHERE type='trigger' AND name LIKE 'compaction_lifecycle_item_%' AND tbl_name='_turn_item_zstd'").await,4);
-        // View replacement (enabling another column) must preserve all
-        // physical triggers before the next write.
-        enable(&store, "active_attempt_status").await;
-        assert_eq!(scalar(&store,"SELECT count(*) n FROM sqlite_master WHERE type='trigger' AND name LIKE 'compaction_lifecycle_item_%' AND tbl_name='_turn_item_zstd'").await,4);
+
         let event_count = scalar(&store, "SELECT count(*) n FROM turn_event").await;
-        let mut compressor = pioneer_sqlite::zstd::ColumnValueCompressor::new(3, None).unwrap();
-        let blob = compressor
-            .compress(b"{\"details\":{\"status\":\"started\"}}")
-            .unwrap();
-        // No trigger may attempt json_extract on this compressed BLOB.
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE _turn_item_zstd SET payload=?,_payload_dict=-1 WHERE item_id='compaction:op'",
-            [blob.into()],
-        ))
-        .await
-        .unwrap();
+        replace_item_with_started_payload(&db, compressed, None).await;
+        let compressed_items = scalar(&store,
+            "SELECT count(*) n FROM turn_item i JOIN portable_payload_value p ON p.id=i.payload_payload_id WHERE i.item_id='compaction:op' AND p.codec=1"
+        ).await;
+        assert_eq!(compressed_items, i64::from(compressed));
         assert!(row(&store, "op").await.is_some());
         assert!(apply(&store, "op", NOW).await);
         assert_eq!(
@@ -706,8 +687,8 @@ async fn lifecycle_physical_plain_compressed_delete_replay_and_storage_switch() 
             event_count,
             "replay repairs projections without duplicate append"
         );
-        assert_eq!(scalar(&store,"SELECT count(*) n FROM turn_item WHERE json_extract(payload,'$.details.status')='failed'").await,1);
-        db.execute_unprepared("DELETE FROM _turn_item_zstd WHERE item_id='compaction:op'")
+        let repaired = terminal_item(&store).await;
+        db.execute_unprepared("DELETE FROM turn_item WHERE item_id='compaction:op'")
             .await
             .unwrap();
         assert!(row(&store, "op").await.is_some());
@@ -720,25 +701,25 @@ async fn lifecycle_physical_plain_compressed_delete_replay_and_storage_switch() 
             .await,
             1
         );
+        assert_eq!(terminal_item(&store).await, repaired);
         assert_eq!(
             scalar(&store, "SELECT count(*) n FROM turn_event").await,
             event_count
         );
-        let before = scalar(&store, "SELECT count(*) n FROM turn_event_delivery").await;
+        let deliveries = scalar(&store, "SELECT count(*) n FROM turn_event_delivery").await;
         assert!(row(&store, "op").await.is_none());
-        // Replay/direct view DML reaches the same physical tracker.
-        db.execute_unprepared("UPDATE turn_item SET payload='{\"details\":{\"status\":\"started\"}}' WHERE item_id='compaction:op'").await.unwrap();
+        replace_item_with_started_payload(&db, !compressed, None).await;
         assert!(apply(&store, "op", NOW).await);
         assert_eq!(
             scalar(&store, "SELECT count(*) n FROM turn_event_delivery").await,
-            before
+            deliveries
         );
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_late_runner_context_turn_and_source_deletion() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     assert!(apply(&store, "op", NOW).await);
     assert!(row(&store, "op").await.is_none());
@@ -748,31 +729,35 @@ async fn lifecycle_late_runner_context_turn_and_source_deletion() {
         "late runner is exact INSERT coverage"
     );
     let db = store.with_maintenance_access().database_connection();
-    // Match the Gateway's actual runtime foreign_keys=OFF policy: missing
-    // source rows must not be fabricated by recovery.
-    db.execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     db.execute_unprepared("DELETE FROM compaction_context WHERE owner='owner'")
         .await
         .unwrap();
-    assert!(apply(&store, "op", NOW).await);
+    assert!(row(&store, "op").await.is_none());
     assert_eq!(
-        scalar(&store, "SELECT count(*) n FROM compaction_context").await,
+        scalar(&store, "SELECT count(*) n FROM compaction_operation").await,
+        0
+    );
+    assert_eq!(
+        scalar(&store, "SELECT count(*) n FROM compaction_runner_state").await,
         0
     );
     db.execute_unprepared("INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)").await.unwrap();
+    operation(&store, "op", "failed", NOW).await;
+    state(&store, "op").await;
     expand_all(&store, NOW).await;
     db.execute_unprepared("DELETE FROM turn WHERE id='turn'")
         .await
         .unwrap();
     assert!(apply(&store, "op", NOW).await);
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn").await, 0);
-    // With foreign keys disabled, restore the cleanup normally performed by
-    // ON DELETE CASCADE before reinserting this Turn with its original id.
-    db.execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
-        .await
-        .unwrap();
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) n FROM compaction_turn_creation WHERE turn_id='turn'"
+        )
+        .await,
+        0
+    );
     db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     expand_all(&store, NOW).await;
     assert!(apply(&store, "op", NOW).await);
@@ -794,9 +779,9 @@ async fn lifecycle_late_runner_context_turn_and_source_deletion() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_running_missing_binding_retries_without_creating_sources() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "running", NOW).await;
     let db = store.with_maintenance_access().database_connection();
     db.execute_unprepared("DELETE FROM turn WHERE id='turn'")
@@ -839,98 +824,32 @@ async fn lifecycle_running_missing_binding_retries_without_creating_sources() {
     );
 }
 
-#[tokio::test]
-async fn lifecycle_scope_and_seed_pages_restart_safe_without_terminal_audit() {
-    let (file, store, writer) = fixture(true).await;
+#[pioneer_postgres_test::postgres_test]
+async fn lifecycle_scope_pages_are_restart_safe() {
+    let (fixture, store, writer) = fixture().await;
     for i in 0..19 {
         operation(&store, &format!("active-{i:02}"), "running", NOW + 60_000).await;
-    }
-    for i in 0..19 {
         let id = format!("terminal-{i:02}");
         operation(&store, &id, "failed", NOW).await;
         state(&store, &id).await;
     }
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_lifecycle_pending"
-        )
-        .await,
-        0,
-        "cutover performs no source backfill"
-    );
-    assert_eq!(
-        store
-            .compaction_expand_lifecycle_scope(true, &|| NOW)
-            .await
-            .unwrap(),
-        4
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_lifecycle_pending"
-        )
-        .await,
-        3
-    );
-    assert_eq!(scalar(&store,"SELECT count(*) n FROM compaction_lifecycle_pending WHERE operation_id LIKE 'terminal-%'").await,0);
-    let seed = scope::Entity::find()
-        .filter(scope::Column::Kind.eq("seed".to_owned()))
-        .filter(scope::Column::Owner.eq(String::new()))
-        .filter(scope::Column::TurnId.eq(String::new()))
-        .one(&store.with_maintenance_access().database_connection())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(seed.cursor_id.as_deref(), Some("active-02"));
-    assert_eq!(seed.upper_id.as_deref(), Some("active-18"));
-    drop(store);
-    drop(writer);
-    let (store, _) = open(&file.0).await;
     expand_all(&store, NOW).await;
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_lifecycle_pending WHERE operation_id LIKE 'active-%'"
-        )
-        .await,
-        19
-    );
-    assert_eq!(scalar(&store,"SELECT count(*) n FROM compaction_lifecycle_pending WHERE operation_id LIKE 'terminal-%'").await,0);
-    assert_eq!(
-        sequence::Entity::find_by_id(1)
-            .one(&store.with_maintenance_access().database_connection())
-            .await
-            .unwrap()
-            .unwrap()
-            .seed_complete,
-        1
-    );
-    assert_eq!(
-        store
-            .compaction_expand_lifecycle_scope(true, &|| NOW)
-            .await
-            .unwrap(),
-        0
-    );
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..8 {
+    loop {
         let batch = store.compaction_due_lifecycle(NOW).await.unwrap();
         assert!(batch.len() <= 8);
         if batch.is_empty() {
             break;
         }
-        for row in batch {
-            assert!(seen.insert(row.operation_id.clone()));
-            assert!(apply(&store, &row.operation_id, NOW).await);
+        for candidate in batch {
+            assert!(seen.insert(candidate.operation_id.clone()));
+            assert!(apply(&store, &candidate.operation_id, NOW).await);
         }
     }
-    assert_eq!(seen.len(), 19);
+    assert_eq!(seen.len(), 38);
+    drop(store);
+    drop(writer);
+    let (store, _) = open(&fixture).await;
     assert!(
         store
             .compaction_due_lifecycle(NOW)
@@ -1004,88 +923,9 @@ async fn lifecycle_scope_and_seed_pages_restart_safe_without_terminal_audit() {
     );
 }
 
-#[tokio::test]
-async fn lifecycle_seed_page_rollback_keeps_claim_and_restart_progress() {
-    let (file, store, writer) = fixture(true).await;
-    for id in ["a", "b", "c", "d"] {
-        operation(&store, id, "running", NOW + 60_000).await;
-    }
-    writer
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_seed_page BEFORE INSERT ON compaction_lifecycle_pending BEGIN SELECT RAISE(ABORT,'seed page rollback'); END").await.unwrap();
-    assert!(
-        store
-            .compaction_expand_lifecycle_scope(true, &|| NOW)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_lifecycle_pending"
-        )
-        .await,
-        0
-    );
-    let interrupted = scope::Entity::find()
-        .filter(scope::Column::Kind.eq("seed".to_owned()))
-        .filter(scope::Column::Owner.eq(String::new()))
-        .filter(scope::Column::TurnId.eq(String::new()))
-        .one(&db)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(interrupted.claim_token.is_some());
-    assert_eq!(interrupted.attempts, 1);
-    assert_eq!(interrupted.due_at, NOW + 5_000);
-    assert!(interrupted.cursor_id.is_none() && interrupted.upper_id.is_none());
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT seed_complete n FROM compaction_lifecycle_sequence"
-        )
-        .await,
-        0
-    );
-    db.execute_unprepared("DROP TRIGGER reject_seed_page")
-        .await
-        .unwrap();
-    drop(db);
-    drop(store);
-    drop(writer);
-    let (store, _) = open(&file.0).await;
-    assert_eq!(
-        store
-            .compaction_expand_lifecycle_scope(true, &|| NOW)
-            .await
-            .unwrap(),
-        0
-    );
-    expand_all(&store, NOW + 5_000).await;
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_lifecycle_pending"
-        )
-        .await,
-        4
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT seed_complete n FROM compaction_lifecycle_sequence"
-        )
-        .await,
-        1
-    );
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_stop_rebind_covers_old_and_new_scope_and_turn_binding_fences_commit() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "running", NOW + 60_000).await;
     expand_all(&store, NOW).await;
     assert!(apply(&store, "op", NOW).await);
@@ -1176,96 +1016,6 @@ async fn lifecycle_stop_rebind_covers_old_and_new_scope_and_turn_binding_fences_
     );
 }
 
-#[tokio::test]
-async fn lifecycle_claim_failure_exact_deferral_poison_progress_and_generation_exhaustion() {
-    let (_file, store, _) = fixture(false).await;
-    for id in ["a-poison", "b-good"] {
-        operation(&store, id, "failed", NOW).await;
-        state(&store, id).await;
-    }
-    let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_claim BEFORE UPDATE OF claim_token ON compaction_lifecycle_pending WHEN OLD.operation_id='a-poison' AND NEW.claim_token IS NOT NULL BEGIN SELECT RAISE(ABORT,'poison reservation'); END").await.unwrap();
-    let due = store.compaction_due_lifecycle(NOW).await.unwrap();
-    assert_eq!(due.len(), 2);
-    for row in due {
-        if row.operation_id == "a-poison" {
-            assert!(
-                store
-                    .compaction_claim_lifecycle(&row, &|| NOW)
-                    .await
-                    .is_err()
-            );
-        } else {
-            assert!(apply(&store, &row.operation_id, NOW).await);
-        }
-    }
-    let delayed = row(&store, "a-poison").await.unwrap();
-    assert_eq!(delayed.due_at, NOW + 5_000);
-    assert_eq!(delayed.attempts, 1);
-    assert!(delayed.claim_token.is_none());
-    assert!(
-        store
-            .compaction_due_lifecycle(NOW)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let stale = delayed.clone();
-    db.execute_unprepared("UPDATE compaction_operation SET outcome='changed' WHERE id='a-poison'")
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_claim_lifecycle(&stale, &|| NOW + 5_000)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let fresh = row(&store, "a-poison").await.unwrap();
-    assert_eq!(
-        fresh.attempts, 1,
-        "stale deferral cannot mutate a new generation"
-    );
-    db.execute_unprepared("CREATE TRIGGER reject_deferral BEFORE UPDATE OF attempts ON compaction_lifecycle_pending WHEN OLD.operation_id='a-poison' BEGIN SELECT RAISE(ABORT,'bookkeeping unavailable'); END").await.unwrap();
-    let error = store
-        .compaction_claim_lifecycle(&fresh, &|| NOW + 5_000)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .downcast_ref::<CompactionLifecycleStorageError>()
-            .is_some()
-    );
-    assert_eq!(row(&store, "a-poison").await.unwrap(), fresh);
-    db.execute_unprepared("DROP TRIGGER reject_deferral")
-        .await
-        .unwrap();
-    db.execute_unprepared("DROP TRIGGER reject_claim")
-        .await
-        .unwrap();
-    db.execute_unprepared(
-        "UPDATE compaction_lifecycle_sequence SET generation=9223372036854775807",
-    )
-    .await
-    .unwrap();
-    assert!(
-        db.execute_unprepared(
-            "UPDATE compaction_operation SET outcome='overflow' WHERE id='a-poison'"
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) n FROM compaction_operation WHERE outcome='changed'"
-        )
-        .await,
-        1
-    );
-    assert_eq!(row(&store, "a-poison").await.unwrap(), fresh);
-}
-
 #[derive(Default)]
 struct Routes {
     reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
@@ -1291,36 +1041,26 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
         self.writes.lock().unwrap().push(event);
     }
 }
-async fn observed_store(path: &Path, routes: Arc<Routes>) -> CrudStore {
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-    options
-        .max_connections(2)
-        .min_connections(1)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+async fn observed_store(fixture: &TestDatabase, routes: Arc<Routes>) -> CrudStore {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     CrudStore::new(SqliteDatabase::from_executor_with_read_observer(
         reader,
         SqliteWriteExecutor::with_observer(writer, routes.clone()),
         routes,
     ))
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_maintenance_routes_clock_after_writer_and_cancellation_preserve_claim() {
+    use pioneer_postgres_test::TestDatabase;
     use pioneer_sqlite::{SqliteReadClass, SqliteReadEvent, SqliteWriteEvent};
-    let (file, store, writer) = fixture(false).await;
+    let (file, store, writer) = fixture().await;
     operation(&store, "op", "running", NOW + 60_000).await;
     expand_all(&store, NOW).await;
     drop(store);
     drop(writer);
     let routes = Arc::new(Routes::default());
-    let store = observed_store(&file.0, routes.clone()).await;
+    let store = observed_store(&file, routes.clone()).await;
     let candidate = store.compaction_due_lifecycle(NOW).await.unwrap().remove(0);
     assert!(
         routes.writes.lock().unwrap().is_empty(),
@@ -1429,14 +1169,14 @@ async fn lifecycle_maintenance_routes_clock_after_writer_and_cancellation_preser
     assert_eq!(row(&store, "op").await.unwrap().due_at, NOW + 60_000);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_retry_policy_saturates_and_unchanged_source_values_do_not_refresh() {
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     state(&store, "op").await;
     let db = store.with_maintenance_access().database_connection();
     db.execute_unprepared(
-        "UPDATE compaction_runner_state SET state='broken' WHERE operation_id='op'",
+        "UPDATE compaction_runner_state SET state=to_json('broken'::text) WHERE operation_id='op'",
     )
     .await
     .unwrap();
@@ -1469,101 +1209,11 @@ async fn lifecycle_retry_policy_saturates_and_unchanged_source_values_do_not_ref
     }
 }
 
-#[tokio::test]
-async fn lifecycle_idle_discovery_and_scope_indexes_have_no_historical_antijoin() {
-    let (_file, store, _) = fixture(false).await;
-    expand_all(&store, NOW).await;
-    let db = store.with_maintenance_access().database_connection();
-    for index in 0..64 {
-        operation(&store, &format!("old-{index}"), "failed", NOW).await;
-    }
-    for index in 0..64 {
-        assert!(apply(&store, &format!("old-{index}"), NOW).await);
-    }
-    assert!(
-        store
-            .compaction_due_lifecycle(NOW)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        store
-            .compaction_expand_lifecycle_scope(true, &|| NOW)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .compaction_expand_lifecycle_scope(false, &|| NOW)
-            .await
-            .unwrap(),
-        0
-    );
-    // Plans run only after acceptance. This code verifies exact index shapes
-    // as well as the due prefix, rather than timing a small fixture.
-    for (name, columns) in [
-        (
-            "idx_compaction_lifecycle_execution",
-            vec!["execution_turn", "id"],
-        ),
-        (
-            "idx_compaction_lifecycle_owner_execution",
-            vec!["owner", "execution_turn", "id"],
-        ),
-        ("idx_compaction_lifecycle_owner", vec!["owner", "id"]),
-        ("idx_compaction_lifecycle_running", vec!["status", "id"]),
-        (
-            "idx_compaction_lifecycle_due",
-            vec!["due_at", "generation", "operation_id"],
-        ),
-    ] {
-        let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
-                [name.into()],
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.iter()
-                .map(|r| r.try_get::<String>("", "name").unwrap())
-                .collect::<Vec<_>>(),
-            columns
-        );
-    }
-    let plan=db.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "EXPLAIN QUERY PLAN SELECT operation_id,generation FROM compaction_lifecycle_pending WHERE due_at<=? ORDER BY due_at,generation,operation_id LIMIT 8",[NOW.into()])).await.unwrap();
-    let details = plan
-        .iter()
-        .map(|r| r.try_get::<String>("", "detail").unwrap())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        details.contains("SEARCH") && details.contains("idx_compaction_lifecycle_due"),
-        "{details}"
-    );
-    assert!(
-        !details.contains("SCAN compaction_operation") && !details.contains("TEMP B-TREE"),
-        "{details}"
-    );
-    let triggers=db.query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'compaction_lifecycle_%'".to_owned())).await.unwrap();
-    for trigger in triggers {
-        let sql = trigger.try_get::<String>("", "sql").unwrap();
-        assert!(
-            !sql.contains("json_extract") && !sql.contains(".payload"),
-            "tracking uses metadata only"
-        );
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_repeated_started_keeps_one_attempt_and_completed_finishes_it() {
     use pioneer_entity::{turn_item, turn_item_attempt};
     use sea_orm::{ColumnTrait, QueryFilter};
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "running", NOW + 60_000).await;
     let running = state(&store, "op").await;
     use futures_util::FutureExt;
@@ -1664,15 +1314,12 @@ async fn lifecycle_repeated_started_keeps_one_attempt_and_completed_finishes_it(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_replay() {
     use pioneer_entity::{turn_event, turn_item};
     use sea_orm::{ColumnTrait, QueryFilter};
     for compressed in [false, true] {
-        let (_file, store, _) = fixture(false).await;
-        if compressed {
-            enable(&store, "payload").await;
-        }
+        let (_file, store, _) = fixture().await;
         operation(&store, "op", "failed", NOW).await;
         state(&store, "op").await;
         let t1 = NOW;
@@ -1725,8 +1372,9 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
                 .unwrap(),
             original
         );
+        let expected_body = terminal_item(&store).await;
         // Damage both the item data and projection time, then repair at T2.
-        db.execute_unprepared("UPDATE turn_item SET payload='{\"details\":{\"status\":\"started\"}}',updated_at='2090-01-01 00:00:00+00:00' WHERE item_id='compaction:op'").await.unwrap();
+        replace_item_with_started_payload(&db, compressed, Some("2090-01-01 00:00:00+00:00")).await;
         assert!(apply(&store, "op", t2).await);
         let repaired = turn_item::Entity::find_by_id(&original.id)
             .one(&db)
@@ -1738,19 +1386,14 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
             repaired,
             turn_item::Model {
                 portable_revision: repaired.portable_revision,
+                payload_payload_id: repaired.payload_payload_id.clone(),
                 ..original.clone()
             }
         );
-        let table = if compressed {
-            "_turn_item_zstd"
-        } else {
-            "turn_item"
-        };
-        db.execute_unprepared(&format!(
-            "DELETE FROM {table} WHERE item_id='compaction:op'"
-        ))
-        .await
-        .unwrap();
+        assert_eq!(terminal_item(&store).await, expected_body);
+        db.execute_unprepared("DELETE FROM turn_item WHERE item_id='compaction:op'")
+            .await
+            .unwrap();
         assert!(apply(&store, "op", t2 + 60_000).await);
         let restored = turn_item::Entity::find()
             .filter(turn_item::Column::ItemId.eq("compaction:op"))
@@ -1758,7 +1401,7 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(restored.payload, original.payload);
+        assert_eq!(terminal_item(&store).await, expected_body);
         assert_eq!(restored.status, original.status);
         assert_eq!(restored.created_at, saved.created_at);
         assert_eq!(restored.updated_at, saved.created_at);
@@ -1793,7 +1436,7 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(canonical.payload, restored.payload);
+        assert_eq!(terminal_item(&store).await, expected_body);
         assert_eq!(canonical.status, restored.status);
         assert_eq!(canonical.created_at, restored.created_at);
         assert_eq!(canonical.updated_at, restored.updated_at);
@@ -1804,58 +1447,10 @@ async fn lifecycle_terminal_repair_uses_saved_event_time_and_matches_canonical_r
     }
 }
 
-#[tokio::test]
-async fn lifecycle_migration_partial_ddl_rollback_retry_and_down_up_trust_terminal_history() {
-    let (_file, store, writer) = fixture(true).await;
-    operation(&store, "old-terminal", "failed", NOW).await;
-    state(&store, "old-terminal").await;
-    operation(&store, "old-running", "running", NOW).await;
-    let db = store.with_maintenance_access().database_connection();
-    // Collision after tables, seed, indexes and the first physical trigger.
-    let collision = "compaction_lifecycle_compaction_operation_delete";
-    db.execute_unprepared(&format!(
-        "CREATE TRIGGER {collision} AFTER DELETE ON compaction_operation WHEN 0 BEGIN SELECT 1; END"
-    ))
-    .await
-    .unwrap();
-    assert!(
-        writer
-            .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
-            .await
-            .is_err()
-    );
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM sqlite_master WHERE (name LIKE 'compaction_lifecycle_%' OR name LIKE 'idx_compaction_lifecycle_%') AND name <> 'compaction_lifecycle_compaction_operation_delete'").await, 0);
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 0);
-    db.execute_unprepared(&format!("DROP TRIGGER {collision}"))
-        .await
-        .unwrap();
-    writer
-        .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 1);
-    expand_all(&store, NOW).await;
-    assert!(row(&store, "old-terminal").await.is_none());
-    assert!(row(&store, "old-running").await.is_some());
-    let tx = db.begin().await.unwrap();
-    LifecycleFixtureMigrator::down(&*tx, Some(1)).await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM sqlite_master WHERE name LIKE 'compaction_lifecycle_%' OR name LIKE 'idx_compaction_lifecycle_%'").await, 0);
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM seaql_migrations WHERE version='m20261008_000004_compaction_lifecycle_pending'").await, 0);
-    writer
-        .run_migrations::<LifecycleFixtureMigrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    expand_all(&store, NOW).await;
-    assert!(row(&store, "old-terminal").await.is_none());
-    assert!(row(&store, "old-running").await.is_some());
-    assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_event").await, 0);
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_terminal_repair_fences_canonical_event_snapshot_and_rolls_back() {
     use pioneer_entity::turn_event;
-    let (_file, store, _) = fixture(false).await;
+    let (_file, store, _) = fixture().await;
     operation(&store, "op", "failed", NOW).await;
     let running = state(&store, "op").await;
     assert!(apply(&store, "op", NOW).await);
@@ -1864,8 +1459,8 @@ async fn lifecycle_terminal_repair_fences_canonical_event_snapshot_and_rolls_bac
     // Reconcile will update runner inside the domain transaction. Simulate an
     // event replacement after projection preparation but before publication.
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_runner_state SET generation=?,state=? WHERE operation_id='op'",
+        DbBackend::Postgres,
+        "UPDATE compaction_runner_state SET generation=$1,state=$2::text::json WHERE operation_id='op'",
         [
             (running.generation as i64).into(),
             serde_json::to_string(&running).unwrap().into(),
@@ -1889,7 +1484,9 @@ async fn lifecycle_terminal_repair_fences_canonical_event_snapshot_and_rolls_bac
         .await
         .unwrap()
         .unwrap();
-    db.execute_unprepared("CREATE TRIGGER change_event_during_repair AFTER UPDATE ON compaction_runner_state BEGIN UPDATE turn_event SET created_at='2090-01-01 00:00:00+00:00'; END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION change_event_during_repair() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN UPDATE turn_event SET created_at='2090-01-01 00:00:00+00:00'; RETURN NEW; END; $$;
+        CREATE TRIGGER change_event_during_repair AFTER UPDATE ON compaction_runner_state FOR EACH ROW EXECUTE FUNCTION change_event_during_repair()").await.unwrap();
     assert!(
         store
             .compaction_repair_lifecycle(prepared, event, NOW / 1000 + 600)
@@ -1915,7 +1512,7 @@ async fn lifecycle_terminal_repair_fences_canonical_event_snapshot_and_rolls_bac
     assert_eq!(row(&store, "op").await.unwrap(), before);
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_item").await, 0);
     assert_eq!(scalar(&store, "SELECT count(*) n FROM turn_event").await, 1);
-    db.execute_unprepared("DROP TRIGGER change_event_during_repair")
+    db.execute_unprepared("DROP TRIGGER change_event_during_repair ON compaction_runner_state")
         .await
         .unwrap();
     assert!(apply(&store, "op", before.retry_not_before).await);

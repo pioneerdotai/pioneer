@@ -44,24 +44,11 @@ impl SqliteReadObserver for FinalizationWakeObserver {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn committed_finalization_publishes_wakes_before_any_post_commit_reader_wait() {
-    use sea_orm::{ConnectOptions, Set};
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("finalization-wakes.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    Migrator::up(&writer, None).await.unwrap();
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(FinalizationWakeObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -74,7 +61,7 @@ async fn committed_finalization_publishes_wakes_before_any_post_commit_reader_wa
         id: Set("ws_finalization_wakes".into()),
         name: Set("Finalization wake fixture".into()),
         is_active: Set(true),
-        is_current: Set(true),
+        is_current: Set(false),
         created_at: Set(unix_to_datetime(at)),
         updated_at: Set(unix_to_datetime(at)),
     })

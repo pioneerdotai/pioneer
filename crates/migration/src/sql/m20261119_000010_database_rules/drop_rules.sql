@@ -314,8 +314,6 @@ DROP TRIGGER "compaction_lifecycle_compaction_operation_delete" ON "compaction_o
 DROP FUNCTION "compaction_lifecycle_compaction_operation_delete"();
 DROP TRIGGER "compaction_lifecycle_compaction_operation_insert" ON "compaction_operation";
 DROP FUNCTION "compaction_lifecycle_compaction_operation_insert"();
-DROP TRIGGER "compaction_new_thread_prepared" ON "thread";
-DROP FUNCTION "compaction_new_thread_prepared"();
 DROP TRIGGER "compaction_context_epoch_update" ON "turn_llm_context";
 DROP FUNCTION "compaction_context_epoch_update"();
 DROP TRIGGER "compaction_source_update" ON "turn_llm_context";

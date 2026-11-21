@@ -1,7 +1,8 @@
 //! Task occurrence contract repair. Preparation uses metadata only; the
 //! existing correctness transaction rechecks facts/token, repairs and ACKs.
 use super::*;
-use crate::repositories::{task_actor_contract as contracts, task_occurrence_reconcile as queue};
+use crate::repositories::task_actor_contract as contracts;
+use pioneer_crud_tasks::task_occurrence_reconcile as queue;
 use pioneer_entity::task_occurrence_reconcile_pending as pending;
 
 impl CrudStore {
@@ -11,14 +12,6 @@ impl CrudStore {
     ) -> Result<u64> {
         let maintenance = self.with_maintenance_access();
         queue::expand_scope(&maintenance.connection, clock).await
-    }
-
-    pub async fn seed_unfinished_task_occurrences(
-        &self,
-        clock: &TaskOccurrenceClock<'_>,
-    ) -> Result<u64> {
-        let maintenance = self.with_maintenance_access();
-        queue::seed_unfinished(&maintenance.connection, clock).await
     }
 
     pub async fn discover_task_occurrence_reconcile(

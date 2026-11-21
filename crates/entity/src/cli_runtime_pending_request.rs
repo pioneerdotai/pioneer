@@ -30,7 +30,8 @@ pub struct Model {
     pub payload_json: Json,
     #[sea_orm(column_type = "Text")]
     pub status: String,
-    pub response_json: Option<Json>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub response_json: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub resolved_at: Option<DateTimeWithTimeZone>,

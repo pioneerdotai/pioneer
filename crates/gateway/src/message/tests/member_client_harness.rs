@@ -195,17 +195,17 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
                 revoke_reason\
              ) VALUES(\
                 '{MEMBER_SESSION_ID}','{}','{MEMBER_A_ID}','{MEMBER_DEVICE_ID}',\
-                'F0000000000000000000A',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,\
+                'F0000000000000000000A',NULL,decode(repeat('9a',32),'hex'),decode(repeat('9a',32),'hex'),0,\
+                (CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',1,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
              );\
              INSERT INTO auth_refresh_credential(\
                 id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
              ) VALUES(\
                 'R0000000000000000000A','{MEMBER_SESSION_ID}',\
-                'F0000000000000000000A',1,randomblob(32),CURRENT_TIMESTAMP,\
-                datetime('now','+90 days')\
+                'F0000000000000000000A',1,decode(repeat('9a',32),'hex'),CURRENT_TIMESTAMP,\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days')\
              );",
                 crate::session::test_support::TEST_GATEWAY_ID,
                 crate::session::test_support::TEST_GATEWAY_ID,
@@ -798,10 +798,10 @@ async fn member_full_access_cli_request_is_capped_before_codex_permissions_adapt
                 revoke_reason\
              ) VALUES(\
                 '{MEMBER_SESSION_ID}','{}','{MEMBER_A_ID}','{MEMBER_DEVICE_ID}',\
-                'F0000000000000000000A',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,\
+                'F0000000000000000000A',NULL,decode(repeat('9a',32),'hex'),decode(repeat('9a',32),'hex'),0,\
+                (CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',1,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
              );",
             crate::session::test_support::TEST_GATEWAY_ID,
             harness.workspace_id,

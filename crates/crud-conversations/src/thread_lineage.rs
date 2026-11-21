@@ -1,33 +1,47 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{thread, thread_lineage};
 use pioneer_protocol::TaskThreadLineage;
-use sea_orm::sea_query::{LockType, OnConflict};
+use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, LockType, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 pub async fn upsert_lineage<C: ConnectionTrait>(
     db: &C,
     lineage: &TaskThreadLineage,
 ) -> Result<bool> {
-    // A child can have exactly one edge. Its header exists even before first
-    // publication and serializes reparenting through the same transaction.
+    // Reviewer admission can publish its lineage before the execution creates
+    // a thread header. When the header exists, coordinate with its writers.
     thread::Entity::find_by_id(&lineage.child_thread_id)
         .select_only()
         .column(thread::Column::Id)
         .lock(LockType::NoKeyUpdate)
         .into_tuple::<String>()
         .one(db)
-        .await?
-        .context("missing child thread for lineage")?;
+        .await?;
     let created_at = chrono::DateTime::from_timestamp(lineage.created_at, 0)
         .unwrap_or_else(chrono::Utc::now)
         .fixed_offset();
-    let old = thread_lineage::Entity::find_by_id(&lineage.child_thread_id)
-        .lock_exclusive()
-        .one(db)
-        .await?;
-    thread_lineage::Entity::insert(thread_lineage::ActiveModel {
+    let updated_columns = [
+        thread_lineage::Column::ParentThreadId,
+        thread_lineage::Column::RootThreadId,
+        thread_lineage::Column::Depth,
+        thread_lineage::Column::OriginKind,
+        thread_lineage::Column::CreatedByThreadId,
+        thread_lineage::Column::CreatedByTurnId,
+    ];
+    // The conflict itself serializes competing writes, including the first
+    // admission. A replay never advances projection state or emits new work.
+    let changed = updated_columns
+        .iter()
+        .copied()
+        .fold(Condition::any(), |condition, column| {
+            condition.add(Expr::col((thread_lineage::Entity, column)).binary(
+                BinOper::Custom("IS DISTINCT FROM"),
+                Expr::col((Alias::new("excluded"), column)),
+            ))
+        });
+    let affected = thread_lineage::Entity::insert(thread_lineage::ActiveModel {
         child_thread_id: Set(lineage.child_thread_id.clone()),
         parent_thread_id: Set(lineage.parent_thread_id.clone()),
         root_thread_id: Set(lineage.root_thread_id.clone()),
@@ -40,24 +54,14 @@ pub async fn upsert_lineage<C: ConnectionTrait>(
     })
     .on_conflict(
         OnConflict::column(thread_lineage::Column::ChildThreadId)
-            .update_columns([
-                thread_lineage::Column::ParentThreadId,
-                thread_lineage::Column::RootThreadId,
-                thread_lineage::Column::Depth,
-                thread_lineage::Column::OriginKind,
-                thread_lineage::Column::CreatedByThreadId,
-                thread_lineage::Column::CreatedByTurnId,
-            ])
+            .update_columns(updated_columns)
+            .action_cond_where(changed)
             .to_owned(),
     )
-    .exec(db)
+    .exec_without_returning(db)
     .await
     .context("failed to upsert thread lineage")?;
-    let new = thread_lineage::Entity::find_by_id(&lineage.child_thread_id)
-        .lock_exclusive()
-        .one(db)
-        .await?;
-    Ok(old != new)
+    Ok(affected != 0)
 }
 
 pub async fn find_lineage_by_child_thread<C: ConnectionTrait>(

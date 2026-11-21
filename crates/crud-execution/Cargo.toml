@@ -12,10 +12,16 @@ futures-util.workspace = true
 hex.workspace = true
 pioneer-hooks.workspace = true
 pioneer-entity.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-crud-conversations.workspace = true
 pioneer-crud-payloads.workspace = true
 pioneer-protocol.workspace = true
+pioneer-sqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 
 [dev-dependencies]

@@ -238,7 +238,12 @@ pub async fn list_threads_by_workspace<C: ConnectionTrait>(
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
         .filter(thread::Column::SidebarVisibility.eq("visible"))
         .order_by_desc(thread::Column::UpdatedAt)
-        .order_by_asc(thread::Column::Id)
+        // Gateway merges this limited page with loaded threads using Rust's
+        // bytewise ID comparison.
+        .order_by_asc(Expr::cust_with_expr(
+            r#"$1 COLLATE "C""#,
+            Expr::col((thread::Entity, thread::Column::Id)),
+        ))
         .limit(limit)
         .all(db)
         .await

@@ -81,7 +81,7 @@ async fn cli_turn_order_key<C: ConnectionTrait>(
             DatabaseBackend::Postgres,
             "SELECT t.created_at AS created_at, COALESCE(c.sequence,0) AS sequence, \
              t.insertion_ordinal AS insertion_ordinal, t.id AS id FROM turn t \
-             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=(t.id COLLATE \"default\") \
              WHERE t.thread_id=$1 AND t.id=$2",
             vec![thread_id.into(), turn_id.into()],
         ))
@@ -115,7 +115,7 @@ async fn cli_bucket_ids<C: ConnectionTrait>(
     };
     let direction = if descending { "DESC" } else { "ASC" };
     let sql = format!(
-        "SELECT t.id AS id FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+        "SELECT t.id AS id FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=(t.id COLLATE \"default\") \
          WHERE t.thread_id=$1 AND t.created_at=$2 {relation} \
          ORDER BY COALESCE(c.sequence,0) {direction}, t.insertion_ordinal {direction}, t.id {direction} LIMIT {limit_parameter}"
     );
@@ -198,7 +198,7 @@ pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionT
         .query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT t.id AS id FROM turn t \
-             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=(t.id COLLATE \"default\") \
              WHERE t.thread_id=$1 AND t.created_at=$2 \
                AND (COALESCE(c.sequence,0),t.insertion_ordinal,t.id) < ($3,$4,$5) \
              ORDER BY COALESCE(c.sequence,0) DESC,t.insertion_ordinal DESC,t.id DESC LIMIT 1",
@@ -228,7 +228,7 @@ pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionT
             DatabaseBackend::Postgres,
             "SELECT (EXISTS(SELECT 1 FROM turn t WHERE t.thread_id=$1 \
                 AND t.created_at>$2 AND t.id<>$3) OR \
-              EXISTS(SELECT 1 FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+              EXISTS(SELECT 1 FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=(t.id COLLATE \"default\") \
                 WHERE t.thread_id=$1 AND t.created_at=$2 AND t.id<>$3 \
                 AND (COALESCE(c.sequence,0),t.insertion_ordinal,t.id) > ($4,$5,$6))) AS intervening",
             vec![

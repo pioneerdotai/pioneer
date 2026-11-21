@@ -6,15 +6,16 @@ use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{OnConflict, Query, SelectStatement};
+use sea_orm::sea_query::{Expr, OnConflict, Query, SelectStatement};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, QueryTrait, Select, Set,
 };
 
 use super::identity::{
-    GatewayPrincipalRecord, actor_ref_to_db, gateway_principal_record_from_model,
-    principal_kind_from_db, principal_kind_to_db, principal_status_from_db,
+    GatewayPrincipalRecord, actor_ref_from_db, actor_ref_to_db,
+    gateway_principal_record_from_model, load_principal_by_id, principal_kind_from_db,
+    principal_kind_to_db, principal_status_from_db,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -282,7 +283,7 @@ pub async fn list_accessible_threads_for_principal<C: ConnectionTrait>(
     workspace_id: &str,
     limit: u64,
 ) -> Result<Vec<thread::Model>> {
-    // SeaORM's limit is a `u64`, while SQLite accepts only a signed 64-bit
+    // SeaORM's limit is a `u64`, while PostgreSQL accepts only a signed 64-bit
     // integer. Callers use `u64::MAX` to request the complete authorized set;
     // clamp that sentinel centrally instead of emitting an invalid SQL LIMIT.
     let limit = limit.min(i64::MAX as u64);
@@ -306,7 +307,10 @@ pub async fn list_accessible_threads_for_principal<C: ConnectionTrait>(
                 ),
         )
         .order_by_desc(thread::Column::UpdatedAt)
-        .order_by_asc(thread::Column::Id)
+        .order_by_asc(Expr::cust_with_expr(
+            r#"$1 COLLATE "C""#,
+            Expr::col((thread::Entity, thread::Column::Id)),
+        ))
         .limit(limit)
         .all(db)
         .await
@@ -737,7 +741,13 @@ pub async fn list_thread_memberships_for_thread<C: ConnectionTrait>(
 ) -> Result<Vec<thread_membership::Model>> {
     thread_membership::Entity::find()
         .filter(thread_membership::Column::ThreadId.eq(thread_id.to_owned()))
-        .order_by_asc(thread_membership::Column::PrincipalId)
+        .order_by_asc(Expr::cust_with_expr(
+            r#"$1 COLLATE "C""#,
+            Expr::col((
+                thread_membership::Entity,
+                thread_membership::Column::PrincipalId,
+            )),
+        ))
         .all(db)
         .await
         .with_context(|| format!("failed to list thread memberships for thread `{thread_id}`"))
@@ -875,6 +885,86 @@ async fn validate_persisted_member_principal<C: ConnectionTrait>(
         bail!("persisted membership target is not an ordinary Member principal");
     }
     Ok(())
+}
+
+pub async fn authorize_private_participant_scope<C: ConnectionTrait>(
+    transaction: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    acting_member_principal_id: Option<&PrincipalId>,
+) -> Result<Option<pioneer_entity::thread::Model>> {
+    let Some(model) = thread::Entity::find_by_id(thread_id)
+        .one(transaction)
+        .await
+        .context("load private thread participant scope")?
+    else {
+        return Ok(None);
+    };
+    if model.workspace_id != workspace_id
+        || model.sidebar_visibility != "visible"
+        || persisted_thread_access_class_from_db(model.access_class.as_str())?
+            != PersistedThreadAccessClass::Private
+    {
+        return Ok(None);
+    }
+    if let Some(principal_id) = acting_member_principal_id {
+        if find_workspace_membership(transaction, principal_id, workspace_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        if actor_ref_from_db(
+            model.created_by_actor_kind.as_deref(),
+            model.created_by_actor_id.as_deref(),
+        )?
+        .as_ref()
+            != Some(&PersistedActorRef::Principal(principal_id.clone()))
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(model))
+}
+
+pub async fn validated_participant_ids_from_rows<C: ConnectionTrait>(
+    transaction: &C,
+    gateway_id: &GatewayId,
+    workspace_id: &str,
+    rows: Vec<pioneer_entity::thread_membership::Model>,
+) -> Result<Vec<PrincipalId>> {
+    let mut participant_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let principal_id = PrincipalId::new(row.principal_id)
+            .context("thread membership contains an invalid principal id")?;
+        let principal = load_principal_by_id(transaction, &principal_id)
+            .await?
+            .context("thread membership references a missing principal")?;
+        let role = principal
+            .role_key
+            .as_deref()
+            .map(pioneer_protocol::RoleKey::new)
+            .transpose()
+            .context("thread membership principal has an invalid role")?;
+        if principal.gateway_id != *gateway_id
+            || principal.kind != pioneer_protocol::PrincipalKind::User
+            || !matches!(
+                principal.status,
+                pioneer_protocol::PrincipalStatus::Active
+                    | pioneer_protocol::PrincipalStatus::Suspended
+            )
+            || role.is_none()
+            || find_workspace_membership(transaction, &principal_id, workspace_id)
+                .await?
+                .is_none()
+        {
+            anyhow::bail!(
+                "thread membership violates persisted Member workspace-parent invariants"
+            );
+        }
+        participant_ids.push(principal_id);
+    }
+    Ok(participant_ids)
 }
 
 pub async fn private_thread_participant_target_is_eligible<C: ConnectionTrait>(

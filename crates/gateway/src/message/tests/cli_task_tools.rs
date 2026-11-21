@@ -434,7 +434,7 @@ fn threads_first_cli_outbox_dispatch_uses_committed_turn_once() {
             .unwrap();
         // Canonical admission must not be inserted again, even idempotently.
         db.execute_unprepared(&format!(
-            "CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission WHEN NEW.turn_id='{child}' BEGIN SELECT RAISE(ABORT,'repeated committed admission'); END"
+            "CREATE FUNCTION reject_repeat_thread_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'repeated committed admission'; END; $$; CREATE TRIGGER reject_repeat_thread_admission BEFORE INSERT ON turn_admission FOR EACH ROW WHEN (NEW.turn_id='{child}') EXECUTE FUNCTION reject_repeat_thread_admission();"
         )).await.unwrap();
         // The recording session otherwise reuses the parent's native ID,
         // which the durable attempt ledger correctly rejects for a new Turn.
@@ -4229,8 +4229,8 @@ fn admitted_cli_prompt_context_does_not_recall_and_keeps_explicit_history_search
             .unwrap()
             .unwrap();
         let other = "indexed-recall-other-conversation";
-        processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+        processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT $1,workspace_id,'Other indexed conversation','',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=$2",
             [other.into(),binding.thread_id.clone().into()])).await.unwrap();
         let capsule = binding.workspace_id.clone();
         crate::message::thread_search_tools::tests::seed(
@@ -4549,27 +4549,24 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             .unwrap();
         let capsule = binding.workspace_id.clone();
         let mut titles = ["A".to_owned(), "B".to_owned(), "C".to_owned()];
-        // Give the three sources distinct lexical relevance. Equal documents
-        // are ordered by generated occurrence IDs, not by their thread names.
+        // Give the three sources different numbers of distinct query terms.
+        // The PostgreSQL rank counts each matched term only once.
         for (n, (thread, text)) in [
             (
                 "byte-boundary-a",
-                "boundaryneedle boundaryneedle boundaryneedle saved decision",
+                "boundaryneedle calibration sparrow saved decision",
             ),
             (
                 "byte-boundary-b",
-                "boundaryneedle boundaryneedle ordinary saved decision",
+                "boundaryneedle calibration ordinary saved decision",
             ),
-            (
-                "byte-boundary-c",
-                "boundaryneedle ordinary ordinary saved decision",
-            ),
+            ("byte-boundary-c", "boundaryneedle ordinary saved decision"),
         ]
         .into_iter()
         .enumerate()
         {
-            processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
-                "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT ?,workspace_id,?,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=?",
+            processor.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind,created_by_actor_id) SELECT $1,workspace_id,$2,'',mode,model,model_provider,status,origin_kind,sidebar_visibility,'workspace',created_at,updated_at,created_by_actor_kind,created_by_actor_id FROM thread WHERE id=$3",
                 [thread.into(),titles[n].clone().into(),binding.thread_id.clone().into()])).await.unwrap();
             crate::message::thread_search_tools::tests::seed(
                 &processor,
@@ -4585,7 +4582,8 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             thread_id: binding.thread_id.clone(),
             turn_id,
         };
-        let params = json!({"query":"boundaryneedle", "limit":2, "cursor":null});
+        let params =
+            json!({"query":"boundaryneedle calibration sparrow", "limit":2, "cursor":null});
         // Calibrate with the actual CLI response: two cards plus a nextCursor.
         // Enlarge the first title so those same two raw cards fit by one byte,
         // but their ToolResultView wrapper would exceed the policy limit.
@@ -4624,8 +4622,8 @@ fn admitted_cli_search_preserves_structured_pages_at_projection_byte_boundary() 
             .crud_store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "UPDATE thread SET name=? WHERE id=?",
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE thread SET name=$1 WHERE id=$2",
                 [titles[0].clone().into(), "byte-boundary-a".into()],
             ))
             .await

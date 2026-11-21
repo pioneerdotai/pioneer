@@ -37,8 +37,8 @@ async fn scenario() -> Scenario {
         ))
         .unwrap();
     f.store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE turn_event SET event_type='item/completed',payload=? WHERE id='copy-thread-source'",
+        DbBackend::Postgres,
+        "UPDATE turn_event SET event_type='item/completed',payload=$1::text::json WHERE id='copy-thread-source'",
         [work_payload.into()],
     )).await.unwrap();
     for sql in [
@@ -168,7 +168,7 @@ async fn project(s: &Scenario, messages: &mut Vec<ChatMessage>) -> anyhow::Resul
     .await
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_covering_removed_input_copy_reuses_summary_and_preserves_tail_and_proof() {
     let s = scenario().await;
     let mut messages = vec![s.original.clone(), s.work.clone(), s.tail.clone()];
@@ -241,7 +241,7 @@ async fn checkpoint_covering_removed_input_copy_reuses_summary_and_preserves_tai
     assert_eq!(joined, messages);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn input_copy_projection_requires_exact_unambiguous_complete_unprotected_proof() {
     let s = scenario().await;
     for case in [
@@ -306,7 +306,7 @@ async fn input_copy_projection_requires_exact_unambiguous_complete_unprotected_p
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn alias_does_not_admit_checkpoint_beyond_the_accepted_boundary() {
     let s = scenario().await;
     let mut messages = vec![s.original.clone(), s.work.clone()];
@@ -335,7 +335,7 @@ async fn alias_does_not_admit_checkpoint_beyond_the_accepted_boundary() {
     assert_eq!(messages, before);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_projection_reuses_copy_checkpoint_after_parent_input_normalization() {
     let s = scenario().await;
     let mut original = s.original.clone();
@@ -363,7 +363,7 @@ async fn accepted_projection_reuses_copy_checkpoint_after_parent_input_normaliza
     assert_eq!(messages[1], s.tail);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_projection_preserves_competing_inputs_in_either_order() {
     let s = scenario().await;
     let mut competing = s.original.clone();
@@ -404,7 +404,7 @@ async fn accepted_projection_preserves_competing_inputs_in_either_order() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn replacing_input_preserves_its_other_saved_copies_without_expanding_coverage() {
     let s = scenario().await;
     let mut original = s.original.clone();
@@ -437,7 +437,7 @@ async fn replacing_input_preserves_its_other_saved_copies_without_expanding_cove
     assert_eq!(messages[1], s.tail);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn overlapping_original_and_task_copy_summaries_keep_the_covering_checkpoint() {
     let s = scenario().await;
     let source = &s.original.provenance.as_ref().unwrap().sources[0];
@@ -566,7 +566,7 @@ async fn overlapping_original_and_task_copy_summaries_keep_the_covering_checkpoi
     assert!(s.f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, ScopedHistorySource};
     use pioneer_compaction::CoverageDomain;
@@ -580,8 +580,8 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
         s.f.store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                DbBackend::Postgres,
+                "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,$2,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
                 [id.into(), format!("{thread}-turn").into()],
             ))
             .await
@@ -896,7 +896,7 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
     use pioneer_agent::compaction::composition::{
         AcceptedContextBranch, ScopedHistorySource, compose_context,
@@ -913,8 +913,8 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
             s.f.store
                 .database_connection()
                 .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                    DbBackend::Postgres,
+                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,$2,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
                     [format!("{thread}-input").into(), format!("{thread}-turn").into()],
                 ))
                 .await
@@ -1258,7 +1258,7 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
     use pioneer_compaction::CoverageDomain;
 
@@ -1274,8 +1274,8 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
             s.f.store
                 .database_connection()
                 .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                    DbBackend::Postgres,
+                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,$2,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
                     [format!("{thread}-input").into(), format!("{thread}-turn").into()],
                 ))
                 .await
@@ -1420,8 +1420,8 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
         s.f.store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_context SET head=NULL WHERE owner=?",
+                DbBackend::Postgres,
+                "UPDATE compaction_context SET head=NULL WHERE owner=$1",
                 [old.owner.clone().into()],
             ))
             .await
@@ -1547,7 +1547,7 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, ScopedHistorySource};
     use pioneer_compaction::CoverageDomain;
@@ -1568,8 +1568,8 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
             s.f.store
                 .database_connection()
                 .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                    DbBackend::Postgres,
+                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,$2,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
                     [format!("{thread}-input").into(), turn.clone().into()],
                 ))
                 .await
@@ -1811,8 +1811,8 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
         s.f.store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_context SET head=NULL WHERE owner=?",
+                DbBackend::Postgres,
+                "UPDATE compaction_context SET head=NULL WHERE owner=$1",
                 [a_checkpoint.owner.clone().into()],
             ))
             .await
@@ -1842,7 +1842,7 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, ScopedHistorySource};
     use pioneer_compaction::CoverageDomain;
@@ -1864,8 +1864,8 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
                 s.f.store
                     .database_connection()
                     .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,?,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+                        DbBackend::Postgres,
+                        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,$2,0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
                         [format!("{thread}-input").into(), turn.clone().into()],
                     ))
                     .await
@@ -2100,7 +2100,7 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn raw_saved_input_alias_is_reused_through_frozen_execution_handoff() {
     let s = scenario().await;
     let raw = vec![s.original.clone(), s.work.clone()];
@@ -2180,7 +2180,7 @@ async fn raw_saved_input_alias_is_reused_through_frozen_execution_handoff() {
     assert!(s.f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_raw_alias_projection_keeps_conflict_and_incomplete_boundary_contracts() {
     for boundary in [
         "conflicting-alias",
@@ -2272,7 +2272,7 @@ async fn frozen_raw_alias_projection_keeps_conflict_and_incomplete_boundary_cont
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn frozen_alias_cannot_admit_late_checkpoint_with_an_additional_snapshot_source() {
     let s = scenario().await;
     let raw = vec![s.original.clone(), s.work.clone()];

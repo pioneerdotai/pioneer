@@ -1,7 +1,9 @@
 //! Database operations for memory and recall.
 
 pub mod episodic_embeddings;
+mod episodic_jobs;
 pub mod episodic_search;
+pub mod episodic_source_store;
 pub mod identity;
 pub mod payloads;
 
@@ -19,3 +21,7 @@ mod store;
 mod util;
 
 pub use store::MemoryStore;
+
+pub mod episodic_repository;
+pub mod thread_episodic;
+pub mod thread_episodic_source;

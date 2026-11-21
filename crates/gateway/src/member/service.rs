@@ -1461,7 +1461,7 @@ mod tests {
                     .database
                     .execute_unprepared(
                         "UPDATE principal_avatar_revision \
-                         SET media_type='image/png', content=zeroblob(length(content)) \
+                         SET media_type='image/png', content=decode(repeat('00',length(content)),'hex') \
                          WHERE principal_id='P0000000000000000000B'",
                     )
                     .await

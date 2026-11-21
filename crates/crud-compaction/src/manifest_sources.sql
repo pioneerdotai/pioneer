@@ -67,18 +67,23 @@ current_sources(source_scope,source_id,source_version,thread_id,workspace_id) AS
    WHERE committed.id=checkpoint_source.operation_id AND committed.status='completed'
   )))
  UNION ALL
- SELECT 'task-basis:'||basis_source.run_id,basis_source.run_id,
+ SELECT 'task-basis:'||current_basis.run_id,current_basis.run_id,
   'task-basis-revision:'||COALESCE(basis_revision.revision,1),
-  basis_source.conversation_thread_id,basis_source.workspace_id
+  current_basis.conversation_thread_id,current_basis.workspace_id
  FROM compaction_manifest need JOIN current_operation o ON o.id=need.operation_id
- JOIN task_run_conversation_snapshot basis_source ON basis_source.run_id=need.source_id
- JOIN thread basis_thread ON basis_thread.id=basis_source.conversation_thread_id
-  AND basis_thread.workspace_id=basis_source.workspace_id
- LEFT JOIN compaction_task_basis_revision basis_revision ON basis_revision.run_id=basis_source.run_id
- WHERE basis_source.history_json_has_array_prefix
-  AND 'task-basis:'||basis_source.run_id=need.source_scope
+ JOIN LATERAL (
+  SELECT run_id, conversation_thread_id, workspace_id, history_json_has_array_prefix
+  FROM task_run_conversation_snapshot basis_source
+  WHERE basis_source.run_id=need.source_id COLLATE "default"
+  LIMIT 1
+ ) current_basis ON true
+ JOIN thread basis_thread ON basis_thread.id=current_basis.conversation_thread_id
+  AND basis_thread.workspace_id=current_basis.workspace_id
+ LEFT JOIN compaction_task_basis_revision basis_revision ON basis_revision.run_id=current_basis.run_id
+ WHERE current_basis.history_json_has_array_prefix
+  AND 'task-basis:'||current_basis.run_id=need.source_scope
   AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=need.source_version
-  AND basis_source.workspace_id=o.workspace_id
+  AND current_basis.workspace_id=o.workspace_id
 ),
 accepted_imports AS MATERIALIZED (
  SELECT i.source_scope, i.source_id,
@@ -120,9 +125,16 @@ accepted_imports AS MATERIALIZED (
   AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count
   AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
   AND h.import_count=p.import_count AND h.next_import=p.import_count
- JOIN compaction_frozen_import i ON i.manifest_id=h.id
-  AND i.ordinal>=0 AND i.ordinal<h.import_count AND i.message_ordinal>=0 AND i.message_ordinal<h.message_count
-  AND i.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=$1)
+ -- Seek the import-ordinal range of this one bound manifest before applying
+ -- proof predicates. The limit is the already-validated size of that range.
+ JOIN LATERAL (
+  SELECT source_scope, source_id, source_version, source_thread, proof_json, bytes
+  FROM compaction_frozen_import entries
+  WHERE entries.manifest_id=h.id
+   AND entries.ordinal>=0 AND entries.ordinal<h.import_count
+  ORDER BY entries.ordinal
+  LIMIT h.import_count
+ ) i ON true
 ),
 accepted_basis_messages AS MATERIALIZED (
  SELECT CASE WHEN f.reference_json IS JSON OBJECT

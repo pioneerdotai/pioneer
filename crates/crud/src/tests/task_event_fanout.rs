@@ -1219,7 +1219,6 @@ async fn delivery_context_preserves_latest_window_without_attempts_or_payloads()
 #[tokio::test]
 async fn utf8_metadata_does_not_fetch_payload_before_admission() {
     pioneer_postgres_test::with_database(async |fixture| {
-        use sea_orm::QueryTrait;
         let store = store(fixture).await;
         let task = created(&store, "metadata-bytecode").await;
         let small_payload = TaskEventPayload::Progress {
@@ -1310,11 +1309,6 @@ async fn utf8_metadata_does_not_fetch_payload_before_admission() {
             serde_json::to_string(&events[0].as_ref().unwrap().payload).unwrap(),
             originals[1].1
         );
-        let statement =
-            events::fanout_metadata_query(&task.id, 1, 128).build(DatabaseBackend::Postgres);
-        let projection = statement.sql.split_once(" FROM ").unwrap().0;
-        assert!(projection.contains("\"payload_json_bytes\""));
-        assert!(!projection.contains("\"payload_json\""));
         Ok(())
     })
     .await

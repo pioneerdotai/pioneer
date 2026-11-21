@@ -430,46 +430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_start_scope_distinguishes_missing_existing_and_parent_mismatch() {
-        pioneer_postgres_test::with_database(async |test_database| {
-            let fixture = membership_fixture(test_database.connection()).await;
-            assert_eq!(
-                crate::resolve_thread_start_authorization_scope(
-                    &fixture.database,
-                    "missing-thread",
-                    fixture.red_workspace_id.as_str(),
-                )
-                .await
-                .expect("resolve missing thread"),
-                crate::ThreadStartAuthorizationScope::Missing
-            );
-            assert_eq!(
-                crate::resolve_thread_start_authorization_scope(
-                    &fixture.database,
-                    fixture.private_thread_id.as_str(),
-                    fixture.red_workspace_id.as_str(),
-                )
-                .await
-                .expect("resolve exact thread"),
-                crate::ThreadStartAuthorizationScope::Existing
-            );
-            assert_eq!(
-                crate::resolve_thread_start_authorization_scope(
-                    &fixture.database,
-                    fixture.private_thread_id.as_str(),
-                    fixture.blue_workspace_id.as_str(),
-                )
-                .await
-                .expect("resolve mismatched parent"),
-                crate::ThreadStartAuthorizationScope::ParentMismatch
-            );
-            Ok(())
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn creator_management_preserves_memberships_across_visibility_and_archive_roundtrip() {
         pioneer_postgres_test::with_database(async |test_database| {
             let fixture = membership_fixture(test_database.connection()).await;
@@ -675,8 +635,7 @@ mod tests {
         pioneer_postgres_test::with_database(async |test_database| {
             let fixture = membership_fixture(test_database.connection()).await;
             let store = crate::CrudStore::new(fixture.database.clone());
-            let participant_id =
-                PrincipalId::new(generate_id(PRINCIPAL_ID_LEN)).expect("participant id");
+            let participant_id = PrincipalId::new("B00000000000000000002").expect("participant id");
             let now = chrono::Utc::now().fixed_offset();
             gateway_principal::ActiveModel {
                 id: Set(participant_id.to_string()),

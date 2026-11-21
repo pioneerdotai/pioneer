@@ -23,12 +23,12 @@ use pioneer_protocol::{
     TaskRunExecutionStatus, TaskRunStatus, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
     TaskWriteLockStatus, generate_id,
 };
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use sha2::{Digest, Sha256};
 
 const ID_LEN: usize = 21;
 
-/// A rejected domain transition is not a transient SQLite insertion failure.
+/// A rejected domain transition must propagate without a database-conflict retry.
 #[derive(Debug)]
 pub struct TaskTerminalConflict(pub &'static str);
 
@@ -576,9 +576,9 @@ impl CrudStore {
         }
     }
 
-    async fn finalize_task_terminal_in_connection<C: ConnectionTrait>(
+    async fn finalize_task_terminal_in_connection(
         &self,
-        db: &C,
+        db: &DatabaseTransaction,
         prepared: &PreparedTaskTerminalTransition,
         completed_at: i64,
     ) -> Result<()> {
@@ -751,9 +751,9 @@ impl CrudStore {
         .await
     }
 
-    pub(crate) async fn settle_finished_retry_in_connection<C: ConnectionTrait + Sync>(
+    pub(crate) async fn settle_finished_retry_in_connection(
         &self,
-        db: &C,
+        db: &DatabaseTransaction,
         mut prepared: PreparedTaskTerminalTransition,
     ) -> Result<(Vec<DeferredAppendedTaskEvent>, Option<String>)> {
         let current =
@@ -838,9 +838,9 @@ impl CrudStore {
         Ok((events, delivery_id))
     }
 
-    async fn commit_task_terminal_in_connection<C: ConnectionTrait + Sync>(
+    async fn commit_task_terminal_in_connection(
         &self,
-        db: &C,
+        db: &DatabaseTransaction,
         mut prepared: PreparedTaskTerminalTransition,
     ) -> Result<DeferredTaskTerminalCommitOutcome> {
         // These exact, bounded reads happen BEFORE RunCompleted/Failed/etc.

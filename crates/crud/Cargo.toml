@@ -7,8 +7,7 @@ authors.workspace = true
 
 [features]
 default = []
-test-support = []
-mysql = ["sea-orm/sqlx-mysql"]
+test-support = ["pioneer-crud-memory/test-support"]
 
 [dependencies]
 zstd.workspace = true
@@ -33,7 +32,7 @@ pioneer-protocol.workspace = true
 pioneer-apps.workspace = true
 pioneer-packages.workspace = true
 pioneer-sqlite.workspace = true
-sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 serde_json.workspace = true
 serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -44,9 +43,13 @@ uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+pioneer-crud-conversations = { workspace = true, features = ["test-support"] }
+pioneer-crud-compaction = { workspace = true, features = ["test-support"] }
+pioneer-crud-memory = { workspace = true, features = ["test-support"] }
+pioneer-sqlite = { workspace = true, features = ["test-support"] }
+pioneer-crud-tasks = { workspace = true, features = ["test-support"] }
 pioneer-crud-access = { workspace = true, features = ["test-support"] }
 pioneer-postgres-test.workspace = true
-pioneer-sqlite = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 pioneer-migration.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

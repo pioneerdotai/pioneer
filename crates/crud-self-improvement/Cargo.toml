@@ -8,7 +8,13 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-crud-conversations.workspace = true
+pioneer-crud-packages.workspace = true
+pioneer-crud-tasks.workspace = true
 pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-sqlite.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde_json.workspace = true
 

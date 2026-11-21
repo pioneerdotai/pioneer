@@ -752,7 +752,7 @@ impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayl
         self.attach_cached_embedding_to_resolved_request(
             job.workspace_id.as_str(),
             &mut resolved,
-            embedding_provider.as_ref(),
+            embedding_provider,
         )
         .await
         .map_err(|error| error.with_source_payload(source_payload.as_str()))?;
@@ -765,7 +765,7 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
         &self,
         workspace_id: &str,
         resolved: &mut ThreadEpisodicResolvedIndexRequest,
-        embedding_provider: &dyn ThreadEpisodicEmbeddingProvider,
+        embedding_provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
     ) -> std::result::Result<(), ThreadEpisodicIndexResolutionError> {
         if resolved.request.embedding.is_some() {
             return Ok(());
@@ -784,7 +784,7 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
             input_hash.as_str(),
         );
         let artifact_lock = self.artifact_lock(artifact_id.as_str())?;
-        let _guard = artifact_lock.lock().await;
+        let guard = artifact_lock.lock_owned().await;
 
         let artifact = match self
             .crud_store
@@ -820,9 +820,23 @@ impl RuntimeVectorThreadEpisodicIndexPayloadProvider {
                 artifact
             }
             None => {
-                let vector = embedding_provider
-                    .embed_text_checked(resolved.request.text.as_str())
-                    .map_err(embedding_resolution_error)?;
+                let text = resolved.request.text.clone();
+                let worker = pioneer_observability::work::spawn_blocking(move || {
+                    let result = embedding_provider.embed_text_checked(&text);
+                    (guard, result)
+                });
+                let (_guard, vector) = match worker.await {
+                    Ok(result) => result,
+                    // The generation supervisor must settle the durable Running
+                    // claim after a panic, under its workspace ownership.
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    Err(_) => {
+                        return Err(ThreadEpisodicIndexResolutionError::retryable(
+                            "embedding worker did not finish",
+                        ));
+                    }
+                };
+                let vector = vector.map_err(embedding_resolution_error)?;
                 self.crud_store
                     .insert_thread_episodic_embedding_artifact_if_absent(
                         NewThreadEpisodicEmbeddingArtifactRecord {
@@ -8205,15 +8219,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn canceled_generation_drops_recovery_admission_and_does_not_retry_rejected_storage() {
         use crate::database::startup::thread_episodic_refill as refill;
         use sea_orm::TransactionTrait;
         for queued_admission in [true, false] {
-            let database_root = TempDir::new().unwrap();
-            let (store, workspace) =
-                physical_runner_store_for_test(&database_root.path().join("generation.sqlite"))
-                    .await;
+            let (store, workspace) = physical_runner_store_for_test().await;
             let root = TempDir::new().unwrap();
             let source_job = runner_source_job_for_test(
                 &store,
@@ -8274,7 +8285,7 @@ mod tests {
             let writer = if queued_admission {
                 Some(store.database_connection().begin().await.unwrap())
             } else {
-                store.database_connection().execute_unprepared("CREATE TRIGGER reject_generation_recovery BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled permanent recovery failure'); END").await.unwrap();
+                store.database_connection().execute_unprepared("CREATE FUNCTION reject_generation_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled permanent recovery failure'; END; $$; CREATE TRIGGER reject_generation_recovery BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (OLD.status = 'running') EXECUTE FUNCTION reject_generation_recovery();").await.unwrap();
                 None
             };
             let completion = executor.progress_notification.notified();
@@ -8309,7 +8320,7 @@ mod tests {
             } else {
                 store
                     .database_connection()
-                    .execute_unprepared("DROP TRIGGER reject_generation_recovery")
+                    .execute_unprepared("DROP TRIGGER reject_generation_recovery ON thread_episodic_index_jobs; DROP FUNCTION reject_generation_recovery()")
                     .await
                     .unwrap();
             }
@@ -8690,7 +8701,7 @@ mod tests {
                 .unwrap(),
             current
         );
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_budget_item_terminal BEFORE UPDATE ON thread_episodic_items WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'controlled terminal item bookkeeping failure'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_budget_item_terminal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled terminal item bookkeeping failure'; END; $$; CREATE TRIGGER reject_budget_item_terminal BEFORE UPDATE ON thread_episodic_items FOR EACH ROW WHEN (NEW.status = 'failed') EXECUTE FUNCTION reject_budget_item_terminal();").await.unwrap();
         let before_item = store
             .find_thread_episodic_item(&original.index_item_id)
             .await
@@ -8720,7 +8731,7 @@ mod tests {
         );
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_budget_item_terminal")
+            .execute_unprepared("DROP TRIGGER reject_budget_item_terminal ON thread_episodic_items; DROP FUNCTION reject_budget_item_terminal()")
             .await
             .unwrap();
         assert!(
@@ -8960,12 +8971,11 @@ mod tests {
         drop(owner);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn confirmed_provider_claim_shutdown_drops_settlement_writer_admission() {
         use sea_orm::TransactionTrait;
-        let database_root = TempDir::new().unwrap();
-        let (store, workspace) =
-            physical_runner_store_for_test(&database_root.path().join("confirmed.sqlite")).await;
+
+        let (store, workspace) = physical_runner_store_for_test().await;
         let root = TempDir::new().unwrap();
         let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -9047,7 +9057,7 @@ mod tests {
         let a_job = runner_source_job_for_test(&store, &a, "poison_bookkeeping_a", now - 30).await;
         let b_job = runner_source_job_for_test(&store, b, "healthy_bookkeeping_b", now - 20).await;
         let c_job = runner_source_job_for_test(&store, c, "healthy_bookkeeping_c", now - 10).await;
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_only_a_bookkeeping BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.thread_id = 'poison_bookkeeping_a' AND OLD.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled A bookkeeping rejection'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_only_a_bookkeeping() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled A bookkeeping rejection'; END; $$; CREATE TRIGGER reject_only_a_bookkeeping BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (OLD.thread_id = 'poison_bookkeeping_a' AND OLD.status = 'running') EXECUTE FUNCTION reject_only_a_bookkeeping();").await.unwrap();
         executor.wake();
         executor.wait_for_completed_job_for_test(&b_job.id).await;
         executor.wait_for_completed_job_for_test(&c_job.id).await;
@@ -9105,7 +9115,7 @@ mod tests {
         executor.shutdown().await;
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_only_a_bookkeeping")
+            .execute_unprepared("DROP TRIGGER reject_only_a_bookkeeping ON thread_episodic_index_jobs; DROP FUNCTION reject_only_a_bookkeeping()")
             .await
             .unwrap();
         store
@@ -9288,7 +9298,7 @@ mod tests {
         executor
             .readiness_read_failure
             .store(false, Ordering::Release);
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_completion_once BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled completion write failure'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_completion_once() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled completion write failure'; END; $$; CREATE TRIGGER reject_completion_once BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (NEW.status = 'completed') EXECUTE FUNCTION reject_completion_once();").await.unwrap();
         executor.wake();
         executor.pending_notification.notified().await;
         let running = store
@@ -9300,7 +9310,7 @@ mod tests {
         assert_eq!(running.attempt_count, 1);
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_completion_once")
+            .execute_unprepared("DROP TRIGGER reject_completion_once ON thread_episodic_index_jobs; DROP FUNCTION reject_completion_once()")
             .await
             .unwrap();
         // A late recovery cannot overwrite a newer attempt. The explicit CRUD
@@ -9651,7 +9661,7 @@ mod tests {
         let published = store
             .database_connection()
             .query_one_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
+                DatabaseBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM thread_episodic_items WHERE search_text IS NOT NULL",
             ))
             .await
@@ -9954,7 +9964,7 @@ mod tests {
                 runner_source_job_for_test(&store, &workspace, name, now - 3 + i as i64).await,
             );
         }
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_batch_ack_b BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.thread_id = 'batch_ack_b' AND NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'controlled batch completion rollback'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_batch_ack_b() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled batch completion rollback'; END; $$; CREATE TRIGGER reject_batch_ack_b BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (OLD.thread_id = 'batch_ack_b' AND NEW.status = 'completed') EXECUTE FUNCTION reject_batch_ack_b();").await.unwrap();
         let first = executor.run_once(now).await.unwrap();
         assert_eq!((first.completed, first.failed_retryable), (2, 1));
         let rolled_back = store
@@ -9965,7 +9975,7 @@ mod tests {
         assert!(rolled_back.projection_text(&store).await.is_none());
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_batch_ack_b")
+            .execute_unprepared("DROP TRIGGER reject_batch_ack_b ON thread_episodic_index_jobs; DROP FUNCTION reject_batch_ack_b()")
             .await
             .unwrap();
         assert_eq!(executor.run_once(now + 60).await.unwrap().completed, 1);
@@ -10415,26 +10425,11 @@ mod tests {
         );
     }
 
-    async fn physical_runner_store_for_test(path: &std::path::Path) -> (Arc<CrudStore>, String) {
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        use sea_orm::ConnectOptions;
-        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-        options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(options).await.unwrap();
-        Migrator::up(&writer, None).await.unwrap();
-        bootstrap(&writer).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
-        pioneer_entity::workspace::Entity::delete_many()
-            .exec(&writer)
-            .await
-            .unwrap();
-        let workspace = WorkspaceManager::new(writer.clone())
+    async fn physical_runner_database_for_test()
+    -> (Arc<pioneer_postgres_test::TestDatabase>, String) {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        bootstrap(fixture.connection()).await.unwrap();
+        let workspace = WorkspaceManager::new(fixture.connection().clone())
             .create_workspace(
                 &pioneer_protocol::generate_id(21),
                 Some("Physical episodic test"),
@@ -10442,19 +10437,13 @@ mod tests {
             .await
             .unwrap()
             .id;
-        let mut options =
-            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
-        options
-            .max_connections(2)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| {
-                options
-                    .read_only(true)
-                    .create_if_missing(false)
-                    .pragma("foreign_keys", "OFF")
-                    .pragma("query_only", "ON")
-            });
-        let reader = Database::connect(options).await.unwrap();
+        (fixture, workspace)
+    }
+
+    async fn physical_runner_store_for_test() -> (Arc<CrudStore>, String) {
+        let (fixture, workspace) = physical_runner_database_for_test().await;
+        let writer = fixture.connect_with_limit(1).await.unwrap();
+        let reader = fixture.connect_read_only().await.unwrap();
         let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
         database.validate_reader().await.unwrap();
         let store = Arc::new(CrudStore::new(database));
@@ -10466,9 +10455,8 @@ mod tests {
     async fn runner_shutdown_cancels_idle_ownership_writer_and_provider_waits() {
         use sea_orm::TransactionTrait;
         for phase in ["idle", "ownership", "writer", "provider"] {
-            let database_root = TempDir::new().unwrap();
             let (store, workspace) = if phase == "writer" {
-                physical_runner_store_for_test(&database_root.path().join("shutdown.sqlite")).await
+                physical_runner_store_for_test().await
             } else {
                 setup_thread_episodic_store().await
             };
@@ -10611,7 +10599,7 @@ mod tests {
             Arc::new(PostgresThreadEpisodicBackend::new(store.clone())),
             Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(store.clone())),
         );
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_candidate_claim BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'controlled claim rollback'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_candidate_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled claim rollback'; END; $$; CREATE TRIGGER reject_candidate_claim BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (NEW.status = 'running') EXECUTE FUNCTION reject_candidate_claim();").await.unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(executor.run_once(now).await.unwrap().storage_error);
         assert_eq!(
@@ -10635,7 +10623,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_candidate_claim")
+            .execute_unprepared("DROP TRIGGER reject_candidate_claim ON thread_episodic_index_jobs; DROP FUNCTION reject_candidate_claim()")
             .await
             .unwrap();
         let selected = store
@@ -10789,53 +10777,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn projection_reset_owns_prepared_requests_and_new_source_claims() {
         use crate::database::startup::thread_episodic_refill as refill;
-        use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
-        use sea_orm::{ConnectOptions, TransactionTrait};
+        use sea_orm::TransactionTrait;
         let root = TempDir::new().unwrap();
-        let db_path = root.path().join("ownership.sqlite");
-        let mut writer_options =
-            ConnectOptions::new(format!("sqlite://{}?mode=rwc", db_path.display()));
-        writer_options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(writer_options).await.unwrap();
-        Migrator::up(&writer, None).await.unwrap();
-        bootstrap(&writer).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
-        pioneer_entity::workspace::Entity::delete_many()
-            .exec(&writer)
-            .await
-            .unwrap();
-        let workspace = WorkspaceManager::new(writer.clone())
-            .create_workspace(
-                &pioneer_protocol::generate_id(21),
-                Some("Physical episodic test"),
-            )
-            .await
-            .unwrap()
-            .id;
-        let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&db_path));
-        reader_options
-            .max_connections(2)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| {
-                options
-                    .read_only(true)
-                    .create_if_missing(false)
-                    .pragma("foreign_keys", "OFF")
-                    .pragma("query_only", "ON")
-            });
-        let reader = Database::connect(reader_options).await.unwrap();
-        let database = SqliteDatabase::new(reader, writer);
-        database.validate_reader().await.unwrap();
-        let store = Arc::new(CrudStore::new(database.clone()));
+        let (store, workspace) = physical_runner_store_for_test().await;
+        let database = store.database_connection();
         let maintenance = Arc::new(store.with_maintenance_access());
         mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
         let model_a = Arc::new(StaticThreadEpisodicEmbeddingProvider::with_identity(
@@ -12478,7 +12426,7 @@ mod tests {
         assert!(chrono::DateTime::from_timestamp(last, 0).is_some());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_embedding_403_uses_durable_attempt_budget() {
         use pioneer_protocol::ProviderFailureClass as Class;
         for (failures, cooldown, class) in [
@@ -12486,10 +12434,7 @@ mod tests {
             (5, None, Class::Unknown),
             (5, Some(60_001), Class::PermissionDenied),
         ] {
-            let database_root = TempDir::new().unwrap();
-            let (store, workspace) =
-                physical_runner_store_for_test(&database_root.path().join("embedding-403.sqlite"))
-                    .await;
+            let (store, workspace) = physical_runner_store_for_test().await;
             let item = seed_pending_thread_episodic_item(
                 &store,
                 &workspace,
@@ -13523,10 +13468,7 @@ mod tests {
                 .await
                 .expect("item lookup")
                 .expect("suppressed item remains durable");
-            crud_store.database_connection().execute_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "CREATE TRIGGER forbid_suppressed_job_deletion BEFORE DELETE ON thread_episodic_index_jobs BEGIN SELECT RAISE(FAIL, 'durable user outcome must not be deleted'); END".to_owned(),
-            )).await.expect("deletion guard should install");
+            crud_store.database_connection().execute_unprepared("CREATE FUNCTION forbid_suppressed_job_deletion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'durable user outcome must not be deleted'; END; $$; CREATE TRIGGER forbid_suppressed_job_deletion BEFORE DELETE ON thread_episodic_index_jobs FOR EACH ROW EXECUTE FUNCTION forbid_suppressed_job_deletion();").await.expect("deletion guard should install");
             let base_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> = Arc::new(
                 StoreThreadEpisodicIndexPayloadProvider::new(crud_store.clone()),
             );
@@ -14094,48 +14036,11 @@ mod tests {
     }
 
     async fn observed_search_store_for_test(
-        path: &std::path::Path,
         evidence: Arc<SearchSchedulingEvidence>,
     ) -> (Arc<CrudStore>, String) {
-        pioneer_sqlite::search::register_auto_extension_once().unwrap();
-        use sea_orm::ConnectOptions;
-        let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-        options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(options).await.unwrap();
-        Migrator::up(&writer, None).await.unwrap();
-        bootstrap(&writer).await.unwrap();
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
-        pioneer_entity::workspace::Entity::delete_many()
-            .exec(&writer)
-            .await
-            .unwrap();
-        let workspace = WorkspaceManager::new(writer.clone())
-            .create_workspace(
-                &pioneer_protocol::generate_id(21),
-                Some("Physical episodic test"),
-            )
-            .await
-            .unwrap()
-            .id;
-        let mut options =
-            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
-        options
-            .max_connections(2)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| {
-                options
-                    .read_only(true)
-                    .create_if_missing(false)
-                    .pragma("foreign_keys", "OFF")
-                    .pragma("query_only", "ON")
-            });
-        let reader = Database::connect(options).await.unwrap();
+        let (fixture, workspace) = physical_runner_database_for_test().await;
+        let writer = fixture.connect_with_limit(1).await.unwrap();
+        let reader = fixture.connect_read_only().await.unwrap();
         let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
             reader,
             pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, evidence.clone()),
@@ -14292,17 +14197,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn sqlite_projection_commits_text_vector_and_job_together_on_scoped_runtime() {
         use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
         use sea_orm::TransactionTrait;
         let root = TempDir::new().unwrap();
         let evidence = Arc::new(SearchSchedulingEvidence::default());
-        let (store, workspace) = observed_search_store_for_test(
-            &root.path().join("projection.sqlite"),
-            evidence.clone(),
-        )
-        .await;
+        let (store, workspace) = observed_search_store_for_test(evidence.clone()).await;
         assert!(
             store
                 .database_connection()
@@ -14336,7 +14237,7 @@ mod tests {
                 .hits
                 .is_empty()
         );
-        maintenance.database_connection().execute_unprepared("CREATE TRIGGER reject_search_completion BEFORE UPDATE ON thread_episodic_index_jobs WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'injected completion rollback'); END;").await.unwrap();
+        maintenance.database_connection().execute_unprepared("CREATE FUNCTION reject_search_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected completion rollback'; END; $$; CREATE TRIGGER reject_search_completion BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (NEW.status='completed') EXECUTE FUNCTION reject_search_completion();").await.unwrap();
         assert!(
             sql_search_publish(
                 &maintenance,
@@ -14368,7 +14269,7 @@ mod tests {
         );
         maintenance
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_search_completion")
+            .execute_unprepared("DROP TRIGGER reject_search_completion ON thread_episodic_index_jobs; DROP FUNCTION reject_search_completion()")
             .await
             .unwrap();
         evidence.reads.lock().unwrap().clear();
@@ -15048,8 +14949,8 @@ mod tests {
         );
         let tx = store.database_connection().begin().await.unwrap();
         tx.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread_episodic_items SET search_text=NULL,status='pending_index' WHERE id=?",
+            DatabaseBackend::Postgres,
+            "UPDATE thread_episodic_items SET search_text=NULL,status='pending_index' WHERE id=$1",
             [item.id.clone().into()],
         ))
         .await

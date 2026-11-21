@@ -42,7 +42,7 @@ impl TaskChildReconciliationFailures {
 
     pub(super) fn retry_transient_storage_access(&self) -> bool {
         !self.independent.is_empty()
-            && is_anyhow_sqlite_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+            && is_anyhow_database_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
     }
 
     pub(super) fn report_worker_failure(&self) {
@@ -90,7 +90,7 @@ pub(super) fn retry_task_child_reconciliation_error(error: &anyhow::Error) -> bo
     if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
         return batch.retry_transient_storage_access();
     }
-    is_anyhow_sqlite_transient_access(error)
+    is_anyhow_database_transient_access(error)
 }
 
 pub(super) fn report_task_child_reconciliation_error(mut error: anyhow::Error) {
@@ -219,7 +219,7 @@ impl MessageProcessor {
                 }
                 *self.task_child_scope_cursor.lock().await = scope_pass;
                 if let Err(error) = store
-                    .expand_child_scope_candidate_with_clock(&candidate, &clock, false)
+                    .expand_child_scope_candidate_with_clock(&candidate, &clock)
                     .await
                 {
                     errors.push("", "", error);

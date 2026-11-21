@@ -6,7 +6,7 @@ use pioneer_entity::{
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, QueryTrait,
+    QueryOrder, QuerySelect, QueryTrait, TransactionTrait,
 };
 
 pub const RECEIPT_CLEANUP_MAX_ROWS: u64 = 128;
@@ -348,4 +348,103 @@ pub async fn apply(db: &DatabaseTransaction, prepared: &PreparedCleanup) -> Resu
         "projection receipt compaction boundary did not advance atomically"
     );
     Ok(deleted)
+}
+
+/// Canonical acceptance, independent of projection completion. PK lookup only.
+pub async fn has_accepted_terminal<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    Ok(stream::Entity::find_by_id(turn_id.to_owned())
+        .one(db)
+        .await?
+        .is_some_and(|row| {
+            row.accepted_terminal_event_id.is_some()
+                || row.accepted_terminal_event_type.is_some()
+                || row.accepted_terminal_sequence.is_some()
+        }))
+}
+
+pub async fn cleanup_quantum(
+    db: &pioneer_sqlite::SqliteDatabase,
+    after_turn_id: Option<&str>,
+    through_turn_id: Option<&str>,
+    addressed: Option<(&str, Option<i64>)>,
+) -> Result<ProjectionReceiptCleanupOutcome> {
+    let change = db.work_signal("maintenance.native").changing();
+    use pioneer_sqlite::{
+        DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
+        SqliteWriteClass, is_retryable_database_conflict, retry_with_backoff,
+    };
+    ensure!(
+        db.read_class() == SqliteReadClass::Maintenance
+            && db.write_class() == SqliteWriteClass::Maintenance,
+        "background database quantum requires maintenance-scoped reads and writes"
+    );
+    let result = retry_with_backoff(
+        || async {
+            let mut outcome = ProjectionReceiptCleanupOutcome::default();
+            let stream = match addressed {
+                Some((turn_id, through)) => addressed_stream(db, turn_id, through).await?,
+                None => next_stream(db, after_turn_id, through_turn_id).await?,
+            };
+            let Some(stream) = stream else {
+                return Ok(outcome);
+            };
+            outcome.through_sequence = Some(stream.through_sequence());
+            outcome.last_turn_id = Some(stream.turn_id.clone());
+            let prepared = match prepare(db, stream).await {
+                Ok(prepared) => prepared,
+                Err(error) if is_retryable_database_conflict(&error) => return Err(error),
+                Err(_) => {
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                    return Ok(outcome);
+                }
+            };
+            outcome.deferred = prepared.deferred;
+            if prepared.is_empty() {
+                return Ok(outcome);
+            }
+            let transaction = db
+                .begin()
+                .await
+                .context("failed to begin projection receipt cleanup quantum")?;
+            match apply(&transaction, &prepared).await {
+                Ok(deleted) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit projection receipt cleanup quantum")?;
+                    outcome.rows_deleted = deleted;
+                    if deleted > 0 {
+                        outcome.source_bytes = prepared.source_bytes;
+                    } else {
+                        outcome.deferred = true;
+                    }
+                }
+                Err(error) => {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back projection receipt cleanup quantum")?;
+                    if is_retryable_database_conflict(&error) {
+                        return Err(error);
+                    }
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                }
+            }
+            Ok(outcome)
+        },
+        is_retryable_database_conflict,
+        DEFAULT_LOCK_RETRY_ATTEMPTS,
+        std::time::Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+    )
+    .await;
+    if let Ok(outcome) = &result {
+        if outcome.rows_deleted > 0 {
+            change.completed_keys(&outcome.last_turn_id.iter().cloned().collect::<Vec<_>>());
+        } else {
+            change.completed(false);
+        }
+    }
+    result
 }

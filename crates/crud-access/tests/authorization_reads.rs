@@ -336,3 +336,39 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
         Ok(())
     }).await
 }
+
+#[tokio::test]
+async fn thread_start_scope_distinguishes_missing_existing_and_parent_mismatch() {
+    use pioneer_crud_access::authorization_scope::{
+        ThreadStartAuthorizationScope, resolve_thread_start_authorization_scope,
+    };
+
+    pioneer_postgres_test::with_database(async |test_database| {
+        let database = test_database.connection();
+        seed(database).await?;
+        database
+            .execute_unprepared("INSERT INTO workspace(id,name) VALUES('other','Other')")
+            .await?;
+        assert_eq!(
+            resolve_thread_start_authorization_scope(database, "missing-thread", "ws",)
+                .await
+                .expect("resolve missing thread"),
+            ThreadStartAuthorizationScope::Missing
+        );
+        assert_eq!(
+            resolve_thread_start_authorization_scope(database, "thread", "ws",)
+                .await
+                .expect("resolve exact thread"),
+            ThreadStartAuthorizationScope::Existing
+        );
+        assert_eq!(
+            resolve_thread_start_authorization_scope(database, "thread", "other",)
+                .await
+                .expect("resolve mismatched parent"),
+            ThreadStartAuthorizationScope::ParentMismatch
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}

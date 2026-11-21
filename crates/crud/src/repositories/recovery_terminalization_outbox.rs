@@ -2,8 +2,17 @@
 
 use anyhow::Result;
 use pioneer_crud_execution::recovery_terminalization_outbox as execution;
-use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use sea_orm::{ConnectionTrait, DatabaseTransaction};
+
+pub(crate) struct ReleaseShellControls;
+
+impl execution::RecoverySettlement for ReleaseShellControls {
+    async fn release(&self, tx: &DatabaseTransaction, job_ids: &[String]) -> Result<()> {
+        super::turn_llm_context::settle_shell_controls_for_recovery_jobs(tx, job_ids).await?;
+        Ok(())
+    }
+}
 
 pub use execution::{
     STATUS_CANCELLED, STATUS_DELIVERED, STATUS_DELIVERING, STATUS_FAILED, STATUS_PENDING,

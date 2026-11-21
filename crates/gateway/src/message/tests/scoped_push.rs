@@ -644,7 +644,7 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
     let large_title = "z".repeat(512);
     let result = json!({"summary":"🙂".repeat(1024),"artifacts":[]}).to_string();
     store.database_connection().execute_unprepared(&format!(
-        "UPDATE task SET title='{large_title}' WHERE id='K0000000000000000000I'; UPDATE task_run SET result_json='{result}' WHERE task_id='K0000000000000000000I'; WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i+1 FROM n WHERE i<399) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,result_json,completed_at,created_at,updated_at) SELECT printf('R%020d',i),'K0000000000000000000I',printf('R%020d',i),1,i,'succeeded','system','{result}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM n"
+        "UPDATE task SET title='{large_title}' WHERE id='K0000000000000000000I'; UPDATE task_run SET result_json='{result}' WHERE task_id='K0000000000000000000I'; WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i+1 FROM n WHERE i<399) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,result_json,completed_at,created_at,updated_at) SELECT ('R'||lpad(i::text,20,'0')),'K0000000000000000000I',('R'||lpad(i::text,20,'0')),1,i,'succeeded','system','{result}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM n"
     )).await.unwrap();
     eprintln!("inbox coverage: byte-capped replacement");
     processor.dirty_push_inbox(&workspace, None, None);
@@ -661,7 +661,7 @@ async fn inbox_reset_keeps_delivered_coverage_and_point_ack_cannot_hide_reset() 
         .expect("byte-capped exact frontier");
     const NEW: &str = "R99999999999999999999";
     store.database_connection().execute_unprepared(&format!(
-        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('{NEW}','K0000000000000000000I','{NEW}',1,99999,'succeeded','system',datetime('now','+1 second'),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('{NEW}','K0000000000000000000I','{NEW}',1,99999,'succeeded','system',(CURRENT_TIMESTAMP + INTERVAL '1 second'),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
     )).await.unwrap();
     processor.dirty_push(&workspace, None, None, Some(NEW), false, None);
     eprintln!("inbox coverage: new entry beyond retained frontier");

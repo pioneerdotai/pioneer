@@ -6,7 +6,7 @@ use pioneer_protocol::TaskDependency;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
-use crate::values::{optional_json_value_to_db, unix_to_datetime};
+use crate::values::{optional_json_value_from_db, optional_json_value_to_db, unix_to_datetime};
 
 #[derive(Clone, Debug)]
 pub struct PreparedTaskDependencyProjection(task_dependency::ActiveModel);
@@ -78,5 +78,18 @@ fn active_model_from_dependency(
         kind: Set(dependency.kind.clone()),
         condition_json: Set(optional_json_value_to_db(&dependency.condition)?),
         created_at: Set(unix_to_datetime(dependency.created_at)),
+    })
+}
+
+pub fn task_dependency_from_db_model(
+    model: pioneer_entity::task_dependency::Model,
+) -> Result<TaskDependency> {
+    Ok(TaskDependency {
+        id: model.id,
+        task_id: model.task_id,
+        depends_on_task_id: model.depends_on_task_id,
+        kind: model.kind,
+        condition: optional_json_value_from_db(model.condition_json)?,
+        created_at: model.created_at.timestamp(),
     })
 }

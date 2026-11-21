@@ -243,7 +243,6 @@ windows-sys = "0.61"
 # Database
 sea-orm = "2.0"
 sea-orm-migration = "2.0"
-rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP

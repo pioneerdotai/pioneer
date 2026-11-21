@@ -625,8 +625,7 @@ fn memory_response_invalid_or_http_403_then_valid_durable_attempt() {
 #[test]
 fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
     run_gateway_message_test("memory_http_403_budget", || async {
-        use sea_orm::ConnectOptions;
-        let (directory, manager, store, workspace) = setup_pooled_file_workspace_manager().await;
+        let (database_fixture, manager, store, workspace) = setup_pooled_workspace_manager().await;
         let provider = Arc::new(ResponseProvider::new(vec![]));
         provider
             .failures
@@ -760,20 +759,9 @@ fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
         drop(f);
         database.close().await.unwrap();
 
-        // Reopen the actual file with the existing Gateway reader/writer contour.
-        let url = format!(
-            "sqlite://{}?mode=rw",
-            directory.path().join("gateway.sqlite").display()
-        );
-        let mut writer_options = ConnectOptions::new(url.clone());
-        writer_options.max_connections(1).sqlx_logging(false);
-        let mut reader_options = ConnectOptions::new(url);
-        reader_options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-        let writer = Database::connect(writer_options).await.unwrap();
-        let reader = Database::connect(reader_options).await.unwrap();
+        // Reopen the actual database with the Gateway reader and writer pools.
+        let writer = database_fixture.connect_with_limit(1).await.unwrap();
+        let reader = database_fixture.connect_read_only().await.unwrap();
         let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
         // Reconciliation/repeated preparation of the same terminal input is idempotent.

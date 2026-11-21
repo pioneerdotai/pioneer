@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hex.workspace = true
+pioneer-crud-conversations.workspace = true
 pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
 pioneer-sqlite.workspace = true
@@ -16,7 +20,7 @@ sea-orm = { workspace = true, features = ["sqlx-postgres", "postgres-vector"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 pioneer-postgres-test.workspace = true
-tokio.workspace = true

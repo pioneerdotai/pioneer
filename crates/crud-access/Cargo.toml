@@ -12,13 +12,13 @@ test-support = []
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true
-pioneer-crud-execution.workspace = true
 pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+pioneer-crud-artifacts.workspace = true
 pioneer-postgres-test.workspace = true
 pioneer-sqlite.workspace = true
 tokio.workspace = true

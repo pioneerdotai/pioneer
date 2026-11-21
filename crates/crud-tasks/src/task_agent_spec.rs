@@ -6,7 +6,9 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::values::{optional_json_value_to_db, unix_to_datetime};
+use crate::values::{
+    json_value_from_db, optional_json_value_from_db, optional_json_value_to_db, unix_to_datetime,
+};
 
 #[derive(Clone, Debug)]
 pub struct PreparedTaskAgentSpecProjection(task_agent_spec::ActiveModel);
@@ -198,4 +200,29 @@ pub async fn find_delivery_review_policy<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to read legacy delivery review policy")
+}
+
+pub fn task_agent_spec_from_db_model(
+    model: pioneer_entity::task_agent_spec::Model,
+) -> Result<TaskAgentSpec> {
+    Ok(TaskAgentSpec {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        agent_role: model.agent_role,
+        agent_nickname: model.agent_nickname,
+        model: model.model,
+        model_provider: model.model_provider,
+        prompt: json_value_from_db(model.prompt_json)?,
+        context_policy: optional_json_value_from_db(model.context_policy_json)?,
+        tool_policy: optional_json_value_from_db(model.tool_policy_json)?,
+        permission_cap: optional_json_value_from_db(model.permission_cap_json)?,
+        security_cap: optional_json_value_from_db(model.security_cap_json)?,
+        result_contract: optional_json_value_from_db(model.result_contract_json)?,
+        review_policy: optional_json_value_from_db(model.review_policy_json)?,
+        depth: model.depth,
+        max_depth: model.max_depth,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+    })
 }

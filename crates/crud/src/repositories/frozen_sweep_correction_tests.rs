@@ -82,7 +82,7 @@ async fn resetting_low_consumer_cannot_starve_later_sources_or_other_kind() {
     }
     exec(
         &store,
-        "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='z-consumer'",
+        "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='z-consumer'",
     )
     .await;
     let mut progress = FrozenStorageLifetimeProgress::default();
@@ -158,7 +158,7 @@ async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_rev
     exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('mutable-consumer',0,0,1,'batch-physical')").await;
     exec(
         &store,
-        "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='mutable-consumer'",
+        "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='mutable-consumer'",
     )
     .await;
     drain_metadata(&store).await;
@@ -180,7 +180,7 @@ async fn relevant_pending_geometry_blocks_stale_delete_and_ack_before_target_rev
     );
     selected
         .finish(
-            &store,
+            &store.connection,
             frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
         )
         .await
@@ -339,7 +339,7 @@ async fn physical_round_pages_future_retries_without_false_eof_or_idle_loop() {
             row(&store, &id, kind, 0).await;
             work(&store, &id, kind)
                 .await
-                .finish(&store, frozen_sweep_work::Completion::Retry)
+                .finish(&store.connection, frozen_sweep_work::Completion::Retry)
                 .await
                 .unwrap();
         }
@@ -402,7 +402,7 @@ async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_res
             "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('mutable-consumer',$1,0,1,'batch-physical')",[kind.into()])).await.unwrap();
         exec(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='mutable-consumer'",
+            "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='mutable-consumer'",
         )
         .await;
         drain_metadata(&store).await; // baseline only; no draining after mutation
@@ -445,7 +445,7 @@ async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_res
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
         assert_eq!(progress.accounting.rows, [0, 0]);
         selected
-            .finish(&store, frozen_sweep_work::Completion::Complete(guard))
+            .finish(&store.connection, frozen_sweep_work::Completion::Complete(guard))
             .await
             .unwrap();
         assert_eq!(pending(&store, "batch-physical", kind).await, 1);
@@ -482,17 +482,14 @@ async fn physical_round_keeps_generation_and_prefanout_fence_with_or_without_res
 #[pioneer_postgres_test::postgres_test]
 async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
     use pioneer_entity::prelude::{
-        CompactionFrozenSweepBootstrap, CompactionFrozenSweepConsumer, CompactionFrozenSweepFanout,
+        CompactionFrozenSweepConsumer, CompactionFrozenSweepFanout,
         CompactionFrozenSweepWork,
     };
     use sea_orm::EntityName;
 
     let store = blank().await;
     let tables = [
-        (
-            CompactionFrozenSweepBootstrap.table_name().to_owned(),
-            "compaction_frozen_sweep_bootstrap",
-        ),
+
         (
             CompactionFrozenSweepConsumer.table_name().to_owned(),
             "compaction_frozen_sweep_consumer",
@@ -519,7 +516,6 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
         "compaction_frozen_sweep_consumer_pending",
         "compaction_frozen_sweep_consumer_sources",
         "compaction_frozen_sweep_source_consumers",
-        "compaction_frozen_sweep_bootstrap_pending",
     ] {
         expected.insert(("index".to_owned(), name.to_owned()));
     }
@@ -590,21 +586,11 @@ async fn fresh_sweep_schema_uses_compaction_names_and_generated_entities() {
 #[pioneer_postgres_test::postgres_test]
 async fn generated_sweep_entities_preserve_defaults_conflicts_and_null_cursor_delivery() {
     use pioneer_entity::{
-        compaction_frozen_sweep_bootstrap as bootstrap,
         compaction_frozen_sweep_consumer as consumer, compaction_frozen_sweep_fanout as fanout,
         compaction_frozen_sweep_work as queued,
     };
     use sea_orm::sea_query::OnConflict;
     let store = blank().await;
-    for kind in [0_i64, 1] {
-        let row = bootstrap::Entity::find_by_id(kind)
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!((row.started, row.complete), (0, 0));
-        assert_eq!((row.upper_manifest, row.after_manifest), (None, None));
-    }
     let service = fanout::Entity::find_by_id(1_i64)
         .one(&store.connection)
         .await
@@ -835,7 +821,7 @@ async fn fanout_ack_reopens_blocked_visit_without_another_work_revision() {
             "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('ack-consumer',$1,0,1,'batch-physical')", [kind.into()])).await.unwrap();
         exec(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='ack-consumer'",
+            "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='ack-consumer'",
         )
         .await;
         // Stop after delivery, before ACK. The source Work revision is now the

@@ -474,7 +474,7 @@ async fn acknowledgement_and_deferral_storage_errors_leave_leases_for_recovery()
         // Failure at the real acknowledgement/deferral boundary, rather than
         // a mock result from a copied drain algorithm.
         store.database_connection().execute_unprepared(&format!(
-            "CREATE TRIGGER reject_delivery_status BEFORE UPDATE OF status ON turn_event_delivery WHEN NEW.consumer = '{consumer}' AND NEW.status = '{status}' BEGIN SELECT RAISE(ABORT, 'fixture delivery storage failure'); END"
+            "CREATE FUNCTION reject_delivery_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture delivery storage failure'; END; $$; CREATE TRIGGER reject_delivery_status BEFORE UPDATE OF status ON turn_event_delivery FOR EACH ROW WHEN (NEW.consumer = '{consumer}' AND NEW.status = '{status}') EXECUTE FUNCTION reject_delivery_status();"
         )).await.unwrap();
         let owner = wake(&processor, consumer);
         owner.claim_barrier.arm("storage_failed");
@@ -774,27 +774,16 @@ async fn projection_recovery_deadline_storage_errors_remain_errors() {
     assert!(store.next_turn_event_delivery_deadline(LIVE).await.is_err());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_queries() {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
     };
-    use sea_orm::ConnectOptions;
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("empty-delivery-owners.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, _) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, _) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,

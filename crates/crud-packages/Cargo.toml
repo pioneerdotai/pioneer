@@ -8,12 +8,15 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+hex.workspace = true
 pioneer-apps.workspace = true
 pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
+pioneer-sqlite.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 pioneer-migration.workspace = true

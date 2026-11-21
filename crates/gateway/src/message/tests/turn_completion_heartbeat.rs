@@ -43,13 +43,13 @@ pub(super) async fn next_heartbeat(processor: &Arc<MessageProcessor>) {
 async fn fixture(
     observer: Option<Arc<dyn pioneer_sqlite::SqliteWriteObserver>>,
 ) -> (
-    tempfile::TempDir,
+    Arc<pioneer_postgres_test::TestDatabase>,
     Arc<MessageProcessor>,
     Arc<CrudStore>,
     String,
 ) {
     let (directory, manager, store, workspace) =
-        setup_pooled_file_workspace_manager_with_observer(observer).await;
+        setup_pooled_workspace_manager_with_observer(observer).await;
     let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
         test_provider(),
@@ -86,9 +86,9 @@ async fn seed_execution(
     }
     // Seed an old receipt before starting workers. Every active status and
     // backend shares the owner heartbeat contract; no runtime is needed here.
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at,started_at,completed_at)
-         VALUES (?,?,?,?,?,?,1,'2000-01-01T00:00:15+00:00','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00',CASE WHEN ?='running' THEN '2000-01-01T00:00:00+00:00' END,CASE WHEN ?='completed' THEN '2000-01-01T00:00:00+00:00' END)",
+         VALUES ($1,$2,$3,$4,$5,$6,1,'2000-01-01T00:00:15+00:00','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00',CASE WHEN $7='running' THEN TIMESTAMPTZ '2000-01-01T00:00:00+00:00' END,CASE WHEN $8='completed' THEN TIMESTAMPTZ '2000-01-01T00:00:00+00:00' END)",
         [id.into(), id.into(), workspace.into(), executor.into(), status.into(), owner.into(), status.into(), status.into()]))
         .await.unwrap();
 }
@@ -97,9 +97,14 @@ async fn install_heartbeat_audit(store: &CrudStore) {
     store
         .database_connection()
         .execute_unprepared(
-            "CREATE TABLE heartbeat_updates(n INTEGER); INSERT INTO heartbeat_updates VALUES(0);
+            "CREATE TABLE heartbeat_updates(n bigint); INSERT INTO heartbeat_updates VALUES(0);
+         CREATE FUNCTION count_turn_heartbeat() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             UPDATE heartbeat_updates SET n=n+1;
+             RETURN NEW;
+         END; $$;
          CREATE TRIGGER heartbeat_count AFTER UPDATE OF heartbeat_at ON turn_execution
-         BEGIN UPDATE heartbeat_updates SET n=n+1; END",
+         FOR EACH ROW EXECUTE FUNCTION count_turn_heartbeat()",
         )
         .await
         .unwrap();
@@ -109,7 +114,7 @@ async fn heartbeat_update_count(store: &CrudStore) -> i64 {
     store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT n FROM heartbeat_updates",
         ))
         .await
@@ -121,7 +126,7 @@ async fn heartbeat_update_count(store: &CrudStore) -> i64 {
 
 // Keep time running during real SQLx I/O and Notify/timeout waits. Pause only
 // for the explicit timer advances, and resume before awaiting database work.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
     let observer = Arc::new(NativeSchedulingObserver::default());
     let (_directory, processor, store, workspace) = fixture(Some(observer.clone())).await;
@@ -155,10 +160,10 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_execution SET lease_until=?1 WHERE turn_id='foreign'",
+            DbBackend::Postgres,
+            "UPDATE turn_execution SET lease_until=$1 WHERE turn_id='foreign'",
             [(chrono::Utc::now() + chrono::Duration::hours(1))
-                .to_rfc3339()
+                .fixed_offset()
                 .into()],
         ))
         .await
@@ -326,7 +331,7 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
     assert_eq!(heartbeat_update_count(&store).await, write_count);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn owner_cancellation_stops_heartbeat_and_worker_does_not_retain_processor() {
     let (_directory, processor, store, workspace) = fixture(None).await;
     seed_execution(
@@ -390,10 +395,10 @@ fn native_child_and_task_run_complete_while_other_turn_holds_history_pass() {
     );
 }
 
-// SQLite 'now' is a wall clock. Tokio's paused clock controls worker timers,
-// but cannot move SQLite's time. Cross one wall-clock second with yields (no
-// race sleeps), then release the existing writer probe before any other write.
-async fn cross_sqlite_clock_second() -> i64 {
+// Tokio's paused clock controls worker timers. PostgreSQL evaluates wall time
+// after writer admission, so cross one wall-clock second while the probe holds
+// the writer before allowing the heartbeat statement to run.
+async fn cross_wall_clock_second() -> i64 {
     let before = chrono::Utc::now().timestamp();
     timeout(Duration::from_secs(2), async {
         loop {
@@ -408,7 +413,7 @@ async fn cross_sqlite_clock_second() -> i64 {
     .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_retry() {
     let observer = Arc::new(PausedCliHeartbeatWriter::default());
     let (_directory, processor, store, workspace) = fixture(Some(observer.clone())).await;
@@ -425,12 +430,22 @@ async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_ret
     let owner = processor.turn_execution_owner_id.to_string();
     for retry in [false, true] {
         if retry {
-            scope.database_connection().execute_unprepared(
-                "CREATE TABLE heartbeat_fault(armed INTEGER); INSERT INTO heartbeat_fault VALUES(1);
+            scope
+                .database_connection()
+                .execute_unprepared(
+                    "CREATE SEQUENCE heartbeat_fault;
+                 CREATE FUNCTION inject_heartbeat_retry() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF nextval('heartbeat_fault') = 1 THEN
+                     RAISE EXCEPTION USING ERRCODE='40001', MESSAGE='fixture serialization retry';
+                   END IF;
+                   RETURN NEW;
+                 END; $$;
                  CREATE TRIGGER heartbeat_lock BEFORE UPDATE ON turn_execution
-                 WHEN EXISTS(SELECT 1 FROM heartbeat_fault WHERE armed=1)
-                 BEGIN DELETE FROM heartbeat_fault; SELECT RAISE(FAIL,'database is locked'); END")
-                .await.unwrap();
+                 FOR EACH ROW EXECUTE FUNCTION inject_heartbeat_retry()",
+                )
+                .await
+                .unwrap();
         }
         observer.armed.store(true, Ordering::SeqCst);
         let task_store = scope.clone();
@@ -454,21 +469,20 @@ async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_ret
             timeout(Duration::from_secs(5), observer.entered.notified())
                 .await
                 .unwrap();
-            // RAISE(FAIL) preserves the one-shot fault marker's deletion while
-            // rejecting the first execution UPDATE. The next real CRUD retry
-            // is paused after admission, before evaluating SQLite's clock.
+            // Sequence advancement survives rollback. The next CRUD retry
+            // is paused after admission, before evaluating the clock.
             let row = scope
                 .database_connection()
                 .query_one_raw(Statement::from_string(
-                    DbBackend::Sqlite,
-                    "SELECT count(*) AS remaining FROM heartbeat_fault",
+                    DbBackend::Postgres,
+                    "SELECT is_called FROM heartbeat_fault",
                 ))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(row.try_get::<i64>("", "remaining").unwrap(), 0);
+            assert_eq!(row.try_get::<bool>("", "is_called").unwrap(), true);
         }
-        let released_at = cross_sqlite_clock_second().await;
+        let released_at = cross_wall_clock_second().await;
         observer.release.notify_one();
         let result = heartbeat.await.unwrap();
         assert_eq!(result.unwrap(), 1);
@@ -486,14 +500,14 @@ async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_ret
         if retry {
             scope
                 .database_connection()
-                .execute_unprepared("DROP TRIGGER heartbeat_lock; DROP TABLE heartbeat_fault")
+                .execute_unprepared("DROP TRIGGER heartbeat_lock ON turn_execution; DROP FUNCTION inject_heartbeat_retry(); DROP SEQUENCE heartbeat_fault")
                 .await
                 .unwrap();
         }
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn parked_empty_heartbeat_releases_processor_and_is_cancellable() {
     let (_directory, processor, store, _workspace) = fixture(None).await;
     let weak = Arc::downgrade(&processor);
@@ -523,7 +537,7 @@ async fn parked_empty_heartbeat_releases_processor_and_is_cancellable() {
     assert!(worker.await.unwrap_err().is_cancelled());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn recovery_due_worker_releases_original_and_scoped_processor_before_wait() {
     let (_directory, processor, _store, _workspace) = fixture(None).await;
     let weak = Arc::downgrade(&processor);

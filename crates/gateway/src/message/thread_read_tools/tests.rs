@@ -1242,7 +1242,7 @@ async fn saved_observation_result_cannot_replay_a_now_inaccessible_thread() {
             let mut saved_item = serde_json::to_value(&item).unwrap();
             saved_item["storage"] = json!({"kind":"metadata","metadata":deep});
             harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                "UPDATE turn_item SET payload=$1::text::json WHERE turn_id='saved-list-turn' AND item_id='saved-list'", [saved_item.to_string().into()])).await.unwrap();
+                "UPDATE turn_item SET payload=$1::text::json,payload_payload_id=NULL WHERE turn_id='saved-list-turn' AND item_id='saved-list'", [saved_item.to_string().into()])).await.unwrap();
             let metadata = processor
                 .crud_store
                 .tool_result_access_source(
@@ -1492,11 +1492,11 @@ async fn list_creation_key_survives_skips_activity_insertions_deletion_and_acces
         async {
             let (harness, processor) = fixture(test_database).await;
             for (id, date) in [
-                ("z-old", "2050-01-01 00:00:00.123456000+00:00"),
+                ("z-old", "2050-01-01 00:00:00.123456+00:00"),
                 ("a-new", "2050-01-01 00:00:01+00:00"),
-                ("b-tie", "2050-01-01 00:00:00.123456789+00:00"),
-                ("c-tie", "2050-01-01 00:00:00.123456789+00:00"),
-                ("d-fraction", "2050-01-01 00:00:00.123456788+00:00"),
+                ("b-tie", "2050-01-01 00:00:00.123458+00:00"),
+                ("c-tie", "2050-01-01 00:00:00.123458+00:00"),
+                ("d-fraction", "2050-01-01 00:00:00.123457+00:00"),
             ] {
                 add_thread(&processor, id, None, false).await;
                 make_conversation(&processor, id).await;

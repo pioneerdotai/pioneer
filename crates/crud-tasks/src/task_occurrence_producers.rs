@@ -385,3 +385,6 @@ pub async fn agent_change<C: ConnectionTrait>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

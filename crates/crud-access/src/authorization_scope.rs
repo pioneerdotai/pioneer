@@ -9,11 +9,14 @@ use pioneer_entity::{
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, JoinType, QueryFilter,
-    QuerySelect,
+    QueryOrder, QuerySelect,
 };
 
-use super::identity::actor_ref_from_db;
-use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
+use super::identity::{actor_ref_from_db, load_principal_by_id};
+use super::membership::{
+    PersistedThreadAccessClass, find_accessible_thread_for_principal,
+    find_active_workspace_for_principal, persisted_thread_access_class_from_db,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceAuthorizationScope {
@@ -369,6 +372,52 @@ pub async fn resolve_turn_authorization_scope<C: ConnectionTrait>(
         turn_id: id,
         thread,
     }))
+}
+
+pub async fn list_artifact_ids_for_authorized_thread_roots<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    authorized_thread_roots: &[Vec<String>],
+) -> Result<Vec<String>> {
+    let authorized_thread_ids = authorized_thread_roots
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if authorized_thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidates = artifact::Entity::find()
+        .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+        .order_by_asc(artifact::Column::Id)
+        .select_only()
+        .column(artifact::Column::Id)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list artifact authorization candidates")?;
+    let mut artifact_ids = Vec::new();
+    for artifact_id in candidates {
+        let Some(scope) = resolve_artifact_authorization_scope(
+            db,
+            artifact_id.as_str(),
+            Some(workspace_id),
+            None,
+        )
+        .await?
+        else {
+            continue;
+        };
+        if scope
+            .thread_id
+            .as_ref()
+            .is_some_and(|thread_id| authorized_thread_ids.contains(thread_id))
+        {
+            artifact_ids.push(artifact_id);
+        }
+    }
+    Ok(artifact_ids)
 }
 
 pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
@@ -1041,4 +1090,49 @@ async fn list_running_task_scopes_for_ids<C: ConnectionTrait>(
 pub struct RunningTaskScopePage {
     pub after_task_id: Option<String>,
     pub scopes: Vec<(TaskAuthorizationScope, bool, bool)>,
+}
+
+pub async fn principal_current_thread_access_kind<C: ConnectionTrait>(
+    transaction: &C,
+    workspace_id: &str,
+    thread_id: &str,
+    principal_id: &PrincipalId,
+) -> Result<Option<pioneer_protocol::PrincipalKind>> {
+    let Some(principal) = load_principal_by_id(transaction, principal_id).await? else {
+        return Ok(None);
+    };
+    if principal.status != pioneer_protocol::PrincipalStatus::Active {
+        return Ok(None);
+    }
+
+    match principal.kind {
+        pioneer_protocol::PrincipalKind::Superuser => Ok(principal
+            .role_key
+            .is_none()
+            .then_some(pioneer_protocol::PrincipalKind::Superuser)),
+        pioneer_protocol::PrincipalKind::User => {
+            let role = principal
+                .role_key
+                .as_deref()
+                .map(pioneer_protocol::RoleKey::new)
+                .transpose()
+                .context("thread actor has an invalid persisted role")?;
+            if role.is_none()
+                || find_active_workspace_for_principal(transaction, principal_id, workspace_id)
+                    .await?
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            Ok(find_accessible_thread_for_principal(
+                transaction,
+                principal_id,
+                workspace_id,
+                thread_id,
+            )
+            .await?
+            .is_some()
+            .then_some(pioneer_protocol::PrincipalKind::User))
+        }
+    }
 }

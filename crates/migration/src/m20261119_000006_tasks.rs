@@ -2199,30 +2199,6 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table("task_occurrence_reconcile_seed")
-                    .col(big_integer("singleton").primary_key())
-                    .col(big_integer("status_index"))
-                    .col(text_null("after_run_id"))
-                    .col(text_null("upper_run_id"))
-                    .check(Expr::cust(r#""singleton" = 1"#))
-                    .check(Expr::cust(r#""status_index" BETWEEN 0 AND 5"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("task_occurrence_reconcile_seed")
-                    .columns(["singleton", "status_index"])
-                    .values_panic([1_i64.into(), 0_i64.into()])
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
                     .table("task_delivery_recovery_retry")
                     .col(text("delivery_id").primary_key())
                     .col(text_null("expected_attempt_id"))
@@ -2437,7 +2413,6 @@ impl MigrationTrait for Migration {
                 "task_event_fanout_sequence",
                 "task_event_fanout_pending",
                 "task_delivery_recovery_retry",
-                "task_occurrence_reconcile_seed",
                 "task_occurrence_reconcile_scope",
                 "task_occurrence_reconcile_sequence",
                 "task_occurrence_reconcile_pending",

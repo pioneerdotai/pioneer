@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub struct MemoryStore {
-    connection: SqliteDatabase,
+    pub(crate) connection: SqliteDatabase,
 }
 
 impl MemoryStore {
@@ -26,7 +26,7 @@ impl MemoryStore {
         }
     }
 
-    async fn retry_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn retry_write<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,

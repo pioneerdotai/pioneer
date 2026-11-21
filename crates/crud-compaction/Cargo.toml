@@ -5,15 +5,29 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
+hex.workspace = true
 pioneer-compaction.workspace = true
+pioneer-crud-artifacts.workspace = true
+pioneer-crud-conversations.workspace = true
+pioneer-crud-execution.workspace = true
+pioneer-crud-tasks.workspace = true
 pioneer-crud-payloads.workspace = true
 pioneer-entity.workspace = true
+pioneer-observability.workspace = true
+pioneer-protocol.workspace = true
+pioneer-sqlite.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-pioneer-crud-tasks.workspace = true
+futures-util.workspace = true
 pioneer-postgres-test.workspace = true
 tokio.workspace = true

@@ -151,7 +151,6 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use axum::extract::ws::Message;
 use futures_util::StreamExt;
-use migration::{Migrator, MigratorTrait};
 use pioneer_agent::{
     AgentManager, AgentMcpToolProvider, SkillsLoopConfig, TaskToolProvider, TaskTurnContext,
     ToolLoopConfig,
@@ -277,8 +276,8 @@ use pioneer_tools::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, Database, DatabaseTransaction, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -1961,12 +1960,12 @@ async fn plugins_list_and_details_preserve_native_member_disclosure() {
     ]).to_string())).await.unwrap();
     harness.crud_store.database_connection().execute_unprepared(&format!(
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at) \
-         VALUES('plugin-disclosure-thread','{}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", harness.workspace_id
+         VALUES('T00000000000000000013','{}','','chat','test','test','active','user','visible','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", harness.workspace_id
     )).await.unwrap();
     materialize_test_member_collaborator(
         &harness.crud_store,
         &harness.workspace_id,
-        "plugin-disclosure-thread",
+        "T00000000000000000013",
     )
     .await;
     let (tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
@@ -13536,7 +13535,6 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
         let (workspace_manager, crud_store, workspace_id) =
             setup_postgres_workspace_manager(fixture).await;
         let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("valid pack id");
@@ -13822,7 +13820,6 @@ fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 }
 
 async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_commands() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -13854,7 +13851,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
-    let parent_thread_id = "thr_concurrent_frozen_composer";
+    let parent_thread_id = "T0000000000000000000F";
     let started = thread_manager
         .thread_start_seeded(
             connection_id,
@@ -14416,8 +14413,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // Simulate a cold/legacy projection cache without changing any source.
     // The first capture must retain the command, not only its later outcome.
     crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=?)",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=$1)",
         [parent_thread_id.into()],
     )).await.unwrap();
     let cold = crate::compaction::test_support::capture_selected_line_json(
@@ -14457,22 +14454,16 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     );
 
     crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=?)",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=$1)",
         [parent_thread_id.into()],
     )).await.unwrap();
-    let replay = crud_store
-        .database_connection()
-        .query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "SELECT payload FROM turn_event WHERE id=?",
-            [acknowledged[0].acknowledgement.id.clone().into()],
-        ))
+    let event = crud_store
+        .persisted_turn_event_for_test(&acknowledged[0].acknowledgement.id)
         .await
         .unwrap()
         .unwrap();
-    let event: pioneer_crud::CanonicalTurnEventPayload =
-        serde_json::from_str(&replay.try_get::<String>("", "payload").unwrap()).unwrap();
+    let replay_payload = serde_json::to_string(&event).unwrap();
     let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) = event else {
         panic!("exact Task output acknowledgement")
     };
@@ -14528,9 +14519,9 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // first encountered row would move the logical command/outcome boundary.
     for n in 0..130 {
         crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT ?,e.thread_id,e.turn_id,CASE WHEN ?=0 THEN -1 ELSE (SELECT MAX(sequence)+1 FROM turn_event WHERE turn_id=e.turn_id) END,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e WHERE e.id=?",
-            [format!("delivery-replay-{n}").into(),n.into(),acknowledged[0].acknowledgement.id.clone().into()],
+            sea_orm::DbBackend::Postgres,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT $1,e.thread_id,e.turn_id,CASE WHEN $2=0 THEN -1 ELSE (SELECT MAX(sequence)+1 FROM turn_event WHERE turn_id=e.turn_id) END,e.event_type,$4::text::json,CURRENT_TIMESTAMP FROM turn_event e WHERE e.id=$3",
+            [format!("delivery-replay-{n}").into(),n.into(),acknowledged[0].acknowledgement.id.clone().into(),replay_payload.clone().into()],
         )).await.unwrap();
     }
     let assembled_json = processor
@@ -14640,7 +14631,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     let db = crud_store.database_connection();
     for (sql, values) in [
         (
-            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('new-child-context',?,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('new-child-context',$1,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             vec![workspace_id.clone().into()],
         ),
         (
@@ -14652,7 +14643,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             vec![],
         ),
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('recapture-task',?,'thread',?,'agent','running','Recapture','fixture')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('recapture-task',$1,'thread',$2,'agent','running','Recapture','fixture')",
             vec![workspace_id.clone().into(), parent_thread_id.into()],
         ),
         (
@@ -14664,11 +14655,11 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             vec![],
         ),
         (
-            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('new-child-context',?,?,1,CURRENT_TIMESTAMP)",
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('new-child-context',$1,$2,1,CURRENT_TIMESTAMP)",
             vec![parent_thread_id.into(), parent_thread_id.into()],
         ),
         (
-            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('recapture-run','recapture-task',$1,$2,$3,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN history_json IS JSON OBJECT THEN history_json::json->>'manifest_id' END FROM frozen_root_fixture",
             vec![
                 workspace_id.clone().into(),
                 parent_thread_id.into(),
@@ -14677,7 +14668,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         ),
     ] {
         db.execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             sql,
             values,
         ))
@@ -14714,8 +14705,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         crud_store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
-                "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+                sea_orm::DbBackend::Postgres,
+                "UPDATE compaction_frozen_history SET imports_sha256=$1 WHERE id=$2",
                 [
                     "0".repeat(64).into(),
                     assembled_descriptor.manifest_id.clone().into()
@@ -14728,8 +14719,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // Corrupt the actual backing row, including a shared import range. The
     // unchanged header digest must detect damage to its retained proof bytes.
     let import_row = crud_store.database_connection().query_one_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE d.ordinal=0 AND ((d.manifest_id=?1 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest)) LIMIT 1",
+        sea_orm::DbBackend::Postgres,
+        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE d.ordinal=0 AND ((d.manifest_id=$1 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=$1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=$1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest)) LIMIT 1",
         [assembled_descriptor.manifest_id.clone().into()],
     )).await.unwrap().unwrap();
     let backing: String = import_row.try_get("", "manifest_id").unwrap();
@@ -14737,8 +14728,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     let original_proof: String = import_row.try_get("", "proof_json").unwrap();
     let original_bytes: i64 = import_row.try_get("", "bytes").unwrap();
     crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_frozen_import_data SET proof_json='{}',bytes=2 WHERE manifest_id=? AND ordinal=?",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE compaction_frozen_import_data SET proof_json='{}',bytes=2 WHERE manifest_id=$1 AND ordinal=$2",
         [backing.clone().into(), ordinal.into()],
     )).await.unwrap();
     assert!(
@@ -14753,8 +14744,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         "own-import metadata corruption cannot silently change context ownership"
     );
     crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE compaction_frozen_import_data SET proof_json=$1,bytes=$2 WHERE manifest_id=$3 AND ordinal=$4",
         [original_proof.into(), original_bytes.into(), backing.into(), ordinal.into()],
     )).await.unwrap();
     assert_eq!(
@@ -14940,7 +14931,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         let rows = crud_store
             .database_connection()
             .query_all_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 "SELECT status,error FROM turn WHERE id='turn_concurrent_task_c'".to_owned(),
             ))
             .await
@@ -14953,7 +14944,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             );
         }
         let rows = crud_store.database_connection().query_all_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT r.status,r.error_json FROM task_run r JOIN task t ON t.id=r.task_id WHERE t.created_by_turn_id='turn_concurrent_task_c' LIMIT 10".to_owned(),
         )).await.unwrap();
         for row in rows {
@@ -15074,8 +15065,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     let unavailable = crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id=? AND kind=0",
+            sea_orm::DbBackend::Postgres,
+            "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id=$1 AND kind=0",
             [accepted_c_descriptor.manifest_id.clone().into()],
         ))
         .await
@@ -15190,8 +15181,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_layout SET failed=0 WHERE manifest_id=? AND kind=0",
+            sea_orm::DbBackend::Postgres,
+            "UPDATE compaction_frozen_layout SET failed=0 WHERE manifest_id=$1 AND kind=0",
             [accepted_c_descriptor.manifest_id.into()],
         ))
         .await
@@ -15208,8 +15199,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE thread_lineage SET created_by_turn_id=NULL WHERE child_thread_id=?",
+            sea_orm::DbBackend::Postgres,
+            "UPDATE thread_lineage SET created_by_turn_id=NULL WHERE child_thread_id=$1",
             [hidden_child.clone().into()],
         ))
         .await
@@ -15258,8 +15249,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE thread_lineage SET created_by_turn_id=? WHERE child_thread_id=?",
+            sea_orm::DbBackend::Postgres,
+            "UPDATE thread_lineage SET created_by_turn_id=$1 WHERE child_thread_id=$2",
             [
                 hidden_lineage.created_by_turn_id.into(),
                 hidden_child.clone().into(),
@@ -15793,28 +15784,28 @@ async fn materialize_test_member_collaborator(
     crud_store
         .database_connection()
         .execute_unprepared(&format!(
-            "INSERT OR IGNORE INTO gateway_principal(\
+            "INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
              ) VALUES(\
                 '{TEST_COLLABORATOR_PRINCIPAL_ID}','G00000000000000000001','user','member',\
                 'active','Test Collaborator','test-collaborator','test-collaborator',\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO workspace_membership(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO workspace_membership(\
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES(\
                 '{TEST_COLLABORATOR_PRINCIPAL_ID}','{workspace_id}','system',NULL,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
-             INSERT OR IGNORE INTO thread_membership(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO thread_membership(\
                 thread_id,principal_id,added_by_actor_kind,added_by_actor_id,\
                 created_at,updated_at\
              ) VALUES(\
                 '{thread_id}','{TEST_COLLABORATOR_PRINCIPAL_ID}','system',NULL,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );"
+             ) ON CONFLICT DO NOTHING;"
         ))
         .await
         .expect("materialize current Member collaborator");
@@ -17045,30 +17036,28 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
 
         let first_turn_id = "turn_unavailable_artifact_01";
         let first_request_id = generate_test_request_id("unavailableartifact", "first");
-        processor
-            .process_request_for_connection(
-                connection_id,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": first_request_id.clone(),
-                    "method": "turn/start",
-                    "params": {
-                        "thread_id": thread.thread.id,
-                        "turn_id": first_turn_id,
-                        "input": [
-                            { "type": "text", "text": "Remember this exact artifact" },
-                            {
-                                "type": "artifact",
-                                "artifactId": artifact.artifact_id.clone(),
-                                "versionId": artifact.version_id.clone()
-                            }
-                        ]
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": first_request_id.clone(),
+            "method": "turn/start",
+            "params": {
+                "thread_id": thread.thread.id,
+                "turn_id": first_turn_id,
+                "input": [
+                    { "type": "text", "text": "Remember this exact artifact" },
+                    {
+                        "type": "artifact",
+                        "artifactId": artifact.artifact_id.clone(),
+                        "versionId": artifact.version_id.clone()
                     }
-                })
-                .to_string(),
-            )
-            .await;
-        let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
+                ]
+            }
+        })
+        .to_string();
+        let (_, _response) = tokio::join!(
+            processor.process_request_for_connection(connection_id, &request),
+            recv_response_by_id(&mut rx, first_request_id.as_str()),
+        );
         let first_status = drain_test_notifications_while(
             &mut rx,
             wait_for_turn_status(
@@ -17101,23 +17090,21 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
 
         let second_turn_id = "turn_unavailable_artifact_02";
         let second_request_id = generate_test_request_id("unavailableartifact", "second");
-        processor
-            .process_request_for_connection(
-                connection_id,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": second_request_id.clone(),
-                    "method": "turn/start",
-                    "params": {
-                        "thread_id": thread.thread.id,
-                        "turn_id": second_turn_id,
-                        "input": [{ "type": "text", "text": "А теперь без файла?" }]
-                    }
-                })
-                .to_string(),
-            )
-            .await;
-        let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": second_request_id.clone(),
+            "method": "turn/start",
+            "params": {
+                "thread_id": thread.thread.id,
+                "turn_id": second_turn_id,
+                "input": [{ "type": "text", "text": "А теперь без файла?" }]
+            }
+        })
+        .to_string();
+        let (_, _response) = tokio::join!(
+            processor.process_request_for_connection(connection_id, &request),
+            recv_response_by_id(&mut rx, second_request_id.as_str()),
+        );
         let second_status = drain_test_notifications_while(
             &mut rx,
             wait_for_turn_status(
@@ -19334,7 +19321,6 @@ async fn collaborative_voice_composer_admits_detached_task() {
         let connection_id =
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
         let (workspace_manager, crud_store, workspace_id) =
             setup_postgres_workspace_manager(fixture).await;
         let provider = Arc::new(CaptureSummaryProvider::new("must run in child"));
@@ -21679,12 +21665,12 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
     crud_store
         .database_connection()
         .execute_unprepared(
-            "INSERT OR IGNORE INTO gateway_identity(\
+            "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -22220,12 +22206,12 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
     crud_store
         .database_connection()
         .execute_unprepared(
-            "INSERT OR IGNORE INTO gateway_identity(\
+            "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -22240,14 +22226,14 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES(\
-                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
              INSERT INTO thread(\
                 id,workspace_id,name,preview,mode,model,model_provider,status,\
                 origin_kind,sidebar_visibility,access_class,created_at,updated_at,\
                 created_by_actor_kind,created_by_actor_id\
              ) VALUES(\
-                'T0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'T0000000000000000000N',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                 'Notification root','', 'chat','test','test','active','user','visible',\
                 'workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'principal',\
                 'P0000000000000000000A');\
@@ -22255,7 +22241,7 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
                 id,workspace_id,owner_kind,owner_id,created_by_thread_id,\
                 root_task_id,parent_task_id,executor_kind,status,title,goal\
              ) VALUES(\
-                'K0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'K0000000000000000000N',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                 'user','P0000000000000000000A','T0000000000000000000N',NULL,NULL,\
                 'agent','waiting','Notification task','Notification task');",
         )
@@ -22611,7 +22597,7 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
             "INSERT INTO workspace_membership(\
             principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at\
          ) SELECT 'P0000000000000000000A',id,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP \
-           FROM workspace WHERE is_current=1 LIMIT 1",
+           FROM workspace WHERE is_current = TRUE LIMIT 1",
         )
         .await
         .expect("restore exact recipient workspace membership");
@@ -22682,12 +22668,12 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
         crud_store
             .database_connection()
             .execute_unprepared(
-                "INSERT OR IGNORE INTO gateway_identity(\
+                "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -22702,9 +22688,9 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES\
-                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
             )
             .await
@@ -22716,7 +22702,7 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
                 id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,\
                 attempt_count,max_attempts,created_at,updated_at\
              ) VALUES(\
-                'D0000000000000000000N',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'D0000000000000000000N',(SELECT id FROM workspace WHERE is_current = TRUE LIMIT 1),\
                 'K0000000000000000000N','R0000000000000000000N','inbox-rpc-delivery',\
                 'user_notification','P0000000000000000000A','delivered',1,1,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
@@ -22966,12 +22952,12 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
     crud_store
         .database_connection()
         .execute_unprepared(
-            "INSERT OR IGNORE INTO gateway_identity(\
+            "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -22986,9 +22972,9 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES\
-                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
         )
         .await
@@ -23840,7 +23826,7 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
     let grant = "INSERT INTO workspace_membership(\
         principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at\
         ) SELECT 'P0000000000000000000A',id,'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP \
-          FROM workspace WHERE is_current=1 LIMIT 1";
+          FROM workspace WHERE is_current = TRUE LIMIT 1";
     for direct in [false, true] {
         for mutation in [revoke, grant] {
             let serializations = Arc::new(AtomicUsize::new(0));
@@ -23956,12 +23942,12 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
         crud_store
             .database_connection()
             .execute_unprepared(
-                "INSERT OR IGNORE INTO gateway_identity(\
+                "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -23973,7 +23959,7 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES\
-                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
                 ('P0000000000000000000A','W0000000000000000000B',\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
@@ -26671,20 +26657,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
     let session_manager = Arc::new(SessionManager::new());
     let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
-    // Initial and revision child turns can overlap task_wait on separate pool
-    // connections. `sqlite::memory:` gives each such connection an unrelated
-    // empty database, so retain one unique file-backed fixture for this exact
-    // concurrency contract.
-    let database_temp = tempfile::tempdir().expect("revision Task database tempdir should exist");
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        database_temp.path().join("revision-task.sqlite3").display()
-    );
-    let connection = Database::connect(database_url)
-        .await
-        .expect("revision Task database should connect");
-    let (workspace_manager, crud_store, workspace_id) =
-        setup_workspace_manager_with_connection(connection).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = review_enabled_processor(
         provider_registry,
         session_manager,
@@ -29917,6 +29890,16 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             })
     );
 
+    // Task completion and the occurrence projection are handled by
+    // independent workers. Synchronize on the committed projection before
+    // inspecting the still-undelivered Task card.
+    wait_for_turn_status(
+        crud_store.clone(),
+        parent_thread_id,
+        run.id.as_str(),
+        TurnStatus::Completed,
+    )
+    .await;
     let (_, occurrence_turn) = crud_store
         .get_turn(parent_thread_id, run.id.as_str())
         .await
@@ -33666,8 +33649,7 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
 fn cli_history_stop_and_shutdown_drop_a_pending_state_read() {
     run_standard_stack_message_test("CLI history cancellation with occupied readers", async {
         for shutdown in [false, true] {
-            let (_directory, workspaces, store, workspace) =
-                setup_pooled_file_workspace_manager().await;
+            let (_directory, workspaces, store, workspace) = setup_pooled_workspace_manager().await;
             let processor = MessageProcessor::new(
                 Arc::new(ThreadManager::new("test-model", "openai")),
                 test_provider(),
@@ -33815,7 +33797,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
         let (_database_directory, workspaces, store, workspace) =
-            setup_pooled_file_workspace_manager_with_observer(Some(writer_pause.clone())).await;
+            setup_pooled_workspace_manager_with_observer(Some(writer_pause.clone())).await;
         sessions
             .set_connection_workspace(connection, Some(workspace.clone()))
             .await;
@@ -34436,7 +34418,7 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
     let (_database_directory, workspaces, store, workspace) =
-        setup_pooled_file_workspace_manager().await;
+        setup_pooled_workspace_manager().await;
     sessions
         .set_connection_workspace(connection, Some(workspace.clone()))
         .await;
@@ -34872,7 +34854,7 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
             TURN_EXECUTION_OWNER_LEASE_SECONDS
         );
         turn_completion_heartbeat::hold_history_pass(&processor).await;
-        // Cross the child's original SQLite wall-clock lease boundary using
+        // Cross the child's original wall-clock lease boundary using
         // production heartbeat cycles and Notify probes. The other Turn keeps
         // the common pass held throughout; no test sleep or long fixture lease.
         loop {
@@ -35806,7 +35788,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     lineage.child_turn_id
                 ),
                 format!(
-                    "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal,metadata_json) SELECT '{blocked_task}',workspace_id,owner_kind,owner_id,created_by_thread_id,'{launch}',executor_kind,'{task_status}',title,goal,json_set(metadata_json,'$.composerWork.launch.turn_id','{launch}') FROM task WHERE id='{task_id}'"
+                    "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal,metadata_json) SELECT '{blocked_task}',workspace_id,owner_kind,owner_id,created_by_thread_id,'{launch}',executor_kind,'{task_status}',title,goal,jsonb_set(metadata_json::jsonb,'{{composerWork,launch,turn_id}}',to_jsonb('{launch}'::text))::json FROM task WHERE id='{task_id}'"
                 ),
                 format!(
                     "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{blocked_run}','{blocked_task}','{blocked_run}',1,1,'{task_status}','agent')"
@@ -40691,20 +40673,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
     ));
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    // This scenario intentionally drives three concurrent Agent Turns. A
-    // pooled `sqlite::memory:` URL can open isolated per-connection databases
-    // under that load, so use one unique file-backed database for the exact
-    // agent domain concurrency contract.
-    let database_temp = tempfile::tempdir().expect("nested Task database tempdir should exist");
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        database_temp.path().join("nested-task.sqlite3").display()
-    );
-    let connection = Database::connect(database_url)
-        .await
-        .expect("nested Task database should connect");
-    let (workspace_manager, crud_store, workspace_id) =
-        setup_workspace_manager_with_connection(connection).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -40923,20 +40892,7 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "supervised-task-native"));
-    let database_temp =
-        tempfile::tempdir().expect("supervised native Task database tempdir should exist");
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        database_temp
-            .path()
-            .join("supervised-native-task.sqlite3")
-            .display()
-    );
-    let connection = Database::connect(database_url)
-        .await
-        .expect("supervised native Task database should connect");
-    let (workspace_manager, crud_store, workspace_id) =
-        setup_workspace_manager_with_connection(connection).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -41239,24 +41195,7 @@ async fn supervised_native_task_apply_patch_creates_approved_missing_destination
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
-    // The Task and permission responder overlap on separate pool connections.
-    // A pooled `sqlite::memory:` URL can expose an unrelated empty database to
-    // either side, so keep one unique file-backed fixture for this concurrency
-    // contract.
-    let database_temp =
-        tempfile::tempdir().expect("Apply Patch Task database tempdir should exist");
-    let database_url = format!(
-        "sqlite://{}?mode=rwc",
-        database_temp
-            .path()
-            .join("apply-patch-task.sqlite3")
-            .display()
-    );
-    let connection = Database::connect(database_url)
-        .await
-        .expect("Apply Patch Task database should connect");
-    let (workspace_manager, crud_store, workspace_id) =
-        setup_workspace_manager_with_connection(connection).await;
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     session_manager
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
@@ -42533,12 +42472,8 @@ fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
 }
 
 async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let connection = fixture.connection().clone();
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -42688,6 +42623,30 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
         prompt_manifest: None,
         permission_profile: default_test_permission_profile(),
     };
+    let child_thread = Thread {
+        id: "child_delivery_thread_1".to_owned(),
+        origin_kind: ThreadOriginKind::TaskRun,
+        turns: Vec::new(),
+        ..parent_thread.clone()
+    };
+    processor
+        .crud_store
+        .materialize_turn_start(
+            &child_thread,
+            SandboxMode::FullAccess,
+            &Turn {
+                id: "child_delivery_turn_1".to_owned(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::TaskRun,
+                origin: TurnOrigin::ScheduledTask,
+                permission_profile: default_test_permission_profile(),
+                ..occurrence_turn.clone()
+            },
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("child delivery turn should persist");
     processor
         .crud_store
         .materialize_turn_start(
@@ -42969,14 +42928,10 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_thread_delivery_materializes_a_system_attributed_turn() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let connection = fixture.connection().clone();
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -43121,14 +43076,10 @@ async fn task_thread_delivery_materializes_a_system_attributed_turn() {
     assert_eq!(delivered_turn.origin, "task_delivery");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let connection = fixture.connection().clone();
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -43240,14 +43191,10 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_task_thread_delivery_is_a_sanitized_system_state_without_work_group() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let connection = fixture.connection().clone();
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -43659,7 +43606,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
         let (_database_dir, workspace_manager, crud_store, workspace_id) =
-            setup_pooled_file_workspace_manager().await;
+            setup_pooled_workspace_manager().await;
         let provider = Arc::new(GuardAwareProvider::new());
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
@@ -45013,7 +44960,7 @@ async fn thread_tree_hides_foreign_empty_draft_threads() {
     .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_closed_discards_unmaterialized_runtime_draft() {
     let (tx, mut rx) = crate::session::test_support::outbound_channel(8);
     let session_manager = Arc::new(SessionManager::new());
@@ -45023,7 +44970,7 @@ async fn connection_closed_discards_unmaterialized_runtime_draft() {
     // Disconnect cleanup and the persistence assertion can acquire different
     // pool connections. Keep both on the same file-backed reader/writer fixture.
     let (_database_dir, workspace_manager, crud_store, workspace_id) =
-        setup_pooled_file_workspace_manager().await;
+        setup_pooled_workspace_manager().await;
     let processor = MessageProcessor::with_agent_manager(
         thread_manager.clone(),
         agent_manager.clone(),
@@ -46896,7 +46843,7 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
         .list_thread_episodic_items_for_thread(&workspace, thread, 100)
         .await
         .unwrap();
-    store.database_connection().execute_unprepared("CREATE TRIGGER reject_snapshot_job BEFORE INSERT ON thread_episodic_index_jobs BEGIN SELECT RAISE(ABORT, 'controlled snapshot bookkeeping failure'); END").await.unwrap();
+    store.database_connection().execute_unprepared("CREATE FUNCTION reject_snapshot_job() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled snapshot bookkeeping failure'; END; $$; CREATE TRIGGER reject_snapshot_job BEFORE INSERT ON thread_episodic_index_jobs FOR EACH ROW EXECUTE FUNCTION reject_snapshot_job();").await.unwrap();
     processor
         .handle_snapshot_agent_event(
             crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
@@ -46928,7 +46875,7 @@ async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchange
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_snapshot_job")
+        .execute_unprepared("DROP TRIGGER reject_snapshot_job ON thread_episodic_index_jobs; DROP FUNCTION reject_snapshot_job()")
         .await
         .unwrap();
     executor.shutdown().await;
@@ -50040,7 +49987,7 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES(\
-                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current = TRUE LIMIT 1),\
                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
         )
         .await
@@ -50551,9 +50498,6 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
 // whether setup and publication happen in the same excluded boundary second.
 async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &str) {
     let earlier = chrono::Utc::now().fixed_offset() - chrono::Duration::seconds(60);
-    // These fixtures seed updated_at with SQLite CURRENT_TIMESTAMP. Keep the
-    // same UTC text format: membership's timestamp CHECK compares stored text.
-    let earlier_sql = earlier.format("%Y-%m-%d %H:%M:%S").to_string();
     let db = store.database_connection();
     let tx = db.begin().await.unwrap();
     pioneer_entity::gateway_identity::Entity::update_many()
@@ -50573,7 +50517,7 @@ async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &st
     pioneer_entity::gateway_principal::Entity::update_many()
         .col_expr(
             pioneer_entity::gateway_principal::Column::CreatedAt,
-            Expr::val(earlier_sql.clone()),
+            Expr::val(earlier),
         )
         .filter(pioneer_entity::gateway_principal::Column::Id.is_in(ids.clone()))
         .exec(&tx)
@@ -50582,7 +50526,7 @@ async fn prepare_post_access_unread_fixture(store: &CrudStore, workspace_id: &st
     pioneer_entity::workspace_membership::Entity::update_many()
         .col_expr(
             pioneer_entity::workspace_membership::Column::CreatedAt,
-            Expr::val(earlier_sql),
+            Expr::val(earlier),
         )
         .filter(pioneer_entity::workspace_membership::Column::WorkspaceId.eq(workspace_id))
         .filter(pioneer_entity::workspace_membership::Column::PrincipalId.is_in(ids))
@@ -50617,9 +50561,9 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES\
-                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000A',(SELECT id FROM workspace WHERE is_current = TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),\
-                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                ('P0000000000000000000B',(SELECT id FROM workspace WHERE is_current = TRUE LIMIT 1),\
                  'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
         )
         .await
@@ -51617,9 +51561,7 @@ async fn message_persistence_failure_rolls_back_and_emits_no_realtime() {
         crud_store
             .database_connection()
             .execute_unprepared(
-                "CREATE TRIGGER epic6_fail_message_event BEFORE INSERT ON turn_event \
-             WHEN NEW.turn_id='trnE6AtomicFailure001' \
-             BEGIN SELECT RAISE(ABORT, 'injected Epic 6 transaction failure'); END;",
+                "CREATE FUNCTION epic6_fail_message_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected Epic 6 transaction failure'; END; $$; CREATE TRIGGER epic6_fail_message_event BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='trnE6AtomicFailure001') EXECUTE FUNCTION epic6_fail_message_event();",
             )
             .await
             .expect("install atomic failure trigger");
@@ -52184,17 +52126,15 @@ fn turn_start_cli_runtime_uses_default_stack_and_errors_before_provider_dispatch
         .build()
         .expect("default-stack regression runtime should build");
     let result = runtime.block_on(async {
-        pioneer_postgres_test::with_test_databases(async {
-            tokio::spawn(
-                turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl(),
-            )
-            .await
-        })
+        tokio::spawn(pioneer_postgres_test::with_test_databases(
+            turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl(),
+        ))
         .await
-        .expect("close isolated PostgreSQL test databases")
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
-    result.expect("default-stack regression task should finish");
+    result
+        .expect("default-stack regression task should finish")
+        .expect("close isolated PostgreSQL test databases");
 }
 
 async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch_impl() {
@@ -53421,12 +53361,11 @@ fn claude_cli_runtime_supervised_uses_provider_permission_mode() {
         .build()
         .expect("Claude supervised provider-mode test runtime should build")
         .block_on(async {
-            pioneer_postgres_test::with_test_databases(async {
-                tokio::spawn(claude_cli_runtime_supervised_uses_provider_permission_mode_impl())
-                    .await
-                    .expect("Claude supervised provider-mode test task should finish");
-            })
+            tokio::spawn(pioneer_postgres_test::with_test_databases(
+                claude_cli_runtime_supervised_uses_provider_permission_mode_impl(),
+            ))
             .await
+            .expect("Claude supervised provider-mode test task should finish")
             .expect("close isolated PostgreSQL test databases")
         });
 }
@@ -53488,12 +53427,11 @@ fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
         .build()
         .expect("Claude legacy sandbox test runtime should build")
         .block_on(async {
-            pioneer_postgres_test::with_test_databases(async {
-                tokio::spawn(claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl())
-                    .await
-                    .expect("Claude legacy sandbox test task should finish");
-            })
+            tokio::spawn(pioneer_postgres_test::with_test_databases(
+                claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl(),
+            ))
             .await
+            .expect("Claude legacy sandbox test task should finish")
             .expect("close isolated PostgreSQL test databases")
         });
 }
@@ -53561,14 +53499,11 @@ fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start() {
         .build()
         .expect("Claude auto-accept security audit test runtime should build")
         .block_on(async {
-            pioneer_postgres_test::with_test_databases(async {
-                tokio::spawn(
-                    claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl(),
-                )
-                .await
-                .expect("Claude auto-accept security audit test task should finish");
-            })
+            tokio::spawn(pioneer_postgres_test::with_test_databases(
+                claude_auto_accept_provider_mode_is_persisted_before_runtime_start_impl(),
+            ))
             .await
+            .expect("Claude auto-accept security audit test task should finish")
             .expect("close isolated PostgreSQL test databases")
         });
 }
@@ -54073,8 +54008,10 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     crud_store
         .database_connection()
         .execute_unprepared(
-            "CREATE TRIGGER freeze_title_time AFTER UPDATE OF name ON thread BEGIN \
-         UPDATE thread SET updated_at = OLD.updated_at WHERE id = NEW.id; END",
+            "CREATE FUNCTION freeze_title_time() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN NEW.updated_at := OLD.updated_at; RETURN NEW; END; $$;
+             CREATE TRIGGER freeze_title_time BEFORE UPDATE OF name ON thread
+             FOR EACH ROW EXECUTE FUNCTION freeze_title_time()",
         )
         .await
         .unwrap();
@@ -54322,12 +54259,12 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
         crud_store
             .database_connection()
             .execute_unprepared(
-                "INSERT OR IGNORE INTO gateway_identity(\
+                "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,0,NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
+             ) ON CONFLICT DO NOTHING;\
              INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
@@ -54340,7 +54277,7 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
                 principal_id,workspace_id,granted_by_actor_kind,granted_by_actor_id,\
                 created_at,updated_at\
              ) VALUES(\
-                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),\
+                'P0000000000000000000A',(SELECT id FROM workspace WHERE is_current IS TRUE LIMIT 1),\
                 'system',NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
              );",
             )
@@ -64290,10 +64227,7 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         crud_store
             .database_connection()
             .execute_unprepared(
-                "CREATE TRIGGER reject_gateway_agent_pin_snapshot \
-             BEFORE INSERT ON turn_runtime_snapshot \
-             WHEN NEW.agent_skill_versions_json IS NOT NULL \
-             BEGIN SELECT RAISE(ABORT, 'forced Gateway Agent pin failure'); END;",
+                "CREATE FUNCTION reject_gateway_agent_pin_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced Gateway Agent pin failure'; END; $$; CREATE TRIGGER reject_gateway_agent_pin_snapshot BEFORE INSERT ON turn_runtime_snapshot FOR EACH ROW WHEN (NEW.agent_skill_versions_json IS NOT NULL) EXECUTE FUNCTION reject_gateway_agent_pin_snapshot();",
             )
             .await
             .expect("conditional Agent pin failure trigger must install");
@@ -64728,9 +64662,7 @@ async fn agent_skill_binding_failure_fails_closed_before_execution() {
         crud_store
             .database_connection()
             .execute_unprepared(
-                "CREATE TRIGGER reject_agent_binding_projection \
-             BEFORE INSERT ON turn_skill_binding \
-             BEGIN SELECT RAISE(ABORT, 'forced Agent binding projection failure'); END;",
+                "CREATE FUNCTION reject_agent_binding_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced Agent binding projection failure'; END; $$; CREATE TRIGGER reject_agent_binding_projection BEFORE INSERT ON turn_skill_binding FOR EACH ROW EXECUTE FUNCTION reject_agent_binding_projection();",
             )
             .await
             .expect("binding projection failure trigger must install");
@@ -65038,15 +64970,11 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
     });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_materializes_thread_and_turn_state() {
     crate::compaction::load_test_catalog();
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("must connect to sqlite memory");
-    Migrator::up(&connection, None)
-        .await
-        .expect("migrations must succeed");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let connection = fixture.connection().clone();
     bootstrap(&connection)
         .await
         .expect("gateway bootstrap should create default workspace");
@@ -65229,6 +65157,8 @@ async fn turn_start_materializes_thread_and_turn_state() {
                 .columns([Alias::new("event_type"), Alias::new("sequence")])
                 .from(Alias::new("turn_event"))
                 .and_where(Expr::col(Alias::new("turn_id")).eq(turn_id))
+                .order_by(Alias::new("sequence"), sea_orm::sea_query::Order::Asc)
+                .limit(1)
                 .to_owned(),
         )
         .await
@@ -66803,7 +66733,7 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal)
-         VALUES('tree-activity-task',?,'thread',?,'tool','waiting','Activity','fixture')",
+         VALUES('tree-activity-task',$1,'thread',$2,'tool','waiting','Activity','fixture')",
         vec![workspace_id.clone().into(), thread_id.into()],
     ))
     .await
@@ -66852,7 +66782,7 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
     db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
-         VALUES('tree-service-task',?,'system','system','waiting','Service','fixture')",
+         VALUES('tree-service-task',$1,'system','system','waiting','Service','fixture')",
         [workspace_id.clone().into()],
     ))
     .await
@@ -69742,6 +69672,7 @@ async fn codex_retry_notice_is_durable_semantic_work_in_an_internal_execution_th
         unrelated.item_id = Set("unrelated-corrupt-system-event".into());
         unrelated.payload = Set(Some(json!({"invalid": "unrelated technical event"})));
         unrelated.payload_payload_id = Set(None);
+        unrelated.insertion_ordinal = sea_orm::NotSet;
         unrelated
             .insert(&store.database_connection())
             .await
@@ -69895,11 +69826,16 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
     let key =
         CLIAgentRuntimeSessionKey::new(&harness.workspace_id, "codex", &harness.thread_id).unwrap();
     let handle = manager.get_or_start(key.clone()).await.unwrap();
-    store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event \
-         WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.code')='codex_request_retried' \
-         BEGIN SELECT RAISE(ABORT,'injected retry notice storage failure'); END;"
-    ).await.unwrap();
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE FUNCTION reject_codex_retry_notice() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected retry notice storage failure'; END $$;
+         CREATE TRIGGER reject_codex_retry_notice BEFORE INSERT ON turn_event FOR EACH ROW
+         WHEN (NEW.event_type='item/completed') EXECUTE FUNCTION reject_codex_retry_notice();",
+        )
+        .await
+        .unwrap();
     processor
         .handle_cli_runtime_timeline_event(
             handle.instance(),
@@ -69989,7 +69925,7 @@ async fn codex_retry_notice_storage_failure_preserves_native_execution_and_rejec
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_codex_retry_notice")
+        .execute_unprepared("DROP TRIGGER reject_codex_retry_notice ON turn_event; DROP FUNCTION reject_codex_retry_notice()")
         .await
         .unwrap();
     processor
@@ -75352,42 +75288,38 @@ async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_postgres_workspace_manager(fixture).await;
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("unix time")
-            .as_nanos();
-        let skill_root = std::env::temp_dir().join(format!("pioneer-gateway-skill-{nanos}"));
-        let skill_dir = skill_root.join("tests").join("my-skill");
+        let skill_root = tempfile::tempdir().expect("create skill root");
+        let skill_dir = skill_root.path().join("tests").join("my-skill");
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
             skill_dir.join("SKILL.md"),
             r#"---
-    name: my-skill
-    slug: my-skill
-    description: gateway skill
-    runtime:
-      tools:
-        - tool_slug: echo_shell
-          description: Echo shell
-          kind: shell
-          parameters:
-            type: object
-          execution_class: session_scoped
-          config:
-            command: ["/bin/sh", "-c", "printf gw-shell-ok"]
-          output_policy:
-            timeline:
-              mode: full
-              max_bytes: 1048576
-            storage:
-              mode: full
-              max_bytes: 1048576
-            deltas:
-              mode: persist_and_display
-              max_chunk_bytes: 65536
-              max_total_bytes: 1048576
-    ---
-    Gateway skill body"#,
+name: my-skill
+slug: my-skill
+description: gateway skill
+runtime:
+  tools:
+    - tool_slug: echo_shell
+      description: Echo shell
+      kind: shell
+      parameters:
+        type: object
+      execution_class: session_scoped
+      config:
+        command: ["/bin/sh", "-c", "printf gw-shell-ok"]
+      output_policy:
+        timeline:
+          mode: full
+          max_bytes: 1048576
+        storage:
+          mode: full
+          max_bytes: 1048576
+        deltas:
+          mode: persist_and_display
+          max_chunk_bytes: 65536
+          max_total_bytes: 1048576
+---
+Gateway skill body"#,
         )
         .expect("write SKILL.md");
 
@@ -75420,7 +75352,7 @@ async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
         let mut tool_loop_config = test_tool_loop_config();
         tool_loop_config.skills.system_roots = Vec::new();
         tool_loop_config.skills.user_roots = Vec::new();
-        tool_loop_config.skills.user_roots = vec![skill_root.display().to_string()];
+        tool_loop_config.skills.user_roots = vec![skill_root.path().display().to_string()];
         tool_loop_config.skills.runtime.allow_shell_tools = true;
         tool_loop_config.skills.security.min_trust_for_shell_tools = SkillTrustLevel::Community;
         let crud_store_for_assert = crud_store.clone();
@@ -75503,7 +75435,11 @@ async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
             dynamic_result.name.as_deref(),
             Some(dynamic_tool_name.as_str())
         );
-        assert!(dynamic_result.content.contains("gw-shell-ok"));
+        assert!(
+            dynamic_result.content.contains("gw-shell-ok"),
+            "shell fixture returned {:?}",
+            dynamic_result.content,
+        );
 
         let _turn_completed = recv_notification_by_method_timeout(
             &mut rx,
@@ -75536,7 +75472,7 @@ async fn turn_start_executes_dynamic_skill_tool_end_to_end() {
             "replayed thread history should contain bounded dynamic shell stdout when policy allows it"
         );
 
-        let _ = std::fs::remove_dir_all(skill_root);
+        let _ = std::fs::remove_dir_all(skill_root.path());
         Ok(())
     }).await.unwrap();
 }
@@ -81339,114 +81275,41 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
     setup_postgres_workspace_manager(&fixture).await
 }
 
-/// Exercise concurrent preparation with the Gateway reader/writer contour.
-pub(super) async fn setup_pooled_file_workspace_manager() -> (
-    tempfile::TempDir,
+/// Exercise concurrent preparation with independent PostgreSQL pools.
+pub(super) async fn setup_pooled_workspace_manager() -> (
+    Arc<pioneer_postgres_test::TestDatabase>,
     Arc<WorkspaceManager>,
     Arc<CrudStore>,
     String,
 ) {
-    setup_pooled_file_workspace_manager_with_observer(None).await
+    setup_pooled_workspace_manager_with_observer(None).await
 }
 
-async fn setup_pooled_file_workspace_manager_with_observer(
+async fn setup_pooled_workspace_manager_with_observer(
     writer_observer: Option<Arc<dyn pioneer_sqlite::SqliteWriteObserver>>,
 ) -> (
-    tempfile::TempDir,
+    Arc<pioneer_postgres_test::TestDatabase>,
     Arc<WorkspaceManager>,
     Arc<CrudStore>,
     String,
 ) {
-    use sea_orm::{ConnectOptions, ConnectionTrait};
-
-    pioneer_sqlite::search::register_auto_extension_once().unwrap();
-    let directory = tempfile::tempdir().expect("isolated Gateway database directory");
-    let path = directory.path().join("gateway.sqlite");
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let mut bootstrap_options = ConnectOptions::new(url.clone());
-    bootstrap_options.max_connections(1).sqlx_logging(false);
-    let bootstrap_connection = Database::connect(bootstrap_options)
-        .await
-        .expect("isolated Gateway bootstrap connection");
-    let (_, _, workspace) =
-        setup_workspace_manager_with_connection(bootstrap_connection.clone()).await;
-    bootstrap_connection
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .expect("isolated Gateway database WAL mode");
-
-    let mut writer_options = ConnectOptions::new(url.clone());
-    writer_options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(writer_options)
-        .await
-        .expect("isolated Gateway writer");
-    let mut reader_options = ConnectOptions::new(url);
-    reader_options
-        .max_connections(4)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(reader_options)
-        .await
-        .expect("isolated Gateway read-only pool");
-    drop(bootstrap_connection);
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&fixture).await;
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let database = match writer_observer {
         Some(observer) => {
             pioneer_sqlite::SqliteDatabase::new_with_observer(reader, writer, observer)
         }
         None => pioneer_sqlite::SqliteDatabase::new(reader, writer),
     };
+    database.validate_reader().await.unwrap();
     (
-        directory,
+        fixture,
         Arc::new(WorkspaceManager::new(database.clone())),
         Arc::new(CrudStore::new(database)),
         workspace,
     )
-}
-
-async fn setup_workspace_manager_with_connection(
-    connection: sea_orm::DatabaseConnection,
-) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
-    // This helper invokes current Gateway bootstrap and authorization, so it
-    // requires the complete schema rather than a historical migration prefix.
-    crate::compaction::load_test_catalog();
-    // Use the normal writer bootstrap path: migrations that change connection
-    // pragmas must own their physical lease outside any enclosing transaction.
-    // Each migration retains its own atomicity; no fixture consumer exists yet.
-    let writer = pioneer_sqlite::SqliteWriteExecutor::new(connection.clone());
-    writer
-        .apply_pragmas(pioneer_sqlite::SqliteWriteClass::Maintenance)
-        .await
-        .expect("test writer must use Gateway runtime pragmas");
-    writer
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
-        .await
-        .expect("migrations must succeed");
-    bootstrap(&connection)
-        .await
-        .expect("gateway bootstrap should create default workspace");
-    let crud_store = Arc::new(CrudStore::new(connection.clone()));
-    ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
-    let workspace_manager = Arc::new(WorkspaceManager::new(connection.clone()));
-    let workspaces = workspace_manager
-        .list_workspaces()
-        .await
-        .expect("workspace/list should succeed in tests");
-    let workspace_id = workspaces
-        .iter()
-        .find(|workspace| workspace.is_active && workspace.is_current)
-        .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
-        .or_else(|| workspaces.first())
-        .expect("default workspace should exist after bootstrap")
-        .id
-        .clone();
-    pioneer_crud::ensure_pioneer_for_workspace(
-        &connection,
-        workspace_id.as_str(),
-        chrono::Utc::now().fixed_offset(),
-    )
-    .await
-    .expect("test workspace should include the reserved Pioneer identity");
-    (workspace_manager, crud_store, workspace_id)
 }
 
 pub(super) async fn setup_workspace_message_processor() -> (
@@ -85189,7 +85052,7 @@ async fn wait_for_thread_manager_turn_status(
     turn_id: &str,
     expected_status: TurnStatus,
 ) -> Turn {
-    // Full-suite SQLite, provider, and indexing work can delay an otherwise
+    // Full-suite PostgreSQL, provider, and indexing work can delay an otherwise
     // healthy provider completion beyond one second. Keep the oracle bounded
     // while matching the contention budget used by the Task lifecycle waits.
     for _ in 0..1_200 {
@@ -86157,7 +86020,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     let row = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation WHERE status='completed'".to_owned(),
         ))
         .await
@@ -86174,7 +86037,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_terminal() {
     use crate::compaction::CompactionObserver;
     use pioneer_compaction::{
@@ -86186,30 +86049,12 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
         SqliteWriteExecutor,
     };
-    use sea_orm::{ConnectOptions, DbBackend, Statement};
+    use sea_orm::{DbBackend, Statement};
 
-    let temp = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}?mode=rwc",
-        temp.path().join("lifecycle.sqlite").display()
-    );
-    let mut bootstrap_options = ConnectOptions::new(url.clone());
-    bootstrap_options.max_connections(1).sqlx_logging(false);
-    let bootstrap = Database::connect(bootstrap_options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(bootstrap.clone()).await;
-    bootstrap
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut writer_options = ConnectOptions::new(url.clone());
-    writer_options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(writer_options).await.unwrap();
-    let mut reader_options = ConnectOptions::new(url);
-    reader_options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(reader_options).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&fixture).await;
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let observed = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -86237,9 +86082,9 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         owner.running.store(true, Ordering::SeqCst);
     }
     store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
-         VALUES ('lifecycle-thread',?,'','agent','test-model','openai','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+         VALUES ('lifecycle-thread',$1,'','agent','test-model','openai','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [workspace.clone().into()],
     )).await.unwrap();
     store.database_connection().execute_unprepared(
@@ -86419,51 +86264,55 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         assert!(terminal_writes.iter().all(|event| !matches!(
             event, SqliteWriteEvent::Acquired { class, .. } if *class != expected_write
         )));
-        let durable = lifecycle_store
+        let rows = lifecycle_store
             .database_connection()
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT COUNT(*) AS count FROM turn_event WHERE turn_id='lifecycle-turn' \
-                 AND event_type IN ('item/started','item/completed') AND payload LIKE ?",
-                [format!("%compaction:{id}%").into()],
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT id FROM turn_event WHERE turn_id='lifecycle-turn' AND event_type IN ('item/started','item/completed')",
             ))
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(durable.try_get::<i64>("", "count").unwrap(), 2);
+        let item_id = format!("compaction:{id}");
+        let mut started = 0;
+        let mut completed = 0;
+        for row in rows {
+            let event_id: String = row.try_get("", "id").unwrap();
+            match lifecycle_store
+                .persisted_turn_event_for_test(&event_id)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                pioneer_crud::CanonicalTurnEventPayload::ItemStarted(event)
+                    if event.item.item_id() == item_id =>
+                {
+                    started += 1
+                }
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(event)
+                    if event.item.item_id() == item_id =>
+                {
+                    completed += 1
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((started, completed), (1, 1));
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_foreground_controller_uses_interactive_database_scope() {
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
         SqliteWriteExecutor,
     };
-    use sea_orm::{ConnectOptions, TransactionTrait};
+    use sea_orm::TransactionTrait;
 
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("native-foreground.sqlite");
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let mut bootstrap_options = ConnectOptions::new(url.clone());
-    bootstrap_options.max_connections(1).sqlx_logging(false);
-    let bootstrap_connection = Database::connect(bootstrap_options).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (workspaces, _bootstrap_store, workspace) =
-        setup_workspace_manager_with_connection(bootstrap_connection.clone()).await;
-    bootstrap_connection
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-
-    let mut writer_options = ConnectOptions::new(url.clone());
-    writer_options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(writer_options).await.unwrap();
-    let mut reader_options = ConnectOptions::new(url);
-    reader_options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(reader_options).await.unwrap();
+        setup_postgres_workspace_manager(&fixture).await;
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -86653,7 +86502,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let operations_before_foreground = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation".to_owned(),
         ))
         .await
@@ -86674,9 +86523,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let read_start = observer.reads.lock().unwrap().len();
     let write_start = observer.writes.lock().unwrap().len();
     let request_id = generate_test_request_id("native-foreground", "start");
-    processor
-        .clone()
-        .process_owned_request(
+    let (_, admission_diagnostics) = crate::public_error::test_support::capture_events_async(
+        processor.clone().process_owned_request(
             sessions.connection_context(connection).await.unwrap(),
             json!({
                 "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
@@ -86685,9 +86533,13 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
                     "model":"test-model", "model_provider":"openai", "mode":"Chat" }
             })
             .to_string(),
-        )
-        .await;
-    let response = recv_response_by_id(&mut rx, &request_id).await;
+        ),
+    )
+    .await;
+    let payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+    let response: JsonRpcResponse = serde_json::from_str(&payload).unwrap_or_else(|error| {
+        panic!("foreground turn admission failed: {error}; response={payload}; diagnostics={admission_diagnostics:?}")
+    });
     let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     timeout(Duration::from_secs(10), async {
         loop {
@@ -86860,7 +86712,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let row = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation".to_owned(),
         ))
         .await
@@ -86996,7 +86848,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
             let row = store
                 .database_connection()
                 .query_one_raw(sea_orm::Statement::from_string(
-                    sea_orm::DbBackend::Sqlite,
+                    sea_orm::DbBackend::Postgres,
                     "SELECT count(*) AS n FROM compaction_history_check WHERE turn_id='native-cancelled-registration-turn'".to_owned(),
                 ))
                 .await
@@ -87115,7 +86967,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
         loop {
             processor.poll_completed_history_checks().await.unwrap();
             let row = store.database_connection().query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 "SELECT count(*) AS n FROM compaction_frozen_history WHERE owner_thread='native-controller' AND ready=1 AND message_count>=2".to_owned(),
             )).await.unwrap().unwrap();
             if row.try_get::<i64>("", "n").unwrap() > 0 && store.compaction_pending_history_checks().await.unwrap().is_empty() { break }
@@ -87165,7 +87017,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     let row = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation".to_owned(),
         ))
         .await
@@ -87190,7 +87042,7 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
     let response: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(response.turn.status, TurnStatus::Completed);
     let row = store.database_connection().query_one_raw(sea_orm::Statement::from_string(
-        sea_orm::DbBackend::Sqlite,
+        sea_orm::DbBackend::Postgres,
         "SELECT count(*) AS n FROM compaction_execution_stop WHERE turn_id='native-controller-turn'".to_owned(),
     )).await.unwrap().unwrap();
     assert_eq!(
@@ -87331,7 +87183,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         .crud_store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             format!(
                 "SELECT count(*) AS n, max(descriptor) AS descriptor FROM compaction_history_check WHERE turn_id='{turn}'"
             ),
@@ -87457,7 +87309,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         .crud_store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             format!(
                 "SELECT outcome,diagnostic FROM compaction_history_check WHERE turn_id='{turn}'"
             ),
@@ -87562,7 +87414,7 @@ async fn completed_history_result_write_failure_remains_an_error_with_durable_wo
         .await
         .unwrap();
     let db = harness.crud_store.database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_history_result BEFORE UPDATE OF outcome ON compaction_history_check WHEN OLD.turn_id='history-result-fault-turn' BEGIN SELECT RAISE(ABORT,'fixture result failure'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION reject_history_result() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture result failure'; END; $$; CREATE TRIGGER reject_history_result BEFORE UPDATE OF outcome ON compaction_history_check FOR EACH ROW WHEN (OLD.turn_id='history-result-fault-turn') EXECUTE FUNCTION reject_history_result();").await.unwrap();
     harness
         .processor
         .poll_completed_history_checks()
@@ -87613,7 +87465,7 @@ async fn completed_history_result_write_failure_remains_an_error_with_durable_wo
         .unwrap();
     assert_eq!(row.state, "pending");
     assert!(row.outcome.is_none());
-    db.execute_unprepared("DROP TRIGGER reject_history_result")
+    db.execute_unprepared("DROP TRIGGER reject_history_result ON compaction_history_check; DROP FUNCTION reject_history_result()")
         .await
         .unwrap();
     harness
@@ -87687,7 +87539,7 @@ async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_che
         .crud_store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             format!(
                 "SELECT descriptor,state,managed,revision,failures,attempt_deadline_ms FROM compaction_history_check WHERE turn_id='{turn_id}'"
             ),
@@ -87735,7 +87587,7 @@ async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_che
         .crud_store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             format!(
                 "SELECT descriptor,state,outcome,managed,revision,failures,attempt_deadline_ms FROM compaction_history_check WHERE turn_id='{turn_id}'"
             ),
@@ -87908,7 +87760,7 @@ async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
         .crud_store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT (SELECT count(*) FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE t.thread_id='followup-thread') AS followups,(SELECT count(*) FROM compaction_history_check WHERE turn_id='nested-execution-turn') AS nested,(SELECT count(*) FROM compaction_history_check WHERE turn_id='parent-execution-turn') AS parent,(SELECT count(*) FROM compaction_history_check WHERE turn_id='cli-intent-turn') AS cli".to_owned(),
         ))
         .await
@@ -88633,8 +88485,8 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     .await
     .unwrap();
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('background-task',?,'thread','background-parent','background-parent','background-parent-turn','agent','running','Background','Background')",
+        sea_orm::DbBackend::Postgres,
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('background-task',$1,'thread','background-parent','background-parent','background-parent-turn','agent','running','Background','Background')",
         [workspace.into()],
     ))
     .await
@@ -88670,8 +88522,8 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     })
     .unwrap();
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "UPDATE task SET metadata_json=? WHERE id='background-task'",
+        sea_orm::DbBackend::Postgres,
+        "UPDATE task SET metadata_json=$1::text::json WHERE id='background-task'",
         [composer_metadata.into()],
     ))
     .await
@@ -88683,8 +88535,8 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         db.execute_unprepared(statement).await.unwrap();
     }
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
-        sea_orm::DbBackend::Sqlite,
-        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
+        sea_orm::DbBackend::Postgres,
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('background-run','background-task',$1,'background-parent','background-parent-turn',$2,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN history_json IS JSON OBJECT THEN history_json::json->>'manifest_id' END FROM frozen_root_fixture",
         [workspace.into(), parent_basis.clone().into()],
     ))
     .await
@@ -89354,6 +89206,30 @@ async fn check_completed_history(
     lose_terminal: bool,
     native: bool,
 ) {
+    async fn count_lifecycle_items(store: &CrudStore, status: &str) -> usize {
+        use pioneer_entity::turn_item;
+        let rows = turn_item::Entity::find()
+            .select_only()
+            .columns([turn_item::Column::TurnId, turn_item::Column::ItemId])
+            .filter(turn_item::Column::ItemId.starts_with("compaction:"))
+            .into_tuple::<(String, String)>()
+            .all(&store.database_connection())
+            .await
+            .unwrap();
+        let mut count = 0;
+        for (turn_id, item_id) in rows {
+            let item = store.get_turn_item(&turn_id, &item_id).await.unwrap();
+            if let Some(TurnItem::SystemEvent {
+                details: Some(details),
+                ..
+            }) = item
+            {
+                count += usize::from(details["status"].as_str() == Some(status));
+            }
+        }
+        count
+    }
+
     use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
     struct SilentObserver;
     #[async_trait::async_trait]
@@ -89768,10 +89644,13 @@ async fn check_completed_history(
             );
             assert_eq!(provider.call_count(), 1);
             let row=harness.crud_store.database_connection().query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,"SELECT (SELECT count(*) FROM compaction_operation WHERE status='cancelled') AS cancelled,(SELECT count(*) FROM turn_item WHERE item_id LIKE 'compaction:%' AND json_extract(payload,'$.details.status')='cancelled') AS items,(SELECT count(*) FROM turn WHERE status='completed') AS turns".to_owned()
+                sea_orm::DbBackend::Postgres,"SELECT (SELECT count(*) FROM compaction_operation WHERE status='cancelled') AS cancelled,(SELECT count(*) FROM turn WHERE status='completed') AS turns".to_owned()
             )).await.unwrap().unwrap();
             assert_eq!(row.try_get::<i64>("", "cancelled").unwrap(), 1);
-            assert_eq!(row.try_get::<i64>("", "items").unwrap(), 1);
+            assert_eq!(
+                count_lifecycle_items(&harness.crud_store, "cancelled").await,
+                1
+            );
             assert_eq!(row.try_get::<i64>("", "turns").unwrap(), 1);
             return;
         }
@@ -89787,7 +89666,7 @@ async fn check_completed_history(
                 .crud_store
                 .database_connection()
                 .query_one_raw(sea_orm::Statement::from_string(
-                    sea_orm::DbBackend::Sqlite,
+                    sea_orm::DbBackend::Postgres,
                     "SELECT id,deadline_ms FROM compaction_operation WHERE status='running'"
                         .to_owned(),
                 ))
@@ -89856,7 +89735,7 @@ async fn check_completed_history(
             .await
             .unwrap();
         let row = harness.crud_store.database_connection().query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,"SELECT outcome FROM compaction_history_check WHERE turn_id='cli-history-completed'".to_owned()
+            sea_orm::DbBackend::Postgres,"SELECT outcome FROM compaction_history_check WHERE turn_id='cli-history-completed'".to_owned()
         )).await.unwrap().unwrap();
         assert_eq!(
             row.try_get::<String>("", "outcome").unwrap(),
@@ -89866,7 +89745,7 @@ async fn check_completed_history(
             .crud_store
             .database_connection()
             .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 "SELECT count(*) AS n FROM compaction_operation WHERE status='completed'"
                     .to_owned(),
             ))
@@ -89875,10 +89754,19 @@ async fn check_completed_history(
             .unwrap();
         assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
         let db = harness.crud_store.database_connection();
-        let row = db.query_one_raw(sea_orm::Statement::from_string(sea_orm::DbBackend::Sqlite,
-            "SELECT (SELECT count(*) FROM compaction_operation) AS operations,(SELECT count(*) FROM turn_item WHERE item_id LIKE 'compaction:%' AND json_extract(payload,'$.details.status')='completed') AS items".to_owned())).await.unwrap().unwrap();
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM compaction_operation) AS operations".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.try_get::<i64>("", "operations").unwrap(), 1);
-        assert_eq!(row.try_get::<i64>("", "items").unwrap(), 1);
+        assert_eq!(
+            count_lifecycle_items(&harness.crud_store, "completed").await,
+            1
+        );
         if let Some(calls) = calls_before_recovery {
             assert_eq!(provider.call_count(), calls);
         }
@@ -89911,7 +89799,7 @@ async fn check_completed_history(
     let db = harness.crud_store.database_connection();
     let row = db
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT (SELECT count(*) FROM turn) AS turns,(SELECT count(*) FROM task_run) AS runs"
                 .to_owned(),
         ))
@@ -90237,8 +90125,8 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
     })
     .unwrap();
     harness.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-context',?, 'agent_message_0', 5, 'assistant_round', ?, '{}', CURRENT_TIMESTAMP)",
+        DbBackend::Postgres,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-context',$1, 'agent_message_0', 5, 'assistant_round', $2, '{}', CURRENT_TIMESTAMP)",
         [historical_turn.clone().into(), canonical.clone().into()],
     )).await.unwrap();
     let result = serde_json::json!({
@@ -90248,8 +90136,8 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
     })
     .to_string();
     harness.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-result',?, 'portable-tool-item', 6, 'tool_result_v2', ?, '{}', CURRENT_TIMESTAMP)",
+        DbBackend::Postgres,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('portable-result',$1, 'portable-tool-item', 6, 'tool_result_v2', $2, '{}', CURRENT_TIMESTAMP)",
         [historical_turn.into(), result.into()],
     )).await.unwrap();
 
@@ -90358,7 +90246,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         .crud_store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT payload FROM turn_llm_context WHERE id='portable-context'",
         ))
         .await
@@ -90504,8 +90392,8 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         ),
     ] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,?,?,?,?,?,'{}',CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES($1,$2,$3,$4,$5,$6,'{}',CURRENT_TIMESTAMP)",
             [id.into(), historical_turn.clone().into(), item.into(), sequence.into(), source.into(), payload.to_owned().into()],
         ))
         .await
@@ -90523,17 +90411,6 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         }),
     };
     let maintenance = harness.crud_store.with_maintenance_access();
-    let mut ready = false;
-    for _ in 0..16 {
-        ready = maintenance
-            .compaction_prepare_history_quantum(&harness.workspace_id, thread)
-            .await
-            .unwrap();
-        if ready {
-            break;
-        }
-    }
-    assert!(ready);
     let captured = harness
         .processor
         .capture_current_context_basis_prepared(
@@ -90712,7 +90589,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     assert!(summarizer.call_count() > 0);
     let saved: String = db
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT payload FROM turn_llm_context WHERE id='effort-round'",
         ))
         .await
@@ -94080,11 +93957,26 @@ async fn fanout_failure_n_preserves_prefix_and_allows_another_task_to_progress()
         fanout_test_append(&processor, id, "N").await;
         fanout_test_append(&processor, id, "N+1").await;
     }
-    // Malformed immutable payload models a poison stored event, not ingress.
+    // An intact frame holds malformed application JSON in the poison event.
+    let poison = pioneer_crud_payloads::Frame::encode("{invalid").unwrap();
+    use sea_orm::sea_query::Expr;
     task_event::Entity::update_many()
+        .col_expr(task_event::Column::PayloadJson, Expr::val(poison.bytes))
         .col_expr(
-            task_event::Column::PayloadJson,
-            sea_orm::sea_query::Expr::val("{invalid"),
+            task_event::Column::PayloadJsonCodec,
+            Expr::val(poison.encoding as i16),
+        )
+        .col_expr(
+            task_event::Column::PayloadJsonBytes,
+            Expr::val(poison.original_bytes as i64),
+        )
+        .col_expr(
+            task_event::Column::PayloadJsonChars,
+            Expr::val(poison.original_chars as i64),
+        )
+        .col_expr(
+            task_event::Column::PayloadJsonSha256,
+            Expr::val(poison.sha256.to_vec()),
         )
         .filter(task_event::Column::TaskId.eq("fanout_bad"))
         .filter(task_event::Column::Sequence.eq(2_i64))
@@ -94342,28 +94234,9 @@ fn native_direct_cancellation_after_activated_blocked_resume_preserves_old_worke
 #[test]
 fn native_cancellation_race_fallback_preserves_materialization_error_and_requires_durable_ack() {
     run_standard_stack_message_test("native cancellation turn_finish race", async {
-        use super::agent_runtime::native_preparation_failure_tests::open_fixture_database;
-        // Capture an actual typed driver BUSY before constructing the race. No
-        // notification, provider work or barrier wait occurs under this lock.
-        let directory = tempfile::tempdir().unwrap();
-        let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("race.sqlite"));
-        let owner = open_fixture_database(&url).await;
-        let contender = open_fixture_database(&url).await;
-        owner
-            .execute_unprepared("CREATE TABLE fact(id INTEGER PRIMARY KEY)")
+        let busy = crate::tests::postgres_failures::lock_unavailable(false)
             .await
             .unwrap();
-        let tx = owner.begin().await.unwrap();
-        tx.execute_unprepared("INSERT INTO fact VALUES(1)")
-            .await
-            .unwrap();
-        let busy = contender
-            .execute_unprepared("INSERT INTO fact VALUES(2)")
-            .await
-            .unwrap_err();
-        tx.rollback().await.unwrap();
-        owner.close().await.unwrap();
-        contender.close().await.unwrap();
         for case in 0..3 {
             let busy_native = false;
             let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
@@ -94646,19 +94519,19 @@ mod task_start_failure;
 #[path = "tests/frozen_history_lifetime.rs"]
 mod frozen_history_lifetime;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_without_timeline() {
     use pioneer_protocol::constants::methods;
     use pioneer_protocol::{TaskCompletionInboxEntryResponse, TaskCompletionInboxListResponse};
     let (_dir, workspace_manager, crud_store, workspace_id) =
-        setup_pooled_file_workspace_manager().await;
+        setup_pooled_workspace_manager().await;
     let db = crud_store.database_connection();
     for sql in [
         "INSERT INTO gateway_principal(id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,created_at,updated_at) VALUES('P0000000000000000000A','G00000000000000000001','user','member','active','Inbox A','inbox-a','inbox-a',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','G00000000000000000001','user','member','active','Inbox B','inbox-b','inbox-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) SELECT id,(SELECT id FROM workspace WHERE is_current=1 LIMIT 1),'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM gateway_principal WHERE id IN ('P0000000000000000000A','P0000000000000000000B')",
-        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) SELECT 'T0000000000000000000I',id,'Inbox root','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current=1 LIMIT 1",
+        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) SELECT id,(SELECT id FROM workspace WHERE is_current = TRUE LIMIT 1),'system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM gateway_principal WHERE id IN ('P0000000000000000000A','P0000000000000000000B')",
+        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) SELECT 'T0000000000000000000I',id,'Inbox root','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current = TRUE LIMIT 1",
         "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) SELECT id,'T0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM gateway_principal WHERE id IN ('P0000000000000000000A','P0000000000000000000B')",
-        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) SELECT 'K0000000000000000000I',id,'workspace',id,'T0000000000000000000I','system','completed','Shared task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current=1 LIMIT 1",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) SELECT 'K0000000000000000000I',id,'workspace',id,'T0000000000000000000I','system','completed','Shared task','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM workspace WHERE is_current = TRUE LIMIT 1",
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,created_at,updated_at) VALUES('R0000000000000000000I','K0000000000000000000I','R0000000000000000000I',1,1,'succeeded','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.expect("inbox fixture");
@@ -94778,7 +94651,7 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     assert!(read.entry.read_at.is_some());
     let thread_reads = db
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT COUNT(*) count FROM thread_read_cursor WHERE thread_id='T0000000000000000000I'",
         ))
         .await
@@ -94936,7 +94809,7 @@ async fn task_completion_inbox_rpc_uses_root_acl_and_syncs_personal_reads_withou
     );
     let thread_reads = db
         .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
+            sea_orm::DbBackend::Postgres,
             "SELECT COUNT(*) count FROM thread_read_cursor WHERE thread_id='T0000000000000000000I'",
         ))
         .await

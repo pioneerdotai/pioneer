@@ -573,32 +573,6 @@ fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus
     }
 }
 
-// Same SeaORM -> SQLx driver chain used by the existing memory write mapper.
-// SQLite extended codes preserve the primary BUSY/LOCKED code in the low byte.
-pub(super) fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
-    use sea_orm::{DbErr, RuntimeErr, SqlxError};
-    let Some(db_error) = error.downcast_ref::<DbErr>() else {
-        return false;
-    };
-    let (DbErr::Conn(RuntimeErr::SqlxError(cause))
-    | DbErr::Exec(RuntimeErr::SqlxError(cause))
-    | DbErr::Query(RuntimeErr::SqlxError(cause))) = db_error
-    else {
-        return false;
-    };
-    let SqlxError::Database(database) = cause.as_ref() else {
-        return false;
-    };
-    database
-        .code()
-        .and_then(|code| code.parse::<i32>().ok())
-        .is_some_and(native_preparation_sqlite_code_is_lock)
-}
-
-fn native_preparation_sqlite_code_is_lock(code: i32) -> bool {
-    matches!(code & 0xff, 5 | 6)
-}
-
 fn confirm_owned_cancellation_lookup(
     result: anyhow::Result<bool>,
 ) -> Result<bool, DurableCommitRejection> {
@@ -648,9 +622,7 @@ fn classify_native_preparation_error(error: anyhow::Error) -> DurableCommitRejec
             "required immutable native cancellation context is unavailable",
         );
     }
-    if native_preparation_has_typed_sqlite_lock(&error)
-        || pioneer_sqlite::is_anyhow_sqlite_transient_access(&error)
-    {
+    if pioneer_sqlite::is_anyhow_database_transient_access(&error) {
         DurableCommitRejection::retryable(
             "storage_temporarily_unavailable",
             "native preparation could not access storage",
@@ -679,7 +651,7 @@ fn classify_durable_commit_guard_error(
         return Ok(true);
     }
 
-    if pioneer_sqlite::is_anyhow_sqlite_transient_access(error) {
+    if pioneer_sqlite::is_anyhow_database_transient_access(error) {
         Err(DurableCommitRejection::retryable(
             "storage_temporarily_unavailable",
             "durable commit authorization could not access storage",
@@ -2500,7 +2472,7 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
-                let rejection = if pioneer_sqlite::is_anyhow_sqlite_transient_access(&error) {
+                let rejection = if pioneer_sqlite::is_anyhow_database_transient_access(&error) {
                     DurableCommitRejection::retryable(
                         "storage_temporarily_unavailable",
                         "durable commit authorization could not access storage",
@@ -8218,6 +8190,9 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
+                            let postgres_sqlstate = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "postgres_sqlstate")
+                            });
                             let sqlite_primary_code = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_i64(error, "sqlite_primary_code")
                             });
@@ -8267,6 +8242,7 @@ impl MessageProcessor {
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     sqlite_primary_code = sqlite_primary_code,
                                     sqlite_extended_code = sqlite_extended_code,
+                                    postgres_sqlstate = postgres_sqlstate,
                                     http_status = ?http_status,
                                     provider_error_reason,
                                     provider_request_id,
@@ -8293,6 +8269,7 @@ impl MessageProcessor {
                                     failure_stage = failure_stage.unwrap_or("unknown"),
                                     sqlite_primary_code = sqlite_primary_code,
                                     sqlite_extended_code = sqlite_extended_code,
+                                    postgres_sqlstate = postgres_sqlstate,
                                     http_status = ?http_status,
                                     provider_error_reason,
                                     provider_request_id,

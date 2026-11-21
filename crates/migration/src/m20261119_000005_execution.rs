@@ -1,8 +1,8 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, boolean, json, json_null, text, text_null,
-    timestamp_with_time_zone, timestamp_with_time_zone_null,
+    big_integer, big_integer_null, boolean, json, text, text_null, timestamp_with_time_zone,
+    timestamp_with_time_zone_null,
 };
 
 #[derive(DeriveMigrationName)]
@@ -160,7 +160,9 @@ impl MigrationTrait for Migration {
                     .col(text("request_kind"))
                     .col(json("payload_json"))
                     .col(text("status"))
-                    .col(json_null("response_json"))
+                    // Delivery retries compare the exact accepted bytes.
+                    .col(text_null("response_json"))
+                    .check(Expr::cust("response_json IS NULL OR response_json IS JSON"))
                     .col(
                         timestamp_with_time_zone("created_at")
                             .default(Expr::cust(r#"statement_timestamp()"#)),
@@ -1511,28 +1513,6 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table("native_event_cleanup_bootstrap")
-                    .col(big_integer("singleton").primary_key())
-                    .col(text_null("cursor_id"))
-                    .col(boolean("complete").default(false))
-                    .check(Expr::cust(r#""singleton" = 1"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("native_event_cleanup_bootstrap")
-                    .columns(["singleton", "complete"])
-                    .values_panic([1_i64.into(), false.into()])
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
                     .table("native_event_cleanup_scheduler")
                     .col(big_integer("singleton").primary_key())
                     .col(big_integer("new_jobs_since_served").default(0))
@@ -1870,7 +1850,6 @@ impl MigrationTrait for Migration {
                 "native_cancellation_context",
                 "provider_usage_observation",
                 "native_event_cleanup_scheduler",
-                "native_event_cleanup_bootstrap",
                 "native_event_cleanup_job",
                 "native_terminal_effect_outbox",
                 "read_model_repair_dirty_turn_item",

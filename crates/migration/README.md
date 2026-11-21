@@ -1,9 +1,11 @@
 # Pioneer 1.0 database migrations
 
-The Migrator installs a fresh schema on PostgreSQL. Use PostgreSQL 16 or later
-with pgvector available to the server. The migration role must be able to create
-objects in the target schema and install `vector`, or the extension must already
-be visible in the target search path. The default schema is `public`.
+The Migrator installs a fresh Pioneer schema on PostgreSQL. The installed Gateway
+starts its bundled PostgreSQL 18 and pgvector and applies these migrations at
+startup. Use PostgreSQL 18 with pgvector for development and tests. The migration
+role must be able to create objects in the target schema and install `vector`, or
+the extension must already be visible in the target search path. The default
+schema is `public`.
 
 Pass the target database URL explicitly.
 

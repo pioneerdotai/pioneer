@@ -4,8 +4,8 @@ use pioneer_entity::{
     turn_event_delivery as delivery, turn_event_projection_state as receipt,
     turn_event_projection_stream_state as stream,
 };
-use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
-use sea_orm::{ConnectOptions, DbBackend, DbErr, ExecResult, IntoActiveModel, QueryResult};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{DbBackend, DbErr, ExecResult, IntoActiveModel, QueryResult};
 use std::sync::Mutex;
 
 const NOW: i64 = 1_700_000_110;
@@ -13,41 +13,23 @@ const EPISODIC: &str = deliveries::CONSUMER_THREAD_EPISODIC;
 const LIVE: &str = deliveries::CONSUMER_LIVE_NOTIFICATION;
 const PREDECESSOR_INDEX: &str = "idx_turn_event_delivery_unfinished_predecessor";
 
-async fn open_file_store(path: &std::path::Path, migrate: bool) -> CrudStore {
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options.max_connections(1);
-    let writer = Database::connect(options).await.unwrap();
-    if migrate {
-        Migrator::up(&writer, None).await.unwrap();
-    }
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(sqlite_read_only_connection_url(path));
-    options.max_connections(2);
-    options.map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-    });
-    let reader = Database::connect(options).await.unwrap();
+async fn open_store(fixture: &pioneer_postgres_test::TestDatabase) -> CrudStore {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let database = SqliteDatabase::new(reader, writer);
     database.validate_reader().await.unwrap();
     CrudStore::new(database).with_maintenance_access()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("delivery.sqlite");
-    let store = open_file_store(&path, true).await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let store = open_store(&fixture).await;
     pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
         id: Set("ws_cleanup_delivery".into()),
         name: Set("Cleanup delivery".into()),
         is_active: Set(true),
-        is_current: Set(true),
+        is_current: Set(false),
         created_at: Set(unix_to_datetime(NOW)),
         updated_at: Set(unix_to_datetime(NOW)),
     })
@@ -74,25 +56,6 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
             .iter()
             .all(|row| row.status == deliveries::DELIVERY_STATUS_PENDING && row.attempt_count == 0)
     );
-    crate::upsert_projection_meta(
-        &store.connection,
-        crate::ProjectionMetaRecord {
-            projection_key: "turn_event_projection_stream_state_backfill".into(),
-            projection_version: 3,
-            status: crate::PROJECTION_META_STATUS_COMPLETE.into(),
-            source_thread_count: 0,
-            source_turn_count: 0,
-            source_turn_item_count: 0,
-            source_turn_event_count: 0,
-            last_error: None,
-            backfill_started_at: Some(unix_to_datetime(NOW)),
-            backfilled_at: Some(unix_to_datetime(NOW)),
-            created_at: unix_to_datetime(NOW),
-            updated_at: unix_to_datetime(NOW),
-        },
-    )
-    .await
-    .unwrap();
     let mut completed = turn.clone();
     completed.status = TurnStatus::Completed;
     store
@@ -145,7 +108,7 @@ async fn episodic_pending_delivery_survives_real_receipt_cleanup_and_reopen() {
     store.database_connection().close().await.unwrap();
     drop(store);
 
-    let reopened = open_file_store(&path, false).await;
+    let reopened = open_store(&fixture).await;
     for expected in pending {
         assert!(
             receipt::Entity::find_by_id(expected.event_id.clone())
@@ -188,9 +151,9 @@ async fn episodic_delivery_requires_matching_stream_scope_and_positive_sequence(
     let db = store.database_connection();
     // Retained projected receipts must not override a missing/wrong stream.
     for mutation in [
-        "UPDATE turn_event_projection_stream_state SET turn_id = 'other_turn' WHERE turn_id = ?",
-        "UPDATE turn_event_projection_stream_state SET thread_id = 'other_thread' WHERE turn_id = ?",
-        "DELETE FROM turn_event_projection_stream_state WHERE turn_id = ?",
+        "UPDATE turn_event_projection_stream_state SET turn_id = 'other_turn' WHERE turn_id = $1",
+        "UPDATE turn_event_projection_stream_state SET thread_id = 'other_thread' WHERE turn_id = $1",
+        "DELETE FROM turn_event_projection_stream_state WHERE turn_id = $1",
     ] {
         let saved = stream::Entity::find_by_id(turn.id.clone())
             .one(&db)
@@ -198,7 +161,7 @@ async fn episodic_delivery_requires_matching_stream_scope_and_positive_sequence(
             .unwrap()
             .unwrap();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             mutation,
             [turn.id.clone().into()],
         ))
@@ -397,10 +360,10 @@ impl ConnectionTrait for ClaimConnection {
 #[pioneer_postgres_test::postgres_test]
 async fn episodic_guarded_claim_rechecks_watermark_scope_and_unknown_predecessor() {
     for mutation in [
-        "UPDATE turn_event_projection_stream_state SET projected_through_sequence = 2 WHERE turn_id = ?",
-        "UPDATE turn_event_projection_stream_state SET thread_id = 'other_thread' WHERE turn_id = ?",
-        "DELETE FROM turn_event_projection_stream_state WHERE turn_id = ?",
-        "UPDATE turn_event_delivery SET status = 'future_nonterminal' WHERE turn_id = ? AND consumer = 'thread_episodic' AND sequence = 2",
+        "UPDATE turn_event_projection_stream_state SET projected_through_sequence = 2 WHERE turn_id = $1",
+        "UPDATE turn_event_projection_stream_state SET thread_id = 'other_thread' WHERE turn_id = $1",
+        "DELETE FROM turn_event_projection_stream_state WHERE turn_id = $1",
+        "UPDATE turn_event_delivery SET status = 'future_nonterminal' WHERE turn_id = $1 AND consumer = 'thread_episodic' AND sequence = 2",
     ] {
         let (store, thread, turn) =
             test_store_with_started_turn("ws_guard", "thr_guard", "turn_guard").await;
@@ -418,7 +381,7 @@ async fn episodic_guarded_claim_rechecks_watermark_scope_and_unknown_predecessor
         let connection = ClaimConnection::new(
             store.database_connection(),
             Some(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 mutation,
                 [turn.id.clone().into()],
             )),
@@ -478,25 +441,30 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
         .await
         .with_maintenance_access();
     let db = store.database_connection();
+    db.execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+         VALUES ('thread','ws_plan','','agent','model','provider','active');
+         INSERT INTO turn(id,thread_id,status) VALUES ('turn_a','thread','completed'), ('turn_b','thread','completed');",
+    ).await.unwrap();
     // Bounded test fixture only: both consumers, mixed terminal statuses,
     // 20k completed events followed by three active events in the same Turn.
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM history WHERE n < ?) \
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "WITH history(n) AS (SELECT generate_series(1::bigint,$1)) \
          INSERT INTO turn_event(id, thread_id, turn_id, sequence, event_type, payload, created_at) \
          SELECT 'history-' || n, 'thread', 'turn_a', n, 'test', '{}', CURRENT_TIMESTAMP FROM history",
         [20_003_i64.into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO turn_event_delivery(id, event_id, thread_id, turn_id, sequence, consumer, status, next_run_at, created_at, updated_at) \
          SELECT event.id || '-' || consumers.consumer, event.id, event.thread_id, event.turn_id, event.sequence, consumers.consumer, \
-             CASE WHEN event.sequence > ? THEN 'pending' WHEN event.sequence % 2 = 0 THEN 'delivered' ELSE 'exhausted' END, ?, ?, ? \
+             CASE WHEN event.sequence > $1 THEN 'pending' WHEN event.sequence % 2 = 0 THEN 'delivered' ELSE 'exhausted' END, $2, $3, $4 \
          FROM turn_event AS event CROSS JOIN (SELECT 'thread_episodic' AS consumer UNION ALL SELECT 'live_notification') AS consumers",
         [20_000_i64.into(), unix_to_datetime(NOW).into(), unix_to_datetime(NOW).into(), unix_to_datetime(NOW).into()])).await.unwrap();
     db.execute_unprepared(
         "INSERT INTO turn_event(id, thread_id, turn_id, sequence, event_type, payload, created_at) VALUES ('independent', 'thread', 'turn_b', 1, 'test', '{}', CURRENT_TIMESTAMP)"
     ).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO turn_event_delivery(id, event_id, thread_id, turn_id, sequence, consumer, status, next_run_at, created_at, updated_at) \
-         VALUES ('independent-delivery', 'independent', 'thread', 'turn_b', 1, ?, 'pending', ?, ?, ?)",
+         VALUES ('independent-delivery', 'independent', 'thread', 'turn_b', 1, $1, 'pending', $2, $3, $4)",
         [EPISODIC.into(), unix_to_datetime(NOW).into(), unix_to_datetime(NOW).into(), unix_to_datetime(NOW).into()])).await.unwrap();
     db.execute_unprepared(
         "INSERT INTO turn_event_projection_stream_state(turn_id, thread_id, status, projected_through_sequence, created_at, updated_at) \
@@ -533,26 +501,29 @@ async fn episodic_claim_production_sql_uses_unfinished_index_with_large_terminal
         } else {
             panic!("unexpected claim statement: {}", statement.sql);
         }
-        // Preserve SQL and bound values; only prepend EXPLAIN QUERY PLAN.
-        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        // Preserve SQL and bound values; only prepend EXPLAIN (COSTS OFF).
+        statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
         let plan = db
             .query_all_raw(statement)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
             .collect::<Vec<_>>();
         assert!(
-            plan.iter()
-                .any(|detail| detail.starts_with("SEARCH predecessor ")
-                    && detail.contains(PREDECESSOR_INDEX)
-                    && detail.contains("consumer=? AND turn_id=? AND sequence<?")),
+            plan.iter().any(|detail| detail.contains(PREDECESSOR_INDEX))
+                && plan.iter().any(|detail| {
+                    detail.contains("Index Cond:")
+                        && detail.contains("turn_id")
+                        && detail.contains("sequence")
+                        && detail.contains('<')
+                }),
             "predecessor must use the consumer/Turn active range: {plan:#?}"
         );
         assert!(
             !plan
                 .iter()
-                .any(|detail| detail.starts_with("SCAN predecessor")),
+                .any(|detail| detail.contains("Seq Scan") && detail.contains("predecessor")),
             "must not scan terminal history: {plan:#?}"
         );
     }
@@ -744,83 +715,6 @@ async fn mixed_delivery_batch_preserves_individual_retry_deferral_and_ack_state(
                 .collect::<Vec<_>>(),
             ["batch_a", "batch_d"],
             "only delivered/exhausted heads unblock their own successors"
-        );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn corrupt_body_in_claim_batch_does_not_suppress_healthy_turn() {
-    pioneer_postgres_test::with_database(async |fixture| {
-        let (store, thread, turn) = postgres_store_with_started_turn(
-            fixture,
-            "ws_corrupt_batch",
-            "thr_corrupt_batch",
-            "a_corrupt_batch",
-        )
-        .await;
-        append_optional_delivery_test_items(&store, &thread, &turn.id, 1).await;
-        let mut other = turn.clone();
-        other.id = "z_healthy_batch".into();
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &other,
-                &[],
-                pioneer_protocol::PersistedActorRef::System,
-            )
-            .await
-            .unwrap();
-        append_optional_delivery_test_items(&store, &thread, &other.id, 1).await;
-        let bad = delivery::Entity::find()
-            .filter(delivery::Column::TurnId.eq(turn.id.clone()))
-            .filter(delivery::Column::Consumer.eq(LIVE))
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap();
-        pioneer_entity::turn_event::Entity::update_many()
-            .col_expr(
-                pioneer_entity::turn_event::Column::Payload,
-                Expr::value(serde_json::json!({"invalid_canonical_event": true})),
-            )
-            .col_expr(
-                pioneer_entity::turn_event::Column::PayloadPayloadId,
-                Expr::value(Option::<String>::None),
-            )
-            .filter(pioneer_entity::turn_event::Column::Id.eq(bad.event_id))
-            .exec(&store.connection)
-            .await
-            .unwrap();
-        let claims = store
-            .claim_due_turn_event_deliveries(LIVE, NOW, 64)
-            .await
-            .unwrap();
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].event.turn_id, other.id);
-        let bad = delivery::Entity::find_by_id(bad.id)
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(bad.status, "failed");
-        assert_eq!(bad.attempt_count, 1);
-        assert!(bad.claim_token.is_none());
-        assert_eq!(bad.next_run_at, unix_to_datetime(NOW + 1));
-        assert_eq!(
-            store
-                .settle_turn_event_deliveries(&[crate::TurnEventDeliverySettlement {
-                    id: claims[0].id.clone(),
-                    claim_token: claims[0].claim_token.clone(),
-                    at_unix: NOW,
-                    outcome: crate::TurnEventDeliveryOutcome::Delivered,
-                }])
-                .await
-                .unwrap(),
-            1
         );
         Ok(())
     })

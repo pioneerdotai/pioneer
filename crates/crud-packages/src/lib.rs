@@ -2,14 +2,17 @@
 
 pub mod agent_skill;
 pub mod mcp_audit_event;
+pub mod mcp_installation_transactions;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
+pub mod native_skill_audit_bundle;
 pub mod package_record;
 pub mod plugin_metadata;
 pub mod plugins;
 pub mod skill_audit_event;
 pub mod skill_dependency_snapshot;
 pub mod skill_pack_installation;
+pub mod skill_pack_transactions;
 
 pub use package_record::{PackageKind, PackageRecord, PreparedAppMetadata};
 
@@ -117,6 +120,10 @@ impl From<pioneer_entity::mcp_server_installation::Model> for McpServerInstallat
 }
 
 pub mod skill_installation;
+pub mod skill_lifecycle;
+pub mod skill_reconciliation;
 pub mod skill_records;
 pub mod skill_upload_session;
 pub mod skill_workspace_policy;
+pub mod turn_mcp_binding;
+pub mod turn_skill_binding;

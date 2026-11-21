@@ -267,7 +267,7 @@ use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
-    SqliteWriteClass, is_anyhow_sqlite_transient_access, retry_with_backoff,
+    SqliteWriteClass, is_anyhow_database_transient_access, retry_with_backoff,
 };
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
@@ -497,7 +497,7 @@ where
 {
     retry_with_backoff(
         operation,
-        is_anyhow_sqlite_transient_access,
+        is_anyhow_database_transient_access,
         DEFAULT_LOCK_RETRY_ATTEMPTS,
         Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
     )
@@ -515,7 +515,7 @@ fn record_resilience_worker_error(
     error: &anyhow::Error,
     impact: ResilienceWorkerFailureImpact,
 ) -> bool {
-    if is_anyhow_sqlite_transient_access(error) {
+    if is_anyhow_database_transient_access(error) {
         warn!(
             operation,
             error = %format!("{error:#}"),

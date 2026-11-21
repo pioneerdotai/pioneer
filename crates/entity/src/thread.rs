@@ -52,8 +52,6 @@ pub struct Model {
     #[sea_orm(has_many)]
     pub compaction_frozen_histories: HasMany<super::compaction_frozen_history::Entity>,
     #[sea_orm(has_one)]
-    pub compaction_history_preparation: HasOne<super::compaction_history_preparation::Entity>,
-    #[sea_orm(has_one)]
     pub compaction_projection_epoch: HasOne<super::compaction_projection_epoch::Entity>,
     #[sea_orm(has_one)]
     pub compaction_root_activity: HasOne<super::compaction_root_activity::Entity>,

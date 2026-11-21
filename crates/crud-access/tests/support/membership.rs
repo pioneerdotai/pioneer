@@ -23,7 +23,7 @@ pub async fn membership_fixture(connection: &DatabaseConnection) -> MembershipFi
     let now = chrono::Utc::now().fixed_offset();
     let gateway_id = GatewayId::new(generate_id(GATEWAY_ID_LEN)).expect("gateway id");
     let superuser_id = PrincipalId::new(generate_id(PRINCIPAL_ID_LEN)).expect("superuser id");
-    let member_id = PrincipalId::new(generate_id(PRINCIPAL_ID_LEN)).expect("member id");
+    let member_id = PrincipalId::new("a00000000000000000001").expect("member id");
     super::domain::identity::create_gateway_singleton(&database, &gateway_id, 1, now)
         .await
         .expect("create gateway");

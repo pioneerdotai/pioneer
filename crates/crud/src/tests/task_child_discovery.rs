@@ -5,20 +5,24 @@ use pioneer_protocol::TaskThreadLineage;
 
 const AT: i64 = 1_700_000_000;
 
+async fn persist_task(store: &CrudStore, task: &Task) {
+    let prepared = task::prepare_task_projection(task).unwrap();
+    let tx = store.connection.begin().await.unwrap();
+    task::upsert_prepared_task(&tx, prepared).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn persist_run(store: &CrudStore, run: &TaskRun) {
+    let prepared = task_run::prepare_run_projection(run).unwrap();
+    let tx = store.connection.begin().await.unwrap();
+    task_run::upsert_prepared_run(&tx, prepared).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
 async fn fixture() -> (CrudStore, Task) {
     let store = test_store_with_workspace("ws_task").await;
-    // Match Gateway's FK-disabled runtime, including deliberately inconsistent
-    // persisted links below. Do not rely on declarative FK ownership checks.
-    pioneer_sqlite::apply_sqlite_pragmas(&store.connection)
-        .await
-        .unwrap();
     let task = sample_task(AT);
-    task::upsert_prepared_task(
-        &store.connection,
-        task::prepare_task_projection(&task).unwrap(),
-    )
-    .await
-    .unwrap();
+    persist_task(&store, &task).await;
     (store.with_maintenance_access(), task)
 }
 
@@ -31,7 +35,7 @@ async fn run(store: &CrudStore, task: &Task, n: u32, status: TaskRunStatus) -> T
     run.run_number = i64::from(n) + 1;
     run.status = status;
     run.completed_at = status.is_terminal().then_some(AT);
-    task_run::upsert_run(&store.connection, &run).await.unwrap();
+    persist_run(store, &run).await;
     run
 }
 
@@ -53,8 +57,9 @@ async fn child(
         error: (status == TurnStatus::Failed).then(|| "child failure".to_owned()),
         ..sample_turn(id)
     };
+    let tx = store.connection.begin().await.unwrap();
     turn::upsert_turn(
-        &store.connection,
+        &tx,
         id,
         &thread.id,
         &turn,
@@ -65,6 +70,7 @@ async fn child(
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     let link = TaskRunTurn {
         id: format!("link_{id}"),
         task_id: run.task_id.clone(),
@@ -145,12 +151,7 @@ async fn many_runs_of_one_task_preserve_active_discovery_cases() {
 
     let mut closed_task = task;
     closed_task.status = TaskStatus::Completed;
-    task::upsert_prepared_task(
-        &store.connection,
-        task::prepare_task_projection(&closed_task).unwrap(),
-    )
-    .await
-    .unwrap();
+    persist_task(&store, &closed_task).await;
     assert!(discovered(&store, 64).await.is_empty());
 }
 
@@ -171,12 +172,7 @@ async fn discovery_rejects_cross_task_run_and_turn_thread_links() {
 
     let mut other_task = task.clone();
     other_task.id = "other_task".to_owned();
-    task::upsert_prepared_task(
-        &store.connection,
-        task::prepare_task_projection(&other_task).unwrap(),
-    )
-    .await
-    .unwrap();
+    persist_task(&store, &other_task).await;
     let foreign_run = run(&store, &other_task, 2, TaskRunStatus::Running).await;
     link.run_id = foreign_run.id;
     store.upsert_task_run_turn(link.clone()).await.unwrap();
@@ -263,8 +259,9 @@ async fn terminal_child(
         )
         .await
         .unwrap();
+    let tx = store.connection.begin().await.unwrap();
     thread_lineage::upsert_lineage(
-        &store.connection,
+        &tx,
         &TaskThreadLineage {
             child_thread_id: link.thread_id,
             parent_thread_id: parent_thread.id.clone(),
@@ -278,6 +275,7 @@ async fn terminal_child(
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     store
         .insert_turn_llm_context(NewTurnLlmContextEntry {
             turn_id: id.to_owned(),
@@ -593,23 +591,19 @@ async fn queued_cleanup_revalidates_late_lineage_receipt_and_capsule_without_sel
     assert!(store.cleanup_claimed_child_capsule(&next).await.unwrap());
 }
 
-// Complete cutover before parking, then discard setup-only fanout so no
-// historical seed or unrelated fixture obligation can accidentally revive it.
-async fn park_after_cutover(
+// Discard setup fanout so only the producer under test can revive the point.
+async fn park_child_point(
     store: &CrudStore,
     claim: &pioneer_entity::task_child_reconcile_pending::Model,
 ) {
     use pioneer_entity::{
         task_child_reconcile_pending as point, task_child_reconcile_scope as scope,
     };
-    while store.expand_child_scope(AT, true).await.unwrap() {}
-    assert!(store.child_work_queues_ready().await.unwrap());
     scope::Entity::delete_many()
-        .filter(scope::Column::ScopeKind.ne("historical-seed"))
         .exec(&store.connection)
         .await
         .unwrap();
-    // Seed preserves the active claim; park through the same fenced operation
+    // Park through the same fenced operation
     // used by the real consumer when domain proof is missing.
     assert_eq!(
         store
@@ -632,7 +626,7 @@ async fn drain_dependency_scopes(store: &CrudStore) {
     // Bounded guard turns a broken EOF implementation into a clear assertion.
     for _ in 0..64 {
         if !store
-            .expand_child_scope(chrono::Utc::now().timestamp() + 100, false)
+            .expand_child_scope(chrono::Utc::now().timestamp() + 100)
             .await
             .unwrap()
         {
@@ -706,7 +700,7 @@ async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurren
         .unwrap();
     let mut run = run(&store, &task, 78, TaskRunStatus::Succeeded).await;
     run.trigger_id = Some(trigger.id.clone());
-    task_run::upsert_run(&store.connection, &run).await.unwrap();
+    persist_run(&store, &run).await;
     store
         .upsert_task_occurrence_contract(
             &TaskOccurrenceContract {
@@ -780,7 +774,7 @@ async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurren
         !store.cleanup_claimed_child_capsule(&claim).await.unwrap(),
         "creator presence cannot substitute for distinct accepted source"
     );
-    park_after_cutover(&store, &claim).await;
+    park_child_point(&store, &claim).await;
     let unrelated = sample_turn("unrelated_accepted_source");
     store
         .materialize_turn_start(
@@ -835,67 +829,6 @@ async fn immediate_cleanup_requires_distinct_accepted_source_and_absent_occurren
             .await
             .unwrap()
             .is_empty()
-    );
-}
-
-#[pioneer_postgres_test::postgres_test]
-async fn queue_cutover_requires_seed_completion_and_recognized_producer_generation() {
-    use pioneer_entity::task_child_reconcile_pending as point;
-    let (store, task) = fixture().await;
-    terminal_child(
-        &store,
-        &task,
-        79,
-        "foreign_writer_child",
-        TaskRunStatus::Succeeded,
-        AT,
-    )
-    .await;
-    assert!(
-        !store.child_work_queues_ready().await.unwrap(),
-        "schema installation alone cannot retire compatibility"
-    );
-    while store.expand_child_scope(AT, true).await.unwrap() {}
-    assert!(store.child_work_queues_ready().await.unwrap());
-    // A foreign repair writer installs an unknown producer generation after
-    // startup; readiness must not be a stale process-local true cache.
-    store.connection.execute_unprepared("CREATE TRIGGER task_occurrence_reconcile_unknown AFTER UPDATE ON task BEGIN SELECT 1; END").await.unwrap();
-    assert!(!store.child_work_queues_ready().await.unwrap());
-    point::Entity::delete_many()
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    store.discover_legacy_child_work(32).await.unwrap();
-    assert!(
-        point::Entity::find_by_id("foreign_writer_child")
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .is_some(),
-        "compatibility must preserve late work from unrecognized writers"
-    );
-    let claim = claimed_child(&store, "th_foreign_writer_child", "foreign_writer_child").await;
-    store.discover_legacy_child_work(32).await.unwrap();
-    assert_eq!(
-        point::Entity::find_by_id("foreign_writer_child")
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap(),
-        claim,
-        "repeated discovery cannot invalidate an existing live claim"
-    );
-    store.finish_child_point(&claim, None, false).await.unwrap();
-    store.discover_legacy_child_work(32).await.unwrap();
-    assert!(
-        point::Entity::find_by_id("foreign_writer_child")
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .next_attempt_at
-            .is_some(),
-        "a newly proven legacy dependency can revive a parked obligation"
     );
 }
 
@@ -990,12 +923,7 @@ async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
     let mut independent_creator = task.clone();
     independent_creator.created_by_thread_id = Some("other_creator_thread".into());
     independent_creator.created_by_turn_id = Some("other_creator_turn".into());
-    task::upsert_prepared_task(
-        &store.connection,
-        task::prepare_task_projection(&independent_creator).unwrap(),
-    )
-    .await
-    .unwrap();
+    persist_task(&store, &independent_creator).await;
     let wrong = sample_thread("wrong_workspace", "thr_task", AT);
     store
         .upsert_thread_model(&wrong, PersistedActorRef::System)
@@ -1008,7 +936,7 @@ async fn parked_taskrun_child_wakes_after_parent_thread_workspace_repair() {
     )
     .await;
     assert!(!store.cleanup_claimed_child_capsule(&claim).await.unwrap());
-    park_after_cutover(&store, &claim).await;
+    park_child_point(&store, &claim).await;
     let unrelated = sample_thread("ws_task", "unrelated_parent_thread", AT);
     store
         .upsert_thread_model(&unrelated, PersistedActorRef::System)

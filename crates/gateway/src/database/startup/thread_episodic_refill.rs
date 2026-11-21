@@ -3251,7 +3251,7 @@ mod tests {
                 self.release
                     .lock()
                     .expect("embedding release lock")
-                    .recv()
+                    .recv_timeout(std::time::Duration::from_secs(30))
                     .expect("embedding test should release its first call");
                 return Err(ThreadEpisodicEmbeddingError::retryable_provider_failure(
                     "openai",
@@ -4141,10 +4141,12 @@ mod tests {
             .await
         });
 
-        pioneer_observability::work::spawn_blocking(move || started_rx.recv())
-            .await
-            .expect("provider-start waiter should join")
-            .expect("provider should start");
+        pioneer_observability::work::spawn_blocking(move || {
+            started_rx.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("provider-start waiter should join")
+        .expect("provider should start");
         crud_store
             .materialize_item_snapshot_updated(
                 ItemUpdatedNotification {
@@ -7003,7 +7005,7 @@ mod tests {
         .unwrap();
         // Production cleanup commits its first bounded reset page, then the
         // fixture rejects page two. No test SQL is executed outside this test.
-        store.database_connection().execute_unprepared("CREATE TRIGGER interrupt_reset_suffix BEFORE UPDATE ON thread_episodic_items WHEN OLD.turn_id = 'reset_turn_32' BEGIN SELECT RAISE(ABORT, 'controlled reset interruption'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION interrupt_reset_suffix() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled reset interruption'; END $$; CREATE TRIGGER interrupt_reset_suffix BEFORE UPDATE ON thread_episodic_items FOR EACH ROW WHEN (OLD.turn_id = 'reset_turn_32') EXECUTE FUNCTION interrupt_reset_suffix()").await.unwrap();
         assert!(
             cleanup_derived_artifacts(
                 &store,
@@ -7117,7 +7119,7 @@ mod tests {
         assert!(failed_checkpoint.last_error.is_some());
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER interrupt_reset_suffix")
+            .execute_unprepared("DROP TRIGGER interrupt_reset_suffix ON thread_episodic_items; DROP FUNCTION interrupt_reset_suffix()")
             .await
             .unwrap();
         // Final resolution B resumes only the suffix. Its exhausted prefix
@@ -8203,7 +8205,7 @@ mod tests {
                     .await
                     .unwrap();
                 store.database_connection().execute_unprepared(&format!(
-                    "CREATE TRIGGER reject_exhausted_refill_source BEFORE UPDATE ON thread_episodic_items WHEN OLD.id = '{}' AND NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'controlled exhaustion write-set failure'); END", poison.index_item_id,
+                    "CREATE FUNCTION reject_exhausted_refill_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled exhaustion write-set failure'; END $$; CREATE TRIGGER reject_exhausted_refill_source BEFORE UPDATE ON thread_episodic_items FOR EACH ROW WHEN (OLD.id = '{}' AND NEW.status = 'failed') EXECUTE FUNCTION reject_exhausted_refill_source()", poison.index_item_id,
                 )).await.unwrap();
             } else {
                 store.inject_episodic_claim_fault_for_test(
@@ -8216,7 +8218,7 @@ mod tests {
                 );
                 if fault == "settlement_error" {
                     store.database_connection().execute_unprepared(&format!(
-                        "CREATE TRIGGER reject_refill_poison_settlement BEFORE UPDATE ON thread_episodic_index_jobs WHEN OLD.id = '{}' AND NEW.status != 'running' BEGIN SELECT RAISE(ABORT, 'controlled fenced settlement failure'); END", poison.id,
+                        "CREATE FUNCTION reject_refill_poison_settlement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled fenced settlement failure'; END $$; CREATE TRIGGER reject_refill_poison_settlement BEFORE UPDATE ON thread_episodic_index_jobs FOR EACH ROW WHEN (OLD.id = '{}' AND NEW.status != 'running') EXECUTE FUNCTION reject_refill_poison_settlement()", poison.id,
                     )).await.unwrap();
                 }
             }
@@ -8337,7 +8339,7 @@ mod tests {
                 );
                 store
                     .database_connection()
-                    .execute_unprepared("DROP TRIGGER reject_exhausted_refill_source")
+                    .execute_unprepared("DROP TRIGGER reject_exhausted_refill_source ON thread_episodic_items; DROP FUNCTION reject_exhausted_refill_source()")
                     .await
                     .unwrap();
             } else if fault == "settlement_error" {
@@ -8355,7 +8357,7 @@ mod tests {
                     .unwrap();
                 store
                     .database_connection()
-                    .execute_unprepared("DROP TRIGGER reject_refill_poison_settlement")
+                    .execute_unprepared("DROP TRIGGER reject_refill_poison_settlement ON thread_episodic_index_jobs; DROP FUNCTION reject_refill_poison_settlement()")
                     .await
                     .unwrap();
             } else if fault == "retry_unknown" {
@@ -8490,26 +8492,13 @@ mod tests {
     }
 
     pub(crate) async fn make_refill_history_unavailable(store: &CrudStore) {
-        let db = store.database_connection();
-        let object = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "SELECT type FROM sqlite_schema WHERE name = ?",
-                ["turn_event".into()],
-            ))
+        // Preserve the canonical rows and their relationships while making
+        // direct queries of canonical history fail in this scoped database.
+        store
+            .database_connection()
+            .execute_unprepared("ALTER TABLE turn_event RENAME TO forbidden_refill_history")
             .await
-            .unwrap()
-            .unwrap()
-            .try_get::<String>("", "type")
             .unwrap();
-        // Compression exposes a view; an ordinary in-memory schema has a
-        // table. Keep its rows and FK targets while denying history queries.
-        let statement = match object.as_str() {
-            "table" => "ALTER TABLE turn_event RENAME TO forbidden_refill_history",
-            "view" => "DROP VIEW turn_event",
-            other => panic!("unexpected history object: {other}"),
-        };
-        db.execute_unprepared(statement).await.unwrap();
     }
 
     async fn mark_refill_marker(crud_store: &CrudStore, status: &str, version: i64) {

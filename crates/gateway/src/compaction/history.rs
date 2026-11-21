@@ -339,18 +339,6 @@ pub(crate) async fn reference_payload(
         .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))
 }
 
-#[cfg(test)]
-pub(crate) async fn prepare_references(
-    store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    references: &[SourceRef],
-) -> Result<()> {
-    store
-        .compaction_prepare_references(workspace, thread, references)
-        .await
-}
-
 /// Resolve retained exact event relationship metadata in bounded batches without
 /// touching raw payloads or requiring the covered event to remain live.
 pub(crate) async fn historical_event_projections(

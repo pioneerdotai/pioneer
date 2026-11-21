@@ -418,37 +418,38 @@ impl MessageProcessor {
             ));
         }
 
-        let workspace_id = self
-            .workspace_manager
-            .validate_workspace_id(workspace_id.as_str())
-            .await
-            .map_err(|error| match error {
-                WorkspaceError::Internal(message) => mcp_error(
-                    Some(request_id.clone()),
-                    INVALID_REQUEST_CODE,
-                    MCP_ERROR_INTERNAL,
-                    format!("failed to validate workspace: {message}"),
-                    json!({}),
-                ),
-                WorkspaceError::WorkspaceNotFound(_) | WorkspaceError::WorkspaceInactive(_) => {
-                    mcp_error(
+        let workspace_id =
+            self.workspace_manager
+                .validate_workspace_id(workspace_id.as_str())
+                .await
+                .map_err(|error| match error {
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => mcp_error(
+                        Some(request_id.clone()),
+                        INVALID_REQUEST_CODE,
+                        MCP_ERROR_INTERNAL,
+                        format!("failed to validate workspace: {message}"),
+                        json!({}),
+                    ),
+                    WorkspaceError::WorkspaceNotFound(_) | WorkspaceError::WorkspaceInactive(_) => {
+                        mcp_error(
+                            Some(request_id.clone()),
+                            INVALID_PARAMS_CODE,
+                            MCP_ERROR_NOT_FOUND,
+                            format!("workspace `{}` is unavailable", workspace_id),
+                            json!({"workspace_id": workspace_id}),
+                        )
+                    }
+                    WorkspaceError::InvalidWorkspaceId
+                    | WorkspaceError::InvalidWorkspaceName
+                    | WorkspaceError::NoWorkspaceUpdateFields => mcp_error(
                         Some(request_id.clone()),
                         INVALID_PARAMS_CODE,
-                        MCP_ERROR_NOT_FOUND,
-                        format!("workspace `{}` is unavailable", workspace_id),
+                        MCP_ERROR_INVALID_REQUEST,
+                        format!("invalid workspace_id for `{method}`"),
                         json!({"workspace_id": workspace_id}),
-                    )
-                }
-                WorkspaceError::InvalidWorkspaceId
-                | WorkspaceError::InvalidWorkspaceName
-                | WorkspaceError::NoWorkspaceUpdateFields => mcp_error(
-                    Some(request_id.clone()),
-                    INVALID_PARAMS_CODE,
-                    MCP_ERROR_INVALID_REQUEST,
-                    format!("invalid workspace_id for `{method}`"),
-                    json!({"workspace_id": workspace_id}),
-                ),
-            })?;
+                    ),
+                })?;
 
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))

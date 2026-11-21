@@ -1,23 +1,7 @@
-use migration::{Migrator, MigratorTrait};
 use pioneer_crud::CrudStore;
 use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-
-#[derive(Default)]
-struct WriteCounter(AtomicUsize);
-
-impl SqliteWriteObserver for WriteCounter {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if matches!(event, SqliteWriteEvent::Acquired { .. }) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 async fn scalar(store: &CrudStore, sql: &str) -> i64 {
     store
@@ -33,20 +17,9 @@ async fn scalar(store: &CrudStore, sql: &str) -> i64 {
         .unwrap()
 }
 
-async fn fixture(compressed: bool) -> CrudStore {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    fixture_on(db, compressed).await
-}
-
-async fn fixture_on(db: sea_orm::DatabaseConnection, compressed: bool) -> CrudStore {
-    let before = Migrator::migrations()
-        .iter()
-        .position(|m| m.name().contains("20260910_000001"))
-        .unwrap();
-    Migrator::up(&db, Some(before as u32)).await.unwrap();
+async fn seed_metadata(db: &sea_orm::DatabaseConnection, compressed: bool) {
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','legacy',1,1)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-turn','other','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "WITH RECURSIVE nums(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM nums WHERE n<299) INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) SELECT 'input-'||n,'turn',n,'text','legacy','{\"type\":\"text\",\"text\":\"legacy\"}',CURRENT_TIMESTAMP FROM nums",
@@ -59,284 +32,55 @@ async fn fixture_on(db: sea_orm::DatabaseConnection, compressed: bool) -> CrudSt
         db.execute_unprepared(sql).await.unwrap();
     }
     if compressed {
-        db.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-            "SELECT zstd_enable_transparent('{\"table\":\"turn_event\",\"column\":\"payload\",\"compression_level\":3,\"dict_chooser\":\"''[nodict]''\"}')"))
-            .await.unwrap();
-    }
-    Migrator::up(&db, None).await.unwrap();
-    CrudStore::new(db).with_maintenance_access()
-}
-
-#[tokio::test]
-async fn retained_turn_preparation_registers_only_that_turns_context_pages() {
-    let store = fixture(false).await;
-    let mut after = 0;
-    let mut pages = 0;
-    while let Some(next) = store
-        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
-        .await
-        .unwrap()
-    {
-        assert!(next > after);
-        after = next;
-        pages += 1;
-    }
-    assert_eq!(pages, 3);
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_source_revision WHERE turn_id='turn'"
-        )
-        .await,
-        300
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_source_revision WHERE source_id='unrelated-context'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_input_revision"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_history_preparation"
-        )
-        .await,
-        0
-    );
-}
-
-#[tokio::test]
-async fn repeated_retained_turn_preparation_does_not_reserve_writer() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let _ = fixture_on(db.clone(), false).await;
-    let writes = Arc::new(WriteCounter::default());
-    let store = CrudStore::new(SqliteDatabase::new_with_observer(
-        db.clone(),
-        db,
-        writes.clone(),
-    ))
-    .with_maintenance_access();
-
-    let mut after = 0;
-    while let Some(next) = store
-        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
-        .await
-        .unwrap()
-    {
-        after = next;
-    }
-    let after_first = writes.0.load(Ordering::SeqCst);
-    assert!(after_first > 0, "initial legacy preparation did not write");
-
-    let mut after = 0;
-    while let Some(next) = store
-        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
-        .await
-        .unwrap()
-    {
-        after = next;
-    }
-    assert_eq!(
-        writes.0.load(Ordering::SeqCst),
-        after_first,
-        "fully registered pages still reserved the serialized writer"
-    );
-}
-
-#[tokio::test]
-async fn exact_legacy_preparation_is_concurrent_idempotent_and_repeat_reads_are_read_only() {
-    let store = fixture(false).await;
-    let source = pioneer_compaction::SourceRef {
-        scope: "item:turn".into(),
-        id: "legacy-item".into(),
-        version: "item-revision:1".into(),
-    };
-    let (left, right) = tokio::join!(
-        store.compaction_prepare_references("ws", "thread", std::slice::from_ref(&source)),
-        store.compaction_prepare_references("ws", "thread", std::slice::from_ref(&source)),
-    );
-    left.unwrap();
-    right.unwrap();
-    assert_eq!(
-        scalar(&store, "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='legacy-item' AND revision=1 AND present=1").await,
-        1
-    );
-    store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_repeat_registration BEFORE INSERT ON compaction_item_revision BEGIN SELECT RAISE(ABORT,'unexpected registration'); END"
-    ).await.unwrap();
-    store
-        .compaction_prepare_references("ws", "thread", std::slice::from_ref(&source))
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .compaction_reference_payload("ws", "thread", &source)
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("{\"text\":\"legacy 🧪\"}")
-    );
-}
-
-async fn finish(store: &CrudStore) {
-    for _ in 0..100 {
-        if store
-            .compaction_prepare_history_quantum("ws", "thread")
-            .await
-            .unwrap()
-        {
-            return;
-        }
-    }
-    panic!("bounded fixture did not finish preparation");
-}
-
-#[tokio::test]
-async fn legacy_history_is_prepared_in_bounded_resumable_pages_before_a_new_fence() {
-    let store = fixture(false).await;
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_input_revision"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_history_preparation"
-        )
-        .await,
-        0
-    );
-    let stale_fence = store.compaction_history_read_fence().await.unwrap();
-    assert!(
-        store
-            .compaction_history_turn_page("ws", "thread", "", &stale_fence)
-            .await
-            .is_err()
-    );
-    for _ in 0..3 {
-        assert!(
-            !store
-                .compaction_prepare_history_quantum("ws", "thread")
-                .await
-                .unwrap()
-        );
-    }
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_input_revision"
-        )
-        .await,
-        128
-    );
-    assert!(
-        !store
-            .compaction_history_prepared("ws", "thread")
-            .await
-            .unwrap()
-    );
-    // A new service handle resumes durable state, rather than a local loop offset.
-    let resumed = CrudStore::new(store.database_connection()).with_maintenance_access();
-    let mut last = 128;
-    loop {
-        let ready = resumed
-            .compaction_prepare_history_quantum("ws", "thread")
+        let wire = serde_json::json!({"source":"🔧".repeat(32_768)}).to_string();
+        let payload = pioneer_crud_payloads::storage::PreparedPayload::new(&wire).unwrap();
+        let transaction = db.begin().await.unwrap();
+        payload.insert(&transaction).await.unwrap();
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE turn_event SET payload=NULL,payload_payload_id=$1 WHERE id='event-1'",
+                [payload.id().into()],
+            ))
             .await
             .unwrap();
-        let count=scalar(&resumed,"SELECT (SELECT count(*) FROM compaction_input_revision)+(SELECT count(*) FROM compaction_event_revision)+(SELECT count(*) FROM compaction_source_revision) AS n").await;
-        assert!((0..=128).contains(&(count - last)));
-        last = count;
-        if ready {
-            break;
-        }
+        transaction.commit().await.unwrap();
     }
-    assert_eq!(last, 900);
-    assert!(
-        resumed
-            .compaction_history_turn_page("ws", "thread", "", &stale_fence)
-            .await
-            .is_err()
-    );
-    let fence = resumed.compaction_history_read_fence().await.unwrap();
-    let turns = resumed
-        .compaction_history_turn_page("ws", "thread", "", &fence)
-        .await
-        .unwrap();
-    assert_eq!(turns.len(), 1);
-    assert_eq!(
-        (
-            turns[0].input_high_water,
-            turns[0].event_high_water,
-            turns[0].context_high_water
-        ),
-        (300, 300, 300)
-    );
-    assert_eq!(
-        scalar(
-            &resumed,
-            "SELECT count(*) AS n FROM compaction_input_revision WHERE source_id='unrelated'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &resumed,
-            "SELECT version AS n FROM compaction_projection_epoch WHERE thread_id='thread'"
-        )
-        .await,
-        1
-    );
-    let step = scalar(
-        &resumed,
-        "SELECT step AS n FROM compaction_history_preparation WHERE thread_id='thread'",
-    )
-    .await;
-    finish(&resumed).await;
-    assert_eq!(
-        scalar(
-            &resumed,
-            "SELECT step AS n FROM compaction_history_preparation WHERE thread_id='thread'"
-        )
-        .await,
-        step
-    );
 }
 
-#[tokio::test]
-async fn preparation_preserves_concurrent_edits_deletes_and_compressed_sources() {
-    let store = fixture(true).await;
-    for _ in 0..3 {
+#[pioneer_postgres_test::postgres_test]
+async fn canonical_revisions_preserve_independent_edits_deletes_and_compressed_sources() {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect().await.unwrap();
+    seed_metadata(fixture.connection(), true).await;
+    let reader = fixture.connect_read_only().await.unwrap();
+    let store = CrudStore::new(SqliteDatabase::new(reader, fixture.connection().clone()));
+    writer
+        .execute_unprepared(
+            "UPDATE turn_input SET payload='{\"edited\":true}' WHERE id='input-250'",
+        )
+        .await
+        .unwrap();
+    writer
+        .execute_unprepared("DELETE FROM turn_input WHERE id='input-251'")
+        .await
+        .unwrap();
+    writer.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES('new','turn',300,'text','{}',CURRENT_TIMESTAMP)").await.unwrap();
+    assert!(
         store
-            .compaction_prepare_history_quantum("ws", "thread")
+            .compaction_source_page(
+                "ws",
+                "thread",
+                "turn",
+                pioneer_crud::compaction::PagedSource::Event,
+                0
+            )
             .await
-            .unwrap();
-    }
-    let db = store.database_connection();
-    db.execute_unprepared("UPDATE turn_input SET payload='{\"edited\":true}' WHERE id='input-250'")
-        .await
-        .unwrap();
-    db.execute_unprepared("DELETE FROM turn_input WHERE id='input-251'")
-        .await
-        .unwrap();
-    db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,payload,created_at) VALUES('new','turn',300,'text','{}',CURRENT_TIMESTAMP)").await.unwrap();
-    finish(&store).await;
+            .unwrap()
+            .entries
+            .iter()
+            .any(|event| event.reference.id == "event-1")
+    );
     assert_eq!(
         scalar(
             &store,
@@ -369,121 +113,19 @@ async fn preparation_preserves_concurrent_edits_deletes_and_compressed_sources()
         .await,
         300
     );
-    assert_eq!(scalar(&store,"SELECT count(*) AS n FROM turn_input WHERE id='input-250' AND payload='{\"edited\":true}'").await,1);
+    assert_eq!(scalar(&store,"SELECT count(*) AS n FROM turn_input WHERE id='input-250' AND payload::text='{\"edited\":true}'").await,1);
 }
 
-#[tokio::test]
-async fn preparation_cursor_and_insertions_roll_back_together_and_workers_converge() {
-    let store = fixture(false).await;
-    for _ in 0..2 {
-        store
-            .compaction_prepare_history_quantum("ws", "thread")
-            .await
-            .unwrap();
-    }
-    let db = store.database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_preparation BEFORE UPDATE OF step ON compaction_history_preparation BEGIN SELECT RAISE(ABORT,'injected failure'); END").await.unwrap();
-    assert!(
-        store
-            .compaction_prepare_history_quantum("ws", "thread")
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_input_revision"
-        )
-        .await,
-        0
-    );
-    db.execute_unprepared("DROP TRIGGER reject_preparation")
-        .await
-        .unwrap();
-    let ((), ()) = tokio::join!(finish(&store), finish(&store));
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(*) AS n FROM compaction_input_revision"
-        )
-        .await,
-        300
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT count(DISTINCT capture_order) AS n FROM compaction_event_revision"
-        )
-        .await,
-        300
-    );
-    assert_eq!(
-        scalar(
-            &store,
-            "SELECT version AS n FROM compaction_projection_epoch WHERE thread_id='thread'"
-        )
-        .await,
-        1
-    );
-    assert!(
-        store
-            .compaction_prepare_history_quantum("wrong-workspace", "thread")
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool() {
+#[pioneer_postgres_test::postgres_test]
+async fn cancelled_frozen_conversion_and_output_writes_reopen_with_a_read_only_pool() {
     let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
-    use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
-    use sea_orm::{ConnectOptions, TransactionTrait};
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-legacy-preparation-{}.db",
-        pioneer_protocol::generate_id(21)
-    ));
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let mut options = ConnectOptions::new(url.clone());
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let setup = fixture_on(writer.clone(), false).await;
-    let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
-    assert_eq!(
-        reader
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA query_only"
-            ))
-            .await
-            .unwrap()
-            .unwrap()
-            .try_get::<i64>("", "query_only")
-            .unwrap(),
-        1
-    );
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    seed_metadata(&writer, false).await;
+    let reader = fixture.connect_read_only().await.unwrap();
     let database = SqliteDatabase::new(reader, writer);
+    assert!(database.reader_query_only_enabled().await.unwrap());
     let store = CrudStore::new(database.clone()).with_maintenance_access();
-    for _ in 0..3 {
-        store
-            .compaction_prepare_history_quantum("ws", "thread")
-            .await
-            .unwrap();
-    }
-    let step = scalar(
-        &store,
-        "SELECT step AS n FROM compaction_history_preparation WHERE thread_id='thread'",
-    )
-    .await;
     let output = pioneer_protocol::ItemDeltaNotification {
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
@@ -542,6 +184,7 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
                 .unwrap()
         );
     }
+    let layouts_before = scalar(&store, "SELECT count(*) AS n FROM compaction_frozen_layout").await;
     let held = database.begin().await.unwrap();
     assert!(
         tokio::time::timeout(
@@ -552,14 +195,6 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .is_err()
     );
 
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            store.compaction_prepare_history_quantum("ws", "thread")
-        )
-        .await
-        .is_err()
-    );
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -584,16 +219,8 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .unwrap();
 
     assert_eq!(
-        scalar(
-            &store,
-            "SELECT step AS n FROM compaction_history_preparation WHERE thread_id='thread'"
-        )
-        .await,
-        step
-    );
-    assert_eq!(
         scalar(&store, "SELECT count(*) AS n FROM compaction_frozen_layout").await,
-        0
+        layouts_before
     );
     for _ in 0..4 {
         assert!(
@@ -605,9 +232,9 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
     }
     drop(store);
     drop(database);
-    drop(setup);
-    // Reopen the file: no in-memory cursor or worker survives this boundary.
-    let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let reopened = CrudStore::new(SqliteDatabase::new(reader, writer)).with_maintenance_access();
     let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let rows = reopened
         .tool_output_page("ws", "thread", "turn", "persisted-shell", 0)
@@ -641,19 +268,6 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
             vec![reference.clone()]
         );
     }
-    finish(&reopened).await;
-    assert_eq!(
-        scalar(
-            &reopened,
-            "SELECT count(*) AS n FROM compaction_source_revision"
-        )
-        .await,
-        300
-    );
-    drop(reopened);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }
 
 async fn postgres_store(database: &TestDatabase) -> CrudStore {
@@ -671,118 +285,6 @@ async fn postgres_store(database: &TestDatabase) -> CrudStore {
         .unwrap();
     let reader = database.connect_read_only().await.unwrap();
     CrudStore::new(SqliteDatabase::new(reader, writer.clone())).with_maintenance_access()
-}
-
-#[tokio::test]
-async fn tool_output_chunks_are_scoped_ordered_and_idempotent() {
-    with_database(async |fixture| {
-        let store = postgres_store(fixture).await;
-        let mut n = pioneer_protocol::ItemDeltaNotification {
-            workspace_id: "ws".into(),
-            thread_id: "thread".into(),
-            turn_id: "turn".into(),
-            item_id: "command".into(),
-            delta: "same text\n".into(),
-            stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-            payload: None,
-            markdown: None,
-            markdown_version: None,
-        };
-        store.record_tool_output("chunk-a", &n).await.unwrap();
-        store.record_tool_output("chunk-a", &n).await.unwrap();
-        store.record_tool_output("chunk-b", &n).await.unwrap();
-        n.stream = Some(pioneer_protocol::ItemDeltaStream::Stderr);
-        n.delta = "failure detail".into();
-        store.record_tool_output("chunk-c", &n).await.unwrap();
-        assert!(store.record_tool_output("chunk-a", &n).await.is_err());
-        n.thread_id = "other".into();
-        assert!(store.record_tool_output("bad", &n).await.is_err());
-        let reopened = CrudStore::new(SqliteDatabase::new(
-            fixture.connect_read_only().await.unwrap(),
-            fixture.connect().await.unwrap(),
-        ));
-        let rows = reopened
-            .tool_output_page("ws", "thread", "turn", "command", 0)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].1.text, "same text\n");
-        assert_eq!(rows[1].1.text, "same text\n");
-        assert_eq!(rows[2].1.text, "failure detail");
-        assert!(
-            reopened
-                .tool_output_page("foreign", "thread", "turn", "command", 0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            reopened
-                .tool_output_page("ws", "thread", "turn", "command", rows[2].0)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies() {
-    with_database(async |fixture| {
-    let store = postgres_store(fixture).await;
-    let original = "вывод🦀\n".repeat(30000);
-    let n = pioneer_protocol::ItemDeltaNotification {
-        workspace_id: "ws".into(),
-        thread_id: "thread".into(),
-        turn_id: "turn".into(),
-        item_id: "large".into(),
-        delta: original.clone(),
-        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-        payload: Some(serde_json::json!({"truncated":false})),
-        markdown: None,
-        markdown_version: None,
-    };
-    store.record_tool_output("large", &n).await.unwrap();
-    assert!(scalar(&store, "SELECT count(*) AS n FROM tool_output_chunk WHERE text_encoding = 1 AND octet_length(text) < text_original_bytes").await > 0);
-    store.record_tool_output("large", &n).await.unwrap();
-    let rows = store
-        .tool_output_page("ws", "thread", "turn", "large", 0)
-        .await
-        .unwrap();
-    assert!(rows.len() > 1);
-    let mut conflicting = n.clone();
-    conflicting.delta.truncate(195000);
-    assert!(
-        store
-            .record_tool_output("large", &conflicting)
-            .await
-            .is_err()
-    );
-    assert!(rows.iter().all(|(_, row)| row.text.len() <= 128 * 1024));
-    assert_eq!(
-        rows.iter()
-            .map(|(_, row)| row.text.as_str())
-            .collect::<String>(),
-        original
-    );
-    assert_eq!(
-        rows.iter()
-            .filter(|(_, row)| row.metadata.is_some())
-            .count(),
-        1
-    );
-    assert!(
-        store
-            .tool_output_page("ws", "thread", "turn", "large", rows.last().unwrap().0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-        Ok(())
-    }).await.unwrap();
 }
 
 #[tokio::test]

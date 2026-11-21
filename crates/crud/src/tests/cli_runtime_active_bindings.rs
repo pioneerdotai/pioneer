@@ -2,7 +2,7 @@ use super::*;
 use crate::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
 use crate::repositories::cli_runtime_binding::active_turn_binding_page_query;
 use pioneer_entity::turn_cli_runtime_binding as binding;
-use sea_orm::QueryTrait;
+use sea_orm::{ActiveModelTrait, QueryTrait};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -25,7 +25,7 @@ impl pioneer_sqlite::SqliteReadObserver for ReadObserver {
 
 fn binding_fixture(id: String, status: &str) -> binding::ActiveModel {
     let timestamp = unix_to_datetime(1_700_000_000);
-    binding::ActiveModel {
+    let mut row = binding::ActiveModel {
         turn_id: Set(id),
         thread_id: Set("thr_active_page".into()),
         continuation_thread_id: Set("thr_active_page".into()),
@@ -34,12 +34,16 @@ fn binding_fixture(id: String, status: &str) -> binding::ActiveModel {
         runtime_kind: Set("codex".into()),
         native_thread_id: Set("native_thread".into()),
         status: Set(status.into()),
-        input_mapping_json: Set("{}".into()),
         frozen_manifest_id: Set(None),
         created_at: Set(timestamp),
         updated_at: Set(timestamp),
         ..Default::default()
-    }
+    };
+    pioneer_crud_execution::input_mapping::InputMapping::prepare("{}", false)
+        .unwrap()
+        .set(&mut row)
+        .unwrap();
+    row
 }
 
 async fn history(store: &CrudStore) {
@@ -195,6 +199,12 @@ async fn cli_active_binding_pages_bound_ties_status_changes_and_restart() {
 async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() {
     let (store, queries) = test_store_with_workspace_and_query_counter("ws_active_page").await;
     history(&store).await;
+    store
+        .database_connection()
+        .execute_unprepared("ANALYZE turn_cli_runtime_binding")
+        .await
+        .unwrap();
+
     let maintenance = store.with_maintenance_access();
     queries.store(0, Ordering::Relaxed);
     for status in [Starting, Running] {
@@ -215,7 +225,7 @@ async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() 
     for status in [Starting, Running] {
         for cursor in [None, Some(&after)] {
             let statement =
-                active_turn_binding_page_query(status, cursor).build(DatabaseBackend::Sqlite);
+                active_turn_binding_page_query(status, cursor).build(DatabaseBackend::Postgres);
             assert!(
                 !statement.sql.contains("OFFSET")
                     && !statement.sql.contains("JOIN")
@@ -224,31 +234,34 @@ async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() 
             let plan = store
                 .database_connection()
                 .query_all_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    format!("EXPLAIN QUERY PLAN {}", statement.sql),
+                    DatabaseBackend::Postgres,
+                    format!("EXPLAIN (COSTS OFF) {}", statement.sql),
                     statement.values.unwrap(),
                 ))
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|row| row.try_get::<String>("", "detail").unwrap())
+                .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
                 .collect::<Vec<_>>();
             assert!(
-                plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                plan.iter().any(|detail| detail.contains("Index Scan")
                     && detail.contains("idx_cli_turn_binding_status_created_turn")
-                    && detail.contains("status=?")),
+                    && plan
+                        .iter()
+                        .any(|line| line.contains("Index Cond:") && line.contains("status"))),
                 "{plan:?}"
             );
             assert!(
                 !plan
                     .iter()
-                    .any(|detail| detail.starts_with("SCAN ") || detail.contains("TEMP B-TREE")),
+                    .any(|detail| detail.contains("Seq Scan") || detail.contains("Sort")),
                 "{plan:?}"
             );
             if cursor.is_some() {
                 assert!(
-                    plan.iter().any(|detail| detail.contains("created_at>?")
-                        || detail.contains("(created_at,turn_id)>(?,?)")),
+                    plan.iter().any(|detail| detail.contains("Index Cond:")
+                        && detail.contains("created_at")
+                        && detail.contains(">")),
                     "keyset must be a range seek: {plan:?}"
                 );
             }
@@ -256,33 +269,13 @@ async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() 
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_cancels() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor,
-        sqlite_read_only_connection_url,
-    };
-    use sea_orm::{ConnectOptions, TransactionTrait};
-    let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
-        "pioneer-cli-active-{}.sqlite",
-        uuid::Uuid::new_v4()
-    )));
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
-    options.max_connections(1);
-    let writer = Database::connect(options).await.unwrap();
-    Migrator::up(&writer, None).await.unwrap();
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
-    options.max_connections(2);
-    options.map_sqlx_sqlite_opts(|opts| {
-        opts.read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-    });
-    let reader = Database::connect(options).await.unwrap();
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
+    use sea_orm::TransactionTrait;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(OptionalDeliveryDatabaseObserver::default());
     let reads = Arc::new(ReadObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
@@ -388,32 +381,35 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn cli_active_binding_index_down_and_up_preserve_domain_and_workspace_index() {
+async fn cli_active_binding_index_rollback_preserves_domain_and_workspace_index() {
     let store = test_store_with_workspace("ws_active_page").await;
     history(&store).await;
     let database = store.database_connection();
     let transaction = database.begin().await.unwrap();
-    let manager = migration::SchemaManager::new(&*transaction);
-    let index_migration = Migrator::migrations()
-        .into_iter()
-        .find(|m| m.name() == "m20261008_000002_background_access_indexes")
-        .unwrap();
-    // The index-only group can be rolled back and reapplied without domain writes.
-    index_migration.down(&manager).await.unwrap();
+    let columns = |row: sea_orm::QueryResult| {
+        ["status", "created_at", "turn_id"].map(|name| row.try_get::<String>("", name).unwrap())
+    };
+    let definition = || {
+        Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT pg_get_indexdef('idx_cli_turn_binding_status_created_turn'::regclass,1,true) AS status,                 pg_get_indexdef('idx_cli_turn_binding_status_created_turn'::regclass,2,true) AS created_at,                 pg_get_indexdef('idx_cli_turn_binding_status_created_turn'::regclass,3,true) AS turn_id".to_owned())
+    };
     assert_eq!(
-        binding::Entity::find().count(&transaction).await.unwrap(),
-        8192
+        columns(
+            transaction
+                .query_one_raw(definition())
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        ["status", "created_at", "turn_id"]
     );
-    let indexes = transaction
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "PRAGMA index_list('turn_cli_runtime_binding')",
-        ))
+    transaction
+        .execute_unprepared("DROP INDEX idx_cli_turn_binding_status_created_turn")
         .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "name").unwrap())
-        .collect::<Vec<_>>();
+        .unwrap();
+    let indexes = transaction.query_all_raw(Statement::from_string(DatabaseBackend::Postgres,
+        "SELECT indexname FROM pg_indexes WHERE schemaname='public' AND tablename='turn_cli_runtime_binding'".to_owned()))
+        .await.unwrap().into_iter().map(|row| row.try_get::<String>("", "indexname").unwrap()).collect::<Vec<_>>();
     assert!(
         !indexes
             .iter()
@@ -424,36 +420,19 @@ async fn cli_active_binding_index_down_and_up_preserve_domain_and_workspace_inde
             .iter()
             .any(|name| name == "idx_turn_cli_runtime_binding_workspace_status")
     );
-    index_migration.up(&manager).await.unwrap();
-    let columns = transaction
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "PRAGMA index_info('idx_cli_turn_binding_status_created_turn')",
-        ))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "name").unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(columns, ["status", "created_at", "turn_id"]);
     assert_eq!(
         binding::Entity::find().count(&transaction).await.unwrap(),
         8192
     );
-    index_migration.down(&manager).await.unwrap();
-    drop(manager);
     transaction.rollback().await.unwrap();
-    let columns_after_rollback = database
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "PRAGMA index_info('idx_cli_turn_binding_status_created_turn')",
-        ))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|row| row.try_get::<String>("", "name").unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(columns_after_rollback, columns);
+    assert_eq!(
+        columns(database.query_one_raw(definition()).await.unwrap().unwrap()),
+        ["status", "created_at", "turn_id"]
+    );
+    assert_eq!(
+        binding::Entity::find().count(&database).await.unwrap(),
+        8192
+    );
 }
 
 async fn terminal_guard_fixture() -> (CrudStore, crate::CliRuntimeTurnTerminalGuard) {
@@ -546,11 +525,6 @@ async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_r
     for control_only in [false, true] {
         for change in ["running", "terminal", "resume"] {
             let (store, logical_guard) = terminal_guard_fixture().await;
-            store
-                .database_connection()
-                .execute_unprepared("PRAGMA foreign_keys=OFF")
-                .await
-                .unwrap();
             let guard = if control_only {
                 store
                     .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
@@ -634,23 +608,21 @@ async fn cli_terminal_guard_rejects_starting_activation_terminal_and_canonical_r
 #[pioneer_postgres_test::postgres_test]
 async fn cli_control_terminal_guard_fences_mapping_replacement_at_same_timestamp() {
     let (store, logical_guard) = terminal_guard_fixture().await;
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     let selected = store
         .cli_runtime_turn_terminal_control_guard(&logical_guard.binding)
         .await
         .unwrap()
         .unwrap();
     let replacement = r#"{"sent":"replacement context"}"#;
-    binding::Entity::update_many()
-        .col_expr(binding::Column::InputMappingJson, Expr::value(replacement))
-        .filter(binding::Column::TurnId.eq(&selected.binding.turn_id))
-        .exec(&store.database_connection())
-        .await
+    let mut row = binding::ActiveModel {
+        turn_id: sea_orm::ActiveValue::Unchanged(selected.binding.turn_id.clone()),
+        ..Default::default()
+    };
+    pioneer_crud_execution::input_mapping::InputMapping::prepare(replacement, false)
+        .unwrap()
+        .set(&mut row)
         .unwrap();
+    row.update(&store.database_connection()).await.unwrap();
     let current = store
         .cli_runtime_turn_terminal_control_guard_by_id(&selected.binding.turn_id)
         .await
@@ -756,7 +728,7 @@ async fn cli_terminal_guard_repairs_active_projection_atomically_and_rolls_back_
         "rollback fixture requires an existing projection"
     );
     store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_cli_guard_projection BEFORE UPDATE ON turn_work_projection BEGIN SELECT RAISE(ABORT, 'guard projection failure'); END",
+        "CREATE FUNCTION reject_cli_guard_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'guard projection failure'; END $$; CREATE TRIGGER reject_cli_guard_projection BEFORE UPDATE ON turn_work_projection FOR EACH ROW EXECUTE FUNCTION reject_cli_guard_projection()",
     ).await.unwrap();
     assert!(commit_guard(&store, &guard).await.is_err());
     assert_eq!(
@@ -783,7 +755,7 @@ async fn cli_terminal_guard_repairs_active_projection_atomically_and_rolls_back_
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_cli_guard_projection")
+        .execute_unprepared("DROP TRIGGER reject_cli_guard_projection ON turn_work_projection; DROP FUNCTION reject_cli_guard_projection()")
         .await
         .unwrap();
     let result = commit_guard(&store, &guard).await.unwrap().unwrap();
@@ -1284,7 +1256,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
         .await
         .unwrap();
     store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_native_terminal_delivery BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_delivery' BEGIN SELECT RAISE(ABORT, 'injected delivery failure'); END"
+        "CREATE FUNCTION reject_native_terminal_delivery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected delivery failure'; END $$; CREATE TRIGGER reject_native_terminal_delivery BEFORE INSERT ON cli_runtime_native_event FOR EACH ROW WHEN (NEW.native_method = 'gateway/terminal_delivery') EXECUTE FUNCTION reject_native_terminal_delivery()"
     ).await.unwrap();
     assert!(
         store
@@ -1308,7 +1280,7 @@ async fn cli_native_terminal_source_write_preserves_first_outcome_and_rolls_back
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_native_terminal_delivery")
+        .execute_unprepared("DROP TRIGGER reject_native_terminal_delivery ON cli_runtime_native_event; DROP FUNCTION reject_native_terminal_delivery()")
         .await
         .unwrap();
     assert!(
@@ -1591,7 +1563,7 @@ async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_ne
                 .unwrap();
         }
         store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_task_continuation BEFORE INSERT ON turn_cli_runtime_attempt WHEN NEW.id = 'task-attempt' BEGIN SELECT RAISE(ABORT, 'injected task continuation failure'); END"
+        "CREATE FUNCTION reject_task_continuation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected task continuation failure'; END $$; CREATE TRIGGER reject_task_continuation BEFORE INSERT ON turn_cli_runtime_attempt FOR EACH ROW WHEN (NEW.id = 'task-attempt') EXECUTE FUNCTION reject_task_continuation()"
     ).await.unwrap();
         assert!(
             store
@@ -1637,29 +1609,63 @@ async fn cli_task_continuation_rolls_back_and_replays_across_scopes_without_a_ne
         );
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_task_continuation")
+            .execute_unprepared("DROP TRIGGER reject_task_continuation ON turn_cli_runtime_attempt; DROP FUNCTION reject_task_continuation()")
             .await
             .unwrap();
         let interactive = store.with_interactive_writes();
         let maintenance = store.with_maintenance_access();
-        let (first, replay) = tokio::join!(
-            interactive.prepare_cli_runtime_task_continuation(
-                source.clone(),
-                "task-owner".into(),
-                "task-attempt".into(),
-                input.clone(),
-                ack.clone()
-            ),
-            maintenance.prepare_cli_runtime_task_continuation(
-                source.clone(),
-                "task-owner".into(),
-                "task-attempt".into(),
-                input.clone(),
-                ack.clone()
-            ),
-        );
-        let first = first.unwrap();
-        assert_eq!(first, replay.unwrap());
+        let gate = store.database_connection().begin().await.unwrap();
+        pioneer_crud_execution::execution_reads::lock_cli_turn_binding(&gate, &source.turn_id)
+            .await
+            .unwrap();
+        let blocker_pid: i32 = gate
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        let launch = |store: CrudStore| {
+            let source = source.clone();
+            let input = input.clone();
+            let ack = ack.clone();
+            tokio::spawn(async move {
+                store
+                    .prepare_cli_runtime_task_continuation(
+                        source,
+                        "task-owner".into(),
+                        "task-attempt".into(),
+                        input,
+                        ack,
+                    )
+                    .await
+            })
+        };
+        let first = launch(interactive);
+        let replay = launch(maintenance);
+        let observer = store.database_connection();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = observer.query_one_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                     WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid))) AS waiting",
+                    [blocker_pid.into()],
+                )).await.unwrap().unwrap().try_get("", "waiting").unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the competing continuation must wait on the held binding");
+        gate.rollback().await.unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first, replay.await.unwrap().unwrap());
         assert_eq!(
             first.1.execution_window_index,
             before.attempt.as_ref().unwrap().execution_window_index
@@ -1747,7 +1753,7 @@ async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
     source.terminal_delivery_id = Some(terminal.id.clone());
     let ack_id = format!("{}:ack", terminal.id);
     store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_task_blocked_ack BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_ack' BEGIN SELECT RAISE(ABORT, 'injected task blocked ACK failure'); END"
+        "CREATE FUNCTION reject_task_blocked_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected task blocked ACK failure'; END $$; CREATE TRIGGER reject_task_blocked_ack BEFORE INSERT ON cli_runtime_native_event FOR EACH ROW WHEN (NEW.native_method = 'gateway/terminal_ack') EXECUTE FUNCTION reject_task_blocked_ack()"
     ).await.unwrap();
     assert!(commit_blocked_source(&store, &source).await.is_err());
     assert!(
@@ -1778,7 +1784,7 @@ async fn cli_stalled_task_blocked_commits_accepted_outcome_ack_atomically() {
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_task_blocked_ack")
+        .execute_unprepared("DROP TRIGGER reject_task_blocked_ack ON cli_runtime_native_event; DROP FUNCTION reject_task_blocked_ack()")
         .await
         .unwrap();
     assert!(commit_blocked_source(&store, &source).await.unwrap());

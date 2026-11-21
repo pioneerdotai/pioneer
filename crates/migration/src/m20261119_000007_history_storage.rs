@@ -718,26 +718,6 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table("compaction_history_preparation")
-                    .col(text("thread_id").primary_key())
-                    .col(text_null("turn_id"))
-                    .col(big_integer("upper_turn_rowid").default(0))
-                    .col(big_integer("turn_rowid").default(0))
-                    .col(big_integer("source_kind").default(0))
-                    .col(big_integer("after_sequence").default(-1))
-                    .col(big_integer("step").default(0))
-                    .col(big_integer("inserted").default(0))
-                    .col(big_integer("input_order").default(0))
-                    .col(big_integer("event_order").default(0))
-                    .col(big_integer("context_order").default(0))
-                    .col(big_integer("ready").default(0))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
                     .table("compaction_frozen_layout")
                     .col(text("manifest_id"))
                     .col(big_integer("kind"))
@@ -1254,53 +1234,6 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table("compaction_frozen_sweep_bootstrap")
-                    .col(big_integer("kind").primary_key())
-                    .col(big_integer("started").default(0))
-                    .col(text_null("upper_manifest"))
-                    .col(text_null("after_manifest"))
-                    .col(big_integer("complete").default(0))
-                    .check(Expr::cust(r#""kind" IN ( 0 , 1 )"#))
-                    .check(Expr::cust(r#""started" IN ( 0 , 1 )"#))
-                    .check(Expr::cust(r#""complete" IN ( 0 , 1 )"#))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("compaction_frozen_sweep_bootstrap_pending")
-                    .table("compaction_frozen_sweep_bootstrap")
-                    .col("complete")
-                    .col("kind")
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("compaction_frozen_sweep_bootstrap")
-                    .columns(["kind", "started", "complete"])
-                    .values_panic([0_i64.into(), 0_i64.into(), 0_i64.into()])
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .exec_stmt(
-                Query::insert()
-                    .into_table("compaction_frozen_sweep_bootstrap")
-                    .columns(["kind", "started", "complete"])
-                    .values_panic([1_i64.into(), 0_i64.into(), 0_i64.into()])
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
                     .table("compaction_root_activity")
                     .col(text("thread_id").primary_key())
                     .col(text("user_turn_id"))
@@ -1368,7 +1301,6 @@ impl MigrationTrait for Migration {
             &[
                 "html_preview_io_work",
                 "compaction_root_activity",
-                "compaction_frozen_sweep_bootstrap",
                 "compaction_frozen_sweep_fanout",
                 "compaction_frozen_sweep_consumer",
                 "compaction_frozen_sweep_work",
@@ -1383,7 +1315,6 @@ impl MigrationTrait for Migration {
                 "compaction_lifecycle_sequence",
                 "compaction_frozen_span",
                 "compaction_frozen_layout",
-                "compaction_history_preparation",
                 "compaction_task_basis_revision",
                 "compaction_turn_creation",
                 "compaction_projection_epoch",

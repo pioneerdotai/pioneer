@@ -320,7 +320,7 @@ async fn complete_thread_acl_query_accepts_the_unbounded_caller_sentinel() {
             u64::MAX,
         )
         .await
-        .expect("unbounded authorized thread list must remain valid SQLite");
+        .expect("unbounded authorized thread list must remain valid PostgreSQL");
         assert_eq!(
             threads
                 .into_iter()
@@ -646,4 +646,53 @@ fn persisted_thread_access_class_conversion_is_strict() {
         );
     }
     assert!(persisted_thread_access_class_from_db("public").is_err());
+}
+
+#[tokio::test]
+async fn authorized_workspace_limit_uses_the_gateway_id_order() -> Result<()> {
+    pioneer_postgres_test::with_database(async |database| {
+        let fixture = membership_fixture(database.connection()).await;
+        let tx = fixture.database.begin().await?;
+        let now = chrono::Utc::now().fixed_offset();
+        insert_workspace_membership(
+            &tx,
+            &NewWorkspaceMembership {
+                gateway_id: fixture.gateway_id.clone(),
+                principal_id: fixture.member_id.clone(),
+                workspace_id: fixture.red_workspace_id.clone(),
+                granted_by: PersistedActorRef::System,
+                now,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        for id in ["a", "B"] {
+            pioneer_entity::thread::Entity::insert(pioneer_entity::thread::ActiveModel {
+                id: Set(id.into()),
+                workspace_id: Set(fixture.red_workspace_id.clone()),
+                preview: Set(String::new()),
+                mode: Set("chat".into()),
+                model: Set("fixture".into()),
+                model_provider: Set("fixture".into()),
+                status: Set("active".into()),
+                access_class: Set("workspace".into()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .exec_without_returning(&fixture.database)
+            .await?;
+        }
+        let one = list_accessible_threads_for_principal(
+            &fixture.database,
+            &fixture.member_id,
+            &fixture.red_workspace_id,
+            1,
+        )
+        .await?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, "B");
+        Ok(())
+    })
+    .await
 }

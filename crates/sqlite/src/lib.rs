@@ -1,7 +1,4 @@
-use anyhow::{Context, Result, bail};
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::future::Future;
-use std::path::{Component, Path};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -12,8 +9,6 @@ pub use query_scope::DiagnosticStream;
 mod work_signal;
 mod writer;
 pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_deadline};
-mod writer_ownership;
-pub use writer_ownership::{WriterBusy, WriterOwnership};
 
 pub use database::{SqliteDatabase, SqliteReadTransaction};
 pub use reader::{
@@ -56,14 +51,8 @@ impl SqliteAdmissionSnapshot {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod search;
-#[cfg(any(test, feature = "test-support"))]
-pub mod zstd;
-
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
 pub const DEFAULT_LOCK_RETRY_BASE_DELAY_MS: u64 = 20;
-pub const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub async fn retry_with_backoff<T, E, F, Fut, P>(
     mut operation: F,
@@ -104,25 +93,14 @@ where
         }
     }
 
-    unreachable!("sqlite retry loop must return in all branches")
-}
-
-pub fn is_sqlite_lock_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    (normalized.contains("database") && normalized.contains("locked"))
-        || (normalized.contains("database") && normalized.contains("busy"))
-        || normalized.contains("sqlite_busy")
-}
-
-pub fn is_anyhow_sqlite_lock(error: &anyhow::Error) -> bool {
-    is_sqlite_lock_message(format!("{error:#}").as_str())
+    unreachable!("database retry loop must return in all branches")
 }
 
 /// A transaction rejected by PostgreSQL must be retried from its beginning.
 pub fn is_retryable_database_conflict(error: &anyhow::Error) -> bool {
     use sea_orm::{DbErr, RuntimeErr, sqlx};
 
-    let retryable_postgres = error.chain().any(|source| {
+    error.chain().any(|source| {
         let error = match source.downcast_ref::<DbErr>() {
             Some(DbErr::Exec(RuntimeErr::SqlxError(error)))
             | Some(DbErr::Query(RuntimeErr::SqlxError(error))) => Some(error.as_ref()),
@@ -132,149 +110,56 @@ pub fn is_retryable_database_conflict(error: &anyhow::Error) -> bool {
             return false;
         };
         matches!(error.code().as_deref(), Some("40001" | "40P01"))
-    });
-    retryable_postgres || is_anyhow_sqlite_lock(error)
+    })
 }
 
-pub fn is_sqlite_transient_open_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("sqlite_cantopen") || normalized.contains("unable to open database file")
-}
+/// Failures for which the operation can obtain a fresh PostgreSQL session
+/// or repeat a transaction known to have rolled back.
+pub fn is_anyhow_database_transient_access(error: &anyhow::Error) -> bool {
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, sqlx};
 
-pub fn is_anyhow_sqlite_transient_open(error: &anyhow::Error) -> bool {
-    is_sqlite_transient_open_message(format!("{error:#}").as_str())
-}
-
-pub fn is_sqlite_pool_timeout_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("connection pool timed out")
-        || normalized.contains("failed to acquire connection from pool")
-}
-
-pub fn is_anyhow_sqlite_pool_timeout(error: &anyhow::Error) -> bool {
-    is_sqlite_pool_timeout_message(format!("{error:#}").as_str())
-}
-
-pub fn is_anyhow_sqlite_transient_access(error: &anyhow::Error) -> bool {
-    is_anyhow_sqlite_transient_open(error) || is_anyhow_sqlite_pool_timeout(error)
-}
-
-pub async fn apply_sqlite_pragmas<C>(connection: &C) -> Result<()>
-where
-    C: ConnectionTrait + Sync,
-{
-    connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA journal_mode = WAL",
-        ))
-        .await
-        .context("failed to set sqlite PRAGMA journal_mode = WAL")?;
-
-    connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            format!("PRAGMA busy_timeout = {DEFAULT_SQLITE_BUSY_TIMEOUT_MS}"),
-        ))
-        .await
-        .context("failed to set sqlite PRAGMA busy_timeout")?;
-
-    connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA foreign_keys = OFF",
-        ))
-        .await
-        .context("failed to set sqlite PRAGMA foreign_keys = OFF")?;
-
-    Ok(())
-}
-
-pub fn sqlite_connection_url(path: &Path) -> String {
-    sqlite_connection_url_with_mode(path, "rwc")
-}
-
-pub fn sqlite_read_only_connection_url(path: &Path) -> String {
-    sqlite_connection_url_with_mode(path, "ro")
-}
-
-fn sqlite_connection_url_with_mode(path: &Path, mode: &str) -> String {
-    let normalized_path = path.to_string_lossy().replace('\\', "/");
-    let has_windows_drive_prefix = normalized_path
-        .as_bytes()
-        .get(1)
-        .is_some_and(|value| *value == b':');
-    let needs_leading_slash =
-        (path.is_absolute() || has_windows_drive_prefix) && !normalized_path.starts_with('/');
-
-    let path_part = if needs_leading_slash {
-        format!("/{normalized_path}")
-    } else {
-        normalized_path
-    };
-
-    format!("sqlite://{path_part}?mode={mode}")
-}
-
-pub fn normalize_relative_database_file_name(value: &str, field_name: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("{field_name} must not be empty");
-    }
-
-    let path = Path::new(trimmed);
-
-    if path.is_absolute() {
-        bail!("{field_name} must be relative");
-    }
-
-    if path.components().any(is_disallowed_component) {
-        bail!("{field_name} must not contain parent or root components");
-    }
-
-    Ok(trimmed.to_owned())
-}
-
-fn is_disallowed_component(component: Component<'_>) -> bool {
-    matches!(
-        component,
-        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-    )
+    error.chain().any(|source| {
+        let error = match source.downcast_ref::<DbErr>() {
+            Some(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)) => return true,
+            Some(
+                DbErr::Conn(RuntimeErr::SqlxError(error))
+                | DbErr::Exec(RuntimeErr::SqlxError(error))
+                | DbErr::Query(RuntimeErr::SqlxError(error)),
+            ) => Some(error.as_ref()),
+            _ => source.downcast_ref::<sqlx::Error>(),
+        };
+        match error {
+            Some(sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(error)) => matches!(
+                error.code().as_deref(),
+                Some("40001" | "40P01" | "55P03" | "08001" | "53300" | "57P03")
+            ),
+            _ => false,
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_sqlite_lock_message, is_sqlite_pool_timeout_message, is_sqlite_transient_open_message,
-    };
+    use super::*;
 
     #[test]
-    fn detects_sqlite_transient_open_errors() {
-        assert!(is_sqlite_transient_open_message(
-            "Query Error: error returned from database: (code: 14) unable to open database file"
-        ));
-        assert!(is_sqlite_transient_open_message("SQLITE_CANTOPEN"));
-    }
-
-    #[test]
-    fn transient_open_errors_do_not_match_lock_only_predicate() {
-        assert!(!is_sqlite_lock_message(
-            "Query Error: error returned from database: (code: 14) unable to open database file"
-        ));
-    }
-
-    #[test]
-    fn detects_sqlite_pool_acquire_timeouts() {
-        assert!(is_sqlite_pool_timeout_message(
-            "failed to query expired running attempts: Failed to acquire connection from pool: Connection pool timed out: Connection pool timed out",
-        ));
-    }
-
-    #[test]
-    fn pool_acquire_timeouts_do_not_match_lock_only_predicate() {
-        assert!(!is_sqlite_lock_message(
-            "Failed to acquire connection from pool: Connection pool timed out"
-        ));
+    fn only_typed_storage_errors_authorize_retry() {
+        let timeout = anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ))
+        .context("failed to list active tasks");
+        assert!(is_anyhow_database_transient_access(&timeout));
+        assert!(!is_retryable_database_conflict(&timeout));
+        for text in [
+            "SQLSTATE 40001",
+            "connection pool timed out",
+            "database is locked",
+        ] {
+            let error = anyhow::anyhow!(text);
+            assert!(!is_anyhow_database_transient_access(&error));
+            assert!(!is_retryable_database_conflict(&error));
+        }
     }
 }
 

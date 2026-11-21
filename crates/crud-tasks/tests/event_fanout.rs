@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use pioneer_crud_tasks::event_fanout::TaskEventFanoutOutcome;
 use pioneer_crud_tasks::{event_fanout as queue, event_log};
-use pioneer_entity::task_event_fanout_pending as pending;
+use pioneer_entity::{task_event, task_event_fanout_pending as pending};
 use pioneer_postgres_test::with_database;
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    TransactionTrait,
+};
 
 #[tokio::test]
 async fn append_preserves_the_fanout_holder_and_a_stale_error_cannot_overwrite_ack() -> Result<()> {
@@ -78,12 +81,18 @@ async fn append_preserves_the_fanout_holder_and_a_stale_error_cannot_overwrite_a
 }
 
 async fn publish(db: &DatabaseConnection, id: &str, sequence: i64) -> Result<()> {
-    let payload = event_log::EventPayload::prepare("{}")?;
     let tx = db.begin().await?;
     event_log::lock_task(&tx, "task").await?;
     assert_eq!(event_log::next_sequence(&tx, "task").await?, sequence);
+    append(&tx, id, sequence).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn append(db: &impl ConnectionTrait, id: &str, sequence: i64) -> Result<()> {
+    let payload = event_log::EventPayload::prepare("{}")?;
     event_log::append(
-        &tx,
+        db,
         event_log::NewEvent {
             id,
             task_id: "task",
@@ -98,6 +107,102 @@ async fn publish(db: &DatabaseConnection, id: &str, sequence: i64) -> Result<()>
         payload,
     )
     .await?;
-    tx.commit().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn atomic_new_batch_keeps_first_sequence_and_rollback_removes_tracking() -> Result<()> {
+    with_database(async |fixture| {
+        let writer = fixture.connect().await?;
+        let reader = fixture.connection();
+        reader
+            .execute_unprepared(
+                "INSERT INTO workspace(id,name) VALUES ('workspace','Workspace');
+                 INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+                 VALUES ('task','workspace','workspace','system','running','Task','Test')",
+            )
+            .await?;
+
+        let history = writer.begin().await?;
+        event_log::lock_task(&history, "task").await?;
+        for sequence in 1..=100 {
+            append(&history, &format!("history-{sequence}"), sequence).await?;
+        }
+        history.commit().await?;
+        let clock = || 4_000_000_000;
+        let candidate = queue::due(reader, clock(), 1)
+            .await?
+            .pop()
+            .context("historical event frontier")?;
+        let claim = queue::claim(reader, &candidate, "history".into(), &clock)
+            .await?
+            .context("claim historical events")?;
+        queue::ack(reader, &claim, 100, &clock).await?;
+        assert!(
+            pending::Entity::find_by_id("task")
+                .one(reader)
+                .await?
+                .is_none()
+        );
+
+        for commit in [false, true] {
+            let batch = writer.begin().await?;
+            event_log::lock_task(&batch, "task").await?;
+            for sequence in [101, 102] {
+                assert_eq!(event_log::next_sequence(&batch, "task").await?, sequence);
+                append(&batch, &format!("batch-{sequence}"), sequence).await?;
+            }
+            let frontier = pending::Entity::find_by_id("task")
+                .one(&batch)
+                .await?
+                .context("new event frontier in writer transaction")?;
+            assert_eq!(
+                (frontier.first_sequence, frontier.newest_sequence),
+                (101, 102)
+            );
+            assert!(
+                pending::Entity::find_by_id("task")
+                    .one(reader)
+                    .await?
+                    .is_none()
+            );
+
+            if commit {
+                batch.commit().await?;
+            } else {
+                batch.rollback().await?;
+                assert!(
+                    pending::Entity::find_by_id("task")
+                        .one(reader)
+                        .await?
+                        .is_none()
+                );
+                assert_eq!(
+                    task_event::Entity::find()
+                        .filter(task_event::Column::TaskId.eq("task"))
+                        .count(reader)
+                        .await?,
+                    100
+                );
+            }
+        }
+        let committed = pending::Entity::find_by_id("task")
+            .one(reader)
+            .await?
+            .context("committed event frontier")?;
+        assert_eq!(
+            (committed.first_sequence, committed.newest_sequence),
+            (101, 102)
+        );
+        assert_eq!(
+            task_event::Entity::find()
+                .filter(task_event::Column::TaskId.eq("task"))
+                .count(reader)
+                .await?,
+            102
+        );
+        writer.close().await?;
+        Ok(())
+    })
+    .await
 }

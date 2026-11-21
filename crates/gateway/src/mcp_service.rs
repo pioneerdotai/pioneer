@@ -6917,11 +6917,11 @@ mod tests {
                      ) VALUES(\
                         '{SESSION_ID}','{GATEWAY_ID}','{PRINCIPAL_ID}','{DEVICE_ID}',\
                         'F0000000000000000000A',NULL,\
-                        X'000000000000000000000000000000000000000000000000000000000000000A',\
-                        X'100000000000000000000000000000000000000000000000000000000000000A',\
-                        0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                        decode('000000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                        decode('100000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                        0,(CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',0,\
                         CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                        datetime('now','+90 days'),NULL,NULL\
+                        (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
                      );\
                      UPDATE turn \
                      SET initiated_by_actor_kind='principal',\

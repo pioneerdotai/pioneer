@@ -293,7 +293,7 @@ mod tests {
         let writer = fixture.connect_with_limit(1).await.unwrap();
         writer
             .execute_unprepared(
-                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
+                "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
             )
             .await
             .unwrap();
@@ -381,8 +381,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - before,
-            3,
-            "time budget stops the NEXT operation after frontier, scope page and witness"
+            6,
+            "time budget permits one conversion step: frontier, two layout seeks, header and two witnesses"
         );
         let before = observer.operations();
         assert!(
@@ -520,8 +520,8 @@ mod tests {
         );
         assert_eq!(
             observer.operations() - operations,
-            3,
-            "only current scope step (frontier, page and witness) completes after wait"
+            6,
+            "only the conversion step completes after reader admission, including both layout witnesses"
         );
 
         let held = store.database_connection().begin_read().await.unwrap();
@@ -634,7 +634,7 @@ mod tests {
         }
         assert!(
             finished,
-            "startup must reach checked EOF with retaining readers"
+            "maintenance must reach EOF with retaining readers"
         );
         let db = store.database_connection();
         let mut release = db.work_signal("maintenance.frozen.release").subscribe();
@@ -823,7 +823,7 @@ mod tests {
                 break;
             }
         }
-        assert!(idle, "the initial legacy inventory must finish");
+        assert!(idle, "initial work must reach EOF");
         let db = store.database_connection();
         let mut wake = db.work_signal("maintenance.frozen").subscribe();
         wake.begin_pass(&db).await.unwrap();
@@ -993,15 +993,9 @@ mod tests {
                     break;
                 }
                 useful += 1;
-                assert!(
-                    more,
-                    "scope and active conversion continue in the next batch"
-                );
+                assert!(more, "active conversion continues in the next batch");
             }
-            assert!(
-                useful > 4,
-                "scope and staged layout validation took bounded steps"
-            );
+            assert!(useful > 4, "staged layout validation took bounded steps");
             assert!(admission.done[0], "actual conversion EOF");
             assert_eq!(
                 history::Entity::find_by_id("live")
@@ -1025,9 +1019,9 @@ mod tests {
             );
 
             admission.done[1] = false;
-            // Locator and proof discovery each capture a frontier and read a page.
-            // Repeating the three conversion discovery reads would change the count.
-            for _ in 0..2 {
+            // The first real lifetime phase is proof discovery. Its frontier
+            // and page must be the only reads while conversion is at EOF.
+            {
                 let before = observer.operations();
                 assert!(
                     batch(
@@ -1219,11 +1213,6 @@ mod tests {
             model: "m".into(),
             effort: None,
         };
-        store.database_connection().execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES('discard-key','discard-op','discard-owner',0,'s','identity',$1::text::json,1,1,'candidate')",
-            [serde_json::to_string(&selection).unwrap().into()],
-        )).await.unwrap();
         let mut progress = FrozenStorageLifetimeProgress::default();
         let mut eof = false;
         for _ in 0..128 {
@@ -1237,18 +1226,31 @@ mod tests {
             }
         }
         assert!(eof, "initial scope and conversion have completed");
-        // The first rotation visits locator, proof, expiry and sweep, then the
-        // concrete discard candidate. Scope was established by conversion.
-        for _ in 0..4 {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status,proof_version) VALUES('discard-key','discard-op','discard-owner',0,'s','identity',$1::text::json,1,1,'candidate',1)",
+            [serde_json::to_string(&selection).unwrap().into()],
+        )).await.unwrap();
+        assert!(
+            progress
+                .restart_for_changes(
+                    &store.with_maintenance_access(),
+                    Some(vec!["c:discard-key".into()]),
+                )
+                .await
+                .unwrap()
+        );
+        // Proof, expiry and sweep precede the addressed discard candidate.
+        for _ in 0..3 {
             assert!(progress.quantum(&store).await.unwrap());
         }
         let reads = observer.operations();
         let writes = observer.writes.lock().unwrap().len();
         assert!(progress.quantum(&store).await.unwrap());
-        let preflight_reads = observer.operations() - reads;
-        assert!(
-            (2..=3).contains(&preflight_reads),
-            "discard preflight must stay within its bounded maintenance read budget"
+        assert_eq!(
+            observer.operations() - reads,
+            2,
+            "preflight verifies incoming edges and loads the current runner binding"
         );
         assert_eq!(observer.writes.lock().unwrap().len(), writes);
         assert!(
@@ -1290,7 +1292,7 @@ mod tests {
             .await
             .unwrap()
         );
-        assert_eq!(admission.done, [false; 2], "scope/budget stop is not EOF");
+        assert_eq!(admission.done, [false; 2], "budget stop is not EOF");
 
         let held = store.database_connection().begin_read().await.unwrap();
         {
@@ -1313,7 +1315,9 @@ mod tests {
         drop(held);
         store
             .database_connection()
-            .execute_unprepared("ALTER TABLE compaction_frozen_layout RENAME TO unavailable_layout")
+            .execute_unprepared(
+                "ALTER TABLE compaction_frozen_history RENAME TO unavailable_history",
+            )
             .await
             .unwrap();
         progress = FrozenStorageLifetimeProgress::default();

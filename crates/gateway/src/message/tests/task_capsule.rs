@@ -370,14 +370,7 @@ fn tool_outputs(step: &CapsuleStepResult, name: &str) -> Vec<serde_json::Value> 
 #[test]
 fn durable_task_management_survives_new_executions_and_runtime_reconstruction() {
     run_standard_stack_message_test("Task capsule continuity", async {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = Database::connect(format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("capsule.sqlite3").display()
-        ))
-        .await
-        .unwrap();
-        let (manager, store, workspace) = setup_workspace_manager_with_connection(connection).await;
+        let (manager, store, workspace) = setup_workspace_manager().await;
         let thread = "task_capsule_root";
         let items = capsule_step(
             manager.clone(),
@@ -556,14 +549,7 @@ fn durable_task_management_survives_new_executions_and_runtime_reconstruction() 
 #[test]
 fn task_wait_repeats_timed_out_observations_for_task_and_run_ids() {
     run_standard_stack_message_test("Repeated task wait", async {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = Database::connect(format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("wait.sqlite3").display()
-        ))
-        .await
-        .unwrap();
-        let (manager, store, workspace) = setup_workspace_manager_with_connection(connection).await;
+        let (manager, store, workspace) = setup_workspace_manager().await;
         let thread = "task_wait_repeat_root";
         let mut task_ids = Vec::new();
         let mut run_ids = Vec::new();
@@ -749,14 +735,7 @@ async fn capsule_deliveries(
 #[test]
 fn reviewed_background_survives_creator_and_is_reviewed_by_later_capsule_executions() {
     run_standard_stack_message_test("Detached capsule review", async {
-        let temp = tempfile::tempdir().unwrap();
-        let connection = Database::connect(format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("review.sqlite3").display()
-        ))
-        .await
-        .unwrap();
-        let (manager, store, workspace) = setup_workspace_manager_with_connection(connection).await;
+        let (manager, store, workspace) = setup_workspace_manager().await;
         let thread = "review_capsule_root";
         let created = capsule_step(
             manager.clone(),

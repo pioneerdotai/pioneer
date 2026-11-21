@@ -1,24 +1,9 @@
 //! Timestamp and JSON column conversions for Task repositories.
 
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
-use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use serde::{Serialize, de::DeserializeOwned};
 
-pub fn unix_to_datetime(value: i64) -> DateTimeWithTimeZone {
-    Utc.timestamp_opt(value, 0)
-        .single()
-        .unwrap_or_else(Utc::now)
-        .fixed_offset()
-}
-
-/// SQL eligibility is checked at whole Unix seconds. Never round a fractional
-/// durable deadline down into an immediate, still-ineligible retry loop.
-pub fn deadline_unix_seconds(value: DateTimeWithTimeZone) -> i64 {
-    value
-        .timestamp()
-        .saturating_add(i64::from(value.timestamp_subsec_nanos() != 0))
-}
+pub use pioneer_crud_execution::time::{deadline_unix_seconds, unix_to_datetime};
 
 pub fn optional_typed_json_to_db<T: Serialize>(value: &Option<T>) -> Result<Option<String>> {
     value
@@ -46,4 +31,14 @@ pub fn optional_typed_json_from_db<T: DeserializeOwned>(
 
 pub fn typed_json_to_db<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).context("failed to serialize JSON column")
+}
+
+pub fn optional_json_value_from_db<T: DeserializeOwned>(
+    value: Option<serde_json::Value>,
+) -> Result<Option<T>> {
+    value.map(json_value_from_db).transpose()
+}
+
+pub fn json_value_from_db<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
+    serde_json::from_value(value).context("failed to decode PostgreSQL JSON column")
 }

@@ -546,7 +546,9 @@ async fn read_accepted_imports(
             let origin = references
                 .get(index)
                 .ok_or_else(|| anyhow::anyhow!("accepted own import has no canonical message"))?;
-            record.validate_preview_archive(store, workspace).await?;
+            record
+                .validate_preview_archive(&store.database_connection(), workspace)
+                .await?;
             let direct_source = record.matches_render_target(origin);
             let checkpoint_target = match origin.sources.as_slice() {
                 [source] if source.scope.starts_with("checkpoint:") => Some(ScopedHistorySource {
@@ -6709,6 +6711,14 @@ fn frozen_payload_batchable(reference: &FrozenMessageRef) -> bool {
         )
 }
 
+fn frozen_row_batchable(reference: &FrozenMessageRef) -> bool {
+    frozen_payload_batchable(reference)
+        || (reference.tool_name.as_deref() != Some("html_preview")
+            && reference.source_aliases.is_empty()
+            && matches!(reference.sources.as_slice(), [source]
+                if matches!(source.scope.split_once(':'), Some(("event" | "item", _)))))
+}
+
 /// Select whole entries from the sequential restore path, scoped to one thread.
 /// Count exact JSON-array bytes before copying an entry and stop at the first
 /// boundary. An oversized entry keeps its old preparation path instead of
@@ -6831,9 +6841,9 @@ async fn restore_entries_page_with_projection(
             index += 1;
             continue;
         }
-        if !frozen_payload_batchable(reference) {
-            #[cfg(test)]
-            pause_after_preparation_precheck().await;
+        #[cfg(test)]
+        pause_after_preparation_precheck().await;
+        if !frozen_row_batchable(reference) {
             result.push(
                 restore_entry(
                     store,
@@ -6853,13 +6863,16 @@ async fn restore_entries_page_with_projection(
             .iter()
             .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
             .take_while(|next| {
-                next.source_thread == reference.source_thread && frozen_payload_batchable(next)
+                next.source_thread == reference.source_thread && frozen_row_batchable(next)
             })
             .count();
         let sources = references[index..index + end]
             .iter()
-            .map(|entry| entry.sources[0].clone())
-            .collect::<Vec<_>>();
+            .map(|entry| {
+                entry.validate()?;
+                Ok(entry.sources[0].clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let (consumed, payloads) = store
             .compaction_reference_payload_batch(workspace, &reference.source_thread, &sources)
             .await?;

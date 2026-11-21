@@ -1,13 +1,15 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use pioneer_entity::task_run_execution;
+use pioneer_entity::{
+    agent_execution_resource_state, task_occurrence_contract, task_run_execution,
+};
 use pioneer_protocol::{TaskError, TaskExecutorKind, TaskResult, TaskRunExecutionStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Condition, Expr, OnConflict};
+use sea_orm::sea_query::{Condition, Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 
 use crate::status::{
@@ -51,42 +53,61 @@ pub async fn list_execution_observations_for_runs<C: ConnectionTrait>(
     if run_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; run_ids.len()].join(", ");
-    let sql = format!(
-        "SELECT execution.task_run_id AS run_id, execution.status AS status, \
-                CASE WHEN execution.executor_kind = 'agent' \
-                     THEN resource.last_heartbeat_at ELSE execution.heartbeat_at END AS heartbeat_at, \
-                resource.last_progress_at AS last_activity_at \
-         FROM task_run_execution AS execution \
-         LEFT JOIN task_occurrence_contract AS occurrence \
-           ON occurrence.run_id = execution.task_run_id \
-          AND occurrence.agent_execution_id = execution.id \
-         LEFT JOIN agent_execution_resource_state AS resource \
-           ON resource.execution_id = execution.id \
-          AND resource.attempt_generation = occurrence.retry_attempt + 1 \
-         WHERE execution.task_run_id IN ({placeholders})"
-    );
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            run_ids.iter().cloned().map(sea_orm::Value::from),
-        ))
+    use agent_execution_resource_state::{Column as Resource, Entity as Resources};
+    use task_occurrence_contract::{Column as Occurrence, Entity as Occurrences};
+    use task_run_execution::{Column as Execution, Entity as Executions};
+
+    let execution = |column| Expr::col((Executions, column));
+    let occurrence = |column| Expr::col((Occurrences, column));
+    let resource = |column| Expr::col((Resources, column));
+    let heartbeat = Expr::case(
+        execution(Execution::ExecutorKind).eq("agent"),
+        resource(Resource::LastHeartbeatAt),
+    )
+    .finally(execution(Execution::HeartbeatAt));
+    let mut query = Executions::find()
+        .select_only()
+        .column(Execution::TaskRunId)
+        .column(Execution::Status)
+        .expr_as(heartbeat, "heartbeat_at")
+        .expr_as(resource(Resource::LastProgressAt), "last_activity_at")
+        .filter(Execution::TaskRunId.is_in(run_ids.iter().cloned()));
+    QuerySelect::query(&mut query)
+        .join(
+            JoinType::LeftJoin,
+            Occurrences,
+            occurrence(Occurrence::RunId)
+                .eq(execution(Execution::TaskRunId))
+                .and(occurrence(Occurrence::AgentExecutionId).eq(execution(Execution::Id))),
+        )
+        .join(
+            JoinType::LeftJoin,
+            Resources,
+            resource(Resource::ExecutionId)
+                .eq(execution(Execution::Id))
+                .and(
+                    resource(Resource::AttemptGeneration)
+                        .eq(occurrence(Occurrence::RetryAttempt).add(1_i64)),
+                ),
+        );
+    let rows = query
+        .into_tuple::<(
+            String,
+            String,
+            Option<DateTimeWithTimeZone>,
+            Option<DateTimeWithTimeZone>,
+        )>()
+        .all(db)
         .await
         .context("failed to observe task run executions")?;
     rows.into_iter()
-        .map(|row| {
-            let status: String = row.try_get("", "status")?;
+        .map(|(run_id, status, heartbeat, last_activity)| {
             Ok(TaskRunExecutionObservationRecord {
-                run_id: row.try_get("", "run_id")?,
-                status: task_run_execution_status_from_db(status.as_str())
+                run_id,
+                status: task_run_execution_status_from_db(&status)
                     .with_context(|| format!("unknown task run execution status `{status}`"))?,
-                heartbeat_at: row
-                    .try_get::<Option<DateTimeWithTimeZone>>("", "heartbeat_at")?
-                    .map(|value| value.timestamp()),
-                last_activity_at: row
-                    .try_get::<Option<DateTimeWithTimeZone>>("", "last_activity_at")?
-                    .map(|value| value.timestamp()),
+                heartbeat_at: heartbeat.map(|value| value.timestamp()),
+                last_activity_at: last_activity.map(|value| value.timestamp()),
             })
         })
         .collect()

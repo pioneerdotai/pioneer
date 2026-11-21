@@ -105,8 +105,33 @@ SELECT i.id, i.workspace_id, i.thread_id, i.turn_id, i.item_id, i.source_actor_r
        i.source_runtime_kind, i.source_context_json, i.visibility, i.status,
        i.text_hash, i.source_text_hash, i.language_hint, i.token_estimate,
        i.indexed_at, i.created_at, i.updated_at, i.deleted_at, i.projection_group_id,
-       i.embedding_artifact_id, left(i.search_text, $18) AS search_text,
+       i.embedding_artifact_id,
+       substring(i.search_text FROM COALESCE(snippet.start_at, 1) FOR $18) AS search_text,
        p.lexical_rank, p.semantic_rank, coverage.incomplete
 FROM coverage LEFT JOIN page p ON true LEFT JOIN thread_episodic_items i ON i.id = p.id
+-- Match original tokens only on this page. Use the same normalized terms as
+-- the rank predicate and measure offsets in the original Unicode characters.
+LEFT JOIN LATERAL (
+    SELECT greatest(
+        1,
+        least(char_length(i.search_text) - $18 + 1,
+              token.start_at - greatest($18 - char_length(token.text), 0) / 2)
+    )::integer AS start_at
+    FROM (
+        SELECT part.piece[1] AS text,
+               1 + COALESCE(sum(char_length(part.piece[1])) OVER (
+                   ORDER BY part.ordinal ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+               ), 0) AS start_at
+        FROM regexp_matches(
+            CASE WHEN p.lexical_rank IS NOT NULL AND char_length(i.search_text) > $18
+                 THEN i.search_text END COLLATE pg_catalog.pg_c_utf8,
+            U&'([[:alnum:]][[:alnum:]\0300-\036F\1AB0-\1AFF\1DC0-\1DFF\FE20-\FE2F]*|[^[:alnum:]]+)',
+            'g'
+        ) WITH ORDINALITY AS part(piece, ordinal)
+    ) token
+    WHERE thread_episodic_search_terms(token.text) && thread_episodic_search_terms($9)
+    ORDER BY token.start_at
+    LIMIT 1
+) snippet ON true
 ORDER BY p.score DESC, p.thread_id COLLATE "C", p.turn_id COLLATE "C",
          p.item_id COLLATE "C", p.id COLLATE "C"

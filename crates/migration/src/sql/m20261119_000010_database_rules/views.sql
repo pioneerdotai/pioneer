@@ -177,12 +177,15 @@ CREATE VIEW compaction_frozen_import
                            THEN h.import_count
                          ELSE h.next_import
                        END
-       AND d.message_ordinal >= 0
-       AND d.message_ordinal < CASE h.ready
-                                 WHEN 1
-                                   THEN h.message_count
-                                 ELSE h.next_ordinal
-                               END
+       -- Apply visibility after locating the manifest's import range.
+       AND CASE
+             WHEN d.message_ordinal >= 0 THEN
+               d.message_ordinal < CASE h.ready
+                                     WHEN 1 THEN h.message_count
+                                     ELSE h.next_ordinal
+                                   END
+             ELSE false
+           END
        AND NOT EXISTS (SELECT 1
                        FROM compaction_frozen_layout AS l
                        WHERE l.manifest_id = h.id
@@ -224,9 +227,13 @@ CREATE VIEW compaction_frozen_import
                            THEN h.import_count
                          ELSE h.next_import
                        END
-       AND d.message_ordinal >= 0
-       AND d.message_ordinal < CASE h.ready
-                                 WHEN 1
-                                   THEN h.message_count
-                                 ELSE h.next_ordinal
-                               END;
+       -- A source manifest can contribute several spans. Seek by the
+       -- physical ordinal of each span before checking message visibility.
+       AND CASE
+             WHEN d.message_ordinal >= 0 THEN
+               d.message_ordinal < CASE h.ready
+                                     WHEN 1 THEN h.message_count
+                                     ELSE h.next_ordinal
+                                   END
+             ELSE false
+           END;

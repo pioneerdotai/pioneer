@@ -1,9 +1,11 @@
 use anyhow::Result;
 use pioneer_crud_packages::{
     McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
-    mcp_audit_event, mcp_server_catalog_snapshot, mcp_server_installation,
+    mcp_audit_event, mcp_installation_transactions, mcp_server_catalog_snapshot,
+    mcp_server_installation,
 };
 use pioneer_postgres_test::with_database;
+use sea_orm::TransactionTrait;
 use sea_orm::prelude::{DateTimeUtc, DateTimeWithTimeZone};
 
 fn at(offset: i64) -> DateTimeWithTimeZone {
@@ -112,9 +114,48 @@ async fn mcp_installation_catalog_and_audit_round_trip() -> Result<()> {
             details_json: "{\"transport_kind\":\"stdio\"}".to_owned(),
             created_at_unix: 1_700_000_003,
         };
-        mcp_audit_event::insert_mcp_audit_event(&database, &audit)
+        let unpublished = sample_mcp_installation("unpublished");
+        let mut invalid_audit = audit.clone();
+        invalid_audit.details_json = "{".into();
+        let transaction = database.begin().await?;
+        assert!(
+            mcp_installation_transactions::publish(
+                &transaction,
+                &unpublished,
+                &invalid_audit,
+                None,
+                None,
+                None,
+                at(3),
+            )
             .await
-            .expect("MCP audit insert should succeed");
+            .is_err()
+        );
+        transaction.rollback().await?;
+        assert!(
+            mcp_server_installation::find_mcp_server_installation(
+                &database,
+                "workspace",
+                "ws_mcp",
+                "unpublished",
+            )
+            .await?
+            .is_none()
+        );
+
+        let transaction = database.begin().await?;
+        let installed_id = mcp_installation_transactions::publish(
+            &transaction,
+            &beta_updated,
+            &audit,
+            None,
+            None,
+            None,
+            at(3),
+        )
+        .await?;
+        transaction.commit().await?;
+        assert_eq!(installed_id, beta_updated_id);
         let audit_rows = mcp_audit_event::list_recent_mcp_audit_events(&database, "beta", 10)
             .await
             .expect("MCP audit list should succeed");
@@ -151,14 +192,17 @@ async fn mcp_installation_catalog_and_audit_round_trip() -> Result<()> {
         assert_eq!(read_catalog.catalog_version, "catalog-v1");
         assert_eq!(read_catalog.tools_json, "[{\"name\":\"send\"}]");
 
-        mcp_server_installation::delete_mcp_server_installation(
-            &database,
-            "workspace",
-            "ws_mcp",
-            "alpha",
-        )
-        .await
-        .expect("MCP installation delete should succeed");
+        let mut uninstall_audit = audit.clone();
+        uninstall_audit.server_installation_id = None;
+        uninstall_audit.server_name = "alpha".into();
+        uninstall_audit.action = "uninstall".into();
+        let transaction = database.begin().await?;
+        mcp_installation_transactions::remove(&transaction, &alpha, &uninstall_audit, None, false)
+            .await?;
+        transaction.commit().await?;
+        let removed = mcp_audit_event::list_recent_mcp_audit_events(&database, "alpha", 10).await?;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].action, "uninstall");
         let rows = mcp_server_installation::list_mcp_server_installations(
             &database,
             "workspace",

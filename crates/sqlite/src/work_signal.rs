@@ -229,18 +229,20 @@ pub async fn wait_for_unix_deadline(deadline: i64) {
 mod tests {
     use super::{MAX_KEY_BYTES, MAX_KEYS};
     use futures_util::FutureExt;
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
     async fn database() -> crate::SqliteDatabase {
-        crate::SqliteDatabase::from_single_connection(
-            Database::connect("sqlite::memory:").await.unwrap(),
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        crate::SqliteDatabase::new(
+            fixture.connect_read_only().await.unwrap(),
+            fixture.connect_with_limit(1).await.unwrap(),
         )
     }
 
     // Existing heartbeat/recovery tests cover their own Notify protocols. They
     // do not protect independent subscriptions or a watch invalidation retained
     // across discovery, so this matrix belongs at the shared mechanism boundary.
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn keyed_frontiers_are_independent_bounded_and_keep_concurrent_changes() {
         let database = database().await;
         let signal = database.work_signal("test.keyed");
@@ -295,7 +297,7 @@ mod tests {
         database.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn independent_consumers_retain_bursts_and_discovery_races() {
         let database = database().await;
         let signal = database.work_signal("test.discovery");
@@ -330,7 +332,7 @@ mod tests {
         database.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cancelled_dispatched_mutation_is_settled_before_empty_discovery() {
         #[derive(Default)]
         struct Routes(std::sync::Mutex<Vec<crate::SqliteWriteClass>>);
@@ -341,53 +343,35 @@ mod tests {
                 }
             }
         }
-        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let raw = Database::connect(options).await.unwrap();
-        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
-        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        struct Release(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                let (lock, condition) = &*self.0;
-                *lock.lock().unwrap() = true;
-                condition.notify_one();
-            }
-        }
-        let release = Release(gate.clone());
-        {
-            let mut connection = raw.get_sqlite_connection_pool().acquire().await.unwrap();
-            let mut locked = connection.lock_handle().await.unwrap();
-            // The native fixture intentionally pauses a dispatched sqlite3_step
-            // to exercise cancellation after dispatch, without production hooks.
-            let native =
-                unsafe { rusqlite::Connection::from_handle(locked.as_raw_handle().as_ptr()) }
-                    .unwrap();
-            let entered = entered.clone();
-            let gate = gate.clone();
-            native
-                .create_scalar_function(
-                    "work_signal_gate",
-                    0,
-                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-                    move |_| {
-                        entered.notify_one();
-                        let (lock, condition) = &*gate;
-                        let mut released = lock.lock().unwrap();
-                        while !*released {
-                            released = condition.wait(released).unwrap();
-                        }
-                        Ok(7_i64)
-                    },
-                )
-                .unwrap();
-        }
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let raw = fixture.connect_with_limit(1).await.unwrap();
+        let reader = fixture.connect_read_only().await.unwrap();
+        let peer = fixture.connect_with_limit(1).await.unwrap();
         let routes = std::sync::Arc::new(Routes::default());
-        let writer = crate::SqliteWriteExecutor::with_observer(raw.clone(), routes.clone());
-        let database = crate::SqliteDatabase::from_executor(raw, writer);
+        let writer = crate::SqliteWriteExecutor::with_observer(raw, routes.clone());
+        let database = crate::SqliteDatabase::from_executor(reader, writer);
         database
-            .execute_unprepared("CREATE TABLE signal_probe(value INTEGER)")
+            .execute_unprepared(
+                "CREATE TABLE signal_probe(value INTEGER);
+             CREATE FUNCTION work_signal_gate() RETURNS integer LANGUAGE plpgsql AS $$
+             BEGIN PERFORM pg_advisory_xact_lock(7564301); RETURN 7; END; $$;",
+            )
             .await
+            .unwrap();
+        let blocking = peer.begin().await.unwrap();
+        blocking
+            .execute_unprepared("SELECT pg_advisory_xact_lock(7564301)")
+            .await
+            .unwrap();
+        let blocker = blocking
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_backend_pid()",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i32>(0)
             .unwrap();
         let signal = database.work_signal("test.cancelled");
         let mut subscription = signal.subscribe();
@@ -402,13 +386,26 @@ mod tests {
                 .unwrap();
             change.completed(true);
         });
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting = database.query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+                    [blocker.into()],
+                )).await.unwrap().unwrap().try_get_by_index::<bool>(0).unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("dispatched mutation must reach the PostgreSQL lock");
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         let maintenance = database.maintenance();
         let mut settling = Box::pin(subscription.begin_pass(&maintenance));
         assert!(settling.as_mut().now_or_never().is_none());
-        drop(release);
+        blocking.commit().await.unwrap();
+        peer.close().await.unwrap();
         settling.await.unwrap();
         assert_eq!(
             *routes.0.lock().unwrap(),
@@ -419,7 +416,7 @@ mod tests {
         );
         let row = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM signal_probe".to_owned(),
             ))
             .await

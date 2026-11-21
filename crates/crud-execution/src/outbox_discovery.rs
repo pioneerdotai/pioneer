@@ -22,16 +22,18 @@ fn exhausted() -> Select<outbox::Entity> {
     // escaped NUL. The canonical action row authorizes reconciliation.
     let canonical = action::Entity::find()
         .select_only()
-        .column(action::Column::Id)
+        .column(action::Column::ActionKind)
         .filter(
             Expr::col((action::Entity, action::Column::Id))
                 .eq(Expr::col((outbox::Entity, outbox::Column::ActionId))),
         )
-        .filter(action::Column::ActionKind.eq("start_agent"))
         .into_query();
     outbox::Entity::find()
         .filter(Expr::cust(EXHAUSTED))
-        .filter(Expr::exists(canonical))
+        // The scalar lookup uses the action primary key for each candidate
+        // reached by the partial outbox index. A semi-join can start by
+        // scanning the entire action ledger before it applies the bound.
+        .filter(Expr::from(canonical).eq("start_agent"))
         .filter(Expr::cust("(status!='failed' OR next_attempt_at IS NOT NULL OR COALESCE(last_error,'')!='outbox_detached_binding_rejected')"))
 }
 

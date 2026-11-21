@@ -497,20 +497,6 @@ $trigger$;
 CREATE TRIGGER "compaction_context_epoch_update" AFTER UPDATE OF payload,turn_id,source,item_id,sequence
 ON "turn_llm_context" FOR EACH ROW EXECUTE FUNCTION "compaction_context_epoch_update"();
 
-CREATE OR REPLACE FUNCTION "compaction_new_thread_prepared"()
-RETURNS trigger LANGUAGE plpgsql
-AS $trigger$
-BEGIN
-    INSERT INTO compaction_history_preparation (thread_id
-                                              , ready)
-    VALUES (new.id, 1);
-    RETURN NEW;
-END;
-$trigger$;
-
-CREATE TRIGGER "compaction_new_thread_prepared" AFTER INSERT
-ON "thread" FOR EACH ROW EXECUTE FUNCTION "compaction_new_thread_prepared"();
-
 CREATE OR REPLACE FUNCTION "compaction_lifecycle_compaction_operation_insert"()
 RETURNS trigger LANGUAGE plpgsql
 AS $trigger$

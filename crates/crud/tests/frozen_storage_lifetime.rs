@@ -9,7 +9,7 @@ async fn fixture() -> CrudStore {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connection().clone();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE),('other','other',TRUE,FALSE)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE),('other','other',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-thread','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         writer.execute_unprepared(sql).await.unwrap();
@@ -74,7 +74,12 @@ async fn drive(
         match progress.quantum(store).await {
             Ok(true) => {}
             Ok(false) => break,
-            Err(_) => failures += 1,
+            Err(error) => {
+                if failures == 0 {
+                    eprintln!("frozen storage test quantum failed: {error:#}");
+                }
+                failures += 1;
+            }
         }
     }
     failures
@@ -130,6 +135,53 @@ fn binding(json: String) -> pioneer_crud::NewCliRuntimeThreadBinding {
 }
 fn cursor(h: &FrozenHistoryRef) -> String {
     serde_json::json!({"pioneerContext":{"version":4,"nativeThreadId":"native","acceptedTurnId":"turn","acceptedTurnRevision":1,"acceptedTurnDeleted":false,"contextOwnerThreadId":"thread","contextHistoryJson":serde_json::to_string(h).unwrap()}}).to_string()
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn oversized_cursor_publishes_descriptor_in_tail_without_retaining_other_workspace() {
+    let store = fixture().await;
+    let retained = header(&store, "large-cursor-root", "ws", "thread", 1, 0).await;
+    let free = header(&store, "other-cursor-root", "other", "other-thread", 1, 0).await;
+    let receipt = cursor(&retained);
+    let mut json = String::with_capacity(9 * 1024 * 1024 + receipt.len() + 16);
+    json.push_str(r#"{"padding":""#);
+    json.extend(std::iter::repeat_n('x', 9 * 1024 * 1024));
+    json.push_str(r#"","#);
+    json.push_str(&receipt[1..]);
+    store
+        .upsert_cli_runtime_thread_binding(binding(json.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id='thread' AND frozen_manifest_id=$1", &retained.manifest_id).await,
+        1,
+        "the write must publish the root before background cleanup can run",
+    );
+    assert_eq!(
+        store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_cursor_json,
+        json,
+    );
+
+    let mut progress = FrozenStorageLifetimeProgress::default();
+    assert_eq!(drive(&store, &mut progress, 2_500).await, 0);
+    assert_eq!(expired(&store, &retained.manifest_id).await, 0);
+    assert_eq!(physical(&store, &retained.manifest_id).await, 1);
+    assert_eq!(expired(&store, &free.manifest_id).await, 1);
+    assert_eq!(physical(&store, &free.manifest_id).await, 0);
+
+    store
+        .upsert_cli_runtime_thread_binding(binding("{}".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(drive(&store, &mut progress, 2_000).await, 0);
+    assert_eq!(expired(&store, &retained.manifest_id).await, 1);
+    assert_eq!(physical(&store, &retained.manifest_id).await, 0);
 }
 
 #[pioneer_postgres_test::postgres_test]
@@ -722,7 +774,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('h',0,0,5,'p'),('h',1,0,3,'p')",vec![]).await;
     sql(
         &store,
-        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='h'",
+        "UPDATE compaction_frozen_layout AS layout SET active=1,pending=0,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='h'",
         vec![],
     )
     .await;
@@ -990,7 +1042,7 @@ async fn malformed_physical_keys_are_not_delete_permission() {
 async fn expiry_rollback_then_restart_sweep_keeps_identity_headers_and_monotonic_tombstone() {
     let store = fixture().await;
     let h = header(&store, "p", "ws", "thread", 1, 1).await;
-    sql(&store,"CREATE FUNCTION fixture_expiry_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit fault'; END; $$; CREATE TRIGGER fixture_expiry_fault BEFORE UPDATE OF expired ON compaction_frozen_history FOR EACH ROW EXECUTE FUNCTION fixture_expiry_fault()",vec![]).await;
+    store.database_connection().execute_unprepared("CREATE FUNCTION fixture_expiry_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit fault'; END; $$; CREATE TRIGGER fixture_expiry_fault BEFORE UPDATE OF expired ON compaction_frozen_history FOR EACH ROW EXECUTE FUNCTION fixture_expiry_fault()").await.unwrap();
     let mut p = FrozenStorageLifetimeProgress::default();
     assert!(drive(&store, &mut p, 1500).await > 0);
     assert_eq!(expired(&store, "p").await, 0);
@@ -1043,30 +1095,35 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
         sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES($1,0,0,1,'physical')",vec![id.clone().into()]).await;
         sql(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=$1",
+            "UPDATE compaction_frozen_layout AS layout SET active=1,pending=0,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id=$1",
             vec![id.into()],
         )
         .await;
     }
+    let db = store.database_connection();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared("SET LOCAL enable_seqscan = off")
+        .await
+        .unwrap();
     for (query, index) in [
         (
             "SELECT start,manifest_id FROM compaction_frozen_span WHERE source_manifest='physical' AND kind=0 AND start>=0 ORDER BY start,manifest_id LIMIT 64",
             "frozen_span_source",
         ),
         (
-            "SELECT run_id FROM task_run_conversation_snapshot WHERE frozen_manifest_id='physical' AND workspace_id='ws'",
+            "SELECT task_id FROM task_run_conversation_snapshot WHERE frozen_manifest_id='physical' AND workspace_id='ws' ORDER BY task_id LIMIT 1",
             "task_run_conversation_snapshot_frozen_root",
         ),
         (
-            "SELECT turn_id FROM turn_runtime_snapshot WHERE frozen_manifest_id='physical' AND workspace_id='ws'",
+            "SELECT 1 FROM turn_runtime_snapshot WHERE frozen_manifest_id='physical' AND workspace_id='ws' LIMIT 1",
             "turn_runtime_snapshot_frozen_root",
         ),
         (
-            "SELECT thread_id FROM thread_cli_runtime_binding WHERE frozen_manifest_id='physical' AND workspace_id='ws'",
+            "SELECT 1 FROM thread_cli_runtime_binding WHERE frozen_manifest_id='physical' AND workspace_id='ws' LIMIT 1",
             "thread_cli_runtime_binding_frozen_root",
         ),
         (
-            "SELECT turn_id FROM turn_cli_runtime_binding WHERE frozen_manifest_id='physical' AND workspace_id='ws'",
+            "SELECT 1 FROM turn_cli_runtime_binding WHERE frozen_manifest_id='physical' AND workspace_id='ws' LIMIT 1",
             "turn_cli_runtime_binding_frozen_root",
         ),
         (
@@ -1082,21 +1139,36 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
             "coverage_incoming_checkpoint",
         ),
     ] {
-        let plan = store
-            .database_connection()
+        let plan = tx
             .query_all_raw(Statement::from_string(
                 DbBackend::Postgres,
                 format!("EXPLAIN (COSTS OFF) {query}"),
             ))
             .await
             .unwrap();
+        let steps: Vec<String> = plan
+            .iter()
+            .map(|row| row.try_get("", "QUERY PLAN").unwrap())
+            .collect();
+        let locator_index = index
+            .strip_suffix("_frozen_root")
+            .map(|table| format!("{table}_frozen_locator_discovery"));
+        let indexed = steps.iter().any(|step| {
+            step.contains(index)
+                || locator_index
+                    .as_ref()
+                    .is_some_and(|locator| step.contains(locator))
+        });
         assert!(
-            plan.iter().any(|r| r
-                .try_get::<String>("", "QUERY PLAN")
-                .unwrap()
-                .contains(index)),
-            "expected indexed reverse lookup {index}"
+            indexed,
+            "expected indexed reverse lookup {index}: {steps:#?}"
         );
+        if locator_index.is_some() {
+            assert!(
+                steps.iter().any(|step| step.contains("Index Cond:") && step.contains("frozen_manifest_id")),
+                "reverse lookup must start from the exact manifest: {steps:#?}"
+            );
+        }
     }
     let hold = store
         .compaction_acquire_frozen_history(
@@ -1119,6 +1191,7 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
     drive(&store, &mut p, 100_000).await;
     assert_eq!(expired(&store, "logical-0000").await, 1);
     assert_eq!(physical(&store, "physical").await, 0);
+    tx.rollback().await.unwrap();
 }
 
 #[pioneer_postgres_test::postgres_test]

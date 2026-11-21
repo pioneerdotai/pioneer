@@ -32,6 +32,7 @@ pub struct MemoryManifestFailure {
     pub stage: MemoryManifestFailureStage,
     pub sqlite_primary_code: Option<i32>,
     pub sqlite_extended_code: Option<i32>,
+    pub postgres_sqlstate: Option<[u8; 5]>,
 }
 
 impl MemoryManifestFailure {
@@ -41,6 +42,7 @@ impl MemoryManifestFailure {
             stage,
             sqlite_primary_code: None,
             sqlite_extended_code: None,
+            postgres_sqlstate: None,
         }
     }
 

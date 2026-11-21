@@ -92,8 +92,8 @@ async fn failed_progress_with_status(
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn SET status=? WHERE id='turn'",
+            DbBackend::Postgres,
+            "UPDATE turn SET status=$1 WHERE id='turn'",
             [old_status.into()],
         ))
         .await
@@ -144,33 +144,38 @@ async fn run_until_invalid_completion(
 ) -> CompactionExit {
     let operation = snapshot.id.clone();
     let runner = runner(f, snapshot, fits, turn);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let (exit, ()) = tokio::join!(runner.run(CancellationToken::new()), async {
-            for attempt in 1..=2 {
-                loop {
-                    let state = f
-                        .store
-                        .compaction_runner_state(&operation)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    if let RunnerPhase::Backoff { not_before_ms, .. } = state.phase
-                        && state.portion_attempts == attempt
-                    {
-                        f.clock.advance(not_before_ms);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
+    let mut sleeps = f.clock.subscribe_sleeps();
+    let execution = runner.run(CancellationToken::new());
+    tokio::pin!(execution);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // Deadlines are driven by the manual clock. Wake only on the exact
+        // persisted backoff, and surface any premature exit immediately.
+        for attempt in 1..=2 {
+            loop {
+                let next = tokio::select! {
+                    exit = &mut execution => anyhow::bail!(
+                        "runner exited before invalid attempt {attempt} finished backing off: {exit:?}"
+                    ),
+                    next = sleeps.recv() => next?,
+                };
+                let state = f.store.compaction_runner_state(&operation).await?
+                    .ok_or_else(|| anyhow::anyhow!("missing runner state while driving invalid completion"))?;
+                if let RunnerPhase::Backoff { not_before_ms, .. } = state.phase
+                    && state.portion_attempts == attempt && next == not_before_ms
+                {
+                    f.clock.advance(not_before_ms);
+                    break;
                 }
             }
-        });
-        exit.unwrap()
+        }
+        execution.await
     })
     .await
     .expect("invalid completion attempts did not finish")
+    .expect("invalid completion runner failed")
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain() {
     for (correction, same_deadline, old_status) in [
         (false, false, "failed"),
@@ -329,8 +334,8 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
             .unwrap()
             .status;
         assert_eq!(saved_status, old_status);
-        let observations = f.store.database_connection().query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT observation FROM compaction_attempt_observation WHERE operation_id=? ORDER BY attempt", [snapshot.id.into()])).await.unwrap();
+        let observations = f.store.database_connection().query_all_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT observation::text AS observation FROM compaction_attempt_observation WHERE operation_id=$1 ORDER BY attempt", [snapshot.id.into()])).await.unwrap();
         assert!(observations.len() > before.attempts as usize);
         let failed_observation: pioneer_compaction::runner::AttemptObservation =
             serde_json::from_str(
@@ -346,7 +351,7 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_without_mutation() {
     for case in [
         "plan",
@@ -381,7 +386,7 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
                 // Closed checkpoints are immutable. Model a missing reference
                 // in saved runner state without deleting retained evidence.
                 Some(
-                    "UPDATE compaction_runner_state SET state=json_set(state,'$.previous_checkpoint','missing-checkpoint') WHERE operation_id IN (SELECT id FROM compaction_operation WHERE owner='resume-owner')",
+                    "UPDATE compaction_runner_state SET state=jsonb_set(state::jsonb,'{previous_checkpoint}',to_jsonb('missing-checkpoint'::text))::json WHERE operation_id IN (SELECT id FROM compaction_operation WHERE owner='resume-owner')",
                 ),
                 "checkpoint is unavailable",
             ),
@@ -405,7 +410,7 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
             ),
             "legacy-correction" => (
                 Some(
-                    "UPDATE compaction_runner_state SET state=json_remove(state,'$.resume_phase') WHERE operation_id IN (SELECT id FROM compaction_operation WHERE owner='resume-owner')",
+                    "UPDATE compaction_runner_state SET state=(state::jsonb-'resume_phase')::json WHERE operation_id IN (SELECT id FROM compaction_operation WHERE owner='resume-owner')",
                 ),
                 "phase is unsafe",
             ),
@@ -497,7 +502,7 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     let (f, mut prepared, snapshot, before) = failed_progress(false).await;
     let operation_before = f
@@ -508,7 +513,7 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
         .unwrap();
     prepared.execution_turn = "new-turn".into();
     f.store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END",
+        "CREATE FUNCTION reject_resume() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END; $$; CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state FOR EACH ROW EXECUTE FUNCTION reject_resume();",
     ).await.unwrap();
     let error = admit(&f, prepared, 20).await.unwrap_err();
     assert!(error.to_string().contains("fixture"), "{error:#}");
@@ -533,7 +538,9 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     );
     f.store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_resume")
+        .execute_unprepared(
+            "DROP TRIGGER reject_resume ON compaction_runner_state; DROP FUNCTION reject_resume()",
+        )
         .await
         .unwrap();
     let deadline = before.deadline_ms + 10;
@@ -556,7 +563,7 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     assert_eq!(after.portion_attempts, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn invalid_completion_resume_keeps_saved_admission_immutable() {
     let (f, mut prepared, snapshot, before) = failed_progress(false).await;
     let record = pioneer_entity::compaction_operation::Entity::find_by_id(snapshot.id.clone())
@@ -601,9 +608,9 @@ async fn invalid_completion_resume_keeps_saved_admission_immutable() {
             .store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "UPDATE compaction_operation SET status='running',outcome=NULL,
-                 deadline_ms=?,snapshot=?,fingerprint=?,execution_turn=? WHERE id=?",
+                 deadline_ms=$1,snapshot=$2,fingerprint=$3,execution_turn=$4 WHERE id=$5",
                 [
                     i64::try_from(deadline).unwrap().into(),
                     serde_json::to_string(&changed).unwrap().into(),
@@ -657,7 +664,7 @@ async fn invalid_completion_resume_keeps_saved_admission_immutable() {
     assert_eq!(*f.provider.count.borrow() as u64, before.attempts);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
     let (f, mut prepared, snapshot, before) = failed_progress(false).await;
     for kind in [
@@ -672,8 +679,8 @@ async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
         f.store
             .database_connection()
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_runner_state SET state=? WHERE operation_id=?",
+                DbBackend::Postgres,
+                "UPDATE compaction_runner_state SET state=$1::text::json WHERE operation_id=$2",
                 [
                     serde_json::to_string(&other).unwrap().into(),
                     snapshot.id.clone().into(),
@@ -715,8 +722,8 @@ async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_runner_state SET state=? WHERE operation_id=?",
+            DbBackend::Postgres,
+            "UPDATE compaction_runner_state SET state=$1::text::json WHERE operation_id=$2",
             [legacy.to_string().into(), snapshot.id.clone().into()],
         ))
         .await
@@ -741,14 +748,14 @@ async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
     assert_eq!(after.portion_attempts, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn refreshed_source_plan_cannot_silently_recompute_saved_progress() {
     let (f, mut prepared, snapshot, before) = failed_progress(false).await;
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_event SET payload=? WHERE id='source'",
+            DbBackend::Postgres,
+            "UPDATE turn_event SET payload=$1::text::json WHERE id='source'",
             [
                 canonical_agent_message_event_payload("fixture-agent-message", "edited history")
                     .into(),
@@ -809,7 +816,7 @@ async fn refreshed_source_plan_cannot_silently_recompute_saved_progress() {
         .store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation WHERE owner='resume-owner'",
         ))
         .await
@@ -820,7 +827,7 @@ async fn refreshed_source_plan_cannot_silently_recompute_saved_progress() {
     assert_eq!(operations, 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn historical_invalid_completion_does_not_block_admission_after_head_advances() {
     let (f, prepared_a) = progress_fixture(false).await;
     let a = admit(&f, prepared_a.clone(), 10).await.unwrap();
@@ -865,8 +872,8 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
             .status,
         "completed"
     );
-    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "UPDATE compaction_frozen_history SET expired=1 WHERE id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?)",
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "UPDATE compaction_frozen_history SET expired=1 WHERE id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=$1)",
         [a.id.clone().into()],
     )).await.unwrap();
     assert!(
@@ -900,9 +907,9 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at)
-         VALUES ('next-source','thread','new-turn',1,?,?,CURRENT_TIMESTAMP)",
+         VALUES ('next-source','thread','new-turn',1,$1,$2::text::json,CURRENT_TIMESTAMP)",
             [event.event_type().into(), payload.into()],
         ))
         .await
@@ -1028,7 +1035,7 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
         .store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT count(*) AS n FROM compaction_operation WHERE owner='resume-owner'",
         ))
         .await

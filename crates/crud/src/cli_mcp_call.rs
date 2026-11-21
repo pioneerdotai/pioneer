@@ -13,43 +13,8 @@ pub struct CliMcpCallIdentity {
     pub execution_owner: Option<(String, u64)>,
 }
 
-fn cli_mcp_item_metadata(item: &TurnItem) -> Option<&pioneer_protocol::ToolMetadata> {
-    let TurnItem::DynamicToolCall { storage, .. } = item else {
-        return None;
-    };
-    match storage {
-        ToolStoragePayload::Summary(summary) => Some(&summary.metadata),
-        ToolStoragePayload::Metadata { metadata } => Some(metadata),
-        _ => None,
-    }
-}
-
-/// Recognizes host-enriched MCP lifecycle items, not tool names or arguments.
-pub fn is_managed_cli_mcp_item(item: &TurnItem) -> bool {
-    let TurnItem::DynamicToolCall { id, tool_name, .. } = item else {
-        return false;
-    };
-    let Some(metadata) = cli_mcp_item_metadata(item) else {
-        return false;
-    };
-    metadata
-        .get("canonicalCallableName")
-        .and_then(|v| v.as_str())
-        == Some(tool_name.as_str())
-        && metadata.get("providerCallId").and_then(|v| v.as_str()) == Some(id.as_str())
-        && metadata
-            .get("sessionGeneration")
-            .and_then(|v| v.as_u64())
-            .is_some()
-        && metadata
-            .get("manifestHash")
-            .and_then(|v| v.as_str())
-            .is_some()
-        && metadata
-            .get("invocationCorrelationId")
-            .and_then(|v| v.as_str())
-            .is_some()
-}
+use pioneer_crud_execution::cli_mcp_item::cli_mcp_item_metadata;
+pub use pioneer_crud_execution::cli_mcp_item::is_managed_cli_mcp_item;
 
 impl CrudStore {
     /// The checked native claim is supplied by the managed adapter. Recheck its

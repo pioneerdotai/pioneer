@@ -518,7 +518,7 @@ async fn scoped_pages_and_exact_guards_preserve_row_workspace_and_pack_facts() {
     .unwrap()
     .unwrap();
     let mut active: pioneer_entity::skill_installation::ActiveModel = model.clone().into();
-    active.updated_at = Set(model.updated_at + chrono::Duration::nanoseconds(1));
+    active.updated_at = Set(model.updated_at + chrono::Duration::microseconds(1));
     active.update(&store.database_connection()).await.unwrap();
     assert_eq!(
         store
@@ -1209,7 +1209,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
     let destination = candidate.destination.clone();
-    harness.processor.crud_store.database_connection().execute_unprepared("CREATE TRIGGER reject_watched_update BEFORE UPDATE ON skill_installation BEGIN SELECT RAISE(ABORT,'injected mutation rejection'); END").await.unwrap();
+    harness.processor.crud_store.database_connection().execute_unprepared("CREATE FUNCTION reject_watched_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected mutation rejection'; END; $$; CREATE TRIGGER reject_watched_update BEFORE UPDATE ON skill_installation FOR EACH ROW EXECUTE FUNCTION reject_watched_update();").await.unwrap();
     let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
@@ -1240,7 +1240,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
         .processor
         .crud_store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_watched_update")
+        .execute_unprepared("DROP TRIGGER reject_watched_update ON skill_installation; DROP FUNCTION reject_watched_update()")
         .await
         .unwrap();
     let _reset = PublicationFaultReset;
@@ -1750,7 +1750,12 @@ async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
     let destination = candidate.destination.clone();
     let source = harness.directory.path().join("source");
-    harness.processor.crud_store.database_connection().execute_unprepared("PRAGMA foreign_keys=ON; CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation BEGIN INSERT INTO watched_commit_child VALUES(123); END").await.unwrap();
+    harness.processor.crud_store.database_connection().execute_unprepared("CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE FUNCTION fail_watched_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO watched_commit_child VALUES(123); RETURN NEW; END; $$;
+         CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation
+         FOR EACH ROW EXECUTE FUNCTION fail_watched_commit()").await.unwrap();
     let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
@@ -1833,7 +1838,7 @@ async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without
         .processor
         .crud_store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_watched_commit")
+        .execute_unprepared("DROP TRIGGER fail_watched_commit ON skill_installation; DROP FUNCTION fail_watched_commit()")
         .await
         .unwrap();
     assert_eq!(

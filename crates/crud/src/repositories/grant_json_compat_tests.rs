@@ -1,11 +1,8 @@
 //! Repository reads must authenticate legacy snapshots without writer admission.
 use super::*;
-use migration::Migrator;
 use pioneer_entity::task_actor_contract;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
-};
-use sea_orm::{ConnectOptions, Database};
+use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver};
+use sea_orm::{DbBackend, Statement};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -103,39 +100,24 @@ async fn insert_task_actor_contract<C: ConnectionTrait>(
     .expect("Task actor contract should insert");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn history_reads_both_durable_containers_without_rewrites_or_writer_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("grants.sqlite");
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let writes = Arc::new(Writes::default());
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| {
-            o.pragma("journal_mode", "WAL")
-                .pragma("foreign_keys", "OFF")
-        });
-    let writer = Database::connect(options).await.unwrap();
     let executor = SqliteWriteExecutor::with_observer(writer, writes.clone());
-    executor
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-                .pragma("foreign_keys", "OFF")
-        });
-    let reader = Database::connect(options).await.unwrap();
     let store = crate::CrudStore::new(SqliteDatabase::from_executor(reader, executor));
     let db = store.database_connection();
-    let v1 = super::tests::version_one_child_launch_grant();
+    db.execute_unprepared(
+        "INSERT INTO workspace(id,name) VALUES('W00000000000000000001','History');
+         INSERT INTO agent_identity(id,workspace_id,source_kind,source_id,source_fingerprint)
+         VALUES('A00000000000000000001','W00000000000000000001','ephemeral','grant','generation-a');",
+    ).await.unwrap();
+    let v1: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../crud-execution/tests/fixtures/child-launch-grant-v1.json"
+    ))
+    .unwrap();
     let mut v2 = v1.clone();
     v2["version"] = serde_json::json!(2);
     v2["maxPermissionProfile"]["effective_policy"]["memory_write"] = serde_json::json!("ask");
@@ -154,6 +136,24 @@ async fn history_reads_both_durable_containers_without_rewrites_or_writer_admiss
             "child_launch_grant":child
         })
         .to_string();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+             VALUES($1,'W00000000000000000001','system','agent','completed','History','History')",
+            [task_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO agent_execution(
+                id,workspace_id,agent_identity_id,identity_source_revision,
+                identity_source_fingerprint,home_root_thread_id,work_graph_root_execution_id,
+                requested_identity_selection_json,requested_profile_selection_json,authorization_context_fingerprint)
+             VALUES($1,'W00000000000000000001','A00000000000000000001',1,'generation-a',
+                'history-thread',$1,'{}','{}','fixture')",
+            [execution_id.clone().into()],
+        )).await.unwrap();
         insert_task_actor_contract(&db, &task_id, &task_json).await;
         let execution_json = serde_json::json!({
             "identity":child["identities"][0], "profile":child["profiles"][0],
@@ -161,8 +161,6 @@ async fn history_reads_both_durable_containers_without_rewrites_or_writer_admiss
         })
         .to_string();
         let fingerprint = agent_execution_grant_fingerprint(&execution_json).unwrap();
-        // Historical fixture insertion only. Gateway uses FK=OFF; admission
-        // checks are independently covered by graph regressions, not this read.
         agent_execution_grant::Entity::insert(agent_execution_grant::ActiveModel {
             id: Set(format!("G{index:020}")),
             execution_id: Set(execution_id.clone()),

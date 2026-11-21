@@ -1325,18 +1325,26 @@ async fn published_root_lookup_ignores_historical_ancestry_liveness() {
 async fn published_checkpoint_lookup_does_not_traverse_large_historical_graph() {
     let fixture = fixture().await;
     let db = fixture.db();
-    db.execute_unprepared(
-        r#"WITH RECURSIVE sequence(n) AS (
-             SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<65535
-           )
-           INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status)
-           SELECT printf('limit-%05d',n),'root-operation','root-owner',
-                  CASE WHEN n<65535 THEN printf('limit-%05d',n+1) END,
-                  n,'limit',printf('limit-version-%05d',n),'{}',0,1,'applied'
-           FROM sequence"#,
-    )
-    .await
-    .unwrap();
+    for (start, end) in [(1_i64, 1_024_i64), (1_025, 65_535)] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status)
+             SELECT 'limit-'||lpad(n::text,5,'0'),'root-operation','root-owner',
+                    CASE WHEN n<65535 THEN 'limit-'||lpad((n+1)::text,5,'0') END,
+                    n,'limit','limit-version-'||lpad(n::text,5,'0'),'{}',0,1,'applied'
+             FROM generate_series($1::bigint,$2::bigint) AS series(n)",
+            [start.into(), end.into()],
+        ))
+        .await
+        .unwrap();
+        if start == 1 {
+            // Let the per-row guard choose its exact (operation, portion)
+            // index for the large suffix. On an empty heap it caches a scan.
+            db.execute_unprepared("ANALYZE compaction_checkpoint")
+                .await
+                .unwrap();
+        }
+    }
     let leaf = canonical_branches().remove(2).branch.source;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1405,6 +1413,7 @@ async fn source_lookup_queries_match_indexed_sources_with_compressed_payloads() 
 async fn assert_production_plans(compressed: bool) {
     let fixture = fixture_with_portable_sources(compressed).await;
     let db = fixture.db();
+    seed_canonical_plan_noise(&db).await;
     let sources = branches()
         .into_iter()
         .map(|branch| branch.source)

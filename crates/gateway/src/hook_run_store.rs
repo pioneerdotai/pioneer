@@ -20,7 +20,7 @@ use pioneer_hooks::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::sync::Arc;
 
-/// Called only after CRUD has returned and released the serialized writer.
+/// Called after CRUD has returned and released its connection.
 /// RuntimeErr does not expose its SQLx error as a standard source, so inspect
 /// that typed wrapper explicitly while walking anyhow's context/source chain.
 fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
@@ -29,9 +29,6 @@ fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
         .find_map(|cause| {
             if let Some(postgres) = cause.downcast_ref::<sea_orm::SqlxPostgresError>() {
                 return Some(postgres_diagnostic(postgres));
-            }
-            if let Some(sqlite) = cause.downcast_ref::<sea_orm::SqlxSqliteError>() {
-                return sqlite_diagnostic(sqlite);
             }
             let sqlx = if let Some(sqlx) = cause.downcast_ref::<sea_orm::SqlxError>() {
                 Some(sqlx)
@@ -45,48 +42,29 @@ fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
             let sea_orm::SqlxError::Database(database) = sqlx? else {
                 return None;
             };
-            if let Some(postgres) = database.try_downcast_ref::<sea_orm::SqlxPostgresError>() {
-                return Some(postgres_diagnostic(postgres));
-            }
-            sqlite_diagnostic(database.try_downcast_ref::<sea_orm::SqlxSqliteError>()?)
+            database
+                .try_downcast_ref::<sea_orm::SqlxPostgresError>()
+                .map(postgres_diagnostic)
         })
         .unwrap_or_default();
     HookRunStoreError::internal_with_diagnostic("failed to append hook audit events", diagnostic)
 }
 
 fn postgres_diagnostic(error: &sea_orm::SqlxPostgresError) -> HookRunStoreDiagnostic {
-    let cause_class = match error.code().as_bytes() {
-        [b'2', b'3', ..] => HookRunStoreCauseClass::PostgresConstraint,
-        [b'0', b'8', ..] => HookRunStoreCauseClass::PostgresConnection,
-        b"40001" | b"40P01" | b"55P03" => HookRunStoreCauseClass::PostgresContention,
-        _ => HookRunStoreCauseClass::PostgresOther,
-    };
     HookRunStoreDiagnostic {
-        cause_class,
+        cause_class: postgres_cause(error.code().as_bytes()),
         ..Default::default()
     }
 }
 
-fn sqlite_diagnostic(sqlite: &sea_orm::SqlxSqliteError) -> Option<HookRunStoreDiagnostic> {
-    use sea_orm::sqlx::error::DatabaseError;
-    // code() is SQLx's typed numeric SQLite code API, not Display/error text.
-    let extended = sqlite.code()?.parse::<i32>().ok()?;
-    Some(sqlite_code_diagnostic(extended))
-}
-
-fn sqlite_code_diagnostic(extended: i32) -> HookRunStoreDiagnostic {
-    let primary = extended & 0xff;
-    let cause_class = match primary {
-        5 => HookRunStoreCauseClass::SqliteBusy,
-        6 => HookRunStoreCauseClass::SqliteLocked,
-        14 => HookRunStoreCauseClass::SqliteCantOpen,
-        19 => HookRunStoreCauseClass::SqliteConstraint,
-        _ => HookRunStoreCauseClass::SqliteOther,
-    };
-    HookRunStoreDiagnostic {
-        cause_class,
-        sqlite_primary_code: Some(primary),
-        sqlite_extended_code: Some(extended),
+fn postgres_cause(sqlstate: &[u8]) -> HookRunStoreCauseClass {
+    match sqlstate {
+        [b'2', b'3', ..] => HookRunStoreCauseClass::PostgresConstraint,
+        [b'0', b'8', ..] | b"57P01" | b"57P02" | b"57P03" => {
+            HookRunStoreCauseClass::PostgresConnection
+        }
+        b"40001" | b"40P01" | b"55P03" => HookRunStoreCauseClass::PostgresContention,
+        _ => HookRunStoreCauseClass::PostgresOther,
     }
 }
 
@@ -528,24 +506,18 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn sqlite_primary_and_extended_codes_have_distinct_safe_classes() {
-        // SQLite native result codes, including extended variants. This tests
-        // the numeric mapping; typed-source extraction is tested below.
-        for (code, primary, class) in [
-            (5, 5, HookRunStoreCauseClass::SqliteBusy),
-            (517, 5, HookRunStoreCauseClass::SqliteBusy),
-            (6, 6, HookRunStoreCauseClass::SqliteLocked),
-            (262, 6, HookRunStoreCauseClass::SqliteLocked),
-            (14, 14, HookRunStoreCauseClass::SqliteCantOpen),
-            (526, 14, HookRunStoreCauseClass::SqliteCantOpen),
-            (19, 19, HookRunStoreCauseClass::SqliteConstraint),
-            (1811, 19, HookRunStoreCauseClass::SqliteConstraint),
-            (1, 1, HookRunStoreCauseClass::SqliteOther),
+    fn postgres_sqlstates_have_distinct_safe_classes() {
+        for (sqlstate, expected) in [
+            (b"23505", HookRunStoreCauseClass::PostgresConstraint),
+            (b"23514", HookRunStoreCauseClass::PostgresConstraint),
+            (b"08006", HookRunStoreCauseClass::PostgresConnection),
+            (b"57P01", HookRunStoreCauseClass::PostgresConnection),
+            (b"40001", HookRunStoreCauseClass::PostgresContention),
+            (b"40P01", HookRunStoreCauseClass::PostgresContention),
+            (b"55P03", HookRunStoreCauseClass::PostgresContention),
+            (b"42601", HookRunStoreCauseClass::PostgresOther),
         ] {
-            let diagnostic = sqlite_code_diagnostic(code);
-            assert_eq!(diagnostic.cause_class, class);
-            assert_eq!(diagnostic.sqlite_primary_code, Some(primary));
-            assert_eq!(diagnostic.sqlite_extended_code, Some(code));
+            assert_eq!(postgres_cause(sqlstate), expected);
         }
     }
 

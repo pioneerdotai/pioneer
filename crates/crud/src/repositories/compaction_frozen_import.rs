@@ -88,52 +88,11 @@ fn observe_checkpoint_import_graph_read(store: &CrudStore, workspace: &str) {
     }
 }
 
-pub const EMPTY_FROZEN_IMPORT_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-// A proof compares two reference records, each individually <=256 KiB, plus
-// fixed provenance fields. This is metadata, never a transcript payload.
-pub const FROZEN_IMPORT_PAGE_BYTES: usize = 1024 * 1024;
+pub use pioneer_crud_compaction::frozen_import::EMPTY_FROZEN_IMPORT_SHA256;
+pub use pioneer_crud_compaction::proof_staging::FROZEN_IMPORT_PAGE_BYTES;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FrozenImportRecord {
-    pub message_ordinal: u64,
-    pub source_thread: String,
-    pub source: SourceRef,
-    pub delivery_id: String,
-    pub candidate_id: String,
-    pub output_manifest: String,
-    pub output_ordinal: u64,
-    pub acknowledgement: SourceRef,
-    /// The grant above remains the immutable output source. Only a verified
-    /// temporary preview may render a diagnostic at this distinct revision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_archive: Option<PreviewArchiveProjection>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreviewArchiveProjection {
-    pub source: SourceRef,
-    pub wire_sha256: String,
-}
-impl FrozenImportRecord {
-    pub fn render_source(&self) -> &SourceRef {
-        self.preview_archive
-            .as_ref()
-            .map_or(&self.source, |p| &p.source)
-    }
-    pub fn matches_render_target(&self, target: &FrozenMessageRef) -> bool {
-        target.source_thread == self.source_thread
-            && target.sources.contains(self.render_source())
-            && self.preview_archive.as_ref().is_none_or(|p| {
-                target.tool_name.as_deref() == Some("html_preview")
-                    && target.sources.as_slice() == std::slice::from_ref(&p.source)
-                    && target.replay_source.as_ref().is_none_or(|s| s == &p.source)
-                    && target.wire_sha256 == p.wire_sha256
-            })
-    }
-}
+use pioneer_crud_compaction::frozen_import::prepare_preview_archive_guards;
+pub use pioneer_crud_compaction::frozen_import::{FrozenImportRecord, PreviewArchiveProjection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveryCheckpointImportSource {
@@ -393,7 +352,8 @@ pub(crate) async fn compaction_prepare_frozen_import(
         acknowledgement: acknowledgement.clone(),
         preview_archive: projection,
     };
-    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
+    let archive_guards =
+        prepare_preview_archive_guards(&store.connection, workspace, &record).await?;
     Ok(PreparedFrozenImport {
         _frozen_hold: frozen_hold,
         workspace: workspace.into(),
@@ -405,119 +365,6 @@ pub(crate) async fn compaction_prepare_frozen_import(
         archive_guards,
         record,
     })
-}
-
-/// Only the existing archive receipt can translate an immutable grant to a
-/// body revision. Prepared SQL revalidates that receipt inside publication;
-/// no parsing or hashing is done while holding writer capacity.
-async fn prepare_preview_archive_guards(
-    store: &CrudStore,
-    workspace: &str,
-    record: &FrozenImportRecord,
-) -> Result<Option<(sea_orm::Statement, sea_orm::Statement)>> {
-    let Some(projection) = &record.preview_archive else {
-        return Ok(None);
-    };
-    use super::html_preview_retention::queries;
-    use pioneer_entity::{
-        compaction_source_revision as revision, html_preview_frozen_result as receipt, thread,
-        turn, turn_llm_context as context,
-    };
-    use queries::{bytes, col};
-    let base = queries::archive_receipt(
-        workspace,
-        &record.source_thread,
-        &record.output_manifest,
-        i64::try_from(record.output_ordinal)?,
-    );
-    let query = base
-        .clone()
-        .clear_selects()
-        .columns([
-            ("r", receipt::Column::ReferenceJson),
-            ("r", receipt::Column::ArchiveWireSha256),
-        ])
-        .expr_as(
-            col("m", compaction_frozen_message::Column::ReferenceJson),
-            "output_reference_json",
-        )
-        .and_where(col("r", receipt::Column::SourceId).eq(&record.source.id))
-        .and_where(col("r", receipt::Column::SourceVersion).eq(&record.source.version))
-        .and_where(bytes(col("r", receipt::Column::ReferenceJson)).lte(262144))
-        .and_where(col("m", compaction_frozen_message::Column::Bytes).between(0, 262144))
-        .and_where(
-            bytes(col("m", compaction_frozen_message::Column::ReferenceJson))
-                .eq(col("m", compaction_frozen_message::Column::Bytes)),
-        )
-        .to_owned();
-    let row = store
-        .connection
-        .query_one(&query)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
-    let json: String = row.try_get("", "reference_json")?;
-    let original: FrozenMessageRef = serde_json::from_str(&json)?;
-    original.validate()?;
-    let output_reference_json: String = row.try_get("", "output_reference_json")?;
-    let output_reference: FrozenMessageRef = serde_json::from_str(&output_reference_json)?;
-    ensure!(
-        original == output_reference,
-        "archival preview receipt/output mismatch"
-    );
-    let revision = record
-        .source
-        .version
-        .strip_prefix("revision:")
-        .and_then(|s| s.parse::<u64>().ok())
-        .and_then(|n| n.checked_add(1))
-        .ok_or_else(|| anyhow::anyhow!("invalid preview grant revision"))?;
-    // Indexing an already archived diagnostic also yields a receipt. Its
-    // unchanged wire body proves no retirement and cannot grant a new revision.
-    ensure!(
-        original.tool_name.as_deref() == Some("html_preview")
-            && original.source_thread == record.source_thread
-            && original.sources.as_slice() == std::slice::from_ref(&record.source)
-            && record.source.scope.starts_with("context:")
-            && projection.source.scope == record.source.scope
-            && projection.source.id == record.source.id
-            && projection.source.version == format!("revision:{revision}")
-            && projection.wire_sha256 != original.wire_sha256
-            && projection.wire_sha256 == row.try_get::<String>("", "archive_wire_sha256")?,
-        "archival preview grant does not match its exact diagnostic"
-    );
-    let historical = base
-        .clone()
-        .and_where(col("r", receipt::Column::ReferenceJson).eq(json))
-        .and_where(col("r", receipt::Column::ArchiveWireSha256).eq(&projection.wire_sha256))
-        .and_where(
-            col("m", compaction_frozen_message::Column::ReferenceJson).eq(output_reference_json),
-        )
-        .to_owned();
-    let canonical = queries::canonical_preview()
-        .and_where(col("c", context::Column::Id).eq(col("r", receipt::Column::SourceId)))
-        .and_where(col("c", context::Column::TurnId).eq(col("r", receipt::Column::TurnId)))
-        .and_where(
-            queries::revision(col("v", revision::Column::Revision)).eq(&projection.source.version),
-        )
-        .and_where(col("th", thread::Column::WorkspaceId).eq(workspace))
-        .and_where(col("t", turn::Column::ThreadId).eq(&record.source_thread))
-        .and_where(Expr::exists(queries::released_marker(workspace)))
-        .to_owned();
-    let current = historical
-        .clone()
-        .and_where(Expr::exists(canonical))
-        .to_owned();
-    let historical = store.connection.get_database_backend().build(&historical);
-    let current = store.connection.get_database_backend().build(&current);
-    Ok(Some((current, historical)))
-}
-impl FrozenImportRecord {
-    /// Historical proof validation does not grant access or accept a fresh body.
-    /// Direct import preparation/publication separately requires current guard.
-    pub async fn validate_preview_archive(&self, store: &CrudStore, workspace: &str) -> Result<()> {
-        let _ = prepare_preview_archive_guards(store, workspace, self).await?;
-        Ok(())
-    }
 }
 
 /// Attach exact immutable grants from one delivered Task output to the
@@ -743,7 +590,8 @@ async fn prepare_accepted_import(
             .await?
             .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
     let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
-    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
+    let archive_guards =
+        prepare_preview_archive_guards(&store.connection, workspace, &record).await?;
     Ok(PreparedFrozenImport {
         _frozen_hold: frozen_hold,
         workspace: workspace.into(),
@@ -951,6 +799,8 @@ LIMIT 1
 
 // This is the existence-only expansion of the source branches in
 // compaction_live_sources. Keep each branch's predicates in sync with the view.
+// The correlated LIMIT 1 keeps each PostgreSQL primary-key probe inside
+// its source branch. A flattened join can scan unrelated revisions.
 const ACCEPTED_IMPORT_CURRENT_SQL: &str = r#"
 SELECT 1
 FROM task_run_turn execution
@@ -988,99 +838,131 @@ WHERE execution.thread_id=$3
   AND (
     EXISTS (
       SELECT 1
-      FROM compaction_source_revision context_revision
-      JOIN turn_llm_context context_source
-        ON context_source.id=context_revision.source_id
-       AND context_source.turn_id=context_revision.turn_id
-      JOIN turn context_turn ON context_turn.id=context_revision.turn_id
+      FROM LATERAL (
+        SELECT source_id, turn_id, revision, present
+        FROM compaction_source_revision context_revision
+        WHERE context_revision.source_id=i.source_id
+        LIMIT 1
+      ) current_context_revision
+      JOIN LATERAL (
+        SELECT id, turn_id FROM turn_llm_context context_source
+        WHERE context_source.id=current_context_revision.source_id
+        LIMIT 1
+      ) current_context_source ON current_context_source.turn_id=current_context_revision.turn_id
+      JOIN turn context_turn ON context_turn.id=current_context_revision.turn_id
       JOIN thread context_thread ON context_thread.id=context_turn.thread_id
-      WHERE context_revision.present=1
+      WHERE current_context_revision.present=1
         AND context_thread.workspace_id=h.workspace_id
         AND context_turn.thread_id=i.source_thread
-        AND 'context:'||context_revision.turn_id=i.source_scope
-        AND context_revision.source_id=i.source_id
-        AND 'revision:'||context_revision.revision=i.source_version
+        AND 'context:'||current_context_revision.turn_id=i.source_scope
+        AND 'revision:'||current_context_revision.revision=i.source_version
     )
     OR EXISTS (
       SELECT 1
-      FROM compaction_item_revision item_revision
-      JOIN turn_item item_source
-        ON item_source.id=item_revision.source_id
-       AND item_source.turn_id=item_revision.turn_id
-      JOIN turn item_turn ON item_turn.id=item_revision.turn_id
+      FROM LATERAL (
+        SELECT source_id, turn_id, revision, present
+        FROM compaction_item_revision item_revision
+        WHERE item_revision.source_id=i.source_id
+        LIMIT 1
+      ) current_item_revision
+      JOIN LATERAL (
+        SELECT id, turn_id FROM turn_item item_source
+        WHERE item_source.id=current_item_revision.source_id
+        LIMIT 1
+      ) current_item_source ON current_item_source.turn_id=current_item_revision.turn_id
+      JOIN turn item_turn ON item_turn.id=current_item_revision.turn_id
       JOIN thread item_thread ON item_thread.id=item_turn.thread_id
-      WHERE item_revision.present=1
+      WHERE current_item_revision.present=1
         AND item_thread.workspace_id=h.workspace_id
         AND item_turn.thread_id=i.source_thread
-        AND 'item:'||item_revision.turn_id=i.source_scope
-        AND item_revision.source_id=i.source_id
-        AND 'item-revision:'||item_revision.revision=i.source_version
+        AND 'item:'||current_item_revision.turn_id=i.source_scope
+        AND 'item-revision:'||current_item_revision.revision=i.source_version
     )
     OR EXISTS (
       SELECT 1
-      FROM compaction_event_revision event_revision
-      JOIN turn_event event_source
-        ON event_source.id=event_revision.source_id
-       AND event_source.turn_id=event_revision.turn_id
-      JOIN turn event_turn ON event_turn.id=event_revision.turn_id
+      FROM LATERAL (
+        SELECT source_id, turn_id, revision, present
+        FROM compaction_event_revision event_revision
+        WHERE event_revision.source_id=i.source_id
+        LIMIT 1
+      ) current_event_revision
+      JOIN LATERAL (
+        SELECT id, turn_id FROM turn_event event_source
+        WHERE event_source.id=current_event_revision.source_id
+        LIMIT 1
+      ) current_event_source ON current_event_source.turn_id=current_event_revision.turn_id
+      JOIN turn event_turn ON event_turn.id=current_event_revision.turn_id
       JOIN thread event_thread ON event_thread.id=event_turn.thread_id
-      WHERE event_revision.present=1
+      WHERE current_event_revision.present=1
         AND event_thread.workspace_id=h.workspace_id
         AND event_turn.thread_id=i.source_thread
-        AND 'event:'||event_revision.turn_id=i.source_scope
-        AND event_revision.source_id=i.source_id
-        AND 'event-revision:'||event_revision.revision=i.source_version
+        AND 'event:'||current_event_revision.turn_id=i.source_scope
+        AND 'event-revision:'||current_event_revision.revision=i.source_version
     )
     OR EXISTS (
       SELECT 1
-      FROM compaction_input_revision input_revision
-      JOIN turn_input input_source
-        ON input_source.id=input_revision.source_id
-       AND input_source.turn_id=input_revision.turn_id
-      JOIN turn input_turn ON input_turn.id=input_revision.turn_id
+      FROM LATERAL (
+        SELECT source_id, turn_id, revision, present
+        FROM compaction_input_revision input_revision
+        WHERE input_revision.source_id=i.source_id
+        LIMIT 1
+      ) current_input_revision
+      JOIN LATERAL (
+        SELECT id, turn_id FROM turn_input input_source
+        WHERE input_source.id=current_input_revision.source_id
+        LIMIT 1
+      ) current_input_source ON current_input_source.turn_id=current_input_revision.turn_id
+      JOIN turn input_turn ON input_turn.id=current_input_revision.turn_id
       JOIN thread input_thread ON input_thread.id=input_turn.thread_id
-      WHERE input_revision.present=1
+      WHERE current_input_revision.present=1
         AND input_thread.workspace_id=h.workspace_id
         AND input_turn.thread_id=i.source_thread
-        AND 'input:'||input_revision.turn_id=i.source_scope
-        AND input_revision.source_id=i.source_id
-        AND 'input-revision:'||input_revision.revision=i.source_version
+        AND 'input:'||current_input_revision.turn_id=i.source_scope
+        AND 'input-revision:'||current_input_revision.revision=i.source_version
     )
     OR EXISTS (
       SELECT 1
-      FROM compaction_checkpoint checkpoint
-      JOIN compaction_context context ON context.owner=checkpoint.owner
+      FROM LATERAL (
+        SELECT id, owner, operation_id, status, format_version, identity_sha256
+        FROM compaction_checkpoint checkpoint
+        WHERE checkpoint.id=i.source_id
+        LIMIT 1
+      ) current_checkpoint
+      JOIN compaction_context context ON context.owner=current_checkpoint.owner
       WHERE (
-          checkpoint.status='applied'
+          current_checkpoint.status='applied'
           OR (
-            checkpoint.status='retained'
+            current_checkpoint.status='retained'
             AND EXISTS (
               SELECT 1
               FROM compaction_operation committed
-              WHERE committed.id=checkpoint.operation_id
+              WHERE committed.id=current_checkpoint.operation_id
                 AND committed.status='completed'
             )
           )
         )
         AND context.workspace_id=h.workspace_id
         AND context.thread_id=i.source_thread
-        AND 'checkpoint:'||checkpoint.owner=i.source_scope
-        AND checkpoint.id=i.source_id
-        AND checkpoint.identity_sha256=i.source_version
-        AND checkpoint.format_version=1
+        AND 'checkpoint:'||current_checkpoint.owner=i.source_scope
+        AND current_checkpoint.identity_sha256=i.source_version
+        AND current_checkpoint.format_version=1
     )
     OR EXISTS (
       SELECT 1
-      FROM task_run_conversation_snapshot basis
+      FROM LATERAL (
+        SELECT run_id, workspace_id, conversation_thread_id, history_json_has_array_prefix
+        FROM task_run_conversation_snapshot basis
+        WHERE basis.run_id=i.source_id
+        LIMIT 1
+      ) current_basis
       JOIN thread basis_thread
-        ON basis_thread.id=basis.conversation_thread_id
-       AND basis_thread.workspace_id=basis.workspace_id
-      LEFT JOIN compaction_task_basis_revision revision ON revision.run_id=basis.run_id
-      WHERE basis.history_json_has_array_prefix
-        AND basis.workspace_id=h.workspace_id
-        AND basis.conversation_thread_id=i.source_thread
-        AND 'task-basis:'||basis.run_id=i.source_scope
-        AND basis.run_id=i.source_id
+        ON basis_thread.id=current_basis.conversation_thread_id
+       AND basis_thread.workspace_id=current_basis.workspace_id
+      LEFT JOIN compaction_task_basis_revision revision ON revision.run_id=current_basis.run_id
+      WHERE current_basis.history_json_has_array_prefix
+        AND current_basis.workspace_id=h.workspace_id
+        AND current_basis.conversation_thread_id=i.source_thread
+        AND 'task-basis:'||current_basis.run_id=i.source_scope
         AND 'task-basis-revision:'||COALESCE(revision.revision,1)=i.source_version
     )
   )
@@ -1699,82 +1581,7 @@ pub(crate) async fn compaction_frozen_import_state<C: ConnectionTrait>(
         .transpose()
 }
 
-pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    owner: &str,
-    manifest: &str,
-    start: u64,
-) -> Result<Vec<FrozenImportRecord>> {
-    let mut complete_count = None;
-    if let Some(h) = compaction_frozen_history::Entity::find_by_id(manifest)
-        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
-        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
-        .one(db)
-        .await?
-    {
-        crate::frozen_lifetime::logical_bounds(&h)?;
-        if let Some(layout) =
-            pioneer_crud_compaction::frozen::find_layout(manifest.to_owned(), 1_i64)
-                .one(db)
-                .await?
-        {
-            ensure!(layout.failed == 0, "invalid frozen layout state");
-        }
-        if h.ready == 1 {
-            complete_count = Some(u64::try_from(h.import_count)?);
-        }
-    }
-    let scoped = compaction_frozen_import::Entity::find()
-        .inner_join(compaction_frozen_history::Entity)
-        .filter(compaction_frozen_history::Column::Id.eq(manifest))
-        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
-        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
-        .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
-        .filter(compaction_frozen_import::Column::Ordinal.gte(i64::try_from(start)?));
-    let rows = scoped
-        .clone()
-        .select_only()
-        .column(compaction_frozen_import::Column::Ordinal)
-        .column(compaction_frozen_import::Column::Bytes)
-        .order_by_asc(compaction_frozen_import::Column::Ordinal)
-        .limit(128)
-        .into_tuple::<(i64, i64)>()
-        .all(db)
-        .await?;
-    let mut end = start;
-    let mut bytes = 0;
-    for (ordinal, size) in rows {
-        let size = usize::try_from(size)?;
-        ensure!(size <= SOURCE_PAGE_BYTES, "invalid import metadata size");
-        if bytes + size > SOURCE_PAGE_BYTES {
-            break;
-        }
-        ensure!(u64::try_from(ordinal)? == end, "import ordinal gap");
-        bytes += size;
-        end += 1;
-    }
-    ensure!(
-        complete_count.is_none_or(|count| start >= count || end > start),
-        "import page missing before declared count"
-    );
-    let rows = scoped
-        .select_only()
-        .column(compaction_frozen_import::Column::ProofJson)
-        .filter(compaction_frozen_import::Column::Ordinal.lt(i64::try_from(end)?))
-        .filter(Expr::cust("octet_length(compaction_frozen_import.proof_json)=compaction_frozen_import.bytes AND compaction_frozen_import.bytes BETWEEN 0 AND 262144"))
-        .order_by_asc(compaction_frozen_import::Column::Ordinal)
-        .into_tuple::<String>()
-        .all(db)
-        .await?;
-    ensure!(
-        rows.len() == usize::try_from(end - start)?,
-        "import bounded readback incomplete"
-    );
-    rows.into_iter()
-        .map(|json| Ok(serde_json::from_str(&json)?))
-        .collect()
-}
+pub use pioneer_crud_compaction::frozen_import::compaction_frozen_import_page;
 
 use super::compaction_live_sources;
 

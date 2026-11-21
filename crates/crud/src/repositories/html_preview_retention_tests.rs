@@ -1111,41 +1111,6 @@ async fn new_inputs_are_adopted_atomically_and_rollback_preserves_old_input() {
 }
 
 #[tokio::test]
-async fn versionless_input_preserves_the_bound_version_when_current_changes() {
-    pioneer_postgres_test::with_database(async |database| {
-        let f = fixture(database).await;
-        preview_input_fixture(&f).await;
-        f.store
-            .replace_turn_input_projection_for_test(
-                "parent-turn",
-                &[pioneer_protocol::UserInput::Artifact {
-                    artifact_id: "preview".into(),
-                    version_id: None,
-                }],
-                1,
-                1_700_000_000,
-            )
-            .await
-            .unwrap();
-        assert!(!preview_is_temporary(&f).await);
-
-        f.sql("UPDATE artifact SET current_version_id='v2' WHERE id='preview'")
-            .await;
-        assert!(!preview_is_temporary(&f).await);
-        let bindings = artifact_binding::Entity::find()
-            .filter(artifact_binding::Column::BindingKind.eq("user_input"))
-            .all(&f.store.connection)
-            .await
-            .unwrap();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].artifact_version_id.as_deref(), Some("v1"));
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
 async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commit() {
     for commit in [false, true] {
         pioneer_postgres_test::with_database(async |database| {
@@ -1232,148 +1197,10 @@ async fn retirement_page_keeps_individual_metadata_budget_and_empty_reader_only_
 
 // Closed test gate: these exercise the real read-only/serialized-writer fixture.
 fn io_queue_key(id: &str) -> String {
-    super::super::html_preview_io_work::HtmlPreviewIoLocator::new(id).key
+    super::super::html_preview_io_work::HtmlPreviewIoLocator::new(id)
+        .key()
+        .to_owned()
 }
-#[tokio::test]
-async fn io_enqueue_rollback_and_idle_poll_never_claim_writer() {
-    pioneer_postgres_test::with_database(async |database| {
-        use super::super::html_preview_io_work::{HtmlPreviewIoFamily, request};
-        use pioneer_entity::html_preview_io_work as work;
-        let f = fixture(database).await;
-        let tx = f.store.connection.begin().await.unwrap();
-        request(&tx, HtmlPreviewIoFamily::Copies, "rollback-copies", 0, "ws")
-            .await
-            .unwrap();
-        tx.rollback().await.unwrap();
-        assert!(
-            find_work("copies".to_owned(), io_queue_key("rollback-copies"), 0_i64)
-                .one(&f.store.connection)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
-            .await;
-        f.routes.reset();
-        assert!(
-            f.store
-                .claim_html_preview_io_work(0, 60_000)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(f.routes.counts(), (1, 0));
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn io_takeover_and_reinsert_reject_stale_worker() {
-    pioneer_postgres_test::with_database(async |database| {
-        use super::super::html_preview_io_work::{HtmlPreviewIoFamily, ack, request};
-        use pioneer_entity::html_preview_io_work as work;
-        let f = fixture(database).await;
-        f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
-            .await;
-        let tx = f.store.connection.begin().await.unwrap();
-        request(&tx, HtmlPreviewIoFamily::Copies, "missing", 0, "ws")
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let old = f
-            .store
-            .claim_html_preview_io_work(0, 10)
-            .await
-            .unwrap()
-            .unwrap();
-        let owner = f
-            .store
-            .claim_html_preview_io_work(10, 10)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(owner.row.claim_token, old.row.claim_token);
-        let tx = f.store.connection.begin().await.unwrap();
-        assert!(!ack(&tx, &old).await.unwrap());
-        assert!(ack(&tx, &owner).await.unwrap());
-        tx.commit().await.unwrap();
-        let tx = f.store.connection.begin().await.unwrap();
-        request(&tx, HtmlPreviewIoFamily::Copies, "missing", 0, "ws")
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let next = f
-            .store
-            .claim_html_preview_io_work(20, 10)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(owner.row.incarnation, next.row.incarnation);
-        let tx = f.store.connection.begin().await.unwrap();
-        assert!(!ack(&tx, &owner).await.unwrap());
-        tx.rollback().await.unwrap();
-        assert!(
-            find_work("copies".to_owned(), io_queue_key("missing"), 0_i64)
-                .one(&f.store.connection)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn io_producer_during_claim_preserves_pass_and_ack_keeps_new_request() {
-    pioneer_postgres_test::with_database(async |database| {
-        use super::super::html_preview_io_work::{HtmlPreviewIoFamily, ack, request};
-        use pioneer_entity::html_preview_io_work as work;
-        let f = fixture(database).await;
-        f.sql("UPDATE html_preview_io_work SET state='done',due_at=NULL,seed_version=1")
-            .await;
-        let tx = f.store.connection.begin().await.unwrap();
-        request(&tx, HtmlPreviewIoFamily::Copies, "late", 0, "ws")
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        let old = f
-            .store
-            .claim_html_preview_io_work(0, 10)
-            .await
-            .unwrap()
-            .unwrap();
-        let tx = f.store.connection.begin().await.unwrap();
-        request(&tx, HtmlPreviewIoFamily::Copies, "late", 0, "ws")
-            .await
-            .unwrap();
-        let active = find_work("copies".to_owned(), io_queue_key("late"), 0_i64)
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(active.claim_token, old.row.claim_token);
-        assert_eq!(active.due_at, old.row.due_at);
-        assert_eq!(active.pass_revision, old.row.pass_revision);
-        assert_ne!(active.requested_revision, old.row.requested_revision);
-        assert!(ack(&tx, &old).await.unwrap());
-        tx.commit().await.unwrap();
-        let next = f
-            .store
-            .claim_html_preview_io_work(chrono::Utc::now().timestamp_millis(), 10)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.row.pass_revision, active.requested_revision);
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
 #[tokio::test]
 async fn io_scoped_repair_completion_is_durable_across_restart() {
     pioneer_postgres_test::with_database(async |database| {
@@ -2014,7 +1841,7 @@ async fn io_copy_cleanup_refuses_case_insensitive_match_after_cooperative_resync
                 .expect("ordinary SQL '=' must falsely equate A.html and a.html");
             assert_eq!(sql_equal.metadata_json, repaired);
             assert_ne!(sql_equal.metadata_json, prepared_from);
-            let scope_key = ("seed_copies".to_owned(), scope.key.clone(), 0_i64);
+            let scope_key = ("seed_copies".to_owned(), scope.key().to_owned(), 0_i64);
             assert!(
                 find_work(&scope_key.0, &scope_key.1, scope_key.2)
                     .one(&f.store.connection)
@@ -2175,54 +2002,6 @@ async fn io_legacy_copy_callback_commits_source_and_ack_atomically() {
                 .unwrap()
                 .metadata_json,
             "{}"
-        );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn gc_deadline_crossing_behind_a_finished_page_is_retained_for_the_next_pass() {
-    pioneer_postgres_test::with_database(async |database| {
-        let f = fixture(database).await;
-        f.sql(r#"INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key,created_at,metadata_json)
-            VALUES('deadline-blob','ws','deadline-sha',1,'local','deadline-key','2020-01-01 00:00:00 +00:00','{"htmlToolTemporary":1}')"#).await;
-        let created_ms = 1_577_836_800_000_i64;
-        let grace_ms = 60_000_i64;
-        let cutoff = created_ms - 1;
-        let (after, candidates) = f.store.html_preview_gc_blob_page("", cutoff).await.unwrap();
-        assert!(candidates.is_empty());
-        assert!(
-            f.store
-                .html_preview_gc_blob_page(&after, cutoff)
-                .await
-                .unwrap()
-                .0
-                .is_empty()
-        );
-        // The real clock is already later than this fixture's grace deadline.
-        // Recomputing a "future only" cutoff at EOF would silently lose it.
-        assert_eq!(
-            f.store
-                .html_preview_gc_deadline(grace_ms, cutoff)
-                .await
-                .unwrap(),
-            Some(1_577_836_860)
-        );
-        let (_, candidates) = f
-            .store
-            .html_preview_gc_blob_page("", created_ms)
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].1.blob_id, "deadline-blob");
-        assert_eq!(
-            f.store
-                .html_preview_gc_deadline(grace_ms, created_ms)
-                .await
-                .unwrap(),
-            None
         );
         Ok(())
     })
@@ -2422,12 +2201,18 @@ async fn io_long_source_locator_seed_and_claim_are_lossless_and_collision_checke
             "new request must preserve full point locator"
         );
         let tx = f.store.connection.begin().await.unwrap();
-        let collision = HtmlPreviewIoLocator {
-            source_id: "different source".into(),
-            key: claim.row.object_id,
-        };
+        // Emulate a collision by changing the stored full identity while
+        // leaving the hashed queue key and all other admission facts intact.
+        tx.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE html_preview_io_work SET cursor_id = $1 WHERE family='copies' AND object_id=$2 AND ordinal=0",
+            ["different source".into(), claim.row.object_id.into()],
+        ))
+        .await
+        .unwrap();
+        let locator = HtmlPreviewIoLocator::new(&id);
         assert!(
-            request_prepared(&tx, HtmlPreviewIoFamily::Copies, &collision, 0, "ws")
+            request_prepared(&tx, HtmlPreviewIoFamily::Copies, &locator, 0, "ws")
                 .await
                 .is_err()
         );
@@ -2826,7 +2611,7 @@ async fn io_repair_revision_and_frontier_capture_the_same_committed_request() {
 #[tokio::test]
 async fn io_business_retry_preserves_cas_class_through_artifact_error_boundary() {
     use super::super::artifact::ArtifactCrudError;
-    use super::super::html_preview_io_work::{CasRace, into_database_error};
+    use pioneer_crud_artifacts::html_preview_io::{CasRace, into_database_error};
     for conflict in [true, false] {
         pioneer_postgres_test::with_database(async |database| {
             let f = fixture(database).await;
@@ -2892,88 +2677,6 @@ async fn retention_pass_finishes_with_a_continuously_growing_artifact_suffix() {
             finished,
             "new suffix rows must not extend an already captured pass"
         );
-        Ok(())
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn finite_copy_and_gc_pages_revisit_older_candidates_despite_new_suffix_rows() {
-    pioneer_postgres_test::with_database(async |database| {
-        let f = fixture(database).await;
-        for id in ["a", "m"] {
-            io_copy_source(&f, id, "{}").await;
-        }
-        let upper = f.store.html_preview_artifact_frontier().await.unwrap();
-        let (mut after, _) = f
-            .store
-            .html_preview_released_copies_page_through("", &upper)
-            .await
-            .unwrap();
-        let metadata = r#"{"htmlTool":{"retention":"released","releasedCopies":["old.html"]}}"#;
-        f.store
-            .connection
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "UPDATE artifact SET metadata_json=$1 WHERE id='a'",
-                [metadata.into()],
-            ))
-            .await
-            .unwrap();
-        let mut finished = false;
-        for suffix in 0..4 {
-            io_copy_source(&f, &format!("z-{suffix}"), "{}").await;
-            let (next, _) = f
-                .store
-                .html_preview_released_copies_page_through(&after, &upper)
-                .await
-                .unwrap();
-            after = next;
-            if after.is_empty() {
-                finished = true;
-                break;
-            }
-        }
-        assert!(finished);
-        let next_upper = f.store.html_preview_artifact_frontier().await.unwrap();
-        let (id, cleanup) = f
-            .store
-            .html_preview_released_copies_page_through("", &next_upper)
-            .await
-            .unwrap();
-        assert_eq!(id, "a");
-        assert_eq!(cleanup, Some(("ws".to_owned(), metadata.to_owned())));
-
-        f.sql(r#"INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key,created_at,metadata_json)
-            VALUES('a','ws','a',1,'local','a','2020-01-01 00:00:00 +00:00','{}')"#).await;
-        let upper = f.store.html_preview_blob_frontier().await.unwrap();
-        let cutoff = 1_577_836_800_000_i64;
-        let (after, candidates) = f
-            .store
-            .html_preview_gc_blob_page_through("", cutoff, &upper)
-            .await
-            .unwrap();
-        assert!(candidates.is_empty());
-        f.sql(r#"UPDATE artifact_blob SET metadata_json='{"htmlToolTemporary":1}' WHERE id='a'"#)
-            .await;
-        f.sql("INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key) VALUES('z','ws','z',1,'local','z')").await;
-        assert!(
-            f.store
-                .html_preview_gc_blob_page_through(&after, cutoff, &upper)
-                .await
-                .unwrap()
-                .0
-                .is_empty()
-        );
-        let next_upper = f.store.html_preview_blob_frontier().await.unwrap();
-        let (_, candidates) = f
-            .store
-            .html_preview_gc_blob_page_through("", cutoff, &next_upper)
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].1.blob_id, "a");
         Ok(())
     })
     .await

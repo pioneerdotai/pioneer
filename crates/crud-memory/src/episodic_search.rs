@@ -1,4 +1,11 @@
+use crate::thread_episodic::{
+    ThreadEpisodicSearchResult, ThreadEpisodicSearchRow, thread_episodic_item_record_from_model,
+    thread_episodic_refill_projection_key,
+};
 use anyhow::{Result, ensure};
+use pioneer_crud_conversations::thread_timeline_projection::{
+    PROJECTION_META_STATUS_COMPLETE, find_projection_meta,
+};
 use pioneer_entity::thread_episodic_items;
 use sea_orm::entity::prelude::PgVector;
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
@@ -161,5 +168,33 @@ pub async fn search<C: ConnectionTrait>(
     Ok(SearchPage {
         rows: page,
         incomplete_sources,
+    })
+}
+
+pub async fn search_projection<C: ConnectionTrait>(
+    db: &C,
+    request: &ThreadEpisodicSearchQuery,
+) -> Result<ThreadEpisodicSearchResult> {
+    let page = search(db, request).await?;
+    let rows = page
+        .rows
+        .into_iter()
+        .map(|row| {
+            let text = row.item.search_text.clone().unwrap_or_default();
+            Ok(ThreadEpisodicSearchRow {
+                item: thread_episodic_item_record_from_model(row.item)?,
+                text,
+                lexical_rank: row.lexical_rank,
+                semantic_rank: row.semantic_rank,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let projection_key = thread_episodic_refill_projection_key(&request.workspace_id)?;
+    let marker = find_projection_meta(db, &projection_key).await?;
+    let coverage_incomplete = page.incomplete_sources
+        || !marker.is_some_and(|marker| marker.status == PROJECTION_META_STATUS_COMPLETE);
+    Ok(ThreadEpisodicSearchResult {
+        rows,
+        coverage_incomplete,
     })
 }

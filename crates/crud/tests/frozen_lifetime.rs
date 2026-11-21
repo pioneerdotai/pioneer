@@ -18,7 +18,7 @@ async fn fixture() -> CrudStore {
     );
     let db = store.database_connection();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -50,7 +50,7 @@ async fn physical_source_counts_and_expiry_do_not_clip_foreign_streams() {
         "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',0,0,'event:turn','e','event-revision:1','thread','i0',2),('p',1,2,'event:turn','e1','event-revision:1','thread','i1',2),('p',2,3,'event:turn','e2','event-revision:1','thread','i2',2)",
         "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('h',0,0,1),('h',1,0,1)",
         "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('h',0,0,4,'p'),('h',1,0,3,'p')",
-        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='h'",
+        "UPDATE compaction_frozen_layout AS layout SET active=1,pending=0,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='h'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -227,7 +227,7 @@ async fn overlapping_layout_across_page_boundary_is_a_consistency_error() {
     }
     db.execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('spans',0,255,257,'spans')").await.unwrap();
     db.execute_unprepared(
-        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='spans'",
+        "UPDATE compaction_frozen_layout AS layout SET active=1,pending=0,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='spans'",
     )
     .await
     .unwrap();

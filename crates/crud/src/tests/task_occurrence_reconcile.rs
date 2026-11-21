@@ -1,15 +1,18 @@
-//! Regression code for Proposal 72/03. Compile only until implementation review.
+//! Cross-domain Task occurrence reconciliation regressions.
 use super::*;
-use crate::repositories::{task_actor_contract as contracts, task_occurrence_reconcile as queue};
+use crate::repositories::task_actor_contract as contracts;
 use crate::{
     TaskOccurrenceClaimDeferral, TaskOccurrenceClaimFailure, TaskOccurrenceReconcileClaim,
     TaskOccurrenceTerminalRepairOutcome as Outcome,
 };
+use pioneer_crud_tasks::{
+    task_occurrence_producers as producer, task_occurrence_reconcile as queue,
+};
 use pioneer_entity::{
-    agent_execution as agents, task_occurrence_contract as occurrences,
+    agent_execution as agents, task as tasks, task_occurrence_contract as occurrences,
     task_occurrence_reconcile_pending as pending, task_occurrence_reconcile_scope as scopes,
-    task_occurrence_reconcile_seed as seed, task_occurrence_reconcile_sequence as sequence,
-    task_run as runs, task_run_execution as executions,
+    task_occurrence_reconcile_sequence as sequence, task_run as runs,
+    task_run_execution as executions,
 };
 use sea_orm::{ActiveModelTrait, IntoActiveModel};
 
@@ -23,9 +26,11 @@ async fn task(store: &CrudStore, kind: TaskExecutorKind) -> Task {
     let mut task = sample_task(AT);
     task.executor_kind = kind;
     let prepared = crate::repositories::task::prepare_task_projection(&task).unwrap();
-    crate::repositories::task::upsert_prepared_task(&store.connection, prepared)
+    let tx = store.connection.begin().await.unwrap();
+    crate::repositories::task::upsert_prepared_task(&tx, prepared)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     task
 }
 
@@ -39,16 +44,19 @@ async fn source_run(store: &CrudStore, task: &Task, n: u64, status: TaskRunStatu
     run.trigger_id = None;
     run.status = status;
     run.completed_at = status.is_terminal().then_some(AT + 1);
-    crate::repositories::task_run::upsert_run(&store.connection, &run)
+    let tx = store.connection.begin().await.unwrap();
+    crate::repositories::task_run::upsert_run(&tx, &run)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     run
 }
 
 async fn authorities(store: &CrudStore, task: &Task, run: &TaskRun, n: u64) -> String {
     let id = format!("e{n:020}");
+    let tx = store.connection.begin().await.unwrap();
     crate::repositories::task_run_execution::insert_execution_if_absent(
-        &store.connection,
+        &tx,
         crate::repositories::task_run_execution::NewTaskRunExecution {
             id: id.clone(),
             task_id: task.id.clone(),
@@ -68,6 +76,7 @@ async fn authorities(store: &CrudStore, task: &Task, run: &TaskRun, n: u64) -> S
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     if task.executor_kind == TaskExecutorKind::Agent {
         ensure_test_agent_identity(store, "ws_task", AT).await;
         attach_test_agent_execution_contract(
@@ -151,19 +160,68 @@ async fn clear_bookkeeping(store: &CrudStore) {
         .exec(&store.connection)
         .await
         .unwrap();
-    seed::Entity::update_many()
-        .col_expr(seed::Column::StatusIndex, Expr::val(5))
-        .exec(&store.connection)
-        .await
-        .unwrap();
 }
-async fn occurrence_status(store: &CrudStore, id: &str, status: &str) {
+async fn update_occurrence_status(store: &CrudStore, id: &str, status: &str) -> anyhow::Result<()> {
+    let tx = store.connection.begin().await?;
+    let before = occurrences::Entity::find()
+        .filter(occurrences::Column::RunId.eq(id))
+        .lock_exclusive()
+        .one(&tx)
+        .await?
+        .unwrap();
     occurrences::Entity::update_many()
         .col_expr(occurrences::Column::Status, Expr::val(status))
         .filter(occurrences::Column::RunId.eq(id))
-        .exec(&store.connection)
+        .exec(&tx)
+        .await?;
+    let after = occurrences::Entity::find_by_id(&before.occurrence_id)
+        .one(&tx)
+        .await?;
+    let publication = producer::contract_change(&tx, Some(&before), after.as_ref()).await;
+    if publication.is_err() {
+        tx.rollback().await?;
+        return publication;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn occurrence_status(store: &CrudStore, id: &str, status: &str) {
+    update_occurrence_status(store, id, status).await.unwrap();
+}
+
+async fn mutate_task(
+    tx: &sea_orm::DatabaseTransaction,
+    id: &str,
+    new_id: Option<&str>,
+    statement: &str,
+    values: Vec<sea_orm::Value>,
+) {
+    let before = tasks::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(tx)
         .await
         .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        statement,
+        values,
+    ))
+    .await
+    .unwrap();
+    let after = match new_id {
+        Some(id) => tasks::Entity::find_by_id(id).one(tx).await.unwrap(),
+        None => None,
+    };
+    producer::task_change(tx, before.as_ref(), after.as_ref())
+        .await
+        .unwrap();
+}
+
+async fn update_task_scope(store: &CrudStore, id: &str, statement: &str) {
+    let tx = store.connection.begin().await.unwrap();
+    mutate_task(&tx, id, Some(id), statement, vec![id.into()]).await;
+    tx.commit().await.unwrap();
 }
 async fn sql(store: &CrudStore, text: &str, values: Vec<sea_orm::Value>) {
     store
@@ -343,10 +401,10 @@ async fn literal_agent_identity_and_null_matrix() {
             .await
             .unwrap();
     }
-    sql(
+    update_task_scope(
         &store,
+        &run.task_id,
         "UPDATE task SET workspace_id='rebound' WHERE id=$1",
-        vec![run.task_id.clone().into()],
     )
     .await;
     matches_diagnostic(&store, &run.id, false).await;
@@ -408,10 +466,10 @@ async fn preparation_mutation_and_task_scope_rebinding_fence_stale_repair() {
     let facts = contracts::load_terminal_occurrence_metadata(&store.connection, &run.id)
         .await
         .unwrap();
-    sql(
+    update_task_scope(
         &store,
+        &run.task_id,
         "UPDATE task SET executor_kind='agent' WHERE id=$1",
-        vec![run.task_id.clone().into()],
     )
     .await;
     // Task scope trigger does not enumerate runs or change this pending row.
@@ -428,10 +486,10 @@ async fn preparation_mutation_and_task_scope_rebinding_fence_stale_repair() {
         Outcome::StaleClaim
     );
     matches_diagnostic(&store, &run.id, false).await;
-    sql(
+    update_task_scope(
         &store,
+        &run.task_id,
         "UPDATE task SET executor_kind='system' WHERE id=$1",
-        vec![run.task_id.clone().into()],
     )
     .await;
     occurrence_status(&store, &run.id, "recovering").await;
@@ -475,10 +533,15 @@ async fn missing_late_authorities_and_same_id_aba_are_covered() {
         .await
         .unwrap()
         .unwrap();
+    let tx = store.connection.begin().await.unwrap();
     executions::Entity::delete_by_id(id)
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    producer::execution_change(&tx, Some(&execution), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let deleted = claim(&store, &run.id, NOW).await;
     assert_eq!(
         store
@@ -488,10 +551,15 @@ async fn missing_late_authorities_and_same_id_aba_are_covered() {
         Outcome::NotRepairable
     );
     assert!(pending_row(&store, &run.id).await.is_none());
-    executions::Entity::insert(execution.into_active_model())
-        .exec(&store.connection)
+    let tx = store.connection.begin().await.unwrap();
+    let execution = executions::Entity::insert(execution.into_active_model())
+        .exec_with_returning(&tx)
         .await
         .unwrap();
+    producer::execution_change(&tx, None, Some(&execution))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let reinserted = pending_row(&store, &run.id).await.unwrap();
     assert!(reinserted.generation > deleted.generation);
     assert_eq!(
@@ -525,10 +593,13 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
         Outcome::NotRepairable
     );
     assert!(pending_row(&store, &run.id).await.is_none());
-    pioneer_entity::task::Entity::insert(task.into_active_model())
-        .exec(&store.connection)
+    let tx = store.connection.begin().await.unwrap();
+    let task = tasks::Entity::insert(task.into_active_model())
+        .exec_with_returning(&tx)
         .await
         .unwrap();
+    producer::task_change(&tx, None, Some(&task)).await.unwrap();
+    tx.commit().await.unwrap();
     assert!(
         pending_row(&store, &run.id).await.is_none(),
         "Task INSERT coalesces a scope"
@@ -551,10 +622,15 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
         .await
         .unwrap()
         .unwrap();
+    let tx = store.connection.begin().await.unwrap();
     occurrences::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    producer::contract_change(&tx, Some(&occurrence), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let owned = claim(&store, &run.id, NOW).await;
     assert_eq!(
         store
@@ -566,10 +642,15 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
     assert!(pending_row(&store, &run.id).await.is_none());
     let mut occurrence = occurrence.into_active_model();
     occurrence.status = Set("recovering".into());
-    occurrences::Entity::insert(occurrence)
-        .exec(&store.connection)
+    let tx = store.connection.begin().await.unwrap();
+    let occurrence = occurrences::Entity::insert(occurrence)
+        .exec_with_returning(&tx)
         .await
         .unwrap();
+    producer::contract_change(&tx, None, Some(&occurrence))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let owned = claim(&store, &run.id, NOW).await;
     assert_eq!(
         store
@@ -584,10 +665,15 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
         .await
         .unwrap()
         .unwrap();
+    let tx = store.connection.begin().await.unwrap();
     runs::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    producer::run_change(&tx, Some(&source), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let owned = claim(&store, &run.id, NOW).await;
     assert_eq!(
         store
@@ -597,10 +683,15 @@ async fn late_task_occurrence_and_run_requeue_after_missing_authority_ack() {
         Outcome::NotFound
     );
     assert!(pending_row(&store, &run.id).await.is_none());
-    runs::Entity::insert(source.into_active_model())
-        .exec(&store.connection)
+    let tx = store.connection.begin().await.unwrap();
+    let source = runs::Entity::insert(source.into_active_model())
+        .exec_with_returning(&tx)
         .await
         .unwrap();
+    producer::run_change(&tx, None, Some(&source))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let owned = claim(&store, &run.id, NOW).await;
     assert_eq!(
         store
@@ -643,10 +734,13 @@ async fn agent_late_insert_uses_execution_pk_and_does_not_invent_bindings() {
     let mut new = model.into_active_model();
     new.id = Set(late.into());
     new.work_graph_root_execution_id = Set(late.into());
-    agents::Entity::insert(new)
-        .exec(&store.connection)
+    let tx = store.connection.begin().await.unwrap();
+    let new = agents::Entity::insert(new)
+        .exec_with_returning(&tx)
         .await
         .unwrap();
+    producer::agent_change(&tx, None, Some(&new)).await.unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     let claimed = claim(&store, &run.id, NOW).await;
     assert_eq!(
@@ -670,9 +764,11 @@ async fn heartbeat_lease_payload_progress_and_identical_upserts_do_not_refresh_d
     sql(&store,"UPDATE task_run_execution SET heartbeat_at=CURRENT_TIMESTAMP,lease_until=CURRENT_TIMESTAMP,worker_id='worker',result_json='{}',error_json='{}',updated_at=CURRENT_TIMESTAMP WHERE id=$1",vec![id.into()]).await;
     sql(&store,"UPDATE task_occurrence_contract SET queue_position=3,terminal_reason='progress',delivery_plan_json='{}',status=status WHERE run_id=$1",vec![run.id.clone().into()]).await;
     sql(&store,"UPDATE task SET title='progress',revision=revision+1,result_json='{}',executor_kind=executor_kind,workspace_id=workspace_id WHERE id=$1",vec![run.task_id.clone().into()]).await;
-    crate::repositories::task_run::upsert_run(&store.connection, &run)
+    let tx = store.connection.begin().await.unwrap();
+    crate::repositories::task_run::upsert_run(&tx, &run)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     task(&store, TaskExecutorKind::System).await;
     assert_eq!(pending_row(&store, &run.id).await.unwrap(), before);
     assert_eq!(
@@ -747,10 +843,10 @@ async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
         source_run(&store, &task, n, TaskRunStatus::Succeeded).await;
     }
     clear_bookkeeping(&store).await;
-    sql(
+    update_task_scope(
         &store,
+        &task.id,
         "UPDATE task SET executor_kind='agent' WHERE id=$1",
-        vec![task.id.clone().into()],
     )
     .await;
     assert!(
@@ -790,9 +886,11 @@ async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
     behind.trigger_id = None;
     behind.executor_kind = TaskExecutorKind::System;
     behind.run_number = 1000;
-    crate::repositories::task_run::upsert_run(&store.connection, &behind)
+    let tx = store.connection.begin().await.unwrap();
+    crate::repositories::task_run::upsert_run(&tx, &behind)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &behind.id).await.is_some());
     let fixed = progressed.upper_run_id.clone();
     source_run(&store, &task, 1000, TaskRunStatus::Succeeded).await;
@@ -805,10 +903,10 @@ async fn scope_fanout_is_bounded_fenced_and_covers_new_ids_behind_cursor() {
             .upper_run_id,
         fixed
     );
-    sql(
+    update_task_scope(
         &store,
+        &task.id,
         "UPDATE task SET workspace_id='rebound' WHERE id=$1",
-        vec![task.id.clone().into()],
     )
     .await;
     let reset = scopes::Entity::find_by_id(task.id.clone())
@@ -923,12 +1021,29 @@ async fn failed_claim_deferral_fences_null_token_due_count_generation_and_stale_
 async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
     let (store, run, id) = fixture(TaskExecutorKind::System).await;
     let owned = claim(&store, &run.id, NOW).await;
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = runs::Entity::find_by_id(&run.id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE task_run SET status='queued',completed_at=NULL WHERE id=$1",
-        vec![run.id.clone().into()],
-    )
-    .await;
+        [run.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let after = runs::Entity::find_by_id(&run.id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::run_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     let resumed = pending_row(&store, &run.id).await.unwrap();
     assert!(resumed.generation > owned.generation);
     assert_eq!(resumed.next_attempt_at, owned.next_attempt_at);
@@ -949,34 +1064,79 @@ async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
     );
     assert!(pending_row(&store, &run.id).await.is_none());
     let new = "new_run_for_rebinding";
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = executions::Entity::find_by_id(&id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE task_run_execution SET task_run_id=$1 WHERE id=$2",
-        vec![new.into(), id.into()],
-    )
-    .await;
+        [new.into(), id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let after = executions::Entity::find_by_id(&id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::execution_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     assert!(pending_row(&store, new).await.is_some());
     pending::Entity::delete_many()
         .exec(&store.connection)
         .await
         .unwrap();
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = occurrences::Entity::find_by_id(&run.id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE task_occurrence_contract SET run_id=$1 WHERE run_id=$2",
-        vec![new.into(), run.id.clone().into()],
-    )
-    .await;
+        [new.into(), run.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let after = occurrences::Entity::find_by_id(&run.id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::contract_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     assert!(pending_row(&store, new).await.is_some());
     pending::Entity::delete_many()
         .exec(&store.connection)
         .await
+        .unwrap();
+    let tx = store.connection.begin().await.unwrap();
+    let before_run = runs::Entity::find_by_id(&run.id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
         .unwrap();
     runs::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    producer::run_change(&tx, Some(&before_run), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     sequence::Entity::update_many()
         .col_expr(sequence::Column::Generation, Expr::val(i64::MAX))
@@ -989,9 +1149,7 @@ async fn resume_retry_rebind_delete_and_monotonic_sequence_overflow() {
         .unwrap()
         .unwrap();
     assert!(
-        occurrences::Entity::update_many()
-            .col_expr(occurrences::Column::Status, Expr::val("cancelled"))
-            .exec(&store.connection)
+        update_occurrence_status(&store, new, "cancelled")
             .await
             .is_err()
     );
@@ -1018,12 +1176,8 @@ async fn over_budget_poison_claims_and_healthy_rows_share_fair_quanta() {
     let mut changed = 0;
     for _ in 0..4 {
         let scope_inputs = store.expand_task_occurrence_scope(&|| NOW).await.unwrap();
-        let seed_inputs = store
-            .seed_unfinished_task_occurrences(&|| NOW)
-            .await
-            .unwrap();
         let candidates = store.discover_task_occurrence_reconcile(NOW).await.unwrap();
-        assert!(scope_inputs + seed_inputs + candidates.len() as u64 <= 64);
+        assert!(scope_inputs + candidates.len() as u64 <= 64);
         assert!(candidates.len() <= 32);
         for candidate in candidates {
             assert!(
@@ -1075,62 +1229,6 @@ async fn over_budget_poison_claims_and_healthy_rows_share_fair_quanta() {
             .unwrap()
             .len(),
         32
-    );
-}
-
-#[pioneer_postgres_test::postgres_test]
-async fn due_scope_and_seed_plans_use_covering_keyset_indexes() {
-    let store = contract_store("ws_task").await;
-    let scope = scopes::Model {
-        task_id: "task".into(),
-        generation: 1,
-        after_run_id: Some("a".into()),
-        upper_run_id: Some("z".into()),
-    };
-    let seed = seed::Model {
-        singleton: 1,
-        status_index: 0,
-        after_run_id: Some("a".into()),
-        upper_run_id: Some("z".into()),
-    };
-    for (query, index) in [
-        (
-            queue::due_query(NOW, 32),
-            "idx_task_occurrence_reconcile_due",
-        ),
-        (queue::scope_page_query(&scope, 15), "idx_task_run_task_id"),
-        (queue::seed_page_query(&seed, 15), "idx_task_run_status_id"),
-    ] {
-        let mut statement = store.connection.get_database_backend().build(&query);
-        statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
-        let plan: Vec<String> = store
-            .with_maintenance_access()
-            .connection
-            .query_all_raw(statement)
-            .await
-            .unwrap()
-            .iter()
-            .map(|row| row.try_get("", "QUERY PLAN").unwrap())
-            .collect();
-        assert!(plan.iter().any(|row| row.contains(index)), "{plan:#?}");
-        assert!(
-            plan.iter()
-                .all(|row| !row.contains("Sort") && !row.contains("Seq Scan on task_run")),
-            "{plan:#?}"
-        );
-    }
-    // Existing unique bindings remain the lookup indexes; don't duplicate them.
-    let rows = store
-        .connection
-        .query_all_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT indisunique AS \"unique\" FROM pg_index WHERE indrelid='task_occurrence_contract'::regclass".to_owned(),
-        ))
-        .await
-        .unwrap();
-    assert!(
-        rows.iter()
-            .any(|row| row.try_get::<bool>("", "unique").unwrap())
     );
 }
 
@@ -1189,7 +1287,7 @@ async fn disk_fixture(store: &CrudStore) -> TaskRun {
         id: Set("ws_task".into()),
         name: Set("Contracts".into()),
         is_active: Set(true),
-        is_current: Set(true),
+        is_current: Set(false),
         created_at: Set(unix_to_datetime(AT)),
         updated_at: Set(unix_to_datetime(AT)),
     })
@@ -1396,35 +1494,78 @@ async fn source_pk_rebinds_and_deletes_enqueue_old_and_new_locators() {
     let (store, run, _) = fixture(TaskExecutorKind::System).await;
     clear_bookkeeping(&store).await;
     let rebound = "rebound_run_key";
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = runs::Entity::find_by_id(&run.id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE task_run SET id=$1 WHERE id=$2",
-        vec![rebound.into(), run.id.clone().into()],
-    )
-    .await;
+        [rebound.into(), run.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let after = runs::Entity::find_by_id(rebound)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::run_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     assert!(pending_row(&store, rebound).await.is_some());
     clear_bookkeeping(&store).await;
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = occurrences::Entity::find_by_id(&run.id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE task_occurrence_contract SET occurrence_id='new_occurrence_key' WHERE run_id=$1",
-        vec![run.id.clone().into()],
-    )
-    .await;
-    assert!(pending_row(&store, &run.id).await.is_some());
-    clear_bookkeeping(&store).await;
-    occurrences::Entity::delete_by_id("new_occurrence_key".to_owned())
-        .exec(&store.connection)
+        [run.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let after = occurrences::Entity::find_by_id("new_occurrence_key")
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::contract_change(&tx, Some(&before), Some(&after))
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &run.id).await.is_some());
     clear_bookkeeping(&store).await;
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    occurrences::Entity::delete_by_id("new_occurrence_key")
+        .exec(&tx)
+        .await
+        .unwrap();
+    producer::contract_change(&tx, Some(&after), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(pending_row(&store, &run.id).await.is_some());
+    clear_bookkeeping(&store).await;
+    let tx = store.connection.begin().await.unwrap();
+    mutate_task(
+        &tx,
+        &run.task_id,
+        Some("new_task_key"),
         "UPDATE task SET id='new_task_key' WHERE id=$1",
         vec![run.task_id.clone().into()],
     )
     .await;
+    tx.commit().await.unwrap();
     assert!(
         scopes::Entity::find_by_id(run.task_id.clone())
             .one(&store.connection)
@@ -1451,10 +1592,16 @@ async fn source_pk_rebinds_and_deletes_enqueue_old_and_new_locators() {
         .exec(&store.connection)
         .await
         .unwrap();
-    pioneer_entity::task::Entity::delete_by_id("new_task_key".to_owned())
-        .exec(&store.connection)
-        .await
-        .unwrap();
+    let tx = store.connection.begin().await.unwrap();
+    mutate_task(
+        &tx,
+        "new_task_key",
+        None,
+        "DELETE FROM task WHERE id=$1",
+        vec!["new_task_key".into()],
+    )
+    .await;
+    tx.commit().await.unwrap();
     assert!(
         scopes::Entity::find_by_id("new_task_key".to_owned())
             .one(&store.connection)
@@ -1473,8 +1620,9 @@ async fn agent_old_new_keys_use_execution_pk_even_without_occurrence_rows() {
     let a_id = "a00000000000000000000";
     let b_id = "b00000000000000000000";
     for (run, id) in [(&a, a_id), (&b, b_id)] {
+        let tx = store.connection.begin().await.unwrap();
         crate::repositories::task_run_execution::insert_execution_if_absent(
-            &store.connection,
+            &tx,
             crate::repositories::task_run_execution::NewTaskRunExecution {
                 id: id.into(),
                 task_id: task.id.clone(),
@@ -1494,6 +1642,7 @@ async fn agent_old_new_keys_use_execution_pk_even_without_occurrence_rows() {
         )
         .await
         .unwrap();
+        tx.commit().await.unwrap();
     }
     let mut model = agents::Entity::find_by_id(original_id)
         .one(&store.connection)
@@ -1507,19 +1656,41 @@ async fn agent_old_new_keys_use_execution_pk_even_without_occurrence_rows() {
         .await
         .unwrap();
     clear_bookkeeping(&store).await;
-    sql(
-        &store,
+    let tx = store.connection.begin().await.unwrap();
+    let before = agents::Entity::find_by_id(a_id)
+        .lock_exclusive()
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
         "UPDATE agent_execution SET id=$1 WHERE id=$2",
-        vec![b_id.into(), a_id.into()],
-    )
-    .await;
+        [b_id.into(), a_id.into()],
+    ))
+    .await
+    .unwrap();
+    let after = agents::Entity::find_by_id(b_id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    producer::agent_change(&tx, Some(&before), Some(&after))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &a.id).await.is_some());
     assert!(pending_row(&store, &b.id).await.is_some());
     clear_bookkeeping(&store).await;
+    let tx = store.connection.begin().await.unwrap();
     agents::Entity::delete_by_id(b_id.to_owned())
-        .exec(&store.connection)
+        .exec(&tx)
         .await
         .unwrap();
+    producer::agent_change(&tx, Some(&after), None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(pending_row(&store, &b.id).await.is_some());
     assert!(pending_row(&store, &a.id).await.is_none());
 }
@@ -1532,10 +1703,10 @@ async fn scope_generation_refresh_while_waiting_for_writer_rejects_old_prefix() 
     let store = observed_store(&fixture, routes.clone()).await;
     let run = disk_fixture(&store).await;
     clear_bookkeeping(&store).await;
-    sql(
+    update_task_scope(
         &store,
+        &run.task_id,
         "UPDATE task SET workspace_id='before' WHERE id=$1",
-        vec![run.task_id.clone().into()],
     )
     .await;
     let hold = store.connection.begin().await.unwrap();
@@ -1545,13 +1716,14 @@ async fn scope_generation_refresh_while_waiting_for_writer_rejects_old_prefix() 
     tokio::time::timeout(Duration::from_secs(5), routes.queued.notified())
         .await
         .unwrap();
-    hold.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
+    mutate_task(
+        &hold,
+        &run.task_id,
+        Some(&run.task_id),
         "UPDATE task SET workspace_id='newer' WHERE id=$1",
-        [run.task_id.clone().into()],
-    ))
-    .await
-    .unwrap();
+        vec![run.task_id.clone().into()],
+    )
+    .await;
     let fresh = scopes::Entity::find_by_id(run.task_id.clone())
         .one(&hold)
         .await
@@ -1586,17 +1758,17 @@ async fn scope_generation_refresh_while_waiting_for_writer_rejects_old_prefix() 
 #[pioneer_postgres_test::postgres_test]
 async fn metadata_repair_does_not_decode_unrelated_payloads() {
     let (store, run, id) = fixture(TaskExecutorKind::System).await;
-    sql(&store,"UPDATE task SET metadata_json='invalid JSON',result_json='invalid JSON',error_json='invalid JSON' WHERE id=$1",vec![run.task_id.clone().into()]).await;
+    sql(&store,"UPDATE task SET metadata_json='\"invalid JSON\"'::json,result_json='\"invalid JSON\"',error_json='\"invalid JSON\"' WHERE id=$1",vec![run.task_id.clone().into()]).await;
     sql(
         &store,
-        "UPDATE task_run SET result_json='invalid JSON',error_json='invalid JSON' WHERE id=$1",
+        "UPDATE task_run SET result_json='\"invalid JSON\"',error_json='\"invalid JSON\"' WHERE id=$1",
         vec![run.id.clone().into()],
     )
     .await;
-    sql(&store,"UPDATE task_run_execution SET result_json='invalid JSON',error_json='invalid JSON' WHERE id=$1",vec![id.into()]).await;
+    sql(&store,"UPDATE task_run_execution SET result_json='\"invalid JSON\"',error_json='\"invalid JSON\"' WHERE id=$1",vec![id.into()]).await;
     sql(
         &store,
-        "UPDATE task_occurrence_contract SET delivery_plan_json='invalid JSON' WHERE run_id=$1",
+        "UPDATE task_occurrence_contract SET delivery_plan_json='\"invalid JSON\"' WHERE run_id=$1",
         vec![run.id.clone().into()],
     )
     .await;
@@ -1617,12 +1789,14 @@ async fn poison_scope_rotates_without_advancing_prefix_and_healthy_scope_progres
     let a = task(&store, TaskExecutorKind::System).await;
     let mut b = a.clone();
     b.id = "task_other_scope".into();
+    let tx = store.connection.begin().await.unwrap();
     crate::repositories::task::upsert_prepared_task(
-        &store.connection,
+        &tx,
         crate::repositories::task::prepare_task_projection(&b).unwrap(),
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     for n in 0..40 {
         source_run(&store, &a, n, TaskRunStatus::Succeeded).await;
     }
@@ -1631,10 +1805,10 @@ async fn poison_scope_rotates_without_advancing_prefix_and_healthy_scope_progres
     }
     clear_bookkeeping(&store).await;
     for task in [&a, &b] {
-        sql(
+        update_task_scope(
             &store,
+            &task.id,
             "UPDATE task SET executor_kind='agent' WHERE id=$1",
-            vec![task.id.clone().into()],
         )
         .await;
     }

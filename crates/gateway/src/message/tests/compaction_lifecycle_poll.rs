@@ -1,18 +1,18 @@
-//! Gateway orchestration regressions; compile only until review acceptance.
+//! Gateway orchestration of compaction lifecycle and history work.
 use super::*;
 use pioneer_entity::{compaction_lifecycle_pending as pending, compaction_operation as operation};
 use pioneer_sqlite::SqliteWriteClass;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 
 async fn fixture() -> (
-    tempfile::TempDir,
+    Arc<pioneer_postgres_test::TestDatabase>,
     Arc<MessageProcessor>,
     Arc<CrudStore>,
     Arc<NativeSchedulingObserver>,
 ) {
     let observer = Arc::new(NativeSchedulingObserver::default());
     let (directory, manager, store, workspace) =
-        setup_pooled_file_workspace_manager_with_observer(Some(observer.clone())).await;
+        setup_pooled_workspace_manager_with_observer(Some(observer.clone())).await;
     let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
         test_provider(),
@@ -51,13 +51,13 @@ async fn fixture() -> (
         "actual root answer",
     )
     .await;
-    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-        "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('poll-owner',?,'poll-thread',1)", [workspace.into()])).await.unwrap();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('poll-owner',$1,'poll-thread',1)", [workspace.into()])).await.unwrap();
     for id in
         std::iter::once("a-poison".to_owned()).chain((0..11).map(|i| format!("b-healthy-{i:02}")))
     {
-        db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,execution_turn,deadline_ms) VALUES (?,'poll-owner',?,'running','{}','poll-turn',0)", [id.clone().into(), id.into()])).await.unwrap();
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,execution_turn,deadline_ms) VALUES ($1,'poll-owner',$2,'running','{}','poll-turn',0)", [id.clone().into(), id.into()])).await.unwrap();
     }
     (directory, processor, store, observer)
 }
@@ -71,11 +71,19 @@ async fn failed_count(store: &CrudStore) -> u64 {
         .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_and_cooldown() {
     let (_directory, processor, store, observer) = fixture().await;
     let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_poison_bookkeeping BEFORE UPDATE ON compaction_lifecycle_pending WHEN OLD.operation_id='a-poison' AND NEW.attempts>OLD.attempts BEGIN SELECT RAISE(ABORT,'fixture bookkeeping unavailable'); END").await.unwrap();
+    db.execute_unprepared(
+        "CREATE FUNCTION reject_poison_bookkeeping() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'fixture bookkeeping unavailable'; END; $$;
+         CREATE TRIGGER reject_poison_bookkeeping BEFORE UPDATE ON compaction_lifecycle_pending
+         FOR EACH ROW WHEN (OLD.operation_id='a-poison' AND NEW.attempts>OLD.attempts)
+         EXECUTE FUNCTION reject_poison_bookkeeping()",
+    )
+    .await
+    .unwrap();
     // Complete expansion before selecting this batch so the first point
     // locator keeps its original generation/order. No seed rediscovery.
     db.execute_unprepared("DELETE FROM compaction_lifecycle_scope; UPDATE compaction_lifecycle_sequence SET seed_complete=1 WHERE singleton=1").await.unwrap();
@@ -168,7 +176,7 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
         .unwrap();
     assert!(scheduled > tokio::time::Instant::now());
     // Removing the fault does not bypass the next lifecycle poll's cooldown.
-    db.execute_unprepared("DROP TRIGGER reject_poison_bookkeeping")
+    db.execute_unprepared("DROP TRIGGER reject_poison_bookkeeping ON compaction_lifecycle_pending; DROP FUNCTION reject_poison_bookkeeping()")
         .await
         .unwrap();
     processor.poll_completed_history_checks().await.unwrap();
@@ -192,11 +200,22 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
     assert!(db.reader_query_only_enabled().await.unwrap());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_scope_bookkeeping_failure_preserves_independent_pending_quota() {
     let (_directory, processor, store, _) = fixture().await;
     let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("CREATE TRIGGER reject_scope_bookkeeping BEFORE UPDATE ON compaction_lifecycle_scope WHEN NEW.attempts>OLD.attempts BEGIN SELECT RAISE(ABORT,'fixture scope unavailable'); END").await.unwrap();
+    db.execute_unprepared(
+        "INSERT INTO compaction_lifecycle_scope(kind,owner,turn_id,generation,due_at)
+         VALUES('owner','poll-owner','',1,0)
+         ON CONFLICT (kind,owner,turn_id) DO UPDATE SET due_at=EXCLUDED.due_at;
+         CREATE FUNCTION reject_scope_bookkeeping() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'fixture scope unavailable'; END; $$;
+         CREATE TRIGGER reject_scope_bookkeeping BEFORE UPDATE ON compaction_lifecycle_scope
+         FOR EACH ROW WHEN (NEW.attempts>OLD.attempts)
+         EXECUTE FUNCTION reject_scope_bookkeeping()",
+    )
+    .await
+    .unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         processor.poll_completed_history_checks(),
@@ -207,8 +226,8 @@ async fn lifecycle_scope_bookkeeping_failure_preserves_independent_pending_quota
     assert_eq!(failed_count(&store).await, 8);
     assert!(
         pioneer_entity::compaction_lifecycle_scope::Entity::find()
-            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Kind.eq("seed"))
-            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Owner.eq(""))
+            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Kind.eq("owner"))
+            .filter(pioneer_entity::compaction_lifecycle_scope::Column::Owner.eq("poll-owner"))
             .filter(pioneer_entity::compaction_lifecycle_scope::Column::TurnId.eq(""))
             .one(&db)
             .await
@@ -224,7 +243,7 @@ async fn lifecycle_scope_bookkeeping_failure_preserves_independent_pending_quota
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn lifecycle_gateway_poll_cancellation_releases_maintenance_reservation() {
     let (_directory, processor, store, observer) = fixture().await;
     let db = store.with_maintenance_access().database_connection();

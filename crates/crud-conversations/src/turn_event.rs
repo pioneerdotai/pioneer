@@ -21,17 +21,24 @@ pub async fn lock_stream(tx: &DatabaseTransaction, turn_id: &str) -> Result<()> 
     Ok(())
 }
 
-pub async fn next_sequence(tx: &DatabaseTransaction, turn_id: &str) -> Result<i64> {
-    let max = event::Entity::find()
+pub async fn max_sequence<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
+    Ok(event::Entity::find()
         .select_only()
         .column_as(event::Column::Sequence.max(), "last")
         .filter(event::Column::TurnId.eq(turn_id))
         .into_tuple::<Option<i64>>()
-        .one(tx)
-        .await?
+        .one(db)
+        .await
+        .context("failed to query max turn_event sequence")?
         .flatten()
-        .unwrap_or(0);
-    max.checked_add(1).context("turn event sequence overflow")
+        .unwrap_or(0))
+}
+
+pub async fn next_sequence(tx: &DatabaseTransaction, turn_id: &str) -> Result<i64> {
+    max_sequence(tx, turn_id)
+        .await?
+        .checked_add(1)
+        .context("turn event sequence overflow")
 }
 
 pub struct NewEvent<'a> {

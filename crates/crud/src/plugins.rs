@@ -5,6 +5,7 @@ use pioneer_entity::package_component;
 pub use plugins::{
     PackageNativeWrite, PackageOwnershipWrite, PluginNativeWrite, PluginOwnershipWrite,
 };
+pub(crate) use plugins::{native_package_removal, validate_native_write_input};
 use sea_orm::TransactionTrait;
 
 impl CrudStore {
@@ -715,34 +716,6 @@ impl CrudStore {
     }
 }
 
-pub(crate) fn validate_native_write_input(write: Option<&PluginNativeWrite>) -> Result<()> {
-    if let Some(write) = write {
-        if write.pending_after.len() > 65536 || write.override_fields_json.len() > 4096 {
-            bail!("plugin native write exceeds bounds");
-        }
-        let _: serde_json::Value = serde_json::from_str(&write.pending_after)?;
-        let fields: Vec<String> = serde_json::from_str(&write.override_fields_json)?;
-        if fields.len() > 32
-            || fields.iter().any(|field| {
-                !matches!(
-                    field.as_str(),
-                    "enabled"
-                        | "allow_implicit_invocation"
-                        | "transport"
-                        | "auth"
-                        | "secret_refs"
-                        | "display_name"
-                        | "required"
-                        | "skill_source"
-                )
-            })
-        {
-            bail!("unknown plugin override field");
-        }
-    }
-    Ok(())
-}
-
 impl CrudStore {
     /// Publish an existing OAuth operation's completed effect; the OAuth
     /// engine/persistence remains authoritative for credentials and cleanup.
@@ -948,17 +921,6 @@ impl CrudStore {
         })
         .await
     }
-}
-
-pub(crate) fn native_package_removal(write: Option<&PluginNativeWrite>) -> Result<bool> {
-    let Some(write) = write else {
-        return Ok(false);
-    };
-    let value: serde_json::Value = serde_json::from_str(&write.pending_after)?;
-    Ok(matches!(
-        value.get("kind").and_then(serde_json::Value::as_str),
-        Some("install" | "update" | "retry" | "remove")
-    ))
 }
 
 impl CrudStore {

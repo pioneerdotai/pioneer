@@ -1114,7 +1114,7 @@ async fn oauth_queue_cancellation_impl(
     oauth_server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn oauth_scoped_restart_keeps_catalog_and_audit_on_maintenance_writer() {
     for phase in ["live", "startup", "backoff", "auth_required", "recovery"] {
         oauth_scope_phase(phase).await;
@@ -1123,30 +1123,10 @@ async fn oauth_scoped_restart_keeps_catalog_and_audit_on_maintenance_writer() {
 
 async fn oauth_scope_phase(phase: &'static str) {
     let observer = Arc::new(NativeSchedulingObserver::default());
-    use sea_orm::ConnectOptions;
-    let directory = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("oauth-scope.sqlite").display()
-    );
-    let mut options = ConnectOptions::new(url.clone());
-    options.max_connections(1).sqlx_logging(false);
-    let bootstrap_connection = Database::connect(options).await.unwrap();
-    let (_, _, workspace_id) =
-        setup_workspace_manager_with_connection(bootstrap_connection.clone()).await;
-    bootstrap_connection
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut writer_options = ConnectOptions::new(url.clone());
-    writer_options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(writer_options).await.unwrap();
-    let mut reader_options = ConnectOptions::new(url);
-    reader_options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(reader_options).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace_id) = setup_postgres_workspace_manager(&fixture).await;
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
         reader,
         pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),

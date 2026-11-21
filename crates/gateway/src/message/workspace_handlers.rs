@@ -20,7 +20,8 @@ impl MessageProcessor {
             Ok(workspaces) => workspaces,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to list workspaces: {message}"),
                     ),
@@ -79,7 +80,8 @@ impl MessageProcessor {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to create workspace: {message}"),
                     ),
@@ -161,7 +163,8 @@ impl MessageProcessor {
             }
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to ensure default workspace: {message}"),
                     ),
@@ -238,7 +241,8 @@ impl MessageProcessor {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to select workspace: {message}"),
                     ),
@@ -312,7 +316,8 @@ impl MessageProcessor {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to update workspace: {message}"),
                     ),

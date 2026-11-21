@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
-use pioneer_entity::{thread_folder, thread_placement, workspace};
+use chrono::Timelike;
+use pioneer_entity::{thread, thread_folder, thread_placement, workspace};
+use pioneer_protocol::{ThreadFolder, ThreadPlacement, generate_id};
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, LockType, OnConflict};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 
 pub async fn list_folders_by_workspace<C: ConnectionTrait>(
@@ -226,4 +229,293 @@ pub async fn upsert_thread_placement<C: ConnectionTrait>(
     .context("failed to upsert thread placement")?;
 
     Ok(())
+}
+
+pub async fn list_thread_folders(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+) -> Result<Vec<ThreadFolder>> {
+    let models = list_folders_by_workspace(db, workspace_id).await?;
+    Ok(models
+        .into_iter()
+        .map(thread_folder_from_db_model)
+        .collect())
+}
+
+pub async fn list_thread_placements(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+) -> Result<Vec<ThreadPlacement>> {
+    let models = list_placements_by_workspace(db, workspace_id).await?;
+    Ok(models
+        .into_iter()
+        .map(thread_placement_from_db_model)
+        .collect())
+}
+
+pub async fn get_thread_placement(
+    db: &SqliteDatabase,
+    thread_id: &str,
+) -> Result<Option<ThreadPlacement>> {
+    Ok(find_placement_by_thread_id(db, thread_id)
+        .await?
+        .map(thread_placement_from_db_model))
+}
+
+pub async fn create_thread_folder(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+    parent_folder_id: Option<&str>,
+    name: &str,
+) -> Result<ThreadFolder> {
+    let transaction = db.begin().await?;
+    lock_topology(&transaction, workspace_id).await?;
+    if let Some(parent_folder_id) = parent_folder_id {
+        let Some(parent) = find_folder_by_id(&transaction, parent_folder_id).await? else {
+            anyhow::bail!("parent folder `{parent_folder_id}` was not found");
+        };
+
+        if parent.workspace_id != workspace_id {
+            anyhow::bail!(
+                "parent folder `{parent_folder_id}` belongs to workspace `{}`",
+                parent.workspace_id
+            );
+        }
+    }
+
+    let created_at = chrono::Utc::now()
+        .with_nanosecond(0)
+        .expect("whole-second timestamp")
+        .fixed_offset();
+    let now = created_at.timestamp();
+    let folder_id = generate_id(21);
+    insert_folder(
+        &transaction,
+        folder_id.as_str(),
+        workspace_id,
+        parent_folder_id,
+        name,
+        created_at,
+        created_at,
+    )
+    .await?;
+
+    transaction.commit().await?;
+    Ok(ThreadFolder {
+        id: folder_id,
+        workspace_id: workspace_id.to_owned(),
+        parent_folder_id: parent_folder_id.map(str::to_owned),
+        name: name.to_owned(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+pub async fn delete_thread_folder_promote(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+    folder_id: &str,
+) -> Result<bool> {
+    let transaction = db
+        .begin()
+        .await
+        .context("failed to begin folder delete transaction")?;
+    lock_topology(&transaction, workspace_id).await?;
+
+    let folder = find_folder_by_id(&transaction, folder_id).await?;
+    let Some(folder) = folder else {
+        transaction
+            .rollback()
+            .await
+            .context("failed to rollback folder delete transaction")?;
+        return Ok(false);
+    };
+
+    if folder.workspace_id != workspace_id {
+        transaction
+            .rollback()
+            .await
+            .context("failed to rollback folder delete transaction")?;
+        anyhow::bail!(
+            "folder `{folder_id}` belongs to workspace `{}`",
+            folder.workspace_id
+        );
+    }
+
+    let now = chrono::Utc::now()
+        .with_nanosecond(0)
+        .expect("whole-second timestamp")
+        .fixed_offset();
+    reparent_child_folders(
+        &transaction,
+        folder_id,
+        folder.parent_folder_id.as_deref(),
+        now,
+    )
+    .await?;
+
+    move_thread_placements_to_folder(
+        &transaction,
+        folder_id,
+        folder.parent_folder_id.as_deref(),
+        now,
+    )
+    .await?;
+
+    delete_folder(&transaction, folder_id).await?;
+
+    transaction
+        .commit()
+        .await
+        .context("failed to commit folder delete transaction")?;
+
+    Ok(true)
+}
+
+pub async fn move_thread_to_folder(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+    thread_id: &str,
+    folder_id: Option<&str>,
+) -> Result<()> {
+    let transaction = db.begin().await?;
+    lock_topology(&transaction, workspace_id).await?;
+    thread::Entity::find_by_id(thread_id)
+        .select_only()
+        .column(thread::Column::Id)
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .lock(LockType::Share)
+        .into_tuple::<String>()
+        .one(&transaction)
+        .await?
+        .context("thread is missing from the placement workspace")?;
+
+    if let Some(folder_id) = folder_id {
+        let Some(folder) = find_folder_by_id(&transaction, folder_id).await? else {
+            anyhow::bail!("folder `{folder_id}` was not found");
+        };
+
+        if folder.workspace_id != workspace_id {
+            anyhow::bail!(
+                "folder `{folder_id}` belongs to workspace `{}`",
+                folder.workspace_id
+            );
+        }
+    }
+
+    let now = chrono::Utc::now()
+        .with_nanosecond(0)
+        .expect("whole-second timestamp")
+        .fixed_offset();
+    upsert_thread_placement(&transaction, workspace_id, thread_id, folder_id, now, now).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn move_folder(
+    db: &SqliteDatabase,
+    workspace_id: &str,
+    folder_id: &str,
+    parent_folder_id: Option<&str>,
+) -> Result<()> {
+    if parent_folder_id == Some(folder_id) {
+        anyhow::bail!("cannot move folder into itself");
+    }
+
+    let transaction = db
+        .begin()
+        .await
+        .context("failed to begin folder move transaction")?;
+    lock_topology(&transaction, workspace_id).await?;
+
+    let Some(folder) = find_folder_by_id(&transaction, folder_id).await? else {
+        transaction
+            .rollback()
+            .await
+            .context("failed to rollback folder move transaction")?;
+        anyhow::bail!("folder `{folder_id}` was not found");
+    };
+    if folder.workspace_id != workspace_id {
+        transaction
+            .rollback()
+            .await
+            .context("failed to rollback cross-workspace folder move transaction")?;
+        anyhow::bail!(
+            "folder `{folder_id}` belongs to workspace `{}`",
+            folder.workspace_id
+        );
+    }
+
+    if let Some(parent_folder_id) = parent_folder_id {
+        let Some(parent) = find_folder_by_id(&transaction, parent_folder_id).await? else {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback folder move transaction")?;
+            anyhow::bail!("parent folder `{parent_folder_id}` was not found");
+        };
+        if parent.workspace_id != workspace_id {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback cross-workspace parent move transaction")?;
+            anyhow::bail!(
+                "parent folder `{parent_folder_id}` belongs to workspace `{}`",
+                parent.workspace_id
+            );
+        }
+        if folder_parent_would_create_cycle(&transaction, workspace_id, folder_id, parent_folder_id)
+            .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .context("failed to rollback cyclic folder move transaction")?;
+            anyhow::bail!(
+                "cannot move folder `{folder_id}` into its descendant `{parent_folder_id}`"
+            );
+        }
+    }
+
+    if folder.parent_folder_id.as_deref() == parent_folder_id {
+        transaction
+            .rollback()
+            .await
+            .context("failed to rollback folder move transaction")?;
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now()
+        .with_nanosecond(0)
+        .expect("whole-second timestamp")
+        .fixed_offset();
+    update_folder_parent(&transaction, folder_id, parent_folder_id, now).await?;
+
+    transaction
+        .commit()
+        .await
+        .context("failed to commit folder move transaction")?;
+
+    Ok(())
+}
+
+fn thread_folder_from_db_model(model: pioneer_entity::thread_folder::Model) -> ThreadFolder {
+    ThreadFolder {
+        id: model.id,
+        workspace_id: model.workspace_id,
+        parent_folder_id: model.parent_folder_id,
+        name: model.name,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+    }
+}
+
+fn thread_placement_from_db_model(
+    model: pioneer_entity::thread_placement::Model,
+) -> ThreadPlacement {
+    ThreadPlacement {
+        thread_id: model.thread_id,
+        workspace_id: model.workspace_id,
+        folder_id: model.folder_id,
+    }
 }

@@ -29,6 +29,13 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
         }
+        // SeaQuery 1.0 cannot alter a foreign key's deferrability.
+        manager
+            .get_connection()
+            .execute_unprepared(include_str!(
+                "sql/m20261119_000009_relations/frozen_span_constraints.sql"
+            ))
+            .await?;
         Ok(())
     }
 
@@ -1018,15 +1025,6 @@ const FOREIGN_KEYS: &[Relation] = &[
         "compaction_turn_creation_turn_id_fkey",
         &["turn_id"],
         "turn",
-        &["id"],
-        ForeignKeyAction::NoAction,
-        ForeignKeyAction::Cascade,
-    ),
-    (
-        "compaction_history_preparation",
-        "compaction_history_preparation_thread_id_fkey",
-        &["thread_id"],
-        "thread",
         &["id"],
         ForeignKeyAction::NoAction,
         ForeignKeyAction::Cascade,

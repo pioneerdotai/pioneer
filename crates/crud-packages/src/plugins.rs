@@ -345,6 +345,18 @@ pub async fn insert_parent(
     metadata: Option<super::plugin_metadata::PreparedMetadata>,
 ) -> Result<()> {
     if row.kind == crate::PackageKind::App {
+        // The slug trigger takes this same lock. Acquire it before preflight so
+        // a losing reservation sees the winner and returns the public conflict.
+        use pioneer_entity::workspace;
+        workspace::Entity::find_by_id(&row.workspace_id)
+            .select_only()
+            .column(workspace::Column::Id)
+            .lock(sea_orm::sea_query::LockType::NoKeyUpdate)
+            .into_tuple::<String>()
+            .one(db)
+            .await?
+            .context("package workspace missing")?;
+
         anyhow::ensure!(
             app_installation::Entity::find()
                 .inner_join(package_installation::Entity)
@@ -1039,4 +1051,42 @@ pub async fn app_runtime_frontier<C: ConnectionTrait>(db: &C) -> Result<Option<S
         .into_tuple::<String>()
         .one(db)
         .await?)
+}
+
+pub fn validate_native_write_input(write: Option<&PluginNativeWrite>) -> Result<()> {
+    if let Some(write) = write {
+        if write.pending_after.len() > 65536 || write.override_fields_json.len() > 4096 {
+            bail!("plugin native write exceeds bounds");
+        }
+        let _: serde_json::Value = serde_json::from_str(&write.pending_after)?;
+        let fields: Vec<String> = serde_json::from_str(&write.override_fields_json)?;
+        if fields.len() > 32
+            || fields.iter().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "enabled"
+                        | "allow_implicit_invocation"
+                        | "transport"
+                        | "auth"
+                        | "secret_refs"
+                        | "display_name"
+                        | "required"
+                        | "skill_source"
+                )
+            })
+        {
+            bail!("unknown plugin override field");
+        }
+    }
+    Ok(())
+}
+pub fn native_package_removal(write: Option<&PluginNativeWrite>) -> Result<bool> {
+    let Some(write) = write else {
+        return Ok(false);
+    };
+    let value: serde_json::Value = serde_json::from_str(&write.pending_after)?;
+    Ok(matches!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("install" | "update" | "retry" | "remove")
+    ))
 }

@@ -1,10 +1,12 @@
 //! Access repositories that use the caller's scoped connection or transaction.
 
+pub mod actor_nickname;
 pub mod administrative_audit;
 pub mod policy_generation;
 pub mod principal_avatar;
 
 pub mod auth_session;
+pub mod authorization_persistence;
 pub mod authorization_scope;
 pub mod identity;
 pub mod membership;

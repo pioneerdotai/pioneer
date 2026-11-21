@@ -3447,8 +3447,7 @@ pub(super) fn agent_start_has_storage_failure(error: &anyhow::Error) -> bool {
                 )
             })
             || source.downcast_ref::<sea_orm::ConnAcquireErr>().is_some()
-    }) || pioneer_sqlite::is_anyhow_sqlite_transient_access(error)
-        || super::agent_runtime::native_preparation_has_typed_sqlite_lock(error)
+    }) || pioneer_sqlite::is_anyhow_database_transient_access(error)
 }
 
 pub(super) fn agent_start_proof_error(

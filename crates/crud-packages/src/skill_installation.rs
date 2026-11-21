@@ -105,6 +105,17 @@ pub async fn delete_skill_installations<C: ConnectionTrait>(
     Ok(result.rows_affected)
 }
 
+pub async fn insert_standalone<C: ConnectionTrait>(
+    db: &C,
+    record: &crate::skill_records::SkillInstallationRecord,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    if record.pack_id.is_some() || record.pack_member_key.is_some() {
+        bail!("pack members must be inserted through a pack transaction");
+    }
+    insert_skill_installation(db, record, now, now).await
+}
+
 pub async fn insert_skill_installation<C: ConnectionTrait>(
     db: &C,
     record: &crate::skill_records::SkillInstallationRecord,
@@ -263,13 +274,41 @@ pub async fn list_skill_installations_by_pack_id<C: ConnectionTrait>(
     db: &C,
     pack_id: &SkillPackId,
 ) -> Result<Vec<skill_installation::Model>> {
+    skill_installations_by_pack_id(pack_id)
+        .all(db)
+        .await
+        .with_context(|| format!("failed to query children for pack `{pack_id}`"))
+}
+
+fn skill_installations_by_pack_id(
+    pack_id: &SkillPackId,
+) -> sea_orm::Select<skill_installation::Entity> {
     skill_installation::Entity::find()
         .filter(skill_installation::Column::PackId.eq(pack_id.to_string()))
         .order_by_asc(skill_installation::Column::PackMemberKey)
         .order_by_asc(skill_installation::Column::Id)
-        .all(db)
+}
+
+pub(crate) async fn lock_skill_installations_by_pack_id<C: ConnectionTrait>(
+    transaction: &C,
+    pack_id: &SkillPackId,
+) -> Result<Vec<skill_installation::Model>> {
+    skill_installations_by_pack_id(pack_id)
+        .lock_exclusive()
+        .all(transaction)
         .await
-        .with_context(|| format!("failed to query children for pack `{pack_id}`"))
+        .with_context(|| format!("failed to lock children for pack `{pack_id}`"))
+}
+
+pub async fn lock_skill_installation<C: ConnectionTrait>(
+    transaction: &C,
+    skill_id: &SkillId,
+) -> Result<Option<skill_installation::Model>> {
+    skill_installation::Entity::find_by_id(skill_id.to_string())
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .with_context(|| format!("failed to lock skill installation `{skill_id}`"))
 }
 
 pub async fn find_skill_installation<C: ConnectionTrait>(

@@ -124,13 +124,13 @@ impl Fixture {
             .await
             .unwrap();
     }
-    async fn answer(
+    async fn accept_answer(
         &self,
         thread: &str,
         turn: &str,
         id: &str,
         text: &str,
-    ) -> pioneer_protocol::ThreadReadPosition {
+    ) -> anyhow::Result<()> {
         self.store
             .materialize_item_completed(
                 pioneer_protocol::ItemCompletedNotification {
@@ -149,7 +149,25 @@ impl Fixture {
                 self.next(),
             )
             .await
-            .unwrap();
+    }
+
+    async fn answer(
+        &self,
+        thread: &str,
+        turn: &str,
+        id: &str,
+        text: &str,
+    ) -> pioneer_protocol::ThreadReadPosition {
+        self.accept_answer(thread, turn, id, text).await.unwrap();
+        self.answer_position(thread, turn, id).await
+    }
+
+    async fn answer_position(
+        &self,
+        thread: &str,
+        turn: &str,
+        id: &str,
+    ) -> pioneer_protocol::ThreadReadPosition {
         let block =
             crate::repositories::thread_timeline_projection::find_thread_timeline_block_by_id(
                 &self.store.connection,
@@ -187,7 +205,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reopen() {
+async fn activation_excludes_history_preserves_real_read_and_survives_reopen() {
     pioneer_postgres_test::with_database(async |fixture| {
         let f = Fixture::new(fixture).await;
         f.grant_workspace().await;
@@ -227,7 +245,7 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
             )
             .await
             .unwrap();
-        // A confirmed logical position can survive projection loss before rollout.
+        // A confirmed logical position can survive the timeline projection losing a block.
         for item in ["old-final", "old-final-2"] {
             crate::delete_thread_timeline_block(
                 &f.store.connection,
@@ -236,12 +254,21 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
             .await
             .unwrap();
         }
-        // Cancellation/rollback must leave neither a moved activation nor a
-        // partially replaced publication ledger. A later retry can commit safely.
-        let migration = Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == "m20261018_000001_thread_unread_start")
-            .expect("unread migration remains registered");
+        // Set the persisted activation boundary while real history and an
+        // independently confirmed read cursor already exist.
+        let new_activation = f.next();
+        let activate = async |tx: &sea_orm::DatabaseTransaction| {
+            let gateway = f.gateway.to_string();
+            gateway_identity::Entity::update_many()
+                .col_expr(
+                    gateway_identity::Column::UnreadStartedAt,
+                    Expr::val(new_activation),
+                )
+                .filter(gateway_identity::Column::Id.eq(gateway))
+                .exec(tx)
+                .await
+                .unwrap()
+        };
         let before = gateway_identity::Entity::find_by_id(f.gateway.to_string())
             .one(&f.store.connection)
             .await
@@ -249,9 +276,7 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
             .unwrap()
             .unread_started_at;
         let tx = f.store.connection.begin().await.unwrap();
-        let manager = migration::SchemaManager::new(&*tx);
-        migration.down(&manager).await.unwrap();
-        migration.up(&manager).await.unwrap();
+        assert_eq!(activate(&tx).await.rows_affected, 1);
         tx.rollback().await.unwrap();
         assert_eq!(
             gateway_identity::Entity::find_by_id(f.gateway.to_string())
@@ -262,11 +287,9 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
                 .unread_started_at,
             before
         );
-        // Exercise the actual new migration with populated pre-rollout sources.
+        // Publish the same boundary after rolling back the first attempt.
         let tx = f.store.connection.begin().await.unwrap();
-        let manager = migration::SchemaManager::new(&*tx);
-        migration.down(&manager).await.unwrap();
-        migration.up(&manager).await.unwrap();
+        assert_eq!(activate(&tx).await.rows_affected, 1);
         tx.commit().await.unwrap();
         let start = gateway_identity::Entity::find_by_id(f.gateway.to_string())
             .one(&f.store.connection)
@@ -304,7 +327,7 @@ async fn legacy_activation_excludes_history_preserves_real_read_and_survives_reo
         f.answer(THREAD, old, "old-commentary", "first final answer")
             .await;
         assert_eq!(f.count(&f.member, THREAD).await, 2);
-        let reopened = CrudStore::new(f.store.connection.clone());
+        let reopened = CrudStore::new(fixture.connect().await?);
         assert_eq!(
             reopened
                 .unread_counts_for_threads(&f.member, &[THREAD.into()])
@@ -668,10 +691,29 @@ async fn rollback_retry_and_second_resolution_boundaries() {
         let ((), ()) = tokio::join!(f.grant_workspace(), f.grant_workspace());
         let turn = "A00000000000000000001";
         f.prompt(&f.thread, turn).await;
-        let _ = tokio::join!(
-            f.answer(THREAD, turn, "parallel-a", "a"),
-            f.answer(THREAD, turn, "parallel-b", "b")
+        let (first, second) = tokio::join!(
+            f.accept_answer(THREAD, turn, "parallel-a", "a"),
+            f.accept_answer(THREAD, turn, "parallel-b", "b"),
         );
+        for result in [first, second] {
+            if let Err(error) = result {
+                assert!(
+                    crate::turn_event_was_appended_before_error(&error)
+                        && error
+                            .to_string()
+                            .contains("waiting for an earlier turn event"),
+                    "parallel publication must either finish or durably defer: {error:#}",
+                );
+            }
+        }
+        let replay = f
+            .store
+            .replay_due_turn_event_projections(f.next(), 4)
+            .await?;
+        assert_eq!(replay.failed, 0);
+        assert_eq!(replay.exhausted, 0);
+        f.answer_position(THREAD, turn, "parallel-a").await;
+        f.answer_position(THREAD, turn, "parallel-b").await;
         assert_eq!(f.count(&f.member, THREAD).await, 3);
         let tx = f.store.connection.begin().await.unwrap();
         delete_workspace_membership(&tx, &f.gateway, &f.member, WS)

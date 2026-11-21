@@ -135,7 +135,7 @@ impl Change {
             Some(Vec::new())
         };
         // Cancellation/error before known completion drops WorkChange and keeps
-        // uncertainty + writer settlement, including a late SQLite commit.
+        // uncertainty and writer settlement, including a late PostgreSQL commit.
         for change in self.0 {
             match &relevant {
                 Some(keys) => change.completed_keys(keys),

@@ -1,8 +1,8 @@
 use crate::drop_tables;
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
-    big_integer, big_integer_null, binary, binary_null, json, small_integer, small_integer_null,
-    text, text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
+    big_integer, big_integer_null, binary, binary_null, boolean, json, small_integer,
+    small_integer_null, text, text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
 };
 
 #[derive(DeriveMigrationName)]
@@ -926,6 +926,7 @@ async fn create_portable_payload_storage(manager: &SchemaManager<'_>) -> Result<
                 .col(binary("sha256"))
                 .col(small_integer_null("codec"))
                 .col(binary_null("body"))
+                .col(boolean("turn_item_shell").default(false))
                 .check(Expr::cust("original_chars BETWEEN 0 AND original_bytes"))
                 .check(Expr::cust("octet_length(sha256) = 32"))
                 .check(Expr::cust(

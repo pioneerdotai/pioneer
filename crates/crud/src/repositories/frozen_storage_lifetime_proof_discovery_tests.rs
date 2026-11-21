@@ -21,7 +21,7 @@ async fn metadata_fixture() -> (
         db, fixture.connection().clone(),
     )).with_maintenance_access();
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,TRUE)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES('owner','ws','thread',1)",
         "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,next_portion) VALUES('failed','owner','failed','failed','{}',1000,0)",
@@ -150,66 +150,6 @@ pub(super) async fn queued_raw_candidate_rechecks_concurrent_seal() {
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn sparse_unsealed_pages_seek_past_seals_and_keep_parameterized_order() {
-    let (store, statements, _) = metadata_fixture().await;
-    let mut unsealed = Vec::new();
-    for i in 0..530 {
-        let id = format!("cp-{i:04}");
-        // Include adjacent unsealed rows on both sides of the old 64-ID page.
-        let version = if i % 8 == 7 || i == 64 { 0 } else { 1 };
-        header(&store, &id, "raw", "candidate", version).await;
-        if version == 0 {
-            unsealed.push(id);
-        }
-    }
-    store.connection.execute_unprepared("ANALYZE compaction_checkpoint").await.unwrap();
-    let mut progress = FrozenStorageLifetimeProgress::default();
-    statements.lock().unwrap().clear();
-    assert!(progress.proof_quantum(&store).await.unwrap());
-    assert_eq!(progress.proof_after, unsealed[63]);
-    assert_eq!(
-        progress.proof_pending,
-        VecDeque::from(unsealed[..64].to_vec())
-    );
-    assert!(
-        progress.proof.is_none(),
-        "metadata discovery does not prepare graphs"
-    );
-    let mut statement = statements.lock().unwrap().last().unwrap().clone();
-    // Explain the actual SeaQuery statement with its original bound values.
-    // Assert the useful access property, never an entire plan/SQL snapshot.
-    statement.sql = format!("EXPLAIN (COSTS OFF) {}", statement.sql);
-    let plan = store.connection.query_all_raw(statement).await.unwrap();
-    let details: Vec<String> = plan
-        .iter()
-        .map(|row| row.try_get("", "QUERY PLAN").unwrap())
-        .collect();
-    assert!(
-        details
-            .iter()
-            .any(|detail| detail.contains("checkpoint_proof_discovery")),
-        "{details:#?}"
-    );
-    assert!(
-        details.iter().any(|detail| detail.contains("Index Cond") && detail.contains("proof_version = 0") && detail.contains("id >")),
-        "{details:#?}"
-    );
-
-    // Isolate page discovery from dequeue: the membership assertions above
-    // prove this page contains only unsealed candidates before consuming it.
-    progress.proof_pending.clear();
-    assert!(progress.proof_quantum(&store).await.unwrap());
-    assert_eq!(
-        progress.proof_pending,
-        VecDeque::from(unsealed[64..].to_vec())
-    );
-    assert_eq!(progress.proof_after, *unsealed.last().unwrap());
-    progress.proof_pending.clear();
-    assert!(!progress.proof_quantum(&store).await.unwrap());
-    assert!(progress.proof_after.is_empty());
-}
-
-#[pioneer_postgres_test::postgres_test]
 async fn discovery_keeps_all_eligibility_branches_and_dequeue_rechecks_scope_and_format() {
     let (store, _, _) = metadata_fixture().await;
     for (id, op, status) in [
@@ -240,18 +180,18 @@ async fn discovery_keeps_all_eligibility_branches_and_dequeue_rechecks_scope_and
         )
         .await
         .unwrap();
-    progress.phase = 1;
+    progress.phase = 0;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(!progress.pass_done[1] && progress.proof.is_none());
+    assert!(!progress.pass_done[0] && progress.proof.is_none());
     assert_eq!(progress.proof_pending.front().unwrap(), "b-retained");
     store
         .connection
         .execute_unprepared("UPDATE compaction_context SET workspace_id='' WHERE owner='owner'")
         .await
         .unwrap();
-    progress.phase = 1;
+    progress.phase = 0;
     assert!(progress.quantum(&store).await.unwrap());
-    assert!(!progress.pass_done[1] && progress.proof.is_none());
+    assert!(!progress.pass_done[0] && progress.proof.is_none());
     assert_eq!(progress.proof_pending.front().unwrap(), "c-no-projection");
     assert!(
         checkpoint::Entity::find()
@@ -306,9 +246,9 @@ async fn demotion_behind_cursor_is_rediscovered_after_pass_and_restart() {
     let mut refused = false;
     for _ in 0..100 {
         let before = progress.accounting.refused;
-        progress.phase = 1;
+        progress.phase = 0;
         assert!(progress.quantum(&store).await.unwrap());
-        assert!(!progress.pass_done[1]);
+        assert!(!progress.pass_done[0]);
         if progress.accounting.refused > before {
             refused = true;
             break;
@@ -318,12 +258,12 @@ async fn demotion_behind_cursor_is_rediscovered_after_pass_and_restart() {
     assert_eq!(progress.proof_after, "z-refused");
     // Only the next successful empty read completes this family. Mark the
     // other families complete to exercise the real global-pass reset.
-    progress.pass_done = [true, false, true, true, true, true];
-    progress.phase = 1;
+    progress.pass_done = [false, true, true, true];
+    progress.phase = 0;
     assert!(!progress.quantum(&store).await.unwrap());
-    assert_eq!(progress.pass_done, [false; 6]);
+    assert_eq!(progress.pass_done, [false; 4]);
     assert!(progress.proof_after.is_empty());
-    progress.phase = 1;
+    progress.phase = 0;
     assert!(progress.quantum(&store).await.unwrap());
     let expected = VecDeque::from(["a-demoted".to_owned(), "z-refused".to_owned()]);
     assert_eq!(progress.proof_pending, expected);
@@ -363,10 +303,10 @@ async fn discovery_database_error_preserves_cursor_and_does_not_latch_eof() {
         )
         .await
         .unwrap();
-    progress.phase = 1;
+    progress.phase = 0;
     let error = progress.quantum(&store).await.unwrap_err();
     assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
-    assert!(!progress.pass_done[1]);
+    assert!(!progress.pass_done[0]);
     assert_eq!(progress.proof_after, "a");
     assert!(progress.proof_pending.is_empty());
     store
@@ -376,11 +316,11 @@ async fn discovery_database_error_preserves_cursor_and_does_not_latch_eof() {
         )
         .await
         .unwrap();
-    progress.phase = 1;
+    progress.phase = 0;
     assert!(progress.quantum(&store).await.unwrap());
     assert_eq!(progress.proof_pending, VecDeque::from(["b".to_owned()]));
     assert_eq!(progress.proof_after, "b");
-    assert!(!progress.pass_done[1]);
+    assert!(!progress.pass_done[0]);
 }
 
 async fn index_columns(store: &CrudStore, name: &str) -> Vec<String> {

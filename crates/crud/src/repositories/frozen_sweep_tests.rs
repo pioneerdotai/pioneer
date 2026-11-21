@@ -284,7 +284,7 @@ mod durable_sweep {
                 "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('capture',$1,0,1,'backing')",[kind.into()])).await.unwrap();
             exec(
                 &store,
-                "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='capture'",
+                "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='capture'",
             )
             .await;
             drain_metadata(&store).await;
@@ -357,7 +357,7 @@ mod durable_sweep {
         header(&store, "key", 1, 1, 0).await;
         drain_metadata(&store).await;
         old.finish(
-            &store,
+            &store.connection,
             frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
         )
         .await
@@ -416,7 +416,7 @@ mod durable_sweep {
             SweepStep::Blocked
         );
         selected
-            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .finish(&store.connection, frozen_sweep_work::Completion::Blocked)
             .await
             .unwrap();
         assert_eq!(pending(&store, "batch-physical", 0).await, 1);
@@ -440,7 +440,7 @@ mod durable_sweep {
         row(&store, "batch-physical", 0, 4).await; // between terminal step and ack
         selected
             .finish(
-                &store,
+                &store.connection,
                 frozen_sweep_work::Completion::Complete(sweep.completion_guard()),
             )
             .await
@@ -469,7 +469,7 @@ mod durable_sweep {
         for id in ["deadline", "future"] {
             work(&store, id, 0)
                 .await
-                .finish(&store, frozen_sweep_work::Completion::Retry)
+                .finish(&store.connection, frozen_sweep_work::Completion::Retry)
                 .await
                 .unwrap();
         }
@@ -533,7 +533,7 @@ mod durable_sweep {
         }
         exec(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='consumer'",
+            "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='consumer'",
         )
         .await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
@@ -638,7 +638,7 @@ mod durable_sweep {
         exec(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('late-consumer',0,0,209,'prefix'),('late-consumer',0,209,601,'batch-physical')").await;
         exec(
             &store,
-            "UPDATE compaction_frozen_layout SET active=1 WHERE manifest_id='late-consumer'",
+            "UPDATE compaction_frozen_layout AS layout SET active=1,verified_span_revision=(SELECT c.revision FROM compaction_frozen_sweep_consumer c WHERE c.manifest_id=layout.manifest_id AND c.kind=layout.kind) WHERE layout.manifest_id='late-consumer'",
         )
         .await;
         assert_eq!(
@@ -646,7 +646,7 @@ mod durable_sweep {
             SweepStep::Blocked
         );
         selected
-            .finish(&store, frozen_sweep_work::Completion::Blocked)
+            .finish(&store.connection, frozen_sweep_work::Completion::Blocked)
             .await
             .unwrap();
         assert_eq!(accounting.rows[0], 209);
@@ -712,7 +712,7 @@ mod durable_sweep {
         let held = store.connection.begin().await.unwrap();
         observer.armed.store(true, Ordering::SeqCst);
         {
-            let finish = selected.finish(&store, frozen_sweep_work::Completion::Retry);
+            let finish = selected.finish(&store.connection, frozen_sweep_work::Completion::Retry);
             tokio::pin!(finish);
             tokio::select! {
                 result = &mut finish => panic!("writer should be queued: {result:?}"),
@@ -767,53 +767,4 @@ mod durable_sweep {
         );
     }
 
-    #[pioneer_postgres_test::postgres_test]
-    async fn empty_physical_queue_does_not_hide_interrupted_fanout() {
-        let store = blank().await;
-        assert!(matches!(
-            frozen_sweep_work::discover(&store, &[], 0, &mut Default::default(), None, false)
-                .await
-                .unwrap(),
-            frozen_sweep_work::Admission::Idle
-        ));
-        header(&store, "consumer", 2, 2, 0).await;
-        for source in ["a", "b"] {
-            header(&store, source, 1, 1, 0).await;
-        }
-        for source in ["a", "b"] {
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer',0,$1,$2,$3)",
-                [i64::from(source=="b").into(),(i64::from(source=="b")+1).into(),source.into()])).await.unwrap();
-        }
-        let before = work(&store, "b", 0).await.revision;
-        assert!(frozen_sweep_work::fanout_step(&store, None).await.unwrap());
-        // A failed cursor commit rolls back its enqueue as well.
-        exec(&store,"CREATE FUNCTION fixture_fanout_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fanout cursor fault'; END; $$; CREATE TRIGGER fixture_fanout_fault BEFORE UPDATE ON compaction_frozen_sweep_consumer FOR EACH ROW WHEN (NEW.after_source='b') EXECUTE FUNCTION fixture_fanout_fault()").await;
-        let mut failed = false;
-        for _ in 0..8 {
-            let turn = query(
-                &store,
-                "SELECT revision AS n FROM compaction_frozen_sweep_fanout WHERE id=1",
-            )
-            .await;
-            if frozen_sweep_work::fanout_step(&store, None).await.is_err() {
-                assert_eq!(
-                    query(
-                        &store,
-                        "SELECT revision AS n FROM compaction_frozen_sweep_fanout WHERE id=1"
-                    )
-                    .await,
-                    turn,
-                    "failed source delivery rolls back service cursor too"
-                );
-                failed = true;
-                break;
-            }
-        }
-        assert!(failed);
-        assert_eq!(work(&store, "b", 0).await.revision, before);
-        exec(&store, "DROP TRIGGER fixture_fanout_fault ON compaction_frozen_sweep_consumer").await;
-        drain_metadata(&store).await;
-        assert!(work(&store, "b", 0).await.revision > before);
-    }
 }

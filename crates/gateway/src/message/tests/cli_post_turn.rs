@@ -430,9 +430,7 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
     // Reject reservation AND conditional deferral permanently. Healthy claims
     // must still reach the actual hook executor, not just return from CRUD.
     store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_gate_bookkeeping BEFORE UPDATE OF gate_probe_at ON native_terminal_effect_outbox
-         WHEN OLD.effect_id='gate-bookkeeping-poison:terminal-effect:post-turn'
-         BEGIN SELECT RAISE(ABORT,'local bookkeeping fault'); END"
+        "CREATE FUNCTION reject_gate_bookkeeping() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'local bookkeeping fault'; END; $$; CREATE TRIGGER reject_gate_bookkeeping BEFORE UPDATE OF gate_probe_at ON native_terminal_effect_outbox FOR EACH ROW WHEN (OLD.effect_id='gate-bookkeeping-poison:terminal-effect:post-turn') EXECUTE FUNCTION reject_gate_bookkeeping();"
     ).await.unwrap();
     let outcome = processor
         .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
@@ -516,7 +514,7 @@ async fn failed_gate_bookkeeping_dispatches_independent_hooks_and_defers_worker(
     tokio::time::resume();
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_gate_bookkeeping")
+        .execute_unprepared("DROP TRIGGER reject_gate_bookkeeping ON native_terminal_effect_outbox; DROP FUNCTION reject_gate_bookkeeping()")
         .await
         .unwrap();
     timeout(Duration::from_secs(10), async {

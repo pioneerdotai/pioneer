@@ -376,8 +376,7 @@ async fn check_composer_history_failure_stays_in_task_without_rejecting_parent()
             .with_maintenance_access()
             .database_connection()
             .execute_unprepared(
-                "CREATE TRIGGER reject_test_history BEFORE INSERT ON compaction_frozen_history
-                 BEGIN SELECT RAISE(ABORT, 'injected history preparation failure'); END;",
+                "CREATE FUNCTION reject_test_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected history preparation failure'; END; $$; CREATE TRIGGER reject_test_history BEFORE INSERT ON compaction_frozen_history FOR EACH ROW EXECUTE FUNCTION reject_test_history();",
             )
             .await
             .unwrap();
@@ -389,7 +388,7 @@ async fn check_composer_history_failure_stays_in_task_without_rejecting_parent()
                 store
                     .with_maintenance_access()
                     .database_connection()
-                    .execute_unprepared("DROP TRIGGER reject_test_history")
+                    .execute_unprepared("DROP TRIGGER reject_test_history ON compaction_frozen_history; DROP FUNCTION reject_test_history()")
                     .await
                     .unwrap();
             }

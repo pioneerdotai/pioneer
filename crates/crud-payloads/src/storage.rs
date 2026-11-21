@@ -30,6 +30,21 @@ pub struct PreparedPayload {
 impl PreparedPayload {
     /// Compression, checksums and UTF-8 boundary discovery happen before any write.
     pub fn new(text: &str) -> Result<Self> {
+        Self::encode(text, false)
+    }
+
+    /// Keep the shell discriminator available when compaction resolves source
+    /// identity without requesting any payload bytes.
+    pub fn new_turn_item(text: &str) -> Result<Self> {
+        let fields = crate::json_fields::first_object_fields(text, &["storage"])?;
+        let shell = fields
+            .pointer("/storage/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("shell");
+        Self::encode(text, shell)
+    }
+
+    fn encode(text: &str, turn_item_shell: bool) -> Result<Self> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let (original_bytes, original_chars, sha256, codec, body, parts) =
             match BlockPayload::encode(text)? {
@@ -74,6 +89,7 @@ impl PreparedPayload {
                 sha256: Set(sha256.to_vec()),
                 codec: Set(codec),
                 body: Set(body),
+                turn_item_shell: Set(turn_item_shell),
             },
             id,
             metadata: PayloadMetadata {

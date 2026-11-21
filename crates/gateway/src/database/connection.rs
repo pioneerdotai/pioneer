@@ -60,12 +60,23 @@ pub async fn initialize_with_startup(
         };
     stage.succeed();
     let prepared = async {
-        for options in [&mut writer_options, &mut reader_options] {
+        for (options, name, read_only) in [
+            (&mut writer_options, "pioneer_gateway_writer", false),
+            (&mut reader_options, "pioneer_gateway_reader", true),
+        ] {
             options
                 .connect_timeout(Duration::from_millis(database_config.connect_timeout_ms))
                 .acquire_timeout(Duration::from_millis(database_config.acquire_timeout_ms))
                 .idle_timeout(Duration::from_millis(database_config.idle_timeout_ms))
                 .sqlx_logging(false)
+                .map_sqlx_postgres_opts(move |session| {
+                    let session = session.application_name(name);
+                    if read_only {
+                        session.options([("default_transaction_read_only", "on")])
+                    } else {
+                        session
+                    }
+                })
                 .map_sqlx_postgres_pool_opts(|pool| {
                     pool.acquire_time_level("trace".parse().expect("valid SQLx timing level"))
                 });
@@ -578,14 +589,18 @@ mod tests {
                     }
                     Ok::<_, anyhow::Error>(database)
                 });
-                initialized.await?;
+                if initialized.await.is_err() {
+                    task.await??;
+                    anyhow::bail!("bootstrap task exited before reporting initialized pools");
+                }
                 async fn extra_connections(
                     db: &sea_orm::DatabaseConnection,
                 ) -> anyhow::Result<i64> {
                     db.query_one_raw(Statement::from_string(
                         DbBackend::Postgres,
                         "SELECT count(*) AS connections FROM pg_stat_activity
-                         WHERE datname = current_database() AND pid <> pg_backend_pid()",
+                         WHERE datname = current_database()
+                           AND application_name IN ('pioneer_gateway_writer','pioneer_gateway_reader')",
                     ))
                     .await?
                     .expect("database connection count")

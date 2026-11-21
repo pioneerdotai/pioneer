@@ -465,25 +465,14 @@ async fn idle_cleanup_keeps_response_generation_pinned_after_lane_removal_throug
     processor.shutdown_cli_runtime_manager().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_process_io() {
     use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
-    use sea_orm::ConnectOptions;
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("idle-cleanup.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,

@@ -1,4 +1,4 @@
-//! Admission transaction regressions. Prepared for review; tests are not run.
+//! Webhook admission through the task and execution transaction coordinator.
 use super::*;
 use pioneer_protocol::{
     TaskActorContract, TaskDeliveryActorContract, TaskReviewerIntent, TaskRunInputEncoding,
@@ -44,52 +44,16 @@ impl SqliteWriteObserver for Routes {
     }
 }
 
-async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
-    let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|options| options.pragma("journal_mode", "WAL"));
-    let writer = Database::connect(options).await.unwrap();
+async fn observed_store(
+    fixture: &pioneer_postgres_test::TestDatabase,
+    routes: Arc<Routes>,
+) -> CrudStore {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
     let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
-    executor
-        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-        .await
-        .unwrap();
-    let mut options =
-        sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|options| {
-            options
-                .read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
-    let store = CrudStore::new(
+    CrudStore::new(
         pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
-    );
-    if pioneer_entity::workspace::Entity::find_by_id("ws_task")
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .is_none()
-    {
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set("ws_task".into()),
-            name: Set("Webhook transactions".into()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(unix_to_datetime(AT)),
-            updated_at: Set(unix_to_datetime(AT)),
-        })
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    }
-    store
+    )
 }
 
 async fn webhook_fixture(store: &CrudStore) -> (Task, TaskTrigger) {
@@ -210,11 +174,12 @@ fn request(
     (run, occurrence, events)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_admission_inherits_request_and_maintenance_classes_with_query_only_readers() {
-    let directory = tempfile::tempdir().unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    postgres_store_with_workspace(&fixture, "ws_task").await;
     let routes = Arc::new(Routes::default());
-    let store = disk_store(&directory.path().join("webhook.sqlite"), routes.clone()).await;
+    let store = observed_store(&fixture, routes.clone()).await;
     let (_, trigger) = webhook_fixture(&store).await;
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
     let mut accepted = Vec::new();
@@ -282,13 +247,8 @@ async fn webhook_admission_inherits_request_and_maintenance_classes_with_query_o
     }
     assert!(store.connection.reader_query_only_enabled().await.unwrap());
     drop(store);
-    // Recreate both the writer executor and physical reader pool from the same
-    // file. This is distinct from restarting a runtime over existing handles.
-    let reopened = disk_store(
-        &directory.path().join("webhook.sqlite"),
-        Arc::new(Routes::default()),
-    )
-    .await;
+    // Open independent writer and reader pools on the same committed database.
+    let reopened = observed_store(&fixture, Arc::new(Routes::default())).await;
     for (run, occurrence) in accepted {
         assert_eq!(
             reopened
@@ -473,11 +433,12 @@ async fn webhook_stale_snapshot_rechecks_pause_cancel_and_finish_before_any_writ
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancelled_webhook_waiter_releases_writer_queue_and_can_be_admitted_again() {
-    let directory = tempfile::tempdir().unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    postgres_store_with_workspace(&fixture, "ws_task").await;
     let routes = Arc::new(Routes::default());
-    let store = disk_store(&directory.path().join("cancel.sqlite"), routes.clone()).await;
+    let store = observed_store(&fixture, routes.clone()).await;
     let (task, trigger) = webhook_fixture(&store).await;
     let (run, occurrence, events) = request(&task, &trigger, 1);
     let hold = store
@@ -539,8 +500,9 @@ async fn cancelled_webhook_waiter_releases_writer_queue_and_can_be_admitted_agai
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn webhook_migration_replay_preserves_saved_input_and_trigger_reference() {
-    let store = test_store_with_workspace("ws_task").await;
+async fn repeated_migration_up_preserves_saved_webhook_input_and_trigger_reference() {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let store = postgres_store_with_workspace(&fixture, "ws_task").await;
     let (task, trigger) = webhook_fixture(&store).await;
     let (run, occurrence, events) = request(&task, &trigger, 1);
     store
@@ -548,22 +510,8 @@ async fn webhook_migration_replay_preserves_saved_input_and_trigger_reference() 
         .await
         .unwrap()
         .unwrap();
-    let migration = Migrator::migrations()
-        .into_iter()
-        .find(|migration| migration.name() == "m20261023_000001_task_webhook")
-        .unwrap();
     for _ in 0..2 {
-        let transaction = store
-            .with_maintenance_access()
-            .connection
-            .begin()
-            .await
-            .unwrap();
-        migration
-            .up(&migration::SchemaManager::new(&*transaction))
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
+        Migrator::up(fixture.connection(), None).await.unwrap();
     }
     assert_eq!(
         store

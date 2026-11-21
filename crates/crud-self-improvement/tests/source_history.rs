@@ -3,6 +3,9 @@ use chrono::DateTime;
 use pioneer_crud_self_improvement::source_history::{
     prepare_source_turn_check, processed_history_date,
 };
+use pioneer_crud_self_improvement::source_turn::{
+    list_after_cursor, list_frozen_range, recent_processed_sources,
+};
 use pioneer_postgres_test::with_database;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
@@ -45,6 +48,17 @@ async fn finalization_requires_a_new_visible_anchor_and_keeps_the_original_histo
         let expected_date = DateTime::parse_from_rfc3339("2026-11-15T20:50:00Z")?.timestamp();
         assert_eq!(processed_history_date(db, "w").await?, Some(expected_date));
         assert_eq!(processed_history_date(db, "other").await?, None);
+
+        let anchors = list_after_cursor(db, "w", 0, 0, 2).await?;
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0].turn_id, "new");
+        assert_eq!(anchors[0].terminal_event_id, "event-new");
+        assert_eq!(list_frozen_range(db, "w", 0, 2, 0).await?, anchors);
+        assert!(list_after_cursor(db, "w", 2, 0, 2).await?.is_empty());
+        let processed = recent_processed_sources(db, "w").await?;
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].turn_id, "old");
+        assert_eq!(processed[0].parent_turn_created_at_unix, expected_date);
 
         let writer = fixture.connect().await?;
         let tx = writer.begin().await?;

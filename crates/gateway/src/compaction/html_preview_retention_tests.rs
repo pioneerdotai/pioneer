@@ -152,7 +152,36 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
                 break;
             }
         }
-        assert!(idle);
+        if !idle {
+            let queue = database
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT family,state,count(*)::bigint AS count FROM html_preview_io_work
+                 GROUP BY family,state ORDER BY family,state",
+                ))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get::<String>("", "family").unwrap(),
+                        row.try_get::<String>("", "state").unwrap(),
+                        row.try_get::<i64>("", "count").unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let indexing = database
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT ready,complete,unknown,next_ordinal,message_count
+                 FROM html_preview_frozen_index ORDER BY manifest_id LIMIT 10",
+                ))
+                .await
+                .unwrap();
+            panic!(
+                "preview maintenance did not finish the bounded pass: queue={queue:?}; index={indexing:?}"
+            );
+        }
         let source = changes.wait(None).now_or_never().is_some();
         let release = released.changed().now_or_never().is_some();
         let io_ready = io.notified().now_or_never().is_some();
@@ -167,7 +196,7 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
     panic!("preview maintenance must quiesce after its own source changes");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_frozen_replay() {
     preview_history_replay(1).await;
     preview_history_replay(2).await;
@@ -183,11 +212,6 @@ async fn preview_history_replay(format_version: u32) {
         Some(database_observer.clone()),
     )
     .await;
-    f.store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
 
     // The shared fixture starts a raw compaction operation. Publish its exact
     // checkpoint before adding preview history, so it does not remain an
@@ -541,8 +565,8 @@ async fn preview_history_replay(format_version: u32) {
             .await
             .is_err()
     );
-    let stored = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+    let stored = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=$1 AND ordinal=$2",
         [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
     assert!(
         stored
@@ -701,8 +725,8 @@ async fn preview_history_replay(format_version: u32) {
     ] {
         let header = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT expired FROM compaction_frozen_history WHERE id=?",
+                DbBackend::Postgres,
+                "SELECT expired FROM compaction_frozen_history WHERE id=$1",
                 [manifest.clone().into()],
             ))
             .await
@@ -718,7 +742,7 @@ async fn preview_history_replay(format_version: u32) {
     // permanent output root and this live accepted input have distinct policy.
     db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('preview-consumer','ws','thread','thread','agent','running','Consumer','fixture')").await.unwrap();
     db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('preview-consumer-run','preview-consumer','preview-consumer-run',1,1,'running','agent')").await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id,created_at) VALUES('preview-consumer-run','preview-consumer','ws','thread',?1,?2,CURRENT_TIMESTAMP)",[serde_json::to_string(&output.history).unwrap().into(),output.history.manifest_id.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,frozen_manifest_id,created_at) VALUES('preview-consumer-run','preview-consumer','ws','thread',$1,$2,CURRENT_TIMESTAMP)",[serde_json::to_string(&output.history).unwrap().into(),output.history.manifest_id.clone().into()])).await.unwrap();
     for _ in 0..2 {
         let mut idle = false;
         for _ in 0..128 {
@@ -1105,8 +1129,8 @@ async fn preview_history_replay(format_version: u32) {
     drain_preview_worker(&f.store, &service).await;
     let index = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT complete,unknown FROM html_preview_frozen_index WHERE manifest_id=?",
+            DbBackend::Postgres,
+            "SELECT complete,unknown FROM html_preview_frozen_index WHERE manifest_id=$1",
             [checkpoint_basis.descriptor.manifest_id.clone().into()],
         ))
         .await
@@ -1214,8 +1238,8 @@ async fn preview_history_replay(format_version: u32) {
     let archive_hash = &archived.preview_archive.as_ref().unwrap().wire_sha256;
     for (hash, expected) in [("0".repeat(64), false), (archive_hash.clone(), true)] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE html_preview_frozen_result SET archive_wire_sha256=?1 WHERE manifest_id=?2 AND ordinal=?3",
+            DbBackend::Postgres,
+            "UPDATE html_preview_frozen_result SET archive_wire_sha256=$1 WHERE manifest_id=$2 AND ordinal=$3",
             [hash.into(), archived.output_manifest.clone().into(), i64::try_from(archived.output_ordinal).unwrap().into()],
         ))
         .await
@@ -1233,23 +1257,23 @@ async fn preview_history_replay(format_version: u32) {
     // frozen diagnostic. Keep that existing diagnostic witness in place: it
     // proves no wire transformation and must not authorize another revision.
     for (manifest, ordinal, unchanged) in [
-        (&archived.output_manifest, archived.output_ordinal, 0_i64),
+        (&archived.output_manifest, archived.output_ordinal, false),
         (
             &accepted.descriptor.manifest_id,
             archived.message_ordinal,
-            1_i64,
+            true,
         ),
     ] {
         let witness = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT archive_wire_sha256=json_extract(reference_json,'$.wire_sha256') AS unchanged FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+                DbBackend::Postgres,
+                "SELECT archive_wire_sha256=(reference_json::json->>'wire_sha256') AS unchanged FROM html_preview_frozen_result WHERE manifest_id=$1 AND ordinal=$2",
                 [manifest.clone().into(), i64::try_from(ordinal).unwrap().into()],
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(witness.try_get::<i64>("", "unchanged").unwrap(), unchanged);
+        assert_eq!(witness.try_get::<bool>("", "unchanged").unwrap(), unchanged);
     }
     // A later edit cannot be accepted using the release receipt as a general
     // revision exemption. Both fresh preparation and accepted replay reject it.
@@ -1262,8 +1286,8 @@ async fn preview_history_replay(format_version: u32) {
         .find(|c| c.tool_name.as_deref() == Some("html_preview"))
         .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE turn_llm_context SET payload=payload||' ' WHERE id=?1",
+        DbBackend::Postgres,
+        "UPDATE turn_llm_context SET payload=payload||' ' WHERE id=$1",
         [row.id.into()],
     ))
     .await
@@ -1315,7 +1339,7 @@ async fn preview_history_replay(format_version: u32) {
         artifact_id: current.artifact.artifact_id.clone(),
         version_id: current.artifact.version_id.clone(),
     };
-    f.store.database_connection().execute_unprepared("CREATE TRIGGER fail_preview_adoption BEFORE INSERT ON artifact_binding WHEN NEW.binding_kind='user_input' BEGIN SELECT RAISE(ABORT,'fixture adoption rollback'); END").await.unwrap();
+    f.store.database_connection().execute_unprepared("CREATE FUNCTION fail_preview_adoption() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture adoption rollback'; END; $$; CREATE TRIGGER fail_preview_adoption BEFORE INSERT ON artifact_binding FOR EACH ROW WHEN (NEW.binding_kind='user_input') EXECUTE FUNCTION fail_preview_adoption();").await.unwrap();
     assert!(
         f.store
             .replace_turn_input_projection_for_test(
@@ -1338,7 +1362,7 @@ async fn preview_history_replay(format_version: u32) {
     );
     f.store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_preview_adoption")
+        .execute_unprepared("DROP TRIGGER fail_preview_adoption ON artifact_binding; DROP FUNCTION fail_preview_adoption()")
         .await
         .unwrap();
     f.store
@@ -1398,7 +1422,7 @@ async fn preview_history_replay(format_version: u32) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview() {
     let f = fixture("ordinary delivered answer", vec![], true, false).await;
     let root = tempfile::tempdir().unwrap();
@@ -1535,8 +1559,8 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
     }
     // Exercise upgrade from the previous implementation's blanket-unknown
     // derived marker as well as a fresh bounded import traversal after restart.
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO html_preview_frozen_index(manifest_id,workspace_id,identity_sha256,message_count,ready,expired,unknown) SELECT id,workspace_id,identity_sha256,message_count,ready,expired,1 FROM compaction_frozen_history WHERE id=? ON CONFLICT(manifest_id) DO UPDATE SET unknown=1,complete=0",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO html_preview_frozen_index(manifest_id,workspace_id,identity_sha256,message_count,ready,expired,unknown) SELECT id,workspace_id,identity_sha256,message_count,ready,expired,1 FROM compaction_frozen_history WHERE id=$1 ON CONFLICT(manifest_id) DO UPDATE SET unknown=1,complete=0",
         [manifest.clone().into()])).await.unwrap();
     drain_preview_worker(&f.store, &service).await;
     assert!(
@@ -1554,8 +1578,8 @@ async fn known_rooted_import_without_preview_does_not_pin_an_independent_preview
     );
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT complete,unknown FROM html_preview_frozen_index WHERE manifest_id=?",
+            DbBackend::Postgres,
+            "SELECT complete,unknown FROM html_preview_frozen_index WHERE manifest_id=$1",
             [manifest.into()],
         ))
         .await

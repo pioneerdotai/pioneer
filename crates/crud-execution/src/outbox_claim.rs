@@ -3,7 +3,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Duration;
 use futures_util::FutureExt;
-use pioneer_entity::{agent_action, agent_action_outbox};
+use pioneer_entity::{
+    agent_action, agent_action_outbox, agent_action_timeline_target, agent_execution,
+    agent_turn_response_execution,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, TransactionSession,
@@ -15,6 +18,10 @@ use std::panic::AssertUnwindSafe;
 // budget requires a migration replacing their predicates, plus the queries below.
 pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
 const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
+const AGENT_ACTION_OUTBOX_MAX_RETRY_SECONDS: i64 = 30 * 60;
+pub const AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS: &str = "waiting_for_durable_permit";
+pub const AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS: &str = "waiting_for_native_thread_runtime";
+pub const ACTION_TIMELINE_TARGET_TURN_INPUT: &str = "turn_input";
 const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 // An exhausted StartAgent still owes outcome reconciliation, never delivery.
@@ -328,3 +335,249 @@ pub async fn transition_agent_action_outbox<C: ConnectionTrait>(
     candidate.last_error = last_error;
     Ok(true)
 }
+
+pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    delivered_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("delivered"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::DeliveredAt,
+            sea_orm::sea_query::Expr::value(Some(delivered_at)),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value::<Option<DateTimeWithTimeZone>>(None),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to mark agent domain outbox row delivered")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn mark_agent_action_outbox_failed_with_cause<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    failed_at: DateTimeWithTimeZone,
+    failure: AgentActionOutboxFailure,
+    terminal: bool,
+) -> Result<bool> {
+    let exhausted_start = if !terminal && expected_attempts == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
+        match agent_action_outbox::Entity::find_by_id(outbox_id.to_owned())
+            .one(db)
+            .await?
+        {
+            Some(row) if row.attempts == expected_attempts => {
+                agent_action::Entity::find_by_id(row.action_id)
+                    .one(db)
+                    .await?
+                    .is_some_and(|action| action.action_kind == "start_agent")
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let next_attempt_at = if terminal {
+        None
+    } else if exhausted_start {
+        Some(failed_at.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS))
+    } else {
+        agent_action_outbox_retry_at(expected_attempts, failed_at.clone())?
+    };
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(
+                if exhausted_start
+                    && AGENT_START_TERMINAL_FAILURE_CLASSES.contains(&failure.safe_name())
+                {
+                    AGENT_START_RECONCILIATION_REQUIRED.to_owned()
+                } else {
+                    failure.safe_name().to_owned()
+                },
+            )),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(next_attempt_at),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to mark agent domain outbox row failed")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn defer_agent_action_outbox_for_permit<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    deferred_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let restored_attempts = expected_attempts
+        .checked_sub(1)
+        .filter(|attempts| *attempts >= 0)
+        .context("outbox permit deferral has an invalid attempt fence")?;
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(restored_attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned())),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(Some(
+                deferred_at + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
+            )),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to defer agent domain outbox for a durable permit")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn defer_agent_action_outbox_for_runtime<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    deferred_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let restored_attempts = expected_attempts
+        .checked_sub(1)
+        .filter(|attempts| *attempts >= 0)
+        .context("outbox runtime deferral has an invalid attempt fence")?;
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(restored_attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(
+                AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS.to_owned(),
+            )),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(Some(deferred_at + Duration::milliseconds(100))),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to defer agent domain outbox for a busy native thread runtime")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn wake_agent_action_outbox_for_execution<C: ConnectionTrait>(
+    db: &C,
+    execution_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    let execution = agent_execution::Entity::find_by_id(execution_id.to_owned())
+        .one(db)
+        .await
+        .context("failed to resolve promoted AgentExecution")?
+        .context("promoted AgentExecution is missing")?;
+    if execution.parent_task_id.is_some() {
+        // Task candidate/reviewer executions are resumed by the Task runtime,
+        // not by a StartAgent action outbox. They may legitimately respond to
+        // multiple initial/revision Turns during one occurrence.
+        return Ok(0);
+    }
+    let responses = agent_turn_response_execution::Entity::find()
+        .filter(agent_turn_response_execution::Column::ExecutionId.eq(execution_id.to_owned()))
+        .limit(2)
+        .all(db)
+        .await
+        .context("failed to resolve promoted execution response Turn")?;
+    if responses.is_empty() {
+        return Ok(0);
+    }
+    if responses.len() != 1 {
+        bail!("promoted non-Task execution responds to multiple Turns");
+    }
+    let target = agent_action_timeline_target::Entity::find_by_id(format!(
+        "turn_input:{}",
+        responses[0].turn_id
+    ))
+    .one(db)
+    .await
+    .context("failed to resolve promoted execution StartAgent action")?;
+    let Some(target) = target else {
+        return Ok(0);
+    };
+    if target.target_kind != ACTION_TIMELINE_TARGET_TURN_INPUT
+        || target.turn_id != responses[0].turn_id
+    {
+        bail!("promoted execution has an inconsistent action timeline target");
+    }
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
+        .filter(agent_action_outbox::Column::ActionId.eq(target.action_id))
+        .filter(agent_action_outbox::Column::Status.eq("failed"))
+        .filter(
+            agent_action_outbox::Column::LastError
+                .eq(AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to wake agent domain outbox after permit promotion")?;
+    Ok(result.rows_affected)
+}
+
+fn agent_action_outbox_retry_at(
+    attempt: i64,
+    failed_at: DateTimeWithTimeZone,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    if !(1..=AGENT_ACTION_OUTBOX_MAX_ATTEMPTS).contains(&attempt) {
+        bail!("outbox failure acknowledgement has an invalid attempt fence");
+    }
+    if attempt == AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
+        return Ok(None);
+    }
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or_default();
+    let delay = std::cmp::Ord::min(
+        AGENT_ACTION_OUTBOX_LEASE_SECONDS.saturating_mul(2_i64.saturating_pow(exponent)),
+        AGENT_ACTION_OUTBOX_MAX_RETRY_SECONDS,
+    );
+    Ok(Some(failed_at + Duration::seconds(delay)))
+}
+
+#[cfg(test)]
+mod tests;

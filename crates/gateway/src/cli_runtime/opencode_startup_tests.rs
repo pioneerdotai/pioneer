@@ -345,7 +345,7 @@ async fn sqlite_startup_conflict_uses_one_deadline_including_backoff() {
     fixture.instance.startup_probe_timeout_ms = 1000;
     let started = Instant::now();
     let error = fixture.start().await.err().unwrap();
-    assert!(format!("{error:#}").contains("timed out"));
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     assert_eq!(fixture.starts().len(), 2);
     // A fresh 1s timeout on the second attempt would exceed 1.4s.
     assert!(started.elapsed() < Duration::from_millis(1250));

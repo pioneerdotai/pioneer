@@ -6091,6 +6091,17 @@ mod tests {
         );
     }
 
+    fn assert_duplicate_recovery(error: &anyhow::Error) {
+        assert!(
+            matches!(
+                error.downcast_ref::<sea_orm::DbErr>().and_then(sea_orm::DbErr::sql_err),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(message))
+                    if message.contains("uq_recovery_job_unresolved_turn")
+            ),
+            "expected the unresolved turn constraint, got {error:#}"
+        );
+    }
+
     #[pioneer_postgres_test::postgres_test]
     async fn compaction_restore_bounds_full_results_and_keeps_round_scoped_sources() {
         let (store, _, coordinator) = setup_coordinator_with_agent().await;
@@ -6566,8 +6577,8 @@ mod tests {
             store
                 .database_connection()
                 .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                    sea_orm::DbBackend::Postgres,
+                    "UPDATE turn_llm_context SET payload=$1 WHERE id=$2",
                     [
                         serde_json::to_string(&invalid).unwrap().into(),
                         legacy_row_id.clone().into(),
@@ -6584,8 +6595,8 @@ mod tests {
         store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
-                "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                sea_orm::DbBackend::Postgres,
+                "UPDATE turn_llm_context SET payload=$1 WHERE id=$2",
                 [
                     serde_json::to_string(&legacy).unwrap().into(),
                     legacy_row_id.into(),
@@ -11067,7 +11078,7 @@ mod tests {
             id: Set("ws_terminal_backfill".to_owned()),
             name: Set("Terminal backfill".to_owned()),
             is_active: Set(true),
-            is_current: Set(true),
+            is_current: Set(false),
             ..Default::default()
         }
         .insert(&crud_store.database_connection())
@@ -11270,7 +11281,7 @@ mod tests {
                 id: sea_orm::Set(thread.workspace_id.clone()),
                 name: sea_orm::Set("Observation fixture".to_owned()),
                 is_active: sea_orm::Set(true),
-                is_current: sea_orm::Set(true),
+                is_current: sea_orm::Set(false),
                 ..Default::default()
             })
             .exec(&crud_store.database_connection())
@@ -11797,15 +11808,15 @@ mod tests {
                 .await
                 .unwrap()
         );
-        // Legacy corruption fixture through the application's scoped Entity DB
-        // path. The fallback {} policy must still permit later rows to progress.
+        // The schema enforces valid JSON. A value with the wrong policy shape
+        // must still let later rows progress through the active scan.
         let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[1].id.clone())
             .one(&store.database_connection())
             .await
             .unwrap()
             .unwrap();
         let mut row: pioneer_entity::recovery_job::ActiveModel = row.into();
-        row.policy_snapshot = Set("invalid legacy JSON".into());
+        row.policy_snapshot = Set(serde_json::json!("invalid policy shape").to_string());
         row.update(&store.database_connection()).await.unwrap();
         for (index, unknown_action) in [(2, true), (3, false)] {
             let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[index].id.clone())
@@ -12026,10 +12037,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_901, 64)
@@ -12104,10 +12112,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved terminal episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_002, 64)
@@ -12277,10 +12282,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -12349,10 +12351,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator

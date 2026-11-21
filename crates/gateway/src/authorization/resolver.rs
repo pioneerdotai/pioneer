@@ -2211,7 +2211,7 @@ mod tests {
                             allow_implicit_invocation,required,fingerprint\
                          ) VALUES(\
                             'mcp-installation-member','workspace','W00000000000000000001',\
-                            'member-tools','config','{}','stdio','{}','{}','[]',1,0,0,\
+                            'member-tools','config','{}','stdio','{}','{}','[]',TRUE,FALSE,FALSE,\
                             'mcp-member-fingerprint'\
                          )",
                     )
@@ -2248,7 +2248,7 @@ mod tests {
                 harness
                     .database
                     .execute_unprepared(
-                        "UPDATE mcp_server_installation SET enabled=0 \
+                        "UPDATE mcp_server_installation SET enabled=FALSE \
                          WHERE id='mcp-installation-member'",
                     )
                     .await
@@ -3255,7 +3255,7 @@ mod tests {
                     harness.database.execute_raw(Statement::from_sql_and_values(
                         harness.database.get_database_backend(),
                         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
-                         VALUES(?,?,?,1,1,'queued',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                         VALUES($1,$2,$3,1,1,'queued',$4,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                         vec![Value::from(run), Value::from(task), Value::from(run), Value::from(executor)],
                     )).await.unwrap();
                 }
@@ -3291,7 +3291,7 @@ mod tests {
                         .database
                         .execute_raw(Statement::from_sql_and_values(
                             harness.database.get_database_backend(),
-                            "UPDATE task_run SET status=? WHERE id='run-a'",
+                            "UPDATE task_run SET status=$1 WHERE id='run-a'",
                             [Value::from(status)],
                         ))
                         .await
@@ -3357,7 +3357,7 @@ mod tests {
                         .database
                         .execute_raw(Statement::from_sql_and_values(
                             harness.database.get_database_backend(),
-                            "UPDATE task SET lifecycle_policy_json=? WHERE id='K0000000000000000000A'",
+                            "UPDATE task SET lifecycle_policy_json=$1::text::json WHERE id='K0000000000000000000A'",
                             [Value::from(serde_json::to_string(&policy).unwrap())],
                         ))
                         .await
@@ -3369,7 +3369,7 @@ mod tests {
                         .database
                         .execute_raw(Statement::from_sql_and_values(
                             harness.database.get_database_backend(),
-                            "UPDATE task_run SET executor_kind=? WHERE id='run-b'",
+                            "UPDATE task_run SET executor_kind=$1 WHERE id='run-b'",
                             [Value::from(executor)],
                         ))
                         .await

@@ -54,19 +54,7 @@ async fn expiry_and_root_publication_follow_the_header_lock_in_both_commit_order
                 }
                 Ok::<_, anyhow::Error>(())
             });
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let blocked: bool = pool.query_one_raw(Statement::from_sql_and_values(
-                        DbBackend::Postgres,
-                        "SELECT cardinality(pg_blocking_pids($1)) > 0",
-                        [second_pid.into()],
-                    )).await?.context("read root publication lock state")?.try_get_by_index(0)?;
-                    if blocked {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }).await.context("second writer did not wait on the header")??;
+            wait_until_blocked(pool, second_pid).await?;
             first.commit().await?;
             attempt.await??;
             let saved = history::Entity::find_by_id("manifest").one(pool).await?.context("saved expiry marker")?;
@@ -98,4 +86,94 @@ async fn backend_pid(tx: &DatabaseTransaction) -> Result<i32> {
         .await?
         .context("competing transaction PID")?
         .try_get_by_index(0)?)
+}
+
+#[tokio::test]
+async fn expiry_and_source_projection_revalidate_the_same_header_in_both_orders() -> Result<()> {
+    use pioneer_compaction::frozen::FrozenHistoryRef;
+    use pioneer_crud_compaction::source_projection::{
+        PreparedSourceProjection, compaction_bound_source_projection,
+    };
+
+    for publish_first in [true, false] {
+        with_database(async |fixture| {
+            let pool = fixture.connection();
+            pool.execute_unprepared(
+                "INSERT INTO workspace(id,name) VALUES ('workspace','Workspace');
+                 INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+                 VALUES ('thread','workspace','','agent','model','provider','active');
+                 INSERT INTO turn(id,thread_id,status) VALUES ('turn','thread','in_progress');
+                 INSERT INTO compaction_context(owner,workspace_id,thread_id)
+                 VALUES ('owner','workspace','thread');
+                 INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms,execution_turn)
+                 VALUES ('operation','owner','fingerprint','running','{}',1234,'turn');
+                 INSERT INTO compaction_frozen_history
+                    (id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready)
+                 VALUES ('manifest','workspace','thread',repeat('a',64),0,0,repeat('b',64),1)",
+            ).await?;
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: "manifest".into(),
+                messages: 0,
+                identity_sha256: "a".repeat(64),
+            };
+            let header = history::Entity::find_by_id("manifest").one(pool).await?.context("manifest fixture")?;
+            let first = pool.begin().await?;
+            if publish_first {
+                PreparedSourceProjection::new(&descriptor)?.bind(&first, "operation").await?;
+                assert!(compaction_bound_source_projection(pool, "operation").await?.is_none());
+            } else {
+                assert!(expire(&first, &header, |_| false).await?);
+            }
+
+            let independent = fixture.connect().await?;
+            let second = independent.begin().await?;
+            let second_pid = backend_pid(&second).await?;
+            let competitor_descriptor = descriptor.clone();
+            let attempt = tokio::spawn(async move {
+                if publish_first {
+                    assert!(!expire(&second, &header, |_| false).await?);
+                    second.commit().await?;
+                } else {
+                    let error = PreparedSourceProjection::new(&competitor_descriptor)?
+                        .bind(&second, "operation").await.expect_err("must reject an expired source");
+                    assert!(error.to_string().contains("compaction origin is unavailable"));
+                    second.rollback().await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            wait_until_blocked(pool, second_pid).await?;
+            first.commit().await?;
+            attempt.await??;
+            assert_eq!(
+                compaction_bound_source_projection(pool, "operation").await?,
+                publish_first.then_some(descriptor),
+            );
+            independent.close().await?;
+            Ok(())
+        }).await?;
+    }
+    Ok(())
+}
+
+async fn wait_until_blocked(db: &impl ConnectionTrait, pid: i32) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT cardinality(pg_blocking_pids($1)) > 0",
+                    [pid.into()],
+                ))
+                .await?
+                .context("read root publication lock state")?
+                .try_get_by_index(0)?;
+            if blocked {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("second writer did not wait on the header")?
 }

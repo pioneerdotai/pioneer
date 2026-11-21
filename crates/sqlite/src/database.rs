@@ -69,17 +69,10 @@ impl SqliteReadPool {
     }
 
     fn max_connections(&self) -> u32 {
-        if self.connection.get_database_backend() == DbBackend::Postgres {
-            self.connection
-                .get_postgres_connection_pool()
-                .options()
-                .get_max_connections()
-        } else {
-            self.connection
-                .get_sqlite_connection_pool()
-                .options()
-                .get_max_connections()
-        }
+        self.connection
+            .get_postgres_connection_pool()
+            .options()
+            .get_max_connections()
     }
 
     async fn query_only_enabled(&self, class: SqliteReadClass) -> Result<bool, DbErr> {
@@ -89,25 +82,17 @@ impl SqliteReadPool {
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
                 pioneer_observability::turn_startup::Stage::DbExecute,
             );
-            let backend = self.connection.get_database_backend();
-            let sql = if backend == DbBackend::Postgres {
-                "SELECT current_setting('transaction_read_only') AS query_only"
-            } else {
-                "PRAGMA query_only"
-            };
             let row = observe_control(
-                self.connection
-                    .query_one_raw(Statement::from_string(backend, sql)),
+                self.connection.query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT current_setting('transaction_read_only') AS query_only",
+                )),
                 "bootstrap",
             )
             .in_pool(reader_pool_context(class))
             .await?
             .ok_or_else(|| DbErr::Custom("read-only pool check returned no row".to_owned()))?;
-            if backend == DbBackend::Postgres {
-                Ok(row.try_get::<String>("", "query_only")? == "on")
-            } else {
-                Ok(row.try_get::<i64>("", "query_only")? != 0)
-            }
+            Ok(row.try_get::<String>("", "query_only")? == "on")
         }
         .await;
         operation.finish(if result.is_ok() {
@@ -555,16 +540,6 @@ impl SqliteDatabase {
         self.reader.begin(self.read_class).await
     }
 
-    /// Execute a row-returning statement on the serialized writer. This is
-    /// reserved for SQLite extension functions whose SQL surface is `SELECT`
-    /// but whose execution mutates database state.
-    pub async fn query_one_write_raw(
-        &self,
-        statement: Statement,
-    ) -> Result<Option<QueryResult>, DbErr> {
-        self.writer_connection().query_one_raw(statement).await
-    }
-
     fn writer_connection(&self) -> SqliteWriteConnection {
         self.writer.connection(self.write_class)
     }
@@ -858,8 +833,7 @@ mod tests {
     use super::{SqliteDatabase, SqliteReadClass, SqliteReadPool, StatementRoute, statement_route};
     use crate::{SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteExecutor};
     use futures_util::StreamExt;
-    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, StreamTrait};
-    use std::path::PathBuf;
+    use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -886,35 +860,32 @@ mod tests {
         }
     }
 
-    async fn test_database() -> SqliteDatabase {
-        let mut reader_options = ConnectOptions::new("sqlite::memory:");
-        reader_options.max_connections(4);
-        let reader = Database::connect(reader_options)
+    async fn test_pools() -> (sea_orm::DatabaseConnection, sea_orm::DatabaseConnection) {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let reader = fixture
+            .connect_with_options(|options| {
+                options
+                    .max_connections(4)
+                    .map_sqlx_postgres_opts(|postgres| {
+                        postgres.options([("default_transaction_read_only", "on")])
+                    });
+            })
             .await
-            .expect("open test reader pool");
-
-        let mut writer_options = ConnectOptions::new("sqlite::memory:");
-        writer_options.max_connections(1);
-        let writer = Database::connect(writer_options)
+            .expect("open read-only test pool");
+        let writer = fixture
+            .connect_with_limit(1)
             .await
             .expect("open test writer");
+        (reader, writer)
+    }
 
+    async fn test_database() -> SqliteDatabase {
+        let (reader, writer) = test_pools().await;
         SqliteDatabase::new(reader, writer)
     }
 
     async fn observed_test_database() -> (SqliteDatabase, Arc<RecordingReadObserver>) {
-        let mut reader_options = ConnectOptions::new("sqlite::memory:");
-        reader_options.max_connections(4);
-        let reader = Database::connect(reader_options)
-            .await
-            .expect("open observed test reader pool");
-
-        let mut writer_options = ConnectOptions::new("sqlite::memory:");
-        writer_options.max_connections(1);
-        let writer = Database::connect(writer_options)
-            .await
-            .expect("open observed test writer");
-
+        let (reader, writer) = test_pools().await;
         let observer = Arc::new(RecordingReadObserver::default());
         let database = SqliteDatabase::from_executor_with_read_observer(
             reader,
@@ -922,56 +893,6 @@ mod tests {
             observer.clone(),
         );
         (database, observer)
-    }
-
-    async fn file_backed_test_database() -> (SqliteDatabase, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "pioneer-sqlite-read-transaction-{}-{}.sqlite",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let mut writer_options =
-            ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-        writer_options.max_connections(1);
-        let writer = Database::connect(writer_options)
-            .await
-            .expect("open file-backed test writer");
-        writer
-            .execute_unprepared("PRAGMA journal_mode = WAL")
-            .await
-            .expect("enable WAL for file-backed test database");
-        writer
-            .execute_unprepared(
-                "CREATE TABLE read_transaction_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
-            )
-            .await
-            .expect("create file-backed read transaction probe");
-
-        let mut reader_options =
-            ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
-        reader_options.max_connections(4);
-        let reader = Database::connect(reader_options)
-            .await
-            .expect("open file-backed test reader");
-        (SqliteDatabase::new(reader, writer), path)
-    }
-
-    async fn close_file_backed_test_database(database: SqliteDatabase, path: PathBuf) {
-        database
-            .close()
-            .await
-            .expect("close file-backed test pools");
-        for candidate in [
-            path.clone(),
-            PathBuf::from(format!("{}-wal", path.display())),
-            PathBuf::from(format!("{}-shm", path.display())),
-        ] {
-            match std::fs::remove_file(&candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("remove test database {}: {error}", candidate.display()),
-            }
-        }
     }
 
     #[test]
@@ -1041,7 +962,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn database_scopes_carry_consistent_read_and_write_classes() {
         let database = test_database().await;
 
@@ -1074,30 +995,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn private_reader_rejects_every_write_entry_point() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("open test reader");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_read_only().await.expect("open test reader");
         let reader = SqliteReadPool::new(connection);
 
         let query_error = reader
             .query_one_raw(
                 SqliteReadClass::Interactive,
                 Statement::from_string(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     "DELETE FROM item RETURNING id".to_owned(),
                 ),
             )
             .await
             .expect_err("row-returning write must be rejected");
-        assert!(query_error.to_string().contains("SQLite read pool"));
+        assert!(query_error.to_string().contains("database read pool"));
 
         let stream_error = match reader
             .stream_raw(
                 SqliteReadClass::Maintenance,
                 Statement::from_string(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     "INSERT INTO item DEFAULT VALUES RETURNING id".to_owned(),
                 ),
             )
@@ -1106,18 +1026,18 @@ mod tests {
             Ok(_) => panic!("streaming write must be rejected"),
             Err(error) => error,
         };
-        assert!(stream_error.to_string().contains("SQLite read pool"));
+        assert!(stream_error.to_string().contains("database read pool"));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn read_transaction_accepts_queries_and_rejects_all_mutations() {
         let database = test_database().await;
         let transaction = database.begin_read().await.expect("begin read transaction");
 
         let row = transaction
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 7 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 7::bigint AS value".to_owned(),
             ))
             .await
             .expect("query through read transaction")
@@ -1128,28 +1048,34 @@ mod tests {
             .execute_unprepared("CREATE TABLE forbidden (id INTEGER)")
             .await
             .expect_err("read transaction execute must be rejected");
-        assert!(execute_error.to_string().contains("SQLite read pool"));
+        assert!(execute_error.to_string().contains("database read pool"));
 
         let returning_error = transaction
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "DELETE FROM forbidden RETURNING id".to_owned(),
             ))
             .await
             .expect_err("row-returning mutation must be rejected");
-        assert!(returning_error.to_string().contains("SQLite read pool"));
+        assert!(returning_error.to_string().contains("database read pool"));
 
         transaction.commit().await.expect("commit read transaction");
         database.close().await.expect("close test database");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn held_read_snapshot_does_not_occupy_or_block_the_writer() {
-        let (database, path) = file_backed_test_database().await;
+        let database = test_database().await;
+        database
+            .execute_unprepared(
+                "CREATE TABLE read_transaction_probe (id BIGINT PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .await
+            .expect("create read transaction probe");
         let transaction = database.begin_read().await.expect("begin read snapshot");
         let initial = transaction
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
             ))
             .await
@@ -1169,7 +1095,7 @@ mod tests {
 
         let snapshot = transaction
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
             ))
             .await
@@ -1180,17 +1106,17 @@ mod tests {
 
         let current = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM read_transaction_probe".to_owned(),
             ))
             .await
             .expect("query current state")
             .expect("current count row");
         assert_eq!(current.try_get::<i64>("", "count").unwrap(), 1);
-        close_file_backed_test_database(database, path).await;
+        database.close().await.expect("close test pools");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn maintenance_read_transaction_holds_limiter_until_completion() {
         let database = test_database().await;
         let maintenance = database.maintenance();
@@ -1200,8 +1126,8 @@ mod tests {
             .expect("begin maintenance read transaction");
         transaction
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 1::bigint AS value".to_owned(),
             ))
             .await
             .expect("query maintenance read transaction");
@@ -1211,8 +1137,8 @@ mod tests {
             async move {
                 maintenance
                     .query_one_raw(Statement::from_string(
-                        DbBackend::Sqlite,
-                        "SELECT 2 AS value".to_owned(),
+                        DbBackend::Postgres,
+                        "SELECT 2::bigint AS value".to_owned(),
                     ))
                     .await
             }
@@ -1226,8 +1152,8 @@ mod tests {
         let interactive = tokio::time::timeout(
             Duration::from_secs(1),
             database.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 3 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 3::bigint AS value".to_owned(),
             )),
         )
         .await
@@ -1250,22 +1176,22 @@ mod tests {
         database.close().await.expect("close test database");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn reader_observer_reports_class_outcome_and_maintenance_lifecycle() {
         let (database, observer) = observed_test_database().await;
 
         database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 1::bigint AS value".to_owned(),
             ))
             .await
             .expect("run observed interactive read");
         database
             .maintenance()
             .query_all_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 2 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 2::bigint AS value".to_owned(),
             ))
             .await
             .expect("run observed maintenance read");
@@ -1316,7 +1242,7 @@ mod tests {
         assert_eq!(events.len(), 5);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn reader_ping_uses_the_typed_maintenance_limiter() {
         let (database, observer) = observed_test_database().await;
 
@@ -1356,14 +1282,14 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn maintenance_stream_reserves_one_slot_without_blocking_interactive_reads() {
         let database = test_database().await;
         let maintenance = database.maintenance();
         let mut held_stream = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1 AS value UNION ALL SELECT 2 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 1::bigint AS value UNION ALL SELECT 2::bigint AS value".to_owned(),
             ))
             .await
             .expect("open maintenance stream");
@@ -1380,8 +1306,8 @@ mod tests {
             async move {
                 maintenance
                     .query_one_raw(Statement::from_string(
-                        DbBackend::Sqlite,
-                        "SELECT 3 AS value".to_owned(),
+                        DbBackend::Postgres,
+                        "SELECT 3::bigint AS value".to_owned(),
                     ))
                     .await
             }
@@ -1395,8 +1321,8 @@ mod tests {
         let interactive = tokio::time::timeout(
             Duration::from_secs(1),
             database.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 4 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 4::bigint AS value".to_owned(),
             )),
         )
         .await
@@ -1415,14 +1341,14 @@ mod tests {
         assert_eq!(resumed.try_get::<i64>("", "value").unwrap(), 3);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn completed_maintenance_stream_releases_permit_before_drop() {
         let database = test_database().await;
         let maintenance = database.maintenance();
         let mut completed_stream = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 1::bigint AS value".to_owned(),
             ))
             .await
             .expect("open maintenance stream");
@@ -1432,8 +1358,8 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(1),
             maintenance.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 2 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 2::bigint AS value".to_owned(),
             )),
         )
         .await
@@ -1443,14 +1369,14 @@ mod tests {
         drop(completed_stream);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cancelling_waiting_maintenance_read_does_not_leak_capacity() {
         let (database, observer) = observed_test_database().await;
         let maintenance = database.maintenance();
         let held_stream = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 1 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 1::bigint AS value".to_owned(),
             ))
             .await
             .expect("open maintenance stream");
@@ -1460,8 +1386,8 @@ mod tests {
             async move {
                 maintenance
                     .query_one_raw(Statement::from_string(
-                        DbBackend::Sqlite,
-                        "SELECT 2 AS value".to_owned(),
+                        DbBackend::Postgres,
+                        "SELECT 2::bigint AS value".to_owned(),
                     ))
                     .await
             }
@@ -1483,8 +1409,8 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(1),
             maintenance.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT 3 AS value".to_owned(),
+                DbBackend::Postgres,
+                "SELECT 3::bigint AS value".to_owned(),
             )),
         )
         .await

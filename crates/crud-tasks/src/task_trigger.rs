@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use pioneer_entity::task_trigger;
-use pioneer_protocol::{TaskTrigger, TaskTriggerStatus};
+use pioneer_protocol::{TaskTrigger, TaskTriggerSpec, TaskTriggerStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::status::{task_trigger_kind_to_db, task_trigger_status_to_db};
+use crate::status::{
+    task_trigger_kind_from_db, task_trigger_kind_to_db, task_trigger_status_from_db,
+    task_trigger_status_to_db,
+};
 use crate::values::unix_to_datetime;
 
 #[derive(Clone, Debug)]
@@ -296,4 +299,34 @@ pub async fn scheduler_dormant_upper<C: ConnectionTrait>(db: &C) -> Result<Optio
         .one(db)
         .await
         .context("failed to capture dormant trigger upper")
+}
+
+pub fn task_trigger_from_db_model(
+    model: pioneer_entity::task_trigger::Model,
+) -> Result<TaskTrigger> {
+    let stored_kind = task_trigger_kind_from_db(model.kind.as_str())
+        .with_context(|| format!("unknown task trigger kind `{}`", model.kind))?;
+    let status = task_trigger_status_from_db(model.status.as_str())
+        .with_context(|| format!("unknown task trigger status `{}`", model.status))?;
+    let spec: TaskTriggerSpec = serde_json::from_value(model.spec_json)
+        .with_context(|| format!("failed to decode task trigger spec `{}`", model.id))?;
+    anyhow::ensure!(
+        stored_kind == spec.kind(),
+        "task trigger `{}` has kind `{}` but spec kind `{:?}`",
+        model.id,
+        model.kind,
+        spec.kind()
+    );
+
+    Ok(TaskTrigger {
+        webhook_secret_ref: model.webhook_secret_ref,
+        id: model.id,
+        task_id: model.task_id,
+        status,
+        spec,
+        next_fire_at: model.next_fire_at.map(|value| value.timestamp()),
+        last_fire_at: model.last_fire_at.map(|value| value.timestamp()),
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+    })
 }

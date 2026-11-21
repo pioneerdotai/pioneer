@@ -8371,7 +8371,7 @@ mod prepared_snapshot_tests {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let database = fixture.connection().clone();
         database.execute_unprepared(&format!(
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',TRUE,TRUE);
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',TRUE,FALSE);
              INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('parent','{workspace}','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('execution','{workspace}','','agent','m','p','active','task','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('own-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('loser-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('winner-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('own-input','own-turn',0,'text','own history','{{\"type\":\"text\",\"text\":\"own history\"}}',CURRENT_TIMESTAMP),('loser-input','loser-turn',0,'text','losing history','{{\"type\":\"text\",\"text\":\"losing history\"}}',CURRENT_TIMESTAMP),('winner-input','winner-turn',0,'text','winning history','{{\"type\":\"text\",\"text\":\"winning history\"}}',CURRENT_TIMESTAMP);
@@ -14213,28 +14213,6 @@ mod tests {
             &fixture.execution,
             now,
         );
-        handle
-            .link_child_thread_with_runtime(
-                lineage_from_task_run_turn(
-                    &response.task,
-                    &fixture.run,
-                    &response.agent_specs[0],
-                    &parent,
-                    &candidate_turn,
-                    now,
-                ),
-                task_run_primary_binding_from_turn(
-                    &response.task,
-                    &fixture.run,
-                    &fixture.execution,
-                    &candidate_turn,
-                    now,
-                ),
-                candidate_turn.clone(),
-                now,
-            )
-            .await
-            .unwrap();
         let mut candidate_thread = processor
             .crud_store
             .get_thread_model("continuity-root")
@@ -14273,6 +14251,28 @@ mod tests {
                 &source_turn,
                 &[],
                 source_turn.author.as_ref().unwrap().actor.clone(),
+            )
+            .await
+            .unwrap();
+        handle
+            .link_child_thread_with_runtime(
+                lineage_from_task_run_turn(
+                    &response.task,
+                    &fixture.run,
+                    &response.agent_specs[0],
+                    &parent,
+                    &candidate_turn,
+                    now,
+                ),
+                task_run_primary_binding_from_turn(
+                    &response.task,
+                    &fixture.run,
+                    &fixture.execution,
+                    &candidate_turn,
+                    now,
+                ),
+                candidate_turn.clone(),
+                now,
             )
             .await
             .unwrap();

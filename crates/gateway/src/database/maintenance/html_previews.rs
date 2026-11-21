@@ -15,6 +15,7 @@ pub(crate) struct Progress {
     previews: HtmlPreviewMaintenanceProgress,
     blocked_after: (String, String, i64),
     blocked_upper: Option<(String, String, i64)>,
+    blocked_finished: bool,
     previews_finished: bool,
     revisit: bool,
 }
@@ -90,21 +91,24 @@ pub(crate) async fn quantum(
     progress: &mut Progress,
 ) -> anyhow::Result<bool> {
     let store = store.with_maintenance_access();
-    // Bounded queue recovery runs even after a lost local wake or restart.
-    if progress.blocked_upper.is_none() {
-        progress.blocked_upper = Some(store.html_preview_io_recovery_frontier().await?);
+    // Latch the recovery frontier for this pass. Immediately rescanning its
+    // parked rows would requeue work that just reported an active hold.
+    if !progress.blocked_finished {
+        if progress.blocked_upper.is_none() {
+            progress.blocked_upper = Some(store.html_preview_io_recovery_frontier().await?);
+        }
+        match store
+            .recover_html_preview_io_blocked_through(
+                &progress.blocked_after,
+                progress.blocked_upper.as_ref().expect("captured frontier"),
+            )
+            .await?
+        {
+            Some(next) => progress.blocked_after = next,
+            None => progress.blocked_finished = true,
+        }
     }
-    let blocked_next = store
-        .recover_html_preview_io_blocked_through(
-            &progress.blocked_after,
-            progress.blocked_upper.as_ref().expect("captured frontier"),
-        )
-        .await?;
-    if blocked_next.is_none() {
-        progress.blocked_upper = None;
-    }
-    let blocked_more = blocked_next.is_some();
-    progress.blocked_after = blocked_next.unwrap_or_default();
+    let blocked_more = !progress.blocked_finished;
     let io_result = io_quantum(&store, service).await;
 
     let mut deferred = false;
@@ -175,6 +179,9 @@ pub(super) async fn run(
                 if release_only {
                     progress.previews.invalidate_completed();
                     progress.previews_finished = false;
+                    progress.blocked_after = Default::default();
+                    progress.blocked_upper = None;
+                    progress.blocked_finished = false;
                     continue;
                 }
                 if progress.previews_finished {

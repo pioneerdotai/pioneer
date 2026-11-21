@@ -136,7 +136,7 @@ pub async fn upsert_candidate<C: ConnectionTrait>(
         )
         // This method is an idempotent upsert: the projector deliberately
         // presents the same candidate in `candidate_created` and the
-        // immediately following terminal review event.  `exec` asks SQLite
+        // immediately following terminal review event. `exec` asks PostgreSQL
         // to return an inserted row and SeaORM maps a legitimate
         // `ON CONFLICT DO NOTHING` replay to `RecordNotInserted`.  Execute
         // without RETURNING so a zero-row conflict remains a successful

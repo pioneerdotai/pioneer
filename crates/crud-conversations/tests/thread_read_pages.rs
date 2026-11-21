@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::thread_lineage::list_children_page;
+use pioneer_crud_conversations::thread_metadata::{find_thread_by_id, update_thread_status};
 use pioneer_crud_conversations::thread_state::{
     is_list_conversation, list_read_candidates_page, list_threads_by_workspace,
 };
 use pioneer_entity::{thread, thread_lineage, workspace};
 use pioneer_postgres_test::with_database;
+use pioneer_protocol::ThreadStatus;
 use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement,
+    ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement, TransactionTrait,
     entity::prelude::DateTimeWithTimeZone,
 };
+use std::time::Duration;
 
 const WORKSPACE: &str = "read-pages";
 
@@ -140,7 +143,7 @@ async fn updated_thread_order_is_applied_before_the_workspace_limit() -> Result<
         seed_workspace(db).await?;
         let same = "2026-01-01T00:00:01Z".parse()?;
         let early = "2026-01-01T00:00:00Z".parse()?;
-        for (id, updated) in [("b", same), ("c", same), ("old", early), ("a", same)] {
+        for (id, updated) in [("b", same), ("A", same), ("old", early), ("a", same)] {
             let mut row = conversation(id, early);
             row.updated_at = Set(updated);
             row.insert(db).await?;
@@ -148,7 +151,7 @@ async fn updated_thread_order_is_applied_before_the_workspace_limit() -> Result<
         let rows = list_threads_by_workspace(db, WORKSPACE, 2).await?;
         assert_eq!(
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
+            ["A", "a"]
         );
         Ok(())
     })
@@ -200,6 +203,66 @@ async fn child_pages_continue_beyond_128_and_are_scoped_to_actual_parent() -> Re
                 .await
                 .is_err()
         );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn concurrent_thread_status_updates_preserve_latest_activity_timestamp() -> Result<()> {
+    with_database(async |fixture| {
+        let db = fixture.connection();
+        seed_workspace(db).await?;
+        let initial = "2026-01-01T00:00:00Z".parse()?;
+        let earlier = "2026-01-01T00:00:01Z".parse()?;
+        let later = "2026-01-01T00:00:02Z".parse()?;
+        for (id, first_at, second_at) in [
+            ("later-then-earlier", later, earlier),
+            ("earlier-then-later", earlier, later),
+        ] {
+            conversation(id, initial).insert(db).await?;
+            let first = db.begin().await?;
+            update_thread_status(&first, id, ThreadStatus::Idle, first_at).await?;
+            let second = db.begin().await?;
+            let pid: i32 = second
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await?
+                .context("missing competing backend PID")?
+                .try_get("", "pid")?;
+            let writer = tokio::spawn(async move {
+                update_thread_status(&second, id, ThreadStatus::Closed, second_at).await?;
+                second.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let blocked: bool = db
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT cardinality(pg_blocking_pids($1)) > 0 AS blocked",
+                            [pid.into()],
+                        ))
+                        .await?
+                        .context("missing lock observation")?
+                        .try_get("", "blocked")?;
+                    if blocked {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("second status update did not wait for the first")??;
+            first.commit().await?;
+            writer.await??;
+
+            let committed = find_thread_by_id(db, id).await?.context("missing thread")?;
+            assert_eq!(committed.status, "closed");
+            assert_eq!(committed.updated_at, later);
+        }
         Ok(())
     })
     .await

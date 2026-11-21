@@ -14,7 +14,7 @@ use pioneer_protocol::{
 };
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
-    is_anyhow_sqlite_transient_access, retry_with_backoff,
+    is_anyhow_database_transient_access, retry_with_backoff,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1458,7 +1458,7 @@ fn same_scheduled_occurrence(left: &TaskTrigger, right: &TaskTrigger) -> bool {
 }
 
 fn is_transient_scheduler_storage_error(error: &anyhow::Error) -> bool {
-    is_anyhow_sqlite_transient_access(error)
+    is_anyhow_database_transient_access(error)
 }
 
 #[cfg(test)]
@@ -1468,10 +1468,10 @@ mod tests {
 
     #[test]
     fn scheduler_treats_pool_acquire_timeout_as_transient_storage_access() {
-        let error = anyhow!(
-            "failed to list active task triggers: Failed to acquire connection from pool: \
-             Connection pool timed out: Connection pool timed out"
-        );
+        let error = anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ))
+        .context("failed to list active task triggers");
 
         assert!(is_transient_scheduler_storage_error(&error));
     }

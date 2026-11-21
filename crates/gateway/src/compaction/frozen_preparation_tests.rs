@@ -74,8 +74,8 @@ async fn scenario() -> (Fixture, Arc<HistoryReadObserver>, Vec<FrozenMessageRef>
         .collect::<Vec<_>>();
 
     let db = f.store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES('precheck-item','turn','historical-command','command_execution','completed',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES('precheck-item','turn','historical-command','command_execution','completed',$1::text::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [serde_json::to_string(&historical_command_fixture("retained output")).unwrap().into()],
     )).await.unwrap();
     let message = ChatMessage::user("exact bounded replay");
@@ -84,8 +84,8 @@ async fn scenario() -> (Fixture, Arc<HistoryReadObserver>, Vec<FrozenMessageRef>
         truncated: false,
     })
     .unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('precheck-replay','turn','historical-command',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('precheck-replay','turn','historical-command',1,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)",
         [replay_payload.into()],
     )).await.unwrap();
     let mut item = reference(
@@ -102,14 +102,6 @@ async fn scenario() -> (Fixture, Arc<HistoryReadObserver>, Vec<FrozenMessageRef>
         version: "revision:1".into(),
     });
     references.insert(1, item);
-    let sources = references
-        .iter()
-        .flat_map(|entry| entry.sources.iter().chain(entry.replay_source.iter()))
-        .cloned()
-        .collect::<Vec<_>>();
-    history::prepare_references(&f.store, "ws", "thread", &sources)
-        .await
-        .unwrap();
     (f, observer, references)
 }
 
@@ -179,9 +171,9 @@ async fn frozen_prepared_event_item_group_saves_metadata_reads_for_both_projecti
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn frozen_unprepared_group_keeps_legacy_registration_fallback() {
+async fn frozen_restore_rejects_missing_authoritative_revisions_without_repair() {
     let (f, observer, references) = scenario().await;
-    let expected = frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
+    frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
         .await
         .unwrap();
     for sql in [
@@ -196,13 +188,17 @@ async fn frozen_unprepared_group_keeps_legacy_registration_fallback() {
             .unwrap();
     }
     observer.writes.lock().unwrap().clear();
-    let actual = frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
+    let error = frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
         .await
-        .unwrap();
-    assert_eq!(actual, expected);
+        .unwrap_err();
     assert!(
-        !observer.writes().is_empty(),
-        "legacy metadata was not registered"
+        error
+            .to_string()
+            .contains("selected history source disappeared")
+    );
+    assert!(
+        observer.writes().is_empty(),
+        "a reader must not recreate missing revisions"
     );
     let sources = references
         .iter()
@@ -210,7 +206,7 @@ async fn frozen_unprepared_group_keeps_legacy_registration_fallback() {
         .cloned()
         .collect::<Vec<_>>();
     assert!(
-        f.store
+        !f.store
             .compaction_references_current("ws", "thread", &sources)
             .await
             .unwrap()
@@ -233,11 +229,11 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
         let mutate = async {
             reached_rx
                 .await
-                .expect("actual grouped precheck did not return true");
+                .expect("restore did not reach the exact-read boundary");
             assert_eq!(
                 take_reads(&observer, SqliteReadClass::Maintenance),
-                1,
-                "payload read started before the precheck pause"
+                0,
+                "payload read started before the exact-read pause"
             );
             // The same maintenance admission must be free while restore is
             // paused. This read completes before any source is changed.
@@ -249,7 +245,7 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
             match change {
                 "edit" => {
                     db.execute_unprepared(
-                        "UPDATE turn_event SET payload=payload||' ' WHERE id='source'",
+                        "UPDATE turn_event SET payload=(payload::text||' ')::json WHERE id='source'",
                     )
                     .await
                     .unwrap();
@@ -258,8 +254,8 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
                     db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
                         .await
                         .unwrap();
-                    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('source','thread','turn',1,'item/completed',?,CURRENT_TIMESTAMP)",
+                    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('source','thread','turn',1,'item/completed',$1::text::json,CURRENT_TIMESTAMP)",
                         [f.canonical_payload.clone().into()],
                     )).await.unwrap();
                 }
@@ -291,16 +287,14 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
                 .contains("selected history source disappeared"),
             "{change}: {error:#}"
         );
-        // No prepare_references call was reintroduced after release: event
-        // failure takes one exact payload read; replay failure reads the first
-        // event, the item, then its exact replay dependency.
+        // One snapshot reads the group after the pause. A stale replay still
+        // requires its own exact dependency read.
         assert_eq!(
             take_reads(&observer, SqliteReadClass::Maintenance),
-            if change == "replay" { 3 } else { 1 }
+            if change == "replay" { 2 } else { 1 }
         );
         assert!(observer.writes().is_empty());
-        // A fresh grouped precheck is false. Legacy seeding must not overwrite
-        // the authoritative revision or tombstone to make this restore pass.
+        // A subsequent restore also rejects the changed authoritative revision.
         assert!(
             frozen::restore_entries_page_for_test(&f.store, "ws", &references, true)
                 .await
@@ -375,7 +369,9 @@ async fn frozen_precheck_does_not_hide_database_errors_or_precheck_malformed_rev
     f.store
         .database_connection()
         .execute_unprepared(
-            "ALTER TABLE compaction_event_revision RENAME TO unavailable_event_revision",
+            // PostgreSQL views continue to resolve a renamed table by OID.
+            "ALTER VIEW compaction_live_sources RENAME TO unavailable_live_sources;
+             ALTER TABLE compaction_event_revision RENAME TO unavailable_event_revision",
         )
         .await
         .unwrap();

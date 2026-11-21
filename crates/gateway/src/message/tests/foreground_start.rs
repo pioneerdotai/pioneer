@@ -545,13 +545,13 @@ async fn cancel_before_activation_keeps_canonical_terminal_without_calling_provi
 #[pioneer_postgres_test::postgres_test]
 async fn mandatory_turn_snapshot_and_user_lifecycle_failures_never_accept_or_run_provider() {
     for (table, predicate) in [
-        ("turn", "1"),
-        ("turn_runtime_snapshot", "1"),
+        ("turn", "TRUE"),
+        ("turn_runtime_snapshot", "TRUE"),
         ("turn_event", "NEW.event_type = 'item/started'"),
     ] {
         let f = Fixture::new().await;
         let db = f.store.database_connection();
-        db.execute_unprepared(&format!("CREATE TRIGGER reject_mandatory BEFORE INSERT ON {table} WHEN {predicate} BEGIN SELECT RAISE(ABORT, 'fixture mandatory failure'); END")).await.unwrap();
+        db.execute_unprepared(&format!("CREATE FUNCTION reject_mandatory() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture mandatory failure'; END; $$; CREATE TRIGGER reject_mandatory BEFORE INSERT ON {table} FOR EACH ROW WHEN ({predicate}) EXECUTE FUNCTION reject_mandatory();")).await.unwrap();
         let result = timeout(Duration::from_secs(10), f.start(f.params(TURN)).await)
             .await
             .unwrap()
@@ -561,9 +561,11 @@ async fn mandatory_turn_snapshot_and_user_lifecycle_failures_never_accept_or_run
             "mandatory {table} failure was acknowledged"
         );
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
-        db.execute_unprepared("DROP TRIGGER reject_mandatory")
-            .await
-            .unwrap();
+        db.execute_unprepared(&format!(
+            "DROP TRIGGER reject_mandatory ON {table}; DROP FUNCTION reject_mandatory()",
+        ))
+        .await
+        .unwrap();
         f.close().await;
     }
 }
@@ -1130,7 +1132,7 @@ async fn old_failure_settlement_cannot_change_a_claimed_replacement() {
             task
         } else {
             f.store.database_connection().execute_unprepared(
-                "CREATE TRIGGER reject_lifecycle BEFORE INSERT ON turn_event WHEN NEW.event_type = 'item/started' BEGIN SELECT RAISE(ABORT, 'fixture lifecycle failure'); END"
+                "CREATE FUNCTION reject_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture lifecycle failure'; END; $$; CREATE TRIGGER reject_lifecycle BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.event_type = 'item/started') EXECUTE FUNCTION reject_lifecycle();"
             ).await.unwrap();
             f.processor.arm_completed_history_preparation_barrier(
                 "__foreground_failure_before_settlement__",
@@ -1158,7 +1160,9 @@ async fn old_failure_settlement_cannot_change_a_claimed_replacement() {
         if !mandatory_ready {
             f.store
                 .database_connection()
-                .execute_unprepared("DROP TRIGGER reject_lifecycle")
+                .execute_unprepared(
+                    "DROP TRIGGER reject_lifecycle ON turn_event; DROP FUNCTION reject_lifecycle()",
+                )
                 .await
                 .unwrap();
         }

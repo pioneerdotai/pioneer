@@ -4,15 +4,16 @@ use pioneer_protocol::{TaskError, TaskResult, TaskRun, TaskRunStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 
 use crate::projection::ProjectionWriteOutcome;
 use crate::status::{
-    is_terminal_task_run_status, task_executor_kind_to_db, task_run_status_from_db,
-    task_run_status_to_db,
+    is_terminal_task_run_status, task_executor_kind_from_db, task_executor_kind_to_db,
+    task_run_status_from_db, task_run_status_to_db,
 };
-use crate::values::{optional_typed_json_to_db, unix_to_datetime};
+use crate::values::{optional_typed_json_from_db, optional_typed_json_to_db, unix_to_datetime};
 
 #[derive(Clone, Debug)]
 pub struct PreparedTaskRunProjection(task_run::ActiveModel);
@@ -82,6 +83,93 @@ pub async fn upsert_prepared_run<C: ConnectionTrait>(
     super::task_child_producers::run_change(db, old.as_ref(), new.as_ref()).await?;
     super::task_occurrence_producers::run_change(db, old.as_ref(), new.as_ref()).await?;
     Ok(())
+}
+
+fn missing_completion() -> Condition {
+    Condition::all()
+        .add(task_run::Column::Status.is_in([
+            "succeeded",
+            "failed",
+            "blocked",
+            "cancelled",
+            "timed_out",
+        ]))
+        .add(task_run::Column::CompletedAt.is_null())
+}
+
+pub async fn missing_completion_high_watermark(
+    db: &impl ConnectionTrait,
+) -> Result<Option<String>> {
+    task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::Id)
+        .filter(missing_completion())
+        .order_by_desc(task_run::Column::Id)
+        .into_tuple()
+        .one(db)
+        .await
+        .context("failed to load terminal task_run repair high-watermark")
+}
+
+pub async fn missing_completion_page(
+    db: &impl ConnectionTrait,
+    high_watermark: &str,
+    cursor: Option<&str>,
+    limit: u64,
+) -> Result<Vec<String>> {
+    let mut query = task_run::Entity::find()
+        .select_only()
+        .column(task_run::Column::Id)
+        .filter(missing_completion())
+        .filter(task_run::Column::Id.lte(high_watermark))
+        .order_by_asc(task_run::Column::Id)
+        .limit(limit);
+    if let Some(cursor) = cursor {
+        query = query.filter(task_run::Column::Id.gt(cursor));
+    }
+    query
+        .into_tuple()
+        .all(db)
+        .await
+        .context("failed to load terminal task_run repair batch")
+}
+
+pub async fn repair_missing_completion(
+    tx: &DatabaseTransaction,
+    run_ids: Vec<String>,
+    completed_at: DateTimeWithTimeZone,
+) -> Result<usize> {
+    let previous = task_run::Entity::find()
+        .filter(task_run::Column::Id.is_in(run_ids))
+        .filter(missing_completion())
+        .order_by_asc(task_run::Column::Id)
+        .lock_exclusive()
+        .all(tx)
+        .await?;
+    if previous.is_empty() {
+        return Ok(0);
+    }
+
+    let repaired = task_run::Entity::update_many()
+        .filter(task_run::Column::Id.is_in(previous.iter().map(|row| row.id.clone())))
+        .col_expr(
+            task_run::Column::CompletedAt,
+            Expr::value(Some(completed_at)),
+        )
+        .exec_with_returning(tx)
+        .await
+        .context("failed to repair terminal runs missing completed_at")?;
+    let repaired_count = repaired.len();
+    let repaired = repaired
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    for old in &previous {
+        if let Some(new) = repaired.get(&old.id) {
+            crate::task_occurrence_producers::run_change(tx, Some(old), Some(new)).await?;
+        }
+    }
+    Ok(repaired_count)
 }
 
 pub async fn find_run_by_id<C: ConnectionTrait>(
@@ -810,4 +898,36 @@ pub async fn next_ready_deadline<C: ConnectionTrait>(db: &C, now: i64) -> Result
         .one(db)
         .await?
         .map(crate::values::deadline_unix_seconds))
+}
+
+pub fn task_run_from_db_model(model: pioneer_entity::task_run::Model) -> Result<TaskRun> {
+    let status = task_run_status_from_db(model.status.as_str())
+        .with_context(|| format!("unknown task run status `{}`", model.status))?;
+    let executor_kind = task_executor_kind_from_db(model.executor_kind.as_str())
+        .with_context(|| format!("unknown task run executor kind `{}`", model.executor_kind))?;
+
+    Ok(TaskRun {
+        trigger_input: optional_typed_json_from_db(model.trigger_input_json)?,
+        id: model.id,
+        task_id: model.task_id,
+        trigger_id: model.trigger_id,
+        parent_run_id: model.parent_run_id,
+        run_group_id: model.run_group_id,
+        attempt_number: u32::try_from(model.attempt_number)
+            .context("task run attempt_number is out of range")?,
+        retry_of_run_id: model.retry_of_run_id,
+        ready_at: model.ready_at.map(|value| value.timestamp()),
+        run_number: model.run_number,
+        status,
+        executor_kind,
+        started_at: model.started_at.map(|value| value.timestamp()),
+        completed_at: model.completed_at.map(|value| value.timestamp()),
+        heartbeat_at: model.heartbeat_at.map(|value| value.timestamp()),
+        locked_by: model.locked_by,
+        lock_expires_at: model.lock_expires_at.map(|value| value.timestamp()),
+        result: optional_typed_json_from_db(model.result_json)?,
+        error: optional_typed_json_from_db(model.error_json)?,
+        created_at: model.created_at.timestamp(),
+        updated_at: model.updated_at.timestamp(),
+    })
 }

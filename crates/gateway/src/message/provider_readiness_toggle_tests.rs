@@ -1197,7 +1197,7 @@ async fn projection_failure_rolls_back_file_before_any_readiness_publication() {
         .unwrap();
     let contents = std::fs::read(h.settings_path()).unwrap();
     h.processor.crud_store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_toggle_projection BEFORE INSERT ON agent_identity BEGIN SELECT RAISE(ABORT, 'injected CLI projection failure'); END;"
+        "CREATE FUNCTION reject_toggle_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected CLI projection failure'; END; $$; CREATE TRIGGER reject_toggle_projection BEFORE INSERT ON agent_identity FOR EACH ROW EXECUTE FUNCTION reject_toggle_projection();"
     ).await.unwrap();
     let mut settings = h.runtimes();
     settings.instances[0].enabled = false;
@@ -1883,7 +1883,7 @@ async fn assert_cli_save_failure_outcome(mode: FailedCliSave) {
     );
     if rollback {
         h.processor.crud_store.database_connection().execute_unprepared(
-            "CREATE TRIGGER reject_failed_toggle_projection BEFORE INSERT ON agent_identity BEGIN SELECT RAISE(ABORT, 'injected CLI projection failure'); END;"
+            "CREATE FUNCTION reject_failed_toggle_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected CLI projection failure'; END; $$; CREATE TRIGGER reject_failed_toggle_projection BEFORE INSERT ON agent_identity FOR EACH ROW EXECUTE FUNCTION reject_failed_toggle_projection();"
         ).await.unwrap();
     }
     let mut settings = h.runtimes();

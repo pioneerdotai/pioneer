@@ -1,15 +1,24 @@
 use super::*;
+
+struct ResumeTokioClock;
+
+impl Drop for ResumeTokioClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
 use crate::message::reconciliation_diagnostics::{Operation, Reporter};
 use sentry::SentryFutureExt;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_turn_event_delivery_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_terminal_effect_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(true).await;
 }
@@ -48,6 +57,7 @@ async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failur
         tracing_subscriber::registry().with(KickFailure(failures)),
     );
     tokio::time::pause();
+    let _resume_clock = ResumeTokioClock;
     processor.kick_native_terminal_effects();
     let first_failure = timeout(Duration::from_secs(10), failures_rx.recv())
         .await
@@ -115,24 +125,13 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
         SqliteWriteExecutor,
     };
-    use sea_orm::{ConnectOptions, DbBackend, Statement};
+    use sea_orm::{DbBackend, Statement};
 
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("native-kick.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -179,7 +178,7 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
             .unwrap();
         let row = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM turn_event_delivery \
              WHERE turn_id='kick-turn' AND consumer='live_notification' \
              AND status='pending'"
@@ -292,7 +291,7 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     if !terminal_effects {
         let row = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM turn_event_delivery \
                  WHERE turn_id='kick-turn' AND consumer='live_notification' \
                  AND status='delivered'"
@@ -334,21 +333,18 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     // Keep writer settlement available: closing both pools stops recovery at
     // begin_pass after an uncertain write, before either domain reporter runs.
     // A closed reader supplies the same real PoolClosed error on every pass.
-    let writer = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-    let reader = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-    reader
-        .execute_unprepared("PRAGMA query_only=ON")
-        .await
-        .unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     reader.clone().close().await.unwrap();
     processor.crud_store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
         reader, writer,
     )));
     let processor = Arc::new(processor);
-    // SQLite pool setup uses a real worker thread. Pause only after the fixture
-    // is ready, so Tokio cannot advance its acquisition timeout while
-    // that thread is still opening the connection.
+    // Pause after PostgreSQL opens both pools, so virtual time cannot advance
+    // the connection timeout before the physical setup has completed.
     tokio::time::pause();
+    let _resume_clock = ResumeTokioClock;
     let (hub, transport, dispatch) = local_capture();
     let projection = tokio::spawn(
         MessageProcessor::run_projection_delivery_resilience_worker(Arc::downgrade(&processor))

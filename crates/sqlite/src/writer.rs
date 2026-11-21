@@ -579,7 +579,6 @@ pub struct SqliteWriteExecutor {
     admission: Arc<AdmissionInner>,
     work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
     settlement: Arc<tokio::sync::Mutex<()>>,
-    ownership: Arc<Mutex<Option<Arc<crate::WriterOwnership>>>>,
 }
 
 impl std::fmt::Debug for SqliteWriteExecutor {
@@ -625,7 +624,6 @@ impl SqliteWriteExecutor {
             connection,
             work_signals: Default::default(),
             settlement: Default::default(),
-            ownership: Default::default(),
             admission: Arc::new(AdmissionInner {
                 state: Mutex::new(AdmissionState::default()),
                 next_waiter_id: AtomicU64::new(1),
@@ -644,17 +642,10 @@ impl SqliteWriteExecutor {
     }
 
     pub fn max_connections(&self) -> u32 {
-        if self.connection.get_database_backend() == DbBackend::Postgres {
-            self.connection
-                .get_postgres_connection_pool()
-                .options()
-                .get_max_connections()
-        } else {
-            self.connection
-                .get_sqlite_connection_pool()
-                .options()
-                .get_max_connections()
-        }
+        self.connection
+            .get_postgres_connection_pool()
+            .options()
+            .get_max_connections()
     }
 
     pub(crate) fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
@@ -704,17 +695,8 @@ impl SqliteWriteExecutor {
         .await
     }
 
-    pub fn retain_ownership(self, ownership: Arc<crate::WriterOwnership>) -> Self {
-        let previous = self.ownership.lock().unwrap().replace(ownership);
-        drop(previous);
-        self
-    }
-
     pub async fn close(self) -> Result<(), DbErr> {
-        let result = self.connection.close().await;
-        let ownership = self.ownership.lock().unwrap().take();
-        drop(ownership);
-        result
+        self.connection.close().await
     }
 
     /// Validates the physical writer connection under the same typed
@@ -722,16 +704,6 @@ impl SqliteWriteExecutor {
     pub async fn ping(&self, class: SqliteWriteClass) -> Result<(), DbErr> {
         let permit = self.acquire(class).await;
         observe_control(self.connection.ping(), "ping")
-            .in_pool(writer_pool_context(permit.class()))
-            .await
-    }
-
-    /// Applies the Gateway's connection pragmas while the physical writer is
-    /// exclusively reserved. The raw connection never crosses this crate's
-    /// API boundary.
-    pub async fn apply_pragmas(&self, class: SqliteWriteClass) -> anyhow::Result<()> {
-        let permit = self.acquire(class).await;
-        observe_control(crate::apply_sqlite_pragmas(&self.connection), "bootstrap")
             .in_pool(writer_pool_context(permit.class()))
             .await
     }
@@ -1303,7 +1275,6 @@ impl TransactionTrait for SqliteTransaction {
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use sea_orm::{ConnectOptions, Database};
     use tokio::sync::{Notify, mpsc};
 
     fn admission(policy: SqliteWritePolicy) -> Arc<AdmissionInner> {
@@ -1702,17 +1673,16 @@ mod tests {
         .expect("dispatched cancellation must release writer capacity");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn class_scoped_connections_reach_the_executor_with_their_declared_class() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let observer = Arc::new(RecordingObserver::default());
         let executor = SqliteWriteExecutor::with_observer(connection, observer.clone());
 
         executor
             .connection(SqliteWriteClass::Critical)
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("critical write");
         executor
@@ -1739,18 +1709,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn each_statement_obtains_its_own_classed_reservation() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let observer = Arc::new(RecordingObserver::default());
         let executor = SqliteWriteExecutor::with_observer(connection, observer.clone());
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let critical = executor.connection(SqliteWriteClass::Critical);
 
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
         maintenance
@@ -1775,16 +1744,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unrelated_await_between_statements_does_not_hold_writer_capacity() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let executor = SqliteWriteExecutor::new(connection);
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
 
@@ -1824,16 +1792,15 @@ mod tests {
             .expect("second maintenance write should succeed");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn transaction_holds_executor_until_commit() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let executor = SqliteWriteExecutor::new(connection);
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
 
@@ -1856,16 +1823,15 @@ mod tests {
             .expect("interactive write");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn dropped_transaction_releases_executor_capacity() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let executor = SqliteWriteExecutor::new(connection);
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
 
@@ -1885,16 +1851,15 @@ mod tests {
             .expect("interactive write should succeed");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn nested_transaction_retains_executor_after_root_wrapper_is_dropped() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
         let executor = SqliteWriteExecutor::new(connection);
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
 
@@ -1917,11 +1882,10 @@ mod tests {
             .expect("interactive write should succeed");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn write_stream_holds_executor_until_stream_drop() {
-        let mut options = ConnectOptions::new("sqlite::memory:");
-        options.max_connections(1);
-        let mut connection = Database::connect(options).await.expect("connect");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let mut connection = fixture.connect_with_limit(1).await.expect("connect");
         // Exercise the actual SeaORM MetricStream destructor, which reports
         // failed=false even for an early drop. The wrapper owns the outcome.
         let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1944,7 +1908,7 @@ mod tests {
         let maintenance = executor.connection(SqliteWriteClass::Maintenance);
         let interactive = executor.connection(SqliteWriteClass::Interactive);
         maintenance
-            .execute_unprepared("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("create table");
 
@@ -1956,7 +1920,7 @@ mod tests {
 
         let mut stream = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "INSERT INTO probe (id) VALUES (1) RETURNING id",
             ))
             .await
@@ -1964,7 +1928,7 @@ mod tests {
         let interactive_task = tokio::spawn(async move {
             interactive
                 .execute_raw(Statement::from_string(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     "INSERT INTO probe (id) VALUES (2)",
                 ))
                 .await
@@ -1992,14 +1956,14 @@ mod tests {
         let transaction = maintenance.begin().await.expect("begin transaction");
         transaction
             .execute_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "INSERT INTO probe (id) VALUES (3)",
             ))
             .await
             .expect("transaction write");
         let mut transaction_stream = StreamTrait::stream_raw(
             &transaction,
-            Statement::from_string(DbBackend::Sqlite, "SELECT id FROM probe ORDER BY id"),
+            Statement::from_string(DbBackend::Postgres, "SELECT id FROM probe ORDER BY id"),
         )
         .await
         .expect("transaction stream");
@@ -2015,7 +1979,7 @@ mod tests {
         drop(transaction);
         let row = maintenance
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM probe WHERE id = 3",
             ))
             .await
@@ -2027,7 +1991,7 @@ mod tests {
         // wrapper must keep the error observed from poll_next instead.
         let mut invalid = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT missing_column FROM probe",
             ))
             .await
@@ -2067,7 +2031,7 @@ mod tests {
         callback_contexts.store(0, Ordering::Relaxed);
         let mut exhausted = maintenance
             .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT id FROM probe ORDER BY id",
             ))
             .await

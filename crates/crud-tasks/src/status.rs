@@ -1,12 +1,70 @@
 use anyhow::Result;
 use pioneer_protocol::{
-    TaskConcurrencyConflictPolicy, TaskExecutorKind, TaskResultCandidateStatus,
+    TaskConcurrencyConflictPolicy, TaskExecutorKind, TaskOwnerKind, TaskResultCandidateStatus,
     TaskResultReviewDecision, TaskResultReviewEventKind, TaskResultReviewerKind,
     TaskRunExecutionStatus, TaskRunStatus, TaskRunThreadBindingKind, TaskRunTurnKind,
-    TaskRunTurnStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind,
+    TaskRunTurnStatus, TaskStatus, TaskTriggerKind, TaskTriggerStatus, TaskWriteLockScopeKind,
     TaskWriteLockStatus,
 };
 use serde::{Serialize, de::DeserializeOwned};
+
+pub fn task_status_to_db(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Draft => "draft",
+        TaskStatus::Scheduled => "scheduled",
+        TaskStatus::Queued => "queued",
+        TaskStatus::Running => "running",
+        TaskStatus::Waiting => "waiting",
+        TaskStatus::WaitingReview => "waiting_review",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+pub fn task_status_from_db(value: &str) -> Option<TaskStatus> {
+    match value {
+        "draft" => Some(TaskStatus::Draft),
+        "scheduled" => Some(TaskStatus::Scheduled),
+        "queued" => Some(TaskStatus::Queued),
+        "running" => Some(TaskStatus::Running),
+        "waiting" => Some(TaskStatus::Waiting),
+        "waiting_review" => Some(TaskStatus::WaitingReview),
+        "completed" => Some(TaskStatus::Completed),
+        "failed" => Some(TaskStatus::Failed),
+        "blocked" => Some(TaskStatus::Blocked),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+pub fn is_terminal_task_status(status: TaskStatus) -> bool {
+    status.is_terminal()
+}
+
+pub fn is_terminal_task_status_db(status: &str) -> bool {
+    task_status_from_db(status).is_some_and(TaskStatus::is_terminal)
+}
+
+pub fn task_owner_kind_to_db(kind: TaskOwnerKind) -> &'static str {
+    match kind {
+        TaskOwnerKind::User => "user",
+        TaskOwnerKind::Thread => "thread",
+        TaskOwnerKind::Workspace => "workspace",
+        TaskOwnerKind::System => "system",
+    }
+}
+
+pub fn task_owner_kind_from_db(value: &str) -> Option<TaskOwnerKind> {
+    match value {
+        "user" => Some(TaskOwnerKind::User),
+        "thread" => Some(TaskOwnerKind::Thread),
+        "workspace" => Some(TaskOwnerKind::Workspace),
+        "system" => Some(TaskOwnerKind::System),
+        _ => None,
+    }
+}
 
 pub fn task_run_status_to_db(status: TaskRunStatus) -> &'static str {
     match status {
@@ -268,4 +326,8 @@ pub fn task_write_lock_status_from_db(value: &str) -> Option<TaskWriteLockStatus
         "blocked" => Some(TaskWriteLockStatus::Blocked),
         _ => None,
     }
+}
+
+pub fn is_terminal_task_run_status_db(status: &str) -> bool {
+    task_run_status_from_db(status).is_some_and(TaskRunStatus::is_terminal)
 }

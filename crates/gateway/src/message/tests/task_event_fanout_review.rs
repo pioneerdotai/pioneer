@@ -1,30 +1,22 @@
-//! Task event fanout scheduling and cutover regressions.
+//! Task event fanout scheduling, restart and bounded history regressions.
 use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};
 use pioneer_entity::{task_event, task_event_fanout_pending as pending};
 use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent, SqliteWriteObserver};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 const NOW: i64 = 4_000_000_000;
 
-const FANOUT_MIGRATION: &str = "m20261008_000007_task_event_fanout_pending";
-
-// Bootstrap uses the complete production schema. This rollback-only registry
-// places fanout last so down(1) removes just the feature under test, preserving
-// the schema required by today's identity, authorization and Task CRUD paths.
-struct FanoutRollbackFixtureMigrator;
-impl MigratorTrait for FanoutRollbackFixtureMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        let target = migrations
-            .iter()
-            .position(|migration| migration.name() == FANOUT_MIGRATION)
-            .expect("fanout migration remains registered");
-        let fanout = migrations.remove(target);
-        migrations.push(fanout);
-        migrations
-    }
+async fn replace_payload(db: &impl ConnectionTrait, event: &task_event::Model, json: &str) {
+    let frame = pioneer_crud_payloads::Frame::encode(json).unwrap();
+    let mut row: task_event::ActiveModel = event.clone().into();
+    row.payload_json = Set(frame.bytes);
+    row.payload_json_codec = Set(frame.encoding as i16);
+    row.payload_json_bytes = Set(frame.original_bytes.try_into().unwrap());
+    row.payload_json_chars = Set(frame.original_chars.try_into().unwrap());
+    row.payload_json_sha256 = Set(frame.sha256.to_vec());
+    row.update(db).await.unwrap();
 }
 
 fn processor_with_store(
@@ -115,15 +107,8 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
             .await
             .unwrap()
             .unwrap();
-        task_event::Entity::update_many()
-            .col_expr(
-                task_event::Column::PayloadJson,
-                sea_orm::sea_query::Expr::val("{invalid"),
-            )
-            .filter(task_event::Column::Id.eq(event.id.clone()))
-            .exec(&processor.crud_store.database_connection())
-            .await
-            .unwrap();
+        let db = processor.crud_store.database_connection();
+        replace_payload(&db, &event, "{invalid").await;
         for attempt in 1..=prior_attempts {
             let failed = processor
                 .for_background_reconciliation()
@@ -138,15 +123,8 @@ async fn competing_small_events(large_size: usize, prior_attempts: i64, restart:
             assert!(retry.claim_token.is_none());
             clock.store(retry.due_at, Ordering::SeqCst);
         }
-        task_event::Entity::update_many()
-            .col_expr(
-                task_event::Column::PayloadJson,
-                sea_orm::sea_query::Expr::val(event.payload_json),
-            )
-            .filter(task_event::Column::Id.eq(event.id))
-            .exec(&processor.crud_store.database_connection())
-            .await
-            .unwrap();
+        let restored: task_event::ActiveModel = event.clone().into();
+        restored.reset_all().update(&db).await.unwrap();
         clock.store(NOW, Ordering::SeqCst);
     }
     ready(&processor, "budget-A", NOW - 10, 0).await;
@@ -346,7 +324,7 @@ impl SqliteWriteObserver for PanicObserver {
 async fn panic_candidate_lifecycle(mode: usize) {
     let observer = Arc::new(PanicObserver::default());
     let (directory, manager, store, workspace) =
-        setup_pooled_file_workspace_manager_with_observer(Some(observer.clone())).await;
+        setup_pooled_workspace_manager_with_observer(Some(observer.clone())).await;
     let processor = processor_with_store(manager, store);
     // Append refreshes B's generation. Distinct due times keep A/B/C order
     // independent of that tie-breaker, so the fault targets B's intended phase.
@@ -361,7 +339,7 @@ async fn panic_candidate_lifecycle(mode: usize) {
     if mode == 5 {
         // B's reservation update fails; its separate failure bookkeeping is
         // the next Maintenance transaction, and its commit observer panics.
-        processor.crud_store.with_maintenance_access().database_connection().execute_unprepared("CREATE TRIGGER fail_B_claim BEFORE UPDATE OF claim_token ON task_event_fanout_pending WHEN NEW.task_id='panic-B' AND NEW.claim_token IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture'); END").await.unwrap();
+        processor.crud_store.with_maintenance_access().database_connection().execute_unprepared("CREATE FUNCTION fail_b_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END; $$; CREATE TRIGGER fail_b_claim BEFORE UPDATE OF claim_token ON task_event_fanout_pending FOR EACH ROW WHEN (NEW.task_id='panic-B' AND NEW.claim_token IS NOT NULL) EXECUTE FUNCTION fail_b_claim()").await.unwrap();
     }
     if mode == 7 {
         fanout_test_append(&processor, "panic-B", "second confirmed prefix event").await;
@@ -465,7 +443,7 @@ async fn panic_candidate_lifecycle(mode: usize) {
             processor
                 .crud_store
                 .database_connection()
-                .execute_unprepared("DROP TRIGGER fail_B_claim")
+                .execute_unprepared("DROP TRIGGER fail_b_claim ON task_event_fanout_pending; DROP FUNCTION fail_b_claim()")
                 .await
                 .unwrap();
         }
@@ -510,15 +488,15 @@ async fn panic_candidate_lifecycle(mode: usize) {
         .unwrap();
     drop(directory);
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn panic_unknown_claim_never_emits_b_and_preserves_a_c_progress() {
     panic_candidate_lifecycle(4).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn panic_claim_failure_bookkeeping_preserves_other_candidates_and_capacity() {
     panic_candidate_lifecycle(5).await;
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn panic_release_preserves_confirmed_prefix_and_dispatcher_continues() {
     panic_candidate_lifecycle(7).await;
 }
@@ -585,31 +563,14 @@ async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
     assert_eq!(last.pending, Some(false));
 }
 
-#[tokio::test]
-async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_events() {
+#[pioneer_postgres_test::postgres_test]
+async fn acknowledged_history_is_not_redecoded_and_new_events_survive_restart() {
     use pioneer_entity::task_event_fanout_cursor as cursor;
     use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
-    use sea_orm::{ConnectOptions, TransactionTrait};
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("cutover.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observed = Arc::new(NativeSchedulingObserver::default());
     let database = SqliteDatabase::from_executor_with_read_observer(
         reader,
@@ -636,79 +597,34 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         ))
     };
     let processor = make_processor();
-    assert_eq!(
-        FanoutRollbackFixtureMigrator::migrations()
-            .last()
-            .unwrap()
-            .name(),
-        FANOUT_MIGRATION
-    );
-    let tx = store
-        .with_maintenance_access()
-        .database_connection()
-        .begin()
-        .await
-        .unwrap();
-    FanoutRollbackFixtureMigrator::down(&*tx, Some(1))
-        .await
-        .unwrap();
-    assert_eq!(
-        Migrator::get_pending_migrations_read_only(&*tx)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|migration| migration.name().to_owned())
-            .collect::<Vec<_>>(),
-        vec![FANOUT_MIGRATION.to_owned()],
-        "cutover must retain every unrelated migration required by current Gateway code"
-    );
-    tx.commit().await.unwrap();
     create(&processor, &workspace, "cutover-old").await;
     for _ in 2..=100 {
         fanout_test_append(&processor, "cutover-old", "historical").await;
     }
     store
-        .advance_task_event_fanout_cursor("cutover-old", 90)
+        .advance_task_event_fanout_cursor("cutover-old", 100)
         .await
         .unwrap();
     for n in 0..70 {
-        create(&processor, &workspace, &format!("old-{n}")).await;
+        let task_id = format!("old-{n}");
+        create(&processor, &workspace, &task_id).await;
+        store
+            .advance_task_event_fanout_cursor(&task_id, 1)
+            .await
+            .unwrap();
     }
-    // Excluding this page must happen before size admission and JSON decode.
-    task_event::Entity::update_many()
-        .col_expr(
-            task_event::Column::PayloadJson,
-            sea_orm::sea_query::Expr::val("界".repeat(BYTES)),
-        )
-        .filter(task_event::Column::TaskId.eq("cutover-old"))
-        .filter(task_event::Column::Sequence.eq(91_i64))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
-    task_event::Entity::update_many()
-        .col_expr(
-            task_event::Column::PayloadJson,
-            sea_orm::sea_query::Expr::val("{invalid"),
-        )
-        .filter(task_event::Column::TaskId.eq("cutover-old"))
-        .filter(task_event::Column::Sequence.eq(100_i64))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
-    let tx = store
-        .with_maintenance_access()
-        .database_connection()
-        .begin()
-        .await
-        .unwrap();
-    Migrator::up(&*tx, None).await.unwrap();
-    assert!(
-        Migrator::get_pending_migrations_read_only(&*tx)
+    let db = store.database_connection();
+    // The acknowledged page must never be admitted by size or decoded again.
+    for (sequence, json) in [(91, "界".repeat(BYTES)), (100, "{invalid".into())] {
+        let historical = task_event::Entity::find()
+            .filter(task_event::Column::TaskId.eq("cutover-old"))
+            .filter(task_event::Column::Sequence.eq(sequence))
+            .one(&db)
             .await
             .unwrap()
-            .is_empty()
-    );
-    tx.commit().await.unwrap();
+            .unwrap();
+        replace_payload(&db, &historical, &json).await;
+    }
     observed.reads.lock().unwrap().clear();
     observed.writes.lock().unwrap().clear();
     let empty = processor
@@ -756,15 +672,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
         .await
         .unwrap()
         .unwrap();
-    task_event::Entity::update_many()
-        .col_expr(
-            task_event::Column::PayloadJson,
-            sea_orm::sea_query::Expr::val("{invalid-new"),
-        )
-        .filter(task_event::Column::Id.eq(second.id.clone()))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
+    replace_payload(&db, &second, "{invalid-new").await;
     // Restart before claim, keeping only the durable floor and reservation state.
     drop(processor);
     let processor = make_processor();
@@ -797,15 +705,8 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     assert_eq!(waiting.selected, 0);
     assert_eq!(waiting.pending, Some(true));
     assert_eq!(pending_row(&processor, "cutover-old").await, retry);
-    task_event::Entity::update_many()
-        .col_expr(
-            task_event::Column::PayloadJson,
-            sea_orm::sea_query::Expr::val(second.payload_json),
-        )
-        .filter(task_event::Column::Id.eq(second.id))
-        .exec(&store.database_connection())
-        .await
-        .unwrap();
+    let restored: task_event::ActiveModel = second.clone().into();
+    restored.reset_all().update(&db).await.unwrap();
     let delivered = processor
         .for_background_reconciliation()
         .task_event_fanout_quantum_with_clock(&|| retry.due_at)

@@ -329,8 +329,8 @@ mod tests {
             let database = fixture.connection().clone();
             database.execute_unprepared(
             "INSERT INTO workspace (id, name) VALUES ('identity-test-worksp', 'Identity test');
-             INSERT INTO thread (id, workspace_id, mode, model, model_provider, status, origin_kind)
-             VALUES ('thread-unknown', 'identity-test-worksp', 'agent', 'm', 'p', 'idle', 'user')",
+             INSERT INTO thread (id, workspace_id, preview, mode, model, model_provider, status, origin_kind)
+             VALUES ('thread-unknown', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'user')",
         ).await.unwrap();
             let listener_opened = AtomicBool::new(false);
 
@@ -422,6 +422,7 @@ mod tests {
                     database
                         .execute_unprepared(
                             "ALTER TABLE thread DROP CONSTRAINT thread_check; \
+                             ALTER TABLE thread DISABLE TRIGGER conversation_actor_thread_created_by_actor_kind_pair_insert; \
                              INSERT INTO workspace (id, name, is_active, is_current) \
                              VALUES ('corrupt-workspace-001', 'Corrupt fixture', true, false); \
                              INSERT INTO thread \
@@ -429,7 +430,8 @@ mod tests {
                                  origin_kind, created_by_actor_kind, created_by_actor_id) \
                              VALUES \
                                 ('corrupt-thread-part1', 'corrupt-workspace-001', '', 'chat', \
-                                 'model', 'provider', 'idle', 'user', 'principal', NULL);",
+                                 'model', 'provider', 'idle', 'user', 'principal', NULL); \
+                             ALTER TABLE thread ENABLE TRIGGER conversation_actor_thread_created_by_actor_kind_pair_insert;",
                         )
                         .await
                         .expect("inject partial actor pair");

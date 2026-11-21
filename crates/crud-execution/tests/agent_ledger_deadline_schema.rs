@@ -11,6 +11,35 @@ async fn ledger_deadline_index_is_reproducible_and_repeat_up_preserves_ledger_ro
     with_empty_database(async |fixture| {
         let db = fixture.connection();
         assert!(index_columns(db).await?.is_empty());
+        let execution_migration = "m20261119_000005_execution";
+        let preceding = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == execution_migration)
+            .expect("execution migration is registered");
+        Migrator::up(db, Some(u32::try_from(preceding)?)).await?;
+        db.execute_unprepared(
+            "CREATE INDEX idx_agent_action_outbox_immediate ON workspace (id)",
+        )
+        .await?;
+        let error = Migrator::up(db, Some(1)).await.expect_err("colliding index");
+        assert!(error.to_string().contains("idx_agent_action_outbox_immediate"));
+        assert_eq!(
+            Migrator::get_pending_migrations(db).await?[0].name(),
+            execution_migration,
+        );
+        let rollback = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT to_regclass('agent_action_outbox') IS NULL
+                    AND to_regclass('idx_agent_action_outbox_timed') IS NULL
+                    AND to_regclass('idx_agent_action_outbox_exhausted') IS NULL
+                    AND to_regprocedure('agent_action_outbox_start_candidate(text)') IS NULL
+                    AS rolled_back",
+            ))
+            .await?
+            .expect("catalog query returns one row");
+        assert!(rollback.try_get::<bool>("", "rolled_back")?);
+        db.execute_unprepared("DROP INDEX idx_agent_action_outbox_immediate").await?;
         Migrator::up(db, None).await?;
         let expected = ["status", "created_at", "id"];
         assert_eq!(index_columns(db).await?, expected);

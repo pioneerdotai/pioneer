@@ -69,7 +69,7 @@ chrono.workspace = true
 schemars.workspace = true
 mime_guess.workspace = true
 url.workspace = true
-sea-orm = { workspace = true, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 tokenizers.workspace = true
 flate2.workspace = true
 tar.workspace = true
@@ -102,13 +102,15 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-postgres-test.workspace = true
 pioneer-cli-agent-runtime = { workspace = true, features = ["test-support"] }
 sentry = { workspace = true, features = ["test"] }
-pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
 pioneer-client-ffi.workspace = true
 pioneer-crud = { workspace = true, features = ["test-support"] }
+pioneer-crud-payloads.workspace = true
+pioneer-crud-tasks.workspace = true
 pioneer-mcp-oauth = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

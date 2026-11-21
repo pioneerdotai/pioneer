@@ -545,13 +545,22 @@ fn relation_with_access(
                 Expr::col((A::Run, task_run::Column::TaskId)).equals((S::Task, task::Column::Id)),
             );
     } else {
-        // Exact run/candidate paths supply a run ID predicate.
-        query
-            .from_as(task_run::Entity, A::Run)
-            .cross_join(task::Entity.table_ref().alias(S::Task))
-            .and_where(
-                Expr::col((S::Task, task::Column::Id)).equals((A::Run, task_run::Column::TaskId)),
-            );
+        // The exact path resolves the owning task by primary key after the
+        // run lookup. The row limit prevents flattening this into a workspace
+        // scan when the planner estimates that there are few workspace tasks.
+        let owner = Query::select()
+            .expr(Expr::col(Asterisk))
+            .from(task::Entity)
+            .and_where(Expr::col(task::Column::Id).equals((A::Run, task_run::Column::TaskId)))
+            .and_where(Expr::col(task::Column::WorkspaceId).eq(access.workspace_id))
+            .limit(1)
+            .to_owned();
+        query.from_as(task_run::Entity, A::Run).join_lateral(
+            JoinType::InnerJoin,
+            owner,
+            S::Task,
+            Expr::val(true),
+        );
     }
     let mut query = task_scope_query(query);
     query
@@ -772,6 +781,22 @@ pub async fn count_unread_task_completion_inbox<C: ConnectionTrait>(
 /// Exact unread membership, not broad history lookup. Missing requested IDs
 /// mean remove. Call with count on the same short read snapshot for one packet.
 /// Projection occurs only after the bounded canonical membership CTE.
+/// One addressed packet: canonical total and <=100 exact memberships share
+/// one reader snapshot. Scheduling is inherited from this scoped store.
+/// The snapshot is released before the caller transforms/serializes/fans out.
+pub async fn addressed_patch(
+    db: &pioneer_sqlite::SqliteDatabase,
+    access: &TaskCompletionInboxAccess<'_>,
+    run_ids: &[String],
+) -> Result<(Vec<TaskCompletionInboxRow>, u64)> {
+    anyhow::ensure!(run_ids.len() <= 100, "inbox addressed batch exceeds limit");
+    let snapshot = db.begin_read().await?;
+    let total = count_unread_task_completion_inbox(&snapshot, access).await?;
+    let entries = find_unread_task_completion_inbox_entries(&snapshot, access, run_ids).await?;
+    snapshot.commit().await?;
+    Ok((entries, total))
+}
+
 pub async fn find_unread_task_completion_inbox_entries<C: ConnectionTrait>(
     db: &C,
     access: &TaskCompletionInboxAccess<'_>,
@@ -1345,4 +1370,97 @@ pub async fn mark_task_completion_inbox_read<C: ConnectionTrait>(
         .to_owned();
     db.execute(&insert).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_postgres_test::with_database;
+    use sea_orm::{DbBackend, Statement};
+
+    async fn explain(db: &impl ConnectionTrait, mut statement: Statement) -> Result<Vec<String>> {
+        statement.sql.insert_str(0, "EXPLAIN (COSTS OFF) ");
+        db.query_all_raw(statement)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get("", "QUERY PLAN").map_err(Into::into))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn page_and_count_plans_seek_workspace_tasks_before_runs() -> Result<()> {
+        with_database(async |fixture| {
+            let writer = fixture.connection();
+            writer.execute_unprepared(
+                "INSERT INTO workspace (id,name) VALUES ('inbox-plan-local','Local'),('inbox-plan-foreign','Foreign');
+                 INSERT INTO task (id,workspace_id,owner_kind,executor_kind,status,title,goal)
+                 SELECT 'foreign-task-' || n, 'inbox-plan-foreign', 'workspace', 'tool','completed','Foreign task','Goal'
+                 FROM generate_series(1,2048) AS s(n);
+                 INSERT INTO task (id,workspace_id,owner_kind,executor_kind,status,title,goal)
+                 VALUES ('local-task','inbox-plan-local','workspace','tool','completed','Local task','Goal');
+                 INSERT INTO task_run (id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at)
+                 SELECT 'foreign-run-' || n, 'foreign-task-' || ((n-1)%2048+1), 'foreign-run-' || n,
+                        1, (n-1)/2048+1, 'succeeded','tool','2099-01-01T00:00:00Z'::timestamptz
+                 FROM generate_series(1,4096) AS s(n);
+                 ANALYZE task;
+                 ANALYZE task_run;",
+            ).await?;
+            let db = fixture.connect_read_only().await?;
+            let access = TaskCompletionInboxAccess {
+                workspace_id: "inbox-plan-local",
+                principal_id: "reader",
+                absolute: false,
+            };
+            for statement in [
+                DbBackend::Postgres.build(&page_query(&access, None, 31)),
+                DbBackend::Postgres.build(&page_query(
+                    &access,
+                    Some(("2026-10-16T10:00:00Z", "run")),
+                    31,
+                )),
+                DbBackend::Postgres.build(&unread_count_query(&access)),
+                DbBackend::Postgres.build(&read_all_query(&access, "2026-10-18T21:00:00Z")?),
+            ] {
+                let values = statement.values.as_ref().context("bound inbox values")?;
+                assert!(values.0.contains(&access.workspace_id.into()));
+                assert!(values.0.contains(&access.principal_id.into()));
+                let plan = explain(&db, statement).await?;
+                let plan_text = plan.join("\n");
+                let task = plan.iter().position(|line| {
+                    line.contains("Index") && line.contains("idx_task_inbox_workspace_id")
+                }).unwrap_or_else(|| panic!("missing workspace task seek: {plan_text}"));
+                let run = plan.iter().position(|line| {
+                    line.contains("Index") && line.contains("idx_task_run_inbox_epoch")
+                }).unwrap_or_else(|| panic!("missing task-local run seek: {plan_text}"));
+                assert!(task < run, "{plan_text}");
+                assert!(plan_text.contains("workspace_id = 'inbox-plan-local'"), "{plan_text}");
+                assert!(plan_text.contains("task_id = t.id"), "{plan_text}");
+                assert!(plan_text.contains("floor(EXTRACT(epoch"), "{plan_text}");
+                assert!(
+                    !plan_text.contains("Seq Scan on task t ")
+                        && !plan_text.contains("Seq Scan on task_run r ")
+                        && !plan_text.contains("Seq Scan on task_run sequence_run"),
+                    "{plan_text}"
+                );
+            }
+
+            let mut exact = relation(&access, false);
+            exact.expr(Expr::val(1)).and_where(
+                Expr::col((InboxAlias::Run, task_run::Column::Id)).eq("absent-run"),
+            );
+            let nodes = explain(&db, DbBackend::Postgres.build(&exact)).await?;
+            let plan = nodes.join("\n");
+            let run = nodes.windows(2).position(|pair| {
+                pair[0].contains("task_run_pkey") && pair[1].contains("id = 'absent-run'")
+            }).unwrap_or_else(|| panic!("missing exact run seek: {plan}"));
+            let task = nodes.windows(2).position(|pair| {
+                pair[0].contains("Index")
+                    && (pair[0].contains("task_pkey") || pair[0].contains("idx_task_inbox_workspace_id"))
+                    && pair[1].contains("id = r.task_id")
+            }).unwrap_or_else(|| panic!("missing exact task seek: {plan}"));
+            assert!(run < task, "{plan}");
+            assert!(!plan.contains("Seq Scan on task_run r ") && !plan.contains("Seq Scan on task t "), "{plan}");
+            Ok(())
+        }).await
+    }
 }

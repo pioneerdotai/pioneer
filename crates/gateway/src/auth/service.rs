@@ -2836,9 +2836,7 @@ fn storage_error(_error: anyhow::Error) -> AuthError {
 
 fn refresh_transaction_acquire_error(error: sea_orm::DbErr) -> AuthError {
     let error = anyhow::Error::new(error);
-    if pioneer_sqlite::is_retryable_database_conflict(&error)
-        || pioneer_sqlite::is_anyhow_sqlite_pool_timeout(&error)
-    {
+    if pioneer_sqlite::is_anyhow_database_transient_access(&error) {
         AuthError::new(AuthErrorCode::TemporarilyUnavailable)
     } else {
         AuthError::new(AuthErrorCode::InvalidCredential)
@@ -3320,6 +3318,9 @@ mod tests {
                 let entered = entered.clone();
                 async move {
                     let transaction = database.begin().await?;
+                    transaction
+                        .execute_unprepared("SELECT id FROM auth_session FOR UPDATE")
+                        .await?;
                     entered.notify_one();
                     tokio::time::sleep(std::time::Duration::from_millis(650)).await;
                     transaction.commit().await?;

@@ -3,7 +3,9 @@ use chrono::{TimeZone, Utc};
 use pioneer_entity::skill_pack_installation;
 use pioneer_protocol::SkillPackId;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 #[derive(Clone, Debug)]
 pub struct PreparedSkillPackInstallation {
@@ -72,6 +74,19 @@ pub async fn find_skill_pack_installation_by_id<C: ConnectionTrait>(
         .one(db)
         .await
         .with_context(|| format!("failed to query skill pack installation `{pack_id}`"))
+}
+
+pub async fn lock_skill_pack_installation<C: ConnectionTrait>(
+    transaction: &C,
+    scope_key: &str,
+    pack_id: &SkillPackId,
+) -> Result<Option<skill_pack_installation::Model>> {
+    skill_pack_installation::Entity::find_by_id(pack_id.to_string())
+        .filter(skill_pack_installation::Column::ScopeKey.eq(scope_key))
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .with_context(|| format!("failed to lock skill pack installation `{pack_id}`"))
 }
 
 pub async fn list_skill_pack_installations<C: ConnectionTrait>(

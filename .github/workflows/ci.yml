@@ -177,6 +177,11 @@ jobs:
 
       - name: archive-workspace-tests
         shell: bash
+        env:
+          # Gateway and CRUD test binaries can use most of the hosted runner's
+          # memory while linking. Compile them one at a time for the archive.
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
         run: |
           set -euo pipefail
           # Archive compilation has exited with SIGTERM without a Cargo error.

@@ -4887,7 +4887,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
             ))
             .await
             .unwrap();
-            db.execute_unprepared(&format!("CREATE TRIGGER fail_terminal_append BEFORE INSERT ON turn_event WHEN NEW.turn_id='{}' BEGIN SELECT RAISE(ABORT,'fixture terminal storage unavailable'); END", params.turn_id)).await.unwrap();
+            db.execute_unprepared(&format!("CREATE FUNCTION fail_terminal_append() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture terminal storage unavailable'; END; $$; CREATE TRIGGER fail_terminal_append BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='{}') EXECUTE FUNCTION fail_terminal_append();", params.turn_id)).await.unwrap();
             crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
                 .await
                 .unwrap();
@@ -4898,7 +4898,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                     .await
                     .unwrap()
             );
-            db.execute_unprepared("DROP TRIGGER fail_terminal_append")
+            db.execute_unprepared("DROP TRIGGER fail_terminal_append ON turn_event; DROP FUNCTION fail_terminal_append()")
                 .await
                 .unwrap();
         } else {
@@ -4945,7 +4945,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                 "claim_storage" | "exhausted_storage" => {
                     // Initial activation can claim started_at while remaining
                     // starting, before runtime registration marks it running.
-                    db.execute_unprepared(&format!("CREATE TRIGGER fail_activation_claim BEFORE UPDATE OF status, started_at ON turn_execution WHEN OLD.turn_id='{}' AND OLD.started_at IS NULL AND (NEW.started_at IS NOT NULL OR NEW.status='running') BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END", params.turn_id)).await.unwrap();
+                    db.execute_unprepared(&format!("CREATE FUNCTION fail_activation_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture storage unavailable'; END; $$; CREATE TRIGGER fail_activation_claim BEFORE UPDATE OF status, started_at ON turn_execution FOR EACH ROW WHEN (OLD.turn_id='{}' AND OLD.started_at IS NULL AND (NEW.started_at IS NOT NULL OR NEW.status='running')) EXECUTE FUNCTION fail_activation_claim();", params.turn_id)).await.unwrap();
                 }
                 "authority_read" => {
                     // Earlier admission/provenance reads succeeded. Fail the actual
@@ -4959,8 +4959,8 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                         .agent_manager
                         .remove_thread(&params.thread_id)
                         .await;
-                    db.execute_unprepared("CREATE TRIGGER fail_recovery_admission BEFORE INSERT ON recovery_job BEGIN SELECT RAISE(ABORT,'fixture recovery storage unavailable'); END").await.unwrap();
-                    db.execute_unprepared(&format!("CREATE TRIGGER fail_dispatch_terminal BEFORE INSERT ON turn_event WHEN NEW.turn_id='{}' BEGIN SELECT RAISE(ABORT,'fixture terminal storage unavailable'); END", params.turn_id)).await.unwrap();
+                    db.execute_unprepared("CREATE FUNCTION fail_recovery_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture recovery storage unavailable'; END; $$; CREATE TRIGGER fail_recovery_admission BEFORE INSERT ON recovery_job FOR EACH ROW EXECUTE FUNCTION fail_recovery_admission();").await.unwrap();
+                    db.execute_unprepared(&format!("CREATE FUNCTION fail_dispatch_terminal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture terminal storage unavailable'; END; $$; CREATE TRIGGER fail_dispatch_terminal BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='{}') EXECUTE FUNCTION fail_dispatch_terminal();", params.turn_id)).await.unwrap();
                 }
                 "claimed_unknown" | "terminal_memory" | "terminal_restart" | "terminal_resume" => {
                     // Claimed loss belongs to runtime reconciliation. The terminal
@@ -4999,7 +4999,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                             .is_none(),
                         "{fault}: failed activation claim must not advance the receipt"
                     );
-                    db.execute_unprepared("DROP TRIGGER fail_activation_claim")
+                    db.execute_unprepared("DROP TRIGGER fail_activation_claim ON turn_execution; DROP FUNCTION fail_activation_claim()")
                         .await
                         .unwrap();
                 }
@@ -5030,7 +5030,7 @@ async fn prepared_agent_start_retries_before_claim_but_reconciles_after_claim_or
                     assert!(acknowledged.delivered_at.is_some());
                     assert!(acknowledged.next_attempt_at.is_none());
                     db.execute_unprepared(
-                        "DROP TRIGGER fail_recovery_admission; DROP TRIGGER fail_dispatch_terminal",
+                        "DROP TRIGGER fail_recovery_admission ON recovery_job; DROP FUNCTION fail_recovery_admission(); DROP TRIGGER fail_dispatch_terminal ON turn_event; DROP FUNCTION fail_dispatch_terminal()",
                     )
                     .await
                     .unwrap();

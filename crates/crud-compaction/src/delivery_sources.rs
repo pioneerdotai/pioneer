@@ -28,14 +28,18 @@ pub struct DeliveredOutputRow {
 /// The scoped delivery index is the starting point. Both existing Turn fence
 /// components exclude newly created Turns, including IDs inserted below the
 /// lexical high water.
-/// The scalar sequence seek reads one index endpoint, not the event history.
+/// The scalar seek uses the foreign-key index collation. The Turn ID itself
+/// uses C collation to keep client cursor ordering stable.
 const DELIVERY_TURN_SQL: &str = r#"SELECT d.delivered_turn_id AS turn_id,
-    (SELECT e.sequence FROM turn_event e WHERE e.turn_id=t.id
+    (SELECT e.sequence FROM turn_event e WHERE e.turn_id=t.id COLLATE "default"
      ORDER BY e.sequence DESC LIMIT 1) AS event_high_water
 FROM task_delivery d
 JOIN turn t ON t.id=d.delivered_turn_id AND t.thread_id=d.target_thread_id
 JOIN thread h ON h.id=t.thread_id AND h.workspace_id=d.workspace_id
-LEFT JOIN compaction_turn_creation ct ON ct.turn_id=t.id
+LEFT JOIN LATERAL (
+    SELECT c.sequence FROM compaction_turn_creation c
+    WHERE c.turn_id=t.id COLLATE "default" LIMIT 1
+) ct ON TRUE
 WHERE d.workspace_id=$1 AND d.target_thread_id=$2 AND d.delivered_turn_id>$3
   AND d.delivered_turn_id<=$4 AND (ct.sequence IS NULL OR ct.sequence<=$5)
   AND ($6::bigint IS NULL OR t.created_at < to_timestamp($6::bigint))
@@ -51,7 +55,7 @@ WITH quantum AS MATERIALIZED (
     SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
            r.revision AS selected_revision,r.capture_order AS selected_order
     FROM turn t JOIN thread h ON h.id=t.thread_id
-    JOIN turn_event e ON e.turn_id=t.id AND e.thread_id=t.thread_id
+    JOIN turn_event e ON e.turn_id=$1 AND e.thread_id=$2
     JOIN compaction_event_revision r ON r.source_id=e.id
     WHERE t.id=$1 AND t.thread_id=$2 AND h.workspace_id=$3
       AND ($4::bigint IS NULL OR e.sequence > $4)
@@ -65,15 +69,23 @@ WITH quantum AS MATERIALIZED (
 /// A refreshed page is resolved by exact source keys and expected revisions.
 /// No Turn/event pagination predicate is reused here. Any edit, deletion,
 /// sequence/scope change, or replacement removes a row and fails validation.
+/// Each lateral limit fixes the lookup to the unique source key before the
+/// outer predicates, so a refresh cannot turn into a scan of scoped history.
 const DELIVERY_RECHECK_QUANTUM_SQL: &str = r#"
 WITH quantum AS MATERIALIZED (
     SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
            r.revision AS selected_revision,r.capture_order AS selected_order
     FROM json_array_elements($1::text::json) AS w(value)
-    JOIN turn_event e ON e.id=(w.value->'source'->>'id')
+    JOIN LATERAL (
+        SELECT event.id,event.turn_id,event.thread_id,event.sequence,event.event_type
+        FROM turn_event event WHERE event.id=(w.value->'source'->>'id') LIMIT 1
+    ) e ON TRUE
     JOIN turn t ON t.id=e.turn_id AND t.thread_id=e.thread_id
     JOIN thread h ON h.id=t.thread_id
-    JOIN compaction_event_revision r ON r.source_id=e.id
+    JOIN LATERAL (
+        SELECT revision.turn_id,revision.revision,revision.capture_order,revision.present
+        FROM compaction_event_revision revision WHERE revision.source_id=e.id LIMIT 1
+    ) r ON TRUE
     WHERE h.workspace_id=$2 AND t.thread_id=$3 AND r.turn_id=e.turn_id
       AND 'event:'||e.turn_id=(w.value->'source'->>'scope')
       AND 'event-revision:'||r.revision=(w.value->'source'->>'version')
@@ -100,8 +112,12 @@ FROM quantum q
 JOIN compaction_event_revision r ON r.source_id=q.id
     AND r.turn_id=q.turn_id AND r.revision=q.selected_revision
     AND r.capture_order=q.selected_order AND r.present=1
-LEFT JOIN task_delivery d
-    ON d.id=substr(r.item_id,length(${prefix}::text)+1) AND r.item_id=(${prefix} || d.id)
+LEFT JOIN LATERAL (
+    SELECT delivery.id,delivery.task_id,delivery.run_id,delivery.workspace_id,
+           delivery.target_thread_id,delivery.delivered_turn_id,delivery.status
+    FROM task_delivery delivery
+    WHERE delivery.id=substr(r.item_id,length(${prefix}::text)+1) LIMIT 1
+) d ON r.item_id=(${prefix} || d.id)
    AND q.event_type=${event_type} AND r.projection_revision=r.revision
    AND d.workspace_id=${workspace} AND d.target_thread_id=q.thread_id
    AND d.delivered_turn_id=q.turn_id AND d.status='delivered'

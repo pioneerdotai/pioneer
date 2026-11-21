@@ -1,9 +1,18 @@
 use anyhow::{Context, Result};
 use pioneer_entity::turn;
 use pioneer_protocol::{PersistedActorRef, TurnKind, TurnStatus, TurnWorkOwner};
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 
 use crate::identity::actor_ref_from_db;
+
+pub fn authorization_context_as_text() -> Expr {
+    Expr::col((
+        turn::Entity,
+        turn::Column::ExecutionAuthorizationContextJson,
+    ))
+    .cast_as("text")
+}
 
 /// Durable facts used by execution binding checks, without presentation or
 /// permission snapshots. Unknown authority enums must never become defaults.
@@ -95,7 +104,7 @@ pub async fn find_turn_execution_authorization_context<C: ConnectionTrait>(
     Ok(turn::Entity::find_by_id(turn_id.to_owned())
         .select_only()
         .column_as(
-            pioneer_crud_execution::turn_envelope::authorization_context_as_text(),
+            authorization_context_as_text(),
             "authorization_context_json",
         )
         .into_tuple::<Option<String>>()
@@ -147,7 +156,7 @@ pub async fn find_turn_execution_authorization_contexts<C: ConnectionTrait>(
             .select_only()
             .column(entity::Column::Id)
             .column_as(
-                pioneer_crud_execution::turn_envelope::authorization_context_as_text(),
+                authorization_context_as_text(),
                 "authorization_context_json",
             )
             .filter(entity::Column::Id.is_in(ids.iter().cloned()))

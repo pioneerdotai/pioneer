@@ -1,13 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use pioneer_entity::{thread, turn};
-use pioneer_protocol::{NativeContextBudget, NativeSummaryContext};
+use pioneer_protocol::{NativeContextBudget, NativeSummaryContext, TurnExecutionSecuritySnapshot};
 use sea_orm::sea_query::{Alias, Expr, ExprTrait};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 use serde_json::Value;
 
-pub fn authorization_context_as_text() -> Expr {
-    authorization_context_column().cast_as(Alias::new("text"))
-}
+pub use pioneer_crud_access::turn_execution::authorization_context_as_text;
 
 pub fn authorization_context_value(json: &str) -> Result<Expr> {
     let json = json.trim();
@@ -19,11 +17,120 @@ pub fn authorization_context_value(json: &str) -> Result<Expr> {
     Ok(Expr::val(json).cast_as(Alias::new("json")))
 }
 
-fn authorization_context_column() -> Expr {
-    Expr::col((
-        turn::Entity,
-        turn::Column::ExecutionAuthorizationContextJson,
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnExecutionSecuritySnapshotRecord {
+    pub turn_id: String,
+    pub version: i64,
+    pub snapshot: TurnExecutionSecuritySnapshot,
+}
+
+pub async fn set_turn_execution_security_snapshot<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    snapshot: &TurnExecutionSecuritySnapshot,
+) -> Result<bool> {
+    let version = i64::from(snapshot.version);
+    let snapshot_json = serde_json::to_string(snapshot)
+        .context("failed to serialize turn execution security snapshot to json")?;
+
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotVersion,
+            Expr::value(version),
+        )
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::value(snapshot_json),
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution security snapshot")?;
+
+    Ok(update_result.rows_affected > 0)
+}
+
+pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    snapshot: &TurnExecutionSecuritySnapshot,
+    authorization_context_json: &str,
+) -> Result<bool> {
+    let version = i64::from(snapshot.version);
+    let snapshot_json = serde_json::to_string(snapshot)
+        .context("failed to serialize turn execution security snapshot to json")?;
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotVersion,
+            Expr::value(version),
+        )
+        .col_expr(
+            turn::Column::ExecutionSecuritySnapshotJson,
+            Expr::value(snapshot_json),
+        )
+        .col_expr(
+            turn::Column::ExecutionAuthorizationContextJson,
+            authorization_context_value(authorization_context_json)?,
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution envelope")?;
+    Ok(update_result.rows_affected > 0)
+}
+
+pub async fn find_turn_execution_security_snapshot<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<TurnExecutionSecuritySnapshotRecord>> {
+    let Some((version, body)) = turn::Entity::find_by_id(turn_id)
+        .select_only()
+        .columns([
+            turn::Column::ExecutionSecuritySnapshotVersion,
+            turn::Column::ExecutionSecuritySnapshotJson,
+        ])
+        .into_tuple::<(Option<i64>, Option<String>)>()
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot_json) = body
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "{}" && *value != "null")
+    else {
+        return Ok(None);
+    };
+
+    let snapshot = serde_json::from_str::<TurnExecutionSecuritySnapshot>(snapshot_json)
+        .with_context(|| {
+            format!("failed to decode execution security snapshot for turn `{turn_id}`")
+        })?;
+    let version = version.unwrap_or_else(|| i64::from(snapshot.version));
+
+    Ok(Some(TurnExecutionSecuritySnapshotRecord {
+        turn_id: turn_id.to_owned(),
+        version,
+        snapshot,
+    }))
+}
+
+pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    context_json: &str,
+) -> Result<bool> {
+    let update_result = turn::Entity::update_many()
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .col_expr(
+            turn::Column::ExecutionAuthorizationContextJson,
+            authorization_context_value(context_json)?,
+        )
+        .exec(db)
+        .await
+        .context("failed to update turn execution authorization context")?;
+    Ok(update_result.rows_affected > 0)
 }
 
 /// Pin an uninitialized Native context or supply its missing service mode.

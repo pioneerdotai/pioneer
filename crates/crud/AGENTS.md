@@ -6,6 +6,10 @@ debugging, see the root [diagnostics scope](../../AGENTS.md#diagnostics).
 - Put ordinary CRUD in the owning domain repository and expose it through
   `CrudStore`, using Entity/Model/ActiveModel and typed projections. Pass the
   facade's transaction to domain operations that commit together.
+- Keep repository tests and their fixtures in the domain crate that owns the
+  operation. Use the facade's test targets for public delegation and commits
+  spanning domains. Run database suites through the PostgreSQL fixture runner
+  described in the [root test guidance](../../AGENTS.md).
 - Prepare portable payload bytes before reserving writer capacity. Capture
   encoded frames in one PostgreSQL snapshot and release the snapshot before
   decompression or hashing. Use the persisted offsets for range reads.

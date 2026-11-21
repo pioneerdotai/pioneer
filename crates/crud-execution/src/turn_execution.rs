@@ -458,9 +458,9 @@ pub async fn claim_expired<C: ConnectionTrait>(
         .checked_add(1)
         .context("Turn execution owner generation overflow")?;
     let next_generation = i64::try_from(next_generation)
-        .context("Turn execution owner generation exceeds SQLite INTEGER")?;
+        .context("Turn execution owner generation exceeds PostgreSQL bigint")?;
     let expected_generation = i64::try_from(expected.owner_generation)
-        .context("Turn execution owner generation exceeds SQLite INTEGER")?;
+        .context("Turn execution owner generation exceeds PostgreSQL bigint")?;
     let result = turn_execution::Entity::update_many()
         .filter(turn_execution::Column::TurnId.eq(expected.turn_id.clone()))
         .filter(turn_execution::Column::OwnerId.eq(expected.owner_id.clone()))
@@ -505,7 +505,7 @@ pub async fn reacquire_blocked<C: ConnectionTrait>(
         return Ok(false);
     }
     let current_generation = i64::try_from(current.owner_generation)
-        .context("Turn execution owner generation exceeds SQLite INTEGER")?;
+        .context("Turn execution owner generation exceeds PostgreSQL bigint")?;
     let next_generation = current_generation
         .checked_add(1)
         .context("Turn execution owner generation overflow")?;
