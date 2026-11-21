@@ -70,10 +70,30 @@ jobs:
     container: &linux-container
       # Reap orphaned descendants so the process-group tests see completed cleanup.
       options: --init
-      image: ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
-      credentials:
+      image: &linux-image ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
+      credentials: &linux-registry-credentials
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    # swapon acts on the runner VM. Only this setup service needs the capability.
+    services:
+      swap:
+        image: *linux-image
+        credentials: *linux-registry-credentials
+        volumes:
+          - /mnt/pioneer-ci-swap:/swap
+        options: >-
+          --user 0 --cap-drop ALL --cap-add SYS_ADMIN
+          --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+          --health-cmd "test -f /tmp/swap-ready" --health-interval 2s
+          --health-retries 60
+        entrypoint: /bin/sh
+        command: >-
+          -ec "umask 077 &&
+          dd if=/dev/zero of=/swap/archive bs=1M count=8192 status=none &&
+          mkswap /swap/archive &&
+          swapon /swap/archive &&
+          touch /tmp/swap-ready &&
+          exec sleep infinity"
     permissions:
       contents: read
       packages: read
@@ -161,6 +181,11 @@ jobs:
           archive_resources() {
             df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
             free -m
+            for metric in memory.swap.current memory.swap.peak memory.swap.max; do
+              if [[ -r /sys/fs/cgroup/$metric ]]; then
+                echo "$metric: $(cat "/sys/fs/cgroup/$metric")"
+              fi
+            done
             if [[ -r /sys/fs/cgroup/memory.events ]]; then
               cat /sys/fs/cgroup/memory.events
             fi
@@ -177,6 +202,17 @@ jobs:
           # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
           trap 'exit 143' TERM
           archive_resources
+          # mkswap reserves one header page from the 8 GiB file.
+          required_swap_kib=$((8 * 1024 * 1024 - $(getconf PAGESIZE) / 1024))
+          awk -v required="$required_swap_kib" '
+            /^SwapTotal:/ { total = $2 }
+            END { exit !(total >= required) }
+          ' /proc/meminfo || { echo "::error::8 GiB runner swap is unavailable"; exit 1; }
+          swap_limit=$(cat /sys/fs/cgroup/memory.swap.max)
+          if [[ "$swap_limit" != max ]] && (( swap_limit < required_swap_kib * 1024 )); then
+            echo "::error::Build container swap limit is too low ($swap_limit bytes)"
+            exit 1
+          fi
           /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use --timings \
             --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
 
