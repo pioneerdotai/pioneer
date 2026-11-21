@@ -77,6 +77,7 @@ use pioneer_provider::{
     ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
     infer_mime_from_reference,
 };
+use pioneer_runtime_events::DurableCommitRejection;
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
     SkillResolvedReason,
@@ -903,23 +904,46 @@ async fn emit_execution_window_started(
     thread_id: &str,
     turn_id: &str,
     stats: &ChatExecutionWindowStats,
+    turn_control: &TurnExecutionControl,
     event_tx: &AgentEventHub,
 ) -> Result<(), ChatTurnError> {
-    emit_durable_event(
-        event_tx,
-        AgentDurableEvent::TurnExecutionWindowStarted {
-            notification: TurnExecutionWindowStartedNotification {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                window_id: execution_window_runtime_id(turn_id, stats.window_index),
-                window_index: stats.window_index,
-                status: ExecutionWindowStatus::Running,
-                started_at_unix_ms: stats.started_at_unix_ms,
-            },
+    let event = AgentDurableEvent::TurnExecutionWindowStarted {
+        notification: TurnExecutionWindowStartedNotification {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            window_id: execution_window_runtime_id(turn_id, stats.window_index),
+            window_index: stats.window_index,
+            status: ExecutionWindowStatus::Running,
+            started_at_unix_ms: stats.started_at_unix_ms,
         },
-    )
-    .await
+    };
+    let cancellation = turn_control.cancellation_token();
+    let confirm = async {
+        const MAX_PROJECTION_RETRIES: u32 = 7;
+        let mut retries = 0;
+        loop {
+            match event_tx.publish_durable_and_wait(event.clone()).await {
+                Err(AgentEventHubError::CommitRejected(rejection))
+                    if rejection.is_retryable()
+                        && rejection.code()
+                            == DurableCommitRejection::EXECUTION_WINDOW_START_PROJECTION_PENDING
+                        && retries < MAX_PROJECTION_RETRIES =>
+                {
+                    // Give the existing projection worker time to apply the
+                    // predecessor. Reuse this event's canonical identity.
+                    sleep(Duration::from_millis(100 << retries)).await;
+                    retries += 1;
+                }
+                result => return result.map_err(agent_event_error),
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(ChatTurnError::Blocked("execution window start cancelled".into())),
+        result = confirm => result,
+    }
 }
 
 async fn emit_execution_window_exhausted_and_checkpointed(
@@ -5827,6 +5851,7 @@ fn execute_agent_provider_response<'a>(
             thread_id,
             turn_id,
             &window_stats,
+            &turn_control,
             event_tx.as_ref(),
         )
         .await?;
@@ -8426,6 +8451,47 @@ fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn execution_window_start_retries_the_same_event_after_projection_deferral() {
+        use pioneer_protocol::AgentDurableEvent;
+        use pioneer_runtime_events::DurableCommitRejection;
+        use std::time::Duration;
+
+        let hub = crate::AgentEventHub::new();
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let control = crate::TurnExecutionControl::new(tx, 1);
+        let stats = super::ChatExecutionWindowStats::new(2);
+        let confirm =
+            super::emit_execution_window_started("ws", "thread", "turn", &stats, &control, &hub);
+        let drive_gateway = async {
+            let AgentDurableEvent::TurnExecutionWindowStarted {
+                notification: first,
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected the continued window start");
+            };
+            receiver.acknowledge_last(Err(DurableCommitRejection::retryable(
+                DurableCommitRejection::EXECUTION_WINDOW_START_PROJECTION_PENDING,
+                "predecessor projection pending",
+            )));
+            let AgentDurableEvent::TurnExecutionWindowStarted {
+                notification: retry,
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected the same start event on retry");
+            };
+            assert_eq!(first, retry);
+            receiver.acknowledge_last(Ok(()));
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(confirm, drive_gateway)
+        })
+        .await
+        .expect("a temporary projection deferral must keep the start pending");
+        assert!(result.is_ok());
+    }
+
     #[tokio::test]
     async fn retained_tool_tasks_keep_existing_parallel_dispatch() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
