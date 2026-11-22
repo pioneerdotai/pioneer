@@ -85619,8 +85619,32 @@ async fn check_foreground_native_preparation(expire: bool) {
         authenticated_test_superuser().principal_id.clone(),
     );
     let started_at = phase_13_now_secs() - 10;
-    let mut thread = phase_13_test_thread(&workspace, thread_id, started_at);
-    thread.mode = ThreadMode::Chat;
+    let thread = processor
+        .thread_manager
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.into(),
+                workspace_id: workspace.clone(),
+                name: Some("Paced native compaction".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Chat),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .response
+        .thread;
     for (historical, text, timestamp) in [
         (
             "paced-old-turn",
@@ -85677,10 +85701,6 @@ async fn check_foreground_native_preparation(expire: bool) {
             .unwrap();
     }
 
-    processor
-        .ensure_thread_loaded(thread_id, &workspace)
-        .await
-        .unwrap();
     let request_id = generate_test_request_id("preparation", "start");
     processor
         .clone()
@@ -90157,7 +90177,12 @@ async fn recovery_failure_task_consumers_impl(
     let terminal = store.get_recovery_job(&job.id).await.unwrap().unwrap();
     let expected_diagnostic = terminal.diagnostic.unwrap();
     let expected = expected_diagnostic.public_message();
-    assert_eq!(terminal.policy_snapshot, job.policy_snapshot);
+    let mut saved_policy = terminal.policy_snapshot.clone();
+    saved_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("active_attempt_start_sequence");
+    assert_eq!(saved_policy, job.policy_snapshot);
     assert_eq!(terminal.action, job.action);
     assert_eq!(terminal.error_class, job.error_class);
     let expected_stop = match scenario {

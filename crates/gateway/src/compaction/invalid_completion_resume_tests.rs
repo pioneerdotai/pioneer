@@ -149,12 +149,32 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
     let (f, mut prepared) = progress_fixture(true).await;
     prepared.owner = super::super::native_owner("ws", "thread");
     f.provider.replies.lock().unwrap().clear();
+    // The source fixture has a raw history event. Give the execution its own
+    // projected stream so that preparation starts after a durable Turn start.
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.id = "resume-turn".into();
+    prepared.execution_turn = turn.id.clone();
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[pioneer_protocol::UserInput::Text {
+                text: "Continue after recovery".into(),
+                text_elements: Vec::new(),
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+
     let begin_preparation = |id: &'static str, timestamp| {
         let store = f.store.clone();
         async move {
             store.materialize_item_started(
                 ItemStartedNotification {
-                    workspace_id: "ws".into(), thread_id: "thread".into(), turn_id: "turn".into(),
+                    workspace_id: "ws".into(), thread_id: "thread".into(), turn_id: "resume-turn".into(),
                     item: TurnItem::SystemEvent {
                         id: id.into(), level: SystemEventLevel::Info,
                         message: "Native context preparation".into(),
@@ -168,20 +188,20 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
     };
     begin_preparation("old-preparation", 1).await;
     let old = pioneer_provider::usage::scope_causal_parent(
-        "item:turn:old-preparation".into(),
+        "item:resume-turn:old-preparation".into(),
         admit(&f, prepared.clone(), 10),
     )
     .await
     .unwrap();
     let mut gate = arm_publication_test_hook(&f.store, &old.id, PublicationTestPause::BeforeWriter);
-    let old_runner = runner(&f, old.clone(), true, "turn");
+    let old_runner = runner(&f, old.clone(), true, "resume-turn");
     let pending = tokio::spawn(async move { old_runner.run(CancellationToken::new()).await });
     gate.reached().await;
 
     let AtomicRecoveryJobEnqueueOutcome::Created(job) = f
         .store
         .enqueue_recovery_job_if_no_unresolved(
-            "turn".into(),
+            "resume-turn".into(),
             "reasoning".into(),
             TurnItemType::Reasoning,
             None,
@@ -242,7 +262,7 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
                 reason_class: "execution_budget".into(),
                 human_message: "no progress".into(),
                 resume_requirements: vec![],
-                resume_command: "turn.resume:turn".into(),
+                resume_command: "turn.resume:resume-turn".into(),
                 blocked_recovery_job_id: Some(job.id.clone()),
                 latest_checkpoint_id: None,
                 can_resume_same_turn: true,
@@ -264,7 +284,7 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
     );
     assert!(matches!(
         f.store
-            .resume_blocked_turn_recovery("thread", "turn", Some(&job.id), 4, "resumed", 49)
+            .resume_blocked_turn_recovery("thread", "resume-turn", Some(&job.id), 4, "resumed", 49)
             .await
             .unwrap(),
         BlockedTurnRecoveryResumeOutcome::Resumed(_)
@@ -272,7 +292,7 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
 
     assert!(
         pioneer_provider::usage::scope_causal_parent(
-            "item:turn:old-preparation".into(),
+            "item:resume-turn:old-preparation".into(),
             admit(&f, prepared.clone(), 20),
         )
         .await
@@ -282,7 +302,7 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
     );
     begin_preparation("new-preparation", 4).await;
     let resumed = pioneer_provider::usage::scope_causal_parent(
-        "item:turn:new-preparation".into(),
+        "item:resume-turn:new-preparation".into(),
         admit(&f, prepared.clone(), 20),
     )
     .await
@@ -300,7 +320,7 @@ async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
             .unwrap()
             .is_none()
     );
-    let CompactionExit::Applied(head) = runner(&f, resumed, true, "turn")
+    let CompactionExit::Applied(head) = runner(&f, resumed, true, "resume-turn")
         .run(CancellationToken::new())
         .await
         .unwrap()

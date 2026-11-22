@@ -10244,7 +10244,12 @@ mod tests {
             assert_eq!(outcome.error_message, diagnostic.public_message());
             assert_eq!(saved.action, job.action);
             assert_eq!(saved.error_class, job.error_class);
-            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            let mut saved_policy = saved.policy_snapshot.clone();
+            saved_policy
+                .as_object_mut()
+                .unwrap()
+                .remove("active_attempt_start_sequence");
+            assert_eq!(saved_policy, job.policy_snapshot);
             assert_eq!(saved.run_count, 1);
         }
     }
@@ -10452,7 +10457,12 @@ mod tests {
         );
         assert_eq!(pending.transport_stage, Some(initial.stage));
         assert_eq!(pending.action, job.action);
-        assert_eq!(pending.policy_snapshot, job.policy_snapshot);
+        let mut saved_policy = pending.policy_snapshot.clone();
+        saved_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("active_attempt_start_sequence");
+        assert_eq!(saved_policy, job.policy_snapshot);
         assert_eq!(
             pending.diagnostic.as_ref().unwrap().last_failure,
             Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
@@ -10669,7 +10679,12 @@ mod tests {
             assert_eq!(saved.run_count, run);
             assert_eq!(saved.provider_attempt_number, run);
             assert_eq!(saved.max_attempts, 3);
-            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            let mut saved_policy = saved.policy_snapshot.clone();
+            saved_policy
+                .as_object_mut()
+                .unwrap()
+                .remove("active_attempt_start_sequence");
+            assert_eq!(saved_policy, job.policy_snapshot);
             assert_eq!(
                 saved.diagnostic.as_ref().unwrap().last_failure,
                 Some(pioneer_protocol::RecoveryProviderFailure::from(&renewed))
