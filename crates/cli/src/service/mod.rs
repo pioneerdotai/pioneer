@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use pioneer_config::{
-    AppConfig, InstallManagedBy, InstallState, load_install_state, save_install_state,
+    AppConfig, InstallManagedBy, InstallState, RuntimeEnvironment, gateway_database_url,
+    load_install_state, save_install_state,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -236,6 +237,11 @@ pub fn start_gateway_service() -> Result<GatewayServiceStartReport> {
         // executable. Observe dev shutdown before registering this build.
         platform::stop_gateway_service(&settings)?;
     }
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
+        report.observe("service.database_url.save", || {
+            gateway_database_url::save_development_service_override(&config.runtime_home_dir()?)
+        })?;
+    }
     report.warnings = platform::start_gateway_service(
         &settings,
         &mut report,
@@ -253,7 +259,11 @@ pub fn stop_gateway_service() -> Result<()> {
     let settings = load_service_settings_from_config(&config)?;
     // Stopping changes service state, not the installed package identity. This
     // command may also be issued by a temporary installer during replacement.
-    platform::stop_gateway_service(&settings)
+    platform::stop_gateway_service(&settings)?;
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
+        gateway_database_url::clear_development_service_override(&config.runtime_home_dir()?)?;
+    }
+    Ok(())
 }
 
 pub fn create_device() -> Result<pioneer_protocol::AuthDeviceCreateResponse> {

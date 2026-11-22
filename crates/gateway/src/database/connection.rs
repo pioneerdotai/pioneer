@@ -148,7 +148,7 @@ fn external_options(
         );
         (url.as_str().to_owned(), "gateway.database.development_url")
     } else {
-        let Some(url) = external_database_url(runtime_home)? else {
+        let Some(url) = pioneer_config::gateway_database_url::resolve(config, runtime_home)? else {
             return Ok(None);
         };
         (url, "DATABASE_URL")
@@ -162,28 +162,6 @@ fn external_options(
         ])
     });
     Ok(Some((writer, reader)))
-}
-
-fn external_database_url(runtime_home: &Path) -> Result<Option<String>> {
-    match std::env::var("DATABASE_URL") {
-        Ok(url) => return Ok(Some(url)),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("DATABASE_URL must be UTF-8"),
-    }
-
-    let entries = match dotenvy::from_path_iter(runtime_home.join(".env")) {
-        Ok(entries) => entries,
-        Err(error) if error.not_found() => return Ok(None),
-        Err(_) => anyhow::bail!("open Gateway runtime .env"),
-    };
-    for entry in entries {
-        // dotenvy syntax errors include the original line and can expose credentials.
-        let (key, value) = entry.map_err(|_| anyhow::anyhow!("parse Gateway runtime .env"))?;
-        if key == "DATABASE_URL" {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
 }
 
 fn external_writer_options(

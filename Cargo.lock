@@ -11465,7 +11465,9 @@ dependencies = [
  "anyhow",
  "config",
  "dirs 7.0.0",
+ "dotenvy",
  "serde",
+ "tempfile",
  "toml 1.2.1+spec-1.1.0",
 ]
 
@@ -12034,7 +12036,6 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "cua-driver-sdk",
- "dotenvy",
  "flate2",
  "fs4",
  "futures-util",

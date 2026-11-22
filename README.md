@@ -102,9 +102,19 @@ its writable primary endpoint. Gateway applies migrations at startup and
 opens its reader and writer pools against that database. Use one active
 Gateway instance per database.
 
-In dev, an explicit `gateway.database.development_url` takes precedence.
-Otherwise Gateway checks the process environment, then `~/.pioneer.dev/.env`.
-Use a separate database for development.
+From the repository root, start Gateway against your development database with
+an inline environment variable:
+
+```sh
+DATABASE_URL="postgresql://$(id -un)@127.0.0.1:5432/pioneer_dev" cargo run -p pioneer-cli -- start
+```
+
+For a repeatable setup, put `DATABASE_URL` in `.env` next to the workspace
+`Cargo.toml` and run `cargo run -p pioneer-cli -- start`. Development precedence
+is `gateway.database.development_url`, the process environment or the URL saved
+by `start` for the background service, the workspace `.env`, then
+`~/.pioneer.dev/.env`. Running `start` without an inline URL, or running `stop`,
+clears the saved service override. Use a separate database for development.
 
 On first initialization of a bundled cluster, Gateway uses PGConfig's
 `DESKTOP` profile with its PostgreSQL 18 tuning rules. The calculator receives the detected RAM budget, logical CPU

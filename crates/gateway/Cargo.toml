@@ -19,7 +19,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
-dotenvy.workspace = true
 pioneer-agent.workspace = true
 pioneer-artifacts.workspace = true
 pioneer-cli-agent-runtime.workspace = true

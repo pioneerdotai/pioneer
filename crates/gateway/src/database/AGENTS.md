@@ -6,9 +6,11 @@
   to exit.
 - Gateway and database operator commands use `DATABASE_URL` from the process
   environment or the runtime home's `.env` to select an external application
-  database. An explicit dev-only `gateway.database.development_url` takes
-  precedence. Keep URL values out of logs and inherited agent environments.
-  The test administrative URL belongs to the test runner.
+  database. Development also reads the URL passed to `pioneer start` and the
+  workspace `.env`, in that order before the runtime home's `.env`. An explicit
+  dev-only `gateway.database.development_url` takes precedence. Keep URL values
+  out of logs and inherited agent environments. The test administrative URL
+  belongs to the test runner.
 - Treat external PostgreSQL as an independently managed service. Gateway owns
   the pools and applies its schema migrations. Use one active Gateway per
   database and connect to the cluster's writable endpoint.

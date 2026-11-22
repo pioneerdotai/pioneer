@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
+pub mod gateway_database_url;
+
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../../config/default.toml");
 const DEV_CONFIG_TOML: &str = include_str!("../../../config/dev.toml");
 pub const DEV_GATEWAY_BUNDLE_ID: &str = "ai.pioneer.gateway.dev";
@@ -3539,10 +3541,11 @@ fn load_config_from_sources(
 }
 
 fn workspace_local_config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("config")
-        .join("local.toml")
+    workspace_root().join("config/local.toml")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn user_override_config_path() -> Option<PathBuf> {
