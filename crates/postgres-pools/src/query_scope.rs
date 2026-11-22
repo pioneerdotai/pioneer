@@ -45,8 +45,8 @@ impl<F: Future> Future for ScopedFuture<'_, F> {
 }
 impl<F> Drop for ScopedFuture<'_, F> {
     fn drop(&mut self) {
-        let _entered = self.scope.enter();
         if self.live {
+            let _entered = self.scope.enter();
             self.live = false;
             // SAFETY: destroy in place once, preserving structural pinning.
             unsafe {
@@ -102,8 +102,7 @@ impl<S: Stream<Item = Result<QueryResult, DbErr>> + Unpin> Stream for Diagnostic
         }
         drop(entered);
         if matches!(&result, Poll::Ready(None)) {
-            // EOF releases the caller reference even if this empty wrapper is
-            // retained. Worker references still delay on_close until cleanup.
+            // EOF releases the scope even if this empty wrapper is retained.
             drop(std::mem::take(&mut this.scope));
         }
         result
@@ -111,10 +110,13 @@ impl<S: Stream<Item = Result<QueryResult, DbErr>> + Unpin> Stream for Diagnostic
 }
 impl<S> Drop for DiagnosticStream<S> {
     fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
         let _history_sql = self.history_sql.enter();
         let _pool = pool_context::enter(self.pool);
         let _entered = self.scope.enter();
-        drop(self.inner.take());
+        drop(inner);
         // No EOF means cancellation, even if MetricStream reports failed=false.
     }
 }

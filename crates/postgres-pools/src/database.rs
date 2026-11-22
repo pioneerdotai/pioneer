@@ -779,6 +779,33 @@ mod tests {
         (database, observer)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[pioneer_postgres_test::postgres_test]
+    async fn postgres_query_cpu_is_measured_on_runtime_threads() {
+        use pioneer_observability::query_cpu::{Session, record_fingerprint};
+
+        let (mut reader, writer) = test_pools().await;
+        reader.set_metric_callback(|_| record_fingerprint(Some(17)));
+        let database = PostgresDatabase::new(reader, writer);
+        pioneer_observability::init_tracing(false);
+        let epoch = pioneer_observability::telemetry_consent_snapshot().1;
+        let session = Session::start(60, epoch).expect("start isolated local capture");
+        let statement = || Statement::from_string(DbBackend::Postgres, "SELECT 42 AS answer");
+
+        let row = database.query_one_raw(statement()).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i32>("", "answer").unwrap(), 42);
+
+        let snapshot = session.finish();
+        assert_eq!(snapshot.groups.len(), 1);
+        let totals = &snapshot.groups[0].totals;
+        assert_eq!(totals.completed_calls, 1);
+        assert!(
+            totals.measured_segments > 0,
+            "completed query has no measured CPU segment"
+        );
+        assert!(totals.cpu_ns.is_some());
+    }
+
     #[test]
     fn routes_plain_queries_to_reader() {
         assert_eq!(statement_route(" SELECT 1"), StatementRoute::Read);

@@ -818,7 +818,7 @@ fn store_sql_cpu(
         "limitations": snapshot.limitations,
         "started_monotonic_ms": snapshot.started_monotonic_ms,
         "ended_monotonic_ms": snapshot.ended_monotonic_ms,
-        "scope": "Observed SQLx command CPU only; aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
+        "scope": "Observed client-side CPU in Gateway PostgreSQL query scopes. Aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
     });
     match stored {
         Ok((files, bytes)) => {

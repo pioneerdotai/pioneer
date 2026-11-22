@@ -2055,12 +2055,7 @@ mod tests {
         }
         assert_eq!(ids, vec![1, 2]);
         assert!(exhausted.next().await.is_none(), "EOF stays exhausted");
-        // Close acknowledges Shutdown after the preceding Execute has exited
-        // its span on the sole worker. No timing guess or sleep is needed.
-        executor
-            .close()
-            .await
-            .expect("drain writer worker references");
+        executor.close().await.expect("close writer pool");
         let snapshot = session.finish();
         assert_eq!(callbacks.load(Ordering::Relaxed), 1);
         assert_eq!(callback_contexts.load(Ordering::Relaxed), 1);
@@ -2070,6 +2065,11 @@ mod tests {
         assert_eq!(snapshot.groups.len(), 1);
         assert_eq!(snapshot.groups[0].totals.completed_calls, 1);
         assert_eq!(snapshot.groups[0].totals.incomplete, 0);
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            assert!(snapshot.groups[0].totals.measured_segments > 0);
+            assert!(snapshot.groups[0].totals.cpu_ns.is_some());
+        }
         assert_eq!(snapshot.measured_unknown.completed_calls, 0);
         // Keep the empty wrapper alive through the snapshot; another poll must
         // neither recreate a scope nor produce another row/result.
