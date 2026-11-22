@@ -555,7 +555,12 @@ impl AnthropicProvider {
             .iter()
             .filter_map(|message| message.provider_replay_state.clone())
             .collect();
-        crate::continuation::stabilize_anthropic_prefix(&mut body, &states)?;
+        crate::continuation::stabilize_anthropic_prefix(
+            &mut body,
+            &states,
+            &request.model,
+            &self.replay_authority,
+        )?;
         // Parallel tool results are merged into one native user message, and
         // native system updates add wire messages. Canonical indices therefore
         // cannot serve as positions in the signed native prefix.
@@ -1468,6 +1473,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AnthropicProvider {
+    fn keeps_tools_when_disabled(&self, _model: &str) -> bool {
+        self.base_url == BASE_URL
+    }
+
     fn usage_api(&self) -> &'static str {
         "messages"
     }
@@ -2097,7 +2106,14 @@ mod tests {
                 }
             }
             let result = build(&provider, &changed);
-            if change == 3 {
+            if change == 2 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("outside the current permitted set")
+                );
+            } else if change == 3 {
                 assert!(
                     result.is_err(),
                     "rewritten historical user input must be rejected"
@@ -2114,6 +2130,122 @@ mod tests {
                 }
             }
         }
+        let mut disclosed = req.clone();
+        disclosed
+            .tools
+            .as_mut()
+            .unwrap()
+            .push(crate::ToolDefinition {
+                name: "lookup".into(),
+                description: "Disclosed tool".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            });
+        let disclosure = build(&provider, &disclosed).unwrap();
+        let prefix = disclosure["messages"].as_array().unwrap();
+        assert_eq!(
+            prefix.last().unwrap()["content"][0]["type"],
+            "tool_addition"
+        );
+        let response: ApiChatResponse = serde_json::from_value(serde_json::json!({
+            "id":"ordinary_response", "content":[{"type":"text","text":"ordinary answer"}],
+            "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+        }))
+        .unwrap();
+        let ordinary = provider
+            .finish_native_response(response, &req.model, &disclosure, None, None)
+            .unwrap();
+        let mut ordinary_answer = ChatMessage::assistant(ordinary.text);
+        ordinary_answer.provider_replay_state = ordinary.provider_replay_state;
+        complete(&mut ordinary_answer);
+        disclosed.messages.push(ordinary_answer);
+        disclosed
+            .messages
+            .push(ChatMessage::user("Observe the new prefix"));
+        let continued = build(&AnthropicProvider::new("test-key"), &disclosed).unwrap();
+        assert_eq!(continued["tools"], disclosure["tools"]);
+        let next = continued["messages"].as_array().unwrap();
+        assert_eq!(&next[..prefix.len()], prefix);
+        assert_eq!(next.len(), prefix.len() + 2);
+
+        // An unsigned assistant prefill can be rendered normally, but an
+        // operator update cannot be appended after it.
+        let mut unsigned = req.clone();
+        unsigned.messages.truncate(1);
+        let unsigned_sent = build(&provider, &unsigned).unwrap();
+        let response: ApiChatResponse = serde_json::from_value(serde_json::json!({
+            "id":"unsigned", "content":[{"type":"text","text":"prefill"}],
+            "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+        }))
+        .unwrap();
+        let decoded = provider
+            .finish_native_response(response, &unsigned.model, &unsigned_sent, None, None)
+            .unwrap();
+        let mut prefill = ChatMessage::assistant(decoded.text);
+        prefill.provider_replay_state = decoded.provider_replay_state;
+        unsigned.messages.push(prefill);
+        unsigned.compiled_prompt.as_mut().unwrap().full_system_text = "Updated rules".into();
+        unsigned.tools.as_mut().unwrap()[0].description = "Updated schema".into();
+        let rewritten = build(&provider, &unsigned).unwrap();
+        assert_eq!(rewritten["system"], "Updated rules");
+        assert_eq!(rewritten["tools"][0]["description"], "Updated schema");
+        assert_eq!(rewritten["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(rewritten["messages"][1]["role"], "assistant");
+
+        let mut revoked_signed = req.clone();
+        revoked_signed.tools = None;
+        assert!(
+            build(&provider, &revoked_signed)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the current permitted set")
+        );
+
+        // Revoke one root definition and one inline definition with a user
+        // message at the tail, so inline replay would otherwise be applicable.
+        let mut revoked = req.clone();
+        revoked.messages.truncate(1);
+        let tool = |name: &str| crate::ToolDefinition {
+            name: name.into(),
+            description: format!("definition for {name}"),
+            parameters: serde_json::json!({"type":"object"}),
+        };
+        revoked.tools = Some(vec![tool("keep"), tool("revoke_root")]);
+        let mut previous = build(&provider, &revoked).unwrap();
+        for (index, removed) in ["revoke_root", "revoke_inline"].into_iter().enumerate() {
+            let reply: ApiChatResponse = serde_json::from_value(serde_json::json!({
+                "id":format!("unsigned_{index}"), "content":[{"type":"text","text":format!("answer {index}")}],
+                "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+            })).unwrap();
+            let response = provider
+                .finish_native_response(reply, &revoked.model, &previous, None, None)
+                .unwrap();
+            let mut message = ChatMessage::assistant(response.text);
+            message.provider_replay_state = response.provider_replay_state;
+            revoked.messages.push(message);
+            revoked.messages.push(ChatMessage::user("Continue"));
+            let mut disabled = revoked.clone();
+            disabled
+                .tools
+                .as_mut()
+                .unwrap()
+                .retain(|definition| definition.name != removed);
+            disabled.tool_choice = Some(ToolChoice::None);
+            let body = build(&provider, &disabled).unwrap();
+            assert!(!body.to_string().contains(removed));
+            assert_eq!(body["tools"][0]["name"], "keep");
+            assert_eq!(body["tool_choice"]["type"], "none");
+
+            if index == 0 {
+                revoked.tools.as_mut().unwrap().push(tool("revoke_inline"));
+                previous = build(&provider, &revoked).unwrap();
+                assert_eq!(
+                    previous["messages"].as_array().unwrap().last().unwrap()["content"][0]["tool"]
+                        ["definition"]["name"],
+                    "revoke_inline"
+                );
+            }
+        }
+
         let restarted = AnthropicProvider::new("test-key");
         assert!(
             build(&restarted, &req).is_ok(),

@@ -1,5 +1,5 @@
-//! Host-owned positional declarations. These are proposals, never delivery
-//! receipts or execution grants. Current request.tools remains authoritative.
+//! Host-owned positional declarations for the prepared Responses history.
+//! Current request.tools remains authoritative for execution.
 use crate::{ChatMessage, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,6 +8,8 @@ const KEY: &str = "tool_declarations_v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDeclarations {
+    #[serde(skip)]
+    pending: bool,
     prefix: Vec<String>,
     batches: Vec<Batch>,
 }
@@ -30,6 +32,37 @@ fn prefix(messages: &[ChatMessage]) -> anyhow::Result<Vec<String>> {
 }
 
 impl ToolDeclarations {
+    /// Carry only the last confirmed positions through Gateway history preparation.
+    pub fn pending(previous: Option<Self>) -> Self {
+        let mut plan = previous.unwrap_or_else(Self::empty);
+        plan.pending = true;
+        plan
+    }
+
+    fn empty() -> Self {
+        Self {
+            pending: false,
+            prefix: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    pub(crate) fn select(request: &crate::ChatRequest) -> anyhow::Result<Option<Self>> {
+        if request
+            .messages
+            .iter()
+            .any(|message| !message.content_parts.is_empty())
+        {
+            return Ok(None);
+        }
+        match (&request.tool_declarations, request.tools.as_deref()) {
+            (Some(plan), Some(tools)) if plan.pending && !tools.is_empty() => Ok(Some(
+                Self::reconcile(Some(plan.clone()), &request.messages, tools)?,
+            )),
+            _ => Ok(Self::for_request(request)),
+        }
+    }
+
     /// Rebuild on schema change, removal, reorder or a replaced history prefix.
     /// Initial definitions are all in input, avoiding top-level override rules.
     pub fn reconcile(
@@ -40,10 +73,8 @@ impl ToolDeclarations {
         let hashes = prefix(messages)?;
         let mut state = previous
             .filter(|state| state.valid_prefix(&hashes))
-            .unwrap_or_else(|| Self {
-                prefix: Vec::new(),
-                batches: Vec::new(),
-            });
+            .unwrap_or_else(Self::empty);
+        state.pending = false;
         let old = state
             .batches
             .iter()
@@ -89,6 +120,7 @@ impl ToolDeclarations {
     }
 
     pub fn save(&self, metadata: &mut serde_json::Value) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.pending, "tool declarations have not been selected");
         anyhow::ensure!(
             metadata.is_object(),
             "tool declaration metadata must be an object"
@@ -97,15 +129,13 @@ impl ToolDeclarations {
         Ok(())
     }
 
-    /// Select an applicable positional proposal after provider preflight. Never
-    /// rebuild here: every consumer must describe the same final request/wire.
+    /// Validate the selected positions and bind them to the complete request.
+    /// An appended message can extend the proof without moving any batch.
     pub fn for_request(request: &crate::ChatRequest) -> Option<Self> {
-        let state = request.tool_declarations.clone()?;
-        if !state.valid_prefix(&prefix(&request.messages).ok()?) {
-            return None;
-        }
+        let plan = request.tool_declarations.as_ref()?;
         let tools = request.tools.as_deref()?;
-        if tools.is_empty()
+        if plan.pending
+            || tools.is_empty()
             || request
                 .messages
                 .iter()
@@ -113,7 +143,11 @@ impl ToolDeclarations {
         {
             return None;
         }
-        let declared = state
+        let hashes = prefix(&request.messages).ok()?;
+        if !plan.valid_prefix(&hashes) {
+            return None;
+        }
+        let declared = plan
             .batches
             .iter()
             .flat_map(|batch| batch.tools.iter())
@@ -123,7 +157,24 @@ impl ToolDeclarations {
                 .iter()
                 .zip(tools)
                 .all(|(a, b)| wire_tool(a) == wire_tool(b)))
-        .then_some(state)
+        .then(|| Self {
+            prefix: hashes,
+            ..plan.clone()
+        })
+    }
+
+    /// Bind a fresh initial batch to the accepted replacement. Compaction
+    /// sizes that batch before the summary text and provenance are available.
+    pub fn bind_replacement(&mut self, messages: &[ChatMessage]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.pending
+                && self.prefix.is_empty()
+                && self.batches.len() == 1
+                && self.batches[0].before_message == 0,
+            "replacement must start with one initial declaration batch"
+        );
+        self.prefix = prefix(messages)?;
+        Ok(())
     }
 
     /// Calibration tracks declaration bytes/positions, not local prefix proofs.

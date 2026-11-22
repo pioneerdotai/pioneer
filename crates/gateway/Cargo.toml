@@ -101,6 +101,7 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+pioneer-provider = { workspace = true, features = ["test-support"] }
 pioneer-cli-agent-runtime = { workspace = true, features = ["test-support"] }
 sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }

@@ -304,7 +304,12 @@ mod worker_tests {
                 if count == expected {
                     break;
                 }
-                tokio::time::advance(Duration::from_secs(1)).await;
+                // Advance pacing only between SQL operations. Advancing the
+                // paused clock during admission can expire the real read's
+                // virtual deadline and make the worker retry.
+                if reads.enqueued.load(SeqCst) == count {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                }
                 tokio::task::yield_now().await;
             }
             assert_eq!(reads.finished.load(SeqCst), expected);

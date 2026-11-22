@@ -1123,11 +1123,19 @@ async fn persist_provider_history_message(
         .map_err(agent_event_error)
 }
 
+const MODEL_RESULT_TOKEN_LIMIT: &str = "model_result_token_limit";
+
 pub(crate) fn bounded_tool_result_message(
     source: &ChatMessage,
     reference: &str,
 ) -> Result<ChatMessage, ChatTurnError> {
-    bounded_tool_result_message_with_budget(source, reference, pioneer_compaction::RESULT_TOKENS)
+    let limit = source
+        .application_context
+        .as_ref()
+        .and_then(|metadata| metadata[MODEL_RESULT_TOKEN_LIMIT].as_u64())
+        .filter(|limit| (512..=pioneer_compaction::RESULT_TOKENS).contains(limit))
+        .unwrap_or(pioneer_compaction::RESULT_TOKENS);
+    bounded_tool_result_message_with_budget(source, reference, limit)
 }
 
 pub(crate) fn bounded_tool_result_message_with_budget(
@@ -1452,6 +1460,37 @@ async fn persist_retained_tool_result(
         pioneer_observability::tool_call::Fact::Failed
     });
     retained
+}
+
+/// Select a bounded text view before committing its full source. Store only
+/// the selected limit with that source so every restore uses the same projector.
+fn select_new_tool_result(
+    source: &mut ChatMessage,
+    reference: &str,
+    limit: u64,
+) -> Result<ChatMessage, ChatTurnError> {
+    if limit < pioneer_compaction::RESULT_TOKENS
+        && source.content_parts.is_empty()
+        && source.name.as_deref() != Some(REQUEST_TOOLS_TOOL_NAME)
+        && let Some(metadata) = source
+            .application_context
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    {
+        metadata.insert(MODEL_RESULT_TOKEN_LIMIT.into(), limit.into());
+        if let Ok(message) = bounded_tool_result_message(source, reference) {
+            return Ok(message);
+        }
+        // Preserve mandatory framing if the smaller allowance cannot carry it.
+        if let Some(metadata) = source
+            .application_context
+            .as_mut()
+            .and_then(JsonValue::as_object_mut)
+        {
+            metadata.remove(MODEL_RESULT_TOKEN_LIMIT);
+        }
+    }
+    bounded_tool_result_message(source, reference)
 }
 
 async fn emit_turn_skills_resolved_event(
@@ -2968,6 +3007,51 @@ fn saved_system_matches_schemas(
         == Some(expected.as_str()))
 }
 
+fn confirmed_tool_snapshot<'a>(
+    retained: &'a [RetainedProviderHistoryMessage],
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Option<&'a JsonValue> {
+    let scope = serde_json::json!([workspace, thread, turn]);
+    retained
+        .iter()
+        .filter(|entry| is_system_snapshot(&entry.message))
+        .filter_map(|entry| {
+            let metadata = entry.message.application_context.as_ref()?;
+            (metadata.get("tool_disclosure_scope") == Some(&scope)
+                && metadata["tool_declarations_confirmed"] == true)
+                .then_some((entry.sequence, metadata))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, metadata)| metadata)
+}
+
+fn restored_sent_tool_declarations(
+    retained: &[RetainedProviderHistoryMessage],
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Option<pioneer_provider::tool_declarations::ToolDeclarations> {
+    confirmed_tool_snapshot(retained, workspace, thread, turn)
+        .and_then(pioneer_provider::tool_declarations::ToolDeclarations::from_metadata)
+}
+
+fn tool_schema_fingerprint(tool: &ToolDefinition) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(tool).expect("serializable tool definition"),
+    ))
+}
+
+fn retained_disabled_definitions(
+    mut current: Vec<ToolDefinition>,
+    sent: &[String],
+) -> Option<Vec<ToolDefinition>> {
+    current.retain(|tool| sent.contains(&tool_schema_fingerprint(tool)));
+    (!current.is_empty()).then_some(current)
+}
+
 async fn persist_system_snapshot(
     prompt: &Option<CompiledPromptPayload>,
     event_tx: &AgentEventHub,
@@ -2977,6 +3061,7 @@ async fn persist_system_snapshot(
     stage: &str,
     schemas: &Option<Vec<ToolDefinition>>,
     disclosure_order: &[String],
+    confirmed: bool,
     declarations: Option<&pioneer_provider::tool_declarations::ToolDeclarations>,
 ) -> Result<Option<ChatMessage>, ChatTurnError> {
     let Some(prompt) = prompt else {
@@ -2987,17 +3072,16 @@ async fn persist_system_snapshot(
     })?;
     use sha2::{Digest, Sha256};
     let schema_hash = schema_fingerprint(schemas)?;
-    // One stage can prepare several same-schema requests. Their retained
-    // positions/prefix proofs differ, so they must not collide at the durable
-    // idempotency key or replace an immutable earlier snapshot.
+    // Governing snapshots and confirmed positions each have immutable keys.
+    // A provider failure can leave only the governing snapshot.
     let declaration_bytes = serde_json::to_vec(&declarations)
         .map_err(|error| ChatTurnError::Terminal(error.to_string()))?;
     let mut item = format!(
         "system-snapshot:{stage}:{}:{schema_hash}",
         hex::encode(Sha256::digest(&encoded)),
     );
-    if declarations.is_some() {
-        item.push(':');
+    if confirmed {
+        item.push_str(":confirmed:");
         item.push_str(&hex::encode(Sha256::digest(declaration_bytes)));
     }
     let mut message = ChatMessage::user("");
@@ -3006,6 +3090,23 @@ async fn persist_system_snapshot(
             "tool_disclosure_scope": [workspace, thread, turn],
             "tool_disclosure_order": disclosure_order}),
     );
+    if confirmed {
+        message
+            .application_context
+            .as_mut()
+            .expect("snapshot metadata")["tool_declarations_confirmed"] =
+            serde_json::Value::Bool(true);
+        message
+            .application_context
+            .as_mut()
+            .expect("snapshot metadata")["sent_tool_schemas"] = serde_json::json!(
+            schemas
+                .iter()
+                .flatten()
+                .map(tool_schema_fingerprint)
+                .collect::<Vec<_>>()
+        );
+    }
     if let Some(declarations) = declarations {
         declarations
             .save(
@@ -5188,6 +5289,7 @@ fn execute_agent_provider_response<'a>(
                 message_item_id,
                 &None,
                 &[],
+                false,
                 None,
             )
             .await?;
@@ -5809,17 +5911,25 @@ fn execute_agent_provider_response<'a>(
             messages.push(continuation);
         }
 
-        // Scope matches disclosure recovery; inherited snapshots never grant a baseline.
-        let mut tool_declarations = continuation_provider_history
-            .iter()
-            .filter(|entry| is_system_snapshot(&entry.message))
-            .max_by_key(|entry| entry.sequence)
-            .and_then(|entry| entry.message.application_context.as_ref())
-            .filter(|value| {
-                value.get("tool_disclosure_scope")
-                    == Some(&serde_json::json!([workspace_id, thread_id, turn_id]))
-            })
-            .and_then(pioneer_provider::tool_declarations::ToolDeclarations::from_metadata);
+        let mut tool_declarations = restored_sent_tool_declarations(
+            &continuation_provider_history,
+            workspace_id,
+            thread_id,
+            turn_id,
+        );
+        let keeps_disabled_schemas =
+            context_session.is_some() && provider.keeps_tools_when_disabled(&model);
+        let confirmed = confirmed_tool_snapshot(
+            &continuation_provider_history,
+            workspace_id,
+            thread_id,
+            turn_id,
+        );
+        let mut sent_tool_schemas: Vec<String> = confirmed
+            .and_then(|metadata| serde_json::from_value(metadata["sent_tool_schemas"].clone()).ok())
+            .unwrap_or_default();
+        let mut sent_tool_prompt: Option<CompiledPromptPayload> =
+            confirmed.and_then(|metadata| serde_json::from_value(metadata["system"].clone()).ok());
         let mut recovered_system_pending =
             recovered_system_snapshot(&continuation_provider_history)?;
         let mut pending_retry_instruction: Option<String> = None;
@@ -6098,18 +6208,26 @@ fn execute_agent_provider_response<'a>(
                 reconcile_tool_disclosure_order(
                     &mut tool_disclosure_order, &visible_tool_names, &available,
                 );
-            let tool_definitions = if round_plan.tools_enabled {
-                    Some(tool_disclosure_order.iter().filter_map(|name| router.find_spec(name))
-                        .map(|configured| native_provider_tool_definition(
-                            configured.spec.clone(), &native_file_tool_capability,
-                        )).collect::<Vec<_>>())
+            let tool_definitions = if round_plan.tools_enabled || keeps_disabled_schemas {
+                let definitions = tool_disclosure_order.iter()
+                    .filter_map(|name| router.find_spec(name))
+                    .map(|configured| native_provider_tool_definition(
+                        configured.spec.clone(), &native_file_tool_capability,
+                    ))
+                    .collect::<Vec<_>>();
+                if round_plan.tools_enabled {
+                    Some(definitions)
+                } else {
+                    retained_disabled_definitions(definitions, &sent_tool_schemas)
+                }
             } else {
                 None
             };
+            let retain_disabled_schemas = !round_plan.tools_enabled && tool_definitions.is_some();
 
             // Discovery changes schemas without running retrieval. Refresh the existing
             // operating contract only when the actual memory inventory changes.
-            if let Some(definitions) = tool_definitions.as_ref() {
+            if round_plan.tools_enabled && let Some(definitions) = tool_definitions.as_ref() {
                 let memory_tool_names = definitions.iter()
                     .filter(|tool| pioneer_tools::MEMORY_DOMAIN_TOOL_NAMES.contains(&tool.name.as_str()))
                     .map(|tool| tool.name.clone()).collect::<BTreeSet<_>>();
@@ -6181,85 +6299,93 @@ fn execute_agent_provider_response<'a>(
                 let no_tool_prompt_sections =
                     prompt_sections_for_compile_from_hook_sections(&no_tool_prompt_section_set)
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_runtime_sections =
-                    runtime_sections_with_execution_continuation_context(
-                        no_tool_prompt_sections.runtime_sections.as_slice(),
-                        execution_window_index,
-                        execution_checkpoint_context.as_ref(),
-                        prior_visible_assistant_text.as_deref(),
-                        turn_tool_materialization.initiating_thread_id.as_deref(),
-                    );
-                let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
-                    no_tool_runtime_sections,
-                    include_artifact_reference_policy,
-                )
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                    skills_prompt.clone(),
-                    applied_retry_instruction.clone(),
-                    no_tool_runtime_sections.as_slice(),
-                    &permission_profile,
-                    include_task_orchestration_policy,
-                    false,
-                    include_html_policy,
-                    false,
-                    false,
-                    continue_generation_hint,
-                    turn_tool_materialization.initiating_thread_id.as_deref(),
-                    thread_id,
-                    turn_id,
-                )
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_instruction_plan = freeze_governing_documents(no_tool_instruction_plan, &governing_documents, &governing_sources)
+                if retain_disabled_schemas
+                    && tool_definitions.as_ref().is_some_and(|tools| tools.len() == sent_tool_schemas.len())
+                    && no_tool_prompt_sections.runtime_sections.is_empty()
+                {
+                    // The final-answer instruction is already in the appended history.
+                    // Explicit no-tool hook sections still take precedence.
+                    sent_tool_prompt.clone()
+                } else {
+                    let no_tool_runtime_sections =
+                        runtime_sections_with_execution_continuation_context(
+                            no_tool_prompt_sections.runtime_sections.as_slice(),
+                            execution_window_index,
+                            execution_checkpoint_context.as_ref(),
+                            prior_visible_assistant_text.as_deref(),
+                            turn_tool_materialization.initiating_thread_id.as_deref(),
+                        );
+                    let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
+                        no_tool_runtime_sections,
+                        include_artifact_reference_policy,
+                    )
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::PromptManifestCompiled {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(
-                            &no_tool_instruction_plan.bundle,
-                            &EffectiveTurnPromptManifestHookMetadata::combined(
-                                effective_prompt_context_set.manifest_metadata(),
-                                no_tool_prompt_section_set.manifest_metadata(),
+                    let no_tool_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+                        tool_loop_config.computer_use.runtime_home_dir.as_path(),
+                        skills_prompt.clone(),
+                        applied_retry_instruction.clone(),
+                        no_tool_runtime_sections.as_slice(),
+                        &permission_profile,
+                        include_task_orchestration_policy,
+                        false,
+                        include_html_policy,
+                        false,
+                        false,
+                        continue_generation_hint,
+                        turn_tool_materialization.initiating_thread_id.as_deref(),
+                        thread_id,
+                        turn_id,
+                    )
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    let no_tool_instruction_plan = freeze_governing_documents(no_tool_instruction_plan, &governing_documents, &governing_sources)
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                    emit_durable_event(
+                        event_tx.as_ref(),
+                        AgentDurableEvent::PromptManifestCompiled {
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            manifest: prompt_manifest_from_bundle(
+                                &no_tool_instruction_plan.bundle,
+                                &EffectiveTurnPromptManifestHookMetadata::combined(
+                                    effective_prompt_context_set.manifest_metadata(),
+                                    no_tool_prompt_section_set.manifest_metadata(),
+                                ),
+                                capability_diagnostics.as_slice(),
                             ),
-                            capability_diagnostics.as_slice(),
-                        ),
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
+                        },
+                    )
+                    .await
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                    Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
+                }
             };
 
             let round_compiled_prompt = if let Some(saved) = recovered_system_pending.take() {
-                if saved_system_matches_schemas(&continuation_provider_history, &tool_definitions)
+                if !retain_disabled_schemas && saved_system_matches_schemas(&continuation_provider_history, &tool_definitions)
                     .map_err(|error| (error, current_thinking_id.clone()))? { Some(saved) } else { round_compiled_prompt }
             } else { round_compiled_prompt };
-                if let Some(definitions) = tool_definitions.as_deref() {
-                    tool_declarations = Some(pioneer_provider::tool_declarations::ToolDeclarations::reconcile(
-                        tool_declarations.take(), &messages, definitions,
-                    ).map_err(|error| (ChatTurnError::Terminal(error.to_string()), current_thinking_id.clone()))?);
-                }
-                if let Some(snapshot) = persist_system_snapshot(&round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id, current_thinking_id.as_str(), &tool_definitions, &tool_disclosure_order, tool_declarations.as_ref()).await
-                .map_err(|error| (error, current_thinking_id.clone()))? {
+            if let Some(snapshot) = persist_system_snapshot(
+                &round_compiled_prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id,
+                current_thinking_id.as_str(), &tool_definitions, &tool_disclosure_order, false, None,
+            ).await.map_err(|error| (error, current_thinking_id.clone()))? {
                 retain_provider_history_message(&mut continuation_provider_history, &mut next_provider_history_sequence, &snapshot);
             }
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
             let request = ChatRequest {
-                        tool_declarations: tool_declarations.clone(),
-                    service_mode: None,
-                    model: model.clone(),
-                    messages: messages.clone(),
-                    temperature: None,
-                    max_tokens: None,
-                    tools: tool_definitions,
-                    tool_choice: None,
-                    parallel_tool_calls: round_plan.tools_enabled.then_some(true),
-                    reasoning,
-                    compiled_prompt: round_compiled_prompt,
-                            };
+                tool_declarations: context_session.is_some().then(|| {
+                    pioneer_provider::tool_declarations::ToolDeclarations::pending(tool_declarations.clone())
+                }),
+                service_mode: None,
+                model: model.clone(),
+                messages: messages.clone(),
+                temperature: None,
+                max_tokens: None,
+                tools: tool_definitions,
+                tool_choice: retain_disabled_schemas.then_some(pioneer_provider::ToolChoice::None),
+                parallel_tool_calls: (round_plan.tools_enabled || retain_disabled_schemas).then_some(true),
+                reasoning,
+                compiled_prompt: round_compiled_prompt,
+            };
             let (mut request, receipt, restoration) = prepare_request_with_inventory(
                 context_session, request, event_tx.as_ref(), workspace_id, thread_id, turn_id,
             ).await.map_err(|error| (error, current_thinking_id.clone()))?;
@@ -6276,6 +6402,12 @@ fn execute_agent_provider_response<'a>(
                 ).await.map_err(|error| (error, current_thinking_id.clone()))?;
             }
             last_provider_reasoning_id = Some(current_thinking_id.clone());
+            let result_input_room = receipt.as_ref().and_then(|receipt| receipt.remaining_input_tokens);
+            let sent_declarations =
+                pioneer_provider::tool_declarations::ToolDeclarations::for_request(&request);
+            let declaration_snapshot = (sent_declarations.is_some() || tool_declarations.is_some()
+                || keeps_disabled_schemas && (request.tools.is_some() || !sent_tool_schemas.is_empty()))
+                .then(|| (request.compiled_prompt.clone(), request.tools.clone()));
             let round = await_context_request(context_session, provider::request_agent_round(
                 provider,
                 request,
@@ -6289,6 +6421,22 @@ fn execute_agent_provider_response<'a>(
             ))
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
+
+            tool_declarations = sent_declarations;
+            if let Some((prompt, schemas)) = declaration_snapshot {
+                if keeps_disabled_schemas {
+                    sent_tool_schemas = schemas.iter().flatten().map(tool_schema_fingerprint).collect();
+                    sent_tool_prompt = prompt.clone();
+                }
+                if let Some(snapshot) = persist_system_snapshot(
+                    &prompt, event_tx.as_ref(), workspace_id, thread_id, turn_id,
+                    current_thinking_id.as_str(), &schemas, &tool_disclosure_order,
+                    true, tool_declarations.as_ref(),
+                ).await.map_err(|error| (error, current_thinking_id.clone()))? {
+                    retain_provider_history_message(&mut continuation_provider_history,
+                        &mut next_provider_history_sequence, &snapshot);
+                }
+            }
 
             if let (Some(session), Some(receipt)) = (context_session, receipt) {
                 session.record_usage(receipt, round.usage.as_ref()).map_err(|e| (
@@ -7750,6 +7898,12 @@ fn execute_agent_provider_response<'a>(
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
+            // Leave room for the assistant calls and result framing. The next
+            // complete request is still subject to ordinary context admission.
+            let result_limit = result_input_room
+                .map(|room| (room.saturating_sub(512) / parallel_tool_calls as u64)
+                    .clamp(512, pioneer_compaction::RESULT_TOKENS))
+                .unwrap_or(pioneer_compaction::RESULT_TOKENS);
             batch_observation.units(pioneer_observability::tool_call::Unit::BatchCalls, tool_tasks.len());
             let remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(tool_tasks.len()));
             let batch_correlation = batch_observation.correlation();
@@ -7832,24 +7986,38 @@ fn execute_agent_provider_response<'a>(
                             result.message = retained_search_page_message(
                                 event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result, &reference,
                             ).await?;
-                            } else if result.shell_model_projection.is_some() {
-                                prepare_shell_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &mut result, &reference).await?;
+                        } else if result.shell_model_projection.is_some() {
+                            prepare_shell_tool_result(
+                                event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &mut result, &reference,
+                            ).await?;
                         } else {
-                            if !result.full_source_in_item {
-                                persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
-                            }
                             // Preserve complete reader pages and their continuation cursors.
-                            if !pioneer_tools::is_thread_paged_tool(&result.tool_name) {
-                                result.message = bounded_tool_result_message(
+                            let projected = if pioneer_tools::is_thread_paged_tool(&result.tool_name) {
+                                Ok(None)
+                            } else if result.full_source_in_item {
+                                bounded_tool_result_message(
                                     result.full_message.as_ref().unwrap_or(&result.message), &reference,
-                                )?;
+                                ).map(Some)
+                            } else {
+                                let source = result.full_message.as_mut().unwrap_or(&mut result.message);
+                                select_new_tool_result(source, &reference, result_limit).map(Some)
+                            };
+                            if !result.full_source_in_item {
+                                persist_retained_tool_result(
+                                    event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result,
+                                ).await?;
                             }
-                        }
-                        // The durable terminal item already owns full shell output. Retain only
-                        // its bounded provider representation in canonical replay history.
-                            if result.full_source_in_item && result.shell_model_projection.is_none() {
-                            result.full_message = None;
-                            persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                            if let Some(projected) = projected? {
+                                result.message = projected;
+                            }
+                            if result.full_source_in_item {
+                                // The terminal item owns the full output. The
+                                // replay row stores its bounded representation.
+                                result.full_message = None;
+                                persist_retained_tool_result(
+                                    event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result,
+                                ).await?;
+                            }
                         }
                         Ok::<(), ChatTurnError>(())
                     };
@@ -10363,6 +10531,23 @@ mod tests {
             &built.router.available_tool_names(),
         );
         assert_eq!(disclosed, vec!["task_accept", "task_revise", "task_get"]);
+        let definitions = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| {
+                    let spec = &built.router.find_spec(name).unwrap().spec;
+                    pioneer_provider::ToolDefinition {
+                        name: spec.name.clone(),
+                        description: spec.description.clone(),
+                        parameters: spec.parameters.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let sent = definitions(&disclosed)
+            .iter()
+            .map(super::tool_schema_fingerprint)
+            .collect::<Vec<_>>();
         built
             .router
             .set_blocked_tool_names([("task_accept".to_owned(), "revoked".to_owned())]);
@@ -10372,6 +10557,16 @@ mod tests {
             &built.router.available_tool_names(),
         );
         assert_eq!(disclosed, vec!["task_revise", "task_get"]);
+        let mut current = definitions(&disclosed);
+        current[1].description.push_str(" changed");
+        assert_eq!(
+            super::retained_disabled_definitions(current, &sent)
+                .unwrap()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["task_revise"],
+        );
     }
 
     #[tokio::test]
@@ -10479,6 +10674,7 @@ mod tests {
                         "round",
                         &schemas,
                         &visible,
+                        true,
                         Some(&next),
                     )
                     .await
@@ -10539,6 +10735,7 @@ mod tests {
                         "round",
                         &schemas,
                         &visible,
+                        true,
                         Some(&later),
                     )
                     .await
@@ -10563,6 +10760,26 @@ mod tests {
                 sequence: 1,
                 message: published.clone(),
             }];
+            let mut legacy_proposal = retained.clone();
+            legacy_proposal[0]
+                .message
+                .application_context
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("tool_declarations_confirmed");
+            assert!(
+                super::restored_sent_tool_declarations(&legacy_proposal, "w", "t", "turn")
+                    .is_none()
+            );
+            assert!(super::restored_sent_tool_declarations(&retained, "w", "t", "other").is_none());
+            assert_eq!(
+                super::restored_sent_tool_declarations(&retained, "w", "t", "turn")
+                    .unwrap()
+                    .projection_identity(),
+                next.projection_identity()
+            );
             let order = super::restored_tool_disclosure_order(&retained, "w", "t", "turn");
             let selection = fresh
                 .router

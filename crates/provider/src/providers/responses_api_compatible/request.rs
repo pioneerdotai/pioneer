@@ -16,26 +16,17 @@ pub(crate) struct PreparedRequest {
     pub(crate) comparison: Option<crate::prompt_cache::Comparison>,
 }
 impl ResponsesApiCompatibleProvider {
-    pub(crate) fn declarations_for_request(
-        &self,
-        request: &ChatRequest,
-    ) -> Option<crate::tool_declarations::ToolDeclarations> {
+    pub(crate) fn select_declarations(&self, request: &mut ChatRequest) -> Result<()> {
         // Positional tool declarations use the public OpenAI Responses protocol.
-        (self.name == "openai"
+        request.tool_declarations = if self.name == "openai"
             && self.root == "https://api.openai.com/v1"
             && matches!(&self.auth, super::AuthStyle::Bearer)
-            && request
-                .messages
-                .iter()
-                .all(|message| message.content_parts.is_empty()))
-        .then(|| {
-            request
-                .tools
-                .as_deref()
-                .filter(|tools| !tools.is_empty())
-                .and_then(|_| crate::tool_declarations::ToolDeclarations::for_request(request))
-        })
-        .flatten()
+        {
+            crate::tool_declarations::ToolDeclarations::select(request)?
+        } else {
+            None
+        };
+        Ok(())
     }
 
     pub(crate) fn project(&self, mut request: ChatRequest) -> Result<ChatRequest> {
@@ -56,7 +47,8 @@ impl ResponsesApiCompatibleProvider {
     ) -> Result<PreparedRequest> {
         let comparison = crate::prompt_cache::Comparison::begin(&self.authority);
         let request = crate::tools::policy::prepare_responses_request(&self.name, request)?;
-        let request = self.project(request)?;
+        let mut request = self.project(request)?;
+        self.select_declarations(&mut request)?;
         let generation = crate::generation::responses_fields(&self.name, &request)?;
         // A compiled prompt is rendered exactly once as instructions. Remaining
         // system messages are retained only when no compiled prompt exists.
@@ -78,12 +70,14 @@ impl ResponsesApiCompatibleProvider {
     }
     pub(crate) fn render(&self, prepared: &PreparedRequest, stream: bool) -> Result<Value> {
         let request = &prepared.request;
-        let declarations = (request.messages.len() == prepared.messages.messages.len())
-            .then(|| self.declarations_for_request(request))
-            .flatten();
+        let declarations = request.tool_declarations.as_ref();
+        ensure!(
+            declarations.is_none() || request.messages.len() == prepared.messages.messages.len(),
+            "Responses declaration positions changed during wire preparation"
+        );
         let mut input = Vec::new();
         for (index, message) in prepared.messages.messages.iter().enumerate() {
-            if let Some(declarations) = &declarations {
+            if let Some(declarations) = declarations {
                 input.extend(declarations.items_before(index));
             }
             if request.compiled_prompt.is_some() && message.role == Role::System {
@@ -142,7 +136,7 @@ impl ResponsesApiCompatibleProvider {
                 input.push(json!({"role":if message.role==Role::System {"system"} else {"user"},"content":content}));
             }
         }
-        if let Some(declarations) = &declarations {
+        if let Some(declarations) = declarations {
             input.extend(declarations.items_before(prepared.messages.messages.len()));
         }
         let mut body = json!({"model":request.model,"input":input,"store":true,"truncation":"disabled","include":["reasoning.encrypted_content"],"stream":stream});
