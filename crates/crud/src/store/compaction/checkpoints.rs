@@ -30,6 +30,38 @@ impl CrudStore {
             .await
     }
 
+    pub async fn compaction_admit_for_turn_with_preparation(
+        &self,
+        workspace: &str,
+        thread: &str,
+        snapshot: &OperationSnapshot,
+        execution_turn: Option<&str>,
+        preparation: Option<&str>,
+    ) -> Result<OperationRecord> {
+        self.compaction_store()
+            .compaction_admit_for_turn_with_preparation(
+                workspace,
+                thread,
+                snapshot,
+                execution_turn,
+                preparation,
+            )
+            .await
+    }
+
+    pub async fn compaction_latest_blocked_sequence(&self, turn: &str) -> Result<Option<i64>> {
+        pioneer_crud_compaction::operations::latest_blocked_sequence(&self.connection, turn).await
+    }
+
+    pub async fn validate_context_preparation(&self, turn: &str, item: &str) -> Result<()> {
+        pioneer_crud_compaction::operations::ensure_current_preparation(
+            &self.connection,
+            turn,
+            item,
+        )
+        .await
+    }
+
     pub async fn compaction_operation_for_plan(
         &self,
         workspace: &str,

@@ -15,8 +15,10 @@ use pioneer_crud_execution::recovery_terminalization_outbox::{
     self, PermanentRecoveryTerminalizationError,
 };
 use pioneer_crud_execution::recovery_terminalization_plan::PreparedRecoveryTerminalizationOutcome;
+use pioneer_crud_execution::recovery_values::recovery_job_status_from_db;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{native_terminal_effect_outbox, recovery_job};
+use pioneer_protocol::TurnStatus;
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
@@ -366,6 +368,7 @@ impl CrudStore {
                 .await
                 .context("failed to begin recovery terminalization transaction")?;
             let result = async {
+                pioneer_crud_conversations::turn_event::lock_stream(&transaction, &record.turn_id).await?;
                 recovery_terminalization_outbox::require_claim_revision(
                     &transaction,
                     &record.recovery_job_id,
@@ -377,7 +380,9 @@ impl CrudStore {
                     recovery_job::find_job_by_id(&transaction, record.recovery_job_id.as_str())
                         .await?
                         .context("recovery terminalization job disappeared")?;
-                if job.updated_at != prepared.job_updated_at {
+                if job.updated_at != prepared.job_updated_at
+                    || recovery_job_status_from_db(&job.status) != Some(record.recovery_status)
+                {
                     anyhow::bail!("recovery terminalization is stale: job identity/status changed");
                 }
                 let turn_model = turn_reads::find_turn_by_id(&transaction, record.turn_id.as_str())
@@ -390,6 +395,8 @@ impl CrudStore {
                 if turn_model.updated_at != prepared.turn_updated_at
                     || thread_model.id != prepared.thread_id
                     || thread_model.workspace_id != prepared.workspace_id
+                    || (prepared.terminal_event.is_some()
+                        && turn_status_from_db(&turn_model.status) != Some(TurnStatus::InProgress))
                 {
                     anyhow::bail!(
                         "recovery terminalization target changed during commit preparation"
@@ -426,6 +433,15 @@ impl CrudStore {
                     .await?;
                 }
                 if let Some(terminal_event) = prepared.terminal_event {
+                    if prepared.stop_native_compaction {
+                        pioneer_crud_compaction::stop_execution::stop_native_operations_for_no_progress(
+                            &transaction,
+                            &prepared.workspace_id,
+                            &prepared.thread_id,
+                            &record.turn_id,
+                        )
+                        .await?;
+                    }
                     self.append_and_project_turn_event_in_transaction(
                         &transaction,
                         terminal_event,

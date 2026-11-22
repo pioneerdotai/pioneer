@@ -1,8 +1,10 @@
 //! Compaction operation authority and bounded admission.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use pioneer_compaction::{FORMAT_VERSION, OperationSnapshot};
-use pioneer_entity::{compaction_context, compaction_execution_stop, compaction_operation, turn};
+use pioneer_entity::{
+    compaction_context, compaction_execution_stop, compaction_operation, turn, turn_event,
+};
 use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
 use sea_orm::{
@@ -26,6 +28,22 @@ pub struct OperationRecord {
     pub correction: i64,
     pub next_portion: i64,
     pub outcome: Option<String>,
+}
+
+pub fn native_owner(workspace: &str, thread: &str) -> String {
+    // Lengths disambiguate arbitrary scope identifiers without parsing them.
+    format!(
+        "native:{}:{workspace}:{}:{thread}",
+        workspace.len(),
+        thread.len()
+    )
+}
+
+impl OperationRecord {
+    pub fn stopped_for_no_progress(&self) -> bool {
+        self.status == "cancelled"
+            && self.outcome.as_deref() == Some(crate::stop_execution::NO_PROGRESS_OUTCOME)
+    }
 }
 
 impl From<compaction_operation::Model> for OperationRecord {
@@ -62,6 +80,25 @@ pub async fn compaction_admit_for_turn(
     snapshot: &OperationSnapshot,
     execution_turn: Option<&str>,
 ) -> Result<OperationRecord> {
+    compaction_admit_for_turn_with_preparation(
+        db,
+        workspace,
+        thread,
+        snapshot,
+        execution_turn,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn compaction_admit_for_turn_with_preparation(
+    db: &PostgresDatabase,
+    workspace: &str,
+    thread: &str,
+    snapshot: &OperationSnapshot,
+    execution_turn: Option<&str>,
+    preparation: Option<&str>,
+) -> Result<OperationRecord> {
     let snapshot_json = serde_json::to_string(snapshot)?;
     ensure!(
         snapshot_json.len() <= SOURCE_PAGE_BYTES,
@@ -71,6 +108,11 @@ pub async fn compaction_admit_for_turn(
     // Preparation reads no mutable DB state. Owner and format are revalidated inside the write boundary.
     retry_conflict(|| async {
             let txn = db.begin().await?;
+            if let Some(item) = preparation {
+                let turn = execution_turn.context("missing preparation Turn")?;
+                pioneer_crud_conversations::turn_event::lock_stream(&txn, turn).await?;
+                ensure_current_preparation(&txn, turn, item).await?;
+            }
             compaction_context::Entity::insert(compaction_context::ActiveModel {workspace_id: sea_orm::Set((workspace).to_owned()), thread_id: sea_orm::Set((thread).to_owned()), owner: sea_orm::Set((snapshot.owner.clone()).to_owned()), ..Default::default() }).on_conflict(OnConflict::columns([compaction_context::Column::Owner]).do_nothing().to_owned()).exec_without_returning(&txn).await?;
             let valid = compaction_context::Entity::find()
             .select_only()
@@ -145,6 +187,49 @@ pub async fn compaction_admit_for_turn(
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("admitted operation missing"))
+}
+
+pub async fn ensure_current_preparation<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item: &str,
+) -> Result<()> {
+    let active = turn::Entity::find_by_id(turn_id)
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Status.eq("in_progress"))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some();
+    ensure!(
+        active
+            && pioneer_crud_execution::turn_item_attempt::has_running_context_preparation(
+                db,
+                turn_id,
+                Some(item),
+                latest_blocked_sequence(db, turn_id).await?,
+            )
+            .await?,
+        "native context preparation was superseded"
+    );
+    Ok(())
+}
+
+pub async fn latest_blocked_sequence<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<i64>> {
+    turn_event::Entity::find()
+        .select_only()
+        .column(turn_event::Column::Sequence)
+        .filter(turn_event::Column::TurnId.eq(turn_id))
+        .filter(turn_event::Column::EventType.eq("turn/blocked"))
+        .order_by_desc(turn_event::Column::Sequence)
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn compaction_operation_for_plan<C: ConnectionTrait>(

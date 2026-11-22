@@ -840,14 +840,16 @@ impl<'a> RecoveryStore<'a> {
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
             retry_write_on_conflict(|| async {
+                let tx = self.connection.begin().await?;
                 let outcome = recovery_job::mark_claimed_job_active(
-                    self.connection,
+                    &tx,
                     job_id,
                     claim_token,
                     active_attempt_id,
                     unix_to_datetime(now_unix),
                 )
                 .await?;
+                tx.commit().await?;
                 Ok(match outcome {
                     recovery_job::ClaimedJobActivation::Activated => {
                         ClaimedRecoveryActivation::Activated

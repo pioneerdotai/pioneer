@@ -1019,6 +1019,26 @@ async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
         store
             .materialize_item_started(
                 ItemStartedNotification {
+                    workspace_id: "ws_diag_atomic".into(),
+                    thread_id: "thr_diag_atomic".into(),
+                    turn_id: "turn_diag_atomic".into(),
+                    item: TurnItem::SystemEvent {
+                        id: "pending-preparation".into(),
+                        level: pioneer_protocol::SystemEventLevel::Info,
+                        message: "Native context preparation".into(),
+                        code: Some("runtime_operation".into()),
+                        details: Some(serde_json::json!({
+                            "operation_kind": "context_preparation", "status": "started"
+                        })),
+                    },
+                },
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
                     workspace_id: "ws_diag_atomic".to_owned(),
                     thread_id: "thr_diag_atomic".to_owned(),
                     turn_id: "turn_diag_atomic".to_owned(),
@@ -1206,6 +1226,15 @@ async fn recovery_diagnostic_atomic_restart_impl(status: RecoveryJobStatus) {
             expected.clone()
         };
         let terminal_turn = applied.newly_terminal_turn.unwrap();
+        let owner = crate::compaction::native_owner("ws_diag_atomic", "thr_diag_atomic");
+        let stop = pioneer_entity::compaction_execution_stop::Entity::find_by_id((
+            owner,
+            terminal_turn.id.clone(),
+        ))
+        .one(&restarted.connection)
+        .await
+        .unwrap();
+        assert_eq!(stop.is_some(), status == RecoveryJobStatus::Exhausted);
         assert_eq!(
             terminal_turn.error.as_deref(),
             Some(expected_turn_message.as_str())

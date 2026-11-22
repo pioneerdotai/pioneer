@@ -50,6 +50,7 @@ pub struct RecoveryTerminalCleanupPlan {
 }
 
 pub struct PreparedRecoveryTerminalizationCommit<E> {
+    pub stop_native_compaction: bool,
     pub outbox_updated_at: DateTimeWithTimeZone,
     pub job_updated_at: DateTimeWithTimeZone,
     pub turn_updated_at: DateTimeWithTimeZone,
@@ -365,6 +366,8 @@ where
     };
     Ok(PreparedRecoveryTerminalizationOutcome::Commit(
         PreparedRecoveryTerminalizationCommit {
+            stop_native_compaction: job_status == RecoveryJobStatus::Blocked
+                && blocked_diagnostic.is_some(),
             outbox_updated_at: outbox.updated_at,
             job_updated_at: job.updated_at,
             turn_updated_at: turn_model.updated_at,

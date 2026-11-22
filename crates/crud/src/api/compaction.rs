@@ -33,7 +33,7 @@ pub use pioneer_crud_compaction::lifecycle::PreparedCompactionLifecycle;
 pub use pioneer_crud_compaction::lifecycle_pending::{
     CompactionLifecycleCandidate, CompactionLifecycleClaim, CompactionLifecycleStorageError,
 };
-pub use pioneer_crud_compaction::operations::OperationRecord;
+pub use pioneer_crud_compaction::operations::{OperationRecord, native_owner};
 #[cfg(any(test, feature = "test-support"))]
 pub use pioneer_crud_compaction::publication_test_hook::{
     PublicationTestHookHandle, PublicationTestPause,

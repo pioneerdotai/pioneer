@@ -293,6 +293,25 @@ impl CrudStore {
             .await
     }
 
+    pub async fn compaction_resume_for_preparation(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+        invalid_completion: bool,
+        preparation: Option<&str>,
+    ) -> Result<bool> {
+        self.compaction_store()
+            .compaction_resume_for_preparation(
+                operation,
+                execution_turn,
+                deadline_ms,
+                invalid_completion,
+                preparation,
+            )
+            .await
+    }
+
     pub async fn compaction_finish_execution(
         &self,
         operation: &str,

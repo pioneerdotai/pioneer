@@ -232,6 +232,12 @@ pub(crate) async fn admit_operation(
     mut prepared: PreparedOperation,
     now_ms: u64,
 ) -> Result<OperationSnapshot> {
+    let causal_parent = pioneer_provider::usage::current_causal_parent();
+    let preparation_prefix = format!("item:{}:", prepared.execution_turn);
+    let preparation = causal_parent
+        .as_deref()
+        .filter(|_| prepared.user_initiated)
+        .and_then(|parent| parent.strip_prefix(&preparation_prefix));
     // A changed identity must fail visibly instead of creating a fresh operation
     // over history that already has saved progress. This lookup is bounded to one
     // stopped operation and is never used to transplant its plan or cursor.
@@ -326,10 +332,29 @@ pub(crate) async fn admit_operation(
         ))?);
     }
     ensure!(selected > 0, "no selected compaction material");
-    let fingerprint = hex::encode(identity.finalize());
-    let existing = store
+    let mut fingerprint = hex::encode(identity.finalize());
+    let mut existing = store
         .compaction_operation_for_plan(workspace, thread, &prepared.owner, &fingerprint)
         .await?;
+    if prepared.user_initiated
+        && existing
+            .as_ref()
+            .is_some_and(|record| record.stopped_for_no_progress())
+    {
+        // Keep the retired operation and its evidence immutable. The canonical
+        // Blocked receipt distinguishes successive explicit resumes of this Turn.
+        let blocked_sequence = store
+            .compaction_latest_blocked_sequence(&prepared.execution_turn)
+            .await?;
+        fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&(
+            &fingerprint,
+            &prepared.execution_turn,
+            blocked_sequence,
+        ))?));
+        existing = store
+            .compaction_operation_for_plan(workspace, thread, &prepared.owner, &fingerprint)
+            .await?;
+    }
     let mut record = if let Some(record) = existing {
         record
     } else {
@@ -372,7 +397,13 @@ pub(crate) async fn admit_operation(
             plan,
         };
         store
-            .compaction_admit_for_turn(workspace, thread, &snapshot, Some(&prepared.execution_turn))
+            .compaction_admit_for_turn_with_preparation(
+                workspace,
+                thread,
+                &snapshot,
+                Some(&prepared.execution_turn),
+                preparation,
+            )
             .await?
     };
     // The old request remains failed. A later admission may reuse its saved
@@ -386,7 +417,13 @@ pub(crate) async fn admit_operation(
             .min(prepared.operation_deadline_ms.unwrap_or(u64::MAX));
         if deadline > now_ms {
             store
-                .compaction_resume_deadline(&record.id, &prepared.execution_turn, deadline)
+                .compaction_resume_for_preparation(
+                    &record.id,
+                    &prepared.execution_turn,
+                    deadline,
+                    false,
+                    preparation,
+                )
                 .await?;
             record = store
                 .compaction_operation(&record.id)
@@ -414,10 +451,12 @@ pub(crate) async fn admit_operation(
             );
             ensure!(
                 store
-                    .compaction_resume_invalid_completion(
+                    .compaction_resume_for_preparation(
                         &record.id,
                         &prepared.execution_turn,
                         deadline,
+                        true,
+                        preparation,
                     )
                     .await?,
                 "compaction resume state or execution fence changed"
@@ -429,6 +468,11 @@ pub(crate) async fn admit_operation(
         }
     }
     let snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot)?;
+    if let Some(item) = preparation {
+        store
+            .validate_context_preparation(&prepared.execution_turn, item)
+            .await?;
+    }
     if record.status != "running" || snapshot.admission.deadline_ms <= now_ms {
         return Ok(snapshot);
     }

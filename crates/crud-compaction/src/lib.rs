@@ -60,7 +60,7 @@ pub const SOURCE_PAGE_BYTES: usize = 256 * 1024;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod publication_test_hook;
-mod stop_execution;
+pub mod stop_execution;
 pub mod store;
 
 pub mod frozen_maintenance;

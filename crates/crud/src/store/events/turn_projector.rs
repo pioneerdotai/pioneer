@@ -551,6 +551,15 @@ impl TurnProjector {
                     Ok(())
                 }),
                 TurnEventPayload::TurnFailed(payload) => project_future(async move {
+                    if payload.turn.status == pioneer_protocol::TurnStatus::Failed {
+                        pioneer_crud_compaction::stop_execution::fence_native_preparation_on_terminal_stop(
+                            db,
+                            &payload.workspace_id,
+                            &payload.thread_id,
+                            &payload.turn.id,
+                        )
+                        .await?;
+                    }
                     turn_item_attempt::close_prepared_terminal_running_attempts(
                         db,
                         payload.turn.id.as_str(),

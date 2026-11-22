@@ -31,7 +31,7 @@ pub async fn compaction_resume_deadline(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
-    resume_failed_operation(db, operation, execution_turn, deadline_ms, false).await
+    resume_failed_operation(db, operation, execution_turn, deadline_ms, false, None).await
 }
 
 pub async fn compaction_resume_invalid_completion(
@@ -40,15 +40,16 @@ pub async fn compaction_resume_invalid_completion(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
-    resume_failed_operation(db, operation, execution_turn, deadline_ms, true).await
+    resume_failed_operation(db, operation, execution_turn, deadline_ms, true, None).await
 }
 
-async fn resume_failed_operation(
+pub(crate) async fn resume_failed_operation(
     db: &PostgresDatabase,
     operation: &str,
     execution_turn: &str,
     deadline_ms: u64,
     invalid_completion: bool,
+    preparation: Option<&str>,
 ) -> Result<bool> {
     let Some(record) = compaction_operation(db, operation).await? else {
         return Ok(false);
@@ -183,6 +184,10 @@ async fn resume_failed_operation(
     );
     retry_conflict(|| async {
         let tx = db.begin().await?;
+        if let Some(item) = preparation {
+            pioneer_crud_conversations::turn_event::lock_stream(&tx, execution_turn).await?;
+            crate::operations::ensure_current_preparation(&tx, execution_turn, item).await?;
+        }
         // Decode the bound header result in this same writer transition. An
         // expired saved Commit is an explicit error, not an ordinary stale CAS.
         let verify_projection = async {

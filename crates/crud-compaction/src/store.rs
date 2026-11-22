@@ -333,6 +333,25 @@ impl CompactionStore {
         crate::runner_repository::compaction_runner_state(&self.connection, operation).await
     }
 
+    pub async fn compaction_resume_for_preparation(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+        invalid_completion: bool,
+        preparation: Option<&str>,
+    ) -> Result<bool> {
+        crate::runner_resume::resume_failed_operation(
+            &self.connection,
+            operation,
+            execution_turn,
+            deadline_ms,
+            invalid_completion,
+            preparation,
+        )
+        .await
+    }
+
     pub async fn compaction_resume_deadline(
         &self,
         operation: &str,
@@ -1208,14 +1227,33 @@ impl CompactionStore {
         snapshot: &OperationSnapshot,
         execution_turn: Option<&str>,
     ) -> Result<OperationRecord> {
+        self.compaction_admit_for_turn_with_preparation(
+            workspace,
+            thread,
+            snapshot,
+            execution_turn,
+            None,
+        )
+        .await
+    }
+
+    pub async fn compaction_admit_for_turn_with_preparation(
+        &self,
+        workspace: &str,
+        thread: &str,
+        snapshot: &OperationSnapshot,
+        execution_turn: Option<&str>,
+        preparation: Option<&str>,
+    ) -> Result<OperationRecord> {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
-            crate::operations::compaction_admit_for_turn(
+            crate::operations::compaction_admit_for_turn_with_preparation(
                 &self.connection,
                 workspace,
                 thread,
                 snapshot,
                 execution_turn,
+                preparation,
             )
             .await
         }
