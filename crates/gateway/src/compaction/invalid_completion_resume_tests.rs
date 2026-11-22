@@ -134,6 +134,209 @@ fn runner(f: &Fixture, snapshot: OperationSnapshot, fits: bool, turn: &str) -> C
     .with_execution_turn(turn.into())
 }
 
+#[tokio::test]
+async fn no_progress_stop_fences_old_publication_across_same_turn_resume() {
+    use pioneer_crud::{
+        AtomicRecoveryJobEnqueueOutcome, BlockedTurnRecoveryResumeOutcome,
+        RecoveryTerminalCleanupPlan, RecoveryTerminalizationApplyOutcome,
+    };
+    use pioneer_protocol::{
+        ItemStartedNotification, RecoveryAction, RecoveryDiagnostic, RecoveryJobStatus,
+        RecoveryStopReason, RecoveryTrigger, SystemEventLevel, TurnBlockedResumeMetadata, TurnItem,
+        TurnItemType, TurnStatus,
+    };
+
+    let (f, mut prepared) = progress_fixture(true).await;
+    prepared.owner = super::super::native_owner("ws", "thread");
+    f.provider.replies.lock().unwrap().clear();
+    // The source fixture has a raw history event. Give the execution its own
+    // projected stream so that preparation starts after a durable Turn start.
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    turn.id = "resume-turn".into();
+    prepared.execution_turn = turn.id.clone();
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &turn,
+            &[pioneer_protocol::UserInput::Text {
+                text: "Continue after recovery".into(),
+                text_elements: Vec::new(),
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+
+    let begin_preparation = |id: &'static str, timestamp| {
+        let store = f.store.clone();
+        async move {
+            store.materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws".into(), thread_id: "thread".into(), turn_id: "resume-turn".into(),
+                    item: TurnItem::SystemEvent {
+                        id: id.into(), level: SystemEventLevel::Info,
+                        message: "Native context preparation".into(),
+                        code: Some("runtime_operation".into()),
+                        details: Some(serde_json::json!({"operation_kind":"context_preparation","status":"started"})),
+                    },
+                },
+                timestamp,
+            ).await.unwrap();
+        }
+    };
+    begin_preparation("old-preparation", 1).await;
+    let old = pioneer_provider::usage::scope_causal_parent(
+        "item:resume-turn:old-preparation".into(),
+        admit(&f, prepared.clone(), 10),
+    )
+    .await
+    .unwrap();
+    let mut gate = arm_publication_test_hook(&f.store, &old.id, PublicationTestPause::BeforeWriter);
+    let old_runner = runner(&f, old.clone(), true, "resume-turn");
+    let pending = tokio::spawn(async move { old_runner.run(CancellationToken::new()).await });
+    gate.reached().await;
+
+    let AtomicRecoveryJobEnqueueOutcome::Created(job) = f
+        .store
+        .enqueue_recovery_job_if_no_unresolved(
+            "resume-turn".into(),
+            "reasoning".into(),
+            TurnItemType::Reasoning,
+            None,
+            RecoveryTrigger::Timeout,
+            RecoveryAction::RestartTurn,
+            None,
+            None,
+            None,
+            None,
+            0,
+            3,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            2,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected new recovery job");
+    };
+    let claims = f.store.claim_due_recovery_jobs(2, 45, 1).await.unwrap();
+    f.store
+        .mark_claimed_recovery_job_active(
+            &job.id,
+            claims[0].claim_token.as_deref().unwrap(),
+            "active",
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                &job.id,
+                "active",
+                RecoveryJobStatus::Blocked,
+                Some("no progress".into()),
+                Some(RecoveryDiagnostic {
+                    stop_reason: Some(RecoveryStopReason::NoProgress),
+                    ..Default::default()
+                }),
+                3,
+                None,
+            )
+            .await
+            .unwrap()
+    );
+    let claims = f
+        .store
+        .claim_due_recovery_terminalizations(3, 45, 1)
+        .await
+        .unwrap();
+    let applied = f
+        .store
+        .apply_claimed_recovery_terminalization(
+            &claims[0],
+            Some(TurnBlockedResumeMetadata {
+                reason_class: "execution_budget".into(),
+                human_message: "no progress".into(),
+                resume_requirements: vec![],
+                resume_command: "turn.resume:resume-turn".into(),
+                blocked_recovery_job_id: Some(job.id.clone()),
+                latest_checkpoint_id: None,
+                can_resume_same_turn: true,
+            }),
+            RecoveryTerminalCleanupPlan {
+                runtime_generation: 1,
+                runtime_contract: "pioneer.test.attached-task-cleanup.v1".into(),
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    let RecoveryTerminalizationApplyOutcome::Applied(applied) = applied else {
+        panic!("expected terminalization");
+    };
+    assert_eq!(
+        applied.newly_terminal_turn.unwrap().status,
+        TurnStatus::Blocked
+    );
+    assert!(matches!(
+        f.store
+            .resume_blocked_turn_recovery("thread", "resume-turn", Some(&job.id), 4, "resumed", 49)
+            .await
+            .unwrap(),
+        BlockedTurnRecoveryResumeOutcome::Resumed(_)
+    ));
+
+    assert!(
+        pioneer_provider::usage::scope_causal_parent(
+            "item:resume-turn:old-preparation".into(),
+            admit(&f, prepared.clone(), 20),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("preparation was superseded")
+    );
+    begin_preparation("new-preparation", 4).await;
+    let resumed = pioneer_provider::usage::scope_causal_parent(
+        "item:resume-turn:new-preparation".into(),
+        admit(&f, prepared.clone(), 20),
+    )
+    .await
+    .unwrap();
+    assert_ne!(resumed.id, old.id);
+    gate.release();
+    assert_eq!(
+        pending.await.unwrap().unwrap(),
+        CompactionExit::Reconcile(FailureKind::Cancelled)
+    );
+    assert!(
+        f.store
+            .compaction_head(&prepared.owner)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let CompactionExit::Applied(head) = runner(&f, resumed, true, "resume-turn")
+        .run(CancellationToken::new())
+        .await
+        .unwrap()
+    else {
+        panic!("resumed operation must publish");
+    };
+    assert_eq!(
+        f.store
+            .compaction_head(&prepared.owner)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
+}
+
 // Drive the two persisted backoffs with the fixture clock, without granting
 // another admission or resetting the current portion's three-call budget.
 async fn run_until_invalid_completion(

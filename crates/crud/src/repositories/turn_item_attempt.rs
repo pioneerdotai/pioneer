@@ -13,8 +13,8 @@ use sea_orm::{
 use std::collections::{HashMap, HashSet};
 
 use crate::convention::{
-    ATTEMPT_STATUS_TIMED_OUT, TURN_ITEM_STATUS_IN_PROGRESS, TURN_ITEM_STATUS_TIMED_OUT,
-    turn_item_attempt_status_to_db, turn_item_execution_class_from_db,
+    ATTEMPT_STATUS_RUNNING, ATTEMPT_STATUS_TIMED_OUT, TURN_ITEM_STATUS_IN_PROGRESS,
+    TURN_ITEM_STATUS_TIMED_OUT, turn_item_attempt_status_to_db, turn_item_execution_class_from_db,
     turn_item_execution_class_to_db, turn_item_timeout_reason_from_db,
     turn_item_timeout_reason_to_db, turn_item_type_from_db, turn_item_type_to_db,
     turn_status_to_db,
@@ -454,8 +454,54 @@ fn clears_attempt_payload(status: TurnItemAttemptStatus) -> bool {
     )
 }
 
+pub(crate) async fn has_running_context_preparation<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: Option<&str>,
+    after_sequence: Option<i64>,
+) -> Result<bool> {
+    use turn_item_attempt::Column;
+
+    let query = turn_item_attempt::Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(Column::TurnId.eq(turn_id))
+        .filter(Column::Status.eq(ATTEMPT_STATUS_RUNNING))
+        .filter(system_event_attempt_matches(context_preparation_marker()));
+    let query = match item_id {
+        Some(id) => query.filter(Column::ItemId.eq(id)),
+        None => query,
+    };
+    let query = match after_sequence {
+        Some(sequence) => query.filter(Column::StartedEventSequence.gt(sequence)),
+        None => query,
+    };
+    Ok(query.into_tuple::<String>().one(db).await?.is_some())
+}
+
 /// Match the original start payload, which is retained for running and timed-out attempts.
 pub(crate) fn watchdog_eligible_attempt() -> Expr {
+    let usage = attempt_payload_field("$.code")
+        .eq("provider_usage")
+        .and(attempt_payload_field("$.details.nativeMethod").eq("provider/usage/observed"));
+    system_event_attempt_matches(usage.or(context_preparation_marker())).not()
+}
+
+fn context_preparation_marker() -> Expr {
+    // Match TurnItem::is_context_preparation_observation on the saved start.
+    attempt_payload_field("$.code")
+        .eq("runtime_operation")
+        .and(attempt_payload_field("$.details.operation_kind").eq("context_preparation"))
+}
+
+fn attempt_payload_field(path: &str) -> Expr {
+    Expr::expr(Func::cust(Alias::new("json_extract")).args([
+        Expr::col(turn_item_attempt::Column::Payload),
+        Expr::val(path),
+    ]))
+}
+
+fn system_event_attempt_matches(marker: Expr) -> Expr {
     use turn_item_attempt::Column;
 
     let payload = Expr::col(Column::Payload);
@@ -464,16 +510,9 @@ pub(crate) fn watchdog_eligible_attempt() -> Expr {
         .add(Expr::expr(
             Func::cust(Alias::new("json_valid")).arg(payload.clone()),
         ));
-    let field = |path: &str| {
-        Expr::expr(Func::cust(Alias::new("json_extract")).args([payload.clone(), Expr::val(path)]))
-    };
-    // Keep this marker aligned with TurnItem::is_provider_usage_observation.
-    let usage = field("$.code")
-        .eq("provider_usage")
-        .and(field("$.details.nativeMethod").eq("provider/usage/observed"));
-    let eligible = Expr::case(usage, false).finally(true);
-    Expr::case(is_system_event_with_json, Expr::expr(eligible))
-        .finally(true)
+    let matches = Expr::case(marker, true).finally(false);
+    Expr::case(is_system_event_with_json, Expr::expr(matches))
+        .finally(false)
         .into()
 }
 

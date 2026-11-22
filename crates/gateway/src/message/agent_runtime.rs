@@ -5792,10 +5792,9 @@ impl MessageProcessor {
                 }
                 let event_timestamp = now_timestamp_secs();
                 let item_id = notification.item.item_id().to_owned();
-                let deadlines = (!notification.item.is_provider_usage_observation()).then(|| {
-                    self.timeout_supervisor
-                        .deadlines_for_item(&notification.item, event_timestamp)
-                });
+                let deadlines = self
+                    .timeout_supervisor
+                    .deadlines_for_item(&notification.item, event_timestamp);
                 if let Err(error) = message_future(self.materialize_native_agent_turn_event(
                     pioneer_crud::CanonicalTurnEventPayload::ItemStarted(notification.clone()),
                     event_timestamp,
@@ -7365,12 +7364,13 @@ impl MessageProcessor {
                     .record_recovery_timeout_failure(&candidate, now_unix)
                     .await
                 {
-                    Ok(Some((job_id, events))) => {
+                    Ok(crate::resilience::RecoveryTimeoutOutcome::Recorded(job_id, events)) => {
                         active_recovery_job_id = Some(job_id);
                         active_recovery_events = events;
                         None
                     }
-                    Ok(None) => match self
+                    Ok(crate::resilience::RecoveryTimeoutOutcome::Stale) => None,
+                    Ok(crate::resilience::RecoveryTimeoutOutcome::NoActiveRecovery) => match self
                         .recovery_coordinator
                         .enqueue_timeout_job(&candidate, now_unix)
                         .await

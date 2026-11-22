@@ -21,6 +21,22 @@ pub const MODEL_HISTORY_CONTEXT_SOURCES: [&str; 5] = [
 pub fn model_history_context_source(source: &str) -> bool {
     MODEL_HISTORY_CONTEXT_SOURCES.contains(&source)
 }
+
+pub fn native_owner(workspace: &str, thread: &str) -> String {
+    // Lengths disambiguate arbitrary scope identifiers without parsing them.
+    format!(
+        "native:{}:{workspace}:{}:{thread}",
+        workspace.len(),
+        thread.len()
+    )
+}
+
+impl OperationRecord {
+    pub fn stopped_for_no_progress(&self) -> bool {
+        self.status == "cancelled"
+            && self.outcome.as_deref() == Some(lifecycle::NO_PROGRESS_OUTCOME)
+    }
+}
 pub use super::compaction_lifecycle_pending::{
     CompactionLifecycleCandidate, CompactionLifecycleClaim, CompactionLifecycleStorageError,
 };
@@ -1007,6 +1023,7 @@ pub(crate) async fn compaction_admit_for_turn(
     thread: &str,
     snapshot: &OperationSnapshot,
     execution_turn: Option<&str>,
+    preparation: Option<&str>,
 ) -> Result<OperationRecord> {
     let snapshot_json = serde_json::to_string(snapshot)?;
     ensure!(
@@ -1017,6 +1034,9 @@ pub(crate) async fn compaction_admit_for_turn(
     // Preparation reads no mutable DB state. Owner and format are revalidated inside the write boundary.
     store.run_serialized_write(|| async {
             let txn = store.connection.begin().await?;
+            if let Some(item) = preparation {
+                ensure_current_preparation(&txn, execution_turn.context("missing preparation Turn")?, item).await?;
+            }
             compaction_context::Entity::insert(compaction_context::ActiveModel {workspace_id: sea_orm::Set((workspace).to_owned()), thread_id: sea_orm::Set((thread).to_owned()), owner: sea_orm::Set((snapshot.owner.clone()).to_owned()), ..Default::default() }).on_conflict(OnConflict::columns([compaction_context::Column::Owner]).do_nothing().to_owned()).exec_without_returning(&txn).await?;
             let valid = compaction_context::Entity::find()
             .select_only()
@@ -1089,6 +1109,49 @@ pub(crate) async fn compaction_admit_for_turn(
         .one(&store.connection)
         .await?
         .ok_or_else(|| anyhow::anyhow!("admitted operation missing"))
+}
+
+pub(crate) async fn ensure_current_preparation<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item: &str,
+) -> Result<()> {
+    let active = turn::Entity::find_by_id(turn_id)
+        .select_only()
+        .column(turn::Column::Id)
+        .filter(turn::Column::Status.eq("in_progress"))
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_some();
+    ensure!(
+        active
+            && super::turn_item_attempt::has_running_context_preparation(
+                db,
+                turn_id,
+                Some(item),
+                latest_blocked_sequence(db, turn_id).await?,
+            )
+            .await?,
+        "native context preparation was superseded"
+    );
+    Ok(())
+}
+
+pub(crate) async fn latest_blocked_sequence<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<i64>> {
+    turn_event::Entity::find()
+        .select_only()
+        .column(turn_event::Column::Sequence)
+        .filter(turn_event::Column::TurnId.eq(turn_id))
+        .filter(turn_event::Column::EventType.eq("turn/blocked"))
+        .order_by_desc(turn_event::Column::Sequence)
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .map_err(Into::into)
 }
 
 pub(crate) async fn compaction_operation_for_plan<C: ConnectionTrait>(

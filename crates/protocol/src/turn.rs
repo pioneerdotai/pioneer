@@ -5561,6 +5561,17 @@ impl TurnItem {
         )
     }
 
+    pub fn is_context_preparation_observation(&self) -> bool {
+        matches!(
+            self,
+            Self::SystemEvent {
+                code: Some(code),
+                details: Some(details),
+                ..
+            } if code == "runtime_operation" && details["operation_kind"] == "context_preparation"
+        )
+    }
+
     /// Classifies execution once at the canonical item boundary. Supervisors
     /// consume the class persisted on the attempt and never need to infer
     /// operational semantics from presentation payloads.

@@ -62,6 +62,12 @@ pub struct SupervisionAuditBatch {
     pub errors: Vec<String>,
 }
 
+pub(crate) enum RecoveryTimeoutOutcome {
+    NoActiveRecovery,
+    Stale,
+    Recorded(String, Vec<RecoveryCoordinatorEvent>),
+}
+
 type RecoveryListenerStarter =
     Arc<dyn Fn(String) -> BoxFuture<'static, std::result::Result<(), String>> + Send + Sync>;
 
@@ -1196,11 +1202,11 @@ impl RecoveryCoordinator {
         Ok(Vec::new())
     }
 
-    pub async fn record_recovery_timeout_failure(
+    pub(crate) async fn record_recovery_timeout_failure(
         &self,
         candidate: &TimeoutCandidate,
         now_unix: i64,
-    ) -> Result<Option<(String, Vec<RecoveryCoordinatorEvent>)>> {
+    ) -> Result<RecoveryTimeoutOutcome> {
         let jobs = self
             .crud_store
             .find_recovery_jobs_by_turn_and_status(
@@ -1208,43 +1214,57 @@ impl RecoveryCoordinator {
                 RecoveryJobStatus::Active,
             )
             .await?;
-        if jobs.is_empty() {
-            return Ok(None);
-        }
+        let Some(job) = jobs.into_iter().next() else {
+            return Ok(RecoveryTimeoutOutcome::NoActiveRecovery);
+        };
+        let start_sequence = job.policy_snapshot["active_attempt_start_sequence"].as_i64();
+        // Activation captures the durable stream frontier under the same
+        // writer as the attempt ID. Backfill uses the original item sequence.
+        let Some(active_attempt_id) = job.active_attempt_id.clone().filter(|_| {
+            start_sequence
+                .zip(candidate.started_event_sequence)
+                .is_some_and(|(frontier, item)| item > frontier)
+        }) else {
+            let _ = self
+                .crud_store
+                .suppress_timeout_candidate_recovery(
+                    candidate,
+                    "outside_active_recovery_attempt",
+                    serde_json::json!({
+                        "active_attempt_start_sequence": start_sequence,
+                        "item_started_event_sequence": candidate.started_event_sequence,
+                    }),
+                    now_unix,
+                )
+                .await?;
+            return Ok(RecoveryTimeoutOutcome::Stale);
+        };
 
-        if jobs[0].active_attempt_id.is_none() {
-            return Ok(None);
-        }
-        let recovery_job_id = jobs[0].id.clone();
+        let recovery_job_id = job.id.clone();
         let _ = self
             .crud_store
-            .mark_attempt_recovery_action(candidate.attempt_id.as_str(), jobs[0].action, now_unix)
+            .mark_attempt_recovery_action(candidate.attempt_id.as_str(), job.action, now_unix)
             .await?;
-
-        let mut events = Vec::new();
         let message = Some(format!(
             "recovery attempt timed out with {:?}",
             candidate.timeout_reason
         ));
-        for job in jobs {
-            let Some(job_active_attempt_id) = job.active_attempt_id.clone() else {
-                continue;
-            };
-            events.extend(
-                self.record_active_recovery_failure(
-                    job,
-                    job_active_attempt_id.as_str(),
-                    message.clone(),
-                    None,
-                    None,
-                    now_unix,
-                    None,
-                )
-                .await?,
-            );
+        let events = self
+            .record_active_recovery_failure(
+                job,
+                &active_attempt_id,
+                message,
+                None,
+                None,
+                now_unix,
+                None,
+            )
+            .await?;
+        // The active-attempt CAS may have lost to a newer attempt.
+        if events.is_empty() {
+            return Ok(RecoveryTimeoutOutcome::Stale);
         }
-
-        Ok(Some((recovery_job_id, events)))
+        Ok(RecoveryTimeoutOutcome::Recorded(recovery_job_id, events))
     }
 
     async fn record_active_recovery_failure(
@@ -3091,6 +3111,12 @@ impl RecoveryCoordinator {
                 now_unix,
             )
             .await?;
+        // Explicit Resume clears the last failure attempt while retaining the
+        // diagnostic. Give that one dispatch a window to make progress again.
+        let explicit_no_progress_resume = job.action == RecoveryAction::RestartTurn
+            && job.last_failure_attempt_id.is_none()
+            && job.diagnostic.as_ref().and_then(|value| value.stop_reason)
+                == Some(pioneer_protocol::RecoveryStopReason::NoProgress);
         if let Some(context) = execution_checkpoint_context.as_ref()
             && let ExecutionWindowContinuationAdmission::Block {
                 reason,
@@ -3102,6 +3128,8 @@ impl RecoveryCoordinator {
                     Some(context.window_index),
                 )
                 .await?
+            && !(explicit_no_progress_resume
+                && stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress))
         {
             return self
                 .block_active_recovery(job, active_attempt_id, reason, stop_reason, now_unix)
@@ -4585,18 +4613,22 @@ impl RecoveryCoordinator {
                     return Ok(());
                 }
 
-                if let Some((_job_id, active_events)) = self
+                match self
                     .record_recovery_timeout_failure(&candidate, now_unix)
                     .await?
                 {
-                    events.extend(active_events);
-                } else {
-                    let outcome = self.enqueue_timeout_job(&candidate, now_unix).await?;
-                    events.push(recovery_enqueue_event_from_outcome(
-                        &candidate,
-                        RecoveryTrigger::Timeout,
-                        outcome,
-                    ));
+                    RecoveryTimeoutOutcome::Recorded(_, active_events) => {
+                        events.extend(active_events)
+                    }
+                    RecoveryTimeoutOutcome::Stale => {}
+                    RecoveryTimeoutOutcome::NoActiveRecovery => {
+                        let outcome = self.enqueue_timeout_job(&candidate, now_unix).await?;
+                        events.push(recovery_enqueue_event_from_outcome(
+                            &candidate,
+                            RecoveryTrigger::Timeout,
+                            outcome,
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -5842,8 +5874,8 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
-        RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RecoveryTimeoutOutcome,
+        RetainedProviderHistoryRow, RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
         assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
     };
     use migration::{Migrator, MigratorTrait};
@@ -10212,7 +10244,12 @@ mod tests {
             assert_eq!(outcome.error_message, diagnostic.public_message());
             assert_eq!(saved.action, job.action);
             assert_eq!(saved.error_class, job.error_class);
-            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            let mut saved_policy = saved.policy_snapshot.clone();
+            saved_policy
+                .as_object_mut()
+                .unwrap()
+                .remove("active_attempt_start_sequence");
+            assert_eq!(saved_policy, job.policy_snapshot);
             assert_eq!(saved.run_count, 1);
         }
     }
@@ -10420,7 +10457,12 @@ mod tests {
         );
         assert_eq!(pending.transport_stage, Some(initial.stage));
         assert_eq!(pending.action, job.action);
-        assert_eq!(pending.policy_snapshot, job.policy_snapshot);
+        let mut saved_policy = pending.policy_snapshot.clone();
+        saved_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("active_attempt_start_sequence");
+        assert_eq!(saved_policy, job.policy_snapshot);
         assert_eq!(
             pending.diagnostic.as_ref().unwrap().last_failure,
             Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
@@ -10589,6 +10631,7 @@ mod tests {
             .into_job();
         assert_eq!(job.next_run_at_unix, now + 2);
         assert_eq!(job.scheduled_at_unix, now + 2);
+        let initial_policy = job.policy_snapshot.clone();
         let restarted = Arc::new(CrudStore::new(store.database_connection()));
         for run in 1..=3 {
             // Recreate the coordinator between attempts: only durable state
@@ -10637,7 +10680,12 @@ mod tests {
             assert_eq!(saved.run_count, run);
             assert_eq!(saved.provider_attempt_number, run);
             assert_eq!(saved.max_attempts, 3);
-            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            let mut saved_policy = saved.policy_snapshot.clone();
+            saved_policy
+                .as_object_mut()
+                .unwrap()
+                .remove("active_attempt_start_sequence");
+            assert_eq!(saved_policy, initial_policy);
             assert_eq!(
                 saved.diagnostic.as_ref().unwrap().last_failure,
                 Some(pioneer_protocol::RecoveryProviderFailure::from(&renewed))
@@ -11463,6 +11511,43 @@ mod tests {
     async fn late_provider_failure_after_timeout_is_stale_noop() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_late_provider_failure";
+        let workspace = "late-timeout-workspace";
+        let thread = "late-timeout-thread";
+        materialize_turn_with_tool_item(
+            &crud_store,
+            workspace,
+            thread,
+            turn_id,
+            "fixture-tool",
+            None,
+        )
+        .await;
+        let start_reasoning = |id: &'static str| {
+            let store = crud_store.clone();
+            async move {
+                store
+                    .materialize_item_started_with_attempt_deadlines(
+                        ItemStartedNotification {
+                            workspace_id: workspace.into(),
+                            thread_id: thread.into(),
+                            turn_id: turn_id.into(),
+                            item: TurnItem::Reasoning {
+                                id: id.into(),
+                                summary: vec![],
+                                content: vec![],
+                            },
+                        },
+                        1_700_000_001,
+                        pioneer_crud::TurnItemAttemptDeadlines {
+                            hard_deadline_at_unix: Some(1_700_000_003),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        start_reasoning("previous_reasoning").await;
         let job = coordinator
             .enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
@@ -11477,21 +11562,50 @@ mod tests {
             .expect("initial provider failure should enqueue")
             .into_job();
         let active_attempt_id = claim_and_activate(crud_store.as_ref(), job.id.as_str()).await;
+        start_reasoning("recovery_reasoning").await;
+        let candidates = crud_store
+            .list_timeout_candidates(1_700_000_004, 8)
+            .await
+            .unwrap();
+        let old = candidates
+            .iter()
+            .find(|candidate| candidate.item_id == "previous_reasoning")
+            .unwrap();
+        let current = candidates
+            .iter()
+            .find(|candidate| candidate.item_id == "recovery_reasoning")
+            .unwrap();
+        assert_eq!(old.started_at_unix, current.started_at_unix);
+        for candidate in [old, current] {
+            assert!(
+                crud_store
+                    .transition_timeout_candidate(candidate, 1_700_000_004)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(matches!(
+            coordinator
+                .record_recovery_timeout_failure(old, 1_700_000_004)
+                .await
+                .unwrap(),
+            RecoveryTimeoutOutcome::Stale
+        ));
+        let still_active = crud_store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            still_active.active_attempt_id.as_deref(),
+            Some(active_attempt_id.as_str())
+        );
+        assert_eq!(still_active.run_count, 0);
 
-        let timeout_result = coordinator
-            .record_recovery_timeout_failure(
-                &timeout_candidate(
-                    "attempt_timeout_before_late_provider",
-                    turn_id,
-                    "recovery_reasoning",
-                    TurnItemType::Reasoning,
-                ),
-                1_700_000_002,
-            )
+        let RecoveryTimeoutOutcome::Recorded(job_id, timeout_events) = coordinator
+            .record_recovery_timeout_failure(current, 1_700_000_004)
             .await
             .expect("timeout inside active recovery should be recorded")
-            .expect("active recovery job should be used");
-        assert_eq!(timeout_result.0, job.id);
+        else {
+            panic!("active recovery job should be used");
+        };
+        assert_eq!(job_id, job.id);
         assert_eq!(
             crud_store
                 .count_recovery_jobs_for_turn(turn_id)
@@ -11506,10 +11620,9 @@ mod tests {
             .unwrap();
         assert_eq!(immediate.status, RecoveryJobStatus::Pending);
         assert_eq!(immediate.run_count, 1);
-        let timeout_events = timeout_result.1;
         assert!(matches!(
             timeout_events.as_slice(),
-            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id == &job.id
+            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id.as_str() == job.id.as_str()
         ));
 
         let late_events = coordinator
@@ -11520,7 +11633,7 @@ mod tests {
                     ProviderFailureClass::NetworkTransient,
                     "late provider failure after timeout",
                 ),
-                1_700_000_003,
+                1_700_000_005,
                 None,
             )
             .await

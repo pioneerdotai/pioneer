@@ -374,15 +374,18 @@ impl TimeoutSupervisor {
         &self,
         item: &TurnItem,
         started_at_unix: i64,
-    ) -> TurnItemAttemptDeadlines {
+    ) -> Option<TurnItemAttemptDeadlines> {
+        if item.is_provider_usage_observation() || item.is_context_preparation_observation() {
+            return None;
+        }
         let policy = self.policy_registry.policy_for_item(item);
         let (lease_expires_at, idle_deadline_at, hard_deadline_at) =
             policy.deadlines(started_at_unix);
-        TurnItemAttemptDeadlines {
+        Some(TurnItemAttemptDeadlines {
             lease_expires_at_unix: Some(lease_expires_at),
             idle_deadline_at_unix: Some(idle_deadline_at),
             hard_deadline_at_unix: Some(hard_deadline_at),
-        }
+        })
     }
 
     pub async fn backfill_missing_deadlines(&self, limit: u64) -> Result<usize> {

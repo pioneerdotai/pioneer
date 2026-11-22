@@ -85481,6 +85481,378 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
 }
 
 #[tokio::test]
+async fn native_preparation_crosses_system_event_deadline_between_compaction_portions() {
+    check_foreground_native_preparation(false).await;
+}
+
+#[tokio::test]
+async fn native_preparation_still_stops_at_the_compaction_deadline() {
+    check_foreground_native_preparation(true).await;
+}
+
+async fn check_foreground_native_preparation(expire: bool) {
+    use pioneer_compaction::summary::{HEADINGS, SummaryInput};
+    use pioneer_provider::catalog::{CatalogLimits, OriginKind};
+
+    #[derive(Default)]
+    struct ProviderFixture {
+        portions: std::sync::Mutex<Vec<Vec<(String, u64, u64)>>>,
+        third_parent: std::sync::Mutex<Option<String>>,
+        third_portion: Notify,
+        release_summary: Notify,
+        main_calls: AtomicUsize,
+        main_request: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ProviderFixture {
+        fn name(&self) -> &str {
+            "preparation-fixture"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            CaptureSummaryProvider::new("").capabilities()
+        }
+
+        async fn model_limits(&self, model: &str) -> anyhow::Result<CatalogLimits> {
+            Ok(CatalogLimits {
+                context_window: if model == "summary-model" {
+                    6144
+                } else {
+                    16384
+                },
+                context_origin: OriginKind::Source,
+                max_input: None,
+                max_output: Some(2048),
+            })
+        }
+
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            let text = if request.model == "summary-model" {
+                let input: SummaryInput =
+                    serde_json::from_str(&request.messages.last().unwrap().content)?;
+                let call = {
+                    let mut portions = self.portions.lock().unwrap();
+                    portions.push(
+                        input
+                            .compact_units
+                            .iter()
+                            .map(|part| (part.sources[0].id.clone(), part.unit, part.part))
+                            .collect(),
+                    );
+                    portions.len()
+                };
+                if call == 3 {
+                    *self.third_parent.lock().unwrap() =
+                        pioneer_provider::usage::current_causal_parent();
+                    self.third_portion.notify_one();
+                    self.release_summary.notified().await;
+                }
+                HEADINGS
+                    .iter()
+                    .map(|heading| format!("{heading}\nRetained fixture fact."))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                assert_eq!(request.model, "test-model");
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("Retained fixture fact."))
+                );
+                self.main_calls.fetch_add(1, Ordering::SeqCst);
+                self.main_request.notify_one();
+                "fixture answer".into()
+            };
+            Ok(ChatResponse {
+                messages: Vec::new(),
+                text,
+                usage: None,
+                reasoning_content: None,
+                provider_replay_state: None,
+                termination: pioneer_provider::ProviderTermination::Complete,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("fixture uses the non-streaming provider path")
+        }
+    }
+
+    crate::compaction::load_test_catalog();
+    let provider = Arc::new(ProviderFixture::default());
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    registry
+        .insert("summary-capture", provider.clone())
+        .unwrap();
+    let harness = setup_phase_13_compaction_harness(registry).await;
+    let Phase13CompactionHarness {
+        processor,
+        crud_store: store,
+        workspace_id: workspace,
+    } = harness;
+    processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            selection: Some(pioneer_compaction::ModelSelection {
+                service_mode: None,
+                context_authority: None,
+                context_window: None,
+                transport: pioneer_compaction::Transport::Api,
+                instance: "summary-capture".into(),
+                model: "summary-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    processor.bind_context_compaction().await;
+
+    let thread_id = "paced-native-thread";
+    let turn_id = "paced-native-turn";
+    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
+    let sessions = &processor.session_manager;
+    let connection = register_authenticated_test_connection(sessions, tx).await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let actor = pioneer_protocol::PersistedActorRef::Principal(
+        authenticated_test_superuser().principal_id.clone(),
+    );
+    let started_at = phase_13_now_secs() - 10;
+    let thread = processor
+        .thread_manager
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: thread_id.into(),
+                workspace_id: workspace.clone(),
+                name: Some("Paced native compaction".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Chat),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .response
+        .thread;
+    for (historical, text, timestamp) in [
+        (
+            "paced-old-turn",
+            "historical account ".repeat(12_000),
+            started_at,
+        ),
+        (
+            "paced-recent-turn",
+            "Short recent answer".into(),
+            started_at + 3,
+        ),
+    ] {
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &phase_13_turn(historical, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: "Prior request".into(),
+                    text_elements: Vec::new(),
+                }],
+                actor.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread_id.into(),
+                    turn_id: historical.into(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("{historical}-answer"),
+                        text,
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp + 1,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace.clone(),
+                    thread_id: thread_id.into(),
+                    turn: phase_13_turn(historical, TurnStatus::Completed),
+                },
+                timestamp + 2,
+            )
+            .await
+            .unwrap();
+    }
+
+    let request_id = generate_test_request_id("preparation", "start");
+    processor
+        .clone()
+        .process_owned_request(
+            sessions.connection_context(connection).await.unwrap(),
+            json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
+                "params": { "thread_id":thread_id, "turn_id":turn_id,
+                    "input":[{"type":"text","text":"Please continue"}],
+                    "model":"test-model", "model_provider":"openai", "mode":"Chat" }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+    timeout(Duration::from_secs(20), provider.third_portion.notified())
+        .await
+        .expect("two portions must finish before the third provider request");
+    let preparation = store
+        .list_turn_items_by_type(turn_id, "system_event")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.is_context_preparation_observation())
+        .expect("preparation start is durable during compaction");
+    let observation_id = format!("item:{turn_id}:{}", preparation.item_id());
+    let observation = store
+        .execution_observation_latest(&workspace, thread_id, &observation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.status, "started");
+    assert_eq!(
+        provider.third_parent.lock().unwrap().as_deref(),
+        Some(observation_id.as_str())
+    );
+
+    let owner = crate::compaction::native_owner(&workspace, thread_id);
+    tokio::time::pause();
+    let elapsed = if expire {
+        Duration::from_millis(pioneer_compaction::OPERATION_MILLIS)
+    } else {
+        Duration::from_secs(121)
+    };
+    // The runner uses Tokio time and the item watchdog accepts a Unix clock sample.
+    tokio::time::advance(elapsed).await;
+    tokio::time::resume();
+    if !expire {
+        let now = phase_13_now_secs() + elapsed.as_secs() as i64;
+        let (candidates, next) = processor
+            .poll_timeout_candidate_page_for_turn(turn_id, now, 64, None)
+            .await
+            .unwrap();
+        assert!(next.is_none());
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.item_id != preparation.item_id())
+        );
+        for candidate in candidates {
+            processor.handle_timeout_candidate(candidate, now).await;
+        }
+        // A Gateway from before the fix could leave deadlines on a running
+        // observation. Even an expired persisted hard deadline is ignored.
+        let start = store
+            .get_running_turn_item_attempt(turn_id, preparation.item_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .started_at_unix;
+        assert!(
+            store
+                .configure_turn_item_attempt_deadlines(
+                    turn_id,
+                    preparation.item_id(),
+                    start,
+                    Some(start + 30),
+                    Some(start + 30),
+                    Some(start + 120),
+                )
+                .await
+                .unwrap()
+        );
+        let (candidates, _) = processor
+            .poll_timeout_candidate_page_for_turn(turn_id, now, 64, None)
+            .await
+            .unwrap();
+        assert!(candidates.is_empty());
+        provider.release_summary.notify_one();
+        timeout(Duration::from_secs(20), provider.main_request.notified())
+            .await
+            .expect("the first main request must follow compaction");
+        assert_eq!(
+            store.count_recovery_jobs_for_turn(turn_id).await.unwrap(),
+            0
+        );
+        let portions = provider.portions.lock().unwrap();
+        assert!(portions.len() >= 3);
+        let mut sent = std::collections::HashSet::new();
+        assert!(
+            portions
+                .iter()
+                .all(|portion| !portion.is_empty() && portion.iter().all(|part| sent.insert(part)))
+        );
+        drop(portions);
+        assert!(store.compaction_head(&owner).await.unwrap().is_some());
+    }
+    let expected = if expire { "failed" } else { "completed" };
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let observation = store
+                .execution_observation_latest(&workspace, thread_id, &observation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if observation.status == expected {
+                assert!(observation.elapsed_ns.is_some());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("preparation must record its terminal observation");
+    if expire {
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
+        assert!(store.compaction_head(&owner).await.unwrap().is_none());
+        assert_eq!(provider.portions.lock().unwrap().len(), 3);
+        let row = store
+            .database_connection()
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT outcome FROM compaction_operation WHERE owner=? AND execution_turn=?",
+                [owner.into(), turn_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "deadline");
+    }
+}
+
+#[tokio::test]
 async fn compaction_native_controller_runs_on_real_turn_and_checks_short_completed_history() {
     let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
     let sessions = Arc::new(SessionManager::new());
@@ -89813,7 +90185,12 @@ async fn recovery_failure_task_consumers_impl(
     let terminal = store.get_recovery_job(&job.id).await.unwrap().unwrap();
     let expected_diagnostic = terminal.diagnostic.unwrap();
     let expected = expected_diagnostic.public_message();
-    assert_eq!(terminal.policy_snapshot, job.policy_snapshot);
+    let mut saved_policy = terminal.policy_snapshot.clone();
+    saved_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("active_attempt_start_sequence");
+    assert_eq!(saved_policy, job.policy_snapshot);
     assert_eq!(terminal.action, job.action);
     assert_eq!(terminal.error_class, job.error_class);
     let expected_stop = match scenario {
