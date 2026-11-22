@@ -1561,7 +1561,7 @@ async fn dev_fixture_endpoint(
     )
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let grants = crate::view_grants::ViewGrantService::new(&Default::default()).unwrap();
@@ -2122,7 +2122,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
 }
 
 // File-event regression sources only: NOT_RUN / NOT_COMPILED.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dev_app_observes_repairs_of_invalid_nested_skills_after_restart_and_creation() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = tempfile::tempdir().unwrap();

@@ -145,8 +145,12 @@ async fn conflicting_trigger_rolls_back_the_rule_migration_and_leaves_the_databa
 -> Result<()> {
     with_empty_database(async |fixture| {
         let db = fixture.connection();
-        let migration_count = u32::try_from(Migrator::migrations().len())?;
-        Migrator::up(db, Some(migration_count - 1)).await?;
+        let migrations = Migrator::migrations();
+        let preceding = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20261119_000010_database_rules")
+            .context("database rule migration is registered")?;
+        Migrator::up(db, Some(u32::try_from(preceding)?)).await?;
         db.execute_unprepared(
             "INSERT INTO workspace(id,name) VALUES ('rollback-fixture','Retained');
              CREATE FUNCTION fixture_task_event() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -155,11 +159,21 @@ async fn conflicting_trigger_rolls_back_the_rule_migration_and_leaves_the_databa
              FOR EACH ROW EXECUTE FUNCTION fixture_task_event();",
         )
         .await?;
-        let error = Migrator::up(db, None)
+        let error = Migrator::up(db, Some(1))
             .await
             .expect_err("repeated trigger name must fail");
         assert!(error.to_string().contains("task_event_fanout_append"));
-        assert_eq!(Migrator::get_pending_migrations(db).await?.len(), 1);
+        assert_eq!(
+            Migrator::get_pending_migrations(db)
+                .await?
+                .iter()
+                .map(|migration| migration.name())
+                .collect::<Vec<_>>(),
+            migrations[preceding..]
+                .iter()
+                .map(|migration| migration.name())
+                .collect::<Vec<_>>(),
+        );
         assert!(
             !scalar::<bool>(
                 db,

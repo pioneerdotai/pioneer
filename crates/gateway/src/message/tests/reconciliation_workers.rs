@@ -314,9 +314,16 @@ pub(super) fn local_capture() -> (
     tracing::Dispatch,
 ) {
     let transport = sentry::test::TestTransport::new();
+    let (hub, dispatch) = capture_with_transport(transport.clone());
+    (hub, transport, dispatch)
+}
+
+fn capture_with_transport(
+    transport: Arc<impl sentry::Transport>,
+) -> (Arc<sentry::Hub>, tracing::Dispatch) {
     let options = sentry::ClientOptions::new()
         .dsn("https://public@sentry.invalid/1")
-        .transport(transport.clone());
+        .transport(transport);
     let hub = Arc::new(sentry::Hub::new(
         Some(Arc::new(options.into())),
         Arc::new(Default::default()),
@@ -324,11 +331,21 @@ pub(super) fn local_capture() -> (
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer()),
     );
-    (hub, transport, dispatch)
+    (hub, dispatch)
 }
 
 #[pioneer_postgres_test::postgres_test]
 async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
+    struct EventTransport(tokio::sync::mpsc::UnboundedSender<sentry::protocol::Event<'static>>);
+
+    impl sentry::Transport for EventTransport {
+        fn send_envelope(&self, envelope: sentry::Envelope) {
+            if let Some(event) = envelope.event() {
+                let _ = self.0.send(event.clone());
+            }
+        }
+    }
+
     let (mut processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     // Keep writer settlement available: closing both pools stops recovery at
     // begin_pass after an uncertain write, before either domain reporter runs.
@@ -341,11 +358,8 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
         reader, writer,
     )));
     let processor = Arc::new(processor);
-    // Pause after PostgreSQL opens both pools, so virtual time cannot advance
-    // the connection timeout before the physical setup has completed.
-    tokio::time::pause();
-    let _resume_clock = ResumeTokioClock;
-    let (hub, transport, dispatch) = local_capture();
+    let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
+    let (hub, dispatch) = capture_with_transport(Arc::new(EventTransport(capture)));
     let projection = tokio::spawn(
         MessageProcessor::run_projection_delivery_resilience_worker(Arc::downgrade(&processor))
             .with_subscriber(dispatch.clone())
@@ -357,45 +371,32 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             .bind_hub(hub),
     );
     let mut events = Vec::new();
-    // Existing replay/child errors mark successive real recovery passes.
-    // Delivery now runs in the independent, coalesced consumer owners.
-    for pass in 1..=3 {
-        let mut completed = false;
-        for _ in 0..1024 {
-            tokio::task::yield_now().await;
-            events.extend(transport.fetch_and_clear_events());
-            let projection_passes = events
-                .iter()
-                .filter(|event| {
-                    event.message.as_deref() == Some("turn event projection replay failed")
-                })
-                .count();
-            let lifecycle_passes = events
-                .iter()
-                .filter(|event| {
-                    event.message.as_deref() == Some("task child terminal reconciler failed")
-                })
-                .count();
-            if projection_passes >= pass && lifecycle_passes >= pass {
-                completed = true;
-                break;
+    let mut projection_passes = 0;
+    let mut lifecycle_passes = 0;
+    // A third pass entering each loop proves the first two reached their
+    // reporters. Real PostgreSQL I/O and the retry clock advance together.
+    let completed = timeout(Duration::from_secs(20), async {
+        while projection_passes < 3 || lifecycle_passes < 3 {
+            let event = captured.recv().await.expect("worker diagnostics stream");
+            match event.message.as_deref() {
+                Some("turn event projection replay failed") => projection_passes += 1,
+                Some("task child terminal reconciler failed") => lifecycle_passes += 1,
+                _ => {}
             }
-            // Existing retry policy also retries the ConnectionAcquire wrapper;
-            // drive its backoff without changing production timing or sleeping.
-            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            events.push(event);
         }
-        assert!(
-            completed,
-            "both workers must finish their real reconciliation pass"
-        );
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    }
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "both workers must complete repeated passes (projection entered {projection_passes}, lifecycle entered {lifecycle_passes})",
+    );
     projection.abort();
     lifecycle.abort();
     let _ = projection.await;
     let _ = lifecycle.await;
     processor.shutdown_resilience_workers().await;
-    events.extend(transport.fetch_and_clear_events());
+    events.extend(std::iter::from_fn(|| captured.try_recv().ok()));
     let diagnostics: Vec<_> = events
         .iter()
         .filter(|event| {

@@ -1,5 +1,5 @@
 //! Schema lifecycle and native constraint proof, independent of CRUD preflight.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use migration::{Migrator, MigratorTrait, SchemaManager};
 use pioneer_entity::{app_installation, package_installation, workspace};
 use pioneer_postgres_test::with_empty_database;
@@ -101,7 +101,13 @@ async fn app_workspace_rules_reapply_enforces_scope_and_preserves_installations(
         assert!(renamed.update(db).await.is_err());
         // The PostgreSQL rules migration owns triggers separately from table data.
         // Roll back those rules, verify that the table survives, then reinstall them.
-        Migrator::down(db, Some(1)).await?;
+        let applied = Migrator::get_applied_migrations(db).await?;
+        let rules = applied
+            .iter()
+            .position(|migration| migration.name() == "m20261119_000010_database_rules")
+            .context("app rules migration is applied")?;
+        let rollback_steps = u32::try_from(applied.len() - rules)?;
+        Migrator::down(db, Some(rollback_steps)).await?;
         assert!(SchemaManager::new(db).has_table("app_installation").await?);
         assert!(!slug_trigger_installed(db).await?);
         Migrator::up(db, None).await?;

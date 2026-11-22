@@ -286,6 +286,7 @@ async fn operator_pools(
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
+    use migration::{Migrator, MigratorTrait};
     use pioneer_observability::DatabaseOperation;
     use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
 
@@ -333,7 +334,11 @@ mod tests {
             let history = super::inspect_applied_migration_names(home.path(), &config)
                 .await?
                 .expect("development database has migration history");
-            assert_eq!(history.len(), 10);
+            let expected_history = Migrator::migrations()
+                .iter()
+                .map(|migration| migration.name().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(history, expected_history);
             first.close().await?;
 
             let (restarted, process) =

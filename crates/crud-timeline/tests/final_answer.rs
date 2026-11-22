@@ -54,9 +54,11 @@ async fn legacy_final_selector_rejects_commentary_and_ambiguous_finals() {
                     upsert_prepared_turn_item(&tx, prepared).await?;
                     tx.commit().await?;
                 }
+                let tx = db.begin().await?;
                 update_turn_status(
-                    &db, "thr_legacy_select", "turn_legacy_select", TurnStatus::Completed, None, at,
+                    &tx, "thr_legacy_select", "turn_legacy_select", TurnStatus::Completed, None, at,
                 ).await?;
+                tx.commit().await?;
                 assert_eq!(
                     store
                         .completed_turn_final_answer(
