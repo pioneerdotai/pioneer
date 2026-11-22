@@ -30,6 +30,9 @@ pub struct NativeInputReceipt {
     /// Exact serialized-message identities including source versions. This is
     /// metadata only; the provider prompt is never copied into a usage record.
     pub messages: Vec<SourceRef>,
+    /// Room in the admitted request for newly produced text results. This is
+    /// preparation metadata and does not participate in calibration identity.
+    pub remaining_input_tokens: Option<u64>,
 }
 impl NativeInputReceipt {
     /// Bind calibration to the entire request shape, the provider's authority,
@@ -96,6 +99,7 @@ impl NativeInputReceipt {
                 checkpoint,
             },
             messages,
+            remaining_input_tokens: None,
         })
     }
 

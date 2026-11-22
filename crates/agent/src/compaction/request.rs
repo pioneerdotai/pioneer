@@ -109,15 +109,19 @@ impl NativeRequestProjection {
             estimates.keys().all(|key| used.contains(key)),
             "media estimate belongs to another request"
         );
-        // A summary candidate deliberately replaces history. Choose full-list
-        // before sizing its envelope/fixed input, and keep that choice in the
-        // returned request. Full/shrink paths reject stale proofs without an
-        // estimator-only rebuild. Unchanged native prefixes retain their plan.
-        request.tool_declarations = if compact.is_empty() {
-            pioneer_provider::tool_declarations::ToolDeclarations::for_request(&request)
-        } else {
-            None
-        };
+        // Preflight selected the adapter's wire form. If compaction replaces
+        // the history, keep that form with a single initial batch for the new prefix.
+        request.tool_declarations =
+            pioneer_provider::tool_declarations::ToolDeclarations::for_request(&request);
+        if !compact.is_empty() && request.tool_declarations.is_some() {
+            request.tool_declarations = Some(
+                pioneer_provider::tool_declarations::ToolDeclarations::reconcile(
+                    None,
+                    &[],
+                    request.tools.as_deref().unwrap_or_default(),
+                )?,
+            );
+        }
         let output_reserve = budget.output_reserve(request.max_tokens.map(u64::from))?;
         request.max_tokens = Some(u32::try_from(output_reserve)?);
         let mut message_sizes = Vec::with_capacity(request.messages.len());
@@ -250,6 +254,11 @@ impl NativeRequestProjection {
             messages.push(message);
         }
         request.messages = messages;
+        if !self.compact.is_empty()
+            && let Some(plan) = &mut request.tool_declarations
+        {
+            plan.bind_replacement(&request.messages)?;
+        }
         let estimated_input_tokens = tokens_from_utf16(units).saturating_add(media_tokens);
         if let Some(prompt) = &mut request.compiled_prompt {
             let diagnostics = prompt
@@ -656,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_candidate_selects_full_list_in_request_budget_and_receipt() {
+    fn compaction_candidate_binds_initial_batch_to_the_replacement_prefix() {
         use super::super::controller::{NativeInputReceipt, NativeUsageMeasurement};
         use pioneer_provider::tool_declarations::ToolDeclarations;
         let mut source = request();
@@ -690,21 +699,17 @@ mod tests {
             candidate.request.messages[1].content,
             "Summary of completed work (historical data):\ncompleted old work"
         );
-        assert_full_list_accounting(&candidate);
         assert_eq!(serde_json::to_vec(&source.messages).unwrap(), original);
-        let fallback_receipt =
+        assert!(ToolDeclarations::for_request(&candidate.request).is_some());
+        let native_receipt =
             NativeInputReceipt::for_request(&candidate.request, "instance", "responses", 1, None)
                 .unwrap();
-        // Identical final messages/tools, but a genuinely new native baseline.
-        let mut fresh = candidate.request.clone();
-        fresh.tool_declarations = Some(
-            ToolDeclarations::reconcile(None, &fresh.messages, fresh.tools.as_deref().unwrap())
-                .unwrap(),
-        );
-        let fresh = NativeRequestProjection::full(fresh, vec![], budget, false).unwrap();
-        assert!(fresh.request.tool_declarations.is_some());
-        let native_receipt =
-            NativeInputReceipt::for_request(&fresh.request, "instance", "responses", 1, None)
+        let mut fallback = candidate.request.clone();
+        fallback.tool_declarations = None;
+        let fallback = NativeRequestProjection::full(fallback, vec![], budget, false).unwrap();
+        assert_full_list_accounting(&fallback);
+        let fallback_receipt =
+            NativeInputReceipt::for_request(&fallback.request, "instance", "responses", 1, None)
                 .unwrap();
         assert_eq!(fallback_receipt.messages, native_receipt.messages);
         assert_ne!(
@@ -718,8 +723,8 @@ mod tests {
         assert_eq!(
             fallback_receipt
                 .calibrated_estimate(
-                    candidate.estimated_input_tokens,
-                    &candidate.message_input_tokens,
+                    fallback.estimated_input_tokens,
+                    &fallback.message_input_tokens,
                     Some(&measured)
                 )
                 .unwrap()
@@ -769,7 +774,7 @@ mod tests {
             .request;
         assert!(prepared.tool_declarations.is_some());
         let original_result = prepared.messages[1].clone();
-        // Same production reducer used by Gateway shrink_results, without DB setup.
+        // A changed result makes an already selected positional proof stale.
         prepared.messages[1] = crate::compaction::restored_tool_result_with_budget(
             &original_result,
             "saved-source",

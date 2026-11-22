@@ -79944,6 +79944,14 @@ struct Phase13CompactionHarness {
 async fn setup_phase_13_compaction_harness(
     provider_registry: Arc<pioneer_provider::ProviderRegistry>,
 ) -> Phase13CompactionHarness {
+    setup_phase_13_compaction_harness_with_tool_config(provider_registry, test_tool_loop_config())
+        .await
+}
+
+async fn setup_phase_13_compaction_harness_with_tool_config(
+    provider_registry: Arc<pioneer_provider::ProviderRegistry>,
+    tool_loop_config: ToolLoopConfig,
+) -> Phase13CompactionHarness {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -79955,7 +79963,7 @@ async fn setup_phase_13_compaction_harness(
         crud_store.clone(),
         test_gateway_secrets(),
         phase_13_summary_config(),
-        test_tool_loop_config(),
+        tool_loop_config,
     ));
 
     Phase13CompactionHarness {
