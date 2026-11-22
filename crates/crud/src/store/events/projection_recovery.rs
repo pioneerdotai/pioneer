@@ -379,14 +379,12 @@ impl CrudStore {
                 };
 
                 let projected = self
-                    .run_serialized_write(|| {
-                        self.project_claimed_turn_event_once(
-                            appended_event.clone(),
-                            projection_context.clone(),
-                            claim_token.clone(),
-                            now,
-                        )
-                    })
+                    .project_claimed_turn_event(
+                        appended_event,
+                        projection_context,
+                        claim_token.clone(),
+                        now,
+                    )
                     .await;
 
                 match projected {

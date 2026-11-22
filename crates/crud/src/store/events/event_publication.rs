@@ -435,20 +435,14 @@ impl CrudStore {
             return Ok(());
         }
 
-        let projection = retry_with_backoff(
-            || {
-                self.project_claimed_turn_event_once(
-                    appended_event.clone(),
-                    projection_context.clone(),
-                    claim_token.clone(),
-                    created_at,
-                )
-            },
-            is_retryable_database_conflict,
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-        .await;
+        let projection = self
+            .project_claimed_turn_event(
+                appended_event.clone(),
+                projection_context,
+                claim_token.clone(),
+                created_at,
+            )
+            .await;
         match projection {
             Ok(TurnEventProjectionOutcome::Projected) => {}
             Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {

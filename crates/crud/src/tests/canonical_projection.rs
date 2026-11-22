@@ -1,6 +1,170 @@
 use super::*;
 
 #[tokio::test]
+async fn terminal_projection_reprepares_after_predecessor_opens_attempt() {
+    pioneer_postgres_test::with_database(async |fixture| {
+        use crate::store::events::event_preparation::TurnEventProjectionContext;
+
+        let workspace_id = "ws_terminal_projection_attempt";
+        let thread_id = "thr_terminal_projection_attempt";
+        let turn_id = "turn_terminal_projection_attempt";
+        let item_id = "call_terminal_projection_attempt";
+        let timestamp = utc_now().timestamp();
+        let store = postgres_store_with_workspace(fixture, workspace_id).await;
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let context = TurnEventProjectionContext {
+            item_started_deadlines: None,
+            enqueue_optional_deliveries: true,
+            cancellation_actor_id: None,
+            native_cancellation: None,
+            unactivated_terminal: None,
+        };
+        let predecessor_claim = "item-start-projection".to_owned();
+        let predecessor = store
+            .append_claimed_turn_event_projection_once(
+                CanonicalTurnEventPayload::ItemStarted(ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: safe_web_fetch_item(item_id),
+                }),
+                unix_to_datetime(timestamp),
+                context.clone(),
+                predecessor_claim.clone(),
+                &|| unix_to_datetime(timestamp + 60),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal_sequence = predecessor.sequence + 1;
+
+        let (_, mut turn) = store.get_turn(thread_id, turn_id).await.unwrap().unwrap();
+        turn.status = TurnStatus::Interrupted;
+        turn.error = Some("stopped by user".into());
+        let cancellation = store.materialize_native_agent_turn_event(
+            CanonicalTurnEventPayload::TurnFailed(TurnFailedNotification {
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn,
+            }),
+            timestamp,
+            None,
+        );
+
+        // Pause the terminal projector after it has read the attempt list,
+        // at its next query. The prior event can still publish its attempt.
+        let blocker = fixture.connection().begin().await.unwrap();
+        blocker
+            .execute_unprepared("LOCK TABLE native_terminal_effect_outbox IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let blocker_pid: i32 = blocker
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        let publish_predecessor = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = fixture
+                        .connection()
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DatabaseBackend::Postgres,
+                            "SELECT EXISTS (
+                                SELECT 1 FROM pg_stat_activity
+                                WHERE datname = current_database()
+                                AND query LIKE 'SELECT \"native_terminal_effect_outbox\".%'
+                                AND $1 = ANY(pg_blocking_pids(pid))
+                            ) AS waiting",
+                            [blocker_pid.into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "waiting")
+                        .unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("terminal projection must wait after preparing its attempt snapshot");
+            assert_eq!(
+                store
+                    .project_claimed_turn_event(
+                        predecessor,
+                        context,
+                        predecessor_claim,
+                        unix_to_datetime(timestamp),
+                    )
+                    .await
+                    .unwrap(),
+                crate::store::events::event_projection::TurnEventProjectionOutcome::Projected
+            );
+            use pioneer_entity::turn_item_attempt;
+            let attempt = turn_item_attempt::Entity::find()
+                .filter(turn_item_attempt::Column::TurnId.eq(turn_id))
+                .filter(turn_item_attempt::Column::ItemId.eq(item_id))
+                .one(fixture.connection())
+                .await
+                .unwrap()
+                .expect("the predecessor must create an attempt before cancellation resumes");
+            assert_eq!(attempt.status, "running");
+            blocker.rollback().await.unwrap();
+            attempt.id
+        };
+        let (cancellation, attempt_id) = tokio::join!(cancellation, publish_predecessor);
+        cancellation.expect("the committed cancellation must reprepare and finish projection");
+        let attempt = pioneer_entity::turn_item_attempt::Entity::find_by_id(attempt_id)
+            .one(fixture.connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.status, "interrupted");
+        let (workspace, saved) = store.get_turn(thread_id, turn_id).await.unwrap().unwrap();
+        assert_eq!(workspace, workspace_id);
+        assert_eq!(saved.status, TurnStatus::Interrupted);
+        assert_eq!(saved.error.as_deref(), Some("stopped by user"));
+        let stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.projected_through_sequence, terminal_sequence);
+        assert_eq!(stream.health, TurnProjectionStreamHealth::Healthy);
+        let terminal_events = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_event::Column::EventType.eq("turn/failed"))
+            .count(fixture.connection())
+            .await
+            .unwrap();
+        assert_eq!(terminal_events, 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn duplicate_interruption_during_projection_preserves_canonical_acceptance() {
     pioneer_postgres_test::with_database(async |fixture| {
     let workspace_id = "ws_interruption_projection_race";
@@ -138,7 +302,7 @@ async fn duplicate_interruption_during_projection_preserves_canonical_acceptance
 
     assert!(matches!(
         store
-            .project_claimed_turn_event_once(
+            .project_claimed_turn_event(
                 appended,
                 context,
                 "interruption_projection_owner".to_owned(),

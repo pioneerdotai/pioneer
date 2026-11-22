@@ -108,6 +108,17 @@ pub struct PreparedTerminalRunningAttempt {
     updated_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug)]
+pub struct TerminalRunningAttemptsChanged;
+
+impl std::fmt::Display for TerminalRunningAttemptsChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("running attempts changed during terminal Turn preparation")
+    }
+}
+
+impl std::error::Error for TerminalRunningAttemptsChanged {}
+
 pub async fn create_running_attempt<C: ConnectionTrait>(
     db: &C,
     id: String,
@@ -1199,7 +1210,7 @@ pub async fn close_prepared_terminal_running_attempts(
         .iter()
         .any(|attempt| !prepared_ids.contains(attempt.id.as_str()))
     {
-        anyhow::bail!("running attempts changed during terminal Turn preparation");
+        return Err(TerminalRunningAttemptsChanged.into());
     }
 
     let interrupted_status =

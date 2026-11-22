@@ -24,6 +24,9 @@ use pioneer_crud_execution::{
 };
 use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_live_turn_event;
 use pioneer_protocol::{Task, Turn, TurnStatus};
+use pioneer_sqlite::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, retry_with_backoff,
+};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
@@ -31,6 +34,7 @@ use sea_orm::{
 };
 use std::error::Error as StdError;
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct TurnEventProjectionAfterAppendError {
@@ -108,6 +112,17 @@ pub(crate) enum TurnEventProjectionOutcome {
     Projected,
     DeferredByPredecessor,
 }
+
+#[derive(Debug)]
+struct ProjectionPredecessorPending;
+
+impl fmt::Display for ProjectionPredecessorPending {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an earlier turn event is still being projected")
+    }
+}
+
+impl StdError for ProjectionPredecessorPending {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnEventProjectionFailureOutcome {
@@ -584,7 +599,55 @@ impl CrudStore {
         result
     }
 
-    pub(crate) async fn project_claimed_turn_event_once(
+    pub(crate) async fn project_claimed_turn_event(
+        &self,
+        appended_event: crate::events::AppendedTurnEvent,
+        projection_context: TurnEventProjectionContext,
+        claim_token: String,
+        projected_at: DateTimeWithTimeZone,
+    ) -> Result<TurnEventProjectionOutcome> {
+        // A predecessor can still be projecting or publish a new attempt after
+        // reader preparation. Give an accepted native cancellation time to
+        // complete both operations while retaining its original claim. A longer
+        // predecessor backlog still goes through ordered recovery.
+        let retry_pending_cancellation = projection_context.native_cancellation.is_some();
+        retry_with_backoff(
+            || async {
+                let outcome = self
+                    .project_claimed_turn_event_once(
+                        appended_event.clone(),
+                        projection_context.clone(),
+                        claim_token.clone(),
+                        projected_at,
+                    )
+                    .await?;
+                if retry_pending_cancellation
+                    && outcome == TurnEventProjectionOutcome::DeferredByPredecessor
+                {
+                    return Err(ProjectionPredecessorPending.into());
+                }
+                Ok(outcome)
+            },
+            |error: &anyhow::Error| {
+                error.is::<turn_item_attempt::TerminalRunningAttemptsChanged>()
+                    || error.is::<ProjectionPredecessorPending>()
+                    || pioneer_crud_tasks::retry::is_retryable(error)
+                    || pioneer_crud_artifacts::html_preview_io::is_conflict(error)
+            },
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
+        .or_else(|error| {
+            if error.is::<ProjectionPredecessorPending>() {
+                Ok(TurnEventProjectionOutcome::DeferredByPredecessor)
+            } else {
+                Err(error)
+            }
+        })
+    }
+
+    async fn project_claimed_turn_event_once(
         &self,
         appended_event: crate::events::AppendedTurnEvent,
         projection_context: TurnEventProjectionContext,
