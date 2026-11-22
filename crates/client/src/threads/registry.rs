@@ -2180,7 +2180,8 @@ impl ClientCore {
             None,
             None,
         );
-        self.promote_thread(id);
+        // The optimistic send can render immediately, but only Gateway's
+        // turn notification or accepted response proves the draft exists.
         {
             let Some(mut coordinator) = self.existing_thread_mutation(id) else {
                 return Default::default();
@@ -13865,7 +13866,8 @@ mod tests {
         let auth = core.current_auth().unwrap();
         core.begin_authorization_epoch(Some(("endpoint".into(), 7)));
         let (generation, connection) = core.current_auth_ticket();
-        core.finish_current_auth(generation, connection, auth).unwrap();
+        core.finish_current_auth(generation, connection, auth)
+            .unwrap();
         assert_eq!(
             core.accept_authorization_projection(generation, connection, policy.clone()),
             crate::authorization::AuthorizationProjectionAcceptance::Accepted,
@@ -13896,7 +13898,9 @@ mod tests {
         let (request, draft) = requests.recv_timeout(timeout).unwrap();
         assert_eq!(request["method"], AUTHORIZATION_CAPABILITIES);
         assert!(policy.thread.is_none());
-        draft.send(Ok(serde_json::to_value(&policy).unwrap())).unwrap();
+        draft
+            .send(Ok(serde_json::to_value(&policy).unwrap()))
+            .unwrap();
         let wait_for_ready = || {
             let deadline = std::time::Instant::now() + timeout;
             loop {
@@ -13909,18 +13913,47 @@ mod tests {
                         _ => {}
                     }
                 }
-                assert!(std::time::Instant::now() < deadline, "capability lookup must settle");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "capability lookup must settle"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
         assert!(wait_for_ready().snapshot.as_ref().unwrap().thread.is_none());
 
+        core.commit_prepared_thread_turn(
+            "a",
+            "ws",
+            ThreadMode::Chat,
+            &crate::composer::turn_prepare::PreparedComposerThreadSnapshotUpdate {
+                selected_model: None,
+                selected_provider: None,
+                selected_reasoning_effort: None,
+                selected_context_window: None,
+                selected_service_mode: None,
+                selected_context_authority: None,
+                user_text: "First message".into(),
+                updated_at_unix: 2,
+            },
+            local("a"),
+            pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn,
+        );
+        assert_eq!(core.thread_workspace_draft("ws").as_deref(), Some("a"));
+        assert!(
+            requests.try_recv().is_err(),
+            "no durable capability lookup before Gateway confirms creation"
+        );
+
+        let mut turn = composer_admission();
+        turn.id = "turn".into();
         core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
             workspace_id: "ws".into(),
             thread_id: "a".into(),
-            turn: composer_admission(),
+            turn: turn.clone(),
         }));
-        let (request, durable) = requests.recv_timeout(timeout)
+        let (request, durable) = requests
+            .recv_timeout(timeout)
             .expect("the open composer must request durable thread permissions");
         assert_eq!(request["method"], AUTHORIZATION_CAPABILITIES);
         assert_eq!(request["params"]["thread_id"], "a");
@@ -13933,12 +13966,34 @@ mod tests {
                 ..Default::default()
             },
         });
-        durable.send(Ok(serde_json::to_value(policy).unwrap())).unwrap();
+        durable
+            .send(Ok(serde_json::to_value(policy).unwrap()))
+            .unwrap();
         let publication = wait_for_ready();
-        let thread = publication.snapshot.as_ref().unwrap().thread.as_ref().unwrap();
+        let thread = publication
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .thread
+            .as_ref()
+            .unwrap();
         assert!(thread.capabilities.can_start_turn);
         assert_eq!(core.active_thread_id().as_deref(), Some("a"));
         assert!(core.thread_workspace_draft("ws").is_none());
+        turn.status = TurnStatus::Completed;
+        core.apply_thread_notification(GatewayNotification::TurnCompleted(
+            TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn,
+            },
+        ));
+        assert!(
+            core.thread_snapshot("a")
+                .unwrap()
+                .conversation()
+                .can_submit_message()
+        );
         core.shutdown();
         wait_history_owner_exit(&waiting);
     }
@@ -20376,6 +20431,7 @@ impl ClientCore {
             return;
         };
         let mut cold_actions = vec![];
+        let mut promoted_draft = false;
         let mut completed_update = None;
         let result = response.map_err(anyhow::Error::new).and_then(|value| {
             let response: pioneer_protocol::ThreadStartResponse =
@@ -20446,12 +20502,31 @@ impl ClientCore {
                     "Thread closed during open"
                 );
             }
+            // A reconnect can recover the first turn even when both its
+            // response and live notification were missed. An empty runtime
+            // draft snapshot does not prove creation.
+            let has_conversation_turn = response
+                .thread
+                .turns
+                .iter()
+                .any(|turn| turn.turn_kind == pioneer_protocol::TurnKind::Conversation);
             store.reconcile_subscription_snapshot(flight.baseline.take().as_ref(), response.thread);
             // The snapshot and all captured LIVE state share this one registry
             // commit. No independently locking ClientCore helper runs here.
             drop(flight);
             let mut pending_reductions = vec![];
             let mut staged_drafts = vec![];
+            if has_conversation_turn
+                && registry
+                    .navigation
+                    .apply(crate::navigation::NavigationIntent::PromoteThread {
+                        thread_id: request.id.clone(),
+                    })
+                    == crate::core::ClientTransitionOutcome::Changed
+            {
+                promoted_draft = true;
+                staged_drafts.extend(registry.navigation_change());
+            }
             if let Some(staged) = staged {
                 for event in staged.events {
                     let effects = self.apply_cold_ingress_locked(
@@ -20461,6 +20536,7 @@ impl ClientCore {
                         event,
                     );
                     cold_actions.extend(effects.actions);
+                    promoted_draft |= effects.promoted_draft;
                     pending_reductions.extend(effects.pending);
                     staged_drafts.extend(effects.drafts);
                 }
@@ -20512,6 +20588,9 @@ impl ClientCore {
             finish();
         }
         if applied {
+            if promoted_draft {
+                self.refresh_thread_capabilities_after_promotion(&request.id);
+            }
             for action in cold_actions {
                 let _ =
                     pioneer_observability::updates::with_context(completed_update.clone(), || {
@@ -20952,6 +21031,10 @@ impl ClientCore {
         if self.is_stopped() || store.generation != token.generation {
             return false;
         }
+        let accepted = matches!(
+            reduction,
+            crate::turns::start::TurnStartSendReduction::Accepted { .. }
+        );
         let events = match reduction {
             crate::turns::start::TurnStartSendReduction::Accepted { events } => events,
             crate::turns::start::TurnStartSendReduction::Rejected { event } => vec![event],
@@ -20984,13 +21067,27 @@ impl ClientCore {
                 crate::timeline::labels::now_unix_ms(),
             );
         }
-        let drafts = registry.publish(&token.id);
+        let promoted_draft = accepted
+            && registry
+                .navigation
+                .apply(crate::navigation::NavigationIntent::PromoteThread {
+                    thread_id: token.id.clone(),
+                })
+                == crate::core::ClientTransitionOutcome::Changed;
+        let mut drafts = registry.publish(&token.id);
+        if promoted_draft {
+            drafts.extend(registry.navigation_change());
+        }
         self.transition_directory(
             &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             vec![],
         );
+        drop(registry);
+        if promoted_draft {
+            self.refresh_thread_capabilities_after_promotion(&token.id);
+        }
         true
     }
 }
