@@ -64,9 +64,9 @@ case "$mode" in
     trap 'rm -f "$gateway_asset"' EXIT
     gateway_entry="$(unzip -Z1 "$target" | grep -E '^Pioneer\.app/Contents/Resources/gateway/pioneer-gateway-macos-.*-computer-use-package\.zip$')"
     unzip -p "$target" "$gateway_entry" > "$gateway_asset"
-    require_zip_entry "$gateway_asset" '^cua/Pioneer Gateway\.app/Contents/MacOS/pioneer$'
-    require_zip_entry "$gateway_asset" '^cua/Pioneer Gateway\.app/Contents/Helpers/cua-driver$'
-    require_zip_entry "$gateway_asset" '^cua/manifest\.json$'
+    require_zip_entry "$gateway_asset" '^runtime/Pioneer Gateway\.app/Contents/MacOS/pioneer$'
+    require_zip_entry "$gateway_asset" '^runtime/Pioneer Gateway\.app/Contents/Helpers/cua-driver$'
+    require_zip_entry "$gateway_asset" '^runtime/cua/manifest\.json$'
     ;;
   linux-appdir)
     require_path "$target/usr/bin/pioneer-app"
@@ -78,8 +78,8 @@ case "$mode" in
       exit 1
     fi
     for asset in "$target"/usr/bin/gateway/pioneer-gateway-linux-*-computer-use-package.zip; do
-      require_zip_entry "$asset" '^cua/cua-driver$'
-      require_zip_entry "$asset" '^cua/manifest\.json$'
+      require_zip_entry "$asset" '^runtime/cua/cua-driver$'
+      require_zip_entry "$asset" '^runtime/cua/manifest\.json$'
     done
     ;;
   windows-stage)
@@ -93,9 +93,9 @@ case "$mode" in
       exit 1
     fi
     for asset in "$target"/gateway/pioneer-gateway-windows-*-computer-use-package.zip; do
-      require_zip_entry "$asset" '^cua/cua-driver\.exe$'
-      require_zip_entry "$asset" '^cua/cua-driver-uia\.exe$'
-      require_zip_entry "$asset" '^cua/manifest\.json$'
+      require_zip_entry "$asset" '^runtime/cua/cua-driver\.exe$'
+      require_zip_entry "$asset" '^runtime/cua/cua-driver-uia\.exe$'
+      require_zip_entry "$asset" '^runtime/cua/manifest\.json$'
     done
     ;;
   *)

@@ -236,7 +236,7 @@ jobs:
                       raise ValueError(f'Missing accepted notarization for exact Gateway archive: {name}')
               receipts[name] = receipt
               if variant in ('default', 'computer-use'):
-                  prefix = 'cua/postgres/'
+                  prefix = 'runtime/postgres/'
                   suffix = '.exe' if 'windows' in target else ''
                   programs = {prefix + f'bin/{program}{suffix}' for program in postgres['PROGRAMS']}
                   extension = {prefix + 'share/extension/vector.control',

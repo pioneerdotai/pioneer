@@ -86,17 +86,17 @@ class MacosNotaryTests(unittest.TestCase):
     def test_default_gateway_delivers_exact_signed_notarized_archive(self):
         identity = "Developer ID Application: Fixture"
         expected_code = {
-            "pioneer", "libonnxruntime.dylib", "cua/postgres/lib/vector.so",
-            *(f"cua/postgres/bin/{name}" for name in ("postgres", "initdb", "pg_ctl", "psql")),
+            "pioneer", "libonnxruntime.dylib", "runtime/postgres/lib/vector.so",
+            *(f"runtime/postgres/bin/{name}" for name in ("postgres", "initdb", "pg_ctl", "psql")),
         }
-        extension = "cua/postgres/share/extension/vector.control"
+        extension = "runtime/postgres/share/extension/vector.control"
         signature = b"fixture Developer ID signature"
         transport = NotaryTransport()
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = SimpleNamespace(target="x86_64-apple-darwin", inputs=root/"inputs",
-                                   postgres=root/"inputs/cua/postgres", notary_log_dir=root/"notary")
+                                   postgres=root/"inputs/runtime/postgres", notary_log_dir=root/"notary")
             for entry in expected_code | {extension}:
                 path = args.inputs / entry
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +123,7 @@ class MacosNotaryTests(unittest.TestCase):
                         for entry in expected_code:
                             self.assertTrue(payload.read(entry).endswith(signature), entry)
                         self.assertEqual(payload.read(extension), b"extension")
-                        mode = payload.getinfo("cua/postgres/bin/postgres").external_attr >> 16
+                        mode = payload.getinfo("runtime/postgres/bin/postgres").external_attr >> 16
                         self.assertEqual(mode & 0o777, 0o755)
                     submitted.append(hashlib.sha256(archive.read_bytes()).hexdigest())
                 return transport.run(arguments, **options)

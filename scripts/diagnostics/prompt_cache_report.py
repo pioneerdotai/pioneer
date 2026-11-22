@@ -95,7 +95,7 @@ class GatewayPostgres:
 
     def __init__(self, gateway, runtime_home):
         executable = pathlib.Path(gateway).resolve(strict=True)
-        if executable.match("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"):
+        if executable.match("Pioneer Gateway.app/Contents/MacOS/pioneer"):
             runtime = executable.parents[3] / "postgres"
         else:
             runtime = executable.parent / "cua" / "postgres"

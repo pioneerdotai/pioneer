@@ -27,7 +27,7 @@ def gateway(directory, target):
     if (directory / "SHA256SUMS").read_text() != expected:
         raise ValueError("Gateway runtime checksums differ from final package")
     with zipfile.ZipFile(directory / asset) as archive:
-        entry = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+        entry = ("runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
                  if "apple-darwin" in target else "pioneer" + suffix)
         data = archive.read(entry)
         originals = metadata["source"]["binaries"]

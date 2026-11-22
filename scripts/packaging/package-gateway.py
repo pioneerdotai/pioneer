@@ -47,7 +47,7 @@ def package_macos_default(args, binary, archive):
             root = work / "payload"
             root.mkdir()
             shutil.copy2(binary, root / binary.name)
-            postgres = root / "cua/postgres"
+            postgres = root / "runtime/postgres"
             shutil.copytree(args.postgres, postgres)
             for program in POSTGRES["PROGRAMS"]:
                 (postgres / "bin" / program).chmod(0o755)
@@ -110,7 +110,7 @@ def package(args):
             shutil.copy2(archive, runtime / archive.name)
             # Record the executable actually delivered inside the final archive.
             # Desktop receives only that archive and its hash-bound metadata.
-            entry = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+            entry = ("runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
                      if "apple-darwin" in args.target else name)
             with zipfile.ZipFile(archive) as complete:
                 binary.write_bytes(complete.read(entry))
@@ -147,7 +147,7 @@ def package(args):
                     if path.is_symlink():
                         raise ValueError("PostgreSQL runtime archive requires regular files")
                     if path.is_file():
-                        member = Path("cua/postgres") / path.relative_to(args.postgres)
+                        member = Path("runtime/postgres") / path.relative_to(args.postgres)
                         # GitHub artifact transfers flatten Unix modes.
                         entry = zipfile.ZipInfo.from_file(path, member.as_posix())
                         if path.parent == args.postgres / "bin":

@@ -178,15 +178,21 @@ in every mode; `--skip-build` remains accepted and never triggers a nested build
 The release workflow supplies the shared model catalog and run/commit/target
 provenance. Missing or mismatched inputs fail without a compilation fallback.
 
-The server assets retain their existing names and formats: gzip for Linux and
-macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
-`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the verified
-CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cannot install
-the driver. The installer keeps the executable and `bin/cua` together and retains
-recovery files when schema compatibility is unknown.
+Server assets are named `pioneer-gateway-{os}-{arch}.zip`. Computer-use assets
+are named `pioneer-gateway-{os}-{arch}-computer-use-package.zip` and include
+the verified CUA runtime. The installer activates the executable together with
+`bin/runtime` and retains recovery files when schema compatibility is unknown.
+Both variants ship PostgreSQL and pgvector under `runtime/postgres/`. Computer
+Use files live under `runtime/cua/`. On macOS the Computer Use executable and
+driver are in the signed `runtime/Pioneer Gateway.app`.
 
-Gateway updates use the complete `-computer-use-package.zip` asset
-through `pioneer update` or `pioneer self-update`.
+Gateway updates use the complete archive through `pioneer update` or
+`pioneer self-update`. For the first layout update from a PostgreSQL build
+whose CLI only understands the older `cua/` layout, use the current
+`install.sh` or `install.ps1`. Pass `--computer-use` or `-ComputerUse` to
+update the Computer Use variant. Desktop launches the installer bundled with
+its own update and can switch an existing PostgreSQL Gateway to the new layout
+directly.
 
 Server/default installations retain their normal update procedure and do not
 need computer use or Desktop. Use `--headless` / `-Headless` for an explicit

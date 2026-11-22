@@ -103,7 +103,7 @@ jobs:
             echo "SMOKE_ASSET=${asset_path}"
             echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
             echo "SMOKE_INSTALL_ROOT=${install_root}"
-            echo "SMOKE_BINARY=${install_root}/bin/cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+            echo "SMOKE_BINARY=${install_root}/bin/runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
           } >> "${GITHUB_ENV}"
 
       - name: install-force-start-with-path-warning

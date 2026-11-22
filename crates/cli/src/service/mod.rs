@@ -642,7 +642,7 @@ mod tests {
         let managed_root = root.join("managed");
         let mut previous = None;
         let cu = if cfg!(target_os = "macos") {
-            "gateway-runtime/payload/cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+            "gateway-runtime/payload/runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
         } else {
             "gateway-runtime/payload/pioneer"
         };

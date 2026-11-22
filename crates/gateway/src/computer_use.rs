@@ -628,17 +628,33 @@ fn bundled_driver_path() -> Result<PathBuf, ToolError> {
     let parent = executable
         .parent()
         .ok_or_else(|| unavailable("invalid Gateway installation"))?;
-    #[cfg(windows)]
-    let binary = parent.join("cua/cua-driver.exe");
-    #[cfg(not(windows))]
-    let binary = if cfg!(target_os = "macos") {
-        parent
-            .parent()
-            .ok_or_else(|| unavailable("invalid Gateway app bundle"))?
-            .join("Helpers/cua-driver")
-    } else {
-        parent.join("cua/cua-driver")
+    #[cfg(target_os = "macos")]
+    let payload = parent
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| unavailable("Gateway application payload is missing"))?
+        .to_path_buf();
+    #[cfg(not(target_os = "macos"))]
+    let payload = {
+        let runtime = parent.join("runtime");
+        if runtime.exists() {
+            runtime
+        } else {
+            parent.join("cua")
+        }
     };
+    let driver_dir = if payload.file_name() == Some(std::ffi::OsStr::new("cua")) {
+        payload.clone()
+    } else {
+        payload.join("cua")
+    };
+    #[cfg(target_os = "macos")]
+    let binary = parent
+        .parent()
+        .ok_or_else(|| unavailable("invalid Gateway app bundle"))?
+        .join("Helpers/cua-driver");
+    #[cfg(not(target_os = "macos"))]
+    let binary = driver_dir.join(format!("cua-driver{}", std::env::consts::EXE_SUFFIX));
     let metadata = std::fs::symlink_metadata(&binary).map_err(|_| {
         unavailable("bundled cua-driver is missing; repair or update Gateway on this machine")
     })?;
@@ -647,24 +663,21 @@ fn bundled_driver_path() -> Result<PathBuf, ToolError> {
             "bundled cua-driver is not a regular installed file",
         ));
     }
-    verify_packaged_driver(parent, &binary)?;
+    verify_packaged_driver(&payload, &driver_dir, &binary)?;
     Ok(binary)
 }
 
-fn verify_packaged_driver(executable_dir: &Path, binary: &Path) -> Result<(), ToolError> {
+fn verify_packaged_driver(
+    payload: &Path,
+    driver_dir: &Path,
+    binary: &Path,
+) -> Result<(), ToolError> {
     use sha2::{Digest, Sha256};
-    #[cfg(target_os = "macos")]
-    let payload = executable_dir
-        .ancestors()
-        .nth(3)
-        .ok_or_else(|| unavailable("Gateway application payload is missing"))?
-        .to_path_buf();
-    #[cfg(not(target_os = "macos"))]
-    let payload = executable_dir.join("cua");
-    let manifest_path = payload.join("manifest.json");
+    let manifest_path = driver_dir.join("manifest.json");
     let metadata = std::fs::symlink_metadata(&manifest_path)
         .map_err(|_| unavailable("Gateway CUA provenance manifest is missing"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
+    {
         return Err(unavailable("Gateway CUA provenance manifest is invalid"));
     }
     let manifest: Value = serde_json::from_slice(
@@ -673,7 +686,7 @@ fn verify_packaged_driver(executable_dir: &Path, binary: &Path) -> Result<(), To
     )
     .map_err(|_| unavailable("Gateway CUA provenance is invalid"))?;
     let relative = binary
-        .strip_prefix(&payload)
+        .strip_prefix(payload)
         .map_err(|_| unavailable("driver is outside the installed Gateway payload"))?;
     let relative = relative.to_string_lossy().replace('\\', "/");
     if manifest["schema_version"] != 1

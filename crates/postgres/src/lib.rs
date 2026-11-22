@@ -50,7 +50,7 @@ impl Runtime {
             .parent()
             .context("Gateway executable has no directory")?;
         let companions = if cfg!(target_os = "macos")
-            && executable.ends_with("cua/Pioneer Gateway.app/Contents/MacOS/pioneer")
+            && executable.ends_with("Pioneer Gateway.app/Contents/MacOS/pioneer")
         {
             // Both the signed Desktop archive and the standalone installer
             // lay out macOS CU with the same companion directory.
@@ -60,7 +60,12 @@ impl Runtime {
                 .context("invalid Gateway bundle path")?
                 .to_path_buf()
         } else {
-            parent.join("cua")
+            let runtime = parent.join("runtime");
+            if runtime.exists() {
+                runtime
+            } else {
+                parent.join("cua")
+            }
         };
         let root = companions.join("postgres");
         for program in ["postgres", "initdb", "pg_ctl"] {

@@ -91,9 +91,9 @@ def process_info(pid):
 
 
 def bundled_runtime(executable):
-    if executable.parts[-5:] == ("cua", "Pioneer Gateway.app", "Contents", "MacOS", "pioneer"):
+    if executable.parts[-4:] == ("Pioneer Gateway.app", "Contents", "MacOS", "pioneer"):
         return executable.parents[3] / "postgres"
-    return executable.parent / "cua/postgres"
+    return executable.parent / "runtime/postgres"
 
 
 def program(runtime, name):
