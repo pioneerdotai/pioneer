@@ -46847,7 +46847,7 @@ mod tests {
             expected.clone()
         };
         let terminal_turn = applied.newly_terminal_turn.unwrap();
-        let owner = compaction::native_owner("ws_diag_atomic", "thr_diag_atomic");
+        let owner = crate::compaction::native_owner("ws_diag_atomic", "thr_diag_atomic");
         let stop = pioneer_entity::compaction_execution_stop::Entity::find_by_id((
             owner,
             terminal_turn.id.clone(),
