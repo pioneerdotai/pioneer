@@ -24,9 +24,8 @@ use crate::writer::{
 
 /// The private owner of the Gateway reader pool.
 ///
-/// The Gateway opens PostgreSQL sessions with read-only transactions. This
-/// wrapper also rejects mutation entry points and routes reads with an explicit
-/// scheduling class through [`PostgresDatabase`].
+/// The Gateway opens read-only PostgreSQL sessions. Standalone queries reach
+/// this pool after routing, with the scheduling class from [`PostgresDatabase`].
 #[derive(Clone)]
 struct PostgresReadPool {
     connection: DatabaseConnection,
@@ -41,11 +40,6 @@ impl std::fmt::Debug for PostgresReadPool {
 }
 
 impl PostgresReadPool {
-    #[cfg(test)]
-    fn new(connection: DatabaseConnection) -> Self {
-        Self::with_observer(connection, noop_read_observer())
-    }
-
     fn with_observer(
         connection: DatabaseConnection,
         observer: Arc<dyn PostgresReadObserver>,
@@ -137,12 +131,11 @@ impl PostgresReadPool {
         }
     }
 
-    async fn query_one_raw(
+    async fn query_one_confirmed_read(
         &self,
         class: PostgresReadClass,
         statement: Statement,
     ) -> Result<Option<QueryResult>, DbErr> {
-        Self::ensure_read_statement(&statement)?;
         let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
@@ -162,12 +155,11 @@ impl PostgresReadPool {
         result
     }
 
-    async fn query_all_raw(
+    async fn query_all_confirmed_read(
         &self,
         class: PostgresReadClass,
         statement: Statement,
     ) -> Result<Vec<QueryResult>, DbErr> {
-        Self::ensure_read_statement(&statement)?;
         let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
@@ -187,12 +179,11 @@ impl PostgresReadPool {
         result
     }
 
-    async fn stream_raw(
+    async fn stream_confirmed_read(
         &self,
         class: PostgresReadClass,
         statement: Statement,
     ) -> Result<PostgresQueryStream, DbErr> {
-        Self::ensure_read_statement(&statement)?;
         let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
@@ -423,7 +414,8 @@ impl StreamTrait for PostgresReadTransaction {
 /// Calls which return rows are classified from the actual SQL so that
 /// row locks and mutations returning rows use the writer. Use a writer
 /// transaction when a lock must protect later statements. `begin_read` opens
-/// a read-only snapshot on the reader pool.
+/// a read-only snapshot on the reader pool. Supply reader sessions configured
+/// for [`crate::MANAGED_SEARCH_PATH`] and the Pioneer schema.
 #[derive(Clone, Debug)]
 pub struct PostgresDatabase {
     reader: PostgresReadPool,
@@ -561,14 +553,22 @@ impl PostgresDatabase {
 
     async fn query_one_routed(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
         match statement_route(statement.sql.as_str()) {
-            StatementRoute::Read => self.reader.query_one_raw(self.read_class, statement).await,
+            StatementRoute::Read => {
+                self.reader
+                    .query_one_confirmed_read(self.read_class, statement)
+                    .await
+            }
             StatementRoute::Write => self.writer_connection().query_one_raw(statement).await,
         }
     }
 
     async fn query_all_routed(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         match statement_route(statement.sql.as_str()) {
-            StatementRoute::Read => self.reader.query_all_raw(self.read_class, statement).await,
+            StatementRoute::Read => {
+                self.reader
+                    .query_all_confirmed_read(self.read_class, statement)
+                    .await
+            }
             StatementRoute::Write => self.writer_connection().query_all_raw(statement).await,
         }
     }
@@ -636,7 +636,11 @@ impl StreamTrait for PostgresDatabase {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
             match statement_route(statement.sql.as_str()) {
-                StatementRoute::Read => self.reader.stream_raw(self.read_class, statement).await,
+                StatementRoute::Read => {
+                    self.reader
+                        .stream_confirmed_read(self.read_class, statement)
+                        .await
+                }
                 StatementRoute::Write => self.writer_connection().stream_raw(statement).await,
             }
         })
@@ -702,9 +706,7 @@ impl TransactionTrait for PostgresDatabase {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PostgresDatabase, PostgresReadClass, PostgresReadPool, StatementRoute, statement_route,
-    };
+    use super::{PostgresDatabase, PostgresReadClass, StatementRoute, statement_route};
     use crate::{
         PostgresReadEvent, PostgresReadObserver, PostgresReadOutcome, PostgresWriteExecutor,
     };
@@ -746,7 +748,10 @@ mod tests {
                 options
                     .max_connections(4)
                     .map_sqlx_postgres_opts(|postgres| {
-                        postgres.options([("default_transaction_read_only", "on")])
+                        postgres.options([
+                            ("default_transaction_read_only", "on"),
+                            ("search_path", crate::MANAGED_SEARCH_PATH),
+                        ])
                     });
             })
             .await
@@ -868,12 +873,13 @@ mod tests {
              SELECT current_setting('transaction_read_only') AS mode FROM \"update\", extra
              -- FOR KEY SHARE",
             "WITH RECURSIVE chain(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM chain WHERE n < 2)
-                SEARCH BREADTH FIRST BY n SET traversal
-                CYCLE n SET cycle_flag USING visited
              SELECT current_setting('transaction_read_only') AS mode FROM chain WHERE n = 2",
             "SELECT current_setting('transaction_read_only') AS mode
              FROM (VALUES (1)) AS lengths(update)
              WHERE substring('x' FOR update) = 'x'",
+            "SELECT current_setting('transaction_read_only') AS mode,
+                    'turn'::text COLLATE \"C\" AS kind
+             WHERE pg_visible_in_snapshot('10'::xid8, pg_current_snapshot()::pg_snapshot)",
         ] {
             let rows = database
                 .query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
@@ -882,6 +888,154 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].try_get::<String>("", "mode").unwrap(), "on");
         }
+
+        let unsupported =
+            "WITH RECURSIVE chain(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM chain WHERE n < 2)
+            SEARCH BREADTH FIRST BY n SET traversal
+            CYCLE n SET cycle_flag USING visited
+            SELECT current_setting('transaction_read_only') AS mode FROM chain WHERE n = 2";
+        let rows = database
+            .query_all_raw(Statement::from_string(DbBackend::Postgres, unsupported))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "mode").unwrap(), "off");
+    }
+
+    #[test]
+    fn checks_executed_expressions_and_qualified_callables() {
+        for sql in [
+            "SELECT id INTO copied FROM workspace",
+            "SELECT COALESCE((SELECT pg_catalog.nextval('probe')), 0)",
+            "SELECT state FROM pg_advisory_xact_lock(1) AS state",
+            "SELECT COALESCE((SELECT an_unknown_function()), 0)",
+            "SELECT other.lower('a')",
+            r#"SELECT pg_catalog."COUNT"(*)"#,
+            "SELECT 1 OPERATOR(other.+) 2",
+            r#"SELECT 1 OPERATOR("PG_CATALOG".+) 2"#,
+            "SELECT NULL::other.custom_type",
+            "SELECT 1 UNION SELECT nextval('probe')",
+            "SELECT 1 INTERSECT SELECT nextval('probe')",
+            "SELECT 1 EXCEPT SELECT nextval('probe')",
+            "EXPLAIN (ANALYZE TRUE) SELECT nextval('probe')",
+            "SELECT 1; SELECT 2",
+            "SELECT (",
+        ] {
+            assert_eq!(statement_route(sql), StatementRoute::Write, "{sql}");
+        }
+        for sql in [
+            "SELECT pg_catalog.lower('a')",
+            "SELECT public.thread_episodic_search_keys('test')",
+            "SELECT 1 OPERATOR(PG_CATALOG.+) 2",
+            r#"SELECT NULL::vector OPERATOR("public".<=>) NULL::vector"#,
+            "SELECT pg_visible_in_snapshot('10'::xid8, pg_current_snapshot()::pg_snapshot)",
+            "EXPLAIN ANALYZE SELECT 1",
+        ] {
+            assert_eq!(statement_route(sql), StatementRoute::Read, "{sql}");
+        }
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn full_episodic_search_runs_on_reader_with_application_bindings() {
+        let (database, observer) = observed_test_database().await;
+        let sql = include_str!("../../crud-memory/src/episodic_search.sql");
+        let query = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            [
+                "absent-workspace".into(),
+                Option::<String>::None.into(),
+                Option::<String>::None.into(),
+                false.into(),
+                Option::<String>::None.into(),
+                Option::<String>::None.into(),
+                Option::<i64>::None.into(),
+                true.into(),
+                "search term".into(),
+                "provider".into(),
+                "model".into(),
+                3_i64.into(),
+                false.into(),
+                sea_orm::prelude::PgVector::from(vec![1.0, 0.0, 0.0]).into(),
+                60.0_f64.into(),
+                20_i64.into(),
+                0_i64.into(),
+                200_i32.into(),
+            ],
+        );
+        let rows = database.query_all_raw(query).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].try_get::<bool>("", "incomplete").unwrap());
+        assert!(observer.events().iter().any(|event| matches!(
+            event,
+            PostgresReadEvent::OperationFinished {
+                outcome: PostgresReadOutcome::Ok,
+                ..
+            }
+        )));
+        database.close().await.unwrap();
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn unknown_and_effectful_calls_use_writer_and_never_run_in_read_transaction() {
+        let database = test_database().await;
+        database
+            .execute_unprepared(
+                "CREATE SEQUENCE route_probe_sequence;
+             CREATE FUNCTION route_probe_mode() RETURNS text
+             LANGUAGE sql STABLE AS $$ SELECT current_setting('transaction_read_only') $$;",
+            )
+            .await
+            .unwrap();
+        let effectful = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT COALESCE((SELECT pg_catalog.nextval('route_probe_sequence')), 0) AS value,
+                    current_setting('transaction_read_only') AS mode",
+        );
+        let unknown =
+            Statement::from_string(DbBackend::Postgres, "SELECT route_probe_mode() AS mode");
+        let read = database.begin_read().await.unwrap();
+        for statement in [effectful.clone(), unknown.clone()] {
+            let error = read.query_one_raw(statement).await.unwrap_err();
+            assert!(error.to_string().contains("database read pool"));
+        }
+        read.commit().await.unwrap();
+
+        let row = database.query_one_raw(effectful).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "value").unwrap(), 1);
+        assert_eq!(row.try_get::<String>("", "mode").unwrap(), "off");
+        let mut rows = database.stream_raw(unknown).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.try_get::<String>("", "mode").unwrap(), "off");
+        assert!(rows.next().await.is_none());
+        drop(rows);
+        database.close().await.unwrap();
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn select_in_write_transaction_reads_its_uncommitted_insert() {
+        let database = test_database().await;
+        database
+            .execute_unprepared("CREATE TABLE route_probe (value bigint)")
+            .await
+            .unwrap();
+        let tx = database.begin().await.unwrap();
+        tx.execute_unprepared("INSERT INTO route_probe VALUES (42)")
+            .await
+            .unwrap();
+        let select = Statement::from_string(DbBackend::Postgres, "SELECT value FROM route_probe");
+        let row = tx.query_one_raw(select.clone()).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "value").unwrap(), 42);
+        assert!(
+            database
+                .query_one_raw(select.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tx.rollback().await.unwrap();
+        assert!(database.query_one_raw(select).await.unwrap().is_none());
+        database.close().await.unwrap();
     }
 
     #[pioneer_postgres_test::postgres_test]
@@ -1072,37 +1226,32 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn private_reader_rejects_every_write_entry_point() {
-        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-        let connection = fixture.connect_read_only().await.expect("open test reader");
-        let reader = PostgresReadPool::new(connection);
+    async fn read_transaction_rejects_returning_writes_in_queries_and_streams() {
+        let database = test_database().await;
+        let reader = database.begin_read().await.expect("open test reader");
 
         let query_error = reader
-            .query_one_raw(
-                PostgresReadClass::Interactive,
-                Statement::from_string(
-                    DbBackend::Postgres,
-                    "DELETE FROM item RETURNING id".to_owned(),
-                ),
-            )
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "DELETE FROM item RETURNING id",
+            ))
             .await
             .expect_err("row-returning write must be rejected");
         assert!(query_error.to_string().contains("database read pool"));
 
         let stream_error = match reader
-            .stream_raw(
-                PostgresReadClass::Maintenance,
-                Statement::from_string(
-                    DbBackend::Postgres,
-                    "INSERT INTO item DEFAULT VALUES RETURNING id".to_owned(),
-                ),
-            )
+            .stream_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO item DEFAULT VALUES RETURNING id",
+            ))
             .await
         {
             Ok(_) => panic!("streaming write must be rejected"),
             Err(error) => error,
         };
         assert!(stream_error.to_string().contains("database read pool"));
+        reader.commit().await.unwrap();
+        database.close().await.unwrap();
     }
 
     #[pioneer_postgres_test::postgres_test]

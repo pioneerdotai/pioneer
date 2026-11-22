@@ -1,4 +1,20 @@
-//! Route PostgreSQL statements before acquiring a pool connection.
+//! Route SQL against the managed Pioneer schema before taking pool capacity.
+
+use std::ops::ControlFlow;
+
+use sqlparser::{
+    ast::{
+        BinaryOperator as Bin, DataType, DescribeAlias, Expr, Ident, InTarget, ObjectName, Query,
+        Select, SetExpr, Statement, TableFactor, UnaryOperator, Visit, Visitor,
+    },
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
+
+/// PostgreSQL implicitly searches pg_catalog first. Name resolution in the
+/// configured app database also includes public (Pioneer and pgvector), and
+/// the temporary schema comes last for types and relations.
+pub const MANAGED_SEARCH_PATH: &str = "public, pg_temp";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatementRoute {
@@ -7,362 +23,434 @@ pub(crate) enum StatementRoute {
 }
 
 pub(crate) fn statement_route(sql: &str) -> StatementRoute {
-    let mut scanner = Scanner {
-        rest: sql.as_bytes(),
-    };
-    if scanner.is_read_statement() {
+    if let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        && let [statement] = statements.as_slice()
+        && statement.visit(&mut ReadVisitor).is_continue()
+    {
         StatementRoute::Read
     } else {
         StatementRoute::Write
     }
 }
 
-fn read_command(token: Token<'_>) -> bool {
-    token.keyword("select") || token.keyword("values") || token.keyword("table")
-}
+struct ReadVisitor;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Token<'a> {
-    Word(&'a str),
-    Identifier,
-    Open,
-    Close,
-    Comma,
-    Semicolon,
-    Other,
-    End,
-    Invalid,
-}
+impl Visitor for ReadVisitor {
+    type Break = ();
 
-impl Token<'_> {
-    fn keyword(self, keyword: &str) -> bool {
-        matches!(self, Self::Word(word) if word.eq_ignore_ascii_case(keyword))
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        // Visit the explained query as well, including any operations that
+        // would take effect when ANALYZE executes it.
+        allow(
+            matches!(statement,
+                Statement::Explain {
+                    describe_alias: DescribeAlias::Explain,
+                    statement,
+                    query_plan: false,
+                    estimate: false,
+                    ..
+                } if matches!(statement.as_ref(), Statement::Query(_))
+            ) || matches!(statement, Statement::Query(_)),
+        )
     }
 
-    fn is_identifier(self) -> bool {
-        matches!(self, Self::Word(_) | Self::Identifier)
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        allow(
+            query.locks.is_empty()
+                && query.for_clause.is_none()
+                && query.settings.is_none()
+                && query.format_clause.is_none()
+                && query.pipe_operators.is_empty()
+                && read_set(&query.body),
+        )
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        allow(
+            select.into.is_none()
+                && select.optimizer_hints.is_empty()
+                && select.select_modifiers.is_none()
+                && select.top.is_none()
+                && select.exclude.is_none()
+                && select.lateral_views.is_empty()
+                && select.prewhere.is_none()
+                && select.connect_by.is_empty()
+                && select.cluster_by.is_empty()
+                && select.distribute_by.is_empty()
+                && select.sort_by.is_empty()
+                && select.qualify.is_none()
+                && select.value_table_mode.is_none(),
+        )
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        allow(match expr {
+            Expr::Function(function) => read_function(&function.name),
+            Expr::BinaryOp { op, .. }
+            | Expr::AnyOp { compare_op: op, .. }
+            | Expr::AllOp { compare_op: op, .. } => read_binary(op),
+            Expr::UnaryOp { op, .. } => matches!(
+                op,
+                UnaryOperator::Not | UnaryOperator::Plus | UnaryOperator::Minus
+            ),
+            Expr::Cast { data_type, .. } => read_type(data_type),
+            Expr::TypedString(value) => read_type(&value.data_type),
+            Expr::In { target, global, .. } => {
+                !global && matches!(target, InTarget::List(_) | InTarget::Subquery(_))
+            }
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::CompoundFieldAccess { .. }
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
+            | Expr::IsDistinctFrom(..)
+            | Expr::IsNotDistinctFrom(..)
+            | Expr::IsJson { .. }
+            | Expr::IsNormalized { .. }
+            | Expr::Between { .. }
+            | Expr::Like { .. }
+            | Expr::ILike { .. }
+            | Expr::SimilarTo { .. }
+            | Expr::AtTimeZone { .. }
+            | Expr::Extract { .. }
+            | Expr::Ceil { .. }
+            | Expr::Floor { .. }
+            | Expr::Position { .. }
+            | Expr::Substring { .. }
+            | Expr::Trim { .. }
+            | Expr::Overlay { .. }
+            | Expr::Collate { .. }
+            | Expr::Nested(_)
+            | Expr::Value(_)
+            | Expr::Case { .. }
+            | Expr::Exists { .. }
+            | Expr::Subquery(_)
+            | Expr::Tuple(_)
+            | Expr::Array(_)
+            | Expr::Interval(_)
+            | Expr::Wildcard(_)
+            | Expr::QualifiedWildcard(..)
+            | Expr::GroupingSets(_)
+            | Expr::Cube(_)
+            | Expr::Rollup(_) => true,
+            _ => false,
+        })
+    }
+
+    fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<()> {
+        allow(match table {
+            TableFactor::Table {
+                name,
+                args,
+                with_hints,
+                version,
+                partitions,
+                json_path,
+                sample,
+                index_directives,
+                ..
+            } => {
+                // A function in FROM may be represented as a table with arguments.
+                (args.is_none() || read_function(name))
+                    && with_hints.is_empty()
+                    && version.is_none()
+                    && partitions.is_empty()
+                    && json_path.is_none()
+                    && sample.is_none()
+                    && index_directives.is_empty()
+            }
+            TableFactor::Function { name, .. } => read_function(name),
+            TableFactor::Derived { sample: None, .. }
+            | TableFactor::NestedJoin { .. }
+            | TableFactor::UNNEST {
+                with_offset: false, ..
+            } => true,
+            _ => false,
+        })
     }
 }
 
-#[derive(Clone, Copy)]
-struct Scanner<'a> {
-    rest: &'a [u8],
+fn allow(read: bool) -> ControlFlow<()> {
+    if read {
+        ControlFlow::Continue(())
+    } else {
+        ControlFlow::Break(())
+    }
 }
 
-impl<'a> Scanner<'a> {
-    fn is_read_statement(&mut self) -> bool {
-        let mut head = self.next();
-        let mut depth = 0;
-        // A CTE's command may start with its own WITH clause. Keep the outer
-        // query's parenthesis depth on a stack while inspecting its children.
-        let mut cte_parents = Vec::new();
-        loop {
-            match head {
-                Token::Open => {
-                    depth += 1;
-                    head = self.next();
-                    continue;
-                }
-                token if token.keyword("with") => {
-                    let mut name = self.next();
-                    if name.keyword("recursive") {
-                        name = self.next();
-                    }
-                    cte_parents.push(depth);
-                    head = self.start_cte_body(name);
-                    depth = 1;
-                    continue;
-                }
-                token if token.keyword("explain") && depth == 0 && cte_parents.is_empty() => {
-                    return self.explain_without_execution();
-                }
-                _ => {}
-            }
-
-            if !read_command(head) || !self.read_tail(depth, !cte_parents.is_empty()) {
-                return false;
-            }
-            let Some(&parent_depth) = cte_parents.last() else {
-                return true;
-            };
-            head = self.after_cte_options();
-            if head == Token::Comma {
-                let name = self.next();
-                head = self.start_cte_body(name);
-                depth = 1;
-            } else {
-                cte_parents.pop();
-                depth = parent_depth;
-            }
-        }
+fn read_set(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) | SetExpr::Query(_) => true,
+        SetExpr::SetOperation { left, right, .. } => read_set(left) && read_set(right),
+        _ => false,
     }
+}
 
-    fn start_cte_body(&mut self, name: Token<'_>) -> Token<'a> {
-        if !name.is_identifier() {
-            return Token::Invalid;
-        }
-        let mut as_token = self.next();
-        if as_token == Token::Open {
-            if !self.read_tail(1, true) {
-                return Token::Invalid;
-            }
-            as_token = self.next();
-        }
-        if !as_token.keyword("as") {
-            return Token::Invalid;
-        }
-
-        let mut opening = self.next();
-        if opening.keyword("not") {
-            opening = self.next();
-            if !opening.keyword("materialized") {
-                return Token::Invalid;
-            }
-        }
-        if opening.keyword("materialized") {
-            opening = self.next();
-        }
-        if opening == Token::Open {
-            self.next()
-        } else {
-            Token::Invalid
-        }
+fn named(ident: &Ident, expected: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == expected
+    } else {
+        ident.value.eq_ignore_ascii_case(expected)
     }
+}
 
-    fn after_cte_options(&mut self) -> Token<'a> {
-        let mut following = self.next();
-        if following.keyword("search") {
-            let order = self.next();
-            if !(order.keyword("depth") || order.keyword("breadth"))
-                || !self.next().keyword("first")
-                || !self.next().keyword("by")
-                || !self.cte_columns_and_set_column()
+fn callable(name: &ObjectName) -> Option<(Option<&Ident>, &Ident)> {
+    match name.0.as_slice() {
+        [name] => Some((None, name.as_ident()?)),
+        [schema, name] => Some((Some(schema.as_ident()?), name.as_ident()?)),
+        _ => None,
+    }
+}
+
+fn read_function(name: &ObjectName) -> bool {
+    let Some((schema, name)) = callable(name) else {
+        return false;
+    };
+    // The public schema is managed by the application migrations. The
+    // built-ins below and these particular Pioneer helpers are read-only.
+    (schema.is_none_or(|s| named(s, "pg_catalog"))
+        && [
+            "abs",
+            "array_agg",
+            "array_length",
+            "avg",
+            "btrim",
+            "cardinality",
+            "char_length",
+            "character_length",
+            "coalesce",
+            "concat",
+            "concat_ws",
+            "convert_to",
+            "count",
+            "current_database",
+            "current_date",
+            "current_schema",
+            "current_setting",
+            "current_timestamp",
+            "date_part",
+            "date_trunc",
+            "dense_rank",
+            "encode",
+            "floor",
+            "generate_series",
+            "greatest",
+            "json_agg",
+            "json_array_elements",
+            "json_array_elements_text",
+            "json_array_length",
+            "json_build_array",
+            "json_build_object",
+            "json_each",
+            "json_each_text",
+            "json_extract_path",
+            "json_extract_path_text",
+            "json_object_keys",
+            "json_typeof",
+            "jsonb_agg",
+            "jsonb_array_elements",
+            "jsonb_array_elements_text",
+            "jsonb_array_length",
+            "jsonb_build_array",
+            "jsonb_build_object",
+            "jsonb_extract_path",
+            "jsonb_extract_path_text",
+            "jsonb_typeof",
+            "lag",
+            "lead",
+            "least",
+            "left",
+            "length",
+            "lower",
+            "ltrim",
+            "max",
+            "min",
+            "now",
+            "nullif",
+            "octet_length",
+            "pg_backend_pid",
+            "pg_blocking_pids",
+            "pg_current_snapshot",
+            "pg_get_constraintdef",
+            "pg_get_functiondef",
+            "pg_get_indexdef",
+            "pg_visible_in_snapshot",
+            "position",
+            "rank",
+            "regexp_match",
+            "regexp_matches",
+            "regexp_replace",
+            "replace",
+            "round",
+            "row_number",
+            "rtrim",
+            "split_part",
+            "starts_with",
+            "string_agg",
+            "strpos",
+            "substr",
+            "substring",
+            "sum",
+            "to_char",
+            "to_json",
+            "to_jsonb",
+            "to_regclass",
+            "to_regprocedure",
+            "to_timestamp",
+            "trim",
+            "unnest",
+            "upper",
+        ]
+        .iter()
+        .any(|candidate| named(name, candidate)))
+        || (schema.is_none_or(|s| named(s, "public"))
+            && [
+                "agent_action_outbox_start_candidate",
+                "thread_episodic_search_keys",
+                "thread_episodic_search_terms",
+            ]
+            .iter()
+            .any(|candidate| named(name, candidate)))
+}
+
+fn read_binary(op: &Bin) -> bool {
+    match op {
+        Bin::Plus
+        | Bin::Minus
+        | Bin::Multiply
+        | Bin::Divide
+        | Bin::Modulo
+        | Bin::StringConcat
+        | Bin::Gt
+        | Bin::Lt
+        | Bin::GtEq
+        | Bin::LtEq
+        | Bin::Eq
+        | Bin::NotEq
+        | Bin::And
+        | Bin::Or
+        | Bin::BitwiseOr
+        | Bin::BitwiseAnd
+        | Bin::PGBitwiseXor
+        | Bin::PGBitwiseShiftLeft
+        | Bin::PGBitwiseShiftRight
+        | Bin::PGExp
+        | Bin::PGOverlap
+        | Bin::PGRegexMatch
+        | Bin::PGRegexIMatch
+        | Bin::PGRegexNotMatch
+        | Bin::PGRegexNotIMatch
+        | Bin::PGLikeMatch
+        | Bin::PGILikeMatch
+        | Bin::PGNotLikeMatch
+        | Bin::PGNotILikeMatch
+        | Bin::PGStartsWith
+        | Bin::Arrow
+        | Bin::LongArrow
+        | Bin::HashArrow
+        | Bin::HashLongArrow
+        | Bin::AtAt
+        | Bin::AtArrow
+        | Bin::ArrowAt
+        | Bin::HashMinus
+        | Bin::AtQuestion
+        | Bin::Question
+        | Bin::QuestionAnd
+        | Bin::QuestionPipe
+        | Bin::Overlaps
+        | Bin::Spaceship
+        | Bin::LtDashGt => true,
+        // pgvector operators installed by the managed extension in public.
+        Bin::Custom(symbol) => matches!(symbol.as_str(), "<=>" | "<->" | "<#>" | "<+>"),
+        Bin::PGCustomBinaryOperator(parts) => match parts.as_slice() {
+            [schema, op] if schema.eq_ignore_ascii_case("public") || schema == "\"public\"" => {
+                matches!(op.as_str(), "<=>" | "<->" | "<#>" | "<+>")
+            }
+            [schema, op]
+                if schema.eq_ignore_ascii_case("pg_catalog") || schema == "\"pg_catalog\"" =>
             {
-                return Token::Invalid;
+                matches!(
+                    op.as_str(),
+                    "=" | "<>" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/" | "&&"
+                )
             }
-            following = self.next();
-        }
-        if following.keyword("cycle") {
-            if !self.cte_columns_and_set_column() {
-                return Token::Invalid;
-            }
-            let mut using = self.next();
-            if using.keyword("to") {
-                // The optional TO/DEFAULT constants precede the reserved USING.
-                loop {
-                    using = self.next();
-                    if using.keyword("using") {
-                        break;
-                    }
-                    if matches!(using, Token::End | Token::Invalid | Token::Semicolon) {
-                        return Token::Invalid;
-                    }
-                }
-            }
-            if !using.keyword("using") || !self.next().is_identifier() {
-                return Token::Invalid;
-            }
-            following = self.next();
-        }
-        following
+            _ => false,
+        },
+        _ => false,
     }
+}
 
-    fn cte_columns_and_set_column(&mut self) -> bool {
-        while self.next().is_identifier() {
-            let next = self.next();
-            if next != Token::Comma {
-                return next.keyword("set") && self.next().is_identifier();
-            }
-        }
-        false
-    }
-
-    fn read_tail(&mut self, mut depth: usize, stop_at_close: bool) -> bool {
-        let mut query_depth = depth;
-        let mut outer_queries = Vec::new();
-        loop {
-            match self.next() {
-                Token::Open => depth += 1,
-                Token::Close if depth == 0 => return false,
-                Token::Close => {
-                    if query_depth == depth {
-                        query_depth = outer_queries.pop().unwrap_or(0);
-                    }
-                    depth -= 1;
-                    if depth == 0 && stop_at_close {
-                        return true;
-                    }
-                }
-                Token::End => return depth == 0 && !stop_at_close,
-                Token::Semicolon if depth == 0 && !stop_at_close => {
-                    return self.next() == Token::End;
-                }
-                Token::Invalid | Token::Semicolon => return false,
-                token if read_command(token) && depth > query_depth => {
-                    outer_queries.push(query_depth);
-                    query_depth = depth;
-                }
-                token if depth == query_depth && token.keyword("into") => return false,
-                token if depth == query_depth && token.keyword("for") && self.starts_row_lock() => {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn starts_row_lock(mut self) -> bool {
-        let strength = self.next();
-        strength.keyword("update")
-            || strength.keyword("share")
-            || (strength.keyword("no")
-                && self.next().keyword("key")
-                && self.next().keyword("update"))
-            || (strength.keyword("key") && self.next().keyword("share"))
-    }
-
-    fn explain_without_execution(&mut self) -> bool {
-        loop {
-            match self.next() {
-                Token::End => return true,
-                Token::Semicolon => return self.next() == Token::End,
-                Token::Invalid => return false,
-                token if token.keyword("analyze") || token.keyword("analyse") => return false,
-                _ => {}
-            }
-        }
-    }
-
-    fn next(&mut self) -> Token<'a> {
-        loop {
-            let input = self.rest;
-            let Some((&first, tail)) = input.split_first() else {
-                return Token::End;
-            };
-            if first.is_ascii_whitespace() {
-                self.rest = tail;
-                continue;
-            }
-            if self.rest.starts_with(b"--") {
-                let end = tail
+fn read_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Custom(name, _) => callable(name).is_some_and(|(schema, name)| {
+            (schema.is_none_or(|s| named(s, "public")) && named(name, "vector"))
+                || (schema.is_none_or(|s| named(s, "pg_catalog"))
+                    && [
+                        "bool",
+                        "bytea",
+                        "float4",
+                        "float8",
+                        "int2",
+                        "int4",
+                        "int8",
+                        "json",
+                        "jsonb",
+                        "name",
+                        "oid",
+                        "pg_snapshot",
+                        "regclass",
+                        "text",
+                        "timestamptz",
+                        "uuid",
+                        "xid8",
+                    ]
                     .iter()
-                    .position(|&byte| matches!(byte, b'\r' | b'\n'))
-                    .unwrap_or(tail.len());
-                self.rest = &tail[end..];
-                continue;
-            }
-            if self.rest.starts_with(b"/*") {
-                if !self.skip_block_comment() {
-                    return Token::Invalid;
-                }
-                continue;
-            }
-
-            self.rest = tail;
-            return match first {
-                b'(' => Token::Open,
-                b')' => Token::Close,
-                b',' => Token::Comma,
-                b';' => Token::Semicolon,
-                b'"' => self.quoted(b'"', false, Token::Identifier),
-                b'\'' => self.quoted(b'\'', false, Token::Other),
-                b'e' | b'E' if tail.first() == Some(&b'\'') => {
-                    self.rest = &tail[1..];
-                    self.quoted(b'\'', true, Token::Other)
-                }
-                b'u' | b'U' if tail.starts_with(b"&\"") => {
-                    self.rest = &tail[2..];
-                    self.quoted(b'"', false, Token::Identifier)
-                }
-                b'$' => self.dollar_quoted(tail),
-                _ if identifier_start(first) => {
-                    let len = tail
-                        .iter()
-                        .take_while(|&&byte| identifier_continue(byte) || byte == b'$')
-                        .count();
-                    self.rest = &tail[len..];
-                    match std::str::from_utf8(&input[..len + 1]) {
-                        Ok(word) => Token::Word(word),
-                        Err(_) => Token::Invalid,
-                    }
-                }
-                _ => Token::Other,
-            };
-        }
+                    .any(|candidate| named(name, candidate)))
+        }),
+        DataType::Array(array) => match array {
+            sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, _) => read_type(element),
+            _ => false,
+        },
+        DataType::Character(_)
+        | DataType::Char(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::Varchar(_)
+        | DataType::Uuid
+        | DataType::Numeric(_)
+        | DataType::Decimal(_)
+        | DataType::Dec(_)
+        | DataType::Float(_)
+        | DataType::Int2(_)
+        | DataType::SmallInt(_)
+        | DataType::Int(_)
+        | DataType::Int4(_)
+        | DataType::Int8(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::Float4
+        | DataType::Real
+        | DataType::Float8
+        | DataType::DoublePrecision
+        | DataType::Bool
+        | DataType::Boolean
+        | DataType::Date
+        | DataType::Time(..)
+        | DataType::Timestamp(..)
+        | DataType::JSON
+        | DataType::JSONB
+        | DataType::Regclass
+        | DataType::Text
+        | DataType::Bytea
+        | DataType::Bit(_)
+        | DataType::BitVarying(_)
+        | DataType::VarBit(_) => true,
+        _ => false,
     }
-
-    fn quoted(&mut self, delimiter: u8, backslash_escapes: bool, token: Token<'a>) -> Token<'a> {
-        while let Some((&first, tail)) = self.rest.split_first() {
-            self.rest = tail;
-            if first == delimiter {
-                if tail.first() != Some(&delimiter) {
-                    return token;
-                }
-                self.rest = &tail[1..];
-            } else if backslash_escapes && first == b'\\' {
-                if tail.is_empty() {
-                    break;
-                }
-                self.rest = &tail[1..];
-            }
-        }
-        Token::Invalid
-    }
-
-    fn dollar_quoted(&mut self, tail: &'a [u8]) -> Token<'a> {
-        let tag_len = if tail.first() == Some(&b'$') {
-            0
-        } else if tail.first().copied().is_some_and(identifier_start) {
-            tail.iter()
-                .take_while(|&&byte| identifier_continue(byte))
-                .count()
-        } else {
-            return Token::Other; // Includes positional parameters.
-        };
-        if tail.get(tag_len) != Some(&b'$') {
-            return Token::Other;
-        }
-        let tag_and_close = &tail[..=tag_len];
-        let mut body = &tail[tag_len + 1..];
-        while let Some(offset) = body.iter().position(|&byte| byte == b'$') {
-            let suffix = &body[offset + 1..];
-            if let Some(rest) = suffix.strip_prefix(tag_and_close) {
-                self.rest = rest;
-                return Token::Other;
-            }
-            body = suffix;
-        }
-        self.rest = &[];
-        Token::Invalid
-    }
-
-    fn skip_block_comment(&mut self) -> bool {
-        let mut depth = 1;
-        self.rest = &self.rest[2..];
-        while let Some((first, tail)) = self.rest.split_first() {
-            match (*first, tail.first()) {
-                (b'/', Some(b'*')) => {
-                    depth += 1;
-                    self.rest = &tail[1..];
-                }
-                (b'*', Some(b'/')) => {
-                    depth -= 1;
-                    self.rest = &tail[1..];
-                    if depth == 0 {
-                        return true;
-                    }
-                }
-                _ => self.rest = tail,
-            }
-        }
-        false
-    }
-}
-
-fn identifier_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
-}
-
-fn identifier_continue(byte: u8) -> bool {
-    identifier_start(byte) || byte.is_ascii_digit()
 }

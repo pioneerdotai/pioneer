@@ -222,13 +222,17 @@ fn connect_options(
         .max_connections(max_connections)
         .connect_timeout(Duration::from_secs(2))
         .acquire_timeout(Duration::from_secs(3))
-        .sqlx_logging(false);
+        .sqlx_logging(false)
+        .map_sqlx_postgres_opts(|options| options.options([("search_path", "public, pg_temp")]));
     options
 }
 
 fn read_only_options(mut options: ConnectOptions) -> ConnectOptions {
     options.map_sqlx_postgres_opts(|options| {
-        options.options([("default_transaction_read_only", "on")])
+        options.options([
+            ("default_transaction_read_only", "on"),
+            ("search_path", "public, pg_temp"),
+        ])
     });
     options
 }

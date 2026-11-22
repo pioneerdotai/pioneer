@@ -1471,14 +1471,19 @@ async fn unread_filter_precedes_limit_and_keyset_cursor() {
             mark_personal_read(db, A, &id).await;
         }
     }
-    let first = list_task_completion_inbox(db, &access(A), None, 30)
+    let database = pioneer_postgres_pools::PostgresDatabase::new(
+        fixture.connect_read_only().await.unwrap(),
+        db.clone(),
+    );
+    let snapshot = database.begin_read().await.unwrap();
+    let first = list_task_completion_inbox(&snapshot, &access(A), None, 30)
         .await
         .unwrap();
     assert_eq!(first.len(), 30);
     assert_eq!(first[0].run_id, "page-034");
     let anchor = first.last().unwrap();
     let next = list_task_completion_inbox(
-        db,
+        &snapshot,
         &access(A),
         Some((&anchor.completed_key, &anchor.run_id)),
         30,
@@ -1486,5 +1491,10 @@ async fn unread_filter_precedes_limit_and_keyset_cursor() {
     .await
     .unwrap();
     assert_eq!(next.len(), 5);
-    assert_eq!(unread(db, A).await, 35);
+    mark_personal_read(db, A, "page-034").await;
+    assert_eq!(unread(&snapshot, A).await, 35);
+    snapshot.commit().await.unwrap();
+    let current = database.begin_read().await.unwrap();
+    assert_eq!(unread(&current, A).await, 34);
+    current.commit().await.unwrap();
 }

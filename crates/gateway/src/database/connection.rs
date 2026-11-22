@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use migration::Migrator;
 use pioneer_config::AppConfig;
 use pioneer_postgres::BundledPostgres;
-use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
+use pioneer_postgres_pools::{MANAGED_SEARCH_PATH, PostgresDatabase, PostgresWriteExecutor};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,7 +70,9 @@ pub async fn initialize_with_startup(
                 .idle_timeout(Duration::from_millis(database_config.idle_timeout_ms))
                 .sqlx_logging(false)
                 .map_sqlx_postgres_opts(move |session| {
-                    let session = session.application_name(name);
+                    let session = session
+                        .application_name(name)
+                        .options([("search_path", MANAGED_SEARCH_PATH)]);
                     if read_only {
                         session.options([("default_transaction_read_only", "on")])
                     } else {
@@ -154,7 +156,10 @@ fn external_options(
     let writer = external_writer_options(&url, source, capacity, database_config)?;
     let mut reader = writer.clone();
     reader.map_sqlx_postgres_opts(|options| {
-        options.options([("default_transaction_read_only", "on")])
+        options.options([
+            ("default_transaction_read_only", "on"),
+            ("search_path", MANAGED_SEARCH_PATH),
+        ])
     });
     Ok(Some((writer, reader)))
 }
@@ -210,7 +215,8 @@ fn external_writer_options(
         .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
         .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
         .idle_timeout(Duration::from_millis(config.idle_timeout_ms))
-        .sqlx_logging(false);
+        .sqlx_logging(false)
+        .map_sqlx_postgres_opts(|session| session.options([("search_path", MANAGED_SEARCH_PATH)]));
     Ok(writer)
 }
 

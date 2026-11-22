@@ -7,6 +7,7 @@ mod query_scope;
 mod reader;
 mod statement_route;
 pub use query_scope::DiagnosticStream;
+pub use statement_route::MANAGED_SEARCH_PATH;
 mod work_signal;
 mod writer;
 pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_deadline};
