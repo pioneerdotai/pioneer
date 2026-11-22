@@ -49571,9 +49571,14 @@ async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
                 runtime_kind: CLIAgentRuntimeKind::Codex,
             }),
             "first-workspace-turn",
-        ).await.expect("the first Codex launch must resolve before startup reconciliation");
+        )
+        .await
+        .expect("the first Codex launch must resolve before startup reconciliation");
         let (identity, _) = resolved.expect("the launch has a persisted agent identity");
-        assert_eq!(identity.source_kind, pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance);
+        assert_eq!(
+            identity.source_kind,
+            pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance
+        );
         let notification_b =
             recv_notification_by_method(&mut rx_b, events::WORKSPACE_CHANGED).await;
 

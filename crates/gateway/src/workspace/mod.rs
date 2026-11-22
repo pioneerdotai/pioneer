@@ -180,8 +180,12 @@ impl WorkspaceManager {
             let now = chrono::Utc::now().fixed_offset();
             pioneer_crud::ensure_pioneer_for_workspace(&transaction, &model.id, now).await?;
             pioneer_crud::ensure_cli_identities_for_workspace(
-                &transaction, &model.id, cli_identities, now,
-            ).await?;
+                &transaction,
+                &model.id,
+                cli_identities,
+                now,
+            )
+            .await?;
             transaction.commit().await?;
             Ok::<_, anyhow::Error>((model, inserted))
         }

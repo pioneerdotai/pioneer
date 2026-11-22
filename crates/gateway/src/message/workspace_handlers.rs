@@ -77,8 +77,14 @@ impl MessageProcessor {
             let _settings_guard = self.gateway_settings_update_lock.lock().await;
             let identities = self
                 .load_cli_runtime_instances()
-                .and_then(|configured| super::agent_action_tools::cli_identity_catalog(self, &configured))
-                .map_err(|error| WorkspaceError::Internal(format!("failed to load CLI identity catalog: {error:#}")))?;
+                .and_then(|configured| {
+                    super::agent_action_tools::cli_identity_catalog(self, &configured)
+                })
+                .map_err(|error| {
+                    WorkspaceError::Internal(format!(
+                        "failed to load CLI identity catalog: {error:#}"
+                    ))
+                })?;
             self.workspace_manager
                 .create_workspace_with_cli_identities(
                     params.workspace_id.as_str(),
