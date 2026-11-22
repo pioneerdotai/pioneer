@@ -154,7 +154,10 @@ pub(crate) enum CliMcpBridgeSupervisorError {
     UnexpectedFrame,
     BootstrapNotConsumed,
     Coordinator(CliMcpCoordinatorError),
-    Artifact(PrivateArtifactError),
+    Artifact {
+        operation: &'static str,
+        error: PrivateArtifactError,
+    },
     Ipc(PrivateIpcError),
     Bootstrap(pioneer_cli_mcp_bridge::BootstrapDecodeError),
     Frame(pioneer_cli_mcp_bridge::BridgeFrameError),
@@ -178,7 +181,7 @@ impl fmt::Display for CliMcpBridgeSupervisorError {
                 formatter.write_str("CLI MCP bootstrap was not consumed before readiness")
             }
             Self::Coordinator(error) => write!(formatter, "CLI MCP bridge grant failed: {error:?}"),
-            Self::Artifact(error) => error.fmt(formatter),
+            Self::Artifact { error, .. } => error.fmt(formatter),
             Self::Ipc(error) => error.fmt(formatter),
             Self::Bootstrap(error) => error.fmt(formatter),
             Self::Frame(error) => error.fmt(formatter),
@@ -194,9 +197,9 @@ impl From<CliMcpCoordinatorError> for CliMcpBridgeSupervisorError {
     }
 }
 
-impl From<PrivateArtifactError> for CliMcpBridgeSupervisorError {
-    fn from(value: PrivateArtifactError) -> Self {
-        Self::Artifact(value)
+impl CliMcpBridgeSupervisorError {
+    fn artifact(operation: &'static str) -> impl FnOnce(PrivateArtifactError) -> Self {
+        move |error| Self::Artifact { operation, error }
     }
 }
 
@@ -392,11 +395,14 @@ impl CliMcpBridgeSupervisor {
             self.endpoint_root.as_path(),
             &issued.bridge_session_id,
             generation,
-        ) {
+        )
+        .map_err(CliMcpBridgeSupervisorError::artifact(
+            "create_mcp_endpoint_directory",
+        )) {
             Ok(directory) => directory,
             Err(error) => {
                 let _ = self.coordinator.revoke_grant(&grant_ref).await;
-                return Err(error.into());
+                return Err(error);
             }
         };
         let mut bootstrap_directory = if self.endpoint_root == artifact_root {
@@ -406,12 +412,15 @@ impl CliMcpBridgeSupervisor {
                 artifact_root,
                 &issued.bridge_session_id,
                 generation,
-            ) {
+            )
+            .map_err(CliMcpBridgeSupervisorError::artifact(
+                "create_mcp_bootstrap_directory",
+            )) {
                 Ok(directory) => Some(directory),
                 Err(error) => {
                     let _ = self.coordinator.revoke_grant(&grant_ref).await;
                     let _ = endpoint_directory.cleanup();
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
         };
@@ -440,7 +449,10 @@ impl CliMcpBridgeSupervisor {
             expires_at_unix_ms: issued.expires_at_unix_ms,
         };
         let bootstrap_owner = bootstrap_directory.as_ref().unwrap_or(&endpoint_directory);
-        let bootstrap = match bootstrap_owner.write_bootstrap(&document) {
+        let bootstrap = match bootstrap_owner
+            .write_bootstrap(&document)
+            .map_err(CliMcpBridgeSupervisorError::artifact("write_mcp_bootstrap"))
+        {
             Ok(bootstrap) => bootstrap,
             Err(error) => {
                 drop(listener);
@@ -449,7 +461,7 @@ impl CliMcpBridgeSupervisor {
                     let _ = directory.cleanup();
                 }
                 let _ = endpoint_directory.cleanup();
-                return Err(error.into());
+                return Err(error);
             }
         };
         let endpoint = document.endpoint;
@@ -720,15 +732,27 @@ impl CliMcpBridgeSupervisor {
                 resources.grant_revoked = true;
             }
             if let Some(bootstrap) = resources.bootstrap.as_mut() {
-                bootstrap.cleanup()?;
+                bootstrap
+                    .cleanup()
+                    .map_err(CliMcpBridgeSupervisorError::artifact(
+                        "cleanup_mcp_bootstrap_file",
+                    ))?;
                 resources.bootstrap.take();
             }
             if let Some(directory) = resources.bootstrap_directory.as_mut() {
-                directory.cleanup()?;
+                directory
+                    .cleanup()
+                    .map_err(CliMcpBridgeSupervisorError::artifact(
+                        "cleanup_mcp_bootstrap_directory",
+                    ))?;
                 resources.bootstrap_directory.take();
             }
             if let Some(directory) = resources.endpoint_directory.as_mut() {
-                directory.cleanup()?;
+                directory
+                    .cleanup()
+                    .map_err(CliMcpBridgeSupervisorError::artifact(
+                        "cleanup_mcp_endpoint_directory",
+                    ))?;
                 resources.endpoint_directory.take();
             }
             resources.finished = true;
