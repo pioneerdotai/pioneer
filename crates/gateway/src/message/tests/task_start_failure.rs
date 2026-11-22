@@ -295,6 +295,7 @@ async fn run_gateway_start_failure(
             .unwrap();
         assert!(turn.status != TurnStatus::InProgress);
         // Terminal dispatch never replaces cancellation with start failure.
+        processor.shutdown_resilience_workers().await;
         return (response.runs[0].error.clone(), response.runs[0].id.clone());
     }
     let expected_status = if matches!(
@@ -469,6 +470,7 @@ async fn run_gateway_start_failure(
                 1
             );
             assert!(cli.turn_starts.lock().await.is_empty());
+            processor.shutdown_resilience_workers().await;
             return (Some(error), run_id);
         }
         install_task_start_cleanup_failure(&store).await;
@@ -526,11 +528,9 @@ async fn run_gateway_start_failure(
     ] {
         assert!(!encoded.contains(marker));
     }
-    if matches!(case, PreparationFailure::ChildPersistence) {
-        // An optional delivery can still own a claim after the run fails.
-        // Join Gateway workers before the fixture closes the PostgreSQL pools.
-        processor.shutdown_resilience_workers().await;
-    }
+    // Terminal Task state can commit before optional deliveries finish.
+    // Join Gateway workers before the fixture closes the PostgreSQL pools.
+    processor.shutdown_resilience_workers().await;
     (Some(error), run_id)
 }
 
@@ -570,8 +570,16 @@ fn gateway_history_lock_keeps_sqlstate_context_and_one_safe_event() {
         (PreparationFailure::AdmissionStorage, "cli_admission"),
     ] {
         let ((error, _), events) = capture_task_start(run_gateway_start_failure(case));
-        assert_eq!(events.len(), 1);
         assert_safe_events(&events);
+        assert_eq!(
+            events.len(),
+            1,
+            "{stage} emitted reports from {:?}",
+            events
+                .iter()
+                .map(|event| event.logger.as_deref())
+                .collect::<Vec<_>>()
+        );
         let error = error.unwrap();
         assert_eq!(error.class, TaskErrorClass::Internal);
         let TaskValue::Object(details) = error.details.unwrap() else {
