@@ -1,19 +1,19 @@
 //! Frozen history and CLI root lifetime contracts on PostgreSQL.
 use pioneer_crud_compaction::store::CompactionStore;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 async fn fixture() -> CompactionStore {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let store = CompactionStore::new(
-        SqliteDatabase::new(reader, fixture.connection().clone()),
+        PostgresDatabase::new(reader, fixture.connection().clone()),
         Default::default(),
     );
     assert!(
         store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );

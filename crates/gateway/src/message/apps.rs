@@ -175,9 +175,9 @@ impl MessageProcessor {
         // Metadata/session reconciliation is maintenance; tool routing blocks
         // its invocation owner. Reuse the existing database-scoped processor.
         let processor = self.scoped_with_database_class(if is_invocation {
-            pioneer_sqlite::SqliteWriteClass::Interactive
+            pioneer_postgres_pools::PostgresWriteClass::Interactive
         } else {
-            pioneer_sqlite::SqliteWriteClass::Maintenance
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance
         });
         let app_id = installation.source_ref["app_id"]
             .as_str()

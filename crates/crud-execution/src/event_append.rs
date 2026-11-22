@@ -89,7 +89,7 @@ impl PreparedTurnEvent {
     /// while the writer is held.
     pub async fn preflight_idempotency(
         mut self,
-        db: &pioneer_sqlite::SqliteDatabase,
+        db: &pioneer_postgres_pools::PostgresDatabase,
     ) -> Result<Self> {
         if let Some(existing) = pioneer_crud_conversations::turn_payload::events(
             db,
@@ -189,7 +189,7 @@ pub async fn prepared_event_already_exists<C: ConnectionTrait>(
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn append_event(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     payload: &TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {

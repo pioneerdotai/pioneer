@@ -331,7 +331,7 @@ async fn live_and_background_finalization_share_one_commit_receipt() -> anyhow::
             .try_get::<i32>("", "pid")?;
 
         let left = store.clone();
-        let right = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        let right = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connect().await?,
         ));

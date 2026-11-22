@@ -384,7 +384,7 @@ impl SweepPreparation {
             let delete = physical_delete(&self.manifest, self.kind, &keys)?;
             let fence = self.work.as_ref().map(frozen_sweep_work::Work::fence);
             let committed = store
-                .run_serialized_write(|| async {
+                .retry_write_on_conflict(|| async {
                     let guard = guard.clone();
                     let delete = delete.clone();
                     let tx = store.connection.begin().await?;
@@ -780,7 +780,10 @@ impl FrozenStorageLifetimeProgress {
         }
     }
 
-    pub async fn convert_storage(&mut self, db: &pioneer_sqlite::SqliteDatabase) -> Result<bool> {
+    pub async fn convert_storage(
+        &mut self,
+        db: &pioneer_postgres_pools::PostgresDatabase,
+    ) -> Result<bool> {
         let (more, deleted) = crate::frozen_storage::maintain(
             db,
             &mut self.conversion,
@@ -1065,7 +1068,7 @@ impl FrozenStorageLifetimeProgress {
         // One bounded metadata page includes direct-root admission. No separate
         // query/continuation is needed for each retained history. A page's
         // negative admission is advisory; expire still checks current roots,
-        // reader holds and the exact header in its serialized writer.
+        // reader holds and the exact header in its write transaction.
         if self.expiry_pending.is_empty() {
             if self.expiry_upper.is_none() {
                 self.expiry_upper = Some(
@@ -1380,7 +1383,7 @@ impl FrozenStorageLifetimeProgress {
 }
 
 // Both reads are advisory: cleanup still owns final authorization in its
-// serialized writer. No reader/permit survives query_one_raw/checkpoint_row.
+// write transaction. No reader permit survives query_one_raw/checkpoint_row.
 async fn prepare_discard_candidate(
     store: &CompactionStore,
     id: &str,
@@ -1495,7 +1498,7 @@ impl DiscardPreparation {
             .work_signal("maintenance.frozen")
             .changing();
         let changed = store
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let tx = store.connection.begin().await?;
                 if crate::frozen_lifetime::cleanup_blocked(
                     &store.frozen_readers,
@@ -2042,7 +2045,7 @@ mod tests {
     }
 
     async fn postgres_store(fixture: &pioneer_postgres_test::TestDatabase) -> CompactionStore {
-        CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(
+        CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connect_with_limit(1).await.unwrap(),
         ))
@@ -3093,7 +3096,7 @@ mod tests {
                 "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('run','task','ws','thread',$1,CURRENT_TIMESTAMP,$2)",
                 [serde_json::to_string(&h).unwrap().into(), h.manifest_id.clone().into()])).await.unwrap();
             let mut prepared = prepared_expiry(&store).await;
-            // Discovery saw a releasing Task. The serialized expiry writer must
+            // Discovery saw a releasing Task. The expiry transaction must
             // still observe a newly retaining Task before marking/deleting payload.
             store
                 .connection

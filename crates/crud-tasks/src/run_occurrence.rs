@@ -10,8 +10,8 @@ use pioneer_crud_conversations::{
     events::TurnEventPayload, protocol_projection::turn_from_db_model, thread_metadata as thread,
     turn_reads as turn,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{TaskRunStatus, TurnKind, TurnStatus, generate_id};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{DatabaseTransaction, TransactionTrait};
 use std::{fmt, future::Future};
 
@@ -83,11 +83,11 @@ pub enum OccurrenceRepairPreparation<P> {
 }
 
 pub struct TaskRunOccurrenceQueue<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> TaskRunOccurrenceQueue<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -230,7 +230,7 @@ pub struct OccurrenceSourceFacts {
 
 impl OccurrenceSourceFacts {
     pub async fn prepare(
-        db: &SqliteDatabase,
+        db: &PostgresDatabase,
         run_id: String,
         fallback_completed_at: i64,
         background: bool,

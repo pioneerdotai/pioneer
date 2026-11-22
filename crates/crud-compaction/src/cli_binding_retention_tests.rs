@@ -8,13 +8,13 @@ use pioneer_crud_execution::{
     cli_runtime_store::CliRuntimeStore,
     input_mapping::InputMapping,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ConnectionTrait, DbBackend, Statement, TransactionTrait, prelude::DateTimeWithTimeZone,
 };
 
-async fn scalar(db: &SqliteDatabase, sql: &str) -> i64 {
+async fn scalar(db: &PostgresDatabase, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
         .await
         .unwrap()
@@ -24,7 +24,7 @@ async fn scalar(db: &SqliteDatabase, sql: &str) -> i64 {
 }
 
 async fn set_status(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     status: pioneer_protocol::TurnStatus,
     at: DateTimeWithTimeZone,
 ) -> anyhow::Result<()> {
@@ -41,7 +41,7 @@ async fn set_status(
 async fn portable_cli_mapping_preserves_sent_bytes_control_updates_and_upsert() {
     with_database(async |db| {
     crate::plan_test_support::seed_payload_sources(db.connection()).await;
-    let connection = SqliteDatabase::new(
+    let connection = PostgresDatabase::new(
         db.connect_read_only().await.unwrap(),
         db.connect().await.unwrap(),
     ).maintenance();

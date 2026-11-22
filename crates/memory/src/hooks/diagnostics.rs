@@ -92,17 +92,13 @@ pub(super) fn memory_manifest_hook_error(failure: crate::MemoryManifestFailure) 
         .postgres_sqlstate
         .as_ref()
         .and_then(|code| std::str::from_utf8(code).ok());
-    let backend = match sqlstate {
-        Some(code) => format!("postgres_sqlstate={code}"),
-        None => format!(
-            "sqlite_primary_code={:?} sqlite_extended_code={:?}",
-            failure.sqlite_primary_code, failure.sqlite_extended_code,
-        ),
-    };
+    let backend = sqlstate
+        .map(|code| format!(" postgres_sqlstate={code}"))
+        .unwrap_or_default();
     let mut error = memory_hook_error(
         failure.code(),
         format!(
-            "memory manifest loading failed: failure_class={} failure_stage={} {backend}",
+            "memory manifest loading failed: failure_class={} failure_stage={}{backend}",
             failure.class_name(),
             failure.stage.as_str(),
         ),
@@ -113,14 +109,6 @@ pub(super) fn memory_manifest_hook_error(failure: crate::MemoryManifestFailure) 
         ("failure_class", Some(failure.class_name().to_owned())),
         ("failure_stage", Some(failure.stage.as_str().to_owned())),
         ("postgres_sqlstate", sqlstate.map(str::to_owned)),
-        (
-            "sqlite_primary_code",
-            failure.sqlite_primary_code.map(|code| code.to_string()),
-        ),
-        (
-            "sqlite_extended_code",
-            failure.sqlite_extended_code.map(|code| code.to_string()),
-        ),
     ] {
         if let Some(value) = value {
             error.metadata.insert(

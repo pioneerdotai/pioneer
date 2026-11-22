@@ -24,8 +24,10 @@ async fn upsert_turn_item_replaces_only_its_portable_payload_version() -> anyhow
                  VALUES ('turn-item', 'thread-item', 'in_progress')",
             )
             .await?;
-        let db =
-            pioneer_sqlite::SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = pioneer_postgres_pools::PostgresDatabase::new(
+            fixture.connect_read_only().await?,
+            writer.clone(),
+        );
         let created_at = fixed_test_datetime();
         let row_query = || {
             turn_item::Entity::find()
@@ -150,7 +152,7 @@ async fn item_event_page_is_empty_for_unmaterialized_and_foreign_turns() -> anyh
         upsert_prepared_turn_item(&tx, prepared).await?;
         tx.commit().await?;
         let db =
-            pioneer_sqlite::SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+            pioneer_postgres_pools::PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
 
         let owned = get_turn_item_events_page(&db, "thread", "owned-turn", None, 10)
             .await?

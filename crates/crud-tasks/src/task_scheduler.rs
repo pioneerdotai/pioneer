@@ -6,11 +6,11 @@ use crate::values::unix_to_datetime;
 use crate::{task_run, task_trigger};
 
 pub struct TaskScheduler<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
 }
 
 impl<'a> TaskScheduler<'a> {
-    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(connection: &'a pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self { connection }
     }
 }

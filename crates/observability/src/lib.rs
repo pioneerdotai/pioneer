@@ -421,7 +421,7 @@ fn load_local_dotenv() {
     LOAD_DOTENV.call_once(|| match dotenvy::dotenv() {
         Ok(_) => {}
         Err(error) if error.not_found() => {}
-        Err(error) => eprintln!("failed to load .env: {error}"),
+        Err(_) => eprintln!("failed to load .env"),
     });
 }
 
@@ -902,12 +902,12 @@ mod tests {
             false
         ));
         assert!(!database_metrics_target_enabled(
-            "pioneer_sqlite::pool",
+            "pioneer_postgres_pools::pool",
             false
         ));
         assert!(database_metrics_target_enabled("sqlx::pool::acquire", true));
         assert!(!database_metrics_target_enabled(
-            "pioneer_sqlite::pool",
+            "pioneer_postgres_pools::pool",
             true
         ));
         assert!(!database_metrics_target_enabled("pioneer::other", true));
@@ -1487,8 +1487,8 @@ extern crate self as pioneer_observability;
 #[cfg(test)]
 mod db_pool_integration_tests;
 #[cfg(test)]
-#[path = "../../sqlite/src/query_scope.rs"]
-mod sqlite_query_scope;
+#[path = "../../postgres-pools/src/query_scope.rs"]
+mod postgres_query_scope;
 
 // Exercise Gateway's exact private admission owner against this target's SDK fixture.
 #[cfg(test)]

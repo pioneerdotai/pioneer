@@ -232,14 +232,14 @@ async fn runner_activation_is_idempotent_and_freezes_the_complete_manifest() -> 
     use pioneer_crud_compaction::runner_writes::{
         compaction_activate_runner, compaction_append_manifest, compaction_runner_transition,
     };
-    use pioneer_sqlite::SqliteDatabase;
+    use pioneer_postgres_pools::PostgresDatabase;
 
     with_database(async |fixture| {
         let writer = fixture.connection();
         seed_runner(writer).await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let other =
-            SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connect().await?);
+            PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connect().await?);
         let budget = ModelBudget::new(None, None, None);
         let state = RunnerState::new(1234, &budget, 100, None)?;
         assert!(compaction_prepare_runner(writer, "operation", &budget, 1, 0).await?);

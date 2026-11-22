@@ -5,8 +5,8 @@ use pioneer_crud_access::membership::{
 };
 use pioneer_crud_access::thread_participants::{CompletionOrder, ParticipantRepository};
 use pioneer_entity::{gateway_principal, task_inbox_activation};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ActiveModelTrait, DatabaseTransaction, EntityTrait, Set, TransactionTrait};
 
 #[path = "support/membership.rs"]
@@ -30,7 +30,7 @@ async fn participant_service_is_idempotent_scoped_and_preserves_creator_membersh
     pioneer_postgres_test::with_database(async |test_database| {
         let fixture = membership_fixture(test_database.connection()).await;
         let reader = test_database.connect_read_only().await?;
-        let db = SqliteDatabase::new(reader, fixture.database.clone());
+        let db = PostgresDatabase::new(reader, fixture.database.clone());
         let store = ParticipantRepository::new(&db);
         let grant_order = FixtureCompletionOrder;
         let participant_id = PrincipalId::new("B00000000000000000002").expect("participant id");

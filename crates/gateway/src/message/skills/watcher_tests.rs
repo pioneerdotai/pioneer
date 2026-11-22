@@ -1,25 +1,25 @@
 use super::*;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteEvent,
-    SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use sea_orm::ConnectionTrait;
 
 #[derive(Default)]
 pub(super) struct Observer {
-    pub(super) reads: StdMutex<Vec<SqliteReadClass>>,
-    pub(super) writes: StdMutex<Vec<SqliteWriteClass>>,
+    pub(super) reads: StdMutex<Vec<PostgresReadClass>>,
+    pub(super) writes: StdMutex<Vec<PostgresWriteClass>>,
 }
-impl SqliteReadObserver for Observer {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
+impl PostgresReadObserver for Observer {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl SqliteWriteObserver for Observer {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if let SqliteWriteEvent::Acquired { class, .. } = event {
+impl PostgresWriteObserver for Observer {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if let PostgresWriteEvent::Acquired { class, .. } = event {
             self.writes.lock().unwrap().push(class);
         }
     }
@@ -30,7 +30,7 @@ pub(super) struct Harness {
     pub(super) processor: Arc<MessageProcessor>,
     pub(super) workspace: pioneer_entity::workspace::Model,
     pub(super) observer: Arc<Observer>,
-    pub(super) writer: SqliteWriteExecutor,
+    pub(super) writer: PostgresWriteExecutor,
 }
 
 pub(super) async fn harness() -> Harness {
@@ -60,9 +60,12 @@ async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
         .await
         .unwrap();
     let observer = Arc::new(Observer::default());
-    let writer = SqliteWriteExecutor::with_observer(writer, observer.clone());
-    let database =
-        SqliteDatabase::from_executor_with_read_observer(reader, writer.clone(), observer.clone());
+    let writer = PostgresWriteExecutor::with_observer(writer, observer.clone());
+    let database = PostgresDatabase::from_executor_with_read_observer(
+        reader,
+        writer.clone(),
+        observer.clone(),
+    );
     let manager = Arc::new(crate::workspace::WorkspaceManager::new(database.clone()));
     manager
         .create_workspace("ws", Some("Skills test"))
@@ -129,7 +132,7 @@ async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
         )
         .with_runtime_home_for_tests(directory.path().join("runtime")),
     );
-    let processor = processor.with_database_class(SqliteWriteClass::Maintenance);
+    let processor = processor.with_database_class(PostgresWriteClass::Maintenance);
     observer.reads.lock().unwrap().clear();
     observer.writes.lock().unwrap().clear();
     Harness {

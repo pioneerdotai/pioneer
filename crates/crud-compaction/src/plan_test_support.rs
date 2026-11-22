@@ -80,7 +80,7 @@ pub fn assert_exact_branch_search(branch: &PlanNode, subject: &str, column: &str
     );
 }
 
-pub async fn seed_compressed_sources(db: &pioneer_sqlite::SqliteDatabase) {
+pub async fn seed_compressed_sources(db: &pioneer_postgres_pools::PostgresDatabase) {
     use pioneer_crud_conversations::{turn_event, turn_item};
     use pioneer_crud_payloads::storage::PreparedPayload;
 
@@ -123,7 +123,7 @@ pub async fn seed_compressed_sources(db: &pioneer_sqlite::SqliteDatabase) {
     tx.commit().await.unwrap();
 }
 
-pub async fn seed_canonical_plan_noise(db: &pioneer_sqlite::SqliteDatabase) {
+pub async fn seed_canonical_plan_noise(db: &pioneer_postgres_pools::PostgresDatabase) {
     // PostgreSQL can prefer a sequential scan on tiny tables. Populate other
     // canonical scopes so this checks the plan relevant to retained histories.
     db.execute_unprepared(
@@ -146,7 +146,7 @@ pub async fn seed_canonical_plan_noise(db: &pioneer_sqlite::SqliteDatabase) {
     ).await.unwrap();
 }
 
-pub async fn seed_task_basis(db: &pioneer_sqlite::SqliteDatabase) {
+pub async fn seed_task_basis(db: &pioneer_postgres_pools::PostgresDatabase) {
     use pioneer_crud_tasks::conversation_snapshot::{
         NewTaskRunConversationSnapshot, insert_if_absent,
     };
@@ -171,7 +171,7 @@ pub async fn seed_task_basis(db: &pioneer_sqlite::SqliteDatabase) {
     tx.commit().await.unwrap();
 }
 
-pub async fn replace_task_basis(db: &pioneer_sqlite::SqliteDatabase, text: &str) {
+pub async fn replace_task_basis(db: &pioneer_postgres_pools::PostgresDatabase, text: &str) {
     let prepared = pioneer_crud_payloads::storage::PreparedPayload::new(text).unwrap();
     let tx = db.begin().await.unwrap();
     prepared.insert(&tx).await.unwrap();
@@ -193,7 +193,7 @@ pub async fn replace_task_basis(db: &pioneer_sqlite::SqliteDatabase, text: &str)
 }
 
 pub async fn seed_portable_event(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     id: &str,
     sequence: i64,
     wire: &str,
@@ -225,7 +225,7 @@ pub async fn seed_portable_event(
 // headers that predate the complete-identity guard. Seed that historical state
 // atomically and restore the exact production DDL before any repository read;
 // no production transition or race fixture runs with a weakened guard.
-pub async fn seed_legacy_frozen_header(db: &pioneer_sqlite::SqliteDatabase, sql: &str) {
+pub async fn seed_legacy_frozen_header(db: &pioneer_postgres_pools::PostgresDatabase, sql: &str) {
     let tx = db.begin().await.unwrap();
     tx.execute_unprepared(
         "ALTER TABLE compaction_frozen_history DISABLE TRIGGER frozen_complete_identity",

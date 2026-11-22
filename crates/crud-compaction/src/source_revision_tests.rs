@@ -3,7 +3,7 @@ use crate::plan_test_support::{
     assert_exact_branch_search, explain, replace_task_basis, seed_canonical_plan_noise,
     seed_compressed_sources, seed_task_basis,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use sea_orm::{QueryTrait, TransactionTrait};
 
@@ -17,16 +17,16 @@ const RAW_SOURCE_ORACLE_SQL: &str = "SELECT count(*) AS matched
             AND s.source_version=wanted.value->>'version'
     )";
 
-async fn fixture() -> SqliteDatabase {
+async fn fixture() -> PostgresDatabase {
     fixture_with_portable_sources(false).await
 }
 
-async fn fixture_with_portable_sources(portable: bool) -> SqliteDatabase {
+async fn fixture_with_portable_sources(portable: bool) -> PostgresDatabase {
     let database = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = database.connection().clone();
     let reader = database.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::new(reader, writer).maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::new(reader, writer).maintenance();
+    assert!(db.reader_is_read_only().await.unwrap());
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('other','other',TRUE,FALSE)",
@@ -176,7 +176,7 @@ fn root_reference() -> SourceRef {
     }
 }
 
-async fn set_root_leaf(db: &SqliteDatabase, source: &SourceRef) {
+async fn set_root_leaf(db: &PostgresDatabase, source: &SourceRef) {
     db.execute_unprepared("DELETE FROM compaction_coverage WHERE checkpoint_id='root-checkpoint'")
         .await
         .unwrap();
@@ -202,7 +202,7 @@ fn raw_source_oracle(payload: String, workspace: &str, thread: &str) -> Statemen
 }
 
 async fn assert_sources(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     sources: &[SourceRef],
@@ -254,7 +254,7 @@ async fn assert_sources(
 }
 
 async fn assert_graph_results(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     reference: &SourceRef,
@@ -292,7 +292,7 @@ async fn assert_graph_results(
 }
 
 async fn assert_graph(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     reference: &SourceRef,
@@ -302,7 +302,7 @@ async fn assert_graph(
     assert_graph_results(db, workspace, thread, reference, expected, expected, case).await;
 }
 
-async fn assert_all(db: &SqliteDatabase, source: &SourceRef, expected: bool, case: &str) {
+async fn assert_all(db: &PostgresDatabase, source: &SourceRef, expected: bool, case: &str) {
     set_root_leaf(db, source).await;
     assert_sources(
         db,
@@ -630,7 +630,7 @@ async fn canonical_liveness_changes_raw_lookup_but_not_published_checkpoint_look
 }
 
 async fn update_task_basis_history(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     basis: &mut SourceRef,
     history_json: &str,
     expected_revision: i64,
@@ -674,7 +674,7 @@ async fn task_basis_revision_and_original_json_array_prefix() {
     assert_all(&db, &basis, false, "tab is not trimmed").await;
 }
 
-async fn projection_epoch(db: &SqliteDatabase) -> i64 {
+async fn projection_epoch(db: &PostgresDatabase) -> i64 {
     db.query_one_raw(Statement::from_string(
         DbBackend::Postgres,
         "SELECT COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id='source-thread'),0) AS version",
@@ -969,7 +969,7 @@ async fn sources_current_treats_checkpoint_as_epoch_independent_published_object
     .await;
 }
 
-async fn install_intermediate(db: &SqliteDatabase) {
+async fn install_intermediate(db: &PostgresDatabase) {
     for sql in [
         "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','foreign-thread','mid-owner',1)",
         "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('mid-operation','mid-owner','mid-fixture','completed','{}',1)",

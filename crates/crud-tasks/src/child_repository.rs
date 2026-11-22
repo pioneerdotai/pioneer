@@ -7,8 +7,8 @@ use pioneer_crud_conversations::context_cleanup::{
 };
 use pioneer_crud_conversations::turn_payload::PreflightRace;
 use pioneer_crud_execution::turn_runtime_snapshot::delete_turn_runtime_snapshot;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::TurnStatus;
-use pioneer_sqlite::SqliteDatabase;
 
 use anyhow::{Context, Result, ensure};
 use pioneer_entity::{task_child_reconcile_pending as point, task_child_reconcile_scope as scope};
@@ -87,7 +87,7 @@ impl TaskChildWorkRepository {
         snapshot: &point::Model,
         clock: &F,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             child_work::defer_child_point_snapshot(&self.connection, snapshot, clock)
         })
         .await
@@ -106,7 +106,7 @@ impl TaskChildWorkRepository {
         candidate: &point::Model,
         clock: &F,
     ) -> Result<Option<point::Model>> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             child_work::claim_child_point_with_clock(&self.connection, candidate, clock)
         })
         .await
@@ -118,7 +118,7 @@ impl TaskChildWorkRepository {
         retry_at: Option<i64>,
         done: bool,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             child_work::finish_child_point(&self.connection, claim, retry_at, done)
         })
         .await
@@ -167,7 +167,7 @@ impl TaskChildWorkRepository {
         clock: &F,
     ) -> Result<bool> {
         let outcome = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let claim = token();
                 let tx = self.connection.begin().await?;
                 let result = expand_child_scope_page(&tx, candidate, &claim, clock()).await;
@@ -187,7 +187,7 @@ impl TaskChildWorkRepository {
             // The prior transaction has dropped; unknown commits are fenced
             // against the advisory snapshot before this independent deferral.
             let deferred = self
-                .run_serialized_write(|| async {
+                .retry_write_on_conflict(|| async {
                     defer_child_scope_snapshot(&self.connection, candidate, clock()).await
                 })
                 .await;
@@ -217,7 +217,7 @@ impl TaskChildWorkRepository {
             // This is consumer bookkeeping, not a new domain invalidation.
             // Only the exact original claim may relinquish its lease and
             // schedule a canonical retry. A newer revision/owner is untouched.
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 // Domain before queue follows cleanup/producer lock order.
                 let current =
@@ -365,7 +365,7 @@ impl TaskChildWorkRepository {
     /// writer transaction. A queue token alone never authorizes deletion.
     pub async fn cleanup_claimed_child_capsule(&self, claim: &point::Model) -> Result<bool> {
         use pioneer_entity::{task, task_run, task_run_turn as link, thread, turn};
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = crate::task_child_cleanup::begin_authoritative(&self.connection).await?;
             crate::task_child_cleanup::lock_authority(&tx, &claim.thread_id, &claim.turn_id)
                 .await?;
@@ -507,18 +507,18 @@ pub struct UnreconciledTerminalTaskChildTurnRecord {
 
 #[derive(Clone)]
 pub struct TaskChildWorkRepository {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
 }
 
 impl TaskChildWorkRepository {
-    pub fn new(connection: &SqliteDatabase) -> Self {
+    pub fn new(connection: &PostgresDatabase) -> Self {
         Self {
             connection: connection.clone(),
         }
     }
 
     #[cfg(test)]
-    fn database_connection(&self) -> SqliteDatabase {
+    fn database_connection(&self) -> PostgresDatabase {
         self.connection.clone()
     }
 
@@ -529,16 +529,18 @@ impl TaskChildWorkRepository {
         }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        pioneer_sqlite::retry_with_backoff(
+        pioneer_postgres_pools::retry_with_backoff(
             || operation(),
             crate::retry::is_retryable,
-            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+            pioneer_postgres_pools::DEFAULT_LOCK_RETRY_ATTEMPTS,
+            std::time::Duration::from_millis(
+                pioneer_postgres_pools::DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+            ),
         )
         .await
     }
@@ -550,7 +552,7 @@ impl TaskChildWorkRepository {
             crate::work_change::TaskWorkChange::for_tasks(&self.connection, [turn.task_id.clone()]);
         let before = self.get_task_run_turn(&turn.id).await?;
         let result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 task_run_turn::upsert_turn(
                     &transaction,

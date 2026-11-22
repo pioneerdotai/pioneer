@@ -1,8 +1,8 @@
 use super::*;
 use crate::compaction::{frozen, history};
 use pioneer_compaction::frozen::FrozenMessageRef;
+use pioneer_postgres_pools::{PostgresReadClass, PostgresReadEvent, PostgresReadOutcome};
 use pioneer_provider::ChatMessage;
-use pioneer_sqlite::{SqliteReadClass, SqliteReadEvent, SqliteReadOutcome};
 use sha2::{Digest, Sha256};
 
 fn reference(source: SourceRef, message: &ChatMessage) -> FrozenMessageRef {
@@ -105,15 +105,15 @@ async fn scenario() -> (Fixture, Arc<HistoryReadObserver>, Vec<FrozenMessageRef>
     (f, observer, references)
 }
 
-fn take_reads(observer: &HistoryReadObserver, class: SqliteReadClass) -> usize {
+fn take_reads(observer: &HistoryReadObserver, class: PostgresReadClass) -> usize {
     let reads = std::mem::take(&mut *observer.reads.lock().unwrap());
     assert!(reads.iter().all(|event| !matches!(event,
-        SqliteReadEvent::OperationFinished { class: actual, outcome, .. }
-            if *actual != class || *outcome != SqliteReadOutcome::Ok
+        PostgresReadEvent::OperationFinished { class: actual, outcome, .. }
+            if *actual != class || *outcome != PostgresReadOutcome::Ok
     )));
     reads
         .iter()
-        .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+        .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
         .count()
 }
 
@@ -127,9 +127,9 @@ async fn frozen_prepared_event_item_group_saves_metadata_reads_for_both_projecti
             f.store.clone()
         };
         let class = if maintenance {
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         } else {
-            SqliteReadClass::Interactive
+            PostgresReadClass::Interactive
         };
         for execution in [false, true] {
             observer.reads.lock().unwrap().clear();
@@ -231,7 +231,7 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
                 .await
                 .expect("restore did not reach the exact-read boundary");
             assert_eq!(
-                take_reads(&observer, SqliteReadClass::Maintenance),
+                take_reads(&observer, PostgresReadClass::Maintenance),
                 0,
                 "payload read started before the exact-read pause"
             );
@@ -290,7 +290,7 @@ async fn frozen_precheck_keeps_exact_reads_and_fallback_rejects_stale_sources() 
         // One snapshot reads the group after the pause. A stale replay still
         // requires its own exact dependency read.
         assert_eq!(
-            take_reads(&observer, SqliteReadClass::Maintenance),
+            take_reads(&observer, PostgresReadClass::Maintenance),
             if change == "replay" { 2 } else { 1 }
         );
         assert!(observer.writes().is_empty());
@@ -364,7 +364,7 @@ async fn frozen_precheck_does_not_hide_database_errors_or_precheck_malformed_rev
             .await
             .is_err()
     );
-    assert_eq!(take_reads(&observer, SqliteReadClass::Interactive), 0);
+    assert_eq!(take_reads(&observer, PostgresReadClass::Interactive), 0);
     references[0].sources[0].version = "event-revision:1".into();
     f.store
         .database_connection()

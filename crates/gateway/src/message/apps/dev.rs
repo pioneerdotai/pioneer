@@ -636,7 +636,8 @@ impl MessageProcessor {
         }
         let cancel = CancellationToken::new();
         let stop = cancel.clone();
-        let owner = self.scoped_with_database_class(pioneer_sqlite::SqliteWriteClass::Maintenance);
+        let owner = self
+            .scoped_with_database_class(pioneer_postgres_pools::PostgresWriteClass::Maintenance);
         let task = tokio::spawn(async move {
             let database = owner.crud_store.database_connection();
             let mut changes = database.work_signal("apps.lifecycle").subscribe();

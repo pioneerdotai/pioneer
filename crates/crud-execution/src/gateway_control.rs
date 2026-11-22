@@ -7,10 +7,10 @@
 use crate::time::{deadline_unix_seconds, unix_to_datetime};
 use anyhow::Result;
 pub struct GatewayControlRepository<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
 }
 impl<'a> GatewayControlRepository<'a> {
-    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(connection: &'a pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self { connection }
     }
 }
@@ -107,18 +107,18 @@ pub fn event_wakes(
 /// fixtures. Production PostgreSQL mutations use the runtime handle. Transaction
 /// primitives cannot notify before commit; their CrudStore owner holds the guard.
 pub trait GatewayControlConnection: sea_orm::ConnectionTrait {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange>;
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange>;
     fn gateway_control_change_for(
         &self,
         work: &[GatewayControlWake],
-    ) -> Option<pioneer_sqlite::WorkChange> {
+    ) -> Option<pioneer_postgres_pools::WorkChange> {
         let keys = work.iter().map(GatewayControlWake::key).collect::<Vec<_>>();
         self.gateway_control_change()
             .map(|change| change.with_keys(&keys))
     }
 }
-impl GatewayControlConnection for pioneer_sqlite::SqliteDatabase {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+impl GatewayControlConnection for pioneer_postgres_pools::PostgresDatabase {
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange> {
         Some(self.work_signal("gateway.control").changing().with_keys(&[
             GatewayControlWake::Resources.key(),
             GatewayControlWake::Actions.key(),
@@ -126,12 +126,12 @@ impl GatewayControlConnection for pioneer_sqlite::SqliteDatabase {
     }
 }
 impl GatewayControlConnection for sea_orm::DatabaseConnection {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange> {
         None
     }
 }
 impl GatewayControlConnection for sea_orm::DatabaseTransaction {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange> {
         None
     }
 }

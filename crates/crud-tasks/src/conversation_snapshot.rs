@@ -254,7 +254,7 @@ pub fn record_from_bytes(
 }
 
 pub async fn get_scoped(
-    connection: &pioneer_sqlite::SqliteDatabase,
+    connection: &pioneer_postgres_pools::PostgresDatabase,
     run_id: &str,
 ) -> Result<Option<TaskRunConversationSnapshotRecord>> {
     let reader = connection.begin_read().await?;

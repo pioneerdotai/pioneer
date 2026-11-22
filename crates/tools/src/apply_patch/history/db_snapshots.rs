@@ -7,7 +7,7 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use sha2::Digest;
 const RECONCILIATION_PAGE_SIZE: u64 = 32;
@@ -25,8 +25,8 @@ pub struct SnapshotReconciliationReport {
 }
 
 #[derive(Clone)]
-pub struct SqliteSnapshotStore {
-    db: SqliteDatabase,
+pub struct PostgresSnapshotStore {
+    db: PostgresDatabase,
     limits: SnapshotStoreLimits,
 }
 
@@ -39,15 +39,15 @@ pub(crate) struct PreparedSnapshot {
     compressed_bytes: Vec<u8>,
 }
 
-impl SqliteSnapshotStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresSnapshotStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self {
             db: db.into(),
             limits: SnapshotStoreLimits::default(),
         }
     }
 
-    pub fn with_limits(db: impl Into<SqliteDatabase>, limits: SnapshotStoreLimits) -> Self {
+    pub fn with_limits(db: impl Into<PostgresDatabase>, limits: SnapshotStoreLimits) -> Self {
         Self {
             db: db.into(),
             limits,
@@ -111,7 +111,7 @@ impl SqliteSnapshotStore {
                 domain_id: domain_id.to_owned(),
                 snapshot: TextSnapshotRef::from_snapshot(snapshot),
             },
-            byte_len_sql: sqlite_i64(byte_len, "snapshot byte length")?,
+            byte_len_sql: postgres_i64(byte_len, "snapshot byte length")?,
             encoding_json: serde_json::to_string(&snapshot.encoding)?,
             line_endings_json: serde_json::to_string(&snapshot.line_endings)?,
             compressed_bytes,
@@ -297,8 +297,8 @@ impl SqliteSnapshotStore {
             identity.thread_id.clone(),
             identity.turn_id.clone(),
             identity.invocation_id.clone(),
-            sqlite_i64(logical_bytes, "logical reservation")?,
-            sqlite_i64(physical_bytes, "physical reservation")?,
+            postgres_i64(logical_bytes, "logical reservation")?,
+            postgres_i64(physical_bytes, "physical reservation")?,
         )
         .await
         .context("insert patch snapshot admission")?;
@@ -498,7 +498,7 @@ impl SqliteSnapshotStore {
                     .map(|snapshot| {
                         Ok((
                             snapshot.content_hash,
-                            sqlite_i64(snapshot.byte_len, "snapshot byte length")?,
+                            postgres_i64(snapshot.byte_len, "snapshot byte length")?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -751,7 +751,7 @@ impl SqliteSnapshotStore {
         }
     }
 
-    /// Intern one snapshot while the caller owns the surrounding SQLite
+    /// Intern one snapshot while the caller owns the surrounding PostgreSQL
     /// transaction. `add_reference` is true for a newly inserted history
     /// record and false when repairing a pre-existing record's missing or
     /// corrupt blob. Keeping blob admission and record insertion in one
@@ -909,7 +909,7 @@ impl SqliteSnapshotStore {
             &self.db,
             &reference.domain_id,
             &reference.snapshot.content_hash,
-            sqlite_i64(reference.snapshot.byte_len, "snapshot byte length")?,
+            postgres_i64(reference.snapshot.byte_len, "snapshot byte length")?,
             self.limits.max_physical_bytes,
         )
         .await
@@ -969,7 +969,7 @@ impl SqliteSnapshotStore {
         {
             bail!("snapshot reference exceeds the configured byte limit");
         }
-        let byte_len = sqlite_i64(reference.snapshot.byte_len, "snapshot byte length")?;
+        let byte_len = postgres_i64(reference.snapshot.byte_len, "snapshot byte length")?;
         let encoding_json = serde_json::to_string(&reference.snapshot.encoding)?;
         let line_endings_json = serde_json::to_string(&reference.snapshot.line_endings)?;
         let transaction = self.db.begin().await.context("begin snapshot release")?;
@@ -1089,7 +1089,7 @@ async fn load_snapshot_bounded<C: ConnectionTrait>(
         domain_id,
         content_hash,
         byte_len,
-        sqlite_i64(max_physical_bytes, "snapshot physical-byte limit")?,
+        postgres_i64(max_physical_bytes, "snapshot physical-byte limit")?,
         MAX_SNAPSHOT_METADATA_BYTES as i64,
     )
     .await?
@@ -1105,8 +1105,8 @@ async fn load_snapshot_bounded<C: ConnectionTrait>(
     Ok(Some(row))
 }
 
-fn sqlite_i64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
+fn postgres_i64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds PostgreSQL integer range"))
 }
 
 fn decode_nonnegative_i64(value: i64, label: &str) -> Result<u64> {

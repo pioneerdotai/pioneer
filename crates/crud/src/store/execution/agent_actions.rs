@@ -21,8 +21,10 @@ impl CrudStore {
         &self,
         input: AgentDelegationRouteInput,
     ) -> Result<pioneer_entity::agent_delegation_route::Model> {
-        self.run_serialized_write(|| agent_delegation_route::create_route(&self.connection, &input))
-            .await
+        self.retry_write_on_conflict(|| {
+            agent_delegation_route::create_route(&self.connection, &input)
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -35,7 +37,7 @@ impl CrudStore {
         authority_fingerprint: &str,
         now: DateTimeWithTimeZone,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             agent_delegation_route::revoke_route(
                 &self.connection,
                 route_id,
@@ -55,7 +57,7 @@ impl CrudStore {
             now,
         )
         .await?;
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             agent_delegation_route::expire_prepared_routes(&self.connection, &prepared, now)
         })
         .await
@@ -72,7 +74,7 @@ impl CrudStore {
         let control_wakes = vec![GatewayControlWake::Resources, GatewayControlWake::Actions];
         let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let input = input.clone();
                 async move {
                     let transaction = self
@@ -118,7 +120,7 @@ impl CrudStore {
         let control_result = async {
             let change = pioneer_crud_tasks::work_change::TaskWorkChange::new(&self.connection);
             let task_result = async {
-                self.run_serialized_write(|| {
+                self.retry_write_on_conflict(|| {
                     let now = now.clone();
                     async move {
                         let transaction = self.connection.begin().await.context(
@@ -180,7 +182,7 @@ impl CrudStore {
             let task_change = self.connection.work_signal("tasks.lifecycle").changing();
             let task_result =
                 async {
-                    self.run_serialized_write(|| {
+                    self.retry_write_on_conflict(|| {
                         let finished_at = finished_at.clone();
                         async move {
                             let transaction = self.connection.begin().await.context(
@@ -232,7 +234,7 @@ impl CrudStore {
         let control_result = async {
             let task_change = self.connection.work_signal("tasks.lifecycle").changing();
             let task_result = async {
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let tx = self.connection.begin().await?;
                     let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
                         return Ok(false);
@@ -327,7 +329,7 @@ impl CrudStore {
         )
         .await?;
         let task_result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let finished_at = finished_at.clone();
                 async move {
                     let transaction = self
@@ -386,7 +388,7 @@ impl CrudStore {
         terminal_reason: &str,
         finished_at: sea_orm::prelude::DateTimeWithTimeZone,
     ) -> Result<Vec<AgentWorkGraphCancellationTarget>> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let finished_at = finished_at.clone();
             async move {
                 let transaction = self

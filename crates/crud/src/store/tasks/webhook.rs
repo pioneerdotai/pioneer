@@ -76,7 +76,7 @@ impl CrudStore {
                 .await?;
             let prepared = &prepared;
             let tasks = &tasks;
-            self.run_serialized_write(|| async move {
+            self.retry_write_on_conflict(|| async move {
                 let prepared = tasks.refresh_queue_admission(prepared).await?;
                 let transaction = self.connection.begin().await?;
                 let outcome = async {

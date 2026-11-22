@@ -149,7 +149,7 @@ impl SelfImprovementFrozenSourceRange {
 }
 
 pub async fn list_for_frozen_range(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     frozen_range: &SelfImprovementFrozenSourceRange,
 ) -> Result<Vec<CanonicalTurnEventRecord>> {
     frozen_range.validate()?;
@@ -302,7 +302,7 @@ pub async fn list_for_frozen_range(
 }
 
 async fn foreground_exchange_bundle(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     parent_turn: &turn::Model,
     source: Option<&self_improvement_source_turn::Model>,
@@ -375,7 +375,7 @@ async fn foreground_exchange_bundle(
 }
 
 async fn collaborative_exchange_bundle(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn: &turn::Model,
@@ -558,7 +558,7 @@ async fn collaborative_exchange_bundle(
 }
 
 async fn load_collaborative_delivery_terminals(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn_id: &str,
@@ -607,7 +607,7 @@ async fn load_collaborative_delivery_terminals(
 }
 
 async fn load_collaborative_child_events(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     parent_thread_id: &str,
     parent_turn_id: &str,
@@ -794,7 +794,7 @@ async fn load_collaborative_child_events(
 }
 
 async fn verify_selected_source(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     selected: &SelfImprovementSourceTurnRecord,
 ) -> Result<()> {
     let persisted = self_improvement_source_turn::Entity::find_by_id(selected.id)
@@ -851,7 +851,7 @@ async fn verify_selected_source(
 }
 
 async fn verify_thread_boundary(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     boundary: &SelfImprovementThreadTerminalBoundary,
     selected_sources: &[SelfImprovementSourceTurnRecord],
 ) -> Result<CanonicalTurnEventRecord> {
@@ -923,7 +923,7 @@ async fn verify_thread_boundary(
 }
 
 async fn load_decoded_event(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     event_id: &str,
 ) -> Result<CanonicalTurnEventRecord> {
@@ -958,7 +958,7 @@ fn parent_turn_at_or_before_boundary(
 }
 
 async fn load_decoded_turn_events(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,

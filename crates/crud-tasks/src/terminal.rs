@@ -491,7 +491,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         let mut prepared = prepared;
         for _ in 0..16 {
             match self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     self.commit_task_terminal_transition_once(prepared.clone())
                 })
                 .await

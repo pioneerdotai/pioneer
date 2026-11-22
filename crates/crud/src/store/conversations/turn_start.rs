@@ -91,7 +91,7 @@ impl CrudStore {
     ) -> Result<()> {
         let turn_id = turn_id.to_owned();
         let input = input.to_vec();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let turn_id = turn_id.clone();
             let input = input.clone();
             async move {

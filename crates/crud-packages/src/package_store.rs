@@ -29,11 +29,11 @@ use crate::{
 };
 use anyhow::Context;
 use pioneer_crud_signals::gateway_control::{GatewayControlWake, control_work_change};
-use pioneer_protocol::SkillId;
-use pioneer_sqlite::SqliteDatabase;
-use pioneer_sqlite::{
+use pioneer_postgres_pools::PostgresDatabase;
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, retry_with_backoff,
 };
+use pioneer_protocol::SkillId;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -45,11 +45,11 @@ pub(crate) use plugins::{native_package_removal, validate_native_write_input};
 use sea_orm::TransactionTrait;
 
 pub struct PackageStore {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
 }
 
 impl PackageStore {
-    pub fn new(connection: SqliteDatabase) -> Self {
+    pub fn new(connection: PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -57,16 +57,18 @@ impl PackageStore {
         Self::new(self.connection.maintenance())
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        pioneer_sqlite::retry_with_backoff(
+        pioneer_postgres_pools::retry_with_backoff(
             || operation(),
-            pioneer_sqlite::is_retryable_database_conflict,
-            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+            pioneer_postgres_pools::is_retryable_database_conflict,
+            pioneer_postgres_pools::DEFAULT_LOCK_RETRY_ATTEMPTS,
+            std::time::Duration::from_millis(
+                pioneer_postgres_pools::DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+            ),
         )
         .await
     }
@@ -101,7 +103,7 @@ impl PackageStore {
             bail!("invalid plugin selection phase");
         }
         let value = serde_json::to_string(snapshot)?;
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let value = value.clone();
             async move { plugins::set_selection(&self.connection, turn, value).await }
         })
@@ -138,7 +140,7 @@ impl PackageStore {
         // The prepared selection and its native bindings may change after the
         // read. Revalidate both under one short writer transaction; serialize
         // outside capacity and perform only bounded DB checks inside it.
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let value = value.clone();
             let expected = expected.clone();
             let snapshot = snapshot.clone();
@@ -285,7 +287,7 @@ impl PackageStore {
             .transpose()?;
         let row = parent.clone();
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let row = row.clone();
             let prepared = prepared.clone();
             async move {
@@ -352,7 +354,7 @@ impl PackageStore {
             bail!("invalid plugin install outcome");
         }
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let error = error.clone();
             async move {
                 let db = self.connection.begin().await?;
@@ -369,7 +371,7 @@ impl PackageStore {
         kind: &str,
         diagnostic: &str,
     ) -> Result<()> {
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::record_failure(&db, write, kind, diagnostic).await?;
             db.commit().await?;
@@ -417,7 +419,7 @@ impl PackageStore {
             && link.status == "installed")
     }
     pub async fn prepare_plugin_reload(&self, id: &str, revision: i64) -> Result<()> {
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::prepare_reload(&db, id, revision).await?;
             db.commit().await?;
@@ -445,7 +447,7 @@ impl PackageStore {
         }
         let row = parent.clone();
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let row = row.clone();
             async move {
                 let db = self.connection.begin().await?;
@@ -643,7 +645,7 @@ impl PackageStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             let row = plugins::begin_mutation(
                 &db,
@@ -672,7 +674,7 @@ impl PackageStore {
             bail!("invalid plugin outcome");
         }
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let error = error.clone();
             async move {
                 let db = self.connection.begin().await?;
@@ -693,7 +695,7 @@ impl PackageStore {
             bail!("plugin pending too large");
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::replace_pending(&db, id, revision, pending.into()).await?;
             db.commit().await?;
@@ -703,7 +705,7 @@ impl PackageStore {
     }
     pub async fn delete_plugin_parent(&self, id: &str, revision: i64) -> Result<()> {
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::delete_parent(&db, id, revision).await?;
             db.commit().await?;
@@ -718,7 +720,7 @@ impl PackageStore {
         let maintenance = self.with_maintenance_access();
         loop {
             let count = maintenance
-                .run_serialized_write(|| async {
+                .retry_write_on_conflict(|| async {
                     let db = maintenance.connection.begin().await?;
                     let count = plugins::interrupt_unfinished(&db).await?;
                     db.commit().await?;
@@ -758,7 +760,7 @@ impl PackageStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::interrupt_mutation(&db, id, revision, pending.into(), error.into()).await?;
             db.commit().await?;
@@ -788,7 +790,7 @@ impl PackageStore {
         kind: &str,
     ) -> Result<()> {
         validate_native_write_input(Some(write))?;
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::validate_native_write(&db, Some(write), workspace, kind, &write.child_id)
                 .await?;
@@ -821,7 +823,7 @@ impl PackageStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             let row = plugins::resume_mutation(
                 &db,
@@ -854,7 +856,7 @@ impl PackageStore {
         }
         let _: serde_json::Value = serde_json::from_str(pending)?;
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             let upload = crate::skill_upload_session::find_skill_upload_session(&db, upload_id)
                 .await?
@@ -944,7 +946,7 @@ impl PackageStore {
             .map(|metadata| crate::plugin_metadata::prepare(id, metadata))
             .transpose()?;
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let prepared = prepared.clone();
             async move {
                 let db = self.connection.begin().await?;
@@ -973,7 +975,7 @@ impl PackageStore {
         kind: &str,
         key: &str,
     ) -> Result<()> {
-        self.run_serialized_write(|| async move {
+        self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::forget_component(&db, id, revision, kind, key).await?;
             db.commit().await?;
@@ -992,7 +994,7 @@ impl PackageStore {
         metadata: &crate::PreparedAppMetadata,
     ) -> Result<()> {
         let _runtime_change = self.connection.work_signal("apps.lifecycle").changing();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let db = self.connection.begin().await?;
             plugins::publish_package(
                 &db,
@@ -1081,7 +1083,7 @@ impl PackageStore {
             bindings,
             unix_to_datetime(event_timestamp_secs),
         );
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -1129,7 +1131,7 @@ impl PackageStore {
         event_timestamp_secs: i64,
     ) -> Result<()> {
         plugins::validate_native_write_input(native)?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let db = self.connection.begin().await?;
             plugins::validate_native_write(
                 &db,
@@ -1255,7 +1257,7 @@ impl PackageStore {
             .changing()
             .with_keys(&[pioneer_crud_signals::gateway_control::GatewayControlWake::Skills.key()]);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let created_at = unix_to_datetime(record.created_at_unix);
                 let updated_at = unix_to_datetime(record.created_at_unix);
                 skill_upload_session::insert_skill_upload_session(
@@ -1289,7 +1291,7 @@ impl PackageStore {
         record: &McpServerInstallationRecord,
         event_timestamp_secs: i64,
     ) -> Result<String> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(event_timestamp_secs);
             mcp_server_installation::upsert_mcp_server_installation(
                 &self.connection,
@@ -1348,7 +1350,7 @@ impl PackageStore {
         }
         let prepared_link = ownership.map(|write| plugins::prepare_link(write, "mcp"));
         let now = unix_to_datetime(event_timestamp_secs);
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let prepared_link = prepared_link.clone();
             async move {
                 let transaction = self.connection.begin().await?;
@@ -1565,7 +1567,7 @@ impl PackageStore {
         native: Option<&PluginNativeWrite>,
     ) -> Result<bool> {
         plugins::validate_native_write_input(native)?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let db = self.connection.begin().await?;
             plugins::validate_native_write(&db, native, workspace_id, "skill", skill_id.as_str())
                 .await?;
@@ -1586,7 +1588,7 @@ impl PackageStore {
         record: &SkillInstallationRecord,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_installation::insert_standalone(
                 &self.connection,
                 record,
@@ -1613,7 +1615,7 @@ impl PackageStore {
     }
 
     pub async fn delete_skill_installation(&self, skill_id: &SkillId) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_installation::delete_skill_installation(&self.connection, skill_id).await
         })
         .await
@@ -1651,7 +1653,7 @@ impl PackageStore {
         &self,
         record: &SkillPackInstallationRecord,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_pack_installation::insert_skill_pack_installation(&self.connection, record).await
         })
         .await
@@ -1663,7 +1665,7 @@ impl PackageStore {
         received_bytes: u64,
         updated_at_unix: i64,
     ) -> Result<Option<SkillUploadSessionRecord>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let updated_at = unix_to_datetime(updated_at_unix);
             let row = skill_upload_session::update_skill_upload_received_bytes(
                 &self.connection,
@@ -1691,7 +1693,7 @@ impl PackageStore {
         let control_change =
             control_work_change(&self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let updated_at = unix_to_datetime(updated_at_unix);
                 if !skill_upload_session::transition_skill_upload_status(
                     &self.connection,
@@ -1782,7 +1784,7 @@ impl PackageStore {
         scope_key: &str,
         name: &str,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             mcp_server_installation::delete_mcp_server_installation(
                 &self.connection,
                 scope_kind,
@@ -1811,7 +1813,7 @@ impl PackageStore {
     ) -> Result<()> {
         plugins::validate_native_write_input(native)?;
         let package_removal = plugins::native_package_removal(native)?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self.connection.begin().await?;
             let result = crate::mcp_installation_transactions::remove(
                 &transaction,
@@ -1840,7 +1842,7 @@ impl PackageStore {
         record: &McpServerCatalogSnapshotRecord,
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(event_timestamp_secs);
             mcp_server_catalog_snapshot::upsert_mcp_server_catalog_snapshot(
                 &self.connection,
@@ -1869,7 +1871,7 @@ impl PackageStore {
         &self,
         server_installation_id: &str,
     ) -> Result<u64> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             mcp_server_catalog_snapshot::delete_mcp_server_catalog_snapshot(
                 &self.connection,
                 server_installation_id,
@@ -1880,7 +1882,7 @@ impl PackageStore {
     }
 
     pub async fn insert_mcp_audit_event_record(&self, record: &McpAuditEventRecord) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             mcp_audit_event::insert_mcp_audit_event(&self.connection, record).await
         })
         .await
@@ -1917,7 +1919,7 @@ impl PackageStore {
         bindings: &[TurnMcpBindingRecord],
         event_timestamp_secs: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             turn_mcp_binding::replace_turn_mcp_bindings(
                 &self.connection,
                 turn_id,
@@ -1933,7 +1935,7 @@ impl PackageStore {
         &self,
         records: &[SkillAuditEventRecord],
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_audit_event::insert_skill_audit_events(&self.connection, None, records).await
         })
         .await
@@ -1944,7 +1946,7 @@ impl PackageStore {
         turn_id: &str,
         records: &[SkillAuditEventRecord],
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_audit_event::insert_skill_audit_events(&self.connection, Some(turn_id), records)
                 .await
         })
@@ -1968,7 +1970,7 @@ impl PackageStore {
         &self,
         record: &SkillDependencySnapshotRecord,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             skill_dependency_snapshot::insert_skill_dependency_snapshot(&self.connection, record)
                 .await
         })

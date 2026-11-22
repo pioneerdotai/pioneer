@@ -119,7 +119,7 @@ async fn exact_tool_item_reads_preserve_canonical_revisions_with_compression() {
     }
 }
 
-async fn fixture() -> SqliteDatabase {
+async fn fixture() -> PostgresDatabase {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connection();
     writer
@@ -131,9 +131,9 @@ async fn fixture() -> SqliteDatabase {
         )
         .await
         .unwrap();
-    let db = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
+    let db = PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
         .maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
     db
 }
 
@@ -245,10 +245,10 @@ async fn poison_source_progress_and_scope_are_bounded() {
     );
     assert_eq!(
         db.read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
+        pioneer_postgres_pools::PostgresReadClass::Maintenance
     );
     assert_eq!(
         db.write_class(),
-        pioneer_sqlite::SqliteWriteClass::Maintenance
+        pioneer_postgres_pools::PostgresWriteClass::Maintenance
     );
 }

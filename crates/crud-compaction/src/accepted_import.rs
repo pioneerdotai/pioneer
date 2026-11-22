@@ -57,7 +57,7 @@ impl Drop for CheckpointImportGraphReadObserver {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn observe_checkpoint_import_graph_reads(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
 ) -> CheckpointImportGraphReadObserver {
     let key = (db.runtime_identity(), workspace.to_owned());

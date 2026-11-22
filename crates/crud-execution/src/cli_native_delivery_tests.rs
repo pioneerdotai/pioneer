@@ -3,7 +3,7 @@ use crate::cli_runtime_store::CliRuntimeStore;
 use crate::gateway_control::GatewayControlWake;
 use crate::native_events::{self, NativeEventRepository};
 use crate::turn_execution::NewTurnExecution;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 
 use crate::test_fixture::InlineInput;
@@ -14,7 +14,7 @@ async fn native_delivery_fixture() -> (
     NewCliRuntimeNativeEvent,
 ) {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = SqliteDatabase::new(
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );

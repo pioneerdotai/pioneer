@@ -110,9 +110,9 @@ impl CrudStore {
         action: Option<crate::AgentCommitInput>,
         actor_id: Option<String>,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        pioneer_sqlite::retry_with_backoff(
+        pioneer_postgres_pools::retry_with_backoff(
             || {
-                self.run_serialized_write(|| {
+                self.retry_write_on_conflict(|| {
                     self.append_task_cancellation_events_once(
                         events.clone(),
                         at,
@@ -128,8 +128,10 @@ impl CrudStore {
                         .is_some()
                 })
             },
-            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+            pioneer_postgres_pools::DEFAULT_LOCK_RETRY_ATTEMPTS,
+            std::time::Duration::from_millis(
+                pioneer_postgres_pools::DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+            ),
         )
         .await
     }

@@ -107,11 +107,11 @@ impl TaskStartupReconciler {
         }
     }
 
-    pub(crate) fn capacity_signal(&self) -> pioneer_sqlite::WorkSignal {
+    pub(crate) fn capacity_signal(&self) -> pioneer_postgres_pools::WorkSignal {
         self.executors.work_signal()
     }
 
-    pub(crate) fn database(&self) -> pioneer_sqlite::SqliteDatabase {
+    pub(crate) fn database(&self) -> pioneer_postgres_pools::PostgresDatabase {
         self.store.database_connection()
     }
 

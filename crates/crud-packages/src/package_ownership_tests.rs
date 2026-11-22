@@ -433,7 +433,7 @@ async fn plugin_ready_keeps_resolved_siblings_and_rejects_real_missing_bindings(
     }
     let legacy = legacy.to_string();
     store
-        .run_serialized_write(|| async {
+        .retry_write_on_conflict(|| async {
             let db = store.connection.begin().await?;
             crate::plugins::set_selection(&db, "turn", legacy.clone()).await?;
             db.commit().await?;
@@ -684,7 +684,7 @@ async fn same_authored_skill_names_do_not_collide_and_child_delete_unlinks() {
 #[tokio::test]
 async fn ownership_does_not_reclassify_interactive_or_maintenance_access() {
     pioneer_postgres_test::with_database(async |fixture| {
-        use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+        use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
         let store = postgres_store_with_workspace(fixture, "ws").await;
         store
             .insert_plugin_installation(&parent("plugin-a", "ws"))
@@ -700,19 +700,19 @@ async fn ownership_does_not_reclassify_interactive_or_maintenance_access() {
         );
         assert_eq!(
             store.connection.clone().read_class(),
-            SqliteReadClass::Interactive
+            PostgresReadClass::Interactive
         );
         assert_eq!(
             store.connection.clone().write_class(),
-            SqliteWriteClass::Interactive
+            PostgresWriteClass::Interactive
         );
         assert_eq!(
             maintenance.connection.clone().read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             maintenance.connection.clone().write_class(),
-            SqliteWriteClass::Maintenance
+            PostgresWriteClass::Maintenance
         );
         Ok(())
     })
@@ -763,14 +763,14 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
         1
     );
     // Observe a real PostgreSQL row-lock wait on an independent writer.
-    use pioneer_sqlite::SqliteDatabase;
+    use pioneer_postgres_pools::PostgresDatabase;
     use sea_orm::{DbBackend, Set, Statement, TransactionTrait};
     use std::time::Duration;
 
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
+    let database = PostgresDatabase::new(reader, writer);
     database.validate_reader().await.unwrap();
     let store = PackageStore::new(database);
     let db = store.connection.clone().begin().await.unwrap();
@@ -829,7 +829,7 @@ async fn concurrent_interactive_and_maintenance_publication_cannot_share_child()
         .unwrap()
         .try_get("", "pid")
         .unwrap();
-    let maintenance = PackageStore::new(SqliteDatabase::new(
+    let maintenance = PackageStore::new(PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         competing_writer,
     ))
@@ -1923,7 +1923,7 @@ async fn app_slug_is_workspace_scoped_and_failed_reservation_leaves_no_orphan_pa
         use sea_orm::{EntityTrait, Set};
         let store = postgres_store_with_workspace(fixture, "ws-app-one").await;
         store
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 for workspace in ["ws-app-two", "ws-app-three"] {
                     pioneer_entity::workspace::Entity::insert(
                         pioneer_entity::workspace::ActiveModel {
@@ -2220,7 +2220,7 @@ async fn app_runtime_discovery_has_a_finite_frontier_and_advances_past_a_poison_
         );
         assert_eq!(
             maintenance.connection.clone().read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         Ok(())
     })
@@ -2260,7 +2260,7 @@ async fn postgres_store_with_workspace(
         .connect_read_only()
         .await
         .expect("read-only PostgreSQL pool");
-    PackageStore::new(pioneer_sqlite::SqliteDatabase::new(
+    PackageStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         reader,
         connection.clone(),
     ))

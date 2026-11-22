@@ -272,7 +272,7 @@ async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget(
         .reconcile_task_run_occurrences_at(NOW, 64)
         .await
         .unwrap();
-    assert!(pioneer_sqlite::is_anyhow_database_transient_access(
+    assert!(pioneer_postgres_pools::is_anyhow_database_transient_access(
         result.first_error.as_ref().unwrap()
     ));
     assert_eq!(result.selected, 64);

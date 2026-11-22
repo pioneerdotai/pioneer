@@ -86,7 +86,7 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     .expect("real admission must persist its running binding");
     // The running binding precedes the execution-window commit and MCP
     // activation. Let admission release its transition gate before advancing
-    // Tokio's clock, or pending SQLite waits can expire during the jump.
+    // Tokio's clock, or pending PostgreSQL waits can expire during the jump.
     let key = CLIAgentRuntimeSessionKey::new(
         &harness.workspace_id,
         "codex",
@@ -468,16 +468,18 @@ async fn idle_cleanup_keeps_response_generation_pinned_after_lane_removal_throug
 
 #[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_process_io() {
-    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteExecutor,
+    };
     let temp = tempfile::tempdir().unwrap();
     let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -515,15 +517,15 @@ async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_proce
         let reads = observer.reads.lock().unwrap();
         assert!(reads.iter().any(|event| matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         )));
         assert!(reads.iter().all(|event| !matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
                 ..
             }
         )));
@@ -541,7 +543,7 @@ async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_proce
         .unwrap()
         .is_none()
     );
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     release.notify_one();
     assert_eq!(cleanup.await, 1);
     manager.close_all().await.unwrap();

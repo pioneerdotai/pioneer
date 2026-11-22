@@ -2543,7 +2543,7 @@ dependencies = [
  "serde_json",
  "toml 1.2.1+spec-1.1.0",
  "winnow 1.0.5",
- "yaml-rust2",
+ "yaml-rust2 0.11.1",
 ]
 
 [[package]]
@@ -4010,10 +4010,7 @@ version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
 dependencies = [
- "anstream",
- "anstyle",
  "env_filter",
- "jiff 0.2.43",
  "log",
 ]
 
@@ -6443,6 +6440,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "heapless"
 version = "0.7.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8236,12 +8242,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
-name = "lru_time_cache"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
-
-[[package]]
 name = "lsp-types"
 version = "0.97.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9284,15 +9284,6 @@ dependencies = [
  "indexmap 2.14.2",
  "rustc-hash 1.1.0",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "names"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bddcd3bf5144b6392de80e04c347cd7fab2508f6df16a85fc496ecd5cec39bc"
-dependencies = [
- "rand 0.8.8",
 ]
 
 [[package]]
@@ -10668,15 +10659,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
-name = "owning_ref"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ff55baddef9e4ad00f88b6c743a2a8062d4c6ade126c2a528644b8e444d52ce"
-dependencies = [
- "stable_deref_trait",
-]
-
-[[package]]
 name = "owo-colors"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10938,6 +10920,16 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap 2.14.2",
+]
+
+[[package]]
+name = "pgconfig"
+version = "4.0.0"
+source = "git+https://github.com/momoi-labs/pgconfig.git?rev=de1c43a5aa2689104172a5923c5c8617357baad3#de1c43a5aa2689104172a5923c5c8617357baad3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "yaml-rust2 0.13.2",
 ]
 
 [[package]]
@@ -11304,10 +11296,10 @@ dependencies = [
  "mime_guess",
  "pioneer-crud",
  "pioneer-observability",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-provider",
- "pioneer-sqlite",
  "pioneer-tools",
  "schemars 1.2.3",
  "sea-orm",
@@ -11485,9 +11477,9 @@ dependencies = [
  "pioneer-migration",
  "pioneer-observability",
  "pioneer-packages",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11508,9 +11500,9 @@ dependencies = [
  "chrono",
  "hex",
  "pioneer-entity",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde_json",
  "tokio",
@@ -11530,9 +11522,9 @@ dependencies = [
  "pioneer-crud-signals",
  "pioneer-entity",
  "pioneer-migration",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11560,9 +11552,9 @@ dependencies = [
  "pioneer-entity",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11582,9 +11574,9 @@ dependencies = [
  "pioneer-crud-access",
  "pioneer-crud-payloads",
  "pioneer-entity",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11608,9 +11600,9 @@ dependencies = [
  "pioneer-entity",
  "pioneer-hooks",
  "pioneer-migration",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11630,9 +11622,9 @@ dependencies = [
  "hex",
  "pioneer-crud-conversations",
  "pioneer-entity",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11652,9 +11644,9 @@ dependencies = [
  "pioneer-crud-signals",
  "pioneer-entity",
  "pioneer-migration",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11691,9 +11683,9 @@ dependencies = [
  "pioneer-crud-tasks",
  "pioneer-entity",
  "pioneer-migration",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde_json",
  "tokio",
@@ -11704,7 +11696,7 @@ name = "pioneer-crud-signals"
 version = "0.74.1"
 dependencies = [
  "pioneer-entity",
- "pioneer-sqlite",
+ "pioneer-postgres-pools",
  "sea-orm",
  "serde_json",
 ]
@@ -11723,9 +11715,9 @@ dependencies = [
  "pioneer-crud-payloads",
  "pioneer-entity",
  "pioneer-migration",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -11746,9 +11738,9 @@ dependencies = [
  "pioneer-crud-execution",
  "pioneer-crud-tasks",
  "pioneer-entity",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde_json",
  "tokio",
@@ -12024,6 +12016,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "cua-driver-sdk",
+ "dotenvy",
  "flate2",
  "fs4",
  "futures-util",
@@ -12062,13 +12055,13 @@ dependencies = [
  "pioneer-packages",
  "pioneer-plugins",
  "pioneer-postgres",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-promt",
  "pioneer-protocol",
  "pioneer-provider",
  "pioneer-runtime-events",
  "pioneer-skills",
- "pioneer-sqlite",
  "pioneer-tasks",
  "pioneer-tools",
  "pioneer-tunnel",
@@ -12194,10 +12187,10 @@ dependencies = [
  "pioneer-crud",
  "pioneer-hooks",
  "pioneer-observability",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-promt",
  "pioneer-protocol",
- "pioneer-sqlite",
  "pioneer-tools",
  "sea-orm",
  "serde",
@@ -12288,15 +12281,32 @@ dependencies = [
  "anyhow",
  "fs4",
  "libc",
+ "pgconfig",
  "pioneer-migration",
  "process-wrap",
  "sea-orm",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pioneer-postgres-pools"
+version = "0.74.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "pioneer-observability",
+ "pioneer-postgres-test",
+ "sea-orm",
+ "sea-orm-migration",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -12426,32 +12436,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pioneer-sqlite"
-version = "0.74.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "env_logger 0.11.11",
- "futures-util",
- "lazy_static",
- "log",
- "lru_time_cache",
- "names",
- "owning_ref",
- "pioneer-observability",
- "pioneer-postgres-test",
- "pretty_assertions",
- "rand 0.10.3",
- "sea-orm",
- "sea-orm-migration",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "pioneer-tasks"
 version = "0.74.1"
 dependencies = [
@@ -12464,9 +12448,9 @@ dependencies = [
  "pioneer-crud-payloads",
  "pioneer-entity",
  "pioneer-observability",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
- "pioneer-sqlite",
  "sea-orm",
  "serde",
  "serde_json",
@@ -12496,11 +12480,11 @@ dependencies = [
  "pioneer-mcp",
  "pioneer-migration",
  "pioneer-observability",
+ "pioneer-postgres-pools",
  "pioneer-postgres-test",
  "pioneer-protocol",
  "pioneer-provider",
  "pioneer-skills",
- "pioneer-sqlite",
  "process-wrap",
  "regex",
  "regex-syntax",
@@ -15897,7 +15881,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hashbrown 0.16.1",
- "hashlink",
+ "hashlink 0.11.1",
  "indexmap 2.14.2",
  "log",
  "memchr",
@@ -20185,7 +20169,17 @@ checksum = "b36710ce3a279cfce8465dbab826f161675a262950b922cb2c3663852dfe9eb0"
 dependencies = [
  "arraydeque",
  "encoding_rs",
- "hashlink",
+ "hashlink 0.11.1",
+]
+
+[[package]]
+name = "yaml-rust2"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a8af4469040402b7fe43c26575bab9a3069f0717c4a2931ecf4fb8728ee4cec"
+dependencies = [
+ "arraydeque",
+ "hashlink 0.12.2",
 ]
 
 [[package]]

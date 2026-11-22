@@ -527,7 +527,7 @@ impl CrudStore {
         turn_id: &str,
         status: RecoveryJobStatus,
     ) -> Result<Vec<RecoveryJobRecord>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let jobs =
                 recovery_job::find_jobs_by_turn_and_status(&self.connection, turn_id, status)
                     .await?;
@@ -557,7 +557,7 @@ impl CrudStore {
             .map(|domain| self.control_work_change(domain, &control_wakes));
         let result = async {
             let _ownership_change = self.execution_heartbeats.changing(execution_owner_id);
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let now = unix_to_datetime(now_unix);
                 let tx = self
                     .connection
@@ -794,7 +794,7 @@ impl CrudStore {
         let _recovery_change = RecoveryChange(self.recovery_work.clone());
         let result = async {
             let reason_value = reason.clone();
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 let jobs = recovery_job::cancel_open_jobs_for_turn(
                     &tx,

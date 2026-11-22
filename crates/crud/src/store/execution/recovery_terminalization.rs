@@ -58,7 +58,7 @@ impl CrudStore {
         let control_wakes = vec![GatewayControlWake::Terminalization];
         let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 recovery_terminalization_outbox::mark_failed(
                     &self.connection,
                     record.recovery_job_id.as_str(),
@@ -199,7 +199,7 @@ impl CrudStore {
         let control_result = async {
         let _release_wake = self.execution_heartbeats.release_wake();
         let record = record.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let created_at = unix_to_datetime(event_timestamp_secs);
             let prepared = match self
                 .prepare_claimed_recovery_terminalization_commit(

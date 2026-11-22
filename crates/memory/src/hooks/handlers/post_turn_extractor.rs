@@ -192,8 +192,8 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                         durable = durable_terminal_effect.is_some(),
                         failure_class = failure.class_name(),
                         failure_stage = failure.stage.as_str(),
-                        sqlite_primary_code = failure.sqlite_primary_code,
-                        sqlite_extended_code = failure.sqlite_extended_code,
+
+
                         "memory post-turn extractor manifest load failed"
                     );
                     if durable_terminal_effect.is_some() {

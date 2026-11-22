@@ -3,11 +3,11 @@ use crate::test_fixture::{fixture_event_scope, safe_web_fetch_item};
 use pioneer_crud_conversations::turn_item::{
     prepare_turn_item_projection, upsert_prepared_turn_item,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{ToolCallStatus, TurnItem, generate_id};
-use pioneer_sqlite::SqliteDatabase;
 
 async fn start_item(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     turn_id: &str,
     item: TurnItem,
     started_at: i64,
@@ -250,7 +250,7 @@ async fn timeout_transition_rejects_candidate_stale_after_heartbeat() {
 }
 
 async fn append_liveness_fixture_start(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     _workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
@@ -437,7 +437,7 @@ async fn turn_liveness_orders_activity_by_time_then_sequence() {
             .expect("older liveness observation should be ignored")
         );
 
-        let db = SqliteDatabase::from(connection);
+        let db = PostgresDatabase::from(connection);
         let store = AttemptSupervision::new(&db);
         let liveness = store
             .get_turn_liveness(turn_id)

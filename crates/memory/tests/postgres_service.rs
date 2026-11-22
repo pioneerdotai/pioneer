@@ -22,9 +22,9 @@ impl ServiceHarness {
     async fn new(database: &TestDatabase) -> Self {
         let writer = database.connect().await.unwrap();
         let reader = database.connect_read_only().await.unwrap();
-        let store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-            reader, writer,
-        )));
+        let store = Arc::new(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
+        ));
         let backend = Arc::new(PostgresMemoryBackend::new(store.clone()));
         let service = MemoryService::new(
             store.clone(),
@@ -767,7 +767,7 @@ async fn superseded_control_plane_row_suppresses_stale_postgres_hit() {
         let mut replacement_params = remember_params(
             scope(MemoryScopeKind::User, "default"),
             Some("postgres.superseded"),
-            "SQLite replacement memory is authoritative.",
+            "PostgreSQL replacement memory is authoritative.",
         );
         replacement_params.supersedes = Some(old.record.id.clone());
         harness
@@ -900,7 +900,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
                 remember_params(
                     scope(MemoryScopeKind::Agent, workspace_a_agent.as_str()),
                     Some("agent.note"),
-                    "SQLite workspace A agent memory.",
+                    "PostgreSQL workspace A agent memory.",
                 ),
             )
             .await
@@ -912,7 +912,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
                 remember_params(
                     scope(MemoryScopeKind::User, "default"),
                     Some("user.global"),
-                    "SQLite global user memory.",
+                    "PostgreSQL global user memory.",
                 ),
             )
             .await
@@ -928,7 +928,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
                 remember_params(
                     scope(MemoryScopeKind::Agent, global_agent.as_str()),
                     Some("agent.global"),
-                    "SQLite global agent memory.",
+                    "PostgreSQL global agent memory.",
                 ),
             )
             .await
@@ -939,7 +939,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
             .search(
                 workspace_context("ws_postgres_b", 603),
                 MemorySearchParams {
-                    query: "SQLite workspace A agent memory".to_owned(),
+                    query: "PostgreSQL workspace A agent memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::Agent, workspace_a_agent.as_str())],
                     ..Default::default()
                 },
@@ -953,7 +953,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
             .search(
                 workspace_context("ws_postgres_a", 604),
                 MemorySearchParams {
-                    query: "SQLite workspace A agent memory".to_owned(),
+                    query: "PostgreSQL workspace A agent memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::Agent, workspace_a_agent.as_str())],
                     ..Default::default()
                 },
@@ -971,7 +971,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
             .search(
                 workspace_context("ws_postgres_a", 605),
                 MemorySearchParams {
-                    query: "SQLite global user memory".to_owned(),
+                    query: "PostgreSQL global user memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::User, "default")],
                     ..Default::default()
                 },
@@ -988,7 +988,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
                     ..workspace_context("ws_postgres_a", 606)
                 },
                 MemorySearchParams {
-                    query: "SQLite global user memory".to_owned(),
+                    query: "PostgreSQL global user memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::User, "default")],
                     ..Default::default()
                 },
@@ -1002,7 +1002,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
             .search(
                 workspace_context("ws_postgres_a", 607),
                 MemorySearchParams {
-                    query: "SQLite global agent memory".to_owned(),
+                    query: "PostgreSQL global agent memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
                     ..Default::default()
                 },
@@ -1019,7 +1019,7 @@ async fn workspace_agent_memory_and_global_allowances_are_enforced() {
                     ..workspace_context("ws_postgres_a", 608)
                 },
                 MemorySearchParams {
-                    query: "SQLite global agent memory".to_owned(),
+                    query: "PostgreSQL global agent memory".to_owned(),
                     scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
                     ..Default::default()
                 },
@@ -1102,7 +1102,7 @@ async fn service_search_respects_sensitivity_policy_with_postgres() {
             let mut params = remember_params(
                 scope(MemoryScopeKind::User, "default"),
                 Some(key),
-                format!("SQLite sensitivity token {key}").as_str(),
+                format!("PostgreSQL sensitivity token {key}").as_str(),
             );
             params.sensitivity = Some(sensitivity);
             harness
@@ -1117,7 +1117,7 @@ async fn service_search_respects_sensitivity_policy_with_postgres() {
             .search(
                 user_context(701),
                 MemorySearchParams {
-                    query: "SQLite sensitivity token".to_owned(),
+                    query: "PostgreSQL sensitivity token".to_owned(),
                     ..Default::default()
                 },
             )
@@ -1139,7 +1139,7 @@ async fn service_search_respects_sensitivity_policy_with_postgres() {
                     ..user_context(702)
                 },
                 MemorySearchParams {
-                    query: "SQLite sensitivity token".to_owned(),
+                    query: "PostgreSQL sensitivity token".to_owned(),
                     ..Default::default()
                 },
             )

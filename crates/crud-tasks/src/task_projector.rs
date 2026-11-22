@@ -1691,7 +1691,7 @@ mod tests {
     use super::*;
     use crate::task_event::{PreparedTaskEvent, append_prepared_event};
     use crate::test_support::task_projection::{sample_task, sample_task_trigger};
-    use pioneer_sqlite::SqliteDatabase;
+    use pioneer_postgres_pools::PostgresDatabase;
     use sea_orm::TransactionTrait;
 
     use crate::test_support::task_projection::NoFrozenOutput;
@@ -1705,7 +1705,7 @@ mod tests {
                     "INSERT INTO workspace (id, name) VALUES ('ws_task', 'Workspace')",
                 )
                 .await?;
-            let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+            let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
             let timestamp = 1_700_000_000;
             let task = sample_task(timestamp);
             let trigger = sample_task_trigger(timestamp);

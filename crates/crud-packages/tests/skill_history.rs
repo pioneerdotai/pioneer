@@ -3,14 +3,14 @@ use pioneer_crud_packages::skill_audit_event::SkillAuditEventRecord;
 use pioneer_crud_packages::skill_dependency_snapshot::SkillDependencySnapshotRecord;
 use pioneer_crud_packages::skill_records::SkillInstallationRecord;
 use pioneer_crud_packages::turn_skill_binding::TurnSkillBindingRecord;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::SkillId;
-use pioneer_sqlite::SqliteDatabase;
 
 #[tokio::test]
 async fn skill_history_survives_exact_installation_delete() {
     pioneer_postgres_test::with_database(async |fixture| {
         let reader = fixture.connect_read_only().await?;
-        let store = PackageStore::new(SqliteDatabase::new(reader, fixture.connection().clone()));
+        let store = PackageStore::new(PostgresDatabase::new(reader, fixture.connection().clone()));
         let skill_id = SkillId::new("G".repeat(21)).expect("valid skill id");
         let turn_id = "turn_000000000000000088";
 

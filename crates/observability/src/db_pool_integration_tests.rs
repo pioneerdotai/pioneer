@@ -2,7 +2,7 @@
 //! Gateway's routing tests cover the selection of the reader and writer.
 use crate::metrics::DatabasePoolAcquireMetricsLayer;
 use crate::pool_context::PoolContext;
-use crate::sqlite_query_scope::{PoolFutureExt, observe_control, open_stream};
+use crate::postgres_query_scope::{PoolFutureExt, observe_control, open_stream};
 use crate::telemetry::tests::{gateway_test_state, with_test_state};
 use futures_util::StreamExt;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};

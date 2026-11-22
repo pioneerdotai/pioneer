@@ -2,12 +2,12 @@ use super::*;
 use crate::event_append::{PreparedTurnEvent, append_prepared_event};
 use crate::test_fixture::fixture_event_scope;
 use crate::time::unix_to_datetime;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{ItemCompletedNotification, ToolMetadata, ToolOutputPolicySnapshot};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::TransactionTrait;
 
 async fn persist_completion(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     notification: ItemCompletedNotification,
     at: i64,
 ) -> Result<()> {

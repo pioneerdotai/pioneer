@@ -3,7 +3,7 @@ use pioneer_crud_artifacts::html_preview_discovery::{
     html_preview_gc_blob_page_through, html_preview_gc_deadline,
     html_preview_released_copies_page_through,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 
 #[tokio::test]
@@ -11,7 +11,7 @@ async fn gc_deadline_crossing_behind_a_finished_page_is_retained_for_the_next_pa
     pioneer_postgres_test::with_database(async |database| {
         let writer = database.connection();
         writer.execute_unprepared("INSERT INTO workspace (id, name) VALUES ('ws', 'Workspace')").await?;
-        let db = SqliteDatabase::new(database.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(database.connect_read_only().await?, writer.clone());
         writer.execute_unprepared(r#"INSERT INTO artifact_blob(id,workspace_id,sha256,size_bytes,storage_backend,storage_key,created_at,metadata_json)
             VALUES('deadline-blob','ws','deadline-sha',1,'local','deadline-key','2020-01-01 00:00:00 +00:00','{"htmlToolTemporary":1}')"#).await?;
         let created_ms = 1_577_836_800_000_i64;
@@ -56,7 +56,7 @@ async fn finite_copy_and_gc_pages_revisit_older_candidates_despite_new_suffix_ro
     pioneer_postgres_test::with_database(async |database| {
         let writer = database.connection();
         writer.execute_unprepared("INSERT INTO workspace (id, name) VALUES ('ws', 'Workspace')").await?;
-        let db = SqliteDatabase::new(database.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(database.connect_read_only().await?, writer.clone());
         for id in ["a", "m"] {
             io_copy_source(writer, id, "{}").await?;
         }

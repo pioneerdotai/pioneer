@@ -8,7 +8,7 @@ use pioneer_crud_conversations::turn_item::{
     prepare_turn_item_projection, upsert_prepared_turn_item,
 };
 use pioneer_entity::{thread, turn};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 use sea_orm::{DbBackend, Statement};
 use std::sync::Arc;
 
@@ -32,9 +32,9 @@ async fn episodic_requeue_source_fixture() -> (
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(WriteQueueObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     database.validate_reader().await.unwrap();
@@ -97,23 +97,26 @@ async fn episodic_requeue_source_fixture() -> (
 
 #[derive(Default)]
 struct WriteQueueObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    events: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     enqueued: tokio::sync::Notify,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for WriteQueueObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for WriteQueueObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for WriteQueueObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for WriteQueueObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
-        if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+        if matches!(
+            event,
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+        ) {
             self.enqueued.notify_one();
         }
     }
@@ -129,7 +132,10 @@ impl WriteQueueObserver {
                     .unwrap()
                     .iter()
                     .filter(|event| {
-                        matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                        matches!(
+                            event,
+                            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+                        )
                     })
                     .count()
                     >= count;
@@ -254,7 +260,7 @@ async fn episodic_late_requeue_cannot_revive_user_exclusion_or_deletion() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn episodic_requeue_reason_is_atomic_and_cancellation_and_rollback_preserve_running() {
-    use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+    use pioneer_postgres_pools::{PostgresWriteClass, PostgresWriteEvent};
     let (store, _thread, _turn, running, observer) = episodic_requeue_source_fixture().await;
     let maintenance = store.maintenance();
     let blocker = store
@@ -288,7 +294,7 @@ async fn episodic_requeue_reason_is_atomic_and_cancellation_and_rollback_preserv
             .unwrap()
             .iter()
             .any(|event| matches!(event,
-            SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+            PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. }
                 if queue.maintenance == 0))
     );
     blocker.rollback().await.unwrap();
@@ -373,14 +379,14 @@ async fn episodic_requeue_reason_is_atomic_and_cancellation_and_rollback_preserv
         .unwrap()
         .iter()
         .filter_map(|event| {
-            if let SqliteWriteEvent::Acquired { class, .. } = event {
+            if let PostgresWriteEvent::Acquired { class, .. } = event {
                 Some(*class)
             } else {
                 None
             }
         })
         .collect::<Vec<_>>();
-    assert_eq!(acquired, vec![SqliteWriteClass::Maintenance]);
+    assert_eq!(acquired, vec![PostgresWriteClass::Maintenance]);
     let mut expected = running.clone();
     expected.status = ThreadEpisodicIndexJobStatus::Queued;
     expected.next_run_at = unix_to_datetime(1_700_000_012);
@@ -436,7 +442,7 @@ async fn episodic_model_reset_commits_cursor_with_replacement_and_preserves_budg
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connection().clone();
     let reader = fixture.connect_read_only().await.unwrap();
-    let store = MemoryStore::new(SqliteDatabase::new(reader, writer));
+    let store = MemoryStore::new(PostgresDatabase::new(reader, writer));
     store.connection.execute_unprepared(
         "INSERT INTO workspace (id, name, is_active, is_current)
              VALUES ('ws_reset_cursor', 'Episodic reset', TRUE, FALSE);

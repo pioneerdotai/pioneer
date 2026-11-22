@@ -524,12 +524,12 @@ async fn legacy_grant_uses_epoch_and_retains_the_ambiguous_second_without_receip
 async fn addressed_patch_uses_unread_membership_and_exact_completion_order() {
     let fixture = fixture().await;
     let connection = fixture.connection();
-    let db = pioneer_sqlite::SqliteDatabase::new(
+    let db = pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         connection.clone(),
     )
     .maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
     task(
         &db,
         "patch-task",

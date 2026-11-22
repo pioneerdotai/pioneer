@@ -9,12 +9,12 @@
 //! journaled and the immutable record is promoted before releasing them.
 
 use anyhow::{Context, Result, anyhow, bail};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_tools::apply_patch::history::IntentStatus;
 use pioneer_tools::apply_patch::history::{
     AppliedPatchDelta, AppliedPatchRecord, AppliedPatchRecordOutcome, CommitOrdinal,
-    CommittedPatchChange, InvocationIdentity, PatchHistoryProvenance, SnapshotDomain,
-    SqliteAppliedPatchStore, SqliteCommitIntentStore, SqliteTurnDiffStore, StoredPatchRecord,
+    CommittedPatchChange, InvocationIdentity, PatchHistoryProvenance, PostgresAppliedPatchStore,
+    PostgresCommitIntentStore, PostgresTurnDiffStore, SnapshotDomain, StoredPatchRecord,
     TurnDiffAuthority, TurnDiffState, TurnFilesystemCoverage,
 };
 use pioneer_tools::apply_patch::{
@@ -55,17 +55,17 @@ async fn reserve_patch_history_capacity_from(
 }
 
 #[derive(Clone)]
-pub(crate) struct SqlitePatchObserver {
-    db: SqliteDatabase,
+pub(crate) struct PostgresPatchObserver {
+    db: PostgresDatabase,
     runtime: Handle,
     identity: InvocationIdentity,
     _admission_permit: Arc<OwnedSemaphorePermit>,
     inner: DurableCommitObserver,
 }
 
-impl SqlitePatchObserver {
+impl PostgresPatchObserver {
     pub(crate) fn new(
-        db: impl Into<SqliteDatabase>,
+        db: impl Into<PostgresDatabase>,
         identity: InvocationIdentity,
         admission_permit: OwnedSemaphorePermit,
     ) -> Self {
@@ -142,7 +142,7 @@ impl SqlitePatchObserver {
 
     fn run_sync_db<T, F, Fut>(&self, operation: F) -> Result<T>
     where
-        F: FnOnce(SqliteDatabase) -> Fut,
+        F: FnOnce(PostgresDatabase) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         let work = pioneer_observability::work::WorkCarrier::child(
@@ -160,15 +160,15 @@ impl SqlitePatchObserver {
     }
 
     pub(crate) async fn project_live(
-        db: SqliteDatabase,
+        db: PostgresDatabase,
         thread_id: String,
         turn_id: String,
         authority: TurnDiffAuthority,
         final_state: bool,
         filesystem_coverage: TurnFilesystemCoverage,
     ) -> Result<TurnDiffState> {
-        let records_store = SqliteAppliedPatchStore::new(db.clone());
-        let intents = SqliteCommitIntentStore::new(db.clone());
+        let records_store = PostgresAppliedPatchStore::new(db.clone());
+        let intents = PostgresCommitIntentStore::new(db.clone());
         let replay = pioneer_tools::apply_patch::history::replay_turn_pages(
             &records_store,
             &intents,
@@ -188,7 +188,7 @@ impl SqlitePatchObserver {
             final_state,
         );
         state.filesystem_coverage = filesystem_coverage;
-        SqliteTurnDiffStore::new(db)
+        PostgresTurnDiffStore::new(db)
             .repair_live(&state)
             .await
             .context("persist live patch projection")?;
@@ -196,7 +196,7 @@ impl SqlitePatchObserver {
     }
 }
 
-impl CommitObserver for SqlitePatchObserver {
+impl CommitObserver for PostgresPatchObserver {
     fn check(
         &self,
         identity: &InvocationIdentity,
@@ -211,13 +211,13 @@ impl CommitObserver for SqlitePatchObserver {
         let identity_for_db = identity.clone();
         let state = self
             .run_sync_db(move |db| async move {
-                let store = SqliteAppliedPatchStore::new(db.clone());
+                let store = PostgresAppliedPatchStore::new(db.clone());
                 let record = store.get(&identity_for_db).await?;
                 let delta = match &record {
                     Some(record) => Some(store.materialize_delta(record).await?),
                     None => None,
                 };
-                let intent = SqliteCommitIntentStore::new(db)
+                let intent = PostgresCommitIntentStore::new(db)
                     .get(&identity_for_db)
                     .await?;
                 Ok((record, intent, delta))
@@ -288,18 +288,18 @@ impl CommitObserver for SqlitePatchObserver {
         let admission_for_db = admission.clone();
         let state = self
             .run_sync_db(move |db| async move {
-                let applied = SqliteAppliedPatchStore::new(db.clone())
+                let applied = PostgresAppliedPatchStore::new(db.clone())
                     .get(&identity_for_db)
                     .await?;
                 let delta = match &applied {
                     Some(record) => Some(
-                        SqliteAppliedPatchStore::new(db.clone())
+                        PostgresAppliedPatchStore::new(db.clone())
                             .materialize_delta(record)
                             .await?,
                     ),
                     None => None,
                 };
-                let intent = SqliteCommitIntentStore::new(db)
+                let intent = PostgresCommitIntentStore::new(db)
                     .get(&identity_for_db)
                     .await?;
                 if let Some(record) = applied {
@@ -371,7 +371,7 @@ impl CommitObserver for SqlitePatchObserver {
         let admission_for_db = admission.clone();
         let outcome = self
             .run_sync_db(move |db| async move {
-                SqliteCommitIntentStore::new(db)
+                PostgresCommitIntentStore::new(db)
                     .begin_next_owned(
                         identity_for_db,
                         admission_for_db.plan_fingerprint,
@@ -424,7 +424,7 @@ impl CommitObserver for SqlitePatchObserver {
         if let Err(error) = self.run_sync_db({
             let identity = identity.clone();
             move |db| async move {
-                pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(db)
+                pioneer_tools::apply_patch::history::PostgresSnapshotStore::new(db)
                     .reserve_for_intent(&identity, &domain, snapshots.as_slice())
                     .await
             }
@@ -436,7 +436,7 @@ impl CommitObserver for SqlitePatchObserver {
             let _ = self.run_sync_db({
                 let identity = identity.clone();
                 move |db| async move {
-                    let store = SqliteCommitIntentStore::new(db);
+                    let store = PostgresCommitIntentStore::new(db);
                     if store.mark_rejected(&identity).await.is_ok() {
                         let _ = store.compact_terminal(&identity).await;
                     }
@@ -452,7 +452,7 @@ impl CommitObserver for SqlitePatchObserver {
             let _ = self.run_sync_db({
                 let identity = identity.clone();
                 move |db| async move {
-                    let store = SqliteCommitIntentStore::new(db);
+                    let store = PostgresCommitIntentStore::new(db);
                     if store.mark_rejected(&identity).await.is_ok() {
                         let _ = store.compact_terminal(&identity).await;
                     }
@@ -467,7 +467,7 @@ impl CommitObserver for SqlitePatchObserver {
                 let _ = self.run_sync_db({
                     let identity = identity.clone();
                     move |db| async move {
-                        let store = SqliteCommitIntentStore::new(db);
+                        let store = PostgresCommitIntentStore::new(db);
                         if store.mark_rejected(&identity).await.is_ok() {
                             let _ = store.compact_terminal(&identity).await;
                         }
@@ -498,7 +498,7 @@ impl CommitObserver for SqlitePatchObserver {
                 )
             })?;
         self.run_sync_db(move |db| async move {
-            SqliteCommitIntentStore::new(db)
+            PostgresCommitIntentStore::new(db)
                 .update_progress(&intent)
                 .await
                 .context("persist committed patch progress")
@@ -527,8 +527,8 @@ impl CommitObserver for SqlitePatchObserver {
             !report.delta.is_empty() || matches!(status, ExecutionStatus::CommitStateUncertain);
         let persist_started = std::time::Instant::now();
         let persisted = self.run_sync_db(move |db| async move {
-            let intent_store = SqliteCommitIntentStore::new(db.clone());
-            let applied_store = SqliteAppliedPatchStore::new(db.clone());
+            let intent_store = PostgresCommitIntentStore::new(db.clone());
+            let applied_store = PostgresAppliedPatchStore::new(db.clone());
             let existing_record = applied_store.get(&identity_for_db).await?;
             let intent = intent_store.get(&identity_for_db).await?;
             if let Some(record) = existing_record {
@@ -664,7 +664,7 @@ impl CommitObserver for SqlitePatchObserver {
                 "pioneer",
                 "thread_history",
             );
-            SqliteAppliedPatchStore::new(db.clone())
+            PostgresAppliedPatchStore::new(db.clone())
                 .insert_with_snapshots(record.clone(), intent.plan_fingerprint, &domain, &snapshots)
                 .await
                 .context("promote applied patch record")?;
@@ -700,7 +700,7 @@ impl CommitObserver for SqlitePatchObserver {
                 if should_record {
                     patch_telemetry().record_applied_record_append(persist_started.elapsed());
                     if let Ok(metrics) = self.run_sync_db(|db| async move {
-                        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(db)
+                        pioneer_tools::apply_patch::history::PostgresSnapshotStore::new(db)
                             .metrics()
                             .await
                     }) {
@@ -723,12 +723,12 @@ impl CommitObserver for SqlitePatchObserver {
                 return Err(Self::db_error(error));
             }
         }
-        // A local publication failure is recoverable once the SQLite record
+        // A local publication failure is recoverable once the PostgreSQL record
         // and projection are durable.  Do not downgrade the result or invite
         // a re-execution after the authoritative durable path succeeded.
         if local_terminal_error.is_some() {
             tracing::warn!(
-                "process-local apply_patch observer publication failed after durable SQLite promotion"
+                "process-local apply_patch observer publication failed after durable PostgreSQL promotion"
             );
         }
         Ok(())
@@ -743,7 +743,7 @@ impl CommitObserver for SqlitePatchObserver {
         let identity_for_db = identity.clone();
         let durable = self
             .run_sync_db(move |db| async move {
-                SqliteAppliedPatchStore::new(db)
+                PostgresAppliedPatchStore::new(db)
                     .get(&identity_for_db)
                     .await
                     .context("load promoted patch record")
@@ -776,13 +776,13 @@ impl CommitObserver for SqlitePatchObserver {
             // watermark and record count from the source log/intent tables,
             // then only advertise RecordedAndProjected when the persisted
             // projection covers that exact source state.
-            let record = SqliteAppliedPatchStore::new(db.clone())
+            let record = PostgresAppliedPatchStore::new(db.clone())
                 .get(&identity_for_db)
                 .await?;
-            let (record_count, max_record_ordinal) = SqliteAppliedPatchStore::new(db.clone())
+            let (record_count, max_record_ordinal) = PostgresAppliedPatchStore::new(db.clone())
                 .record_summary_for_turn(&identity_for_db.thread_id, &identity_for_db.turn_id)
                 .await?;
-            let intents = SqliteCommitIntentStore::new(db.clone());
+            let intents = PostgresCommitIntentStore::new(db.clone());
             let max_status_ordinal = intents
                 .max_ordinal_for_turn(&identity_for_db.thread_id, &identity_for_db.turn_id)
                 .await?;
@@ -793,7 +793,7 @@ impl CommitObserver for SqlitePatchObserver {
                 .max()
                 .map(|ordinal| ordinal.saturating_add(1))
                 .unwrap_or(0);
-            let state = SqliteTurnDiffStore::new(db)
+            let state = PostgresTurnDiffStore::new(db)
                 .get(&identity_for_db.thread_id, &identity_for_db.turn_id)
                 .await?;
             Ok(match (record, state) {

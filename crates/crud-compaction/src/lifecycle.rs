@@ -7,7 +7,7 @@ use pioneer_crud_conversations::events::CanonicalTurnEventPayload;
 use pioneer_entity::{
     compaction_context, compaction_execution_stop, compaction_operation, thread, turn, turn_item,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, TransactionTrait,
 };
@@ -170,7 +170,7 @@ impl LifecycleFacts {
 
 /// The worker holds no DB resource while acquiring its coordinator lease or
 /// building the existing lifecycle item. Only this bounded preparation crosses
-/// that gap; commit compares every used input under the serialized writer.
+/// that gap; the write transaction revalidates every used input.
 #[derive(Clone, Debug)]
 pub struct PreparedCompactionLifecycle {
     claim: queue::CompactionLifecycleClaim,
@@ -202,7 +202,7 @@ impl PreparedCompactionLifecycle {
 }
 
 pub async fn prepare_lifecycle(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     claim: &queue::CompactionLifecycleClaim,
     now_ms: i64,
 ) -> Result<Option<PreparedCompactionLifecycle>> {
@@ -370,7 +370,7 @@ pub struct LifecycleAdmission {
 
 impl LifecycleAdmission {
     pub async fn prepare(
-        db: &SqliteDatabase,
+        db: &PostgresDatabase,
         operation: &str,
         generation: u64,
         event: &CanonicalTurnEventPayload,

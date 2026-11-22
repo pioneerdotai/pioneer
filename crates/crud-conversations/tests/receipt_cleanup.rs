@@ -5,14 +5,14 @@ use pioneer_crud_conversations::{event_projection, projection_stream};
 use pioneer_entity::{
     turn_event_projection_state as receipt, turn_event_projection_stream_state as stream,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, Statement,
     TransactionTrait, sea_query::Expr,
 };
 
-async fn scoped_store(fixture: &TestDatabase) -> SqliteDatabase {
+async fn scoped_store(fixture: &TestDatabase) -> PostgresDatabase {
     let writer = fixture.connection();
     writer
         .execute_unprepared(
@@ -23,10 +23,10 @@ async fn scoped_store(fixture: &TestDatabase) -> SqliteDatabase {
         )
         .await
         .unwrap();
-    SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()).maintenance()
+    PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()).maintenance()
 }
 
-async fn seed(db: &SqliteDatabase, count: i64) {
+async fn seed(db: &PostgresDatabase, count: i64) {
     for sql in [
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload)
          SELECT 'turn-'||n,'thread','turn',n,'test','{}'::json
@@ -43,7 +43,7 @@ async fn seed(db: &SqliteDatabase, count: i64) {
     }
 }
 
-async fn boundary(db: &SqliteDatabase) -> i64 {
+async fn boundary(db: &PostgresDatabase) -> i64 {
     stream::Entity::find_by_id("turn")
         .one(db)
         .await

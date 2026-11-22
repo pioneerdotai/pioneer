@@ -33,27 +33,22 @@ pub async fn task_runtime_invariants(
     if let Some(seconds) = stale_turn_after_seconds {
         scanner = scanner.with_stale_turn_after_seconds(seconds);
     }
-    let report = with_existing_database(
+    with_existing_database(
         runtime_home,
         config,
         OperatorAccess::ReadOnly,
-        async |database| {
-            scanner
+        async |database, data_directory| {
+            let report = scanner
                 .scan_store(&CrudStore::new(database), observed_at_unix)
-                .await
+                .await?;
+            Ok(match data_directory {
+                Some(path) => report.with_db_path(path.display().to_string()),
+                None => report,
+            })
         },
     )
     .await?
-    .context("Gateway PostgreSQL database is missing")?;
-    if config.gateway.database.development_url.is_some() {
-        Ok(report)
-    } else {
-        Ok(report.with_db_path(
-            pioneer_postgres::data_directory(runtime_home)
-                .display()
-                .to_string(),
-        ))
-    }
+    .context("Gateway PostgreSQL database is missing")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,7 +88,7 @@ pub struct SecretKindCounts {
 #[derive(Debug, Clone, Serialize)]
 pub struct McpSecretOrphanStatusReport {
     pub available: bool,
-    pub gateway_db_path: PathBuf,
+    pub gateway_db_path: Option<PathBuf>,
     pub active_refs: Option<usize>,
     pub stored_refs: Option<usize>,
     pub orphan_refs: Option<usize>,
@@ -124,7 +119,6 @@ pub async fn secrets_status(
     runtime_home: &Path,
 ) -> Result<SecretsStatusReport> {
     let storage_path = DbKeyStoreConfig::for_runtime_home(runtime_home).path;
-    let gateway_db_path = pioneer_postgres::data_directory(runtime_home);
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
     let entries = gateway_secrets.list_secret_entries()?;
     let counts = count_secret_kinds(entries.as_slice());
@@ -137,16 +131,17 @@ pub async fn secrets_status(
         runtime_home,
         config,
         OperatorAccess::ReadOnly,
-        async |database| {
+        async |database, data_directory| {
             let crud_store = CrudStore::new(database);
-            garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
+            let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
                 .await
-                .context("failed to compute MCP orphan secret status")
+                .context("failed to compute MCP orphan secret status")?;
+            Ok((report, data_directory))
         },
     )
     .await?;
     let mcp_orphans = match report {
-        Some(report) => McpSecretOrphanStatusReport {
+        Some((report, gateway_db_path)) => McpSecretOrphanStatusReport {
             available: true,
             gateway_db_path,
             active_refs: Some(report.active_refs),
@@ -156,7 +151,7 @@ pub async fn secrets_status(
         },
         None => McpSecretOrphanStatusReport {
             available: false,
-            gateway_db_path,
+            gateway_db_path: Some(pioneer_postgres::data_directory(runtime_home)),
             active_refs: None,
             stored_refs: None,
             orphan_refs: None,
@@ -187,7 +182,7 @@ pub async fn secrets_garbage_collection(
         runtime_home,
         config,
         OperatorAccess::ReadOnly,
-        async |database| {
+        async |database, _| {
             let crud_store = CrudStore::new(database);
             garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, dry_run)
                 .await
@@ -226,7 +221,7 @@ pub async fn artifact_storage_usage(
         runtime_home,
         config,
         OperatorAccess::ReadOnly,
-        async |database| {
+        async |database, _| {
             artifact_service_for_database(config, runtime_home, database)
                 .workspace_usage(workspace_id)
                 .await
@@ -249,7 +244,7 @@ pub async fn artifact_gc_dry_run(
         runtime_home,
         config,
         OperatorAccess::ReadOnly,
-        async |database| {
+        async |database, _| {
             artifact_service_for_database(config, runtime_home, database)
                 .gc_dry_run(workspace_id, now_unix_ms)
                 .await
@@ -274,7 +269,7 @@ pub async fn artifact_gc_execute(
         runtime_home,
         config,
         OperatorAccess::Write,
-        async |database| {
+        async |database, _| {
             artifact_service_for_database(config, runtime_home, database)
                 .gc_execute(workspace_id, now_unix_ms)
                 .await
@@ -310,7 +305,7 @@ pub async fn artifact_gc_execute(
 fn artifact_service_for_database(
     config: &AppConfig,
     runtime_home: &Path,
-    database: pioneer_sqlite::SqliteDatabase,
+    database: pioneer_postgres_pools::PostgresDatabase,
 ) -> ArtifactService {
     ArtifactService::new_with_policies(
         Arc::new(CrudStore::new(database.maintenance())),
@@ -437,6 +432,7 @@ mod tests {
             assert_eq!(report.counts.desktop_gateway_session, 1);
             assert_eq!(report.total_entries, 5);
             assert!(report.mcp_orphans.available);
+            assert!(report.mcp_orphans.gateway_db_path.is_none());
             assert_eq!(report.mcp_orphans.active_refs, Some(1));
             assert_eq!(report.mcp_orphans.stored_refs, Some(2));
             assert_eq!(report.mcp_orphans.orphan_refs, Some(1));
@@ -606,7 +602,7 @@ mod tests {
             &runtime_home,
             &config,
             OperatorAccess::ReadOnly,
-            async |database| {
+            async |database, _| {
                 CrudStore::new(database)
                     .count_artifact_blobs_by_workspace("ws_ops")
                     .await

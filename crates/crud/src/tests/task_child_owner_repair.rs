@@ -96,7 +96,9 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
         pioneer_crud_tasks::task_run::update_run_status(&source, &id, TaskRunStatus::Blocked, now)
             .await
             .unwrap_err();
-    assert!(pioneer_sqlite::is_retryable_database_conflict(&error));
+    assert!(pioneer_postgres_pools::is_retryable_database_conflict(
+        &error
+    ));
     source.rollback().await.unwrap();
     assert_eq!(
         pioneer_entity::task_run::Entity::find_by_id(&id)
@@ -229,7 +231,7 @@ async fn counterpart_repair_cannot_suppress_later_run_obligation() {
                 error
                     .downcast_ref::<pioneer_crud_conversations::turn_payload::PreflightRace>()
                     .is_some()
-                    || pioneer_sqlite::is_retryable_database_conflict(&error)
+                    || pioneer_postgres_pools::is_retryable_database_conflict(&error)
             );
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();

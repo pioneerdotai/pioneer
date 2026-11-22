@@ -3,12 +3,12 @@ use crate::native_terminal_effect_outbox::{
     self as outbox, ClaimedNativeTerminalEffectRecord, NativeTerminalEffectClaimOutcome,
 };
 use pioneer_entity::native_terminal_effect_outbox as effect;
+use pioneer_postgres_pools::{
+    PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteClass,
+    PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
+};
 use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{TaskResultCandidateStatus, generate_id};
-use pioneer_sqlite::{
-    SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
-    SqliteWriteExecutor, SqliteWriteObserver,
-};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryTrait, Set,
     sea_query::Expr,
@@ -28,12 +28,12 @@ struct Routes {
     writes: AtomicUsize,
     queued: AtomicUsize,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
         if matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         ) {
@@ -41,17 +41,17 @@ impl SqliteReadObserver for Routes {
         }
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         match event {
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.writes.fetch_add(1, Ordering::SeqCst);
             }
-            SqliteWriteEvent::Enqueued {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Enqueued {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.queued.fetch_add(1, Ordering::SeqCst);
@@ -61,7 +61,7 @@ impl SqliteWriteObserver for Routes {
     }
 }
 struct Fixture<'a> {
-    db: SqliteDatabase,
+    db: PostgresDatabase,
     routes: Arc<Routes>,
     database: &'a TestDatabase,
 }
@@ -79,13 +79,13 @@ impl<'a> Fixture<'a> {
             database,
         }
     }
-    async fn open_connection(database: &TestDatabase, routes: &Arc<Routes>) -> SqliteDatabase {
+    async fn open_connection(database: &TestDatabase, routes: &Arc<Routes>) -> PostgresDatabase {
         // Queue the scheduling cases behind a deliberately occupied writer slot.
         let writer = database.connect_with_limit(1).await.unwrap();
         let reader = database.connect_read_only().await.unwrap();
-        let db = SqliteDatabase::from_executor_with_read_observer(
+        let db = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, routes.clone()),
+            PostgresWriteExecutor::with_observer(writer, routes.clone()),
             routes.clone(),
         );
         db.validate_reader().await.unwrap();
@@ -395,8 +395,8 @@ async fn total_quantum_is_sixteen_inputs_with_malformed_payload_and_checkpoint_p
         assert!(f.routes.reads.load(Ordering::SeqCst) > 0);
         assert!(f.routes.writes.load(Ordering::SeqCst) > 0);
         let db = f.db.maintenance();
-        assert_eq!(db.read_class(), SqliteReadClass::Maintenance);
-        assert_eq!(db.write_class(), SqliteWriteClass::Maintenance);
+        assert_eq!(db.read_class(), PostgresReadClass::Maintenance);
+        assert_eq!(db.write_class(), PostgresWriteClass::Maintenance);
         db.validate_reader().await.unwrap();
         Ok(())
     })
@@ -552,7 +552,7 @@ async fn planner_uses_four_covering_seeks_gate_partial_range_and_three_claim_ran
 }
 
 async fn assert_plan(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     mut statement: sea_orm::Statement,
     index: &str,
     keys: &[&str],
@@ -1166,7 +1166,7 @@ async fn failed_claim_discovery_page_keeps_its_input_quota_and_other_statuses_pr
             })
             .await
             .unwrap();
-        let scoped = SqliteDatabase::new(reader, db.clone());
+        let scoped = PostgresDatabase::new(reader, db.clone());
         let at = NOW + 2; // ready first, then retry_wait, then running
         let outcome = outbox::claim_records(&scoped, at, 10, 8, &|| at)
             .await
@@ -1255,7 +1255,7 @@ async fn assert_terminal_checkpoint_quarantine(runtime_snapshot: serde_json::Val
         let workspace_id = "ws_terminal_effect_bad_checkpoint";
         let thread_id = "thr_terminal_effect_bad_checkpoint";
         let turn_id = "turn_terminal_effect_bad_checkpoint";
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connection().clone(),
         );
@@ -1453,7 +1453,7 @@ async fn native_lifecycle_health_probe_commits_and_reports_stale_turn_and_termin
         let workspace_id = "ws_native_health";
         let thread_id = "thr_native_health";
         let turn_id = "turn_native_health";
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
         db.execute_unprepared(
             "INSERT INTO workspace (id,name) VALUES ('ws_native_health','Native health');
              INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status)
@@ -1544,7 +1544,7 @@ fn candidate_status(status: TaskResultCandidateStatus) -> &'static str {
 // Restore the persisted candidate directly. The gate only reads the exact
 // turn and candidate metadata. Cross-domain Task publication has its own tests.
 async fn insert_restored_candidate(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
     turn_id: &str,
     suffix: &str,

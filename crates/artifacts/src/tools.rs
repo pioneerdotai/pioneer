@@ -1643,10 +1643,12 @@ mod tests {
              INSERT INTO turn(id,thread_id,status) VALUES ('turn_artifact_register','thr_artifact_register','in_progress');",
         ).await.expect("create artifact owner");
         ArtifactService::new(
-            Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-                database.connect_read_only().await.unwrap(),
-                database.connection().clone(),
-            ))),
+            Arc::new(CrudStore::new(
+                pioneer_postgres_pools::PostgresDatabase::new(
+                    database.connect_read_only().await.unwrap(),
+                    database.connection().clone(),
+                ),
+            )),
             Arc::new(crate::LocalArtifactBlobStore::new(runtime_home)),
         )
     }

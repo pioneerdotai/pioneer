@@ -4,11 +4,11 @@ use pioneer_crud::{
     CrudStore,
     compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome},
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
 use pioneer_protocol::{
     ItemCompletedNotification, TurnCompletedNotification, TurnItem, TurnStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 const READY: i64 = 1_792_838_000;
@@ -16,7 +16,7 @@ const READY: i64 = 1_792_838_000;
 async fn open_store(fixture: &TestDatabase) -> CrudStore {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
+    let database = PostgresDatabase::new(reader, writer);
     database.validate_reader().await.unwrap();
     CrudStore::new(database).with_maintenance_access()
 }

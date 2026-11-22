@@ -1,18 +1,18 @@
 //! Scoped preparation, completion, and retention of durable terminal effects.
 use crate::gateway_control::{GatewayControlWake, control_work_change};
 use crate::native_terminal_effect_outbox::{self, NativeTerminalEffectStats};
-use crate::retry::run_serialized_write;
+use crate::retry::retry_write_on_conflict;
 use crate::time::unix_to_datetime;
 use anyhow::{Context, Result};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
 
 pub struct TerminalEffectStore<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> TerminalEffectStore<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -29,7 +29,7 @@ impl<'a> TerminalEffectStore<'a> {
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
             let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
-            run_serialized_write(|| {
+            retry_write_on_conflict(|| {
                 let prepared = prepared.clone();
                 async move {
                     let transaction = self.connection.begin().await.context(
@@ -74,7 +74,7 @@ impl<'a> TerminalEffectStore<'a> {
         now_unix: i64,
     ) -> Result<()> {
         let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
-        run_serialized_write(|| {
+        retry_write_on_conflict(|| {
             let prepared = prepared.clone();
             async move {
                 let tx = self.connection.begin().await?;
@@ -112,7 +112,7 @@ impl<'a> TerminalEffectStore<'a> {
         now_unix: i64,
         limit: u64,
     ) -> Result<u64> {
-        run_serialized_write(|| {
+        retry_write_on_conflict(|| {
             native_terminal_effect_outbox::requeue_retryable_unresolved(
                 self.connection,
                 unix_to_datetime(now_unix),
@@ -137,7 +137,7 @@ impl<'a> TerminalEffectStore<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            run_serialized_write(|| {
+            retry_write_on_conflict(|| {
                 native_terminal_effect_outbox::mark_succeeded(
                     self.connection,
                     effect_id,
@@ -174,7 +174,7 @@ impl<'a> TerminalEffectStore<'a> {
         checkpoint_json: &str,
         now_unix: i64,
     ) -> Result<()> {
-        run_serialized_write(|| {
+        retry_write_on_conflict(|| {
             native_terminal_effect_outbox::store_handler_checkpoint(
                 self.connection,
                 effect_id,
@@ -197,7 +197,7 @@ impl<'a> TerminalEffectStore<'a> {
         retry_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool> {
-        run_serialized_write(|| {
+        retry_write_on_conflict(|| {
             native_terminal_effect_outbox::mark_failed(
                 self.connection,
                 effect_id,
@@ -221,7 +221,7 @@ impl<'a> TerminalEffectStore<'a> {
         cutoff_unix: i64,
         limit: u64,
     ) -> Result<u64> {
-        run_serialized_write(|| {
+        retry_write_on_conflict(|| {
             native_terminal_effect_outbox::purge_resolved_before(
                 self.connection,
                 unix_to_datetime(cutoff_unix),
@@ -232,7 +232,7 @@ impl<'a> TerminalEffectStore<'a> {
     }
 
     pub async fn native_lifecycle_read_write_probe(&self) -> Result<()> {
-        run_serialized_write(|| async {
+        retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()

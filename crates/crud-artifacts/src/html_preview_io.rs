@@ -8,8 +8,8 @@ use pioneer_entity::{
     artifact, compaction_frozen_history as history, html_preview_frozen_result as result_row,
     html_preview_io_work as work,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::sea_query::{Expr, ExprTrait, Func};
@@ -415,15 +415,15 @@ fn bytes(value: Expr) -> Expr {
 }
 
 pub struct HtmlPreviewIoQueue<'db> {
-    connection: &'db SqliteDatabase,
+    connection: &'db PostgresDatabase,
 }
 
 impl<'db> HtmlPreviewIoQueue<'db> {
-    pub fn new(connection: &'db SqliteDatabase) -> Self {
+    pub fn new(connection: &'db PostgresDatabase) -> Self {
         Self { connection }
     }
 
-    pub(crate) async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -474,7 +474,7 @@ impl HtmlPreviewIoQueue<'_> {
             return Ok(None);
         };
         HtmlPreviewIoState::try_from(candidate.state.as_str())?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let mut update = work::Entity::update_many()
                 .filter(key(&candidate))
@@ -526,7 +526,7 @@ impl HtmlPreviewIoQueue<'_> {
         } else {
             None
         };
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             if matches!(outcome, HtmlPreviewIoOutcome::Done) {
                 if !obsolete
@@ -730,7 +730,7 @@ impl HtmlPreviewIoQueue<'_> {
             .into_query();
         if row.upper_id.is_none() {
             let initialized = self
-                .run_serialized_write(|| async {
+                .retry_write_on_conflict(|| async {
                     let tx = self.connection.begin().await?;
                     let Some(current) = work::Entity::find()
                         .filter(fence(&row))
@@ -906,7 +906,7 @@ impl HtmlPreviewIoQueue<'_> {
             }
         }
         let locator = source.as_ref().map(|s| HtmlPreviewIoLocator::new(&s.id));
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let mut cursor_fence = fence(&row);
             cursor_fence = cursor_fence.add(if let Some(id) = &row.cursor_id {

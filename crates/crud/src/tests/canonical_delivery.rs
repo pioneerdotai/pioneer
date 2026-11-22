@@ -151,8 +151,9 @@ async fn native_event_append_is_fenced_by_durable_execution_owner() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_claims() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresWriteClass, PostgresWriteEvent,
+        PostgresWriteExecutor,
     };
     use sea_orm::TransactionTrait;
 
@@ -160,9 +161,9 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(FixtureDatabaseObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     database.validate_reader().await.unwrap();
@@ -194,14 +195,14 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
         (
             &interactive,
             "live_notification",
-            SqliteReadClass::Interactive,
-            SqliteWriteClass::Interactive,
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
         ),
         (
             &maintenance,
             "thread_episodic",
-            SqliteReadClass::Maintenance,
-            SqliteWriteClass::Maintenance,
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
         ),
     ] {
         let claims = store
@@ -216,7 +217,7 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
             events
                 .iter()
                 .filter_map(|event| match event {
-                    SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                    PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -252,14 +253,14 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
         (
             &interactive,
             "interactive save",
-            SqliteReadClass::Interactive,
-            SqliteWriteClass::Interactive,
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
         ),
         (
             &maintenance,
             "maintenance save",
-            SqliteReadClass::Maintenance,
-            SqliteWriteClass::Maintenance,
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
         ),
     ] {
         observer.reads.lock().unwrap().clear();
@@ -286,10 +287,10 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
         );
         let events = observer.events.lock().unwrap();
         assert!(events.iter().any(
-            |event| matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == write)
+            |event| matches!(event, PostgresWriteEvent::Acquired { class, .. } if *class == write)
         ));
         assert!(events.iter().all(
-            |event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class != write)
+            |event| !matches!(event, PostgresWriteEvent::Acquired { class, .. } if *class != write)
         ));
     }
     let transaction = database.with_critical_writes().begin().await.unwrap();
@@ -307,8 +308,8 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     assert!(cancelled.await.unwrap_err().is_cancelled());
     assert!(observer.events.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Cancelled {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Cancelled {
+            class: PostgresWriteClass::Maintenance,
             queue,
             ..
         } if queue.maintenance == 0
@@ -358,16 +359,16 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     let acquired = events
         .iter()
         .filter_map(|event| match event {
-            SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+            PostgresWriteEvent::Acquired { class, .. } => Some(*class),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(acquired.len(), 2);
-    assert!(acquired.contains(&SqliteWriteClass::Interactive));
-    assert!(acquired.contains(&SqliteWriteClass::Maintenance));
+    assert!(acquired.contains(&PostgresWriteClass::Interactive));
+    assert!(acquired.contains(&PostgresWriteClass::Maintenance));
     assert!(matches!(
         events.last(),
-        Some(SqliteWriteEvent::Released { queue, .. })
+        Some(PostgresWriteEvent::Released { queue, .. })
             if queue.interactive == 0 && queue.maintenance == 0 && queue.critical == 0
     ));
     drop(events);
@@ -396,7 +397,7 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     observer.wait_for_enqueued(1).await;
     recovery.abort();
     assert!(recovery.await.unwrap_err().is_cancelled());
-    assert!(observer.events.lock().unwrap().iter().any(|event| matches!(event, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+    assert!(observer.events.lock().unwrap().iter().any(|event| matches!(event, PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
     transaction.rollback().await.unwrap();
     assert_eq!(
         recovery_store
@@ -426,9 +427,9 @@ async fn native_optional_delivery_preserves_scoped_routes_and_cancels_queued_cla
     assert_eq!(recovered.id, running.id);
     assert_eq!(recovered.attempt_count, running.attempt_count + 1);
     let events = observer.events.lock().unwrap();
-    assert!(events.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class == SqliteWriteClass::Interactive)));
+    assert!(events.iter().all(|event| !matches!(event, PostgresWriteEvent::Acquired { class, .. } if *class == PostgresWriteClass::Interactive)));
     assert!(
-        matches!(events.last(), Some(SqliteWriteEvent::Released { queue, .. }) if queue.maintenance == 0 && queue.critical == 0 && queue.interactive == 0)
+        matches!(events.last(), Some(PostgresWriteEvent::Released { queue, .. }) if queue.maintenance == 0 && queue.critical == 0 && queue.interactive == 0)
     );
     drop(events);
     database.close().await.unwrap();

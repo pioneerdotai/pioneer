@@ -1,7 +1,7 @@
 use anyhow::Result;
 use pioneer_crud_compaction::frozen_reachability::Reachability;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 
 #[tokio::test]
@@ -27,7 +27,7 @@ async fn reverse_traversal_distinguishes_unpublished_and_published_descendants()
                      1, 1, 'candidate', 'parent');",
             )
             .await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
 
         for status in ["candidate", "applied"] {
             if status == "applied" {

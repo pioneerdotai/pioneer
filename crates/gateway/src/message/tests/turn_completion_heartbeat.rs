@@ -1,5 +1,5 @@
 use super::*;
-use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+use pioneer_postgres_pools::{PostgresWriteClass, PostgresWriteEvent};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 const HEARTBEAT_WRITTEN: &str = "__execution_owner_heartbeat_written__";
@@ -41,7 +41,7 @@ pub(super) async fn next_heartbeat(processor: &Arc<MessageProcessor>) {
 }
 
 async fn fixture(
-    observer: Option<Arc<dyn pioneer_sqlite::SqliteWriteObserver>>,
+    observer: Option<Arc<dyn pioneer_postgres_pools::PostgresWriteObserver>>,
 ) -> (
     Arc<pioneer_postgres_test::TestDatabase>,
     Arc<MessageProcessor>,
@@ -282,8 +282,8 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
             .iter()
             .any(|e| matches!(
                 e,
-                SqliteWriteEvent::Acquired {
-                    class: SqliteWriteClass::Critical,
+                PostgresWriteEvent::Acquired {
+                    class: PostgresWriteClass::Critical,
                     ..
                 }
             ))
@@ -291,7 +291,7 @@ async fn owner_heartbeat_survives_held_pass_is_single_and_stops_with_parent() {
     assert!(
         store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );
@@ -460,7 +460,7 @@ async fn heartbeat_time_is_evaluated_after_writer_wait_and_again_on_internal_ret
             .unwrap();
         assert_eq!(
             *observer.acquired_class.lock().unwrap(),
-            Some(SqliteWriteClass::Critical)
+            Some(PostgresWriteClass::Critical)
         );
         if retry {
             // Arm the next attempt before releasing the failing statement.

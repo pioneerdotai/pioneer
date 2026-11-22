@@ -15,17 +15,17 @@ use crate::plan_test_support::{
 use migration::Migrator;
 use pioneer_compaction::runner::{RunnerPhase, RunnerState, SourceCursor};
 use pioneer_compaction::{ModelSelection, Transport};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteClass, PostgresWriteExecutor};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
 use std::time::Duration;
 
 struct Fixture {
     store: CompactionStore,
-    writer: SqliteWriteExecutor,
+    writer: PostgresWriteExecutor,
 }
 
 impl Fixture {
-    fn db(&self) -> SqliteDatabase {
+    fn db(&self) -> PostgresDatabase {
         self.store.database_connection()
     }
 
@@ -44,14 +44,14 @@ async fn fixture() -> Fixture {
 
 async fn fixture_with_portable_sources(portable: bool) -> Fixture {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let writer = SqliteWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
+    let writer = PostgresWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
     let reader = fixture.connect_read_only().await.unwrap();
-    let store = CompactionStore::for_test(SqliteDatabase::from_executor(reader, writer.clone()))
+    let store = CompactionStore::for_test(PostgresDatabase::from_executor(reader, writer.clone()))
         .with_maintenance_access();
     assert!(
         store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );
@@ -238,7 +238,7 @@ fn canonical_cases() -> [CanonicalCase; 4] {
     ]
 }
 
-async fn set_manifest(db: &SqliteDatabase, source: &SourceCase, reference_only: bool) {
+async fn set_manifest(db: &PostgresDatabase, source: &SourceCase, reference_only: bool) {
     db.execute_unprepared(
         "DELETE FROM compaction_manifest WHERE operation_id='manifest-operation'",
     )
@@ -259,7 +259,12 @@ async fn set_manifest(db: &SqliteDatabase, source: &SourceCase, reference_only: 
     .unwrap();
 }
 
-async fn assert_manifest_current(db: &SqliteDatabase, operation: &str, expected: bool, case: &str) {
+async fn assert_manifest_current(
+    db: &PostgresDatabase,
+    operation: &str,
+    expected: bool,
+    case: &str,
+) {
     let actual = compaction_manifest_sources_current(db, operation)
         .await
         .unwrap();
@@ -893,7 +898,7 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
     .await;
 }
 
-async fn install_projection(db: &SqliteDatabase, manifest: &str, message_json: &str) {
+async fn install_projection(db: &PostgresDatabase, manifest: &str, message_json: &str) {
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ($1,'ws','root-thread','identity',1,1,0,'imports',0,1)",
@@ -2065,7 +2070,7 @@ fn assert_frozen_view_plan(plan: &PlanNode, name: &str, relation: &str) {
     assert_storage_kind(shared, "compaction_frozen_span");
 }
 
-async fn seed_plan_noise(db: &SqliteDatabase) {
+async fn seed_plan_noise(db: &PostgresDatabase) {
     for index in 0..16 {
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -3005,7 +3010,7 @@ async fn fresh_schema_updates_source_revisions_without_retired_publication_fence
         let fixture = fixture_with_portable_sources(portable).await;
         fixture
             .writer
-            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .run_migrations::<Migrator>(PostgresWriteClass::Maintenance, None)
             .await
             .unwrap();
         let db = fixture.db();

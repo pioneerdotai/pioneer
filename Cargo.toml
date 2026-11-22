@@ -58,7 +58,7 @@ members = [
   "crates/plugins",
   "crates/packages",
   "crates/apps",
-  "crates/sqlite",
+  "crates/postgres-pools",
   "crates/tasks",
   "crates/tools",
   "crates/terminal",
@@ -132,7 +132,7 @@ pioneer-packages = { path = "crates/packages" }
 pioneer-apps = { path = "crates/apps" }
 pioneer-tasks = { path = "crates/tasks" }
 pioneer-tools = { path = "crates/tools" }
-pioneer-sqlite = { path = "crates/sqlite" }
+pioneer-postgres-pools = { path = "crates/postgres-pools" }
 pioneer-promt = { path = "crates/promt" }
 
 # Native skills directory notifications (FSEvents on macOS).
@@ -165,7 +165,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Tracing
 log = "0.4"
-env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "debug-images", "panic", "transport", "tracing"] }
@@ -204,11 +203,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 tempfile = "3"
 fs4 = "1.1"
-lazy_static = "1.5"
-lru_time_cache = "0.11"
-owning_ref = "0.4"
-names = { version = "0.14", default-features = false }
-pretty_assertions = "1"
 shell-words = "1.1"
 keepawake = "0.6"
 cpal = "0.18"

@@ -3,8 +3,8 @@ use pioneer_crud_conversations::thread_tree::{
     create_thread_folder, delete_thread_folder_promote, get_thread_placement, list_thread_folders,
     move_folder, move_thread_to_folder,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 
 #[tokio::test]
@@ -17,9 +17,9 @@ async fn folder_topology_serializes_competing_moves_and_promotes_children() -> R
              VALUES ('local-thread', 'ws', '', 'chat', 'model', 'provider', 'active'),
                     ('foreign-thread', 'foreign', '', 'chat', 'model', 'provider', 'active');",
         ).await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let other =
-            SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connect().await?);
+            PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connect().await?);
         let left = create_thread_folder(&db, "ws", None, "Left").await?;
         let right = create_thread_folder(&db, "ws", None, "Right").await?;
         let (move_left, move_right) = tokio::join!(

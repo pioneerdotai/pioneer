@@ -1,11 +1,11 @@
 use crate::{plan_test_support::seed_payload_sources, store::CompactionStore};
 use pioneer_crud_payloads::storage::PreparedPayload;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 async fn open(fixture: &TestDatabase) -> CompactionStore {
-    CompactionStore::for_test(SqliteDatabase::new(
+    CompactionStore::for_test(PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connect().await.unwrap(),
     ))

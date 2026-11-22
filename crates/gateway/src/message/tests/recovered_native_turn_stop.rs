@@ -1,11 +1,11 @@
 use super::*;
 use pioneer_client::{core::ClientCore, state::snapshot::ActiveThreadSnapshot};
 use pioneer_crud::{TurnExecutionStatus, TurnExecutorKind};
+use pioneer_postgres_pools::PostgresWriteClass;
 use pioneer_protocol::{
     GatewayNotification, NativeTerminalEffectPreparation, ThreadUpdatedNotification,
     TurnStartParams,
 };
-use pioneer_sqlite::SqliteWriteClass;
 use sea_orm::ActiveModelTrait;
 use std::sync::atomic::AtomicU64;
 
@@ -503,7 +503,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             Box::pin(async move {
                 weak.upgrade()
                     .unwrap()
-                    .with_database_class(SqliteWriteClass::Critical)
+                    .with_database_class(PostgresWriteClass::Critical)
                     .ensure_agent_listener_task(&thread)
                     .await
                     .map_err(|e| format!("{e:#}"))

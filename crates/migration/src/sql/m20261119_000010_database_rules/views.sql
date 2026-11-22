@@ -1,4 +1,4 @@
--- Domain views retained from the SQLite catalog.
+-- Domain views for the PostgreSQL schema.
 
 CREATE VIEW compaction_live_sources
   AS ((((SELECT 'context:' || r.turn_id AS source_scope

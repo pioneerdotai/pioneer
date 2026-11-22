@@ -1534,7 +1534,7 @@ fn turn_mcp_metadata_from_model(
 
 /// Decode a body captured by the source query after releasing database capacity.
 pub async fn hydrate_record(
-    _db: &pioneer_sqlite::SqliteDatabase,
+    _db: &pioneer_postgres_pools::PostgresDatabase,
     mut record: CliRuntimeTurnBindingRecord,
 ) -> Result<CliRuntimeTurnBindingRecord> {
     if let Some(mapping) = record.input_mapping_frame.take() {

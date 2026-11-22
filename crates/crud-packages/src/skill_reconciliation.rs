@@ -1,8 +1,8 @@
 //! Fences for publishing filesystem-prepared skill metadata.
 
 use anyhow::{Context, Result, bail};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::SkillId;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::LockType;
 use sea_orm::{ConnectionTrait, EntityTrait, QuerySelect, TransactionTrait};
 
@@ -90,7 +90,7 @@ async fn revalidate_skill_source_workspace<C: ConnectionTrait>(
 }
 
 pub async fn update_skill_installation(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     skill_id: &SkillId,
     patch: &SkillInstallationPatch,
     event_timestamp_secs: i64,
@@ -99,7 +99,7 @@ pub async fn update_skill_installation(
 }
 
 pub async fn reconcile_skill_installation_with_progress(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     expected: &SkillReconciliationSnapshot,
     patch: &SkillInstallationPatch,
     now: i64,
@@ -130,7 +130,7 @@ pub async fn reconcile_skill_installation_with_progress(
 }
 
 pub async fn confirm_skill_reconciliation(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     expected: &SkillReconciliationSnapshot,
     workspace: Option<&pioneer_entity::workspace::Model>,
     still_current: &(dyn Fn() -> bool + Send + Sync),
@@ -157,7 +157,7 @@ pub async fn confirm_skill_reconciliation(
 }
 
 pub async fn register_skill_import_pending(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     record: &SkillInstallationRecord,
     workspace: Option<&pioneer_entity::workspace::Model>,
     now: i64,
@@ -193,7 +193,7 @@ pub async fn register_skill_import_pending(
 }
 
 pub async fn find_skill_import_provenance(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     kind: &str,
     scope: &str,
     reference: &str,
@@ -208,7 +208,7 @@ pub async fn find_skill_import_provenance(
 }
 
 pub async fn list_skill_reconciliation_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     source_kind: &str,
     scope_key: &str,
     after: Option<&str>,
@@ -228,7 +228,7 @@ pub async fn list_skill_reconciliation_page(
 }
 
 async fn update_skill_installation_guarded(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     skill_id: &SkillId,
     patch: &SkillInstallationPatch,
     event_timestamp_secs: i64,

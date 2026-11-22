@@ -51,7 +51,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             [event.task_id().to_owned()],
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.transition_task_delivery_once(event.clone(), transition, at, None)
             })
             .await

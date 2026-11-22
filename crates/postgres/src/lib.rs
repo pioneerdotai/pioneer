@@ -20,12 +20,15 @@ use tokio::{process::Command, time::Instant};
 use url::Url;
 use uuid::Uuid;
 
+mod tuning;
+
 #[cfg(windows)]
 mod windows;
 
 const ROLE: &str = "pioneer";
 const READER_ROLE: &str = "pioneer_reader";
 const DATABASE: &str = "pioneer";
+const POSTGRES_MAJOR: &str = "18";
 const START_TIMEOUT: Duration = Duration::from_secs(40);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -149,6 +152,8 @@ impl Cluster {
                 .await
                 .context("launch bundled initdb")?;
             ensure!(status.success(), "bundled initdb failed ({status})");
+            tuning::install(staged.path())
+                .context("configure the newly initialized PostgreSQL cluster")?;
             // Publish a fully initialized cluster only. An interrupted initdb
             // leaves the existing data and the credential available on retry.
             fs::rename(staged.path(), &directory)
@@ -157,7 +162,7 @@ impl Cluster {
         let version = fs::read_to_string(directory.join("PG_VERSION"))
             .context("read PostgreSQL data version")?;
         ensure!(
-            version.trim() == "18",
+            version.trim() == POSTGRES_MAJOR,
             "private PostgreSQL data needs a major version upgrade"
         );
         Ok(Self {

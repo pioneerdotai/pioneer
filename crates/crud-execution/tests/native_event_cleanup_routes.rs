@@ -1,8 +1,8 @@
 use anyhow::Result;
 use pioneer_crud_execution::native_event_cleanup::run_quantum;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use std::sync::{
     Arc,
@@ -14,12 +14,12 @@ struct Observer {
     writes: AtomicU64,
     queued: AtomicU64,
 }
-impl SqliteReadObserver for Observer {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Observer {
+    fn observe(&self, event: PostgresReadEvent) {
         if matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         ) {
@@ -27,17 +27,17 @@ impl SqliteReadObserver for Observer {
         }
     }
 }
-impl SqliteWriteObserver for Observer {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Observer {
+    fn observe(&self, event: PostgresWriteEvent) {
         match event {
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.writes.fetch_add(1, Ordering::SeqCst);
             }
-            SqliteWriteEvent::Enqueued {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Enqueued {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.queued.fetch_add(1, Ordering::SeqCst);
@@ -53,9 +53,9 @@ async fn production_api_empty_queue_uses_one_maintenance_read_without_writer() -
     let observer = Arc::new(Observer::default());
     let reader = fixture.connect_read_only().await?;
     let writer = fixture.connect_with_limit(1).await?;
-    let db = SqliteDatabase::from_executor_with_read_observer(
+    let db = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     db.maintenance().validate_reader().await?;

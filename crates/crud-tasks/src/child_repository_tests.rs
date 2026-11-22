@@ -20,7 +20,7 @@ async fn postgres_store_with_workspace(
     .await
     .expect("insert Task child workspace fixture");
     let reader = fixture.connect_read_only().await.unwrap();
-    TaskChildWorkRepository::new(&SqliteDatabase::new(reader, writer.clone()))
+    TaskChildWorkRepository::new(&PostgresDatabase::new(reader, writer.clone()))
 }
 mod child_queue_pass_regressions {
     use super::*;
@@ -293,10 +293,13 @@ async fn empty_child_polls_use_physical_read_only_reader_without_writer_admissio
         atomic::{AtomicUsize, Ordering},
     };
     struct Observer(AtomicUsize);
-    impl pioneer_sqlite::SqliteWriteObserver for Observer {
-        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
-            if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
-                assert_eq!(class, pioneer_sqlite::SqliteWriteClass::Maintenance);
+    impl pioneer_postgres_pools::PostgresWriteObserver for Observer {
+        fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
+            if let pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } = event {
+                assert_eq!(
+                    class,
+                    pioneer_postgres_pools::PostgresWriteClass::Maintenance
+                );
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
@@ -305,13 +308,14 @@ async fn empty_child_polls_use_physical_read_only_reader_without_writer_admissio
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(Observer(AtomicUsize::new(0)));
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone());
-    let store = TaskChildWorkRepository::new(&SqliteDatabase::from_executor(reader, executor))
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, observer.clone());
+    let store = TaskChildWorkRepository::new(&PostgresDatabase::from_executor(reader, executor))
         .with_maintenance_access();
     assert!(
         store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );
@@ -368,7 +372,7 @@ async fn child_preflight_race_restarts_the_entire_short_transaction_after_rollba
         let store = postgres_store_with_workspace(fixture, "ws_task").await;
         let attempts = AtomicUsize::new(0);
         store
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 let tx = store.connection.begin().await?;
                 if attempt == 0 {
@@ -396,7 +400,7 @@ async fn child_preflight_race_restarts_the_entire_short_transaction_after_rollba
                 .unwrap()
                 .is_some()
         );
-        assert!(!pioneer_sqlite::is_retryable_database_conflict(
+        assert!(!pioneer_postgres_pools::is_retryable_database_conflict(
             &anyhow::anyhow!(sea_orm::DbErr::Custom("unknown commit outcome".into()))
         ));
         Ok(())
@@ -481,7 +485,7 @@ async fn failed_child_scope_claim_remains_deferred_until_its_deadline_after_reop
     assert!(store.expand_child_scope(100).await.is_err());
     let reader = fixture.connect_read_only().await.unwrap();
     let writer = fixture.connect().await.unwrap();
-    let restarted = TaskChildWorkRepository::new(&SqliteDatabase::new(reader, writer));
+    let restarted = TaskChildWorkRepository::new(&PostgresDatabase::new(reader, writer));
     assert_eq!(
         restarted.child_scope_due_upper(102).await.unwrap(),
         Some((102, "task".into(), "scope".into()))

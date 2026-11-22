@@ -5,7 +5,7 @@ async fn store_preserves_typed_database_scope_across_construction_and_write_recl
     pioneer_postgres_test::with_database(async |fixture| {
         let reader = fixture.connect_read_only().await.unwrap();
         let writer = fixture.connection().clone();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer)
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer)
             .maintenance()
             .with_critical_writes();
 
@@ -14,22 +14,22 @@ async fn store_preserves_typed_database_scope_across_construction_and_write_recl
 
         assert_eq!(
             scoped.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             scoped.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Critical
+            pioneer_postgres_pools::PostgresWriteClass::Critical
         );
 
         let background_control_plane = store.with_maintenance_reads_and_critical_writes();
         let scoped = background_control_plane.database_connection();
         assert_eq!(
             scoped.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             scoped.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Critical
+            pioneer_postgres_pools::PostgresWriteClass::Critical
         );
         Ok(())
     })
@@ -42,7 +42,7 @@ async fn pure_maintenance_read_does_not_reserve_the_writer() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+    let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
     let store = CrudStore::new(database.clone());
     let transaction = database
         .with_critical_writes()
@@ -82,7 +82,7 @@ async fn ambiguous_transport_outcome_is_not_replayed() {
         let attempts = AtomicUsize::new(0);
         let result: anyhow::Result<()> =
             store
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     async {
                         Err(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(
@@ -119,12 +119,12 @@ async fn postgres_driver_distinguishes_retryable_sqlstates() {
         );
         let error = db.execute_unprepared(&sql).await.unwrap_err().into();
         assert_eq!(
-            pioneer_sqlite::is_retryable_database_conflict(&error),
+            pioneer_postgres_pools::is_retryable_database_conflict(&error),
             retry
         );
         let mut attempts = 0;
         let result = store
-            .run_serialized_write(|| {
+            .retry_write_on_conflict(|| {
                 attempts += 1;
                 let first = attempts == 1;
                 let sql = &sql;

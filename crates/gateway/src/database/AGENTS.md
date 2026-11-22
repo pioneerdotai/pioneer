@@ -1,15 +1,20 @@
 # Gateway Database Lifecycle
 
-- Production uses the PostgreSQL runtime shipped with Gateway. Keep the cluster
+- Gateway uses the shipped PostgreSQL runtime by default. Keep the cluster
   under the private runtime home, outside the installation. Start the bundled
   postmaster directly, and close application connections before waiting for it
   to exit.
-- Development can explicitly select a private application database through
-  `gateway.database.development_url`. Keep the URL out of logs. The test
-  administrative URL belongs to the test runner.
-- New clusters start from the PostgreSQL schema. Do not introduce SQLite
-  compatibility reads or historical data migrations. Keep ongoing maintenance
-  in the existing domain workers under their scoped handles.
+- Gateway and database operator commands use `DATABASE_URL` from the process
+  environment or the runtime home's `.env` to select an external application
+  database. An explicit dev-only `gateway.database.development_url` takes
+  precedence. Keep URL values out of logs and inherited agent environments.
+  The test administrative URL belongs to the test runner.
+- Treat external PostgreSQL as an independently managed service. Gateway owns
+  the pools and applies its schema migrations. Use one active Gateway per
+  database and connect to the cluster's writable endpoint.
+- Apply the registered migrations to an empty PostgreSQL database at initial
+  setup. Keep application reads and ongoing maintenance on PostgreSQL under
+  their scoped handles.
 - Schema changes belong in the [migration crate](../../../migration/AGENTS.md).
   Delegate ordinary database operations to [CRUD repositories](../../../crud/AGENTS.md).
 - Keep work needed for current PostgreSQL data bounded, restart-safe and

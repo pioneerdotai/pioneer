@@ -10,22 +10,22 @@ use pioneer_crud::{
     find_codex_aggregate_state, find_first_codex_aggregate_state_for_thread,
     upsert_codex_aggregate_state,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::TransactionTrait;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 static CODEX_PROJECTION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
-/// SQLite projection for Codex aggregate events.  Applied patch records are
+/// PostgreSQL projection for Codex aggregate events.  Applied patch records are
 /// intentionally never written here: Codex remains an AggregateOnly source.
 #[derive(Clone)]
-pub struct SqliteCodexAggregateStore {
-    db: SqliteDatabase,
+pub struct PostgresCodexAggregateStore {
+    db: PostgresDatabase,
 }
 
-impl SqliteCodexAggregateStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresCodexAggregateStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self { db: db.into() }
     }
 
@@ -132,7 +132,7 @@ impl SqliteCodexAggregateStore {
         state.final_state = true;
         validate_state(&state).map_err(|error| anyhow!(error))?;
         let payload = bounded_state_json(&state)?;
-        let revision = sqlite_i64(state.revision, "Codex aggregate revision")?;
+        let revision = postgres_i64(state.revision, "Codex aggregate revision")?;
         let updated =
             finalize_codex_aggregate_state(&self.db, thread_id, turn_id, revision, payload)
                 .await
@@ -142,7 +142,7 @@ impl SqliteCodexAggregateStore {
 
     pub async fn upsert(&self, state: &CodexAggregateState) -> Result<bool> {
         validate_state(state).map_err(|error| anyhow!(error))?;
-        let revision_sql = sqlite_i64(state.revision, "Codex aggregate revision")?;
+        let revision_sql = postgres_i64(state.revision, "Codex aggregate revision")?;
         let existing = find_codex_aggregate_state(&self.db, &state.thread_id, &state.turn_id)
             .await
             .context("query Codex aggregate projection")?;
@@ -340,6 +340,6 @@ fn same_aggregate_payload(left: &CodexAggregateState, right: &CodexAggregateStat
         && left.files == right.files
 }
 
-fn sqlite_i64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
+fn postgres_i64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds PostgreSQL integer range"))
 }

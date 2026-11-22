@@ -10,11 +10,11 @@ use crate::{native_cancellation_context, recovery_job, turn_execution};
 use anyhow::{Context, Result, bail};
 use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_conversations::projection_receipts::has_accepted_terminal;
-use pioneer_protocol::TurnStatus;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::TurnStatus;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
@@ -100,7 +100,7 @@ impl CliRuntimeTurnTerminalGuard {
 // capacity or writer closures have committed. Repository records inside a
 // transaction retain the SQL projection and storage provenance.
 pub async fn hydrate_cli_binding_optional(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     record: Option<CliRuntimeTurnBindingRecord>,
 ) -> Result<Option<CliRuntimeTurnBindingRecord>> {
     match record {
@@ -109,7 +109,7 @@ pub async fn hydrate_cli_binding_optional(
     }
 }
 pub async fn hydrate_cli_binding_list(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     records: Vec<CliRuntimeTurnBindingRecord>,
 ) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
     let mut output = Vec::with_capacity(records.len());
@@ -119,7 +119,7 @@ pub async fn hydrate_cli_binding_list(
     Ok(output)
 }
 pub async fn hydrate_cli_binding_pair(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     (binding, attempt): (CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord),
 ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
     Ok((
@@ -128,7 +128,7 @@ pub async fn hydrate_cli_binding_pair(
     ))
 }
 pub async fn hydrate_cli_binding_triple(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     (binding, attempt, segment): (
         CliRuntimeTurnBindingRecord,
         CliRuntimeTurnAttemptRecord,
@@ -146,7 +146,7 @@ pub async fn hydrate_cli_binding_triple(
     ))
 }
 pub async fn hydrate_cli_binding_optional_triple(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     record: Option<(
         CliRuntimeTurnBindingRecord,
         CliRuntimeTurnAttemptRecord,
@@ -165,7 +165,7 @@ pub async fn hydrate_cli_binding_optional_triple(
     }
 }
 pub async fn hydrate_cli_binding_owner(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     record: Option<CliRuntimeNativeTurnOwner>,
 ) -> Result<Option<CliRuntimeNativeTurnOwner>> {
     if let Some(mut owner) = record {
@@ -479,15 +479,15 @@ pub fn cli_runtime_continuation_guard_from_snapshot(
 
 #[derive(Clone)]
 pub struct CliRuntimeStore {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
 }
 
 impl CliRuntimeStore {
-    pub fn new(connection: SqliteDatabase) -> Self {
+    pub fn new(connection: PostgresDatabase) -> Self {
         Self { connection }
     }
 
-    pub fn database_connection(&self) -> SqliteDatabase {
+    pub fn database_connection(&self) -> PostgresDatabase {
         self.connection.clone()
     }
 

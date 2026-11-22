@@ -1,4 +1,4 @@
-//! Capture-only attribution of SQLx command CPU on named Gateway SQLite workers.
+//! Capture-only attribution of SQLx command CPU in Gateway PostgreSQL query scopes.
 //! No SQL, identifiers, errors, or per-query records leave this bounded collector.
 use serde::Serialize;
 use std::{
@@ -21,7 +21,7 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context as LayerContext, registry::LookupSpan};
 
-pub(crate) const TARGET: &str = "pioneer_sqlite::query_cpu";
+pub(crate) const TARGET: &str = "pioneer_postgres_pools::query_cpu";
 const MAX_SCOPES: usize = 128;
 const MAX_SEGMENTS: u64 = 20_000;
 // Independent first-admission reservations: unmeasured sequential scopes cannot
@@ -353,9 +353,9 @@ impl SessionState {
             measured_unknown: data.unknown.clone(),
             group_overflow: data.overflow.clone(),
             coverage: data.coverage.clone(),
-            measurement: "CPU of SQLx commands in query scopes on Gateway SQLite workers",
+            measurement: "CPU of SQLx commands in query scopes on Gateway threads",
             limitations: &[
-                "Includes preparation, SQLite execution, row processing/transfer and cleanup; not sqlite3_step alone.",
+                "Measures client-side preparation, driver polling, row processing and cleanup. Server CPU is outside this process.",
                 "Private SQLx command kinds, including pool service commands under a scope, cannot be separated.",
                 "Scopes begun before capture, uninstrumented work and worker bootstrap are not reconstructed.",
                 "Open segments at window end have no endpoint CPU measurement; their unmeasured cost is unknown.",
@@ -536,7 +536,8 @@ impl QueryScope {
         drop(data);
         let key = Key { session, id };
         let previous = CREATING.with(|s| s.replace(Some(key.clone())));
-        let span = tracing::info_span!(target: "pioneer_sqlite::query_cpu", "sqlite.query_cpu");
+        let span =
+            tracing::info_span!(target: "pioneer_postgres_pools::query_cpu", "postgres.query_cpu");
         CREATING.with(|s| {
             s.replace(previous);
         });
@@ -739,7 +740,8 @@ where
         // Thread names are application prefixes, not operating system TIDs.
         let thread = std::thread::current();
         if !thread.name().is_some_and(|n| {
-            n.starts_with("pioneer-sqlite-reader-") || n.starts_with("pioneer-sqlite-writer-")
+            n.starts_with("pioneer-postgres-pools-reader-")
+                || n.starts_with("pioneer-postgres-pools-writer-")
         }) {
             return;
         }
@@ -1121,7 +1123,7 @@ pub(crate) mod tests {
     }
 
     // Shared with diagnostics owner-path regressions. Real scope/callback and
-    // named SQLite-worker span boundaries; no SQL connections or fabricated totals.
+    // query-scope span boundaries; no SQL connections or fabricated totals.
     pub(crate) fn capture_command(fingerprint: u64, measured: bool) {
         capture_scope(Some(fingerprint), measured, None);
     }
@@ -1142,7 +1144,7 @@ pub(crate) mod tests {
                 if let Some(span) = scope.span.clone() {
                     let worker_dispatch = dispatch.clone();
                     std::thread::Builder::new()
-                        .name("pioneer-sqlite-reader-capture-test".into())
+                        .name("pioneer-postgres-pools-reader-capture-test".into())
                         .spawn(move || {
                             tracing::dispatcher::with_default(&worker_dispatch, || {
                                 let _entered = span.enter();
@@ -1543,14 +1545,14 @@ pub(crate) mod tests {
                     let ready = ready.clone();
                     let release = release.clone();
                     std::thread::Builder::new()
-                        .name("pioneer-sqlite-reader-test".into())
+                        .name("pioneer-postgres-pools-reader-test".into())
                         .spawn(move || {
                             tracing::dispatcher::with_default(&thread_dispatch, || {
                                 let _outer = worker_span.enter();
                                 // A nested private span sees the same ancestor. It must
                                 // not create a second CPU segment.
                                 let nested =
-                                    tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "nested");
+                                    tracing::trace_span!(target: "pioneer_postgres_pools::query_cpu", "nested");
                                 let _nested = nested.enter();
                                 ready.wait();
                                 release.wait();
@@ -1610,7 +1612,7 @@ pub(crate) mod tests {
                 let ready = ready.clone();
                 let release = release.clone();
                 std::thread::Builder::new()
-                    .name("pioneer-sqlite-writer-test".into())
+                    .name("pioneer-postgres-pools-writer-test".into())
                     .spawn(move || {
                         tracing::dispatcher::with_default(&thread_dispatch, || {
                             let _outer = span.enter();
@@ -1618,7 +1620,7 @@ pub(crate) mod tests {
                             release.wait();
                             // Enter/exit after sealing must still balance cleanup.
                             let nested =
-                                tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "late_nested");
+                                tracing::trace_span!(target: "pioneer_postgres_pools::query_cpu", "late_nested");
                             let _nested = nested.enter();
                         });
                     })
@@ -1668,7 +1670,7 @@ pub(crate) mod tests {
             let span = outer.span.as_ref().unwrap().clone();
             let worker_dispatch = dispatch.clone();
             std::thread::Builder::new()
-                .name("pioneer-sqlite-reader-mixed".into())
+                .name("pioneer-postgres-pools-reader-mixed".into())
                 .spawn(move || {
                     tracing::dispatcher::with_default(&worker_dispatch, || {
                         let _entered = span.enter();
@@ -1726,7 +1728,7 @@ pub(crate) mod tests {
             let span = measured.span.as_ref().unwrap().clone();
             let thread_dispatch = dispatch.clone();
             std::thread::Builder::new()
-                .name("pioneer-sqlite-reader-budget".into())
+                .name("pioneer-postgres-pools-reader-budget".into())
                 .spawn(move || {
                     tracing::dispatcher::with_default(&thread_dispatch, || {
                         for _ in 0..=MAX_SEGMENTS {

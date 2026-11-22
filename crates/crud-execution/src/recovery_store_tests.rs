@@ -1,7 +1,7 @@
 use super::*;
-use pioneer_sqlite::{
-    SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteEvent, SqliteWriteExecutor,
-    SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteEvent,
+    PostgresWriteExecutor, PostgresWriteObserver,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::sync::Mutex;
@@ -9,48 +9,48 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct RecoveryRoutes {
-    reads: Mutex<Vec<SqliteReadClass>>,
-    events: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadClass>>,
+    events: Mutex<Vec<PostgresWriteEvent>>,
 }
 
-impl SqliteReadObserver for RecoveryRoutes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
+impl PostgresReadObserver for RecoveryRoutes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
 
-impl SqliteWriteObserver for RecoveryRoutes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for RecoveryRoutes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
 
-async fn recovery_discovery_fixture() -> (SqliteDatabase, Arc<RecoveryRoutes>) {
+async fn recovery_discovery_fixture() -> (PostgresDatabase, Arc<RecoveryRoutes>) {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(RecoveryRoutes::default());
-    let executor = SqliteWriteExecutor::with_observer(writer, observer.clone());
+    let executor = PostgresWriteExecutor::with_observer(writer, observer.clone());
     (
-        SqliteDatabase::from_executor_with_read_observer(reader, executor, observer.clone()),
+        PostgresDatabase::from_executor_with_read_observer(reader, executor, observer.clone()),
         observer,
     )
 }
 
 #[pioneer_postgres_test::postgres_test]
 async fn empty_recovery_discovery_and_active_reads_do_not_reserve_writer() {
-    use pioneer_sqlite::SqliteReadClass;
+    use pioneer_postgres_pools::PostgresReadClass;
     let (db, observer) = recovery_discovery_fixture().await;
     let wake = Arc::new(Notify::new());
     let held_writer = db.begin().await.unwrap();
     for (scoped, expected_class) in [
-        (db.clone(), SqliteReadClass::Interactive),
-        (db.maintenance(), SqliteReadClass::Maintenance),
+        (db.clone(), PostgresReadClass::Interactive),
+        (db.maintenance(), PostgresReadClass::Maintenance),
         (
             db.maintenance().with_critical_writes(),
-            SqliteReadClass::Maintenance,
+            PostgresReadClass::Maintenance,
         ),
     ] {
         let scoped = RecoveryStore::new(&scoped, &wake);
@@ -104,7 +104,7 @@ async fn empty_recovery_discovery_and_active_reads_do_not_reserve_writer() {
 #[tokio::test]
 async fn claimed_recovery_job_can_be_marked_active_and_retried() {
     pioneer_postgres_test::with_database(async |fixture| {
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connection().clone(),
         );
@@ -186,7 +186,7 @@ async fn claimed_recovery_job_can_be_marked_active_and_retried() {
 #[tokio::test]
 async fn unresolved_recovery_episode_rejects_duplicate_jobs_for_turn() {
     pioneer_postgres_test::with_database(async |fixture| {
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connection().clone(),
         );

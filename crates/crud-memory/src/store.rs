@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
+    is_retryable_database_conflict, retry_with_backoff,
+};
 use pioneer_protocol::{
     MemoryCandidateDecision, MemoryCandidateStatus, MemoryScope, MemoryScopeKind, generate_id,
-};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::{EntityTrait, TransactionTrait};
 use std::{future::Future, time::Duration};
@@ -55,13 +55,13 @@ impl EpisodicClaimTestState {
 
 #[derive(Clone)]
 pub struct MemoryStore {
-    pub(crate) connection: SqliteDatabase,
+    pub(crate) connection: PostgresDatabase,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) episodic_claim_test_state: EpisodicClaimTestState,
 }
 
 impl MemoryStore {
-    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+    pub fn new(connection: impl Into<PostgresDatabase>) -> Self {
         Self {
             connection: connection.into(),
             #[cfg(any(test, feature = "test-support"))]
@@ -1761,7 +1761,7 @@ impl MemoryStore {
                     .one(&tx)
                     .await?
                     .is_some();
-                // Re-read under the same serialized transaction as DELETE.
+                // Re-read in the same transaction as DELETE.
                 if repair || (owner.status == "active" && !quarantined) {
                     tx.commit().await?;
                     return Ok(false);

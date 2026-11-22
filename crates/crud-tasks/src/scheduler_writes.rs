@@ -65,7 +65,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             // Revalidate their complete input, including same-time reschedules,
             // in the existing atomic trigger + occurrence + Run transaction.
             let expected_snapshot = (trigger.clone(), serde_json::to_value(&trigger.spec)?);
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_due_trigger_task_events_once(
                     trigger.id.clone(),
                     expected_next_fire_at,
@@ -102,7 +102,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 error: Some(error),
                 blocked_at: now,
             }];
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_due_trigger_task_events_once(
                     trigger.id.clone(),
                     expected_next_fire_at,
@@ -130,7 +130,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<Option<DueTaskTriggerReconciliation>> {
         let change = TaskWorkChange::for_source(&self.connection, "g", trigger_id);
         let result = self
-            .run_serialized_write(|| {
+            .retry_write_on_conflict(|| {
                 self.reconcile_due_trigger_for_nonexecuting_task_once(
                     trigger_id.to_owned(),
                     expected_next_fire_at,
@@ -151,7 +151,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<Option<(TaskRun, AppendedTaskEvent)>> {
         let change = TaskWorkChange::for_source(&self.connection, "r", run_id);
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.claim_task_run_for_dispatch_once(run_id.to_owned(), claimed_at, None)
             })
             .await
@@ -179,7 +179,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 occurrence.run_id == run_id,
                 "retry occurrence belongs to another run"
             );
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.claim_task_run_for_dispatch_once(
                     run_id.to_owned(),
                     claimed_at,
@@ -324,7 +324,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<Option<AppendedTaskEvent>> {
         let change = TaskWorkChange::for_tasks(&self.connection, [task_id.clone()]);
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_run_started_once_inner(task_id.clone(), run_id.clone(), started_at)
             })
             .await

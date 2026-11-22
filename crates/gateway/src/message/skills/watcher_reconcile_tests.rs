@@ -264,7 +264,7 @@ async fn own_writes_and_failed_summary_retry_do_not_rewrite_successful_packages(
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
     assert!(
         harness
@@ -273,14 +273,14 @@ async fn own_writes_and_failed_summary_retry_do_not_rewrite_successful_packages(
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == SqliteWriteClass::Maintenance)
+            .all(|class| *class == PostgresWriteClass::Maintenance)
     );
     assert!(
         harness
             .processor
             .crud_store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );
@@ -635,7 +635,7 @@ async fn scope_reader_pages_are_capped_and_resume_after_the_last_id() {
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
 }
 

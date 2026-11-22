@@ -65,7 +65,7 @@ impl CrudStore {
         }
         let maintenance = self.connection.work_signal("maintenance.html").changing();
         let result = self
-            .run_serialized_write(|| {
+            .retry_write_on_conflict(|| {
                 let prepared = prepared.clone();
                 let publication = prepared.publication_target().cloned();
                 let at = prepared.prepared_at();
@@ -463,7 +463,7 @@ impl CrudStore {
         created_at_unix_ms: i64,
         id: String,
     ) -> Result<ArtifactBlobRecord> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let record = record.clone();
             let id = id.clone();
             async move {
@@ -481,7 +481,7 @@ impl CrudStore {
     }
 
     pub async fn update_test_artifact_status(&self, artifact_id: &str, status: &str) -> Result<()> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let artifact_id = artifact_id.to_owned();
             let status = status.to_owned();
             async move {

@@ -219,7 +219,7 @@ async fn snapshot_claim_serializes_with_updates_to_the_episodic_job() -> anyhow:
         MemoryStore,
         thread_episodic::{NewThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus},
     };
-    use pioneer_sqlite::SqliteDatabase;
+    use pioneer_postgres_pools::PostgresDatabase;
     use sea_orm::{DbBackend, TransactionTrait};
     use std::time::Duration;
 
@@ -252,7 +252,7 @@ async fn snapshot_claim_serializes_with_updates_to_the_episodic_job() -> anyhow:
                 .await?
                 .context("candidate connection PID")?
                 .try_get_by_index(0)?;
-            let store = MemoryStore::new(SqliteDatabase::new(
+            let store = MemoryStore::new(PostgresDatabase::new(
                 fixture.connect_read_only().await?,
                 candidate_writer,
             ));

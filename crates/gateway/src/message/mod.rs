@@ -76,8 +76,8 @@ const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
 /// registration, restore, or compaction to Critical.
 pub(crate) fn ordinary_history_store(store: &CrudStore) -> CrudStore {
     match store.database_connection().read_class() {
-        SqliteReadClass::Interactive => store.with_interactive_writes(),
-        SqliteReadClass::Maintenance => store.with_maintenance_access(),
+        PostgresReadClass::Interactive => store.with_interactive_writes(),
+        PostgresReadClass::Maintenance => store.with_maintenance_access(),
     }
 }
 mod workspace_handlers;
@@ -188,6 +188,10 @@ use pioneer_crud::{
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_memory::{PostgresThreadEpisodicBackend, ThreadEpisodicSearchBackend};
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresReadClass,
+    PostgresWriteClass, is_anyhow_database_transient_access, retry_with_backoff,
+};
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ArtifactBindingDirection, ArtifactBindingKind,
     ArtifactCreatedByKind, ArtifactCreatedNotification, ArtifactKind, ArtifactRole,
@@ -265,10 +269,6 @@ use pioneer_protocol::{
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
 use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
-    SqliteWriteClass, is_anyhow_database_transient_access, retry_with_backoff,
-};
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -2159,7 +2159,7 @@ impl MessageProcessor {
                     }
                     break;
                 };
-                let processor = processor.with_database_class(SqliteWriteClass::Critical);
+                let processor = processor.with_database_class(PostgresWriteClass::Critical);
                 match event {
                     crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
                         let result = processor
@@ -2481,11 +2481,11 @@ impl MessageProcessor {
     /// Clone the processor with one explicit class for its core persistence
     /// services while preserving all shared runtime state. Long-lived workers
     /// use this at their task boundary instead of inheriting request priority.
-    fn scoped_with_database_class(&self, class: SqliteWriteClass) -> Self {
+    fn scoped_with_database_class(&self, class: PostgresWriteClass) -> Self {
         let crud_store = Arc::new(match class {
-            SqliteWriteClass::Critical => self.crud_store.with_critical_writes(),
-            SqliteWriteClass::Interactive => self.crud_store.with_interactive_writes(),
-            SqliteWriteClass::Maintenance => self.crud_store.with_maintenance_access(),
+            PostgresWriteClass::Critical => self.crud_store.with_critical_writes(),
+            PostgresWriteClass::Interactive => self.crud_store.with_interactive_writes(),
+            PostgresWriteClass::Maintenance => self.crud_store.with_maintenance_access(),
         });
         self.scoped_with_crud_store(crud_store)
     }
@@ -2516,7 +2516,7 @@ impl MessageProcessor {
         scoped
     }
 
-    fn with_database_class(self: &Arc<Self>, class: SqliteWriteClass) -> Arc<Self> {
+    fn with_database_class(self: &Arc<Self>, class: PostgresWriteClass) -> Arc<Self> {
         Arc::new(self.scoped_with_database_class(class))
     }
 
@@ -2529,8 +2529,8 @@ impl MessageProcessor {
     /// for nested TaskService calls made from MessageProcessor work.
     fn critical_task_service(&self) -> Arc<pioneer_tasks::TaskService> {
         match self.crud_store.database_connection().read_class() {
-            SqliteReadClass::Interactive => self.task_runtime.critical_service(),
-            SqliteReadClass::Maintenance => self.task_runtime.background_control_service(),
+            PostgresReadClass::Interactive => self.task_runtime.critical_service(),
+            PostgresReadClass::Maintenance => self.task_runtime.background_control_service(),
         }
     }
 
@@ -3160,7 +3160,7 @@ impl MessageProcessor {
                     let processor = processor.upgrade().ok_or_else(|| {
                         "message processor stopped before recovery listener startup".to_owned()
                     })?;
-                    let processor = processor.with_database_class(SqliteWriteClass::Critical);
+                    let processor = processor.with_database_class(PostgresWriteClass::Critical);
                     processor
                         .ensure_agent_listener_task(thread_id.as_str())
                         .await
@@ -3266,7 +3266,7 @@ impl MessageProcessor {
                     break;
                 };
                 let this = this.for_background_reconciliation();
-                let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
+                let maintenance = this.with_database_class(PostgresWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 // Poll release obligations even while other families have more
                 // portions; a busy outbox must not starve terminal cleanup.

@@ -18,7 +18,7 @@ const EPISODIC: &str = deliveries::CONSUMER_THREAD_EPISODIC;
 const LIVE: &str = deliveries::CONSUMER_LIVE_NOTIFICATION;
 const PREDECESSOR_INDEX: &str = "idx_turn_event_delivery_unfinished_predecessor";
 
-async fn delivery_connection(workspace: &str) -> SqliteDatabase {
+async fn delivery_connection(workspace: &str) -> PostgresDatabase {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connection();
     writer.execute_raw(Statement::from_sql_and_values(
@@ -26,7 +26,7 @@ async fn delivery_connection(workspace: &str) -> SqliteDatabase {
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ($1,'Delivery fixture',TRUE,FALSE)",
         [workspace.into()],
     )).await.unwrap();
-    SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
+    PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
 }
 
 async fn delivery_fixture(
@@ -34,7 +34,7 @@ async fn delivery_fixture(
     thread_id: &str,
     turn_id: &str,
     count: i64,
-) -> (SqliteDatabase, String) {
+) -> (PostgresDatabase, String) {
     let db = delivery_connection(workspace).await;
     let tx = db.begin().await.unwrap();
     for statement in [
@@ -107,7 +107,7 @@ async fn delivery_fixture(
 }
 
 async fn claim_deliveries(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     consumer: &str,
     now: i64,
     limit: u64,
@@ -191,15 +191,15 @@ async fn episodic_delivery_requires_matching_stream_scope_and_positive_sequence(
 }
 
 // Test-only interception captures the exact statements issued by claim_due.
-// All actual I/O still goes through the scoped SqliteDatabase and its routes.
+// All actual I/O still goes through the scoped PostgresDatabase and its routes.
 struct ClaimConnection {
-    db: SqliteDatabase,
+    db: PostgresDatabase,
     statements: Mutex<Vec<Statement>>,
     before_update: Mutex<Option<Statement>>,
 }
 
 impl ClaimConnection {
-    fn new(db: SqliteDatabase, before_update: Option<Statement>) -> Self {
+    fn new(db: PostgresDatabase, before_update: Option<Statement>) -> Self {
         Self {
             db,
             statements: Mutex::new(Vec::new()),

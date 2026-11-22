@@ -61,7 +61,7 @@ impl CrudStore {
         notification: NewUserNotificationOutbox,
         agent_action: Option<AgentCommitInput>,
     ) -> Result<pioneer_entity::user_notification_outbox::Model> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             self.materialize_task_notification_once(notification.clone(), agent_action.clone())
         })
         .await

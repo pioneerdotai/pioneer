@@ -598,7 +598,7 @@ impl TurnProjector {
     #[cfg(test)]
     pub async fn project(
         &self,
-        db: impl Into<pioneer_sqlite::SqliteDatabase>,
+        db: impl Into<pioneer_postgres_pools::PostgresDatabase>,
         event: &AppendedTurnEvent,
     ) -> Result<()> {
         use sea_orm::TransactionTrait;

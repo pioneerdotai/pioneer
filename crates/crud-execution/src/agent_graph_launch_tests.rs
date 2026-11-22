@@ -8,13 +8,13 @@ use crate::agent_identity::{SOURCE_EPHEMERAL, load_agent_presentation_snapshot};
 use crate::agent_identity_catalog::{CliRuntimeIdentitySeed, sync_cli_runtime_identity_catalog};
 use crate::time::utc_now;
 use pioneer_entity::{agent_execution_grant, agent_presentation_snapshot};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
 use pioneer_protocol::AgentIdentityId;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ActiveModelTrait, PaginatorTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 
-struct FixtureStore(SqliteDatabase);
+struct FixtureStore(PostgresDatabase);
 
 struct NoTaskProjection;
 
@@ -30,7 +30,7 @@ impl ExecutionChangeSink for NoTaskProjection {
 }
 
 impl FixtureStore {
-    fn database_connection(&self) -> SqliteDatabase {
+    fn database_connection(&self) -> PostgresDatabase {
         self.0.clone()
     }
 
@@ -56,7 +56,7 @@ impl FixtureStore {
 async fn store(fixture: &TestDatabase) -> FixtureStore {
     let writer = fixture.connection();
     writer.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('continuity-workspace','Test Workspace',TRUE,FALSE)").await.unwrap();
-    FixtureStore(SqliteDatabase::new(
+    FixtureStore(PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         writer.clone(),
     ))

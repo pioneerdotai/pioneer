@@ -363,19 +363,19 @@ pub async fn has_accepted_terminal<C: ConnectionTrait>(db: &C, turn_id: &str) ->
 }
 
 pub async fn cleanup_quantum(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     after_turn_id: Option<&str>,
     through_turn_id: Option<&str>,
     addressed: Option<(&str, Option<i64>)>,
 ) -> Result<ProjectionReceiptCleanupOutcome> {
     let change = db.work_signal("maintenance.native").changing();
-    use pioneer_sqlite::{
-        DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
-        SqliteWriteClass, is_retryable_database_conflict, retry_with_backoff,
+    use pioneer_postgres_pools::{
+        DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresReadClass,
+        PostgresWriteClass, is_retryable_database_conflict, retry_with_backoff,
     };
     ensure!(
-        db.read_class() == SqliteReadClass::Maintenance
-            && db.write_class() == SqliteWriteClass::Maintenance,
+        db.read_class() == PostgresReadClass::Maintenance
+            && db.write_class() == PostgresWriteClass::Maintenance,
         "background database quantum requires maintenance-scoped reads and writes"
     );
     let result = retry_with_backoff(
@@ -451,11 +451,11 @@ pub async fn cleanup_quantum(
 
 #[derive(Clone, Copy)]
 pub struct ProjectionReceiptRepository<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
 }
 
 impl<'a> ProjectionReceiptRepository<'a> {
-    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(connection: &'a pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self { connection }
     }
 

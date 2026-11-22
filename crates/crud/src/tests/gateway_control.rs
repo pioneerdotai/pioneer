@@ -84,8 +84,8 @@ async fn gateway_control_heads_park_empty_and_terminal_upload_history() {
 /// Exercise a PostgreSQL COMMIT that settles after the calling future is cancelled.
 #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_sent_acquisition_commit_settles_before_owner_can_park() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -94,9 +94,9 @@ async fn cancelled_sent_acquisition_commit_settles_before_owner_can_park() {
         armed: AtomicBool,
         acquired: tokio::sync::Notify,
     }
-    impl SqliteWriteObserver for WriterBoundary {
-        fn observe(&self, event: SqliteWriteEvent) {
-            if matches!(event, SqliteWriteEvent::Acquired { .. })
+    impl PostgresWriteObserver for WriterBoundary {
+        fn observe(&self, event: PostgresWriteEvent) {
+            if matches!(event, PostgresWriteEvent::Acquired { .. })
                 && self.armed.swap(false, Ordering::SeqCst)
             {
                 self.acquired.notify_one();
@@ -107,9 +107,9 @@ async fn cancelled_sent_acquisition_commit_settles_before_owner_can_park() {
     let writer = fixture.connect_with_limit(2).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let boundary = Arc::new(WriterBoundary::default());
-    let database = SqliteDatabase::from_executor(
+    let database = PostgresDatabase::from_executor(
         reader,
-        SqliteWriteExecutor::with_observer(writer.clone(), boundary.clone()),
+        PostgresWriteExecutor::with_observer(writer.clone(), boundary.clone()),
     );
     database.validate_reader().await.unwrap();
     let store = CrudStore::new(database);

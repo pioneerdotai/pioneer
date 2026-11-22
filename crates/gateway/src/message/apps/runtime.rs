@@ -154,7 +154,7 @@ impl MessageProcessor {
         }
         let cancel = CancellationToken::new();
         let child = cancel.clone();
-        let owner = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let owner = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         let task = tokio::spawn(async move {
             let recovery = async {
                 let backend = owner

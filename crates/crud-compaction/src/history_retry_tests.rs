@@ -10,11 +10,11 @@ use pioneer_crud_execution::{
     time::unix_to_datetime,
 };
 use pioneer_entity::compaction_history_check as check;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{
     ItemCompletedNotification, TurnCompletedNotification, TurnItem, TurnStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement, TransactionTrait};
 
 async fn start_history_check_root(store: &CompactionStore, turn_id: &str) {
@@ -403,7 +403,8 @@ async fn postgres_store(database: &TestDatabase) -> CompactionStore {
         .await
         .unwrap();
     let reader = database.connect_read_only().await.unwrap();
-    CompactionStore::for_test(SqliteDatabase::new(reader, writer.clone())).with_maintenance_access()
+    CompactionStore::for_test(PostgresDatabase::new(reader, writer.clone()))
+        .with_maintenance_access()
 }
 
 #[tokio::test]
@@ -497,7 +498,7 @@ async fn history_check_retry_survives_reopening_the_pool_and_a_cancelled_claim()
             .await
             .unwrap();
         drop(store);
-        let reopened = CompactionStore::for_test(SqliteDatabase::new(
+        let reopened = CompactionStore::for_test(PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connect().await.unwrap(),
         ))

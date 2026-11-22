@@ -6,17 +6,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS: usize = 1;
 
-/// Scheduling class for SQLite reads. Interactive reads use the pool
+/// Scheduling class for PostgreSQL reads. Interactive reads use the pool
 /// directly; maintenance reads share one process-local permit so background
 /// work cannot consume every physical reader connection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SqliteReadClass {
+pub enum PostgresReadClass {
     #[default]
     Interactive,
     Maintenance,
 }
 
-impl SqliteReadClass {
+impl PostgresReadClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Interactive => "interactive",
@@ -25,15 +25,15 @@ impl SqliteReadClass {
     }
 }
 
-/// Terminal outcome for one typed SQLite reader operation.
+/// Terminal outcome for one typed PostgreSQL reader operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SqliteReadOutcome {
+pub enum PostgresReadOutcome {
     Ok,
     Error,
     Cancelled,
 }
 
-impl SqliteReadOutcome {
+impl PostgresReadOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -43,34 +43,34 @@ impl SqliteReadOutcome {
     }
 }
 
-/// Low-cardinality lifecycle emitted by the typed SQLite reader runtime.
+/// Low-cardinality lifecycle emitted by the typed PostgreSQL reader runtime.
 /// Events deliberately contain no SQL, identifiers, paths, or error text.
 #[derive(Clone, Copy, Debug)]
-pub enum SqliteReadEvent {
+pub enum PostgresReadEvent {
     OperationFinished {
-        class: SqliteReadClass,
-        outcome: SqliteReadOutcome,
+        class: PostgresReadClass,
+        outcome: PostgresReadOutcome,
         elapsed: Duration,
     },
     AdmissionEnqueued {
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         queue_depth: usize,
         active: usize,
     },
     AdmissionAcquired {
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         waited: Duration,
         queue_depth: usize,
         active: usize,
     },
     AdmissionReleased {
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         held: Duration,
         queue_depth: usize,
         active: usize,
     },
     AdmissionCancelled {
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         waited: Duration,
         queue_depth: usize,
         active: usize,
@@ -81,32 +81,36 @@ pub enum SqliteReadEvent {
 ///
 /// Implementations must return promptly: callbacks run inline after state has
 /// been snapshotted, although never while the limiter state lock is held.
-pub trait SqliteReadObserver: Send + Sync + 'static {
-    fn observe(&self, event: SqliteReadEvent);
+pub trait PostgresReadObserver: Send + Sync + 'static {
+    fn observe(&self, event: PostgresReadEvent);
 
     /// Atomic observation adapter. Called after the native state lock is released.
-    fn observe_admission(&self, event: SqliteReadEvent, snapshot: crate::SqliteAdmissionSnapshot) {
+    fn observe_admission(
+        &self,
+        event: PostgresReadEvent,
+        snapshot: crate::PostgresAdmissionSnapshot,
+    ) {
         self.observe(event);
         self.observe_queue_snapshot(snapshot);
     }
     /// Source-ordered current state; milestone depths above remain historical.
-    fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
+    fn observe_queue_snapshot(&self, _snapshot: crate::PostgresAdmissionSnapshot) {}
 }
 
 #[derive(Default)]
-struct NoopSqliteReadObserver;
+struct NoopPostgresReadObserver;
 
-impl SqliteReadObserver for NoopSqliteReadObserver {
-    fn observe(&self, _event: SqliteReadEvent) {}
+impl PostgresReadObserver for NoopPostgresReadObserver {
+    fn observe(&self, _event: PostgresReadEvent) {}
 }
 
-pub(crate) fn noop_read_observer() -> Arc<dyn SqliteReadObserver> {
-    Arc::new(NoopSqliteReadObserver)
+pub(crate) fn noop_read_observer() -> Arc<dyn PostgresReadObserver> {
+    Arc::new(NoopPostgresReadObserver)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReadAdmissionSnapshot {
-    current: crate::SqliteAdmissionSnapshot,
+    current: crate::PostgresAdmissionSnapshot,
     queue_depth: usize,
     active: usize,
 }
@@ -121,7 +125,7 @@ struct ReadAdmissionState {
 pub(crate) struct MaintenanceReadLimiter {
     semaphore: Arc<Semaphore>,
     state: Mutex<ReadAdmissionState>,
-    observer: Arc<dyn SqliteReadObserver>,
+    observer: Arc<dyn PostgresReadObserver>,
 }
 
 impl std::fmt::Debug for MaintenanceReadLimiter {
@@ -131,7 +135,7 @@ impl std::fmt::Debug for MaintenanceReadLimiter {
 }
 
 impl MaintenanceReadLimiter {
-    pub(crate) fn new(observer: Arc<dyn SqliteReadObserver>) -> Arc<Self> {
+    pub(crate) fn new(observer: Arc<dyn PostgresReadObserver>) -> Arc<Self> {
         Arc::new(Self {
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS)),
             state: Mutex::new(ReadAdmissionState::default()),
@@ -139,7 +143,7 @@ impl MaintenanceReadLimiter {
         })
     }
 
-    pub(crate) async fn acquire(self: &Arc<Self>) -> Result<SqliteMaintenanceReadPermit, DbErr> {
+    pub(crate) async fn acquire(self: &Arc<Self>) -> Result<PostgresMaintenanceReadPermit, DbErr> {
         let enqueued_at = Instant::now();
         let snapshot = {
             let mut state = self.lock();
@@ -147,8 +151,8 @@ impl MaintenanceReadLimiter {
             state.snapshot()
         };
         self.observer.observe_admission(
-            SqliteReadEvent::AdmissionEnqueued {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionEnqueued {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: snapshot.queue_depth,
                 active: snapshot.active,
             },
@@ -160,12 +164,10 @@ impl MaintenanceReadLimiter {
             enqueued_at,
             armed: true,
         };
-        let raw = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| DbErr::Custom("SQLite maintenance read limiter closed".to_owned()))?;
+        let raw =
+            self.semaphore.clone().acquire_owned().await.map_err(|_| {
+                DbErr::Custom("PostgreSQL maintenance read limiter closed".to_owned())
+            })?;
         let snapshot = {
             let mut state = self.lock();
             debug_assert!(state.queue_depth > 0);
@@ -177,15 +179,15 @@ impl MaintenanceReadLimiter {
         registration.armed = false;
         let acquired_at = Instant::now();
         self.observer.observe_admission(
-            SqliteReadEvent::AdmissionAcquired {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionAcquired {
+                class: PostgresReadClass::Maintenance,
                 waited: acquired_at.saturating_duration_since(enqueued_at),
                 queue_depth: snapshot.queue_depth,
                 active: snapshot.active,
             },
             snapshot.current,
         );
-        Ok(SqliteMaintenanceReadPermit {
+        Ok(PostgresMaintenanceReadPermit {
             limiter: self.clone(),
             raw: Some(raw),
             acquired_at,
@@ -200,8 +202,8 @@ impl MaintenanceReadLimiter {
             state.snapshot()
         };
         self.observer.observe_admission(
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 waited: enqueued_at.elapsed(),
                 queue_depth: snapshot.queue_depth,
                 active: snapshot.active,
@@ -223,8 +225,8 @@ impl MaintenanceReadLimiter {
             state.snapshot()
         };
         self.observer.observe_admission(
-            SqliteReadEvent::AdmissionReleased {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionReleased {
+                class: PostgresReadClass::Maintenance,
                 held: acquired_at.elapsed(),
                 queue_depth: snapshot.queue_depth,
                 active: snapshot.active,
@@ -244,7 +246,7 @@ impl ReadAdmissionState {
     fn snapshot(&mut self) -> ReadAdmissionSnapshot {
         self.observation_revision = self.observation_revision.saturating_add(1);
         ReadAdmissionSnapshot {
-            current: crate::SqliteAdmissionSnapshot::capture(
+            current: crate::PostgresAdmissionSnapshot::capture(
                 self.observation_revision,
                 self.queue_depth,
                 None,
@@ -269,27 +271,27 @@ impl Drop for ReadWaitRegistration {
     }
 }
 
-pub(crate) struct SqliteMaintenanceReadPermit {
+pub(crate) struct PostgresMaintenanceReadPermit {
     limiter: Arc<MaintenanceReadLimiter>,
     raw: Option<OwnedSemaphorePermit>,
     acquired_at: Instant,
 }
 
-impl Drop for SqliteMaintenanceReadPermit {
+impl Drop for PostgresMaintenanceReadPermit {
     fn drop(&mut self) {
         self.limiter.release(&mut self.raw, self.acquired_at);
     }
 }
 
-pub(crate) struct SqliteReadOperation {
-    observer: Arc<dyn SqliteReadObserver>,
-    class: SqliteReadClass,
+pub(crate) struct PostgresReadOperation {
+    observer: Arc<dyn PostgresReadObserver>,
+    class: PostgresReadClass,
     started_at: Instant,
     finished: bool,
 }
 
-impl SqliteReadOperation {
-    pub(crate) fn start(observer: Arc<dyn SqliteReadObserver>, class: SqliteReadClass) -> Self {
+impl PostgresReadOperation {
+    pub(crate) fn start(observer: Arc<dyn PostgresReadObserver>, class: PostgresReadClass) -> Self {
         Self {
             observer,
             class,
@@ -298,12 +300,12 @@ impl SqliteReadOperation {
         }
     }
 
-    pub(crate) fn finish(&mut self, outcome: SqliteReadOutcome) {
+    pub(crate) fn finish(&mut self, outcome: PostgresReadOutcome) {
         if self.finished {
             return;
         }
         self.finished = true;
-        self.observer.observe(SqliteReadEvent::OperationFinished {
+        self.observer.observe(PostgresReadEvent::OperationFinished {
             class: self.class,
             outcome,
             elapsed: self.started_at.elapsed(),
@@ -311,19 +313,19 @@ impl SqliteReadOperation {
     }
 }
 
-impl Drop for SqliteReadOperation {
+impl Drop for PostgresReadOperation {
     fn drop(&mut self) {
-        self.finish(SqliteReadOutcome::Cancelled);
+        self.finish(PostgresReadOutcome::Cancelled);
     }
 }
 
 pub(crate) fn reader_pool_context(
-    class: SqliteReadClass,
+    class: PostgresReadClass,
 ) -> pioneer_observability::pool_context::PoolContext {
     use pioneer_observability::pool_context::PoolContext;
     match class {
-        SqliteReadClass::Interactive => PoolContext::ReaderInteractive,
-        SqliteReadClass::Maintenance => PoolContext::ReaderMaintenance,
+        PostgresReadClass::Interactive => PoolContext::ReaderInteractive,
+        PostgresReadClass::Maintenance => PoolContext::ReaderMaintenance,
     }
 }
 
@@ -344,7 +346,7 @@ mod observation_tests {
         assert!(new.current.sampled_monotonic_ms >= old.current.sampled_monotonic_ms);
         assert_eq!(old.current.oldest_waited_ms, None);
         assert_eq!(new.current.oldest_waited_ms, None);
-        NoopSqliteReadObserver.observe_queue_snapshot(new.current);
-        NoopSqliteReadObserver.observe_queue_snapshot(old.current);
+        NoopPostgresReadObserver.observe_queue_snapshot(new.current);
+        NoopPostgresReadObserver.observe_queue_snapshot(old.current);
     }
 }

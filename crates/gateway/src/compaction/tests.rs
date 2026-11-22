@@ -1058,28 +1058,28 @@ async fn compaction_observer_heartbeat_reaches_the_live_progress_lane() {
 
 #[derive(Default)]
 struct HistoryReadObserver {
-    reads: Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
-    writes: Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
+    writes: Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for HistoryReadObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for HistoryReadObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.reads.lock().unwrap().push(event);
     }
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for HistoryReadObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for HistoryReadObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
 
 impl HistoryReadObserver {
-    fn reads(&self) -> Vec<pioneer_sqlite::SqliteReadEvent> {
+    fn reads(&self) -> Vec<pioneer_postgres_pools::PostgresReadEvent> {
         self.reads.lock().unwrap().clone()
     }
 
-    fn writes(&self) -> Vec<pioneer_sqlite::SqliteWriteEvent> {
+    fn writes(&self) -> Vec<pioneer_postgres_pools::PostgresWriteEvent> {
         self.writes.lock().unwrap().clone()
     }
 }
@@ -2257,13 +2257,13 @@ async fn completed_history_runner_preserves_its_owner_database_scope() {
     for (scoped, expected_read, expected_write) in [
         (
             f.store.with_interactive_writes(),
-            pioneer_sqlite::SqliteReadClass::Interactive,
-            pioneer_sqlite::SqliteWriteClass::Interactive,
+            pioneer_postgres_pools::PostgresReadClass::Interactive,
+            pioneer_postgres_pools::PostgresWriteClass::Interactive,
         ),
         (
             f.store.with_maintenance_access(),
-            pioneer_sqlite::SqliteReadClass::Maintenance,
-            pioneer_sqlite::SqliteWriteClass::Maintenance,
+            pioneer_postgres_pools::PostgresReadClass::Maintenance,
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance,
         ),
     ] {
         let runner = CompactionRunner::new(
@@ -3850,7 +3850,7 @@ async fn frozen_recapture_fixture() -> (CrudStore, Vec<pioneer_provider::ChatMes
     super::load_test_catalog();
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         reader,
         fixture.connection().clone(),
     ));
@@ -4141,8 +4141,8 @@ async fn frozen_equivalent_capture_holds_selected_manifest_through_handoff_and_c
 
 #[pioneer_postgres_test::postgres_test]
 async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
+    use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
-    use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
     use sea_orm::TransactionTrait;
 
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
@@ -4154,9 +4154,9 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
     ).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(HistoryReadObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer,
     );
     let store = CrudStore::new(database);
@@ -4189,7 +4189,7 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
         super::frozen::capture(&store, "ws", "thread", &allowed, &[message]),
     )
     .await
-    .expect("foreign capture waited for the serialized writer")
+    .expect("foreign capture waited for the open write transaction")
     .unwrap_err();
     held_writer.rollback().await.unwrap();
     assert!(error.to_string().contains("outside the accepted context"));
@@ -4493,12 +4493,17 @@ async fn fixture_with_canonical_payloads_observer_and_budget(
     let writer = fixture.connection().clone();
     let reader = fixture.connect_read_only().await.unwrap();
     let database = match database_observer {
-        Some(observer) => pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
-            reader,
-            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
-            observer,
-        ),
-        None => pioneer_sqlite::SqliteDatabase::new(reader, writer),
+        Some(observer) => {
+            pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
+                reader,
+                pioneer_postgres_pools::PostgresWriteExecutor::with_observer(
+                    writer,
+                    observer.clone(),
+                ),
+                observer,
+            )
+        }
+        None => pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
     };
     let store = CrudStore::new(database);
     for sql in [
@@ -15891,7 +15896,11 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
 
     let parent_json = serde_json::to_string(&parent_projection.descriptor).unwrap();
 
-    async fn install_execution(db: &pioneer_sqlite::SqliteDatabase, id: &str, parent_json: &str) {
+    async fn install_execution(
+        db: &pioneer_postgres_pools::PostgresDatabase,
+        id: &str,
+        parent_json: &str,
+    ) {
         for statement in [
             format!(
                 "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{id}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
@@ -16582,7 +16591,11 @@ async fn exact_task_grants_survive_summary_projection_independently_of_new_conve
         .await
         .unwrap();
 
-    async fn install_recapture(db: &pioneer_sqlite::SqliteDatabase, id: &str, history_json: &str) {
+    async fn install_recapture(
+        db: &pioneer_postgres_pools::PostgresDatabase,
+        id: &str,
+        history_json: &str,
+    ) {
         for statement in [
             format!(
                 "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{id}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
@@ -21896,8 +21909,9 @@ async fn committed_history_is_available_for_the_first_frozen_execution_basis() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn history_capture_inherits_read_class_and_cancellation_releases_admission() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+        PostgresWriteExecutor,
     };
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
@@ -21919,9 +21933,9 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
     }
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(HistoryReadObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = CrudStore::new(database.clone());
@@ -22017,9 +22031,9 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .any(|event| matches!(
                 event,
-                SqliteReadEvent::OperationFinished {
-                    class: SqliteReadClass::Interactive,
-                    outcome: SqliteReadOutcome::Ok,
+                PostgresReadEvent::OperationFinished {
+                    class: PostgresReadClass::Interactive,
+                    outcome: PostgresReadOutcome::Ok,
                     ..
                 }
             ))
@@ -22030,8 +22044,8 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .all(|event| {
                 !matches!(
                     event,
-                    SqliteReadEvent::OperationFinished {
-                        class: SqliteReadClass::Maintenance,
+                    PostgresReadEvent::OperationFinished {
+                        class: PostgresReadClass::Maintenance,
                         ..
                     }
                 )
@@ -22042,17 +22056,17 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .all(|event| !matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Acquired {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Acquired {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Released {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Released {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Cancelled {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Cancelled {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             ))
@@ -22062,8 +22076,8 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .any(|event| matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Acquired {
-                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Interactive,
                     ..
                 }
             ))
@@ -22088,8 +22102,8 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
     );
     assert!(observer.reads().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionCancelled {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::AdmissionCancelled {
+            class: PostgresReadClass::Maintenance,
             queue_depth: 0,
             active: 1,
             ..
@@ -22149,17 +22163,17 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .any(|event| matches!(
                 event,
-                SqliteReadEvent::OperationFinished {
-                    class: SqliteReadClass::Maintenance,
-                    outcome: SqliteReadOutcome::Ok,
+                PostgresReadEvent::OperationFinished {
+                    class: PostgresReadClass::Maintenance,
+                    outcome: PostgresReadOutcome::Ok,
                     ..
                 }
             ))
     );
     assert!(maintenance_events.iter().rev().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionReleased {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::AdmissionReleased {
+            class: PostgresReadClass::Maintenance,
             queue_depth: 0,
             active: 0,
             ..
@@ -22170,8 +22184,8 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .all(|event| !matches!(
                 event,
-                SqliteReadEvent::OperationFinished {
-                    class: SqliteReadClass::Interactive,
+                PostgresReadEvent::OperationFinished {
+                    class: PostgresReadClass::Interactive,
                     ..
                 }
             ))
@@ -22181,17 +22195,17 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .all(|event| !matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Interactive,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Acquired {
-                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Acquired {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Interactive,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Released {
-                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Released {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Interactive,
                     ..
-                } | pioneer_sqlite::SqliteWriteEvent::Cancelled {
-                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                } | pioneer_postgres_pools::PostgresWriteEvent::Cancelled {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Interactive,
                     ..
                 }
             ))
@@ -22201,8 +22215,8 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
             .iter()
             .any(|event| matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Acquired {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             ))

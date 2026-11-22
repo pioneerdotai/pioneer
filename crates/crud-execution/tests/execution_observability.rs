@@ -10,10 +10,10 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFi
 async fn open_store(
     database: &pioneer_postgres_test::TestDatabase,
     seed: bool,
-) -> pioneer_sqlite::SqliteDatabase {
+) -> pioneer_postgres_pools::PostgresDatabase {
     let writer = database.connect_with_limit(1).await.unwrap();
     let reader = database.connect_read_only().await.unwrap();
-    let db = pioneer_sqlite::SqliteDatabase::new(reader, writer);
+    let db = pioneer_postgres_pools::PostgresDatabase::new(reader, writer);
     db.validate_reader().await.unwrap();
     if seed {
         db.execute_unprepared(
@@ -28,7 +28,7 @@ async fn open_store(
     db
 }
 
-async fn fixture() -> pioneer_sqlite::SqliteDatabase {
+async fn fixture() -> pioneer_postgres_pools::PostgresDatabase {
     let database = pioneer_postgres_test::scoped_database().await.unwrap();
     open_store(&database, true).await
 }

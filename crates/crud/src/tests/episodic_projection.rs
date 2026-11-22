@@ -2,7 +2,7 @@ use super::*;
 
 #[pioneer_postgres_test::postgres_test]
 async fn episodic_requeue_and_canonical_snapshot_commits_are_serialized_in_both_orders() {
-    use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent};
+    use pioneer_postgres_pools::{PostgresWriteClass, PostgresWriteEvent};
     for snapshot_first in [true, false] {
         let (store, thread, turn, running, observer) = episodic_requeue_source_fixture().await;
         // Both contenders inherit Maintenance, so their explicit queue
@@ -93,7 +93,7 @@ async fn episodic_requeue_and_canonical_snapshot_commits_are_serialized_in_both_
             .unwrap()
             .iter()
             .filter_map(|event| {
-                if let SqliteWriteEvent::Acquired { class, .. } = event {
+                if let PostgresWriteEvent::Acquired { class, .. } = event {
                     Some(*class)
                 } else {
                     None
@@ -102,7 +102,7 @@ async fn episodic_requeue_and_canonical_snapshot_commits_are_serialized_in_both_
             .collect::<Vec<_>>();
         assert_eq!(
             acquired,
-            vec![SqliteWriteClass::Maintenance; 2],
+            vec![PostgresWriteClass::Maintenance; 2],
             "each contender must keep a single writer reservation through its commit"
         );
         let current = store
@@ -857,15 +857,15 @@ async fn episodic_requeue_source_fixture() -> (
     ThreadEpisodicIndexJobRecord,
     Arc<FixtureDatabaseObserver>,
 ) {
-    use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+    use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(FixtureDatabaseObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     database.validate_reader().await.unwrap();

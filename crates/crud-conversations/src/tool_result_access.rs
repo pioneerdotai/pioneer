@@ -1,13 +1,13 @@
 use anyhow::Result;
 use pioneer_entity::{thread, turn, turn_item};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ColumnTrait, EntityTrait, JoinType, QueryFilter, QuerySelect};
 
 /// Resolve ownership using canonical columns. Never deserialize full provider
 /// output/storage merely to authorize a result. Only observer parameters can
 /// introduce additional protected source references; other arguments are ignored.
 pub async fn tool_result_access_source(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,

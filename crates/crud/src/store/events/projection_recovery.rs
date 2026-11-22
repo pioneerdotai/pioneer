@@ -91,7 +91,7 @@ impl CrudStore {
         });
         let task_change = pioneer_crud_tasks::work_change::TaskWorkChange::new(&self.connection);
         let result = async {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -261,7 +261,7 @@ impl CrudStore {
                 break;
             }
             let claimed = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     event_projection::claim_candidates(
                         &self.connection,
                         now,
@@ -293,7 +293,7 @@ impl CrudStore {
                         })?
                 else {
                     let marked = self
-                        .run_serialized_write(|| {
+                        .retry_write_on_conflict(|| {
                             self.mark_turn_event_projection_failure_once(
                                 event_id.clone(),
                                 thread_id.clone(),
@@ -341,7 +341,7 @@ impl CrudStore {
                     Err(error) => {
                         let error_message = format!("{error:#}");
                         let marked = self
-                            .run_serialized_write(|| {
+                            .retry_write_on_conflict(|| {
                                 self.mark_turn_event_projection_failure_once(
                                     event_id.clone(),
                                     thread_id.clone(),
@@ -393,7 +393,7 @@ impl CrudStore {
                     }
                     Ok(TurnEventProjectionOutcome::DeferredByPredecessor) => {
                         let released = self
-                            .run_serialized_write(|| {
+                            .retry_write_on_conflict(|| {
                                 self.mark_turn_event_projection_pending_once(
                                     event_id.clone(),
                                     turn_id.clone(),
@@ -409,7 +409,7 @@ impl CrudStore {
                     Err(error) => {
                         let error_message = format!("{error:#}");
                         let marked = self
-                            .run_serialized_write(|| {
+                            .retry_write_on_conflict(|| {
                                 self.mark_turn_event_projection_failure_once(
                                     event_id.clone(),
                                     thread_id.clone(),

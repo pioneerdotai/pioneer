@@ -757,7 +757,7 @@ fn validate_candidate_paths(
 
 // FS publication guard, outside database capacity. This hashes only the two
 // metadata inputs, without reparsing or rescanning security for each scope.
-// External writers can still edit after this boundary; SQLite cannot lock them.
+// External writers can still edit after this boundary; PostgreSQL cannot lock them.
 pub(crate) fn verify_skill_inputs(
     package: PathBuf,
     expected: pioneer_skills::SkillInputRevision,

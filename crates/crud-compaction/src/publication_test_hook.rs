@@ -1,4 +1,4 @@
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,7 +30,7 @@ static PUBLICATION_TEST_HOOKS: std::sync::OnceLock<
 pub struct PublicationTestHookHandle {
     key: (usize, String, PublicationTestPause),
     token: std::sync::Arc<()>,
-    _database: SqliteDatabase,
+    _database: PostgresDatabase,
     reached: Option<tokio::sync::oneshot::Receiver<()>>,
     release: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -76,7 +76,7 @@ impl Drop for PublicationTestHookHandle {
 }
 #[cfg(any(test, feature = "test-support"))]
 pub fn arm_publication_test_hook(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     phase: PublicationTestPause,
 ) -> PublicationTestHookHandle {
@@ -107,7 +107,7 @@ pub fn arm_publication_test_hook(
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub async fn trigger_publication_test_hook(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     phase: PublicationTestPause,
 ) {

@@ -224,7 +224,7 @@ async fn webhook_http_admits_distinct_durable_runs_and_create_get_recover_the_sa
     let polling_started_at = std::time::Instant::now();
     loop {
         // Keep the runtime runnable while the real handler authenticates through
-        // SQLite. Paused time must not auto-advance to a DB acquisition timeout.
+        // PostgreSQL. Paused time must not auto-advance to a DB acquisition timeout.
         assert!(
             polling_started_at.elapsed() < std::time::Duration::from_secs(5),
             "the handler never started reading the request body"

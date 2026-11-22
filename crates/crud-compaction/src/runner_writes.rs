@@ -8,7 +8,7 @@ use pioneer_entity::{
     compaction_execution_stop, compaction_manifest, compaction_operation, compaction_runner_plan,
     compaction_runner_state, thread, turn,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, JoinType, OnConflict, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect,
@@ -68,7 +68,7 @@ pub fn checkpoint_identity(checkpoint: &Checkpoint) -> Result<String> {
 }
 
 pub async fn compaction_append_manifest(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     entries: &[ManifestEntry],
 ) -> Result<()> {
@@ -355,7 +355,7 @@ pub async fn compaction_append_manifest(
     .await
 }
 pub async fn compaction_activate_runner(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     initial: &RunnerState,
 ) -> Result<bool> {
@@ -530,7 +530,7 @@ pub async fn compaction_activate_runner(
 }
 
 pub async fn compaction_runner_transition(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     expected: u64,
     next: &RunnerState,

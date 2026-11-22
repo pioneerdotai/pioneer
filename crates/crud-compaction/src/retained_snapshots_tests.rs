@@ -16,7 +16,7 @@ async fn turn_runtime_snapshot_upsert_round_trips_and_updates() {
                 VALUES ('turn_runtime_snapshot','thread_runtime_snapshot','in_progress','conversation','user'),
                        ('turn_runtime_base_fallback','thread_runtime_snapshot','in_progress','conversation','user');",
         ).await?;
-        let store = CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(
+        let store = CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?, writer.clone(),
         ));
         let created_at = unix_to_datetime(1_700_000_000);
@@ -167,7 +167,7 @@ async fn binding_store(
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ($1,'CLI binding fixture',TRUE,TRUE)",
         [workspace.into()],
     )).await.unwrap();
-    CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(
+    CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         writer.clone(),
     ))

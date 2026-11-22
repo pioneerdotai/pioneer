@@ -6,7 +6,7 @@ use pioneer_entity::{
     compaction_checkpoint as checkpoint, compaction_context as context,
     compaction_coverage as coverage, compaction_operation as operation,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, JoinType, Order, Query};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::collections::{BTreeSet, VecDeque};
@@ -48,7 +48,7 @@ impl Reachability {
         &self.workspace
     }
 
-    pub async fn step(&mut self, db: &SqliteDatabase) -> Result<()> {
+    pub async fn step(&mut self, db: &PostgresDatabase) -> Result<()> {
         if self.done() {
             return Ok(());
         }

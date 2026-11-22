@@ -10,10 +10,10 @@ use anyhow::{Context, Result};
 use pioneer_crud_conversations::thread_metadata;
 use pioneer_crud_conversations::{thread_agents_doc, thread_tree};
 use pioneer_crud_execution::time::unix_to_datetime;
+use pioneer_postgres_pools::run_database_attempt;
 use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, Thread, ThreadFolder, ThreadPlacement,
 };
-use pioneer_sqlite::run_database_attempt;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
 use std::collections::HashMap;
 
@@ -36,7 +36,7 @@ impl CrudStore {
             let creator = creator.clone();
             let created_at = unix_to_datetime(thread_model.created_at);
             let updated_at = unix_to_datetime(thread_model.updated_at);
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let thread_model = thread_model.clone();
                 let creator = creator.clone();
                 async move {
@@ -77,7 +77,7 @@ impl CrudStore {
         let creator_principal_id = creator_principal_id.clone();
         let created_at = unix_to_datetime(thread_model.created_at);
         let updated_at = unix_to_datetime(thread_model.updated_at);
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let thread_model = thread_model.clone();
             let gateway_id = gateway_id.clone();
             let creator_principal_id = creator_principal_id.clone();
@@ -129,7 +129,7 @@ impl CrudStore {
         let thread_model = thread_model.clone();
         let created_at = unix_to_datetime(thread_model.created_at);
         let updated_at = unix_to_datetime(thread_model.updated_at);
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let thread_model = thread_model.clone();
             let creator = creator.clone();
             async move {
@@ -172,7 +172,7 @@ impl CrudStore {
         let thread_id = thread_id.to_owned();
         let member_principal_id = member_principal_id.cloned();
         let name = name.map(str::to_owned);
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let workspace_id = workspace_id.clone();
             let thread_id = thread_id.clone();
             let member_principal_id = member_principal_id.clone();
@@ -489,7 +489,7 @@ impl CrudStore {
         parent_folder_id: Option<&str>,
         name: &str,
     ) -> Result<ThreadFolder> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             thread_tree::create_thread_folder(
                 &self.connection,
                 workspace_id,
@@ -505,7 +505,7 @@ impl CrudStore {
         workspace_id: &str,
         folder_id: &str,
     ) -> Result<bool> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             thread_tree::delete_thread_folder_promote(&self.connection, workspace_id, folder_id)
         })
         .await
@@ -517,7 +517,7 @@ impl CrudStore {
         thread_id: &str,
         folder_id: Option<&str>,
     ) -> Result<()> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             thread_tree::move_thread_to_folder(&self.connection, workspace_id, thread_id, folder_id)
         })
         .await
@@ -529,14 +529,14 @@ impl CrudStore {
         folder_id: &str,
         parent_folder_id: Option<&str>,
     ) -> Result<()> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             thread_tree::move_folder(&self.connection, workspace_id, folder_id, parent_folder_id)
         })
         .await
     }
 
     pub async fn update_thread_name(&self, thread_id: &str, name: &str) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(chrono::Utc::now().timestamp());
             thread_metadata::update_thread_name(&self.connection, thread_id, name, now).await
         })
@@ -544,7 +544,7 @@ impl CrudStore {
     }
 
     pub async fn update_thread_name_if_changed(&self, thread_id: &str, name: &str) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(chrono::Utc::now().timestamp());
             thread_metadata::update_thread_name_if_changed(&self.connection, thread_id, name, now)
                 .await
@@ -559,7 +559,7 @@ impl CrudStore {
         fallback: Option<&str>,
         binding: Option<&CliRuntimeThreadBindingRecord>,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(chrono::Utc::now().timestamp());
             thread_writes::update_automatic_thread_name(
                 &self.connection,

@@ -145,7 +145,7 @@ impl CrudStore {
         let notification = notification.clone();
         let expected_task_finalization_revision =
             expected_task_finalization_revision.map(str::to_owned);
-        let result = self.run_serialized_write(|| async {
+        let result = self.retry_write_on_conflict(|| async {
             let tx = self
                 .connection
                 .begin()
@@ -408,7 +408,7 @@ impl CrudStore {
         let result = async {
             let _release_wake = self.execution_heartbeats.release_wake();
             let turn_id = turn_id.to_owned();
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 // Decode the prepared item and materialize both canonical event
                 // payloads through the read contour. The writer transaction below
                 // revalidates their durable identities before committing them.

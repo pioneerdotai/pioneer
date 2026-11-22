@@ -25,4 +25,4 @@ pub use timeline::*;
 
 pub use crate::store::connection::CrudStore;
 
-pub use pioneer_sqlite::{WorkSignal, WorkSubscription};
+pub use pioneer_postgres_pools::{WorkSignal, WorkSubscription};

@@ -1127,9 +1127,9 @@ async fn oauth_scope_phase(phase: &'static str) {
     let (_, _, workspace_id) = setup_postgres_workspace_manager(&fixture).await;
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+    let database = pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
         reader,
-        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let workspaces = Arc::new(WorkspaceManager::new(database.clone()));
@@ -1227,11 +1227,11 @@ async fn oauth_scope_phase(phase: &'static str) {
     let service = crate::mcp_oauth::maintenance_service(processor.mcp_service.inner.clone());
     assert_eq!(
         scoped_store.database_connection().read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
+        pioneer_postgres_pools::PostgresReadClass::Maintenance
     );
     assert_eq!(
         scoped_store.database_connection().write_class(),
-        pioneer_sqlite::SqliteWriteClass::Maintenance
+        pioneer_postgres_pools::PostgresWriteClass::Maintenance
     );
     if phase == "recovery" {
         let change = Arc::new(tokio::sync::Notify::new());
@@ -1412,7 +1412,7 @@ async fn oauth_scope_phase(phase: &'static str) {
     })
     .await
     .unwrap();
-    // The physical reader pool is query_only. Catalog/audit persistence must
+    // The physical reader pool is read-only. Catalog/audit persistence must
     // succeed through the writer, with the Maintenance class retained by the
     // cloned service handle inside the background actor.
     assert!(
@@ -1426,7 +1426,7 @@ async fn oauth_scope_phase(phase: &'static str) {
     let acquired = writes
         .iter()
         .filter_map(|event| match event {
-            pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+            pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1434,7 +1434,9 @@ async fn oauth_scope_phase(phase: &'static str) {
     let read_classes = reads
         .iter()
         .filter_map(|event| match event {
-            pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } => {
+                Some(*class)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1442,13 +1444,13 @@ async fn oauth_scope_phase(phase: &'static str) {
     assert!(
         read_classes
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
     assert!(!acquired.is_empty());
     assert!(
         acquired
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
     // The foreground source handle was not reclassified by background cloning.
     observer.reads.lock().unwrap().clear();
@@ -1461,8 +1463,8 @@ async fn oauth_scope_phase(phase: &'static str) {
     );
     assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        pioneer_sqlite::SqliteReadEvent::OperationFinished {
-            class: pioneer_sqlite::SqliteReadClass::Interactive,
+        pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+            class: pioneer_postgres_pools::PostgresReadClass::Interactive,
             ..
         }
     )));

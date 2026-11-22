@@ -26,7 +26,7 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 pioneer-postgres-test.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util"] }

@@ -1,6 +1,6 @@
 //! Transient write conflicts recognized by Task repositories.
 pub fn is_retryable(error: &anyhow::Error) -> bool {
-    pioneer_sqlite::is_retryable_database_conflict(error)
+    pioneer_postgres_pools::is_retryable_database_conflict(error)
         || crate::task_event::is_idempotency_preflight_race(error)
         || error
             .downcast_ref::<crate::task_occurrence_producers::OccurrencePublicationRace>()

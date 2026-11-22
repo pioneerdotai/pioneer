@@ -13,9 +13,9 @@ use pioneer_crud_packages::{
     skill_audit_event, skill_installation, skill_lifecycle, skill_reconciliation,
     skill_upload_session, skill_workspace_policy,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
 use pioneer_protocol::{SkillId, SkillPackId, generate_id};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 
 fn unix_to_datetime(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
@@ -24,15 +24,15 @@ fn unix_to_datetime(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
         .fixed_offset()
 }
 
-async fn database(fixture: &TestDatabase) -> Result<SqliteDatabase> {
-    Ok(SqliteDatabase::new(
+async fn database(fixture: &TestDatabase) -> Result<PostgresDatabase> {
+    Ok(PostgresDatabase::new(
         fixture.connect_read_only().await?,
         fixture.connection().clone(),
     ))
 }
 
 async fn find_installation(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     skill_id: &SkillId,
 ) -> Result<Option<SkillInstallationRecord>> {
     skill_installation::find_skill_installation(db, skill_id)
@@ -42,7 +42,7 @@ async fn find_installation(
 }
 
 async fn find_policy(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     skill_id: &SkillId,
 ) -> Result<Option<WorkspaceSkillPolicyRecord>> {
@@ -52,19 +52,19 @@ async fn find_policy(
         .transpose()
 }
 
-async fn insert_upload(db: &SqliteDatabase, record: &SkillUploadSessionRecord) -> Result<()> {
+async fn insert_upload(db: &PostgresDatabase, record: &SkillUploadSessionRecord) -> Result<()> {
     let now = unix_to_datetime(record.created_at_unix);
     skill_upload_session::insert_skill_upload_session(db, record, now, now).await
 }
 
-async fn find_upload(db: &SqliteDatabase, id: &str) -> Result<Option<SkillUploadSessionRecord>> {
+async fn find_upload(db: &PostgresDatabase, id: &str) -> Result<Option<SkillUploadSessionRecord>> {
     Ok(skill_upload_session::find_skill_upload_session(db, id)
         .await?
         .map(skill_upload_session_record_from_model))
 }
 
 async fn transition_upload(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     id: &str,
     expected: &[&str],
     status: &str,

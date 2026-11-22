@@ -2961,7 +2961,7 @@ mod tests {
         };
 
         pioneer_postgres_test::with_database(async |fixture| {
-            let database = pioneer_sqlite::SqliteDatabase::new(
+            let database = pioneer_postgres_pools::PostgresDatabase::new(
                 fixture.connect_read_only().await?,
                 fixture.connection().clone(),
             );

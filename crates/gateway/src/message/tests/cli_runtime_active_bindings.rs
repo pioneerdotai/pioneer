@@ -630,9 +630,9 @@ async fn cli_active_scan_cancellation_advances_selected_page_and_keeps_runtime_a
 
 #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_writes() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
     let temp = tempfile::tempdir().unwrap();
     let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
@@ -640,9 +640,9 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -680,15 +680,15 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     let reads = observer.reads.lock().unwrap();
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(reads.iter().all(|event| !matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -696,14 +696,14 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     let writes = observer.writes.lock().unwrap();
     assert!(writes.iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));
-    assert!(writes.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical)));
+    assert!(writes.iter().all(|event| !matches!(event, PostgresWriteEvent::Acquired { class, .. } if *class != PostgresWriteClass::Critical)));
     drop(writes);
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     assert!(has_recovery(&store, "route_stale").await);
 }
 
@@ -1271,7 +1271,7 @@ async fn blocked_observation_fixture_with_receipt(
     }
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
+    let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer);
     let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
     let store = Arc::new(CrudStore::new(database));
     let workspace = workspace_manager
@@ -3031,7 +3031,7 @@ async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_
         "consumer retains ownership independently of its publisher"
     );
     // Read before suspending admission: its first poll can retain the fixture's
-    // only SQLite connection while the binding lookup is still in progress.
+    // only PostgreSQL connection while the binding lookup is still in progress.
     let before = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
         .count(&store.database_connection())

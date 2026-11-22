@@ -229,9 +229,9 @@ pub type ArtifactIngestGuard = (u64, tokio_util::sync::CancellationToken);
 
 /// Validate caller authorization before the Artifact write set uses the transaction.
 pub async fn authorize_artifact_ingest(
-    transaction: pioneer_sqlite::SqliteTransaction,
+    transaction: pioneer_postgres_pools::PostgresTransaction,
     commit_guard: Option<&ArtifactIngestGuard>,
-) -> anyhow::Result<pioneer_sqlite::SqliteTransaction> {
+) -> anyhow::Result<pioneer_postgres_pools::PostgresTransaction> {
     use pioneer_crud_access::policy_generation::current_policy_generation_on;
     if let Some((generation, cancel)) = commit_guard {
         if cancel.is_cancelled() {
@@ -259,13 +259,13 @@ pub async fn authorize_artifact_ingest(
 }
 
 pub struct ArtifactIngestStore<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
     io_wake: &'a tokio::sync::Notify,
 }
 
 impl<'a> ArtifactIngestStore<'a> {
     pub fn new(
-        connection: &'a pioneer_sqlite::SqliteDatabase,
+        connection: &'a pioneer_postgres_pools::PostgresDatabase,
         io_wake: &'a tokio::sync::Notify,
     ) -> Self {
         Self {
@@ -288,7 +288,7 @@ impl<'a> ArtifactIngestStore<'a> {
         let maintenance = self.connection.work_signal("maintenance.html").changing();
         let queue = crate::html_preview_io::HtmlPreviewIoQueue::new(self.connection);
         let result = queue
-            .run_serialized_write(|| {
+            .retry_write_on_conflict(|| {
                 let prepared = prepared.clone();
                 let commit_guard = commit_guard.clone();
                 async move {

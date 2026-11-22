@@ -18,7 +18,7 @@ async fn migrated_store(
             ('ws_run_b', 'Run B', true, false)",
         )
         .await?;
-    let store = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await?,
         writer.clone(),
     ));
@@ -506,7 +506,7 @@ async fn claims_checkpoints_and_reads_are_workspace_scoped_and_fenced() {
 async fn two_gateways_claim_once_and_expired_lease_rotates_authority() {
     pioneer_postgres_test::with_database(async |fixture| {
         let (database, gateway_a) = migrated_store(fixture).await?;
-        let gateway_b = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+        let gateway_b = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connect().await?,
         ));

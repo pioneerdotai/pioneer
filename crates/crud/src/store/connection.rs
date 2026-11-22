@@ -6,11 +6,11 @@ use pioneer_crud_compaction::frozen_lifetime;
 use pioneer_crud_conversations::projection_receipts;
 use pioneer_crud_conversations::turn_finalization;
 use pioneer_crud_execution::execution_heartbeat;
-use pioneer_protocol::Turn;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase, SqliteReadClass,
-    SqliteWriteClass, retry_with_backoff,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
+    PostgresReadClass, PostgresWriteClass, retry_with_backoff,
 };
+use pioneer_protocol::Turn;
 use sea_orm::{ConnectionTrait, Statement};
 use std::future::Future;
 use std::time::Duration;
@@ -29,12 +29,12 @@ pub struct CrudStore {
     pub(crate) episodic_work: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) html_preview_io_work: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) frozen_readers: frozen_lifetime::ReaderCounts,
-    pub(crate) connection: SqliteDatabase,
+    pub(crate) connection: PostgresDatabase,
     pub(crate) turn_projector: TurnProjector,
 }
 
 impl CrudStore {
-    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+    pub fn new(connection: impl Into<PostgresDatabase>) -> Self {
         Self {
             execution_heartbeats: Default::default(),
             recovery_work: Default::default(),
@@ -127,7 +127,7 @@ impl CrudStore {
             .collect()
     }
 
-    pub fn database_connection(&self) -> SqliteDatabase {
+    pub fn database_connection(&self) -> PostgresDatabase {
         self.connection.clone()
     }
 
@@ -141,8 +141,8 @@ impl CrudStore {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if self.connection.read_class() != SqliteReadClass::Maintenance
-            || self.connection.write_class() != SqliteWriteClass::Maintenance
+        if self.connection.read_class() != PostgresReadClass::Maintenance
+            || self.connection.write_class() != PostgresWriteClass::Maintenance
         {
             bail!("background database quantum requires maintenance-scoped reads and writes");
         }
@@ -174,8 +174,8 @@ impl CrudStore {
     }
 
     /// Performs at most one bounded receipt cleanup batch for one stream.
-    /// Discovery uses maintenance readers; only revalidation and deletion hold
-    /// the serialized writer. A persisted per-stream boundary makes restart safe.
+    /// Discovery uses maintenance readers. Revalidation and deletion share a
+    /// short write transaction. A persisted per-stream boundary makes restart safe.
     pub async fn cleanup_projection_receipts_quantum(
         &self,
         after_turn_id: Option<&str>,
@@ -198,7 +198,7 @@ impl CrudStore {
             .await
     }
 
-    pub(crate) async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -220,7 +220,7 @@ impl CrudStore {
 }
 
 pub(crate) async fn rollback_preserving_error(
-    transaction: pioneer_sqlite::SqliteTransaction,
+    transaction: pioneer_postgres_pools::PostgresTransaction,
     error: anyhow::Error,
 ) -> anyhow::Error {
     let _ = transaction.rollback().await;

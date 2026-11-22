@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use pioneer_compaction::{FORMAT_VERSION, OperationSnapshot};
 use pioneer_entity::{compaction_context, compaction_execution_stop, compaction_operation, turn};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -47,7 +47,7 @@ impl From<compaction_operation::Model> for OperationRecord {
 }
 
 pub async fn compaction_admit(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     snapshot: &OperationSnapshot,
@@ -56,7 +56,7 @@ pub async fn compaction_admit(
 }
 
 pub async fn compaction_admit_for_turn(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     snapshot: &OperationSnapshot,

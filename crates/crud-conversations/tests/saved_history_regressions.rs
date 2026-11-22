@@ -7,8 +7,8 @@ use pioneer_crud_conversations::{
     saved_history::{page, revision, snapshot},
     turn_input,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
 
 fn unix_to_datetime(value: i64) -> sea_orm::prelude::DateTimeWithTimeZone {
@@ -21,8 +21,8 @@ async fn seed(
     fixture: &TestDatabase,
     workspace: &str,
     thread: &str,
-) -> anyhow::Result<SqliteDatabase> {
-    let db = SqliteDatabase::new(
+) -> anyhow::Result<PostgresDatabase> {
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await?,
         fixture.connection().clone(),
     );
@@ -38,7 +38,7 @@ async fn seed(
     Ok(db)
 }
 
-async fn new_turn(db: &SqliteDatabase, thread: &str, id: &str) -> anyhow::Result<()> {
+async fn new_turn(db: &PostgresDatabase, thread: &str, id: &str) -> anyhow::Result<()> {
     db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "INSERT INTO turn (id,thread_id,turn_kind,origin,status) VALUES ($1,$2,'conversation','user','in_progress')",
         [id.into(), thread.into()])).await?;
@@ -46,7 +46,7 @@ async fn new_turn(db: &SqliteDatabase, thread: &str, id: &str) -> anyhow::Result
 }
 
 async fn change_input(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     id: &str,
     input: &[UserInput],
     number: i64,

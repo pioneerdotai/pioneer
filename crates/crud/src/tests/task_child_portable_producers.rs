@@ -351,7 +351,9 @@ async fn postgres_workspace_restore_after_drained_scope_publishes_again() {
         .await
         .unwrap();
     let conflict = write(&stale, &a).await.unwrap_err();
-    assert!(pioneer_sqlite::is_retryable_database_conflict(&conflict));
+    assert!(pioneer_postgres_pools::is_retryable_database_conflict(
+        &conflict
+    ));
     stale.rollback().await.unwrap();
     let restored = db.begin().await.unwrap();
     write(&restored, &a).await.unwrap();
@@ -439,7 +441,9 @@ async fn postgres_late_source_commit_after_other_publication_ack_keeps_ticket() 
         .await;
         if turn_existed {
             let conflict = birth.unwrap_err();
-            assert!(pioneer_sqlite::is_retryable_database_conflict(&conflict));
+            assert!(pioneer_postgres_pools::is_retryable_database_conflict(
+                &conflict
+            ));
             source.rollback().await.unwrap();
             let retry = db.begin().await.unwrap();
             crate::store::conversations::context_writes::insert_turn_llm_context(
@@ -513,7 +517,7 @@ async fn postgres_serialization_abort_rolls_back_entire_transaction_before_repla
     let competing = fixture.connect().await.unwrap();
     let competing = Arc::new(competing);
     store
-        .run_serialized_write(|| {
+        .retry_write_on_conflict(|| {
             let id = &id;
             let attempts = &attempts;
             let competing = competing.clone();
@@ -554,7 +558,9 @@ async fn postgres_serialization_abort_rolls_back_entire_transaction_before_repla
                         .await
                         .unwrap_err()
                         .into();
-                    assert!(pioneer_sqlite::is_retryable_database_conflict(&error));
+                    assert!(pioneer_postgres_pools::is_retryable_database_conflict(
+                        &error
+                    ));
                     tx.rollback().await?;
                     return Err(error);
                 }
@@ -609,7 +615,9 @@ async fn postgres_context_recreation_after_cleanup_is_birth_not_payload_append()
     )
     .await
     .unwrap_err();
-    assert!(pioneer_sqlite::is_retryable_database_conflict(&conflict));
+    assert!(pioneer_postgres_pools::is_retryable_database_conflict(
+        &conflict
+    ));
     source.rollback().await.unwrap();
     let retry = db.begin().await.unwrap();
     crate::store::conversations::context_writes::insert_turn_llm_context(&retry, entry(&id, 2))

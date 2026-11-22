@@ -874,17 +874,23 @@ async fn delivery_general_event_ingestion_keeps_strict_terminal_fsm() {
 
 #[derive(Default)]
 struct DeliveryRoutingObserver {
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
     queued: Notify,
     cancelled: Notify,
     watch_queue: std::sync::atomic::AtomicBool,
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for DeliveryRoutingObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
-        let queued = matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. });
-        let cancelled = matches!(event, pioneer_sqlite::SqliteWriteEvent::Cancelled { .. });
+impl pioneer_postgres_pools::PostgresWriteObserver for DeliveryRoutingObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
+        let queued = matches!(
+            event,
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+        );
+        let cancelled = matches!(
+            event,
+            pioneer_postgres_pools::PostgresWriteEvent::Cancelled { .. }
+        );
         self.writes.lock().unwrap().push(event);
         if queued && self.watch_queue.load(Ordering::SeqCst) {
             self.queued.notify_one();
@@ -894,8 +900,8 @@ impl pioneer_sqlite::SqliteWriteObserver for DeliveryRoutingObserver {
         }
     }
 }
-impl pioneer_sqlite::SqliteReadObserver for DeliveryRoutingObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for DeliveryRoutingObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.reads.lock().unwrap().push(event);
     }
 }
@@ -914,8 +920,9 @@ async fn observed_delivery_fixture(
     let reader = database.connect_read_only().await.unwrap();
     seed_postgres_task_fixture(&writer).await;
     let observer = Arc::new(DeliveryRoutingObserver::default());
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone());
-    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, observer.clone());
+    let database = pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
         reader,
         executor,
         observer.clone(),
@@ -935,18 +942,21 @@ async fn delivery_commit_uses_scoped_writer_and_maintenance_discovery() {
         assert!(!writes.is_empty());
         for event in writes.iter() {
             let class = match event {
-                pioneer_sqlite::SqliteWriteEvent::Enqueued { class, .. }
-                | pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. }
-                | pioneer_sqlite::SqliteWriteEvent::Released { class, .. }
-                | pioneer_sqlite::SqliteWriteEvent::Cancelled { class, .. } => class,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued { class, .. }
+                | pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. }
+                | pioneer_postgres_pools::PostgresWriteEvent::Released { class, .. }
+                | pioneer_postgres_pools::PostgresWriteEvent::Cancelled { class, .. } => class,
             };
             // This is the pre-existing Gateway background control scope.
-            assert_eq!(*class, pioneer_sqlite::SqliteWriteClass::Critical);
+            assert_eq!(*class, pioneer_postgres_pools::PostgresWriteClass::Critical);
         }
         assert_eq!(
             writes
                 .iter()
-                .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
+                .filter(|event| matches!(
+                    event,
+                    pioneer_postgres_pools::PostgresWriteEvent::Acquired { .. }
+                ))
                 .count(),
             1,
             "point reads and projection writes must share one physical writer transaction"
@@ -954,7 +964,10 @@ async fn delivery_commit_uses_scoped_writer_and_maintenance_discovery() {
         assert_eq!(
             writes
                 .iter()
-                .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Released { .. }))
+                .filter(|event| matches!(
+                    event,
+                    pioneer_postgres_pools::PostgresWriteEvent::Released { .. }
+                ))
                 .count(),
             1
         );
@@ -962,15 +975,15 @@ async fn delivery_commit_uses_scoped_writer_and_maintenance_discovery() {
         let reads = observer.reads.lock().unwrap();
         assert!(reads.iter().any(|event| matches!(
             event,
-            pioneer_sqlite::SqliteReadEvent::OperationFinished {
-                class: pioneer_sqlite::SqliteReadClass::Maintenance,
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+                class: pioneer_postgres_pools::PostgresReadClass::Maintenance,
                 ..
             }
         )));
         assert!(!reads.iter().any(|event| matches!(
             event,
-            pioneer_sqlite::SqliteReadEvent::OperationFinished {
-                class: pioneer_sqlite::SqliteReadClass::Interactive,
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+                class: pioneer_postgres_pools::PostgresReadClass::Interactive,
                 ..
             }
         )));
@@ -1005,17 +1018,23 @@ async fn delivery_cancelled_commit_wait_releases_queue_and_allows_next_delivery(
             .unwrap()
             .iter()
             .find_map(|event| {
-                if let pioneer_sqlite::SqliteWriteEvent::Cancelled { class, queue, .. } = event {
+                if let pioneer_postgres_pools::PostgresWriteEvent::Cancelled {
+                    class, queue, ..
+                } = event
+                {
                     Some((*class, *queue))
                 } else {
                     None
                 }
             })
             .unwrap();
-        assert_eq!(cancellation.0, pioneer_sqlite::SqliteWriteClass::Critical);
+        assert_eq!(
+            cancellation.0,
+            pioneer_postgres_pools::PostgresWriteClass::Critical
+        );
         assert_eq!(
             cancellation.1,
-            pioneer_sqlite::SqliteWriteQueueSnapshot::default()
+            pioneer_postgres_pools::PostgresWriteQueueSnapshot::default()
         );
         transaction.rollback().await.unwrap();
         let before = snapshot(&runtime, &queued).await;
@@ -1294,7 +1313,10 @@ async fn delivery_maintenance_and_interactive_commits_keep_their_own_scope_under
                     .unwrap()
                     .iter()
                     .filter(|event| {
-                        matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                        matches!(
+                            event,
+                            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+                        )
                     })
                     .count();
                 if count == 2 {
@@ -1320,7 +1342,7 @@ async fn delivery_maintenance_and_interactive_commits_keep_their_own_scope_under
             .unwrap()
             .iter()
             .filter_map(|event| {
-                if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
+                if let pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } = event {
                     Some(*class)
                 } else {
                     None
@@ -1328,9 +1350,9 @@ async fn delivery_maintenance_and_interactive_commits_keep_their_own_scope_under
             })
             .collect();
         assert_eq!(classes.len(), 2);
-        assert!(classes.contains(&pioneer_sqlite::SqliteWriteClass::Maintenance));
-        assert!(classes.contains(&pioneer_sqlite::SqliteWriteClass::Interactive));
-        assert!(!classes.contains(&pioneer_sqlite::SqliteWriteClass::Critical));
+        assert!(classes.contains(&pioneer_postgres_pools::PostgresWriteClass::Maintenance));
+        assert!(classes.contains(&pioneer_postgres_pools::PostgresWriteClass::Interactive));
+        assert!(!classes.contains(&pioneer_postgres_pools::PostgresWriteClass::Critical));
         assert_eq!(snapshot(&runtime, &maintenance).await.attempts.len(), 1);
         assert_eq!(snapshot(&runtime, &interactive).await.attempts.len(), 1);
         Ok(())
@@ -1940,11 +1962,14 @@ async fn recovery_retry_writes_are_maintenance_and_domain_commit_keeps_critical_
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(classes, [pioneer_sqlite::SqliteWriteClass::Maintenance]);
+        assert_eq!(
+            classes,
+            [pioneer_postgres_pools::PostgresWriteClass::Maintenance]
+        );
         observer.clear();
         assert_eq!(
             runtime
@@ -1961,27 +1986,27 @@ async fn recovery_retry_writes_are_maintenance_and_domain_commit_keeps_critical_
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             classes,
-            [pioneer_sqlite::SqliteWriteClass::Critical],
+            [pioneer_postgres_pools::PostgresWriteClass::Critical],
             "event+attempt+delivery+retry cleanup share one writer transaction"
         );
         let reads = observer.reads.lock().unwrap();
         assert!(reads.iter().any(|e| matches!(
             e,
-            pioneer_sqlite::SqliteReadEvent::OperationFinished {
-                class: pioneer_sqlite::SqliteReadClass::Maintenance,
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+                class: pioneer_postgres_pools::PostgresReadClass::Maintenance,
                 ..
             }
         )));
         assert!(!reads.iter().any(|e| matches!(
             e,
-            pioneer_sqlite::SqliteReadEvent::OperationFinished {
-                class: pioneer_sqlite::SqliteReadClass::Interactive,
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+                class: pioneer_postgres_pools::PostgresReadClass::Interactive,
                 ..
             }
         )));
@@ -2030,15 +2055,15 @@ async fn recovery_cancellation_aborts_queued_error_delay_and_releases_capacity()
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                pioneer_sqlite::SqliteWriteEvent::Cancelled { class, queue, .. } => {
+                pioneer_postgres_pools::PostgresWriteEvent::Cancelled { class, queue, .. } => {
                     Some((*class, *queue))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert!(queues.contains(&(
-            pioneer_sqlite::SqliteWriteClass::Maintenance,
-            pioneer_sqlite::SqliteWriteQueueSnapshot::default()
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance,
+            pioneer_postgres_pools::PostgresWriteQueueSnapshot::default()
         )));
         timeout(
             Duration::from_secs(5),
@@ -2057,7 +2082,7 @@ async fn recovery_cancellation_aborts_queued_error_delay_and_releases_capacity()
 
 fn pause_recovery_clock() -> tokio::task::JoinHandle<()> {
     tokio::time::pause();
-    // SQLx waits on an external SQLite thread. Keep virtual time from advancing
+    // SQLx waits on a PostgreSQL connection. Keep virtual time from advancing
     // automatically while it runs; tests advance it explicitly at boundaries.
     tokio::spawn(async {
         loop {

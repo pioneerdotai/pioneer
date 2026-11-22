@@ -10,8 +10,8 @@ use pioneer_entity::{
     artifact_version, compaction_source_revision, thread as thread_entity, turn as turn_entity,
     turn_input, turn_llm_context,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase, WorkSignal,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase, WorkSignal,
     is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::sea_query::{BinOper, Expr, ExprTrait, JoinType, Order, Query};
@@ -61,7 +61,11 @@ struct PreviewArtifactHeader {
 }
 
 impl PreviewArtifactScan {
-    pub async fn quantum(&mut self, db: &SqliteDatabase, upper: &str) -> Result<PreviewCandidate> {
+    pub async fn quantum(
+        &mut self,
+        db: &PostgresDatabase,
+        upper: &str,
+    ) -> Result<PreviewCandidate> {
         if self.pending.is_empty() {
             self.pending = artifact::Entity::find()
                 .select_only()
@@ -107,7 +111,7 @@ impl PreviewArtifactScan {
 }
 
 pub async fn retire_preview(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     io_wake: &tokio::sync::Notify,
     guard: &impl PreviewRetirementGuard,
     candidate: artifact::Model,

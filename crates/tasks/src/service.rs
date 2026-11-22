@@ -6975,7 +6975,7 @@ pub(crate) fn task_error(
 #[cfg(test)]
 mod resource_policy_tests {
     use super::ensure_paginated_response_budget;
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
 
     #[test]
     fn page_size_target_never_hides_a_single_logical_record() {
@@ -6993,23 +6993,23 @@ mod resource_policy_tests {
             let cases = [
                 (
                     runtime.service(),
-                    SqliteReadClass::Interactive,
-                    SqliteWriteClass::Interactive,
+                    PostgresReadClass::Interactive,
+                    PostgresWriteClass::Interactive,
                 ),
                 (
                     runtime.critical_service(),
-                    SqliteReadClass::Interactive,
-                    SqliteWriteClass::Critical,
+                    PostgresReadClass::Interactive,
+                    PostgresWriteClass::Critical,
                 ),
                 (
                     runtime.maintenance_service(),
-                    SqliteReadClass::Maintenance,
-                    SqliteWriteClass::Maintenance,
+                    PostgresReadClass::Maintenance,
+                    PostgresWriteClass::Maintenance,
                 ),
                 (
                     runtime.background_control_service(),
-                    SqliteReadClass::Maintenance,
-                    SqliteWriteClass::Critical,
+                    PostgresReadClass::Maintenance,
+                    PostgresWriteClass::Critical,
                 ),
             ];
 

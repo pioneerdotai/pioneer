@@ -5,13 +5,13 @@ use crate::artifact::{
 };
 use anyhow::{Context, Result};
 use pioneer_entity::artifact as artifact_row;
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
+    is_retryable_database_conflict, retry_with_backoff,
+};
 use pioneer_protocol::{
     ArtifactBindingSummary, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactStatus,
     generate_id,
-};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::{
     ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
@@ -34,7 +34,7 @@ where
 }
 
 pub async fn update_status(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     artifact_id: &str,
     status: ArtifactStatus,
@@ -72,7 +72,7 @@ pub async fn update_status(
 }
 
 pub async fn replace_projection(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     artifact_id: &str,
     artifact_version_id: &str,
@@ -109,7 +109,7 @@ pub async fn replace_projection(
 }
 
 pub async fn find_or_create_blob(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     blob: NewArtifactBlobRecord,
 ) -> Result<ArtifactBlobRecord> {
     let id = generate_id(21);
@@ -128,7 +128,7 @@ pub async fn find_or_create_blob(
 }
 
 pub async fn bind_artifact(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     artifact_id: &str,
     version_id: Option<&str>,
@@ -210,7 +210,7 @@ pub async fn bind_artifact(
 }
 
 pub async fn upsert_external_ref(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     request: UpsertArtifactExternalRefRequest,
 ) -> Result<ArtifactExternalRefRecord> {
     let change = db.work_signal("maintenance.html").changing();
@@ -222,7 +222,7 @@ pub async fn upsert_external_ref(
 }
 
 pub async fn prune_expired_external_refs(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     now_unix_ms: i64,
 ) -> Result<u64> {
@@ -236,7 +236,7 @@ pub async fn prune_expired_external_refs(
 }
 
 pub async fn delete_blob_row(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     blob_id: &str,
 ) -> Result<u64> {
@@ -249,7 +249,7 @@ pub async fn delete_blob_row(
 }
 
 pub async fn delete_projection_row(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     projection_id: &str,
 ) -> Result<u64> {

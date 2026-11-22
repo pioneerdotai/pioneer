@@ -6,8 +6,8 @@ use pioneer_crud_tasks::completion_inbox::{
     mark_all_task_completion_inbox_read, mark_task_completion_inbox_read,
 };
 use pioneer_crud_tasks::occurrence_repository::TaskOccurrenceRepository;
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 use pioneer_postgres_test::{TestDatabase, scoped_database};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
@@ -19,15 +19,15 @@ const A: &str = "P0000000000000000000A";
 
 const B: &str = "P0000000000000000000B";
 
-async fn open(fixture: &TestDatabase) -> (SqliteDatabase, SqliteWriteExecutor) {
-    let writer = SqliteWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
+async fn open(fixture: &TestDatabase) -> (PostgresDatabase, PostgresWriteExecutor) {
+    let writer = PostgresWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
     let reader = fixture.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::from_executor(reader, writer.clone());
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::from_executor(reader, writer.clone());
+    assert!(db.reader_is_read_only().await.unwrap());
     (db, writer)
 }
 
-async fn fixture() -> (Arc<TestDatabase>, SqliteDatabase, SqliteWriteExecutor) {
+async fn fixture() -> (Arc<TestDatabase>, PostgresDatabase, PostgresWriteExecutor) {
     let fixture = scoped_database().await.unwrap();
     let (store, writer) = open(&fixture).await;
     let db = store.maintenance();
@@ -44,7 +44,7 @@ fn access(principal: &str) -> TaskCompletionInboxAccess<'_> {
 }
 
 async fn task(
-    store: &SqliteDatabase,
+    store: &PostgresDatabase,
     id: &str,
     thread: Option<&str>,
     root: Option<&str>,
@@ -56,18 +56,18 @@ async fn task(
     fixture_data::task(&db, id, thread, root, executor, mode, attachment).await;
 }
 
-async fn run(store: &SqliteDatabase, id: &str, task: &str, status: &str, number: i64) {
+async fn run(store: &PostgresDatabase, id: &str, task: &str, status: &str, number: i64) {
     let db = store.maintenance();
     fixture_data::run(&db, id, task, status, number).await;
 }
 
-async fn unread(store: &SqliteDatabase, principal: &str) -> u64 {
+async fn unread(store: &PostgresDatabase, principal: &str) -> u64 {
     count_unread_task_completion_inbox(&store.clone(), &access(principal))
         .await
         .unwrap()
 }
 
-async fn read(store: &SqliteDatabase, principal: &str, run: &str) {
+async fn read(store: &PostgresDatabase, principal: &str, run: &str) {
     mark_task_completion_inbox_read(
         &store.clone(),
         &access(principal),
@@ -78,7 +78,7 @@ async fn read(store: &SqliteDatabase, principal: &str, run: &str) {
     .unwrap();
 }
 
-async fn saved_result_item(store: &SqliteDatabase, turn: &str, item: &str) {
+async fn saved_result_item(store: &PostgresDatabase, turn: &str, item: &str) {
     store.clone().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,active_attempt_number,created_at,updated_at) VALUES($1,$2,$3,'agent_message','completed','{}',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [format!("saved-{turn}-{item}").into(), turn.into(), item.into()])).await.unwrap();
@@ -154,7 +154,7 @@ async fn ordinary_negative_batches_keep_viewport_scope_checks_and_direct_run_evi
 }
 
 async fn inbox_contracts(
-    store: &SqliteDatabase,
+    store: &PostgresDatabase,
     task_id: &str,
     run_id: &str,
     creator: &str,
@@ -802,7 +802,7 @@ fn grant_time() -> chrono::DateTime<chrono::FixedOffset> {
     chrono::DateTime::parse_from_rfc3339("2026-10-16T10:00:00.999999999Z").unwrap()
 }
 
-async fn grant_workspace(store: &SqliteDatabase) -> pioneer_entity::workspace_membership::Model {
+async fn grant_workspace(store: &PostgresDatabase) -> pioneer_entity::workspace_membership::Model {
     let db = store.clone();
     let tx = db.begin().await.unwrap();
     let sequence = current_completion_sequence(&tx).await.unwrap();
@@ -823,7 +823,7 @@ async fn grant_workspace(store: &SqliteDatabase) -> pioneer_entity::workspace_me
     grant
 }
 
-async fn revoke_workspace(store: &SqliteDatabase) {
+async fn revoke_workspace(store: &PostgresDatabase) {
     let db = store.clone();
     let tx = db.begin().await.unwrap();
     pioneer_crud_access::membership::delete_workspace_membership(
@@ -837,7 +837,7 @@ async fn revoke_workspace(store: &SqliteDatabase) {
     tx.commit().await.unwrap();
 }
 
-async fn complete_for_access(store: &SqliteDatabase, id: &str, task_id: &str, at: i64) {
+async fn complete_for_access(store: &PostgresDatabase, id: &str, task_id: &str, at: i64) {
     TaskEventStore::new(store.clone(), NoFrozenOutput)
         .append_task_event(
             pioneer_protocol::TaskEventPayload::RunCompleted {
@@ -1213,7 +1213,7 @@ async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope()
 }
 
 async fn commit_cancellation(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     events: Vec<pioneer_protocol::TaskEventPayload>,
     at: i64,
     actor: Option<&str>,

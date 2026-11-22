@@ -109,7 +109,7 @@ impl PreviewRetirementGuard for FrozenPreviewGuard<'_> {
         workspace: &'a str,
         thread: &'a str,
         turn: &'a str,
-        release: &'a pioneer_sqlite::WorkSignal,
+        release: &'a pioneer_postgres_pools::WorkSignal,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let root_execution = pioneer_crud_execution::canonical_id::canonical_agent_id(

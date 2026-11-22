@@ -47,7 +47,7 @@ impl CrudStore {
                 let result = async {
                     let _release_wake = (!matches!(status, TurnStatus::InProgress))
                         .then(|| self.execution_heartbeats.release_wake());
-                    self.run_serialized_write(|| async {
+                    self.retry_write_on_conflict(|| async {
                         let updated_at = unix_to_datetime(event_timestamp_secs);
                         let transaction = self
                             .connection

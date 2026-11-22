@@ -5551,7 +5551,7 @@ fn cli_threads_read_errors_keep_safe_reasons_through_the_admitted_facade() {
             let wire = response.to_string();
             for private in [
                 "private_token",
-                "/private/source.sqlite",
+                "/private/source.data",
                 "secret-diagnostic",
                 "unavailable-private-source",
                 "private fragment title",
@@ -5593,7 +5593,7 @@ fn cli_threads_read_errors_keep_safe_reasons_through_the_admitted_facade() {
             ("legacy-list", legacy_cursor),
             (
                 "invalid-list",
-                "SELECT private_token FROM /private/source.sqlite; secret-diagnostic".into(),
+                "SELECT private_token FROM /private/source.data; secret-diagnostic".into(),
             ),
         ] {
             let response = facade

@@ -503,7 +503,7 @@ impl CrudStore {
         summary: &str,
         turn_count: i64,
     ) -> Result<()> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(chrono::Utc::now().timestamp());
             thread_metadata::update_thread_summary(
                 &self.connection,

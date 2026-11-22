@@ -121,7 +121,7 @@ impl TurnMcpProjectionPersistenceError {
     pub fn is_retryable_conflict(&self) -> bool {
         matches!(
             self,
-            Self::Storage { source, .. } if pioneer_sqlite::is_retryable_database_conflict(source)
+            Self::Storage { source, .. } if pioneer_postgres_pools::is_retryable_database_conflict(source)
         )
     }
 }

@@ -8,7 +8,7 @@ pub(crate) async fn postgres_store(database: &TestDatabase) -> Arc<CrudStore> {
         .connect_read_only()
         .await
         .expect("PostgreSQL test reader");
-    Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-        reader, writer,
-    )))
+    Arc::new(CrudStore::new(
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
+    ))
 }

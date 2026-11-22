@@ -39,11 +39,11 @@ fn attached_immediate(task: &Task, trigger: Option<&TaskTrigger>) -> bool {
         && trigger.is_some_and(|t| t.kind() == pioneer_protocol::TaskTriggerKind::Immediate)
 }
 pub struct TaskEventContextRepository<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
 }
 
 impl<'a> TaskEventContextRepository<'a> {
-    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(connection: &'a pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self { connection }
     }
 

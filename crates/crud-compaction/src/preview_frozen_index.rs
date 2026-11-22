@@ -7,7 +7,7 @@ use pioneer_entity::{
     compaction_frozen_history as history, html_preview_frozen_index as frozen_index,
     html_preview_frozen_result as frozen_result, html_preview_frozen_turn as frozen_turn,
 };
-use pioneer_sqlite::{
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
     retry_with_backoff,
 };
@@ -554,7 +554,7 @@ pub async fn unowned<C: ConnectionTrait>(
     turn: &str,
     root_execution: &str,
     readers: &crate::frozen_lifetime::ReaderCounts,
-    released: &pioneer_sqlite::WorkSignal,
+    released: &pioneer_postgres_pools::WorkSignal,
 ) -> Result<bool> {
     let row = db
         .query_one(&queries::unowned(workspace, thread, turn, root_execution))
@@ -562,8 +562,8 @@ pub async fn unowned<C: ConnectionTrait>(
     if row.is_none() {
         return Ok(false);
     }
-    // Acquisition uses the same serialized writer as retirement. Inspect only
-    // currently held roots, not the unbounded set of permanent archive roots.
+    // Check active reader holds before retiring the preview. The set of held
+    // roots is bounded independently of permanent archive roots.
     let held_ids: Vec<String> = {
         let mut readers = readers
             .lock()

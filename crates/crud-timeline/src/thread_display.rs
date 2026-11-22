@@ -5,16 +5,16 @@ use pioneer_crud_conversations::{
     thread_metadata, thread_state, turn_order, turn_reads,
     values::turn_kind_to_db,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{PrincipalId, Thread, TurnKind};
-use pioneer_sqlite::SqliteDatabase;
 use std::collections::HashMap;
 
 pub struct ThreadDisplayStore<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> ThreadDisplayStore<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 

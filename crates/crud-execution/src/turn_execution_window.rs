@@ -961,7 +961,7 @@ async fn count_turn_execution_window_terminal_items_query<C: ConnectionTrait>(
 }
 
 pub async fn list_turn_execution_window_items(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     started_at: DateTimeWithTimeZone,
 ) -> Result<Vec<TurnItem>> {

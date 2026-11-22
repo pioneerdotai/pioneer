@@ -14,7 +14,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 async fn postgres_store_with_workspace(
     fixture: &pioneer_postgres_test::TestDatabase,
     workspace_id: &str,
-) -> SqliteDatabase {
+) -> PostgresDatabase {
     let connection = fixture.connection();
     let tx = connection.begin().await.expect("begin workspace fixture");
     pioneer_entity::workspace::Entity::update_many()
@@ -43,7 +43,7 @@ async fn postgres_store_with_workspace(
         .connect_read_only()
         .await
         .expect("read-only PostgreSQL pool");
-    SqliteDatabase::new(reader, connection.clone())
+    PostgresDatabase::new(reader, connection.clone())
 }
 
 #[tokio::test]

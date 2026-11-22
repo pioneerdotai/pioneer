@@ -299,7 +299,7 @@ pub fn query_file_history(
         }
     }
 
-    // Keep the in-memory implementation's order identical to the SQLite
+    // Keep the in-memory implementation's order identical to the PostgreSQL
     // index.  `records_for_thread` is ordered by turn/ordinal, whereas the
     // file cursor is explicitly environment/turn/ordinal/sequence.  Sorting
     // before applying the cursor prevents skipped or duplicated entries when
@@ -402,7 +402,7 @@ fn lineage_aliases_by_environment(
         .into_iter()
         .map(|(environment_id, mut records)| {
             // Commit ordinals restart at every turn.  The file-history cursor
-            // and the SQLite path-index use the deterministic
+            // and the PostgreSQL path-index use the deterministic
             // environment/turn/ordinal/sequence order, so lineage discovery
             // must use the same cross-turn order instead of sorting by the
             // ordinal alone.
@@ -474,7 +474,7 @@ pub(crate) fn validate_query_path(value: &str) -> Result<(), HistoryQueryError> 
 }
 
 fn validate_query_ordinal_cursor(value: CommitOrdinal) -> Result<(), HistoryQueryError> {
-    // The ordinal itself is bounded by the SQLite adapter when it becomes a
+    // The ordinal itself is bounded by the PostgreSQL adapter when it becomes a
     // SQL parameter.  Rejecting values above that boundary here keeps the
     // in-memory and durable query contracts identical.
     if value.0 > i64::MAX as u64 {

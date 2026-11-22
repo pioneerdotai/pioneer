@@ -4,12 +4,12 @@ use pioneer_artifacts::{
     IngestArtifactBytesRequest, LocalArtifactBlobStore,
 };
 use pioneer_crud::CrudStore;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRole,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio_util::sync::CancellationToken;
@@ -35,8 +35,8 @@ async fn fixture(
         seed.execute_unprepared(sql).await.unwrap();
     }
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, seed.clone());
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    let database = PostgresDatabase::new(reader, seed.clone());
+    assert!(database.reader_is_read_only().await.unwrap());
     let store = Arc::new(CrudStore::new(database));
     let service = ArtifactService::new_with_quota(
         store.clone(),

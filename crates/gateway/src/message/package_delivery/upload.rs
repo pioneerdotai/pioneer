@@ -1072,7 +1072,7 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn cleanup_stale_skill_uploads(&self, now: i64) {
-        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let maintenance = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         if let Err(error) = maintenance
             .cleanup_stale_skill_uploads_for_control(now)
             .await

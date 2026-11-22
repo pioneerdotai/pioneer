@@ -223,25 +223,25 @@ fn can_start_step(
 mod tests {
     use super::*;
     use pioneer_compaction::frozen::FrozenHistoryRef;
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-        SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+        PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
     };
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct Observer {
-        reads: Mutex<Vec<SqliteReadEvent>>,
-        writes: Mutex<Vec<SqliteWriteEvent>>,
+        reads: Mutex<Vec<PostgresReadEvent>>,
+        writes: Mutex<Vec<PostgresWriteEvent>>,
         queued: tokio::sync::Notify,
     }
-    impl SqliteReadObserver for Observer {
-        fn observe(&self, event: SqliteReadEvent) {
+    impl PostgresReadObserver for Observer {
+        fn observe(&self, event: PostgresReadEvent) {
             self.reads.lock().unwrap().push(event);
             if matches!(
                 event,
-                SqliteReadEvent::AdmissionEnqueued {
+                PostgresReadEvent::AdmissionEnqueued {
                     active: 1,
                     queue_depth: 1,
                     ..
@@ -251,8 +251,8 @@ mod tests {
             }
         }
     }
-    impl SqliteWriteObserver for Observer {
-        fn observe(&self, event: SqliteWriteEvent) {
+    impl PostgresWriteObserver for Observer {
+        fn observe(&self, event: PostgresWriteEvent) {
             self.writes.lock().unwrap().push(event);
         }
     }
@@ -265,8 +265,8 @@ mod tests {
                 .filter(|e| {
                     matches!(
                         e,
-                        SqliteReadEvent::OperationFinished {
-                            outcome: pioneer_sqlite::SqliteReadOutcome::Ok,
+                        PostgresReadEvent::OperationFinished {
+                            outcome: pioneer_postgres_pools::PostgresReadOutcome::Ok,
                             ..
                         }
                     )
@@ -344,16 +344,16 @@ mod tests {
             .await
             .unwrap();
         let observer = Arc::new(Observer::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         let store = CrudStore::new(database).with_maintenance_access();
         assert!(
             store
                 .database_connection()
-                .reader_query_only_enabled()
+                .reader_is_read_only()
                 .await
                 .unwrap()
         );
@@ -457,11 +457,11 @@ mod tests {
         );
         assert_eq!(
             store.database_connection().read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             store.database_connection().write_class(),
-            SqliteWriteClass::Maintenance
+            PostgresWriteClass::Maintenance
         );
         assert!(
             observer
@@ -470,20 +470,20 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+                    PostgresReadEvent::OperationFinished { class, .. } => Some(*class),
                     _ => None,
                 })
-                .all(|class| class == SqliteReadClass::Maintenance)
+                .all(|class| class == PostgresReadClass::Maintenance)
         );
         let writes = observer.writes.lock().unwrap();
         assert!(writes.iter().any(|e| matches!(
             e,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         )));
-        assert!(!writes.iter().any(|e| matches!(e, SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Maintenance)));
+        assert!(!writes.iter().any(|e| matches!(e, PostgresWriteEvent::Acquired { class, .. } if *class != PostgresWriteClass::Maintenance)));
     }
 
     #[pioneer_postgres_test::postgres_test]
@@ -535,8 +535,8 @@ mod tests {
             .unwrap();
         assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
             event,
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 0,
                 active: 1,
                 ..
@@ -554,11 +554,11 @@ mod tests {
         assert!(
             store
                 .database_connection()
-                .reader_query_only_enabled()
+                .reader_is_read_only()
                 .await
                 .unwrap()
         );
-        let pragma = store
+        let session = store
             .database_connection()
             .query_one_raw(Statement::from_string(
                 DbBackend::Postgres,
@@ -568,7 +568,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            pragma.try_get::<String>("", "replication_role").unwrap(),
+            session.try_get::<String>("", "replication_role").unwrap(),
             "origin"
         );
     }
@@ -1260,15 +1260,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, .. } =>
-                        *class == SqliteReadClass::Maintenance,
+                    PostgresReadEvent::OperationFinished { class, .. } =>
+                        *class == PostgresReadClass::Maintenance,
                     _ => true,
                 })
         );
         assert!(
             store
                 .database_connection()
-                .reader_query_only_enabled()
+                .reader_is_read_only()
                 .await
                 .unwrap()
         );
@@ -1383,8 +1383,8 @@ mod tests {
                     .unwrap()
                     .iter()
                     .rev()
-                    .find(|event| !matches!(event, SqliteReadEvent::OperationFinished { .. })),
-                Some(SqliteReadEvent::AdmissionReleased {
+                    .find(|event| !matches!(event, PostgresReadEvent::OperationFinished { .. })),
+                Some(PostgresReadEvent::AdmissionReleased {
                     active: 0,
                     queue_depth: 0,
                     ..
@@ -1392,7 +1392,7 @@ mod tests {
             );
             let writers_idle = matches!(
                 observer.writes.lock().unwrap().last(),
-                Some(SqliteWriteEvent::Released { .. })
+                Some(PostgresWriteEvent::Released { .. })
             );
             if current == previous && readers_idle && writers_idle {
                 quiet += 1;
@@ -1485,8 +1485,8 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, .. } =>
-                        *class == SqliteReadClass::Maintenance,
+                    PostgresReadEvent::OperationFinished { class, .. } =>
+                        *class == PostgresReadClass::Maintenance,
                     _ => true,
                 })
         );
@@ -1497,12 +1497,12 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|event| match event {
-                    SqliteWriteEvent::Acquired { class, .. } =>
-                        *class == SqliteWriteClass::Maintenance,
+                    PostgresWriteEvent::Acquired { class, .. } =>
+                        *class == PostgresWriteClass::Maintenance,
                     _ => true,
                 })
         );
-        assert!(db.reader_query_only_enabled().await.unwrap());
+        assert!(db.reader_is_read_only().await.unwrap());
     }
 
     #[pioneer_postgres_test::postgres_test]
@@ -1647,22 +1647,22 @@ mod tests {
             .unwrap();
         assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         )));
         assert!(observer.writes.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         )));
         assert!(
             store
                 .database_connection()
-                .reader_query_only_enabled()
+                .reader_is_read_only()
                 .await
                 .unwrap()
         );
@@ -1682,8 +1682,8 @@ mod tests {
         drop(held);
         assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 0,
                 ..
             }

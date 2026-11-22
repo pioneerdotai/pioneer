@@ -80,7 +80,7 @@ impl CrudStore {
             )
             .await?;
         let timeline_item = serde_json::to_value(&notification.item)?;
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let notification = notification.clone();
             let connection = self.connection.clone();
             let mut prepared_item = prepared_item.clone();

@@ -159,7 +159,7 @@ pub async fn capture(
 }
 /// Read a bounded page of already validated canonical source identities.
 pub async fn read_page(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
     thread: &str,
     candidates: &[pioneer_compaction::SourceRef],

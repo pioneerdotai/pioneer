@@ -22,7 +22,7 @@ RETURN CASE WHEN payload IS JSON OBJECT THEN COALESCE((
     ) AS fields
     WHERE depth = 1 AND separator = ':'
       AND key_token COLLATE "C" ~ $kind$^"(k|\\u006[bB])(i|\\u0069)(n|\\u006[eE])(d|\\u0064)"$$kind$
-    -- Match the first top-level kind, as in SQLite json_extract.
+    -- Match the first top-level kind in the original JSON input.
     ORDER BY ordinal
     LIMIT 1
 ), true) ELSE true END;

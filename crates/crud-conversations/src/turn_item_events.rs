@@ -1,15 +1,15 @@
 //! Client item event pages and the latest snapshot-only diff observations.
 use anyhow::{Context, Result};
 use pioneer_entity::{thread, turn, turn_item};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{TurnItem, TurnItemEvent, TurnItemEventPayload, TurnItemsResponse};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ColumnTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect};
 use std::collections::HashMap;
 
 use crate::{events::TurnEventPayload, turn_event_reads, turn_payload};
 
 pub async fn get_turn_item_events_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
     turn_id: &str,
     after_sequence: Option<i64>,
@@ -332,7 +332,7 @@ fn remember_agent_diff_snapshot_payload(
 }
 
 pub async fn latest_agent_diff_raw_payload_for_item(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
     turn_id: &str,
     item_id: &str,

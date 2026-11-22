@@ -7,6 +7,6 @@ authors.workspace = true
 
 [dependencies]
 pioneer-entity.workspace = true
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde_json.workspace = true

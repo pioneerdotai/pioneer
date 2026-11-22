@@ -173,7 +173,7 @@ async fn cli_adjacent_timestamp<C: ConnectionTrait>(
 }
 
 pub async fn latest_turn_id_by_creation_order(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
 ) -> Result<Option<String>> {
     // The timestamp seek and tie-breaker must see one reader snapshot.
@@ -189,7 +189,7 @@ pub async fn latest_turn_id_by_creation_order(
 }
 
 pub async fn turn_before_launch_and_intervening_by_creation_order(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     launch_turn_id: &str,
     allowed_task_run_turn_id: &str,
@@ -254,7 +254,7 @@ pub async fn turn_before_launch_and_intervening_by_creation_order(
 }
 
 pub async fn turn_ids_after_by_creation_order(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     source_turn_id: &str,
 ) -> Result<Vec<String>> {

@@ -25,16 +25,16 @@ struct Routes {
     maintenance_queued: tokio::sync::Notify,
     watch_claim: AtomicBool,
 }
-impl pioneer_sqlite::SqliteReadObserver for Routes {
-    fn observe(&self, _: pioneer_sqlite::SqliteReadEvent) {}
+impl pioneer_postgres_pools::PostgresReadObserver for Routes {
+    fn observe(&self, _: pioneer_postgres_pools::PostgresReadEvent) {}
 }
-impl pioneer_sqlite::SqliteWriteObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         if self.watch_claim.load(Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             )
@@ -44,29 +44,29 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
     }
 }
 
-async fn fixture_db() -> SqliteDatabase {
+async fn fixture_db() -> PostgresDatabase {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    SqliteDatabase::new(
+    PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     )
 }
 
-async fn terminal_fixture() -> (SqliteDatabase, TaskRun) {
+async fn terminal_fixture() -> (PostgresDatabase, TaskRun) {
     terminal_fixture_with_turn(true).await
 }
 
-async fn terminal_fixture_with_turn(include_occurrence: bool) -> (SqliteDatabase, TaskRun) {
+async fn terminal_fixture_with_turn(include_occurrence: bool) -> (PostgresDatabase, TaskRun) {
     let db = fixture_db().await;
     let run = seed_pair_with_turn(&db, include_occurrence).await;
     (db, run)
 }
 
-async fn seed_pair(db: &SqliteDatabase) -> TaskRun {
+async fn seed_pair(db: &PostgresDatabase) -> TaskRun {
     seed_pair_with_turn(db, true).await
 }
 
-async fn seed_pair_with_turn(db: &SqliteDatabase, include_occurrence: bool) -> TaskRun {
+async fn seed_pair_with_turn(db: &PostgresDatabase, include_occurrence: bool) -> TaskRun {
     db.execute_unprepared(
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_task','Tracker',TRUE,FALSE);
          INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class)
@@ -114,11 +114,11 @@ async fn seed_pair_with_turn(db: &SqliteDatabase, include_occurrence: bool) -> T
     run
 }
 
-async fn insert_occurrence(db: &SqliteDatabase, run_id: &str) {
+async fn insert_occurrence(db: &PostgresDatabase, run_id: &str) {
     insert_occurrence_with_kind(db, run_id, "task_run").await;
 }
 
-async fn insert_occurrence_with_kind(db: &SqliteDatabase, run_id: &str, kind: &str) {
+async fn insert_occurrence_with_kind(db: &PostgresDatabase, run_id: &str, kind: &str) {
     let tx = db.begin().await.unwrap();
     tx.execute_raw(Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
@@ -139,7 +139,7 @@ async fn insert_occurrence_with_kind(db: &SqliteDatabase, run_id: &str, kind: &s
 async fn observed_store(
     fixture: &pioneer_postgres_test::TestDatabase,
     routes: Arc<Routes>,
-) -> SqliteDatabase {
+) -> PostgresDatabase {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture
         .connect_with_options(|options| {
@@ -151,18 +151,19 @@ async fn observed_store(
         })
         .await
         .unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
-    SqliteDatabase::from_executor_with_read_observer(reader, executor, routes)
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, routes.clone());
+    PostgresDatabase::from_executor_with_read_observer(reader, executor, routes)
 }
 
-async fn row(store: &SqliteDatabase, id: &str) -> Option<pending::Model> {
+async fn row(store: &PostgresDatabase, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
         .one(store)
         .await
         .unwrap()
 }
 
-async fn generation(store: &SqliteDatabase) -> i64 {
+async fn generation(store: &PostgresDatabase) -> i64 {
     sequence::Entity::find_by_id(1)
         .one(store)
         .await
@@ -551,7 +552,7 @@ async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
     store.close().await.unwrap();
 }
 
-async fn claimed(store: &SqliteDatabase) -> TaskRunOccurrenceReconcileClaim {
+async fn claimed(store: &PostgresDatabase) -> TaskRunOccurrenceReconcileClaim {
     let queue = TaskRunOccurrenceQueue::new(store);
     let candidates = queue
         .discover_task_run_occurrence_reconcile(NOW, 64)
@@ -566,7 +567,7 @@ async fn claimed(store: &SqliteDatabase) -> TaskRunOccurrenceReconcileClaim {
 }
 
 async fn reconcile_without_publication(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
     claim: &TaskRunOccurrenceReconcileClaim,
 ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
     let scoped = connection.maintenance().with_critical_writes();
@@ -590,7 +591,7 @@ async fn reconcile_without_publication(
         .await
 }
 
-async fn remove_run(store: &SqliteDatabase, id: &str) -> runs::Model {
+async fn remove_run(store: &PostgresDatabase, id: &str) -> runs::Model {
     let tx = store.begin().await.unwrap();
     let saved = runs::Entity::find_by_id(id)
         .lock_exclusive()
@@ -606,7 +607,7 @@ async fn remove_run(store: &SqliteDatabase, id: &str) -> runs::Model {
     saved
 }
 
-async fn restore_run(store: &SqliteDatabase, saved: runs::Model) {
+async fn restore_run(store: &PostgresDatabase, saved: runs::Model) {
     let tx = store.begin().await.unwrap();
     let inserted = runs::Entity::insert(saved.into_active_model())
         .exec_with_returning(&tx)
@@ -618,7 +619,7 @@ async fn restore_run(store: &SqliteDatabase, saved: runs::Model) {
     tx.commit().await.unwrap();
 }
 
-async fn run_status(store: &SqliteDatabase, id: &str, status: &str) {
+async fn run_status(store: &PostgresDatabase, id: &str, status: &str) {
     let tx = store.begin().await.unwrap();
     update_run_in_transaction(
         &tx,
@@ -629,7 +630,7 @@ async fn run_status(store: &SqliteDatabase, id: &str, status: &str) {
     .unwrap();
     tx.commit().await.unwrap();
 }
-async fn turn_status(store: &SqliteDatabase, id: &str, status: &str) {
+async fn turn_status(store: &PostgresDatabase, id: &str, status: &str) {
     let tx = store.begin().await.unwrap();
     let before = turns::Entity::find_by_id(id)
         .lock_exclusive()
@@ -871,7 +872,7 @@ async fn trigger_updates_preserve_retry_and_ignore_noops_heartbeat_updated_at() 
     );
 }
 
-async fn prepared_facts(connection: &SqliteDatabase, run_id: &str) -> Box<OccurrenceSourceFacts> {
+async fn prepared_facts(connection: &PostgresDatabase, run_id: &str) -> Box<OccurrenceSourceFacts> {
     let scoped = connection.maintenance().with_critical_writes();
     match OccurrenceSourceFacts::prepare(&scoped, run_id.to_owned(), NOW, true)
         .await
@@ -885,7 +886,7 @@ async fn prepared_facts(connection: &SqliteDatabase, run_id: &str) -> Box<Occurr
 }
 
 async fn revalidate_without_publication(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
     facts: &OccurrenceSourceFacts,
     claim: &TaskRunOccurrenceReconcileClaim,
 ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {

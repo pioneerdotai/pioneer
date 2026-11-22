@@ -44,7 +44,7 @@ async fn receipt_lookup_error_keeps_its_typed_storage_reason() -> anyhow::Result
     let owner = fixture.connect_with_limit(1).await?;
     let contender = fixture.connect_with_limit(1).await?;
     contender.execute_unprepared("SET lock_timeout = '100ms'").await?;
-    let scoped = pioneer_sqlite::SqliteDatabase::from_single_connection(contender);
+    let scoped = pioneer_postgres_pools::PostgresDatabase::from_single_connection(contender);
     let store = pioneer_crud::CrudStore::new(scoped.clone());
     let tx = owner.begin().await?;
     tx.execute_unprepared("LOCK TABLE native_cancellation_context IN ACCESS EXCLUSIVE MODE").await?;

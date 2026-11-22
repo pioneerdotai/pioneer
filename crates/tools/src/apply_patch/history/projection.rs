@@ -93,7 +93,7 @@ impl TurnDiffState {
 }
 
 /// Validate the typed aggregate before it crosses either the in-memory or
-/// SQLite projection boundary.  The aggregate is normally produced by the
+/// PostgreSQL projection boundary.  The aggregate is normally produced by the
 /// bounded projector, but recovery and provider adapters also deserialize it
 /// from durable input; those paths must not be able to smuggle an unbounded or
 /// internally inconsistent state into the projection.
@@ -104,15 +104,15 @@ pub(crate) fn validate_turn_diff_state(state: &TurnDiffState) -> Result<(), Stri
     validate_non_empty_bounded(&state.thread_id, MAX_PROJECTION_ID_BYTES, "thread id")?;
     validate_non_empty_bounded(&state.turn_id, MAX_PROJECTION_ID_BYTES, "turn id")?;
     if state.revision > i64::MAX as u64 {
-        return Err("turn diff revision exceeds SQLite integer range".to_owned());
+        return Err("turn diff revision exceeds PostgreSQL integer range".to_owned());
     }
     if state.record_count > i64::MAX as u64 {
-        return Err("turn diff record count exceeds SQLite integer range".to_owned());
+        return Err("turn diff record count exceeds PostgreSQL integer range".to_owned());
     }
     if let Some(ordinal) = state.applied_through_ordinal
         && ordinal.0 > i64::MAX as u64
     {
-        return Err("turn diff applied ordinal exceeds SQLite integer range".to_owned());
+        return Err("turn diff applied ordinal exceeds PostgreSQL integer range".to_owned());
     }
     if state.aggregate.thread_id != state.thread_id || state.aggregate.turn_id != state.turn_id {
         return Err("turn diff aggregate identity disagrees with state identity".to_owned());

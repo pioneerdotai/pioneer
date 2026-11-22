@@ -170,7 +170,7 @@ async fn setup(
         ))
         .await
         .expect("workspace history fixtures must insert");
-    let store = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         database.clone(),
     ));

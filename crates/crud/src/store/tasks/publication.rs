@@ -87,7 +87,7 @@ impl CrudStore {
             events.iter().map(|event| event.task_id().to_owned()),
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_events_with_agent_action_once(
                     events.clone(),
                     event_timestamp_secs,
@@ -114,7 +114,7 @@ impl CrudStore {
             events.iter().map(|event| event.task_id().to_owned()),
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_events_with_execution_admission_once(
                     events.clone(),
                     event_timestamp_secs,
@@ -141,7 +141,7 @@ impl CrudStore {
             events.iter().map(|event| event.task_id().to_owned()),
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_events_with_execution_readmission_once(
                     events.clone(),
                     event_timestamp_secs,
@@ -169,7 +169,7 @@ impl CrudStore {
             events.iter().map(|event| event.task_id().to_owned()),
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_events_with_execution_readmission_and_agent_action_once(
                     events.clone(),
                     event_timestamp_secs,
@@ -205,7 +205,7 @@ impl CrudStore {
                 .as_ref()
                 .map(|s| frozen_lifetime::PreparedFrozenRoot::history(&s.history_json))
                 .transpose()?;
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.commit_task_creation_once(input.clone(), root.clone())
             })
             .await
@@ -229,7 +229,7 @@ impl CrudStore {
         updated_at: DateTimeWithTimeZone,
         agent_action: AgentCommitInput,
     ) -> Result<()> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             self.commit_agent_thread_creation_with_action_once(
                 thread.clone(),
                 execution_id.clone(),

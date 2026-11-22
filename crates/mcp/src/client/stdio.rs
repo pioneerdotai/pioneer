@@ -244,6 +244,8 @@ pub(crate) fn build_stdio_transport(
     if let Some(cwd) = transport.cwd.as_deref() {
         command.current_dir(cwd);
     }
+    // A server may provide its own URL through the materialized MCP config.
+    command.env_remove("DATABASE_URL");
     command.envs(
         transport
             .env

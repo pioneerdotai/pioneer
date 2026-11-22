@@ -20,24 +20,24 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use crate::reader::{SqliteMaintenanceReadPermit, SqliteReadOperation, SqliteReadOutcome};
+use crate::reader::{PostgresMaintenanceReadPermit, PostgresReadOperation, PostgresReadOutcome};
 
 pub const DEFAULT_MAX_CRITICAL_BURST: usize = 8;
 pub const DEFAULT_MAX_NON_MAINTENANCE_BURST: usize = 16;
 pub const DEFAULT_MAX_MAINTENANCE_WAIT_MS: u64 = 2_000;
 
-/// Scheduling class for every operation which can mutate the Gateway SQLite
+/// Scheduling class for every operation which can mutate the Gateway PostgreSQL
 /// database. The class is carried by a scoped database handle; callers never
 /// acquire scheduler permits themselves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SqliteWriteClass {
+pub enum PostgresWriteClass {
     Critical,
     #[default]
     Interactive,
     Maintenance,
 }
 
-impl SqliteWriteClass {
+impl PostgresWriteClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Critical => "critical",
@@ -48,18 +48,18 @@ impl SqliteWriteClass {
 }
 
 fn writer_pool_context(
-    class: SqliteWriteClass,
+    class: PostgresWriteClass,
 ) -> pioneer_observability::pool_context::PoolContext {
     use pioneer_observability::pool_context::PoolContext;
     match class {
-        SqliteWriteClass::Critical => PoolContext::WriterCritical,
-        SqliteWriteClass::Interactive => PoolContext::WriterInteractive,
-        SqliteWriteClass::Maintenance => PoolContext::WriterMaintenance,
+        PostgresWriteClass::Critical => PoolContext::WriterCritical,
+        PostgresWriteClass::Interactive => PoolContext::WriterInteractive,
+        PostgresWriteClass::Maintenance => PoolContext::WriterMaintenance,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SqliteWriteGrantReason {
+pub enum PostgresWriteGrantReason {
     Uncontended,
     OnlyClass,
     Priority,
@@ -67,7 +67,7 @@ pub enum SqliteWriteGrantReason {
     MaintenanceFairness,
 }
 
-impl SqliteWriteGrantReason {
+impl PostgresWriteGrantReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Uncontended => "uncontended",
@@ -80,75 +80,79 @@ impl SqliteWriteGrantReason {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SqliteWriteQueueSnapshot {
+pub struct PostgresWriteQueueSnapshot {
     pub critical: usize,
     pub interactive: usize,
     pub maintenance: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum SqliteWriteEvent {
+pub enum PostgresWriteEvent {
     Enqueued {
-        class: SqliteWriteClass,
-        queue: SqliteWriteQueueSnapshot,
+        class: PostgresWriteClass,
+        queue: PostgresWriteQueueSnapshot,
     },
     Acquired {
-        class: SqliteWriteClass,
-        reason: SqliteWriteGrantReason,
+        class: PostgresWriteClass,
+        reason: PostgresWriteGrantReason,
         waited: Duration,
-        queue: SqliteWriteQueueSnapshot,
+        queue: PostgresWriteQueueSnapshot,
     },
     Released {
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
         held: Duration,
-        queue: SqliteWriteQueueSnapshot,
+        queue: PostgresWriteQueueSnapshot,
     },
     Cancelled {
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
         waited: Duration,
-        queue: SqliteWriteQueueSnapshot,
+        queue: PostgresWriteQueueSnapshot,
     },
 }
 
-pub trait SqliteWriteObserver: Send + Sync + 'static {
-    fn observe(&self, event: SqliteWriteEvent);
+pub trait PostgresWriteObserver: Send + Sync + 'static {
+    fn observe(&self, event: PostgresWriteEvent);
 
     /// Atomic observation adapter. Called after the native state lock is released.
-    fn observe_admission(&self, event: SqliteWriteEvent, snapshot: crate::SqliteAdmissionSnapshot) {
+    fn observe_admission(
+        &self,
+        event: PostgresWriteEvent,
+        snapshot: crate::PostgresAdmissionSnapshot,
+    ) {
         self.observe(event);
         self.observe_queue_snapshot(snapshot);
     }
 
     /// Pure current owner snapshot after mutation, including the oldest of
     /// the three FIFO class heads. No queue scan or readiness query.
-    fn observe_queue_snapshot(&self, _snapshot: crate::SqliteAdmissionSnapshot) {}
+    fn observe_queue_snapshot(&self, _snapshot: crate::PostgresAdmissionSnapshot) {}
 
     /// Test-only pause after `execute_raw` owns its writer permit. The Gateway
     /// enables this feature only for tests; normal builds omit the hook.
     #[cfg(feature = "test-support")]
     fn pause_execute_raw_after_acquire_for_test(
         &self,
-        _class: SqliteWriteClass,
+        _class: PostgresWriteClass,
     ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
         None
     }
 }
 
 #[derive(Default)]
-struct NoopSqliteWriteObserver;
+struct NoopPostgresWriteObserver;
 
-impl SqliteWriteObserver for NoopSqliteWriteObserver {
-    fn observe(&self, _event: SqliteWriteEvent) {}
+impl PostgresWriteObserver for NoopPostgresWriteObserver {
+    fn observe(&self, _event: PostgresWriteEvent) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SqliteWritePolicy {
+pub struct PostgresWritePolicy {
     pub max_critical_burst: usize,
     pub max_non_maintenance_burst: usize,
     pub max_maintenance_wait: Duration,
 }
 
-impl Default for SqliteWritePolicy {
+impl Default for PostgresWritePolicy {
     fn default() -> Self {
         Self {
             max_critical_burst: DEFAULT_MAX_CRITICAL_BURST,
@@ -177,19 +181,19 @@ struct AdmissionState {
 }
 
 impl AdmissionState {
-    fn snapshot(&self) -> SqliteWriteQueueSnapshot {
-        SqliteWriteQueueSnapshot {
+    fn snapshot(&self) -> PostgresWriteQueueSnapshot {
+        PostgresWriteQueueSnapshot {
             critical: self.critical.len(),
             interactive: self.interactive.len(),
             maintenance: self.maintenance.len(),
         }
     }
 
-    fn queue_mut(&mut self, class: SqliteWriteClass) -> &mut VecDeque<Waiter> {
+    fn queue_mut(&mut self, class: PostgresWriteClass) -> &mut VecDeque<Waiter> {
         match class {
-            SqliteWriteClass::Critical => &mut self.critical,
-            SqliteWriteClass::Interactive => &mut self.interactive,
-            SqliteWriteClass::Maintenance => &mut self.maintenance,
+            PostgresWriteClass::Critical => &mut self.critical,
+            PostgresWriteClass::Interactive => &mut self.interactive,
+            PostgresWriteClass::Maintenance => &mut self.maintenance,
         }
     }
 }
@@ -198,8 +202,8 @@ struct AdmissionInner {
     state: Mutex<AdmissionState>,
     next_waiter_id: AtomicU64,
     capacity: usize,
-    policy: SqliteWritePolicy,
-    observer: Arc<dyn SqliteWriteObserver>,
+    policy: PostgresWritePolicy,
+    observer: Arc<dyn PostgresWriteObserver>,
 }
 
 struct Dispatch {
@@ -209,11 +213,11 @@ struct Dispatch {
 
 struct Reservation {
     inner: Arc<AdmissionInner>,
-    class: SqliteWriteClass,
-    reason: SqliteWriteGrantReason,
+    class: PostgresWriteClass,
+    reason: PostgresWriteGrantReason,
     enqueued_at: Instant,
     acquired_at: Instant,
-    queue: SqliteWriteQueueSnapshot,
+    queue: PostgresWriteQueueSnapshot,
     started: bool,
 }
 
@@ -222,7 +226,7 @@ impl Reservation {
         self.started = true;
         let snapshot = self.inner.queue_observation();
         self.inner.observer.observe_admission(
-            SqliteWriteEvent::Acquired {
+            PostgresWriteEvent::Acquired {
                 class: self.class,
                 reason: self.reason,
                 waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
@@ -239,7 +243,7 @@ impl Drop for Reservation {
         let (queue, snapshot, dispatch) = self.inner.release(self.class);
         if self.started {
             self.inner.observer.observe_admission(
-                SqliteWriteEvent::Released {
+                PostgresWriteEvent::Released {
                     class: self.class,
                     held,
                     queue,
@@ -252,7 +256,7 @@ impl Drop for Reservation {
             // race still has to close the observer lifecycle; otherwise an
             // `Enqueued` event would have neither `Acquired` nor `Cancelled`.
             self.inner.observer.observe_admission(
-                SqliteWriteEvent::Cancelled {
+                PostgresWriteEvent::Cancelled {
                     class: self.class,
                     waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
                     queue,
@@ -267,7 +271,7 @@ impl Drop for Reservation {
 struct WaitRegistration {
     inner: Arc<AdmissionInner>,
     id: u64,
-    class: SqliteWriteClass,
+    class: PostgresWriteClass,
     enqueued_at: Instant,
     armed: bool,
 }
@@ -287,7 +291,7 @@ impl Drop for WaitRegistration {
             return;
         };
         self.inner.observer.observe_admission(
-            SqliteWriteEvent::Cancelled {
+            PostgresWriteEvent::Cancelled {
                 class: self.class,
                 waited: self.enqueued_at.elapsed(),
                 queue,
@@ -299,14 +303,14 @@ impl Drop for WaitRegistration {
 }
 
 #[derive(Clone)]
-struct SqliteWritePermit {
+struct PostgresWritePermit {
     // The reservation is released only after the final owner disappears.
     // Nested transactions clone this lease so dropping the root wrapper
     // cannot expose the physical writer while a savepoint is still alive.
     _reservation: Arc<Reservation>,
 }
 
-impl SqliteWritePermit {
+impl PostgresWritePermit {
     fn new(mut reservation: Reservation) -> Self {
         reservation.start();
         Self {
@@ -314,13 +318,13 @@ impl SqliteWritePermit {
         }
     }
 
-    fn class(&self) -> SqliteWriteClass {
+    fn class(&self) -> PostgresWriteClass {
         self._reservation.class
     }
 }
 
 impl AdmissionInner {
-    fn queue_observation(&self) -> crate::SqliteAdmissionSnapshot {
+    fn queue_observation(&self) -> crate::PostgresAdmissionSnapshot {
         let mut state = self
             .state
             .lock()
@@ -328,7 +332,7 @@ impl AdmissionInner {
         Self::queue_observation_locked(&mut state)
     }
 
-    fn queue_observation_locked(state: &mut AdmissionState) -> crate::SqliteAdmissionSnapshot {
+    fn queue_observation_locked(state: &mut AdmissionState) -> crate::PostgresAdmissionSnapshot {
         state.observation_revision = state.observation_revision.saturating_add(1);
         let oldest = [
             state.critical.front(),
@@ -340,7 +344,7 @@ impl AdmissionInner {
         .map(|waiter| waiter.enqueued_at)
         .min();
         let queue = state.snapshot();
-        crate::SqliteAdmissionSnapshot::capture(
+        crate::PostgresAdmissionSnapshot::capture(
             state.observation_revision,
             queue
                 .critical
@@ -352,7 +356,7 @@ impl AdmissionInner {
 
     fn enqueue(
         self: &Arc<Self>,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
     ) -> (oneshot::Receiver<Reservation>, WaitRegistration) {
         let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
         let enqueued_at = Instant::now();
@@ -374,7 +378,7 @@ impl AdmissionInner {
             (queue, snapshot, dispatch)
         };
         self.observer
-            .observe_admission(SqliteWriteEvent::Enqueued { class, queue }, snapshot);
+            .observe_admission(PostgresWriteEvent::Enqueued { class, queue }, snapshot);
         Self::dispatch(dispatch);
         (
             receiver,
@@ -391,10 +395,10 @@ impl AdmissionInner {
     fn cancel(
         self: &Arc<Self>,
         id: u64,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
     ) -> Option<(
-        SqliteWriteQueueSnapshot,
-        crate::SqliteAdmissionSnapshot,
+        PostgresWriteQueueSnapshot,
+        crate::PostgresAdmissionSnapshot,
         Option<Dispatch>,
     )> {
         let mut state = self
@@ -414,10 +418,10 @@ impl AdmissionInner {
 
     fn release(
         self: &Arc<Self>,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
     ) -> (
-        SqliteWriteQueueSnapshot,
-        crate::SqliteAdmissionSnapshot,
+        PostgresWriteQueueSnapshot,
+        crate::PostgresAdmissionSnapshot,
         Option<Dispatch>,
     ) {
         let mut state = self
@@ -429,7 +433,7 @@ impl AdmissionInner {
             "database writer released without an owner"
         );
         state.active -= 1;
-        if class == SqliteWriteClass::Maintenance {
+        if class == PostgresWriteClass::Maintenance {
             state.active_maintenance -= 1;
         }
         let queue = state.snapshot();
@@ -470,68 +474,71 @@ impl AdmissionInner {
         } else if newly_uncontended && class_count == 1 {
             debug_assert_eq!(class_count, 1);
             let class = if critical {
-                SqliteWriteClass::Critical
+                PostgresWriteClass::Critical
             } else if interactive {
-                SqliteWriteClass::Interactive
+                PostgresWriteClass::Interactive
             } else {
-                SqliteWriteClass::Maintenance
+                PostgresWriteClass::Maintenance
             };
-            (class, SqliteWriteGrantReason::Uncontended)
+            (class, PostgresWriteGrantReason::Uncontended)
         } else if class_count == 1 {
             let class = if critical {
-                SqliteWriteClass::Critical
+                PostgresWriteClass::Critical
             } else if interactive {
-                SqliteWriteClass::Interactive
+                PostgresWriteClass::Interactive
             } else {
-                SqliteWriteClass::Maintenance
+                PostgresWriteClass::Maintenance
             };
-            (class, SqliteWriteGrantReason::OnlyClass)
+            (class, PostgresWriteGrantReason::OnlyClass)
         } else if maintenance_due {
             (
-                SqliteWriteClass::Maintenance,
-                SqliteWriteGrantReason::MaintenanceFairness,
+                PostgresWriteClass::Maintenance,
+                PostgresWriteGrantReason::MaintenanceFairness,
             )
         } else if interactive_due {
             (
-                SqliteWriteClass::Interactive,
-                SqliteWriteGrantReason::InteractiveFairness,
+                PostgresWriteClass::Interactive,
+                PostgresWriteGrantReason::InteractiveFairness,
             )
         } else if critical {
-            (SqliteWriteClass::Critical, SqliteWriteGrantReason::Priority)
+            (
+                PostgresWriteClass::Critical,
+                PostgresWriteGrantReason::Priority,
+            )
         } else if interactive {
             (
-                SqliteWriteClass::Interactive,
-                SqliteWriteGrantReason::Priority,
+                PostgresWriteClass::Interactive,
+                PostgresWriteGrantReason::Priority,
             )
         } else {
             (
-                SqliteWriteClass::Maintenance,
-                SqliteWriteGrantReason::Priority,
+                PostgresWriteClass::Maintenance,
+                PostgresWriteGrantReason::Priority,
             )
         };
 
         match reason {
-            SqliteWriteGrantReason::Uncontended | SqliteWriteGrantReason::OnlyClass => {
+            PostgresWriteGrantReason::Uncontended | PostgresWriteGrantReason::OnlyClass => {
                 // Fairness debt is meaningful only while classes contend.
                 // Work which ran alone must not make a future waiter jump the
                 // queue based on activity which predated that waiter.
                 state.consecutive_critical = 0;
                 state.consecutive_non_maintenance = 0;
             }
-            SqliteWriteGrantReason::Priority
-            | SqliteWriteGrantReason::InteractiveFairness
-            | SqliteWriteGrantReason::MaintenanceFairness => match class {
-                SqliteWriteClass::Critical => {
+            PostgresWriteGrantReason::Priority
+            | PostgresWriteGrantReason::InteractiveFairness
+            | PostgresWriteGrantReason::MaintenanceFairness => match class {
+                PostgresWriteClass::Critical => {
                     state.consecutive_critical = state.consecutive_critical.saturating_add(1);
                     state.consecutive_non_maintenance =
                         state.consecutive_non_maintenance.saturating_add(1);
                 }
-                SqliteWriteClass::Interactive => {
+                PostgresWriteClass::Interactive => {
                     state.consecutive_critical = 0;
                     state.consecutive_non_maintenance =
                         state.consecutive_non_maintenance.saturating_add(1);
                 }
-                SqliteWriteClass::Maintenance => {
+                PostgresWriteClass::Maintenance => {
                     state.consecutive_critical = 0;
                     state.consecutive_non_maintenance = 0;
                 }
@@ -541,9 +548,9 @@ impl AdmissionInner {
         let waiter = state
             .queue_mut(class)
             .pop_front()
-            .expect("selected SQLite writer queue must contain a waiter");
+            .expect("selected PostgreSQL writer queue must contain a waiter");
         state.active += 1;
-        if class == SqliteWriteClass::Maintenance {
+        if class == PostgresWriteClass::Maintenance {
             state.active_maintenance += 1;
         }
         let queue = state.snapshot();
@@ -574,20 +581,20 @@ impl AdmissionInner {
 /// Write pool and its scheduling queue. A write cannot reach the pool without
 /// a classed reservation.
 #[derive(Clone)]
-pub struct SqliteWriteExecutor {
+pub struct PostgresWriteExecutor {
     connection: DatabaseConnection,
     admission: Arc<AdmissionInner>,
     work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
     settlement: Arc<tokio::sync::Mutex<()>>,
 }
 
-impl std::fmt::Debug for SqliteWriteExecutor {
+impl std::fmt::Debug for PostgresWriteExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SqliteWriteExecutor")
+        formatter.write_str("PostgresWriteExecutor")
     }
 }
 
-impl SqliteWriteExecutor {
+impl PostgresWriteExecutor {
     pub(crate) fn runtime_identity(&self) -> usize {
         Arc::as_ptr(&self.admission) as usize
     }
@@ -595,22 +602,22 @@ impl SqliteWriteExecutor {
     pub fn new(connection: DatabaseConnection) -> Self {
         Self::with_policy_and_observer(
             connection,
-            SqliteWritePolicy::default(),
-            Arc::new(NoopSqliteWriteObserver),
+            PostgresWritePolicy::default(),
+            Arc::new(NoopPostgresWriteObserver),
         )
     }
 
     pub fn with_observer(
         connection: DatabaseConnection,
-        observer: Arc<dyn SqliteWriteObserver>,
+        observer: Arc<dyn PostgresWriteObserver>,
     ) -> Self {
-        Self::with_policy_and_observer(connection, SqliteWritePolicy::default(), observer)
+        Self::with_policy_and_observer(connection, PostgresWritePolicy::default(), observer)
     }
 
     pub fn with_policy_and_observer(
         connection: DatabaseConnection,
-        policy: SqliteWritePolicy,
-        observer: Arc<dyn SqliteWriteObserver>,
+        policy: PostgresWritePolicy,
+        observer: Arc<dyn PostgresWriteObserver>,
     ) -> Self {
         let capacity = match connection.get_database_backend() {
             DbBackend::Postgres if !connection.is_mock_connection() => connection
@@ -634,8 +641,8 @@ impl SqliteWriteExecutor {
         }
     }
 
-    pub(crate) fn connection(&self, class: SqliteWriteClass) -> SqliteWriteConnection {
-        SqliteWriteConnection {
+    pub(crate) fn connection(&self, class: PostgresWriteClass) -> PostgresWriteConnection {
+        PostgresWriteConnection {
             executor: self.clone(),
             class,
         }
@@ -659,7 +666,7 @@ impl SqliteWriteExecutor {
 
     pub(crate) async fn settle_dispatched_writes(
         &self,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
     ) -> Result<(), DbErr> {
         let backend = self.connection.get_database_backend();
         if backend != DbBackend::Postgres || self.connection.is_mock_connection() {
@@ -701,7 +708,7 @@ impl SqliteWriteExecutor {
 
     /// Validates the physical writer connection under the same typed
     /// reservation and pool-attribution contract as every other operation.
-    pub async fn ping(&self, class: SqliteWriteClass) -> Result<(), DbErr> {
+    pub async fn ping(&self, class: PostgresWriteClass) -> Result<(), DbErr> {
         let permit = self.acquire(class).await;
         observe_control(self.connection.ping(), "ping")
             .in_pool(writer_pool_context(permit.class()))
@@ -713,7 +720,7 @@ impl SqliteWriteExecutor {
     /// bootstrap callback from cloning and leaking the raw connection.
     pub async fn run_migrations<M>(
         &self,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
         steps: Option<u32>,
     ) -> Result<(), DbErr>
     where
@@ -725,29 +732,29 @@ impl SqliteWriteExecutor {
             .await
     }
 
-    async fn acquire(&self, class: SqliteWriteClass) -> SqliteWritePermit {
+    async fn acquire(&self, class: PostgresWriteClass) -> PostgresWritePermit {
         let _startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbAdmission,
         );
         let (receiver, mut registration) = self.admission.enqueue(class);
         let reservation = receiver
             .await
-            .expect("SQLite writer executor must outlive its queued reservations");
+            .expect("PostgreSQL writer executor must outlive its queued reservations");
         registration.disarm();
-        SqliteWritePermit::new(reservation)
+        PostgresWritePermit::new(reservation)
     }
 }
 
 /// A class-scoped view of the writer executor. It exposes SeaORM traits but
 /// never the underlying physical connection.
 #[derive(Clone, Debug)]
-pub(crate) struct SqliteWriteConnection {
-    executor: SqliteWriteExecutor,
-    class: SqliteWriteClass,
+pub(crate) struct PostgresWriteConnection {
+    executor: PostgresWriteExecutor,
+    class: PostgresWriteClass,
 }
 
 #[async_trait]
-impl ConnectionTrait for SqliteWriteConnection {
+impl ConnectionTrait for PostgresWriteConnection {
     fn get_database_backend(&self) -> DbBackend {
         self.executor.connection.get_database_backend()
     }
@@ -813,18 +820,18 @@ impl ConnectionTrait for SqliteWriteConnection {
 /// Stream wrapper which retains either the writer reservation or the
 /// maintenance-read permit until the returned rows have been consumed or the
 /// stream is dropped.
-pub struct SqliteQueryStream {
+pub struct PostgresQueryStream {
     inner: DiagnosticStream<QueryStream>,
-    writer_permit: Option<SqliteWritePermit>,
-    maintenance_read_permit: Option<SqliteMaintenanceReadPermit>,
-    read_operation: Option<SqliteReadOperation>,
+    writer_permit: Option<PostgresWritePermit>,
+    maintenance_read_permit: Option<PostgresMaintenanceReadPermit>,
+    read_operation: Option<PostgresReadOperation>,
 }
 
-impl SqliteQueryStream {
+impl PostgresQueryStream {
     pub(crate) fn read(
         inner: DiagnosticStream<QueryStream>,
-        permit: Option<SqliteMaintenanceReadPermit>,
-        operation: SqliteReadOperation,
+        permit: Option<PostgresMaintenanceReadPermit>,
+        operation: PostgresReadOperation,
     ) -> Self {
         Self {
             inner,
@@ -834,7 +841,7 @@ impl SqliteQueryStream {
         }
     }
 
-    fn write(inner: DiagnosticStream<QueryStream>, permit: SqliteWritePermit) -> Self {
+    fn write(inner: DiagnosticStream<QueryStream>, permit: PostgresWritePermit) -> Self {
         Self {
             inner,
             writer_permit: Some(permit),
@@ -844,7 +851,7 @@ impl SqliteQueryStream {
     }
 }
 
-impl Stream for SqliteQueryStream {
+impl Stream for PostgresQueryStream {
     type Item = Result<QueryResult, DbErr>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -852,7 +859,7 @@ impl Stream for SqliteQueryStream {
         match &result {
             Poll::Ready(None) => {
                 if let Some(operation) = self.read_operation.as_mut() {
-                    operation.finish(SqliteReadOutcome::Ok);
+                    operation.finish(PostgresReadOutcome::Ok);
                 }
                 self.read_operation.take();
                 self.writer_permit.take();
@@ -860,7 +867,7 @@ impl Stream for SqliteQueryStream {
             }
             Poll::Ready(Some(Err(_))) => {
                 if let Some(operation) = self.read_operation.as_mut() {
-                    operation.finish(SqliteReadOutcome::Error);
+                    operation.finish(PostgresReadOutcome::Error);
                 }
                 self.read_operation.take();
             }
@@ -870,8 +877,8 @@ impl Stream for SqliteQueryStream {
     }
 }
 
-impl StreamTrait for SqliteWriteConnection {
-    type Stream<'a> = SqliteQueryStream;
+impl StreamTrait for PostgresWriteConnection {
+    type Stream<'a> = PostgresQueryStream;
 
     fn get_database_backend(&self) -> DbBackend {
         self.executor.connection.get_database_backend()
@@ -890,33 +897,33 @@ impl StreamTrait for SqliteWriteConnection {
             let stream = open_stream(self.executor.connection.stream_raw(statement))
                 .in_pool(writer_pool_context(effective_class))
                 .await?;
-            Ok(SqliteQueryStream::write(stream, permit))
+            Ok(PostgresQueryStream::write(stream, permit))
         })
     }
 }
 
 /// Transaction returned by the writer executor. The reservation is released
 /// only after the SeaORM transaction commits, rolls back, or is dropped.
-pub struct SqliteTransaction {
+pub struct PostgresTransaction {
     inner: Option<DatabaseTransaction>,
-    _permit: Option<SqliteWritePermit>,
+    _permit: Option<PostgresWritePermit>,
 }
 
-impl std::fmt::Debug for SqliteTransaction {
+impl std::fmt::Debug for PostgresTransaction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SqliteTransaction")
+        formatter.write_str("PostgresTransaction")
     }
 }
 
-impl SqliteTransaction {
-    fn root(inner: DatabaseTransaction, permit: SqliteWritePermit) -> Self {
+impl PostgresTransaction {
+    fn root(inner: DatabaseTransaction, permit: PostgresWritePermit) -> Self {
         Self {
             inner: Some(inner),
             _permit: Some(permit),
         }
     }
 
-    fn nested(inner: DatabaseTransaction, permit: SqliteWritePermit) -> Self {
+    fn nested(inner: DatabaseTransaction, permit: PostgresWritePermit) -> Self {
         Self {
             inner: Some(inner),
             _permit: Some(permit),
@@ -926,14 +933,14 @@ impl SqliteTransaction {
     fn inner(&self) -> &DatabaseTransaction {
         self.inner
             .as_ref()
-            .expect("SQLite transaction was already completed")
+            .expect("PostgreSQL transaction was already completed")
     }
 
     fn pool_context(&self) -> pioneer_observability::pool_context::PoolContext {
         writer_pool_context(
             self._permit
                 .as_ref()
-                .expect("SQLite transaction must retain a writer permit")
+                .expect("PostgreSQL transaction must retain a writer permit")
                 .class(),
         )
     }
@@ -945,7 +952,7 @@ impl SqliteTransaction {
         observe_control(
             self.inner
                 .take()
-                .expect("SQLite transaction was already completed")
+                .expect("PostgreSQL transaction was already completed")
                 .commit(),
             "commit",
         )
@@ -957,7 +964,7 @@ impl SqliteTransaction {
         observe_control(
             self.inner
                 .take()
-                .expect("SQLite transaction was already completed")
+                .expect("PostgreSQL transaction was already completed")
                 .rollback(),
             "rollback",
         )
@@ -966,7 +973,7 @@ impl SqliteTransaction {
     }
 }
 
-impl Deref for SqliteTransaction {
+impl Deref for PostgresTransaction {
     type Target = DatabaseTransaction;
 
     fn deref(&self) -> &Self::Target {
@@ -975,7 +982,7 @@ impl Deref for SqliteTransaction {
 }
 
 // Drop-triggered rollback is its own control command, never a successful SQL query.
-impl Drop for SqliteTransaction {
+impl Drop for PostgresTransaction {
     fn drop(&mut self) {
         if self.inner.is_some() {
             let _pool = self.pool_context().enter();
@@ -987,18 +994,18 @@ impl Drop for SqliteTransaction {
 }
 
 #[async_trait]
-impl TransactionSession for SqliteTransaction {
+impl TransactionSession for PostgresTransaction {
     async fn commit(self) -> Result<(), DbErr> {
-        SqliteTransaction::commit(self).await
+        PostgresTransaction::commit(self).await
     }
 
     async fn rollback(self) -> Result<(), DbErr> {
-        SqliteTransaction::rollback(self).await
+        PostgresTransaction::rollback(self).await
     }
 }
 
 #[async_trait]
-impl ConnectionTrait for SqliteTransaction {
+impl ConnectionTrait for PostgresTransaction {
     fn get_database_backend(&self) -> DbBackend {
         ConnectionTrait::get_database_backend(self.inner())
     }
@@ -1036,7 +1043,7 @@ impl ConnectionTrait for SqliteTransaction {
     }
 }
 
-impl StreamTrait for SqliteTransaction {
+impl StreamTrait for PostgresTransaction {
     type Stream<'a> = DiagnosticStream<TransactionStream<'a>>;
 
     fn get_database_backend(&self) -> DbBackend {
@@ -1068,7 +1075,7 @@ impl StreamTrait for SqliteTransaction {
 }
 
 async fn finish_callback<T, E>(
-    transaction: SqliteTransaction,
+    transaction: PostgresTransaction,
     result: Result<T, E>,
 ) -> Result<T, TransactionError<E>>
 where
@@ -1093,8 +1100,8 @@ where
 }
 
 #[async_trait]
-impl TransactionTrait for SqliteWriteConnection {
-    type Transaction = SqliteTransaction;
+impl TransactionTrait for PostgresWriteConnection {
+    type Transaction = PostgresTransaction;
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire(self.class).await;
@@ -1105,7 +1112,7 @@ impl TransactionTrait for SqliteWriteConnection {
         let transaction = observe_control(self.executor.connection.begin(), "begin")
             .in_pool(writer_pool_context(effective_class))
             .await?;
-        Ok(SqliteTransaction::root(transaction, permit))
+        Ok(PostgresTransaction::root(transaction, permit))
     }
 
     async fn begin_with_config(
@@ -1126,7 +1133,7 @@ impl TransactionTrait for SqliteWriteConnection {
         )
         .in_pool(writer_pool_context(effective_class))
         .await?;
-        Ok(SqliteTransaction::root(transaction, permit))
+        Ok(PostgresTransaction::root(transaction, permit))
     }
 
     async fn begin_with_options(
@@ -1144,7 +1151,7 @@ impl TransactionTrait for SqliteWriteConnection {
         )
         .in_pool(writer_pool_context(effective_class))
         .await?;
-        Ok(SqliteTransaction::root(transaction, permit))
+        Ok(PostgresTransaction::root(transaction, permit))
     }
 
     async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
@@ -1185,17 +1192,17 @@ impl TransactionTrait for SqliteWriteConnection {
 }
 
 #[async_trait]
-impl TransactionTrait for SqliteTransaction {
-    type Transaction = SqliteTransaction;
+impl TransactionTrait for PostgresTransaction {
+    type Transaction = PostgresTransaction;
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
-        Ok(SqliteTransaction::nested(
+        Ok(PostgresTransaction::nested(
             observe_control(self.inner().begin(), "begin")
                 .in_pool(self.pool_context())
                 .await?,
             self._permit
                 .as_ref()
-                .expect("SQLite transaction must retain a writer permit")
+                .expect("PostgreSQL transaction must retain a writer permit")
                 .clone(),
         ))
     }
@@ -1205,7 +1212,7 @@ impl TransactionTrait for SqliteTransaction {
         isolation_level: Option<IsolationLevel>,
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
-        Ok(SqliteTransaction::nested(
+        Ok(PostgresTransaction::nested(
             observe_control(
                 self.inner().begin_with_config(isolation_level, access_mode),
                 "begin",
@@ -1214,7 +1221,7 @@ impl TransactionTrait for SqliteTransaction {
             .await?,
             self._permit
                 .as_ref()
-                .expect("SQLite transaction must retain a writer permit")
+                .expect("PostgreSQL transaction must retain a writer permit")
                 .clone(),
         ))
     }
@@ -1223,13 +1230,13 @@ impl TransactionTrait for SqliteTransaction {
         &self,
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
-        Ok(SqliteTransaction::nested(
+        Ok(PostgresTransaction::nested(
             observe_control(self.inner().begin_with_options(options), "begin")
                 .in_pool(self.pool_context())
                 .await?,
             self._permit
                 .as_ref()
-                .expect("SQLite transaction must retain a writer permit")
+                .expect("PostgreSQL transaction must retain a writer permit")
                 .clone(),
         ))
     }
@@ -1277,19 +1284,19 @@ mod tests {
     use futures_util::StreamExt;
     use tokio::sync::{Notify, mpsc};
 
-    fn admission(policy: SqliteWritePolicy) -> Arc<AdmissionInner> {
+    fn admission(policy: PostgresWritePolicy) -> Arc<AdmissionInner> {
         Arc::new(AdmissionInner {
             state: Mutex::new(AdmissionState::default()),
             next_waiter_id: AtomicU64::new(1),
             capacity: 1,
             policy,
-            observer: Arc::new(NoopSqliteWriteObserver),
+            observer: Arc::new(NoopPostgresWriteObserver),
         })
     }
 
     #[test]
     fn native_current_snapshot_carries_source_order_and_oldest_without_sql() {
-        let inner = admission(SqliteWritePolicy::default());
+        let inner = admission(PostgresWritePolicy::default());
         let (sender, _receiver) = oneshot::channel();
         inner.state.lock().unwrap().maintenance.push_back(Waiter {
             id: 1,
@@ -1305,19 +1312,22 @@ mod tests {
         assert!(new.revision > old.revision);
         assert!(new.sampled_monotonic_ms >= old.sampled_monotonic_ms);
         // Existing observers still only implement observe; snapshot callback is optional.
-        NoopSqliteWriteObserver.observe_queue_snapshot(new);
-        NoopSqliteWriteObserver.observe_queue_snapshot(old);
+        NoopPostgresWriteObserver.observe_queue_snapshot(new);
+        NoopPostgresWriteObserver.observe_queue_snapshot(old);
     }
-    async fn acquire(inner: &Arc<AdmissionInner>, class: SqliteWriteClass) -> SqliteWritePermit {
+    async fn acquire(
+        inner: &Arc<AdmissionInner>,
+        class: PostgresWriteClass,
+    ) -> PostgresWritePermit {
         let (receiver, mut registration) = inner.enqueue(class);
         let reservation = receiver.await.expect("reservation");
         registration.disarm();
-        SqliteWritePermit::new(reservation)
+        PostgresWritePermit::new(reservation)
     }
 
     fn spawn_waiter(
         inner: Arc<AdmissionInner>,
-        class: SqliteWriteClass,
+        class: PostgresWriteClass,
         name: &'static str,
         acquired: mpsc::UnboundedSender<&'static str>,
         release: Arc<Notify>,
@@ -1329,7 +1339,7 @@ mod tests {
         })
     }
 
-    async fn wait_for_queue(inner: &Arc<AdmissionInner>, expected: SqliteWriteQueueSnapshot) {
+    async fn wait_for_queue(inner: &Arc<AdmissionInner>, expected: PostgresWriteQueueSnapshot) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let snapshot = inner
@@ -1349,36 +1359,36 @@ mod tests {
 
     #[tokio::test]
     async fn critical_precedes_interactive_and_maintenance() {
-        let inner = admission(SqliteWritePolicy::default());
-        let blocker = acquire(&inner, SqliteWriteClass::Interactive).await;
+        let inner = admission(PostgresWritePolicy::default());
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
         let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
         let critical_release = Arc::new(Notify::new());
         let interactive_release = Arc::new(Notify::new());
         let maintenance_release = Arc::new(Notify::new());
         let maintenance = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Maintenance,
+            PostgresWriteClass::Maintenance,
             "maintenance",
             acquired_tx.clone(),
             maintenance_release.clone(),
         );
         let interactive = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Interactive,
+            PostgresWriteClass::Interactive,
             "interactive",
             acquired_tx.clone(),
             interactive_release.clone(),
         );
         let critical = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical",
             acquired_tx,
             critical_release.clone(),
         );
         wait_for_queue(
             &inner,
-            SqliteWriteQueueSnapshot {
+            PostgresWriteQueueSnapshot {
                 critical: 1,
                 interactive: 1,
                 maintenance: 1,
@@ -1400,45 +1410,45 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_progress_is_bounded_under_continuous_critical_load() {
-        let inner = admission(SqliteWritePolicy {
+        let inner = admission(PostgresWritePolicy {
             max_critical_burst: 2,
             max_non_maintenance_burst: 32,
             max_maintenance_wait: Duration::from_secs(60),
         });
-        let blocker = acquire(&inner, SqliteWriteClass::Interactive).await;
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
         let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
         let releases = (0..4).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
         let interactive = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Interactive,
+            PostgresWriteClass::Interactive,
             "interactive",
             acquired_tx.clone(),
             releases[0].clone(),
         );
         let critical_one = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-1",
             acquired_tx.clone(),
             releases[1].clone(),
         );
         let critical_two = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-2",
             acquired_tx.clone(),
             releases[2].clone(),
         );
         let critical_three = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-3",
             acquired_tx,
             releases[3].clone(),
         );
         wait_for_queue(
             &inner,
-            SqliteWriteQueueSnapshot {
+            PostgresWriteQueueSnapshot {
                 critical: 3,
                 interactive: 1,
                 maintenance: 0,
@@ -1463,52 +1473,52 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_progress_is_bounded_under_mixed_non_maintenance_load() {
-        let inner = admission(SqliteWritePolicy {
+        let inner = admission(PostgresWritePolicy {
             max_critical_burst: 2,
             max_non_maintenance_burst: 3,
             max_maintenance_wait: Duration::from_secs(60),
         });
-        let blocker = acquire(&inner, SqliteWriteClass::Interactive).await;
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
         let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
         let releases = (0..5).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
         let maintenance = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Maintenance,
+            PostgresWriteClass::Maintenance,
             "maintenance",
             acquired_tx.clone(),
             releases[0].clone(),
         );
         let interactive = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Interactive,
+            PostgresWriteClass::Interactive,
             "interactive",
             acquired_tx.clone(),
             releases[1].clone(),
         );
         let critical_one = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-1",
             acquired_tx.clone(),
             releases[2].clone(),
         );
         let critical_two = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-2",
             acquired_tx.clone(),
             releases[3].clone(),
         );
         let critical_three = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical-3",
             acquired_tx,
             releases[4].clone(),
         );
         wait_for_queue(
             &inner,
-            SqliteWriteQueueSnapshot {
+            PostgresWriteQueueSnapshot {
                 critical: 3,
                 interactive: 1,
                 maintenance: 1,
@@ -1541,17 +1551,17 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_queued_waiter_does_not_leak_writer_capacity() {
-        let inner = admission(SqliteWritePolicy::default());
-        let blocker = acquire(&inner, SqliteWriteClass::Interactive).await;
+        let inner = admission(PostgresWritePolicy::default());
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
         let cancelled = tokio::spawn({
             let inner = inner.clone();
             async move {
-                let _permit = acquire(&inner, SqliteWriteClass::Maintenance).await;
+                let _permit = acquire(&inner, PostgresWriteClass::Maintenance).await;
             }
         });
         wait_for_queue(
             &inner,
-            SqliteWriteQueueSnapshot {
+            PostgresWriteQueueSnapshot {
                 critical: 0,
                 interactive: 0,
                 maintenance: 1,
@@ -1560,12 +1570,12 @@ mod tests {
         .await;
         cancelled.abort();
         let _ = cancelled.await;
-        wait_for_queue(&inner, SqliteWriteQueueSnapshot::default()).await;
+        wait_for_queue(&inner, PostgresWriteQueueSnapshot::default()).await;
         drop(blocker);
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            acquire(&inner, SqliteWriteClass::Critical),
+            acquire(&inner, PostgresWriteClass::Critical),
         )
         .await
         .expect("cancelled waiter must release queue capacity");
@@ -1573,32 +1583,32 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_wait_deadline_overrides_priority_at_the_next_boundary() {
-        let inner = admission(SqliteWritePolicy {
+        let inner = admission(PostgresWritePolicy {
             max_critical_burst: 32,
             max_non_maintenance_burst: 32,
             max_maintenance_wait: Duration::from_millis(10),
         });
-        let blocker = acquire(&inner, SqliteWriteClass::Interactive).await;
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
         let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
         let maintenance_release = Arc::new(Notify::new());
         let critical_release = Arc::new(Notify::new());
         let maintenance = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Maintenance,
+            PostgresWriteClass::Maintenance,
             "maintenance",
             acquired_tx.clone(),
             maintenance_release.clone(),
         );
         let critical = spawn_waiter(
             inner.clone(),
-            SqliteWriteClass::Critical,
+            PostgresWriteClass::Critical,
             "critical",
             acquired_tx,
             critical_release.clone(),
         );
         wait_for_queue(
             &inner,
-            SqliteWriteQueueSnapshot {
+            PostgresWriteQueueSnapshot {
                 critical: 1,
                 interactive: 0,
                 maintenance: 1,
@@ -1618,24 +1628,24 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingObserver {
-        acquired: Mutex<Vec<SqliteWriteClass>>,
-        cancelled: Mutex<Vec<SqliteWriteClass>>,
+        acquired: Mutex<Vec<PostgresWriteClass>>,
+        cancelled: Mutex<Vec<PostgresWriteClass>>,
     }
 
-    impl SqliteWriteObserver for RecordingObserver {
-        fn observe(&self, event: SqliteWriteEvent) {
+    impl PostgresWriteObserver for RecordingObserver {
+        fn observe(&self, event: PostgresWriteEvent) {
             match event {
-                SqliteWriteEvent::Acquired { class, .. } => self
+                PostgresWriteEvent::Acquired { class, .. } => self
                     .acquired
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(class),
-                SqliteWriteEvent::Cancelled { class, .. } => self
+                PostgresWriteEvent::Cancelled { class, .. } => self
                     .cancelled
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(class),
-                SqliteWriteEvent::Enqueued { .. } | SqliteWriteEvent::Released { .. } => {}
+                PostgresWriteEvent::Enqueued { .. } | PostgresWriteEvent::Released { .. } => {}
             }
         }
     }
@@ -1647,14 +1657,14 @@ mod tests {
             state: Mutex::new(AdmissionState::default()),
             next_waiter_id: AtomicU64::new(1),
             capacity: 1,
-            policy: SqliteWritePolicy::default(),
+            policy: PostgresWritePolicy::default(),
             observer: observer.clone(),
         });
 
         // With an idle executor enqueue dispatches synchronously. Dropping the
         // receiver exercises cancellation after selection but before the
-        // future can construct a SqliteWritePermit.
-        let (receiver, registration) = inner.enqueue(SqliteWriteClass::Critical);
+        // future can construct a PostgresWritePermit.
+        let (receiver, registration) = inner.enqueue(PostgresWriteClass::Critical);
         drop(receiver);
         drop(registration);
 
@@ -1663,11 +1673,11 @@ mod tests {
                 .cancelled
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![SqliteWriteClass::Critical]
+            vec![PostgresWriteClass::Critical]
         );
         tokio::time::timeout(
             Duration::from_secs(1),
-            acquire(&inner, SqliteWriteClass::Interactive),
+            acquire(&inner, PostgresWriteClass::Interactive),
         )
         .await
         .expect("dispatched cancellation must release writer capacity");
@@ -1678,20 +1688,20 @@ mod tests {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
         let observer = Arc::new(RecordingObserver::default());
-        let executor = SqliteWriteExecutor::with_observer(connection, observer.clone());
+        let executor = PostgresWriteExecutor::with_observer(connection, observer.clone());
 
         executor
-            .connection(SqliteWriteClass::Critical)
+            .connection(PostgresWriteClass::Critical)
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
             .expect("critical write");
         executor
-            .connection(SqliteWriteClass::Interactive)
+            .connection(PostgresWriteClass::Interactive)
             .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
             .await
             .expect("interactive write");
         executor
-            .connection(SqliteWriteClass::Maintenance)
+            .connection(PostgresWriteClass::Maintenance)
             .execute_unprepared("DELETE FROM probe WHERE id = 1")
             .await
             .expect("maintenance write");
@@ -1702,9 +1712,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             vec![
-                SqliteWriteClass::Critical,
-                SqliteWriteClass::Interactive,
-                SqliteWriteClass::Maintenance,
+                PostgresWriteClass::Critical,
+                PostgresWriteClass::Interactive,
+                PostgresWriteClass::Maintenance,
             ]
         );
     }
@@ -1714,9 +1724,9 @@ mod tests {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
         let observer = Arc::new(RecordingObserver::default());
-        let executor = SqliteWriteExecutor::with_observer(connection, observer.clone());
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let critical = executor.connection(SqliteWriteClass::Critical);
+        let executor = PostgresWriteExecutor::with_observer(connection, observer.clone());
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let critical = executor.connection(PostgresWriteClass::Critical);
 
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
@@ -1737,9 +1747,9 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             vec![
-                SqliteWriteClass::Maintenance,
-                SqliteWriteClass::Maintenance,
-                SqliteWriteClass::Critical,
+                PostgresWriteClass::Maintenance,
+                PostgresWriteClass::Maintenance,
+                PostgresWriteClass::Critical,
             ]
         );
     }
@@ -1748,9 +1758,9 @@ mod tests {
     async fn unrelated_await_between_statements_does_not_hold_writer_capacity() {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
@@ -1796,9 +1806,9 @@ mod tests {
     async fn transaction_holds_executor_until_commit() {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
@@ -1827,9 +1837,9 @@ mod tests {
     async fn dropped_transaction_releases_executor_capacity() {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
@@ -1855,9 +1865,9 @@ mod tests {
     async fn nested_transaction_retains_executor_after_root_wrapper_is_dropped() {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_with_limit(1).await.expect("connect");
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await
@@ -1895,18 +1905,17 @@ mod tests {
             let callback_contexts = callback_contexts.clone();
             move |_| {
                 callbacks.fetch_add(1, Ordering::Relaxed);
-                if tracing::Span::current()
-                    .metadata()
-                    .is_some_and(|metadata| metadata.target() == "pioneer_sqlite::query_cpu")
-                {
+                if tracing::Span::current().metadata().is_some_and(|metadata| {
+                    metadata.target() == "pioneer_postgres_pools::query_cpu"
+                }) {
                     callback_contexts.fetch_add(1, Ordering::Relaxed);
                 }
                 query_cpu::record_fingerprint(Some(17));
             }
         });
-        let executor = SqliteWriteExecutor::new(connection);
-        let maintenance = executor.connection(SqliteWriteClass::Maintenance);
-        let interactive = executor.connection(SqliteWriteClass::Interactive);
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
         maintenance
             .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
             .await

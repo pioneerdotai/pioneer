@@ -1,13 +1,13 @@
 //! Publish terminal cleanup work once a relevant write has settled.
 
 use pioneer_entity::turn;
-use pioneer_sqlite::{SqliteDatabase, WorkChange};
+use pioneer_postgres_pools::{PostgresDatabase, WorkChange};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 
 pub struct Change(Vec<WorkChange>);
 
 impl Change {
-    pub fn events(db: &SqliteDatabase) -> Self {
+    pub fn events(db: &PostgresDatabase) -> Self {
         Self(
             [
                 "maintenance.native",
@@ -20,11 +20,11 @@ impl Change {
         )
     }
 
-    pub fn native(db: &SqliteDatabase) -> Self {
+    pub fn native(db: &PostgresDatabase) -> Self {
         Self(vec![db.work_signal("maintenance.native").changing()])
     }
 
-    pub fn payload(db: &SqliteDatabase) -> Self {
+    pub fn payload(db: &PostgresDatabase) -> Self {
         Self(
             ["maintenance.zstd", "maintenance.portable"]
                 .map(|domain| db.work_signal(domain).changing())
@@ -41,7 +41,7 @@ impl Change {
         }
     }
 
-    pub async fn complete(self, db: &SqliteDatabase, changed: bool, turns: &[String]) {
+    pub async fn complete(self, db: &PostgresDatabase, changed: bool, turns: &[String]) {
         let relevant = if changed && !turns.is_empty() {
             // A bounded primary-key metadata probe after releasing the writer.
             // This also covers late projection/raw arrivals after terminalization.

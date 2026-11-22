@@ -1,8 +1,8 @@
 use super::*;
 use futures_util::FutureExt;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadEvent, SqliteReadObserver, SqliteWriteEvent, SqliteWriteExecutor,
-    SqliteWriteObserver, WorkSubscription,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadEvent, PostgresReadObserver, PostgresWriteEvent,
+    PostgresWriteExecutor, PostgresWriteObserver, WorkSubscription,
 };
 use std::sync::{
     Arc, Mutex,
@@ -18,18 +18,18 @@ struct FinalizationWakeObserver {
     subscriptions: Mutex<Vec<WorkSubscription>>,
     observed: Mutex<Option<Vec<bool>>>,
 }
-impl SqliteWriteObserver for FinalizationWakeObserver {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if matches!(event, SqliteWriteEvent::Released { .. })
+impl PostgresWriteObserver for FinalizationWakeObserver {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if matches!(event, PostgresWriteEvent::Released { .. })
             && self.armed.swap(false, Ordering::SeqCst)
         {
             self.after_commit.store(true, Ordering::SeqCst);
         }
     }
 }
-impl SqliteReadObserver for FinalizationWakeObserver {
-    fn observe(&self, event: SqliteReadEvent) {
-        if matches!(event, SqliteReadEvent::AdmissionEnqueued { .. })
+impl PostgresReadObserver for FinalizationWakeObserver {
+    fn observe(&self, event: PostgresReadEvent) {
+        if matches!(event, PostgresReadEvent::AdmissionEnqueued { .. })
             && self.after_commit.swap(false, Ordering::SeqCst)
         {
             let states = self
@@ -50,9 +50,9 @@ async fn committed_finalization_publishes_wakes_before_any_post_commit_reader_wa
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(FinalizationWakeObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = CrudStore::new(database.clone()).with_maintenance_access();

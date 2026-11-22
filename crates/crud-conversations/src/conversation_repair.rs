@@ -8,13 +8,13 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use pioneer_crud_access::turn_execution::{turn_kind_from_db, turn_origin_from_db};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{ThreadStatus, Turn, TurnItem, TurnKind, TurnStatus, TurnWorkOwner};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::{collections::HashSet, future::Future};
 
 pub async fn complete_in_progress_turns_after_final_agent_message<Publish, Published>(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
     event_timestamp_secs: i64,
     mut publish: Publish,
 ) -> Result<u64>
@@ -88,7 +88,7 @@ where
 }
 
 pub async fn reconcile_thread_foreground_statuses(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
     event_timestamp_secs: i64,
 ) -> Result<u64> {
     let active_conversation_thread_ids = pioneer_entity::turn::Entity::find()

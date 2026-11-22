@@ -143,7 +143,7 @@ impl WorkSubscription {
     /// unacknowledged until the next pass starts.
     pub async fn begin_pass(
         &mut self,
-        database: &crate::SqliteDatabase,
+        database: &crate::PostgresDatabase,
     ) -> Result<(), sea_orm::DbErr> {
         let (unknown, revision) = {
             let state = self.receiver.borrow_and_update();
@@ -161,7 +161,7 @@ impl WorkSubscription {
     /// or bounded hint overflow). Each subscription has its own revision frontier.
     pub async fn begin_keyed_pass(
         &mut self,
-        database: &crate::SqliteDatabase,
+        database: &crate::PostgresDatabase,
     ) -> Result<Option<Vec<String>>, sea_orm::DbErr> {
         let state = self.receiver.borrow_and_update().clone();
         if state.unknown != self.settled {
@@ -231,9 +231,9 @@ mod tests {
     use futures_util::FutureExt;
     use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
-    async fn database() -> crate::SqliteDatabase {
+    async fn database() -> crate::PostgresDatabase {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-        crate::SqliteDatabase::new(
+        crate::PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connect_with_limit(1).await.unwrap(),
         )
@@ -335,10 +335,10 @@ mod tests {
     #[pioneer_postgres_test::postgres_test]
     async fn cancelled_dispatched_mutation_is_settled_before_empty_discovery() {
         #[derive(Default)]
-        struct Routes(std::sync::Mutex<Vec<crate::SqliteWriteClass>>);
-        impl crate::SqliteWriteObserver for Routes {
-            fn observe(&self, event: crate::SqliteWriteEvent) {
-                if let crate::SqliteWriteEvent::Acquired { class, .. } = event {
+        struct Routes(std::sync::Mutex<Vec<crate::PostgresWriteClass>>);
+        impl crate::PostgresWriteObserver for Routes {
+            fn observe(&self, event: crate::PostgresWriteEvent) {
+                if let crate::PostgresWriteEvent::Acquired { class, .. } = event {
                     self.0.lock().unwrap().push(class);
                 }
             }
@@ -348,8 +348,8 @@ mod tests {
         let reader = fixture.connect_read_only().await.unwrap();
         let peer = fixture.connect_with_limit(1).await.unwrap();
         let routes = std::sync::Arc::new(Routes::default());
-        let writer = crate::SqliteWriteExecutor::with_observer(raw, routes.clone());
-        let database = crate::SqliteDatabase::from_executor(reader, writer);
+        let writer = crate::PostgresWriteExecutor::with_observer(raw, routes.clone());
+        let database = crate::PostgresDatabase::from_executor(reader, writer);
         database
             .execute_unprepared(
                 "CREATE TABLE signal_probe(value INTEGER);
@@ -410,8 +410,8 @@ mod tests {
         assert_eq!(
             *routes.0.lock().unwrap(),
             [
-                crate::SqliteWriteClass::Interactive,
-                crate::SqliteWriteClass::Maintenance
+                crate::PostgresWriteClass::Interactive,
+                crate::PostgresWriteClass::Maintenance
             ]
         );
         let row = database

@@ -7,8 +7,8 @@ invariants below.
 ## Diagnostics
 
 For debugging the Gateway database, use direct SQL with `psql` or a short
-script. For independent SQLite stores, use `sqlite3`. Raw SQL and direct connections are allowed
-for this work; the application architecture/ORM requirements below govern code
+script. Use `sqlite3` for diagnostics of independent SQLite stores. Raw SQL
+and direct connections are allowed for this work; the application architecture/ORM requirements below govern code
 implementation. Do not add Rust files/crates or generate Entity/ORM scaffolding
 solely to inspect a database. Use read-only connections for inspection; data
 changes must stay within the task's authorized scope.
@@ -26,6 +26,13 @@ For any database behavior change, including callers in other crates, read
 - Database startup and maintenance: [Gateway database](crates/gateway/src/database/AGENTS.md).
 
 ## Runtime Model
+
+The Gateway application database runs on PostgreSQL. The scoped handle and
+admission queues live in [`pioneer-postgres-pools`](crates/postgres-pools).
+
+Microsandbox uses its own SQLite database for the local Dev Apps sandbox
+registry. The keystore and external CLI runtimes also own their storage
+independently of the Gateway application database.
 
 The Gateway PostgreSQL runtime has two independent pools:
 

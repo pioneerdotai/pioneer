@@ -7,10 +7,10 @@ use crate::{
     time::unix_to_datetime,
 };
 use anyhow::{Context, Result};
-use pioneer_sqlite::SqliteDatabase;
-use pioneer_sqlite::{
-    SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
-    SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::PostgresDatabase;
+use pioneer_postgres_pools::{
+    PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteClass,
+    PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sea_orm::{DatabaseBackend, Statement};
@@ -29,12 +29,12 @@ struct Observer {
     writes: AtomicU64,
     queued: AtomicU64,
 }
-impl SqliteReadObserver for Observer {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Observer {
+    fn observe(&self, event: PostgresReadEvent) {
         if matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         ) {
@@ -42,17 +42,17 @@ impl SqliteReadObserver for Observer {
         }
     }
 }
-impl SqliteWriteObserver for Observer {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Observer {
+    fn observe(&self, event: PostgresWriteEvent) {
         match event {
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.writes.fetch_add(1, Ordering::SeqCst);
             }
-            SqliteWriteEvent::Enqueued {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Enqueued {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.queued.fetch_add(1, Ordering::SeqCst);
@@ -62,8 +62,8 @@ impl SqliteWriteObserver for Observer {
     }
 }
 struct Fixture {
-    foreground: SqliteDatabase,
-    db: SqliteDatabase,
+    foreground: PostgresDatabase,
+    db: PostgresDatabase,
     observer: Arc<Observer>,
 }
 impl Fixture {
@@ -76,9 +76,9 @@ impl Fixture {
         let writer = fixture.connect_with_limit(1).await?;
         let reader = fixture.connect_read_only().await?;
         let observer = Arc::new(Observer::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         database.maintenance().validate_reader().await?;

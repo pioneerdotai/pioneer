@@ -15,7 +15,7 @@ impl CrudStore {
             && entry.tool_name.as_deref() == Some("html_preview"))
         .then(|| self.connection.work_signal("maintenance.html").changing());
         let result = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 let row = crate::store::conversations::context_writes::insert_turn_llm_context(
                     &tx,
@@ -64,7 +64,7 @@ impl CrudStore {
             None
         };
         let result = self
-            .run_serialized_write(|| {
+            .retry_write_on_conflict(|| {
                 let mut entry = entry.clone();
                 let preview_archive = preview_archive.clone();
                 let mut source_observation = source_observation.clone();

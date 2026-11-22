@@ -1866,7 +1866,7 @@ async fn selected_import_understated_retained_output_direct_and_shared_fails_bef
 async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
     use pioneer_crud::compaction::{PublicationTestPause, arm_publication_test_hook};
     let f = fixture_with_mode(FixtureMode::WorkerLegacy).await;
-    // Real timers let SQLite's external worker finish: a paused runtime can
+    // Real timers allow PostgreSQL I/O to complete. A paused runtime can
     // auto-advance to pool timeouts while a database request is in flight.
     let db = f.h.crud_store.database_connection();
     // Run the actual production loop, cancel it, and restart with fresh private

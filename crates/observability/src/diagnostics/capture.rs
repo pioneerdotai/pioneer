@@ -762,7 +762,7 @@ fn capture_inventory(path: &Path, sql_cpu: bool) -> Result<Vec<ArtifactFile>> {
         storage::inventory(path)
     }
 }
-// The diagnostic owner performs serialization/checksums, never a SQLite worker.
+// The diagnostic owner performs serialization and checksums outside database operations.
 fn store_sql_cpu(
     path: &Path,
     target: &TargetSnapshot,
@@ -942,7 +942,7 @@ impl SqlCpuCapture {
         } else {
             slice
         };
-        // No collector mutex, SQL scope or SQLite capacity is held while waiting.
+        // No collector mutex, SQL scope or PostgreSQL capacity is held while waiting.
         std::thread::sleep(remaining);
     }
     fn wait(&mut self, epoch: u64, pid: u32, start: &str, stop: &AtomicBool, cancel: &AtomicBool) {

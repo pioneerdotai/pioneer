@@ -2,12 +2,12 @@
 
 use anyhow::{Context, Result};
 use pioneer_entity::{task as task_entity, task_trigger as trigger_entity};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     Task, TaskAgendaItem, TaskAgendaParams, TaskAgendaResponse, TaskAgentSpec, TaskDependency,
     TaskListParams, TaskRun, TaskStatus, TaskTree, TaskTrigger, TaskTriggerKind, TaskTriggerSpec,
     TaskWriteLock,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, JoinType, NullOrdering, Order};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
@@ -89,7 +89,7 @@ fn build_task_tree(
 }
 
 pub async fn list_tasks_scoped(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     params: TaskListParams,
     access: Option<&TaskRootAccessFilter>,
 ) -> Result<Vec<Task>> {
@@ -128,7 +128,7 @@ pub async fn list_tasks_scoped(
     rows.into_iter().map(task_from_db_model).collect()
 }
 pub async fn get_task_tree_bounded(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     task_id: &str,
     max_nodes: usize,
 ) -> Result<Option<TaskTree>> {
@@ -226,7 +226,7 @@ pub async fn get_task_tree_bounded(
     )))
 }
 pub async fn list_task_agenda_scoped(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     params: TaskAgendaParams,
     access: Option<&TaskRootAccessFilter>,
 ) -> Result<TaskAgendaResponse> {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ async fn unknown_commit_is_visible_before_background_discovery() -> Result<()> {
             .await?;
 
         let writer = fixture.connect_with_limit(2).await?;
-        let scoped = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let scoped = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let change = scoped.work_signal("commit-wake");
         let mut wake = change.subscribe();
         wake.begin_pass(&scoped).await?;

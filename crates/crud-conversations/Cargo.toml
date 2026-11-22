@@ -16,7 +16,7 @@ pioneer-crud-access.workspace = true
 pioneer-crud-payloads.workspace = true
 pioneer-entity.workspace = true
 pioneer-protocol.workspace = true
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres"] }
 serde.workspace = true
 serde_json.workspace = true

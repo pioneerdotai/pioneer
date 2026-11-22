@@ -41,7 +41,7 @@ impl CrudStore {
             unix_to_datetime(event_timestamp_secs),
         );
         let authorization_context_json = authorization_context_json.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()

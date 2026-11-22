@@ -75,7 +75,7 @@ async fn setup(
         ))
         .await
         .expect("workspace history fixtures must insert");
-    let store = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         database.clone(),
     ));
@@ -852,7 +852,7 @@ async fn stale_claim_authority_epoch_and_cursor_write_nothing() {
 async fn expired_owner_and_takeover_have_one_terminal_writer() {
     pioneer_postgres_test::with_database(async |fixture| {
         let (database, gateway_a) = setup(fixture).await;
-        let gateway_b = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+        let gateway_b = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connect().await?,
         ));

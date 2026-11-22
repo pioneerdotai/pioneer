@@ -34,18 +34,18 @@ use pioneer_compaction::{
 use pioneer_crud_execution::cli_runtime_binding::{self, *};
 use pioneer_crud_execution::gateway_control::{GatewayControlWake, control_work_change};
 use pioneer_entity::compaction_frozen_history as history;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{EntityTrait, QuerySelect, TransactionTrait};
 use std::future::Future;
 
 #[derive(Clone)]
 pub struct CompactionStore {
-    pub(crate) connection: SqliteDatabase,
+    pub(crate) connection: PostgresDatabase,
     pub(crate) frozen_readers: ReaderCounts,
 }
 
 impl CompactionStore {
-    pub fn new(connection: SqliteDatabase, frozen_readers: ReaderCounts) -> Self {
+    pub fn new(connection: PostgresDatabase, frozen_readers: ReaderCounts) -> Self {
         Self {
             connection,
             frozen_readers,
@@ -53,7 +53,7 @@ impl CompactionStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(connection: SqliteDatabase) -> Self {
+    pub(crate) fn for_test(connection: PostgresDatabase) -> Self {
         Self::new(connection, Default::default())
     }
 
@@ -66,7 +66,7 @@ impl CompactionStore {
             .await
     }
 
-    pub fn database_connection(&self) -> SqliteDatabase {
+    pub fn database_connection(&self) -> PostgresDatabase {
         self.connection.clone()
     }
 
@@ -74,7 +74,7 @@ impl CompactionStore {
         Self::new(self.connection.maintenance(), self.frozen_readers.clone())
     }
 
-    pub(crate) async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -258,7 +258,7 @@ impl CompactionStore {
         use sea_orm::TransactionTrait;
         let layout_check =
             frozen::ReadyLayoutCheck::prepare(&self.connection, &descriptor.manifest_id).await?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let finished = frozen::compaction_finish_frozen_history(
                 &tx,
@@ -292,7 +292,7 @@ impl CompactionStore {
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let maintenance_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 use sea_orm::TransactionTrait;
                 let tx = self.connection.begin().await?;
                 anyhow::ensure!(
@@ -362,7 +362,7 @@ impl CompactionStore {
             .map(|domain| control_work_change(&self.connection, domain, &control_wakes));
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
                     binding.thread_id.clone(),
@@ -423,7 +423,7 @@ impl CompactionStore {
         let frozen_change = self.connection.work_signal("maintenance.frozen").changing();
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&pending.resume_cursor_json, true)?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
                     pending.thread_id.clone(),
@@ -486,7 +486,7 @@ impl CompactionStore {
                     .collect::<Vec<_>>()
             });
         let maintenance_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 cli_runtime_binding::discard_rejected_fork_intent(
                     &self.connection,
                     thread_id,
@@ -523,7 +523,7 @@ impl CompactionStore {
         let html_change = self.connection.work_signal("maintenance.html").changing();
         let result = async {
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
                     pending.thread_id.clone(),
@@ -590,7 +590,7 @@ impl CompactionStore {
             let expected_native_thread_id = expected_native_thread_id.to_owned();
             let expected_cursor_json = expected_cursor_json.to_owned();
             let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
                     thread_id.clone(),
@@ -652,7 +652,7 @@ impl CompactionStore {
                 &request.thread_binding.resume_cursor_json,
                 true,
             )?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(
                     request.thread_binding.thread_id.clone(),
@@ -732,7 +732,7 @@ impl CompactionStore {
                 &binding.input_mapping_json,
                 root.locator().is_some(),
             )?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let old_root = pioneer_entity::turn_cli_runtime_binding::Entity::find_by_id(
                     binding.turn_id.clone(),
@@ -803,7 +803,7 @@ impl CompactionStore {
         workspace: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<(history::Model, FrozenReadHold)> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let (header, hold) = crate::frozen_lifetime::acquire_header(
                 &tx,
@@ -1126,7 +1126,7 @@ impl CompactionStore {
         thread: &str,
         turn: &str,
     ) -> Result<Option<AcceptedTaskBasis>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             crate::history::compaction_task_basis_snapshot(
                 &self.connection,
                 workspace,
@@ -1291,7 +1291,7 @@ impl CompactionStore {
         reference: &SourceRef,
         character_offset: u64,
     ) -> Result<Option<CanonicalFragment>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             crate::canonical_history::compaction_reference_fragment(
                 &self.connection,
                 workspace,
@@ -1536,7 +1536,7 @@ impl CompactionStore {
         let maintenance_changes = [self.connection.work_signal("maintenance.html").changing()];
         let prepared = crate::source_projection::PreparedSourceProjection::new(descriptor)?;
         let maintenance_result = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 prepared.bind(&tx, operation).await?;
                 tx.commit().await?;
@@ -1645,7 +1645,7 @@ impl CompactionStore {
             let json = serde_json::to_string(diagnostic)?;
             anyhow::ensure!(json.len() <= 4096, "history diagnostic exceeds bound");
             let diagnostic: serde_json::Value = serde_json::from_str(&json)?;
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let diagnostic = diagnostic.clone();
                 async move {
                     let tx = self.connection.begin().await?;
@@ -1675,7 +1675,7 @@ impl CompactionStore {
         thread: &str,
         reference: &SourceRef,
     ) -> Result<Option<String>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             crate::canonical_history::compaction_reference_payload(
                 &self.connection,
                 workspace,
@@ -1952,7 +1952,7 @@ impl CompactionStore {
         thread: &str,
         references: &[SourceRef],
     ) -> Result<(usize, Vec<String>)> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             crate::canonical_history::compaction_reference_payload_batch(
                 &self.connection,
                 workspace,
@@ -2460,7 +2460,7 @@ impl CompactionStore {
         revision: i64,
         now: i64,
     ) -> Result<Option<pioneer_entity::compaction_history_check::Model>> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let claimed = crate::background::claim_history_check(&tx, id, revision, now).await?;
             tx.commit().await?;

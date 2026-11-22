@@ -7,7 +7,7 @@ use pioneer_crud_execution::cli_runtime_binding::{
 use pioneer_crud_execution::cli_runtime_store::CliRuntimeStore;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_entity::{turn_cli_runtime_binding as binding, workspace};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait,
@@ -23,11 +23,11 @@ use std::{
 
 #[derive(Default)]
 struct WriteObserver {
-    events: Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    events: Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for WriteObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for WriteObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
@@ -53,7 +53,7 @@ async fn postgres_store_with_workspace(
 ) -> CliRuntimeStore {
     seed_workspace(fixture.connection(), workspace_id).await;
     let reader = fixture.connect_read_only().await.unwrap();
-    CliRuntimeStore::new(SqliteDatabase::new(reader, fixture.connection().clone()))
+    CliRuntimeStore::new(PostgresDatabase::new(reader, fixture.connection().clone()))
 }
 
 async fn test_store_with_workspace(workspace_id: &str) -> CliRuntimeStore {
@@ -76,23 +76,23 @@ async fn test_store_with_workspace_and_query_counter(
         });
     }
     (
-        CliRuntimeStore::new(SqliteDatabase::new(reader, writer)),
+        CliRuntimeStore::new(PostgresDatabase::new(reader, writer)),
         query_count,
     )
 }
 
 #[derive(Default)]
 struct ReadObserver {
-    events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+    events: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
     enqueued: tokio::sync::Notify,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for ReadObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for ReadObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.events.lock().unwrap().push(event);
         if matches!(
             event,
-            pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { .. }
+            pioneer_postgres_pools::PostgresReadEvent::AdmissionEnqueued { .. }
         ) {
             self.enqueued.notify_one();
         }
@@ -346,17 +346,19 @@ async fn cli_active_binding_plans_seek_both_statuses_and_empty_active_history() 
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_cancels() {
-    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
+async fn cli_active_binding_discovery_uses_read_only_maintenance_reader_and_cancels() {
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteExecutor,
+    };
     use sea_orm::TransactionTrait;
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(WriteObserver::default());
     let reads = Arc::new(ReadObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         reads.clone(),
     );
     database.validate_reader().await.unwrap();
@@ -382,11 +384,11 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+                PostgresReadEvent::OperationFinished { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![SqliteReadClass::Maintenance; 2]
+        vec![PostgresReadClass::Maintenance; 2]
     );
     assert!(
         observer.events.lock().unwrap().is_empty(),
@@ -415,7 +417,7 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
             if reads.events.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::AdmissionEnqueued {
+                    PostgresReadEvent::AdmissionEnqueued {
                         queue_depth: 1,
                         active: 1,
                         ..
@@ -433,7 +435,7 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
     assert!(cancelled.await.unwrap_err().is_cancelled());
     assert!(reads.events.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionCancelled {
+        PostgresReadEvent::AdmissionCancelled {
             queue_depth: 0,
             active: 1,
             ..

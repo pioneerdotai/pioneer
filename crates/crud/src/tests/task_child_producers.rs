@@ -20,7 +20,7 @@ async fn unknown_commit_response_keeps_business_and_obligation_without_replaying
     // Lose only the response after a real commit. This is neither rollback nor
     // an empty result, and must not enter the known-rollback CAS retry policy.
     let result: anyhow::Result<()> = store
-        .run_serialized_write(|| async {
+        .retry_write_on_conflict(|| async {
             attempts.fetch_add(1, Ordering::SeqCst);
             let tx = store.connection.begin().await?;
             task::upsert_prepared_task(&tx, task::prepare_task_projection(&task)?).await?;

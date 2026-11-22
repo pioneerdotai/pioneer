@@ -670,7 +670,7 @@ pub trait TaskExecutor: Send + Sync {
 
 #[derive(Default)]
 pub struct TaskExecutorRegistry {
-    changed: pioneer_sqlite::WorkSignal,
+    changed: pioneer_postgres_pools::WorkSignal,
     executors: RwLock<HashMap<&'static str, Arc<dyn TaskExecutor>>>,
 }
 
@@ -679,7 +679,7 @@ impl TaskExecutorRegistry {
         Self::default()
     }
 
-    pub(crate) fn work_signal(&self) -> pioneer_sqlite::WorkSignal {
+    pub(crate) fn work_signal(&self) -> pioneer_postgres_pools::WorkSignal {
         self.changed.clone()
     }
 

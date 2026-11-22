@@ -6,8 +6,10 @@ async fn store() -> CrudStore {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connection().clone();
     let reader = fixture.connect_read_only().await.unwrap();
-    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer))
-        .with_maintenance_access();
+    let store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
+        reader, writer,
+    ))
+    .with_maintenance_access();
     let db = store.database_connection();
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",

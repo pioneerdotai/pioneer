@@ -170,7 +170,7 @@ impl PreparedTaskEvent {
     /// again against its projected state and trusts only the captured row fence.
     pub async fn preflight_idempotency(
         mut self,
-        db: &pioneer_sqlite::SqliteDatabase,
+        db: &pioneer_postgres_pools::PostgresDatabase,
     ) -> Result<Self> {
         self.semantically_matching_existing = None;
         self.batch_existing.clear();
@@ -379,7 +379,7 @@ pub async fn terminal_idempotency_key<C: ConnectionTrait>(
 }
 
 pub async fn append_event(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     payload: &TaskEventPayload,
     created_at: DateTimeWithTimeZone,
     idempotency_key: Option<&str>,

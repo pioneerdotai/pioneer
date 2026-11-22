@@ -12,24 +12,24 @@ use crate::event_records::{
 use crate::task_event;
 use crate::task_projector::TaskOutputBinder;
 use anyhow::{Context, Result};
-use pioneer_protocol::{TaskEventPayload, TaskEventsResponse};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     retry_with_backoff,
 };
+use pioneer_protocol::{TaskEventPayload, TaskEventsResponse};
 use sea_orm::TransactionTrait;
 use std::{future::Future, time::Duration};
 
 #[derive(Clone)]
 pub struct TaskEventStore<B> {
-    pub(crate) connection: SqliteDatabase,
+    pub(crate) connection: PostgresDatabase,
     pub(crate) outputs: B,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) delivery_commit_test_hooks: crate::delivery_transitions::DeliveryCommitTestHooks,
 }
 
 impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
-    pub fn new(connection: SqliteDatabase, outputs: B) -> Self {
+    pub fn new(connection: PostgresDatabase, outputs: B) -> Self {
         Self {
             connection,
             outputs,
@@ -54,7 +54,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
         self
     }
 
-    pub(crate) async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    pub(crate) async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -77,7 +77,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             [event.task_id().to_owned()],
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_event_once(event.clone(), event_timestamp_secs)
             })
             .await
@@ -99,7 +99,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             events.iter().map(|event| event.task_id().to_owned()),
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.append_task_events_once(events.clone(), event_timestamp_secs)
             })
             .await

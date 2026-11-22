@@ -1937,8 +1937,8 @@ async fn execute_refill_jobs(
         )
         .await;
         // Finish confirmed healthy claims before observing any uncertain one.
-        // These snapshots are not dispatch receipts. Serialized writer state
-        // observation, under this workspace's ownership, fences settlement.
+        // These snapshots are not dispatch receipts. Check committed state
+        // while holding the workspace guard before settling uncertain claims.
         let claim_error_count = claim_failures.len();
         for (mut expected, failure_class) in claim_failures {
             tracing::warn!(failure_class, "episodic refill claim deferred");
@@ -2968,6 +2968,7 @@ mod tests {
         ThreadEpisodicEmbeddingError, ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind,
         ThreadEpisodicSearchRequest,
     };
+    use pioneer_postgres_pools::PostgresDatabase;
     use pioneer_protocol::{
         ItemCompletedNotification, ItemUpdatedNotification, SandboxMode, TaskExecutorKind,
         TaskStatus, TaskTriggerKind, TaskTurnItem, Thread,
@@ -2975,7 +2976,6 @@ mod tests {
         ThreadEpisodicSourceContext, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnItem, TurnItemType, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
-    use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{
         ConnectOptions, ConnectionTrait, DatabaseBackend, EntityTrait, Statement, TransactionTrait,
     };
@@ -6496,7 +6496,7 @@ mod tests {
         let reader = fixture.connect_read_only().await.unwrap();
         let temp_dir = TempDir::new().expect("temp dir");
         (
-            Arc::new(CrudStore::new(SqliteDatabase::new(reader, writer))),
+            Arc::new(CrudStore::new(PostgresDatabase::new(reader, writer))),
             temp_dir,
             workspace_id,
         )
@@ -8477,7 +8477,7 @@ mod tests {
             .await
             .unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, connection);
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, connection);
         let workspace_manager = WorkspaceManager::new(database.clone());
         let workspace_id = workspace_manager
             .create_workspace(&pioneer_protocol::generate_id(21), Some("Refill test"))

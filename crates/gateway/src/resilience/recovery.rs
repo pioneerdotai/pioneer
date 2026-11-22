@@ -7191,7 +7191,8 @@ mod tests {
     ) -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, fixture.connection().clone());
+        let database =
+            pioneer_postgres_pools::PostgresDatabase::new(reader, fixture.connection().clone());
         let crud_store = Arc::new(CrudStore::new(database));
         crate::session::test_support::ensure_test_superuser_execution_authority(
             crud_store.as_ref(),

@@ -20,8 +20,8 @@ use pioneer_crud_conversations::{
     turn_item::turn_item_type_from_db,
     turn_payload, turn_reads as turn,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{RecoveryJobStatus, ToolCallStatus, Turn, TurnItem, TurnStatus};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, EntityTrait, entity::prelude::DateTimeWithTimeZone};
 use std::future::Future;
 
@@ -74,7 +74,7 @@ pub enum PreparedRecoveryTerminalizationOutcome<E> {
 }
 
 pub async fn prepare_claimed_recovery_terminalization_commit<E, F, Fut>(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
     record: &ClaimedRecoveryTerminalizationRecord,
     resume: Option<&pioneer_protocol::TurnBlockedResumeMetadata>,
     cleanup_plan: &RecoveryTerminalCleanupPlan,

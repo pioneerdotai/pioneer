@@ -4,13 +4,13 @@ use crate::apply_patch::history::{
     AppliedPatchRecord, AppliedPatchRecordOutcome, ChangeKind, CommitOrdinal, CommittedPatchChange,
     CommittedTextSnapshot, ContentAddressedSnapshotRef, DurablePatchChange, HistoryQueryLimits,
     InsertedPatchRecord, IntentStatus, InvocationIdentity, LineEnding, LineEndingMetadata,
-    PatchHistoryCoverage, PatchRecoveryPlan, PatchSideEffects, PreparedChangeRecovery,
-    SnapshotDomain, SqliteAppliedPatchStore, SqliteCommitIntentStore, SqliteSnapshotStore,
-    SqliteTurnDiffStore, TextEncoding, TextSnapshotRef, TurnDiffAuthority, TurnDiffState,
-    replay_turn_pages,
+    PatchHistoryCoverage, PatchRecoveryPlan, PatchSideEffects, PostgresAppliedPatchStore,
+    PostgresCommitIntentStore, PostgresSnapshotStore, PostgresTurnDiffStore,
+    PreparedChangeRecovery, SnapshotDomain, TextEncoding, TextSnapshotRef, TurnDiffAuthority,
+    TurnDiffState, replay_turn_pages,
 };
 use pioneer_crud::patch_history as crud;
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteEvent, PostgresWriteObserver};
 use sea_orm::ConnectionTrait;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,9 +21,9 @@ struct WriterAcquisitionCounter {
     acquired: AtomicUsize,
 }
 
-impl SqliteWriteObserver for WriterAcquisitionCounter {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if matches!(event, SqliteWriteEvent::Acquired { .. }) {
+impl PostgresWriteObserver for WriterAcquisitionCounter {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if matches!(event, PostgresWriteEvent::Acquired { .. }) {
             self.acquired.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -126,10 +126,10 @@ async fn postgres_history_survives_reload_and_rebuilds_projection_from_snapshots
 -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let snapshots = SqliteSnapshotStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database.clone());
-        let projections = SqliteTurnDiffStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
+        let projections = PostgresTurnDiffStore::new(database.clone());
         let domain = SnapshotDomain::new("thread:thread", "pioneer", "thread_history");
         let original = snapshot(b"old\n");
         let edited = snapshot(b"edited\n");
@@ -332,8 +332,8 @@ async fn thread_history_deletion_releases_writer_between_records() -> anyhow::Re
         let connection = fixture.connection().clone();
         let observer = Arc::new(WriterAcquisitionCounter::default());
         let database =
-            SqliteDatabase::new_with_observer(connection.clone(), connection, observer.clone());
-        let records = SqliteAppliedPatchStore::new(database);
+            PostgresDatabase::new_with_observer(connection.clone(), connection, observer.clone());
+        let records = PostgresAppliedPatchStore::new(database);
         let domain = SnapshotDomain::new("thread:bounded-delete", "pioneer", "thread_history");
 
         for (invocation_id, ordinal) in [("call-1", 0), ("call-2", 1)] {
@@ -364,8 +364,8 @@ async fn thread_history_deletion_releases_writer_between_records() -> anyhow::Re
 async fn unresolved_patch_recovery_records_a_gap_without_a_fake_path() -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database);
         let identity = InvocationIdentity::new("thread", "turn", "crashed-call").unwrap();
         let recovery_plan = PatchRecoveryPlan {
             environment_id: "workspace".to_owned(),
@@ -407,8 +407,8 @@ async fn unresolved_patch_recovery_records_a_gap_without_a_fake_path() -> anyhow
 async fn side_effect_only_record_round_trips_without_a_fake_file_change() -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database);
         let domain = SnapshotDomain::new("thread:thread", "pioneer", "thread_history");
         let identity = InvocationIdentity::new("thread", "turn", "residual-parent").unwrap();
         let mut record = AppliedPatchRecord::new(
@@ -452,8 +452,8 @@ async fn side_effect_only_record_round_trips_without_a_fake_file_change() -> any
 async fn snapshot_reconciliation_decodes_canonical_v1_record_delta() -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let snapshots = SqliteSnapshotStore::new(database);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database);
         let domain = SnapshotDomain::new("thread:thread", "pioneer", "thread_history");
         let original = snapshot(b"old\n");
         let edited = snapshot(b"edited\n");
@@ -485,8 +485,8 @@ async fn snapshot_reconciliation_decodes_canonical_v1_record_delta() -> anyhow::
 async fn recovery_journals_a_residual_authorized_parent_as_a_side_effect() -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database);
         let workspace = tempfile::tempdir().unwrap();
         let workspace_root = workspace.path().canonicalize().unwrap();
         let parent = workspace_root.join("nested");
@@ -552,7 +552,7 @@ async fn restart_recovery_distinguishes_precommit_from_an_exact_partial_prefix()
 
         {
             let database = fixture.connect().await?;
-            let intents = SqliteCommitIntentStore::new(database);
+            let intents = PostgresCommitIntentStore::new(database);
             intents
                 .begin_next_owned(
                     untouched_identity.clone(),
@@ -583,8 +583,8 @@ async fn restart_recovery_distinguishes_precommit_from_an_exact_partial_prefix()
         }
 
         let database = fixture.connect().await?;
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
         assert_eq!(intents.terminalize_pending_gaps(&records).await.unwrap(), 2);
         assert!(records.get(&untouched_identity).await.unwrap().is_none());
         assert_eq!(
@@ -609,7 +609,7 @@ async fn restart_recovery_distinguishes_precommit_from_an_exact_partial_prefix()
         assert_eq!(partial.record.changes.len(), 1);
         assert_eq!(partial.record.changes[0].operation_index, 0);
         assert_eq!(std::fs::read(&partial_path).unwrap(), middle.bytes);
-        let projection = SqliteTurnDiffStore::new(database)
+        let projection = PostgresTurnDiffStore::new(database)
             .get("thread", "turn-partial")
             .await
             .unwrap()
@@ -662,7 +662,7 @@ async fn restart_after_record_insert_repairs_projection_and_compacts_intent_once
 
         {
             let database = fixture.connect().await?;
-            let intents = SqliteCommitIntentStore::new(database.clone());
+            let intents = PostgresCommitIntentStore::new(database.clone());
             let admitted = intents
                 .begin_next_owned(identity.clone(), [3; 32], vec![[31; 32]], plan.clone())
                 .await
@@ -671,7 +671,7 @@ async fn restart_after_record_insert_repairs_projection_and_compacts_intent_once
                 admitted,
                 crate::apply_patch::history::BeginNextOutcome::Inserted(_)
             ));
-            SqliteAppliedPatchStore::new(database)
+            PostgresAppliedPatchStore::new(database)
                 .insert_with_snapshots(
                     record_for("thread", "turn", "call", 0, &[committed]),
                     [3; 32],
@@ -685,8 +685,8 @@ async fn restart_after_record_insert_repairs_projection_and_compacts_intent_once
         }
 
         let database = fixture.connect().await?;
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
         assert_eq!(intents.terminalize_pending_gaps(&records).await.unwrap(), 1);
         assert_eq!(intents.terminalize_pending_gaps(&records).await.unwrap(), 0);
         assert_eq!(
@@ -700,7 +700,7 @@ async fn restart_after_record_insert_repairs_projection_and_compacts_intent_once
                 .unwrap(),
             crate::apply_patch::history::BeginNextOutcome::Existing(_)
         ));
-        let projection = SqliteTurnDiffStore::new(database)
+        let projection = PostgresTurnDiffStore::new(database)
             .get("thread", "turn")
             .await
             .unwrap()
@@ -737,8 +737,8 @@ async fn final_projection_survives_restart_and_rejects_late_live_state() -> anyh
         let final_state;
         {
             let database = fixture.connect().await?;
-            let records = SqliteAppliedPatchStore::new(database.clone());
-            let intents = SqliteCommitIntentStore::new(database.clone());
+            let records = PostgresAppliedPatchStore::new(database.clone());
+            let intents = PostgresCommitIntentStore::new(database.clone());
             records
                 .insert_with_snapshots(
                     record("final-call", 0, &[committed]),
@@ -758,7 +758,7 @@ async fn final_projection_survives_restart_and_rejects_late_live_state() -> anyh
                 true,
             );
             assert!(
-                SqliteTurnDiffStore::new(database)
+                PostgresTurnDiffStore::new(database)
                     .upsert(&final_state)
                     .await
                     .unwrap()
@@ -766,7 +766,7 @@ async fn final_projection_survives_restart_and_rejects_late_live_state() -> anyh
         }
 
         let database = fixture.connect().await?;
-        let projections = SqliteTurnDiffStore::new(database);
+        let projections = PostgresTurnDiffStore::new(database);
         assert_eq!(
             projections.get("thread", "turn").await.unwrap(),
             Some(final_state.clone())
@@ -786,8 +786,8 @@ async fn earlier_pending_ordinal_keeps_a_later_record_durable_and_explicitly_inc
 -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
         let workspace = tempfile::tempdir().unwrap();
         let workspace_root = workspace.path().canonicalize().unwrap();
         let before = snapshot(b"before\n");
@@ -850,8 +850,8 @@ async fn record_and_snapshot_promotion_is_atomic_and_retryable_after_injected_fa
 -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let snapshots = SqliteSnapshotStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database.clone());
         let before = snapshot(b"before\n");
         let after = snapshot(b"after\n");
         let committed = change(
@@ -916,8 +916,8 @@ async fn corrupt_snapshot_never_crosses_domain_and_thread_gc_preserves_other_his
 -> anyhow::Result<()> {
     pioneer_postgres_test::with_database(async |fixture| {
         let database = fixture.connection().clone();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let snapshots = SqliteSnapshotStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database.clone());
         let before = snapshot(b"shared-before\n");
         let after = snapshot(b"shared-after\n");
         let committed = change(

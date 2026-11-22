@@ -13,7 +13,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 pioneer-crud.workspace = true
 pioneer-protocol.workspace = true
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }

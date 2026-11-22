@@ -21,7 +21,7 @@ async fn migrated_store(
             ('ws_source_b', 'Source B', true, false)",
         )
         .await?;
-    let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await?,
         writer.clone(),
     ));

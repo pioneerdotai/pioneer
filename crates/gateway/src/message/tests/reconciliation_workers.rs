@@ -121,9 +121,9 @@ async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failur
 }
 
 async fn assert_native_kick_database_scope(terminal_effects: bool) {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
     use sea_orm::{DbBackend, Statement};
 
@@ -133,9 +133,9 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -207,8 +207,8 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
             if observer.reads.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::AdmissionEnqueued {
-                        class: SqliteReadClass::Maintenance,
+                    PostgresReadEvent::AdmissionEnqueued {
+                        class: PostgresReadClass::Maintenance,
                         ..
                     }
                 )
@@ -228,17 +228,14 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         observer.writes.lock().unwrap().is_empty(),
         "discovery must wait before writing"
     );
-    let query_only = timeout(
-        Duration::from_secs(10),
-        database.reader_query_only_enabled(),
-    )
-    .await
-    .expect("foreground read must proceed while the kick waits")
-    .unwrap();
-    assert!(query_only, "the physical reader must remain query-only");
+    let read_only = timeout(Duration::from_secs(10), database.reader_is_read_only())
+        .await
+        .expect("foreground read must proceed while the kick waits")
+        .unwrap();
+    assert!(read_only, "the physical reader must remain read-only");
     assert_eq!(
         processor.crud_store.database_connection().read_class(),
-        SqliteReadClass::Interactive
+        PostgresReadClass::Interactive
     );
     observer.reads.lock().unwrap().clear();
     drop(held);
@@ -259,15 +256,15 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     let reads = observer.reads.lock().unwrap().clone();
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(reads.iter().all(|event| !matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -279,13 +276,13 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     } else {
         assert!(writes.iter().any(|event| matches!(
             event,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Critical,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Critical,
                 ..
             }
         )));
         assert!(writes.iter().all(|event| !matches!(event,
-            SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
+            PostgresWriteEvent::Acquired { class, .. } if *class != PostgresWriteClass::Critical
         )));
     }
     if !terminal_effects {
@@ -354,9 +351,9 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     reader.clone().close().await.unwrap();
-    processor.crud_store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-        reader, writer,
-    )));
+    processor.crud_store = Arc::new(CrudStore::new(
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
+    ));
     let processor = Arc::new(processor);
     let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
     let (hub, dispatch) = capture_with_transport(Arc::new(EventTransport(capture)));

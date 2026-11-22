@@ -4,8 +4,8 @@ use pioneer_entity::{turn, turn_event};
 use pioneer_entity::{
     turn_event_projection_state as receipt, turn_event_projection_stream_state as stream_entity,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryTrait,
@@ -87,22 +87,22 @@ async fn seed_scope(database: &sea_orm::DatabaseConnection) {
         .unwrap();
 }
 
-async fn open(fixture: &TestDatabase) -> SqliteDatabase {
-    SqliteDatabase::new(
+async fn open(fixture: &TestDatabase) -> PostgresDatabase {
+    PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connect().await.unwrap(),
     )
     .maintenance()
 }
 
-async fn store(fixture: &TestDatabase) -> SqliteDatabase {
+async fn store(fixture: &TestDatabase) -> PostgresDatabase {
     seed_scope(fixture.connection()).await;
     open(fixture).await
 }
 
 async fn write_fixture<T>(
-    database: &pioneer_sqlite::SqliteDatabase,
-    operation: impl AsyncFnOnce(&pioneer_sqlite::SqliteTransaction) -> anyhow::Result<T>,
+    database: &pioneer_postgres_pools::PostgresDatabase,
+    operation: impl AsyncFnOnce(&pioneer_postgres_pools::PostgresTransaction) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let tx = database.begin().await?;
     let value = operation(&tx).await?;
@@ -110,7 +110,7 @@ async fn write_fixture<T>(
     Ok(value)
 }
 
-async fn seed(store: &SqliteDatabase, turn_id: &str, count: i64, watermark: i64) {
+async fn seed(store: &PostgresDatabase, turn_id: &str, count: i64, watermark: i64) {
     let db = store.clone();
     let now = chrono::Utc::now().fixed_offset();
     pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
@@ -146,7 +146,7 @@ async fn seed(store: &SqliteDatabase, turn_id: &str, count: i64, watermark: i64)
     }
 }
 
-async fn insert_event(store: &SqliteDatabase, turn_id: &str, sequence: i64, status: &str) {
+async fn insert_event(store: &PostgresDatabase, turn_id: &str, sequence: i64, status: &str) {
     let db = store.clone();
     let event_id = format!("{turn_id}-{sequence}");
     db.execute_raw(Statement::from_sql_and_values(db.get_database_backend(),
@@ -159,7 +159,7 @@ async fn insert_event(store: &SqliteDatabase, turn_id: &str, sequence: i64, stat
     )).await.unwrap();
 }
 
-async fn boundary(store: &SqliteDatabase, turn_id: &str) -> i64 {
+async fn boundary(store: &PostgresDatabase, turn_id: &str) -> i64 {
     streams::find(&store.clone(), turn_id)
         .await
         .unwrap()
@@ -167,7 +167,7 @@ async fn boundary(store: &SqliteDatabase, turn_id: &str) -> i64 {
         .receipts_compacted_through_sequence
 }
 
-async fn watermark(db: &pioneer_sqlite::SqliteDatabase, turn_id: &str) -> i64 {
+async fn watermark(db: &pioneer_postgres_pools::PostgresDatabase, turn_id: &str) -> i64 {
     stream_entity::Entity::find_by_id(turn_id)
         .one(db)
         .await
@@ -176,7 +176,7 @@ async fn watermark(db: &pioneer_sqlite::SqliteDatabase, turn_id: &str) -> i64 {
         .projected_through_sequence
 }
 
-async fn seed_compacted_history(store: &SqliteDatabase) {
+async fn seed_compacted_history(store: &PostgresDatabase) {
     // Retain canonical events, with no old receipts and equal durable boundaries.
     // Bulk insertion is fixture setup only, never a production history backfill.
     store.clone().execute_unprepared(&format!(
@@ -970,19 +970,19 @@ async fn cleanup_reads_canonical_keys_with_portable_event_bodies() {
 }
 
 #[derive(Default)]
-struct WriteEvents(std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>);
+struct WriteEvents(std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>);
 
-impl pioneer_sqlite::SqliteWriteObserver for WriteEvents {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for WriteEvents {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.0.lock().unwrap().push(event);
     }
 }
 
 #[derive(Default)]
-struct ReadEvents(std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>);
+struct ReadEvents(std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>);
 
-impl pioneer_sqlite::SqliteReadObserver for ReadEvents {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for ReadEvents {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.0.lock().unwrap().push(event);
     }
 }
@@ -990,9 +990,9 @@ impl pioneer_sqlite::SqliteReadObserver for ReadEvents {
 #[tokio::test]
 async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_interactive_work() {
     with_database(async |fixture| {
-        use pioneer_sqlite::{
-            SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteClass,
-            SqliteWriteEvent, SqliteWriteExecutor,
+        use pioneer_postgres_pools::{
+            PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome, PostgresWriteClass,
+            PostgresWriteEvent, PostgresWriteExecutor,
         };
         use std::{sync::Arc, time::Duration};
         seed_scope(fixture.connection()).await;
@@ -1000,9 +1000,9 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
         let reader = fixture.connect_read_only().await.unwrap();
         let events = Arc::new(WriteEvents::default());
         let reads = Arc::new(ReadEvents::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, events.clone()),
+            PostgresWriteExecutor::with_observer(writer, events.clone()),
             reads.clone(),
         );
         let store = database.maintenance();
@@ -1032,7 +1032,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
             assert_eq!(
                 observed
                     .iter()
-                    .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+                    .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
                     .count(),
                 1
             );
@@ -1041,9 +1041,9 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                     .iter()
                     .filter(|event| matches!(
                         event,
-                        SqliteReadEvent::OperationFinished {
-                            class: SqliteReadClass::Maintenance,
-                            outcome: SqliteReadOutcome::Ok,
+                        PostgresReadEvent::OperationFinished {
+                            class: PostgresReadClass::Maintenance,
+                            outcome: PostgresReadOutcome::Ok,
                             ..
                         }
                     ))
@@ -1055,8 +1055,8 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                     .iter()
                     .filter(|event| matches!(
                         event,
-                        SqliteReadEvent::AdmissionReleased {
-                            class: SqliteReadClass::Maintenance,
+                        PostgresReadEvent::AdmissionReleased {
+                            class: PostgresReadClass::Maintenance,
                             active: 0,
                             queue_depth: 0,
                             ..
@@ -1101,8 +1101,8 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
                 if events.0.lock().unwrap().iter().any(|event| {
                     matches!(
                         event,
-                        SqliteWriteEvent::Enqueued {
-                            class: SqliteWriteClass::Maintenance,
+                        PostgresWriteEvent::Enqueued {
+                            class: PostgresWriteClass::Maintenance,
                             ..
                         }
                     )
@@ -1115,7 +1115,7 @@ async fn discovery_uses_read_only_pool_and_cancelled_writer_wait_does_not_block_
         .unwrap();
         drop(work);
         assert!(events.0.lock().unwrap().iter().any(|event| matches!(event,
-            SqliteWriteEvent::Cancelled {class: SqliteWriteClass::Maintenance, queue, ..} if queue.maintenance == 0
+            PostgresWriteEvent::Cancelled {class: PostgresWriteClass::Maintenance, queue, ..} if queue.maintenance == 0
         )));
         blocker.rollback().await.unwrap();
         assert_eq!(boundary(&store, "turn").await, 0);

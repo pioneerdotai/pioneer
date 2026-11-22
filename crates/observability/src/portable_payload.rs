@@ -118,7 +118,7 @@ impl Metrics {
                 .with_description("Actual read/encoded/published/cleaned blocks by kind; staged blocks are not published")
                 .with_unit("{block}").build(),
             native_reads: meter.u64_counter("pioneer.gateway.portable.native.reads")
-                .with_description("Native guard/blob read operations; outside ordinary SQL callback/query-count and named SQLite worker-thread CPU coverage")
+                .with_description("Native guard/blob read operations; outside ordinary SQL callback/query-count and SQLx query-scope CPU coverage")
                 .with_unit("{read}").build(),
             native_duration: meter.f64_histogram("pioneer.gateway.portable.native.operation.duration")
                 .with_description("Sum of native handle wait or guard/blob execution elapsed per logical operation/family (standalone read when unowned); not per-read latency or CPU; excludes pool/admission waits")

@@ -369,10 +369,9 @@ async fn postgres_task_store(fixture: &pioneer_postgres_test::TestDatabase) -> A
         .connect_read_only()
         .await
         .expect("read-only PostgreSQL fixture");
-    Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-        reader,
-        writer.clone(),
-    )))
+    Arc::new(CrudStore::new(
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer.clone()),
+    ))
 }
 
 async fn seed_postgres_task_fixture(connection: &sea_orm::DatabaseConnection) {
@@ -9165,20 +9164,20 @@ async fn role_owned_task_observation_budget_clamps_list_and_event_pages() {
 
 #[derive(Default)]
 struct DispatchDatabaseObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteClass>>,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for DispatchDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for DispatchDatabaseObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for DispatchDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
-        if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
+impl pioneer_postgres_pools::PostgresWriteObserver for DispatchDatabaseObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
+        if let pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } = event {
             self.writes.lock().unwrap().push(class);
         }
     }
@@ -9186,8 +9185,8 @@ impl pioneer_sqlite::SqliteWriteObserver for DispatchDatabaseObserver {
 impl DispatchDatabaseObserver {
     fn assert_scope(
         &self,
-        read: pioneer_sqlite::SqliteReadClass,
-        write: pioneer_sqlite::SqliteWriteClass,
+        read: pioneer_postgres_pools::PostgresReadClass,
+        write: pioneer_postgres_pools::PostgresWriteClass,
     ) {
         let reads = std::mem::take(&mut *self.reads.lock().unwrap());
         let writes = std::mem::take(&mut *self.writes.lock().unwrap());
@@ -9205,16 +9204,16 @@ impl DispatchDatabaseObserver {
 #[tokio::test]
 async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenance_scope() {
     pioneer_postgres_test::with_database(async |fixture| {
-        use pioneer_sqlite::{
-            SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteExecutor,
+        use pioneer_postgres_pools::{
+            PostgresDatabase, PostgresReadClass, PostgresWriteClass, PostgresWriteExecutor,
         };
         let writer = fixture.connect().await?;
         let reader = fixture.connect_read_only().await?;
         seed_postgres_task_fixture(&writer).await;
         let observer = Arc::new(DispatchDatabaseObserver::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         let runtime = TaskRuntime::new(Arc::new(CrudStore::new(database)));
@@ -9224,18 +9223,18 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
         for (service, read, write) in [
             (
                 runtime.service(),
-                SqliteReadClass::Interactive,
-                SqliteWriteClass::Interactive,
+                PostgresReadClass::Interactive,
+                PostgresWriteClass::Interactive,
             ),
             (
                 runtime.maintenance_service(),
-                SqliteReadClass::Maintenance,
-                SqliteWriteClass::Maintenance,
+                PostgresReadClass::Maintenance,
+                PostgresWriteClass::Maintenance,
             ),
             (
                 runtime.background_control_service(),
-                SqliteReadClass::Maintenance,
-                SqliteWriteClass::Critical,
+                PostgresReadClass::Maintenance,
+                PostgresWriteClass::Critical,
             ),
         ] {
             let result = service
@@ -9260,9 +9259,15 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
             )
             .await
             .unwrap();
-        observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
+        observer.assert_scope(
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
+        );
         assert_eq!(runtime.process_due_once(4_000_000_000).await.unwrap(), 1);
-        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+        observer.assert_scope(
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
+        );
 
         let invalid = runtime
             .service()
@@ -9296,9 +9301,15 @@ async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenan
             )
             .await
             .unwrap();
-        observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
+        observer.assert_scope(
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
+        );
         assert_eq!(runtime.process_due_once(now).await.unwrap(), 0);
-        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+        observer.assert_scope(
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
+        );
         let invalid = runtime
             .service()
             .get_task(pioneer_protocol::TaskGetParams {

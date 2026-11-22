@@ -103,7 +103,7 @@ impl ProjectionWork {
         }
     }
 
-    pub async fn wait(&self, changes: &mut pioneer_sqlite::WorkSubscription) {
+    pub async fn wait(&self, changes: &mut pioneer_postgres_pools::WorkSubscription) {
         // Waiting consumes the watch notification. Between quanta only yield
         // in the caller: changes during this frontier must wake its successor.
         if self.is_complete() {
@@ -147,7 +147,7 @@ mod tests {
         use futures_util::FutureExt;
 
         pioneer_postgres_test::with_database(async |fixture| {
-            let database = pioneer_sqlite::SqliteDatabase::new(
+            let database = pioneer_postgres_pools::PostgresDatabase::new(
                 fixture.connect_read_only().await?,
                 fixture.connection().clone(),
             );

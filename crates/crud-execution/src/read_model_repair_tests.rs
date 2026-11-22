@@ -28,8 +28,8 @@ impl EpisodicRepair for NoEpisodicRepair {
     fn committed(&self) {}
 }
 
-async fn scoped(fixture: &pioneer_postgres_test::TestDatabase) -> SqliteDatabase {
-    SqliteDatabase::new(
+async fn scoped(fixture: &pioneer_postgres_test::TestDatabase) -> PostgresDatabase {
+    PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     )
@@ -45,7 +45,7 @@ async fn run_repair(
 }
 
 async fn read_fixture_item(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: pioneer_entity::turn_item::Model,
 ) -> Result<TurnItem> {
     let mut rows = turn_payload::hydrate_items(db, vec![row]).await?;

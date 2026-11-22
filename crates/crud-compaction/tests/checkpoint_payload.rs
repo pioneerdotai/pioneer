@@ -1,6 +1,6 @@
 use pioneer_compaction::SourceRef;
 use pioneer_crud_compaction::store::CompactionStore;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::ConnectionTrait;
 
 #[pioneer_postgres_test::postgres_test]
@@ -25,7 +25,7 @@ async fn checkpoint_payload_public_path_returns_the_exact_summary() {
         .await
         .unwrap();
     let store = CompactionStore::new(
-        SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()),
+        PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()),
         Default::default(),
     )
     .with_maintenance_access();

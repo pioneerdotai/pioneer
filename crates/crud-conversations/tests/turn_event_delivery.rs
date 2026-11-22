@@ -342,8 +342,10 @@ async fn corrupt_body_in_claim_batch_does_not_suppress_healthy_turn() -> Result<
         .await?;
         enqueue_items(db, BAD, 1).await?;
         enqueue_items(db, GOOD, 1).await?;
-        let storage =
-            pioneer_sqlite::SqliteDatabase::new(fixture.connect_read_only().await?, db.clone());
+        let storage = pioneer_postgres_pools::PostgresDatabase::new(
+            fixture.connect_read_only().await?,
+            db.clone(),
+        );
         let bad = delivery::Entity::find()
             .filter(delivery::Column::TurnId.eq(BAD))
             .filter(delivery::Column::Consumer.eq(CONSUMER_LIVE_NOTIFICATION))

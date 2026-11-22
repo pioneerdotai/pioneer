@@ -81,7 +81,7 @@ impl CrudStore {
     }
 
     /// Initial native handoff CAS, fenced against accepted terminal and exact
-    /// process ownership generation in the same serialized write transaction.
+    /// process ownership generation in the same write transaction.
     pub async fn mark_turn_execution_running_current(
         &self,
         expected: &TurnExecutionRecord,
@@ -116,8 +116,8 @@ impl CrudStore {
     }
 
     /// Fence duplicate outbox activations using the starting receipt's timestamp.
-    /// This CAS precedes runtime registration, while canonical
-    /// terminal acceptance shares the same serialized writer.
+    /// This CAS precedes runtime registration. Canonical terminal acceptance
+    /// also checks and updates the execution record.
     pub async fn claim_unactivated_agent_turn(
         &self,
         expected: &TurnExecutionRecord,
@@ -193,7 +193,7 @@ impl CrudStore {
     ) -> Result<bool> {
         let turn_id = turn_id.to_owned();
         let snapshot = snapshot.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             pioneer_crud_execution::turn_envelope::set_turn_execution_security_snapshot(
                 &self.connection,
                 turn_id.as_str(),
@@ -212,7 +212,7 @@ impl CrudStore {
         budget: &pioneer_protocol::NativeContextBudget,
         summary: Option<&pioneer_protocol::NativeSummaryContext>,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             pioneer_crud_execution::turn_envelope::pin_native_context(
                 &self.connection,
                 workspace,
@@ -230,7 +230,7 @@ impl CrudStore {
         turn_id: &str,
     ) -> Result<Option<TurnExecutionSecuritySnapshotRecord>> {
         let turn_id = turn_id.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             pioneer_crud_execution::turn_envelope::find_turn_execution_security_snapshot(
                 &self.connection,
                 turn_id.as_str(),
@@ -249,7 +249,7 @@ impl CrudStore {
         let turn_id = turn_id.to_owned();
         let snapshot = snapshot.clone();
         let authorization_context_json = authorization_context_json.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             pioneer_crud_execution::turn_envelope::set_turn_execution_envelope(
                 &self.connection,
                 turn_id.as_str(),
@@ -268,7 +268,7 @@ impl CrudStore {
     ) -> Result<bool> {
         let turn_id = turn_id.to_owned();
         let context_json = context_json.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             pioneer_crud_execution::turn_envelope::set_turn_execution_authorization_context(
                 &self.connection,
                 turn_id.as_str(),

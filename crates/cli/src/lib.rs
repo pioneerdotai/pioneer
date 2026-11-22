@@ -701,7 +701,7 @@ fn help_text() -> String {
   {command} status [--json]     Show gateway service status
   {command} device create [--json]  Create a pending device session and one-time activation code
   {command} task-invariants [--json] [--stale-turn-after-seconds <seconds>]
-                                Scan task/subagent runtime invariants in a SQLite gateway DB
+                                Scan task/subagent runtime invariants in a PostgreSQL gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} stop                Stop and uninstall the persistent gateway service

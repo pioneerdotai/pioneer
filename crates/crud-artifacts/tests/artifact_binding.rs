@@ -5,11 +5,11 @@ use pioneer_crud_artifacts::{
     mutations::bind_artifact,
 };
 use pioneer_entity::artifact_binding;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, Statement, TransactionTrait,
 };
@@ -63,7 +63,7 @@ async fn current_version_binding_waits_for_a_concurrent_version_change() -> Resu
         let pid: i32 = candidate_writer.query_one_raw(Statement::from_string(
             DbBackend::Postgres, "SELECT pg_backend_pid()",
         )).await?.context("binding backend PID")?.try_get_by_index(0)?;
-        let scoped = SqliteDatabase::new(fixture.connect_read_only().await?, candidate_writer);
+        let scoped = PostgresDatabase::new(fixture.connect_read_only().await?, candidate_writer);
         let target = ArtifactBindingTargetRecord {
             thread_id: None, turn_id: None, message_id: None, turn_item_id: None,
             tool_call_id: None, task_id: None, task_run_id: None,

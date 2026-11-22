@@ -1534,7 +1534,7 @@ impl TaskAgentExecutor {
         match self.processor() {
             Ok(processor) => Ok(Some(match origin {
                 TaskChildReconciliationOrigin::Live => {
-                    processor.with_database_class(SqliteWriteClass::Critical)
+                    processor.with_database_class(PostgresWriteClass::Critical)
                 }
                 TaskChildReconciliationOrigin::DurableBackground => {
                     processor.for_background_reconciliation()
@@ -1597,7 +1597,7 @@ impl TaskAgentExecutor {
     ) -> Result<TaskExecutorStartOutcome> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
@@ -6851,7 +6851,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let failed_at = now_timestamp_secs();
         let error = task_turn_failure_error(
@@ -6888,7 +6888,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let cancelled_at = now_timestamp_secs();
         let error = task_error(
@@ -6940,7 +6940,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
         let error = match start_failure {
@@ -7078,7 +7078,7 @@ impl TaskExecutor for TaskAgentExecutor {
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
         let cancelled_at = now_timestamp_secs();
@@ -8052,21 +8052,21 @@ mod prepared_snapshot_tests {
         let live = ordinary_history_store(&store.with_critical_writes());
         assert_eq!(
             live.database_connection().read_class(),
-            SqliteReadClass::Interactive
+            PostgresReadClass::Interactive
         );
         assert_eq!(
             live.database_connection().write_class(),
-            SqliteWriteClass::Interactive
+            PostgresWriteClass::Interactive
         );
         let background =
             ordinary_history_store(&store.with_maintenance_reads_and_critical_writes());
         assert_eq!(
             background.database_connection().read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             background.database_connection().write_class(),
-            SqliteWriteClass::Maintenance
+            PostgresWriteClass::Maintenance
         );
     }
 
@@ -10331,7 +10331,7 @@ fn spawn_execution_heartbeat(
         let Some(owner) = processor.upgrade() else {
             return;
         };
-        let owner = owner.with_database_class(SqliteWriteClass::Critical);
+        let owner = owner.with_database_class(PostgresWriteClass::Critical);
         let Ok(Some(resource_state)) = pioneer_crud::load_agent_execution_resource_state(
             &owner.crud_store.database_connection(),
             execution_id.as_str(),
@@ -10364,7 +10364,7 @@ fn spawn_execution_heartbeat(
             let Some(processor) = processor.upgrade() else {
                 break;
             };
-            let processor = processor.with_database_class(SqliteWriteClass::Critical);
+            let processor = processor.with_database_class(PostgresWriteClass::Critical);
             let Ok(Some(execution)) = processor.crud_store.load_execution_for_run(&run_id).await
             else {
                 break;

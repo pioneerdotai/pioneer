@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 const NOW: i64 = 1_900_000_000;
 struct Fixture {
-    db: SqliteDatabase,
+    db: PostgresDatabase,
     fixture: Arc<pioneer_postgres_test::TestDatabase>,
 }
 
@@ -22,7 +22,7 @@ impl Fixture {
     async fn connect(fixture: Arc<pioneer_postgres_test::TestDatabase>) -> Result<Self> {
         let writer = fixture.connect_with_limit(1).await?;
         let reader = fixture.connect_read_only().await?;
-        let db = SqliteDatabase::new(reader, writer).maintenance();
+        let db = PostgresDatabase::new(reader, writer).maintenance();
         db.validate_reader().await?;
         Ok(Self { db, fixture })
     }

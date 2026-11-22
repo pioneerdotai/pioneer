@@ -1,7 +1,7 @@
 //! Gateway orchestration of compaction lifecycle and history work.
 use super::*;
 use pioneer_entity::{compaction_lifecycle_pending as pending, compaction_operation as operation};
-use pioneer_sqlite::SqliteWriteClass;
+use pioneer_postgres_pools::PostgresWriteClass;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 
 async fn fixture() -> (
@@ -163,8 +163,8 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
             .iter()
             .any(|event| matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Acquired {
-                    class: SqliteWriteClass::Critical,
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired {
+                    class: PostgresWriteClass::Critical,
                     ..
                 }
             ))
@@ -197,7 +197,7 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
     processor.poll_completed_history_checks().await.unwrap();
     assert!(failed_count(&store).await > 7);
     processor.suspend_completed_history_checks().await;
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
 }
 
 #[pioneer_postgres_test::postgres_test]
@@ -258,8 +258,8 @@ async fn lifecycle_gateway_poll_cancellation_releases_maintenance_reservation() 
                 .any(|event| {
                     matches!(
                         event,
-                        pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                            class: SqliteWriteClass::Maintenance,
+                        pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                            class: PostgresWriteClass::Maintenance,
                             ..
                         }
                     )
@@ -284,8 +284,8 @@ async fn lifecycle_gateway_poll_cancellation_releases_maintenance_reservation() 
             .is_some()
     );
     assert!(observer.writes.lock().unwrap()[start..].iter().any(|event| matches!(event,
-        pioneer_sqlite::SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+        pioneer_postgres_pools::PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
     processor.poll_completed_history_checks().await.unwrap();
     assert_eq!(failed_count(&store).await, 8);
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
 }

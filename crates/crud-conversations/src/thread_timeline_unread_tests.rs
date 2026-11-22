@@ -3,14 +3,14 @@ use crate::test_support::insert_unread_test_turn;
 use crate::thread_mutations::upsert_thread_with_creator;
 use crate::values::unix_to_datetime;
 use pioneer_crud_access::identity::{create_gateway_singleton, create_superuser};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, Thread, ThreadMode, ThreadOriginKind,
     ThreadSidebarVisibility, ThreadStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait, sea_query::Expr};
 
-async fn insert_fixture_thread(db: &SqliteDatabase, id: &str, reader: &PrincipalId) {
+async fn insert_fixture_thread(db: &PostgresDatabase, id: &str, reader: &PrincipalId) {
     let when = 1_700_000_000;
     let timestamp = unix_to_datetime(when);
     let tx = db.begin().await.unwrap();
@@ -55,7 +55,7 @@ fn sample_thread(workspace_id: &str, thread_id: &str, timestamp: i64) -> Thread 
 #[pioneer_postgres_test::postgres_test]
 async fn unread_batch_seeks_positions_and_preserves_sparse_distinct_membership() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = SqliteDatabase::new(
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );

@@ -85,6 +85,31 @@ Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed 
 
 Gateway releases include PostgreSQL 18 and pgvector. Starting a local Gateway initializes its private database in the Gateway data directory. The same database is opened on later starts and application updates. Desktop installs the same database runtime when it sets up a local Gateway.
 
+For a self-hosted Gateway with an external PostgreSQL 18 server or cluster,
+set `DATABASE_URL` in the Gateway process environment or in
+`~/.pioneer/.env` under the service account.
+
+```dotenv
+DATABASE_URL=postgresql://pioneer_app:YOUR_PASSWORD@db.example.com:5432/pioneer?sslmode=verify-full
+```
+
+Create a dedicated application database with pgvector available and give the
+configured role permission to apply Pioneer migrations. For a cluster, use
+its writable primary endpoint. Gateway applies migrations at startup and
+opens its reader and writer pools against that database. Use one active
+Gateway instance per database.
+
+In dev, an explicit `gateway.database.development_url` takes precedence.
+Otherwise Gateway checks the process environment, then `~/.pioneer.dev/.env`.
+Use a separate database for development.
+
+On first initialization of a bundled cluster, Gateway uses PGConfig's
+`DESKTOP` profile. The calculator receives the detected RAM budget, logical CPU
+count and storage type. On Linux, the RAM input respects a detected cgroup limit. PGConfig supplies the
+server connection limit, currently 100. Gateway sets its pool sizes separately.
+The generated file is `postgres/data/pioneer-tuning.conf`. Add manual
+overrides below its include in `postgresql.conf`.
+
 On Windows ARM64, the bundled PostgreSQL and pgvector run through Windows 11's built-in x64 emulation.
 
 ```mermaid

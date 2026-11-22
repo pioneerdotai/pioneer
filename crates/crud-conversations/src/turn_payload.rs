@@ -1,13 +1,13 @@
 //! Read payload frames in a PostgreSQL snapshot and decode them after release.
 use anyhow::Result;
 use pioneer_crud_payloads::storage::{self, CapturedPayload, Selection};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::EntityTrait;
 
 macro_rules! reader {
     ($load:ident, $hydrate:ident, $capture:ident, $decode:ident, $module:ident) => {
         pub async fn $load(
-            db: &SqliteDatabase,
+            db: &PostgresDatabase,
             query: sea_orm::Select<pioneer_entity::$module::Entity>,
         ) -> Result<Vec<pioneer_entity::$module::Model>> {
             let reader = db.begin_read().await?;
@@ -18,7 +18,7 @@ macro_rules! reader {
         }
 
         pub async fn $hydrate(
-            db: &SqliteDatabase,
+            db: &PostgresDatabase,
             rows: Vec<pioneer_entity::$module::Model>,
         ) -> Result<Vec<pioneer_entity::$module::Model>> {
             let reader = db.begin_read().await?;
@@ -74,7 +74,7 @@ reader!(items, hydrate_items, capture_items, decode_items, turn_item);
 
 /// Capture exact bytes for readers that publish a hash or compare a source CAS.
 pub async fn exact_items(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     query: sea_orm::Select<pioneer_entity::turn_item::Entity>,
 ) -> Result<Vec<(pioneer_entity::turn_item::Model, String)>> {
     use anyhow::Context;

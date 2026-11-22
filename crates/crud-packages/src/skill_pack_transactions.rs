@@ -3,11 +3,11 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pioneer_protocol::{SkillId, SkillPackId};
-use pioneer_sqlite::{
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
     retry_with_backoff,
 };
+use pioneer_protocol::{SkillId, SkillPackId};
 use sea_orm::{ConnectionTrait, TransactionSession, TransactionTrait};
 
 use crate::skill_audit_event::SkillAuditEventRecord;

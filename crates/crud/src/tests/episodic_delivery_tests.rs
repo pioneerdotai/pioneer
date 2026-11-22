@@ -4,7 +4,7 @@ use pioneer_entity::{
     turn_event_delivery as delivery, turn_event_projection_state as receipt,
     turn_event_projection_stream_state as stream,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 
 const NOW: i64 = 1_700_000_110;
 const EPISODIC: &str = deliveries::CONSUMER_THREAD_EPISODIC;
@@ -13,7 +13,7 @@ const LIVE: &str = deliveries::CONSUMER_LIVE_NOTIFICATION;
 async fn open_store(fixture: &pioneer_postgres_test::TestDatabase) -> CrudStore {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
+    let database = PostgresDatabase::new(reader, writer);
     database.validate_reader().await.unwrap();
     CrudStore::new(database).with_maintenance_access()
 }

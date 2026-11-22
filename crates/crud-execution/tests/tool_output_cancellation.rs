@@ -1,5 +1,5 @@
 use pioneer_crud_execution::tool_output::{page, record_output};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 #[pioneer_postgres_test::postgres_test]
@@ -14,8 +14,8 @@ async fn cancelled_tool_output_write_reopens_with_a_read_only_pool() {
         writer.execute_unprepared(statement).await.unwrap();
     }
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    let database = PostgresDatabase::new(reader, writer);
+    assert!(database.reader_is_read_only().await.unwrap());
     let scoped = database.maintenance();
     let output = pioneer_protocol::ItemDeltaNotification {
         workspace_id: "ws".into(),
@@ -58,7 +58,7 @@ async fn cancelled_tool_output_write_reopens_with_a_read_only_pool() {
     drop(database);
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let reopened = SqliteDatabase::new(reader, writer).maintenance();
+    let reopened = PostgresDatabase::new(reader, writer).maintenance();
     let rows = page(&reopened, "ws", "thread", "turn", "persisted-shell", 0)
         .await
         .unwrap();

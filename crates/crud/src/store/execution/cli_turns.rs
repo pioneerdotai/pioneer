@@ -50,7 +50,7 @@ impl CrudStore {
                 &binding.input_mapping_json,
                 root.locator().is_some(),
             )?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let prepared_binding = binding.clone();
                 let transaction = self
                     .connection
@@ -137,7 +137,7 @@ impl CrudStore {
             let expected_ack_id = format!("{source_terminal_id}:ack");
             let expected_continuation_id = format!("{attempt_id}:task-continuation");
             let result = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let source = source.clone();
                     let source_terminal_id = source_terminal_id.clone();
                     let expected_ack_id = expected_ack_id.clone();
@@ -213,7 +213,7 @@ impl CrudStore {
             let turn_id = turn_id.to_owned();
             let legacy_attempt_id = pioneer_protocol::generate_id(DB_ID_LEN);
             let result = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let legacy_attempt_id = legacy_attempt_id.clone();
                     let turn_id = turn_id.clone();
                     let attempt_id = attempt_id.clone();
@@ -333,7 +333,7 @@ impl CrudStore {
         let native_turn_id = native_turn_id.to_owned();
         let execution_owner_id = execution_owner_id.map(str::to_owned);
         let result = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -593,7 +593,7 @@ impl CrudStore {
                 created_at,
             )
             .await?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let prepared = prepared.clone();
                 let transaction = self.connection.begin().await?;
                 let Some(binding) =
@@ -854,7 +854,7 @@ impl CrudStore {
             }
             let turn_id = turn_id.to_owned();
             let binding_status = binding_status.to_owned();
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()

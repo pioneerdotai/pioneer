@@ -4,11 +4,11 @@ use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::{TimeZone, Utc};
-use pioneer_protocol::generate_id;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::generate_id;
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
@@ -24,11 +24,11 @@ const DB_ID_LEN: usize = 21;
 
 #[derive(Clone)]
 pub struct SelfImprovementStore {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
 }
 
 impl SelfImprovementStore {
-    pub fn new(connection: SqliteDatabase) -> Self {
+    pub fn new(connection: PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -36,7 +36,7 @@ impl SelfImprovementStore {
         Self::new(self.connection.maintenance())
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -65,7 +65,7 @@ impl SelfImprovementStore {
         now_unix: i64,
     ) -> Result<SelfImprovementWorkspaceStateRecord> {
         let workspace_id = workspace_id.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             self_improvement_workspace_state::ensure(
                 &self.connection,
                 workspace_id.as_str(),
@@ -83,7 +83,7 @@ impl SelfImprovementStore {
         effective_enabled_at_unix: i64,
     ) -> Result<SelfImprovementWorkspaceStateRecord> {
         let workspace_id = workspace_id.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -148,7 +148,7 @@ impl SelfImprovementStore {
         now_unix: i64,
     ) -> Result<SelfImprovementWorkspaceStateRecord> {
         let workspace_id = workspace_id.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -264,7 +264,7 @@ impl SelfImprovementStore {
     ) -> Result<SelfImprovementRunRecord> {
         self_improvement_run::validate_new_run(&input)?;
         let run_id = generate_id(DB_ID_LEN);
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -393,7 +393,7 @@ impl SelfImprovementStore {
         let claimed_by = claimed_by.to_owned();
         let claim_token = generate_id(32);
 
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -469,7 +469,7 @@ impl SelfImprovementStore {
         let fence = fence.clone();
         let analysis_cursor_json = analysis_cursor_json.to_owned();
         let analysis_digest_json = analysis_digest_json.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -502,7 +502,7 @@ impl SelfImprovementStore {
             bail!("self-improvement heartbeat lease must expire after heartbeat time");
         }
         let fence = fence.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -530,7 +530,7 @@ impl SelfImprovementStore {
         now_unix: i64,
     ) -> Result<SelfImprovementRunMutationResult> {
         let run = run.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -559,7 +559,7 @@ impl SelfImprovementStore {
     ) -> Result<SelfImprovementRunMutationResult> {
         let run = run.clone();
         let authority = authority.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -611,7 +611,7 @@ impl SelfImprovementStore {
             bail!("self-improvement budget yield must schedule a future wake");
         }
         let fence = fence.clone();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -676,7 +676,7 @@ impl SelfImprovementStore {
         let fence = fence.clone();
         let status = status.to_owned();
         let last_error = last_error.to_owned();
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -706,7 +706,7 @@ impl SelfImprovementStore {
         now_unix: i64,
     ) -> Result<FinalizeSelfImprovementRunResult> {
         let prepared = finalization::prepare(&self.connection, input).await?;
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let prepared = prepared.clone();
             async move {
                 let transaction = self
@@ -773,7 +773,7 @@ impl SelfImprovementStore {
             return Ok(());
         };
         maintenance
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let transaction = maintenance.connection.begin().await?;
                 let result =
                     crate::history_cursor::rewind_idle(&transaction, &state, earliest).await;

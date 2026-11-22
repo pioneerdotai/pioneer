@@ -1,6 +1,6 @@
 use super::FrozenStorageLifetimeProgress;
 use crate::store::CompactionStore;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 
 async fn scalar(store: &CompactionStore, sql: &str) -> i64 {
@@ -24,8 +24,8 @@ async fn cancelled_frozen_conversion_reopens_with_a_read_only_pool() {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     crate::plan_test_support::seed_revision_fixture(&writer, false).await;
     let reader = fixture.connect_read_only().await.unwrap();
-    let database = SqliteDatabase::new(reader, writer);
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    let database = PostgresDatabase::new(reader, writer);
+    assert!(database.reader_is_read_only().await.unwrap());
     let store =
         CompactionStore::new(database.clone(), Default::default()).with_maintenance_access();
     // Complete bounded scope discovery while no frozen rows exist. The
@@ -98,7 +98,7 @@ async fn cancelled_frozen_conversion_reopens_with_a_read_only_pool() {
     drop(database);
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let reopened = CompactionStore::new(SqliteDatabase::new(reader, writer), Default::default())
+    let reopened = CompactionStore::new(PostgresDatabase::new(reader, writer), Default::default())
         .with_maintenance_access();
     let mut frozen_conversion_progress = FrozenStorageLifetimeProgress::default();
     for _ in 0..512 {

@@ -9,10 +9,10 @@ use pioneer_crud_tasks::{
     task_event_context::TaskEventContextRepository, view_store::TaskViewStore,
 };
 use pioneer_entity::{turn_cli_runtime_attempt as attempt, turn_item};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     CodexRetryNotice, SystemEventLevel, TaskAttachmentMode, TaskTurnItem, TurnItem, TurnKind,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::collections::{HashMap, HashSet};
 
@@ -43,11 +43,11 @@ pub struct CodexRetryNoticeRead {
 }
 
 pub struct CodexRetryNoticeRepository<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> CodexRetryNoticeRepository<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 

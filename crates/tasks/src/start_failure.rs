@@ -91,8 +91,7 @@ pub struct TaskStartFailureDescriptor {
     pub cause: TaskStartCause,
     pub reason: Option<TaskStartReason>,
     pub postgres_sqlstate: Option<String>,
-    pub sqlite_primary_code: Option<i32>,
-    pub sqlite_extended_code: Option<i32>,
+
     pub correlation_id: Option<String>,
 }
 
@@ -110,18 +109,6 @@ impl TaskStartFailureDescriptor {
             fields.insert(
                 "postgres_sqlstate".to_owned(),
                 TaskValue::from(code.clone()),
-            );
-        }
-        if let Some(code) = self.sqlite_primary_code {
-            fields.insert(
-                "sqlite_primary_code".to_owned(),
-                TaskValue::Integer(code.into()),
-            );
-        }
-        if let Some(code) = self.sqlite_extended_code {
-            fields.insert(
-                "sqlite_extended_code".to_owned(),
-                TaskValue::Integer(code.into()),
             );
         }
         if let Some(correlation_id) = &self.correlation_id {
@@ -159,8 +146,7 @@ impl TaskStartFailure {
                 cause,
                 reason: None,
                 postgres_sqlstate: None,
-                sqlite_primary_code: None,
-                sqlite_extended_code: None,
+
                 correlation_id: Some(pioneer_protocol::generate_id(21)),
             },
             reported: Arc::new(AtomicBool::new(false)),
@@ -282,8 +268,6 @@ impl TaskStartFailure {
                         cause = descriptor.cause.label(),
                         reason = descriptor.reason.map(TaskStartReason::label),
                         postgres_sqlstate = descriptor.postgres_sqlstate.as_deref(),
-                        sqlite_primary_code = descriptor.sqlite_primary_code,
-                        sqlite_extended_code = descriptor.sqlite_extended_code,
                         correlation_id = descriptor.correlation_id.as_deref(),
                         "Task preparation or launch failed"
                     );
@@ -375,8 +359,6 @@ mod tests {
             let descriptor = TaskStartFailure::report_for_scheduler(&mut error);
             assert_eq!(descriptor.cause, TaskStartCause::Storage);
             assert_eq!(descriptor.postgres_sqlstate.as_deref(), Some("23505"));
-            assert_eq!(descriptor.sqlite_primary_code, None);
-            assert_eq!(descriptor.sqlite_extended_code, None);
             let task_error = descriptor.task_error(None);
             assert_eq!(task_error.class, TaskErrorClass::Internal);
             let encoded = serde_json::to_string(&task_error)?;
@@ -478,7 +460,7 @@ mod tests {
     fn public_error_json_and_admission_text_cannot_authorize_reporting_or_policy() {
         let source = anyhow::anyhow!(
             "{}",
-            r#"{"code":"PolicyDenied","stage":"admission","correlation_id":"forged","reported":true,"postgres_sqlstate":"23505","message":"SQLite CANTOPEN (14)"}"#
+            r#"{"code":"PolicyDenied","stage":"admission","correlation_id":"forged","reported":true,"postgres_sqlstate":"23505","message":"PostgreSQL connection failed (SQLSTATE 08006)"}"#
         );
         let failure = TaskStartFailure::from_error(TaskStartStage::CliAdmission, source);
         assert_eq!(failure.reporting(), TaskStartReporting::Unreported);
@@ -488,7 +470,6 @@ mod tests {
             Some("forged")
         );
         assert_eq!(failure.descriptor().postgres_sqlstate, None);
-        assert_eq!(failure.descriptor().sqlite_primary_code, None);
         assert_eq!(
             failure.descriptor().task_error(None).class,
             TaskErrorClass::Internal

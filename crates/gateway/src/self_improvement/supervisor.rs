@@ -15,10 +15,10 @@ use pioneer_crud::{
     SelfImprovementFrozenSourceRange, SelfImprovementNoChangeReason, SelfImprovementRunFence,
     SelfImprovementRunMutationResult, SelfImprovementRunRecord,
 };
+use pioneer_postgres_pools::is_retryable_database_conflict;
 use pioneer_protocol::{ProviderFailureClass, SKILL_ID_LEN, SkillId, generate_id};
 use pioneer_provider::ProviderRegistry;
 use pioneer_skills::AgentSkillRuntimeEntry;
-use pioneer_sqlite::is_retryable_database_conflict;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

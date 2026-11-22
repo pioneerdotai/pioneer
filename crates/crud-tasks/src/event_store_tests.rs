@@ -25,7 +25,7 @@ use sea_orm::{
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-fn task_event_store(connection: SqliteDatabase) -> TaskEventStore<NoFrozenOutput> {
+fn task_event_store(connection: PostgresDatabase) -> TaskEventStore<NoFrozenOutput> {
     TaskEventStore::new(connection, NoFrozenOutput)
 }
 
@@ -55,7 +55,9 @@ async fn store(fixture: &pioneer_postgres_test::TestDatabase) -> TaskEventStore<
         .await
         .unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    task_event_store(pioneer_sqlite::SqliteDatabase::new(reader, writer))
+    task_event_store(pioneer_postgres_pools::PostgresDatabase::new(
+        reader, writer,
+    ))
 }
 async fn row(store: &TaskEventStore<NoFrozenOutput>, id: &str) -> Option<pending::Model> {
     pending::Entity::find_by_id(id.to_owned())
@@ -1053,26 +1055,26 @@ async fn malformed_event_page_keeps_good_prefix_and_does_not_discard_poison() {
 
 #[derive(Default)]
 struct Routes {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     queued: tokio::sync::Notify,
     watch: std::sync::atomic::AtomicBool,
 }
-impl pioneer_sqlite::SqliteReadObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
         if self.watch.load(std::sync::atomic::Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             )
@@ -1087,15 +1089,18 @@ async fn observed_store(
 ) -> TaskEventStore<NoFrozenOutput> {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, routes.clone());
     task_event_store(
-        pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
+        pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
+            reader, executor, routes,
+        ),
     )
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_discovery_claims_context_and_cancellation_use_physical_routes() {
     pioneer_postgres_test::with_database(async |fixture| {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass, SqliteWriteEvent};
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass, PostgresWriteEvent};
     store(fixture).await.connection.close().await.unwrap();
     let routes = Arc::new(Routes::default());
     let store = observed_store(fixture, routes.clone()).await;
@@ -1118,7 +1123,7 @@ async fn maintenance_discovery_claims_context_and_cancellation_use_physical_rout
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
     assert!(
         routes.writes.lock().unwrap().is_empty(),
@@ -1147,7 +1152,7 @@ async fn maintenance_discovery_claims_context_and_cancellation_use_physical_rout
     assert!(waiting.await.unwrap_err().is_cancelled());
     hold.rollback().await.unwrap();
     assert_eq!(row(&store, &task.id).await.unwrap(), before);
-    assert!(routes.writes.lock().unwrap().iter().any(|event|matches!(event,SqliteWriteEvent::Cancelled{class:SqliteWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
+    assert!(routes.writes.lock().unwrap().iter().any(|event|matches!(event,PostgresWriteEvent::Cancelled{class:PostgresWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
     routes
         .watch
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1159,7 +1164,7 @@ async fn maintenance_discovery_claims_context_and_cancellation_use_physical_rout
         .await
         .unwrap()
         .unwrap();
-    assert!(routes.writes.lock().unwrap().iter().all(|event|!matches!(event,SqliteWriteEvent::Enqueued{class,..} if *class!=SqliteWriteClass::Maintenance)));
+    assert!(routes.writes.lock().unwrap().iter().all(|event|!matches!(event,PostgresWriteEvent::Enqueued{class,..} if *class!=PostgresWriteClass::Maintenance)));
     routes.writes.lock().unwrap().clear();
     store
         .with_maintenance_reads_and_critical_writes()
@@ -1168,8 +1173,8 @@ async fn maintenance_discovery_claims_context_and_cancellation_use_physical_rout
         .unwrap();
     assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));

@@ -117,7 +117,7 @@ impl CrudStore {
             owner_id,
             unix_to_datetime(now_unix),
         )?;
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let candidate = candidate.clone();
             let tx = self.connection.begin().await?;
             pioneer_crud_conversations::turn_event::lock_stream(&tx, &preparation.turn_id).await?;

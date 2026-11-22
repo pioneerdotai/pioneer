@@ -20,7 +20,7 @@ pub(crate) async fn compaction_stop_execution(
         store.frozen_readers.clone(),
     );
     store
-        .run_serialized_write(|| async {
+        .retry_write_on_conflict(|| async {
             let tx = store.connection.begin().await?;
             // Validate and insert under the same existing writer transaction;
             // a concurrent scope change cannot enter between these operations.

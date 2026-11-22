@@ -1,11 +1,11 @@
 use super::*;
 use crate::html_preview_io::{HtmlPreviewIoLocator, HtmlPreviewIoQueue, find_work, request_at};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{DbBackend, Statement};
 
-async fn fixture(database: &TestDatabase) -> Result<SqliteDatabase> {
-    let db = SqliteDatabase::new(
+async fn fixture(database: &TestDatabase) -> Result<PostgresDatabase> {
+    let db = PostgresDatabase::new(
         database.connect_read_only().await?,
         database.connect_with_limit(1).await?,
     )

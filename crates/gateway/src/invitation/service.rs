@@ -6,6 +6,7 @@ use pioneer_crud::{
     CrudStore, InvitationProjectionRows, InvitationTransitionOutcome, NewInvitationRow,
     NewMemberPrincipalRow, NewPrincipalAvatarRow, NewWorkspaceMembership,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, GatewayBaseUrl,
     INVITATION_MAX_WORKSPACE_GRANTS, InvitationAcceptParams, InvitationAcceptResponse,
@@ -17,11 +18,7 @@ use pioneer_protocol::{
     PioneerAppUrlScheme, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId,
     generate_id,
 };
-use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{
-    SqliteTransactionMode, TransactionOptions, TransactionTrait,
-    entity::prelude::DateTimeWithTimeZone,
-};
+use sea_orm::{TransactionTrait, entity::prelude::DateTimeWithTimeZone};
 
 use crate::auth::{
     AuthenticatedSessionPrincipal, FirstMemberSessionIds, GatewayAuthService,
@@ -104,7 +101,7 @@ impl Deref for InvitationRevokeCommitted {
 impl InvitationService {
     #[cfg(test)]
     pub(crate) async fn preview_restricted(
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
         credentials: &OpaqueCredentialFactory,
         gateway_id: &pioneer_protocol::GatewayId,
         raw_credential: &str,
@@ -122,7 +119,7 @@ impl InvitationService {
     }
 
     pub(crate) async fn preview_restricted_with_lifecycle(
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
         credentials: &OpaqueCredentialFactory,
         auth_service: Option<&GatewayAuthService>,
         gateway_id: &pioneer_protocol::GatewayId,
@@ -132,10 +129,7 @@ impl InvitationService {
         let started = std::time::Instant::now();
         let now = chrono::Utc::now().fixed_offset();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin invitation preview transaction")?;
         let result = preview_in_transaction(
@@ -181,7 +175,7 @@ impl InvitationService {
     }
 
     pub(crate) async fn accept_restricted(
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
         credentials: &OpaqueCredentialFactory,
         auth_service: &GatewayAuthService,
         gateway_id: &pioneer_protocol::GatewayId,
@@ -210,10 +204,7 @@ impl InvitationService {
         // expiry notification must outlive dispatch and follow that commit.
         let expiry_change = database.work_signal("auth.expiry").changing();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin invitation accept transaction")
             .map_err(InvitationAcceptServiceError::Storage)?;
@@ -385,10 +376,7 @@ impl InvitationService {
             .map_err(InvitationServiceError::Unavailable)?;
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin invitation create transaction")
             .map_err(InvitationServiceError::Unavailable)?;
@@ -552,10 +540,7 @@ impl InvitationService {
         let now = chrono::Utc::now().fixed_offset();
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin invitation list transaction")
             .map_err(InvitationServiceError::Unavailable)?;
@@ -683,10 +668,7 @@ impl InvitationService {
         let now = chrono::Utc::now().fixed_offset();
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin invitation revoke transaction")
             .map_err(InvitationServiceError::Unavailable)?;
@@ -847,7 +829,7 @@ enum InvitationAdmission {
 }
 
 async fn preflight_accept_admission(
-    database: &SqliteDatabase,
+    database: &PostgresDatabase,
     credentials: &OpaqueCredentialFactory,
     auth_service: &GatewayAuthService,
     gateway_id: &pioneer_protocol::GatewayId,
@@ -856,10 +838,7 @@ async fn preflight_accept_admission(
     let started = std::time::Instant::now();
     let now = chrono::Utc::now().fixed_offset();
     let transaction = database
-        .begin_with_options(TransactionOptions {
-            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-            ..Default::default()
-        })
+        .begin()
         .await
         .context("failed to begin invitation accept preflight transaction")
         .map_err(InvitationAcceptServiceError::Storage)?;
@@ -4005,7 +3984,7 @@ mod tests {
                 let harness = IsolatedEpic4Harness::populated(test_database)
                     .await
                     .unwrap();
-                let database = SqliteDatabase::from_single_connection(harness.database.clone());
+                let database = PostgresDatabase::from_single_connection(harness.database.clone());
                 let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
                 let credentials = OpaqueCredentialFactory::new(key.as_bytes()).unwrap();
                 let gateway_id = GatewayId::new("G00000000000000000001").unwrap();

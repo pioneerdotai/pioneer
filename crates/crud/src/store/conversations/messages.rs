@@ -21,7 +21,7 @@ impl CrudStore {
         &self,
         request: EditTurnMessageRequest,
     ) -> Result<TurnMessageEditedEvent> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let request = request.clone();
             async move { self.edit_turn_message_once(request).await }
         })
@@ -122,7 +122,7 @@ impl CrudStore {
         &self,
         request: DeleteTurnMessageRequest,
     ) -> Result<DeleteTurnMessageResult> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let request = request.clone();
             async move { self.delete_turn_message_once(request).await }
         })

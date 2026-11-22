@@ -98,7 +98,7 @@ pub fn unregister_native_patch_observer(identity: &InvocationIdentity) {
 }
 
 /// Releases all process-local native patch observers for a terminal turn.
-/// SQLite intent/record rows remain the source of truth; this only drops the
+/// PostgreSQL intent/record rows remain the source of truth; this only drops the
 /// bounded in-process hand-off objects and their history-capacity permits.
 pub fn unregister_native_patch_observers_for_turn(thread_id: &str, turn_id: &str) {
     if let Ok(mut registry) = native_patch_observer_registry().lock() {

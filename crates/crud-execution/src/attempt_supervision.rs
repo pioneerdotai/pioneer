@@ -1,14 +1,14 @@
 //! Scoped execution attempt deadlines, progress, and timeout transitions.
 use crate::attempt_values::*;
 use crate::gateway_control::{GatewayControlWake, control_work_change};
-use crate::retry::run_serialized_write;
+use crate::retry::retry_write_on_conflict;
 use crate::time::unix_to_datetime;
 use crate::turn_item_attempt::{self, TimeoutCandidateCursor};
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::turn_item::{turn_item_type_from_db, turn_item_type_to_db};
 use pioneer_crud_conversations::{turn_event_reads, turn_liveness, turn_reads};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
@@ -68,11 +68,11 @@ pub struct RunningTurnItemAttempt {
 }
 
 pub struct AttemptSupervision<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> AttemptSupervision<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -89,7 +89,7 @@ impl<'a> AttemptSupervision<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 turn_item_attempt::configure_running_attempt_deadlines(
                     self.connection,
                     turn_id,
@@ -148,7 +148,7 @@ impl<'a> AttemptSupervision<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 let heartbeat_at = unix_to_datetime(heartbeat_at_unix);
                 let updated = turn_item_attempt::heartbeat_running_attempt(
                     self.connection,
@@ -215,7 +215,7 @@ impl<'a> AttemptSupervision<'a> {
         let control_wakes = vec![GatewayControlWake::Activity(turn_id.into())];
         let cli_change = control_work_change(self.connection, "gateway.control", &control_wakes);
         let cli_result = async {
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 let Some(turn_model) =
                     turn_reads::find_turn_by_id(self.connection, turn_id).await?
                 else {
@@ -348,7 +348,7 @@ impl<'a> AttemptSupervision<'a> {
         context: serde_json::Value,
         now_unix: i64,
     ) -> Result<bool> {
-        run_serialized_write(|| async {
+        retry_write_on_conflict(|| async {
             crate::timeout_recovery::suppress_timeout_recovery(
                 self.connection,
                 candidate.attempt_id.as_str(),
@@ -648,7 +648,7 @@ impl<'a> AttemptSupervision<'a> {
             else {
                 return Ok(false);
             };
-            run_serialized_write(|| {
+            retry_write_on_conflict(|| {
                 let prepared = prepared.clone();
                 async move {
                     let tx = self
@@ -739,7 +739,7 @@ impl<'a> AttemptSupervision<'a> {
                 idle_deadline_at: deadlines.idle_deadline_at_unix.map(unix_to_datetime),
                 hard_deadline_at: deadlines.hard_deadline_at_unix.map(unix_to_datetime),
             };
-            run_serialized_write(|| {
+            retry_write_on_conflict(|| {
                 let prepared = prepared.clone();
                 let deadlines = deadlines.clone();
                 async move {

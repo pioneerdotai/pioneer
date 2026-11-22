@@ -314,7 +314,7 @@ pub(crate) async fn compaction_apply_runner(
         "runner publication preflight identity mismatch"
     );
     store
-        .run_serialized_write(|| async {
+        .retry_write_on_conflict(|| async {
             let txn = store.connection.begin().await?;
             #[cfg(test)]
             let _writer_test_guard = PublicationWriterTestGuard::enter(operation);

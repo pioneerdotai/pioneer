@@ -1,10 +1,10 @@
 use pioneer_crud::{list_active_workspaces_for_principal, workspace_repository};
 use pioneer_entity::workspace;
-use pioneer_protocol::Workspace;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::Workspace;
 use sea_orm::ConnectionTrait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 use std::future::Future;
@@ -49,7 +49,7 @@ impl std::error::Error for WorkspaceError {}
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
     changes: Arc<WorkspaceChanges>,
 }
 
@@ -74,14 +74,14 @@ impl WorkspaceChanges {
 }
 
 impl WorkspaceManager {
-    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+    pub fn new(connection: impl Into<PostgresDatabase>) -> Self {
         Self {
             connection: connection.into(),
             changes: Arc::default(),
         }
     }
 
-    pub(crate) fn with_database(&self, connection: SqliteDatabase) -> Self {
+    pub(crate) fn with_database(&self, connection: PostgresDatabase) -> Self {
         Self {
             connection,
             changes: self.changes.clone(),
@@ -920,19 +920,20 @@ mod tests {
     async fn manager_preserves_the_typed_database_scope() {
         pioneer_postgres_test::with_database(async |test_database| {
             let connection = test_database.connection().clone();
-            let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection)
-                .maintenance()
-                .with_critical_writes();
+            let database =
+                pioneer_postgres_pools::PostgresDatabase::from_single_connection(connection)
+                    .maintenance()
+                    .with_critical_writes();
 
             let manager = WorkspaceManager::new(database);
 
             assert_eq!(
                 manager.connection.read_class(),
-                pioneer_sqlite::SqliteReadClass::Maintenance
+                pioneer_postgres_pools::PostgresReadClass::Maintenance
             );
             assert_eq!(
                 manager.connection.write_class(),
-                pioneer_sqlite::SqliteWriteClass::Critical
+                pioneer_postgres_pools::PostgresWriteClass::Critical
             );
             Ok(())
         })

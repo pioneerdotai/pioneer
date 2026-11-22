@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use pioneer_crud_conversations::{
     events::TurnEventPayload, turn_event_reads, turn_item, turn_payload, turn_reads,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{ItemCompletedNotification, TurnItemAttemptStatus};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, entity::prelude::DateTimeWithTimeZone};
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ pub struct CliMcpCallIdentity {
 // execution fact must remain unchanged. Decode outside the writer and
 // carry the immutable event bytes back as a commit-time fence.
 pub async fn find_confirmed_completion(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     notification: &ItemCompletedNotification,
     identity: &CliMcpCallIdentity,
 ) -> Result<Option<pioneer_entity::turn_event::Model>> {

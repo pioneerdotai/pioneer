@@ -2,7 +2,7 @@
 use pioneer_crud_execution::native_terminal_effect_outbox as outbox;
 use pioneer_crud_execution::terminal_effect_store::TerminalEffectStore;
 use pioneer_crud_execution::time::unix_to_datetime;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
     sea_query::Expr,
@@ -10,7 +10,7 @@ use sea_orm::{
 
 async fn fixture_database(
     fixture: &pioneer_postgres_test::TestDatabase,
-) -> anyhow::Result<SqliteDatabase> {
+) -> anyhow::Result<PostgresDatabase> {
     let writer = fixture.connection();
     writer.execute_unprepared(
         "INSERT INTO workspace (id, name) VALUES ('ws_post_turn_reopen', 'Fixture');
@@ -19,14 +19,14 @@ async fn fixture_database(
          INSERT INTO turn (id, thread_id, status)
          VALUES ('turn_post_turn_reopen', 'thr_post_turn_reopen', 'in_progress');",
     ).await?;
-    Ok(SqliteDatabase::new(
+    Ok(PostgresDatabase::new(
         fixture.connect_read_only().await?,
         writer.clone(),
     ))
 }
 
 async fn activate_post_turn_effect(
-    database: &SqliteDatabase,
+    database: &PostgresDatabase,
     timestamp: i64,
 ) -> anyhow::Result<String> {
     let workspace_id = "ws_post_turn_reopen";
@@ -583,7 +583,7 @@ async fn native_terminal_effect_retention_is_bounded_and_preserves_recovery_auth
                 [turn_id.into(), thread_id.into()],
             )).await?;
         }
-        let database = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let database = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let store = TerminalEffectStore::new(&database);
         for turn_id in turn_ids {
             store

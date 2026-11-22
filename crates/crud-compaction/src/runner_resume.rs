@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{FailureKind, RunnerPhase};
 use pioneer_entity::{compaction_checkpoint, compaction_frozen_history, compaction_runner_state};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Statement,
     TransactionTrait,
@@ -26,7 +26,7 @@ use crate::sweep_work::retry_conflict;
 /// the existing runner revalidates before reading another raw portion. A
 /// completed candidate resumes without revisiting its historical sources.
 pub async fn compaction_resume_deadline(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     execution_turn: &str,
     deadline_ms: u64,
@@ -35,7 +35,7 @@ pub async fn compaction_resume_deadline(
 }
 
 pub async fn compaction_resume_invalid_completion(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     execution_turn: &str,
     deadline_ms: u64,
@@ -44,7 +44,7 @@ pub async fn compaction_resume_invalid_completion(
 }
 
 async fn resume_failed_operation(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     operation: &str,
     execution_turn: &str,
     deadline_ms: u64,

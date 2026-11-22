@@ -60,7 +60,7 @@ impl CrudStore {
             .await?;
             let confirmed_replay =
                 find_confirmed_completion(&self.connection, &notification, &identity).await?;
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let prepared = prepared.clone();
                 let transaction = self.connection.begin().await?;
                 if completion_already_confirmed(

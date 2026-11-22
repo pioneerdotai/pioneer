@@ -2241,10 +2241,12 @@ mod tests {
     }
 
     async fn setup_store(fixture: &TestDatabase) -> Result<CrudStore> {
-        Ok(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-            fixture.connect_read_only().await?,
-            fixture.connection().clone(),
-        )))
+        Ok(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connection().clone(),
+            ),
+        ))
     }
 
     fn open_request(thread_id: &str, opened_at: i64) -> CLIAgentRuntimeThreadBindingOpenRequest {

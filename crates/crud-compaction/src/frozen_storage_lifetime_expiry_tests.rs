@@ -1,26 +1,26 @@
 use super::*;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome,
-    SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresReadOutcome,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Routes {
-    reads: Mutex<Vec<SqliteReadEvent>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadEvent>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
     blocked: tokio::sync::Notify,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if matches!(event, SqliteReadEvent::AdmissionEnqueued { active: 1, .. }) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if matches!(event, PostgresReadEvent::AdmissionEnqueued { active: 1, .. }) {
             self.blocked.notify_one();
         }
         self.reads.lock().unwrap().push(event);
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
@@ -29,15 +29,15 @@ impl Routes {
         self.reads.lock().unwrap().clear();
         self.writes.lock().unwrap().clear();
     }
-    fn assert_reads(&self, outcome: SqliteReadOutcome, count: usize) {
+    fn assert_reads(&self, outcome: PostgresReadOutcome, count: usize) {
         self.assert_read_outcomes(&vec![outcome; count]);
     }
-    fn assert_read_outcomes(&self, outcomes: &[SqliteReadOutcome]) {
+    fn assert_read_outcomes(&self, outcomes: &[PostgresReadOutcome]) {
         let reads = self.reads.lock().unwrap();
         let operations: Vec<_> = reads
             .iter()
             .filter_map(|event| match event {
-                SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                     Some((*class, *outcome))
                 }
                 _ => None,
@@ -47,12 +47,12 @@ impl Routes {
             operations,
             outcomes
                 .iter()
-                .map(|outcome| (SqliteReadClass::Maintenance, *outcome))
+                .map(|outcome| (PostgresReadClass::Maintenance, *outcome))
                 .collect::<Vec<_>>()
         );
         assert!(reads.iter().any(|event| matches!(
             event,
-            SqliteReadEvent::AdmissionReleased {
+            PostgresReadEvent::AdmissionReleased {
                 active: 0,
                 queue_depth: 0,
                 ..
@@ -81,12 +81,12 @@ async fn observed_fixture() -> (CompactionStore, Arc<Routes>, FrozenHistoryRef) 
         .await
         .unwrap();
     let routes = Arc::new(Routes::default());
-    let store = CompactionStore::for_test(SqliteDatabase::from_executor_with_read_observer(
+    let store = CompactionStore::for_test(PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, routes.clone()),
+        PostgresWriteExecutor::with_observer(writer, routes.clone()),
         routes.clone(),
     ));
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',TRUE,FALSE)",
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -257,7 +257,7 @@ async fn direct_roots_and_task_release_set_match_final_guard_without_preparation
         assert_unprepared(&preparation);
         assert_eq!(accounting.held, u64::from(held));
         assert_eq!(accounting.expired + accounting.refused, 0);
-        routes.assert_reads(SqliteReadOutcome::Ok, 1);
+        routes.assert_reads(PostgresReadOutcome::Ok, 1);
         let page =
             read_queries::expiry_page(&store.with_maintenance_access().connection, "", "origin")
                 .await
@@ -315,8 +315,8 @@ async fn negative_page_admission_keeps_final_writer_check_for_late_roots() {
         assert!(routes.reads.lock().unwrap().is_empty());
         assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
             event,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         )));
@@ -362,8 +362,8 @@ async fn negative_preflight_does_not_bypass_active_reader_hold() {
     assert_eq!(accounting.expired, 0);
     assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Maintenance,
             ..
         }
     )));
@@ -397,7 +397,7 @@ async fn positive_visit_keeps_cursor_accounting_and_periodic_revisit_after_root_
     assert!(progress.quantum(&store).await.unwrap());
     // Discovery and root admission share a page. A hold needs no individual
     // preparation or a later root-query quantum.
-    routes.assert_reads(SqliteReadOutcome::Ok, 2);
+    routes.assert_reads(PostgresReadOutcome::Ok, 2);
     assert!(progress.expiry.is_none());
     assert_eq!(progress.expiry_after, "origin");
     assert_eq!(progress.accounting.held, 1);
@@ -464,7 +464,7 @@ async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
         progress.accounting.held + progress.accounting.expired + progress.accounting.refused,
         0
     );
-    routes.assert_read_outcomes(&[SqliteReadOutcome::Ok, SqliteReadOutcome::Error]);
+    routes.assert_read_outcomes(&[PostgresReadOutcome::Ok, PostgresReadOutcome::Error]);
     store
         .connection
         .execute_unprepared("ALTER TABLE unavailable_output RENAME TO compaction_task_output")
@@ -477,7 +477,7 @@ async fn page_root_error_preserves_cursor_and_retries_before_preparation() {
     assert!(progress.expiry.is_none() && !progress.pass_done[1]);
     assert_eq!(progress.accounting.held, 1);
     assert_eq!(progress.expiry_after, "origin");
-    routes.assert_reads(SqliteReadOutcome::Ok, 1);
+    routes.assert_reads(PostgresReadOutcome::Ok, 1);
     assert!(store.frozen_readers.lock().unwrap().is_empty());
 }
 
@@ -513,7 +513,7 @@ async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capa
     assert!(routes.writes.lock().unwrap().is_empty());
     assert!(routes.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionCancelled {
+        PostgresReadEvent::AdmissionCancelled {
             active: 1,
             queue_depth: 0,
             ..
@@ -521,16 +521,16 @@ async fn cancelled_paged_preparation_preserves_attempt_and_restart_releases_capa
     )));
     assert!(routes.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
-            outcome: SqliteReadOutcome::Cancelled,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
+            outcome: PostgresReadOutcome::Cancelled,
             ..
         }
     )));
     reader.commit().await.unwrap();
     assert!(routes.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionReleased {
+        PostgresReadEvent::AdmissionReleased {
             active: 0,
             queue_depth: 0,
             ..
@@ -694,7 +694,7 @@ async fn expiry_pages_skip_holds_without_per_header_work_or_writer() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+        .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
         .count();
     // One frontier and two pages, including root checks. No per-header query.
     assert_eq!(reads, 3);

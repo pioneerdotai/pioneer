@@ -221,6 +221,7 @@ async fn run_gateway_until_shutdown_inner(
 
     let runtime_stage = startup.stage(pioneer_observability::GatewayStartupStage::RuntimePrepare);
     let runtime_home = config.ensure_runtime_home_dir()?;
+    let _database_owner = database::lock_gateway_database_owner(&runtime_home)?;
     #[cfg(windows)]
     let shutdown_event = windows_shutdown::ShutdownEvent::listen(&runtime_home)
         .context("register Gateway shutdown event")?;
@@ -1256,7 +1257,7 @@ pub async fn create_device(
         runtime_home,
         config,
         database::OperatorAccess::Write,
-        async |database| create_offline_device(config, runtime_home, database).await,
+        async |database, _| create_offline_device(config, runtime_home, database).await,
     )
     .await;
     match response {
@@ -1279,7 +1280,7 @@ pub async fn create_device(
 async fn create_offline_device(
     config: &AppConfig,
     runtime_home: &Path,
-    database: pioneer_sqlite::SqliteDatabase,
+    database: pioneer_postgres_pools::PostgresDatabase,
 ) -> Result<AuthDeviceCreateResponse> {
     let gateway_secrets = GatewaySecrets::open(runtime_home)?;
     let identity = Arc::new(

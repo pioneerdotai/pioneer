@@ -7,11 +7,11 @@ use crate::membership::{
     validated_participant_ids_from_rows,
 };
 use anyhow::{Context, Result};
-use pioneer_protocol::{GatewayId, PersistedActorRef, PrincipalId};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::{GatewayId, PersistedActorRef, PrincipalId};
 use sea_orm::{DatabaseTransaction, TransactionTrait, entity::prelude::DateTimeWithTimeZone};
 use std::{future::Future, time::Duration};
 
@@ -30,15 +30,15 @@ fn current_time() -> DateTimeWithTimeZone {
 }
 
 pub struct ParticipantRepository<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> ParticipantRepository<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -104,7 +104,7 @@ impl<'a> ParticipantRepository<'a> {
         let thread_id = thread_id.to_owned();
         let acting_member_principal_id = acting_member_principal_id.cloned();
         let target_principal_id = target_principal_id.clone();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let gateway_id = gateway_id.clone();
             let workspace_id = workspace_id.clone();
             let thread_id = thread_id.clone();
@@ -200,7 +200,7 @@ impl<'a> ParticipantRepository<'a> {
         let thread_id = thread_id.to_owned();
         let acting_member_principal_id = acting_member_principal_id.cloned();
         let target_principal_id = target_principal_id.clone();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let gateway_id = gateway_id.clone();
             let workspace_id = workspace_id.clone();
             let thread_id = thread_id.clone();

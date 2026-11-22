@@ -15,13 +15,13 @@ use sea_orm::{
 use serde_json::Value;
 
 pub struct HtmlPreviewReceipts<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
     io_wake: &'a tokio::sync::Notify,
 }
 
 impl<'a> HtmlPreviewReceipts<'a> {
     pub fn new(
-        connection: &'a pioneer_sqlite::SqliteDatabase,
+        connection: &'a pioneer_postgres_pools::PostgresDatabase,
         io_wake: &'a tokio::sync::Notify,
     ) -> Self {
         Self {
@@ -35,19 +35,21 @@ impl<'a> HtmlPreviewReceipts<'a> {
         self.connection.work_signal("maintenance.html").notify();
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        pioneer_sqlite::retry_with_backoff(
+        pioneer_postgres_pools::retry_with_backoff(
             || operation(),
             |error| {
-                pioneer_sqlite::is_retryable_database_conflict(error)
+                pioneer_postgres_pools::is_retryable_database_conflict(error)
                     || crate::html_preview_io::is_conflict(error)
             },
-            pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-            std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+            pioneer_postgres_pools::DEFAULT_LOCK_RETRY_ATTEMPTS,
+            std::time::Duration::from_millis(
+                pioneer_postgres_pools::DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+            ),
         )
         .await
     }
@@ -153,7 +155,7 @@ impl HtmlPreviewReceipts<'_> {
         claim: Option<&HtmlPreviewIoClaim>,
     ) -> Result<bool> {
         let io_locator = crate::html_preview_io::HtmlPreviewIoLocator::new(id);
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             let callback = if claim.is_none() {
                 crate::html_preview_io::callback_ticket(&tx, "copies", &io_locator, 0).await?
@@ -453,7 +455,7 @@ impl HtmlPreviewReceipts<'_> {
             .and_where(col("v", compaction_source_revision::Column::Revision).eq(source_revision))
             .to_owned();
         let result = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 let callback = if claim.is_none() {
                     crate::html_preview_io::callback_ticket(
@@ -602,7 +604,7 @@ impl HtmlPreviewReceipts<'_> {
                 // Historical orphan was deliberately timed, not permanently
                 // parked. Restoration can now bind its previously unknown owner.
                 let locator = crate::html_preview_io::HtmlPreviewIoLocator::new(claim.source_id());
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let tx = self.connection.begin().await?;
                     ensure!(
                         history::Entity::find_by_id(claim.source_id())
@@ -793,7 +795,7 @@ impl HtmlPreviewReceipts<'_> {
 mod tests;
 
 pub async fn html_preview_archived_frozen_result(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
     reference: &pioneer_compaction::frozen::FrozenMessageRef,
 ) -> Result<Option<(String, String, pioneer_compaction::SourceRef)>> {

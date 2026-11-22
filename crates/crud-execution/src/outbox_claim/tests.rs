@@ -1016,21 +1016,24 @@ async fn action_outbox_minimum_budget_rejects_one_and_serves_both_ranges_at_two(
 
 #[derive(Default)]
 struct RouteObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     enqueued: tokio::sync::Notify,
 }
-impl pioneer_sqlite::SqliteReadObserver for RouteObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for RouteObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for RouteObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for RouteObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
-        if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+        if matches!(
+            event,
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+        ) {
             self.enqueued.notify_one();
         }
     }
@@ -1039,13 +1042,12 @@ impl RouteObserver {
     async fn wait_for_enqueue(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if self
-                    .writes
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }))
-                {
+                if self.writes.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+                    )
+                }) {
                     return;
                 }
                 self.enqueued.notified().await;
@@ -1057,8 +1059,9 @@ impl RouteObserver {
 }
 #[pioneer_postgres_test::postgres_test]
 async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresWriteClass, PostgresWriteEvent,
+        PostgresWriteExecutor,
     };
     use std::sync::{
         Arc,
@@ -1071,15 +1074,15 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
     seed(&writer, "queued", "pending", 0, now, None).await;
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(RouteObserver::default());
-    let db = SqliteDatabase::from_executor_with_read_observer(
+    let db = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     db.validate_reader().await.unwrap();
     let maintenance = db.maintenance();
-    assert_eq!(maintenance.read_class(), SqliteReadClass::Maintenance);
-    assert_eq!(maintenance.write_class(), SqliteWriteClass::Maintenance);
+    assert_eq!(maintenance.read_class(), PostgresReadClass::Maintenance);
+    assert_eq!(maintenance.write_class(), PostgresWriteClass::Maintenance);
     let held = db.begin().await.unwrap();
     observer.writes.lock().unwrap().clear();
     observer.reads.lock().unwrap().clear();
@@ -1091,7 +1094,7 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
     cancelled.abort();
     assert!(cancelled.await.unwrap_err().is_cancelled());
     assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(event,
-        SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0
+        PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. } if queue.maintenance == 0
     )));
     assert_eq!(
         load(&db, "queued").await.attempts,
@@ -1130,7 +1133,7 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == SqliteReadClass::Maintenance)
+            .all(|class| *class == PostgresReadClass::Maintenance)
     );
     assert_eq!(
         observer
@@ -1139,11 +1142,11 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![SqliteWriteClass::Maintenance]
+        vec![PostgresWriteClass::Maintenance]
     );
     // A deferred backlog costs exactly the two empty reader ranges, no writer.
     observer.reads.lock().unwrap().clear();
@@ -1157,7 +1160,7 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
     );
     assert_eq!(
         *observer.reads.lock().unwrap(),
-        vec![SqliteReadClass::Maintenance; 2]
+        vec![PostgresReadClass::Maintenance; 2]
     );
     assert!(observer.writes.lock().unwrap().is_empty());
     // The caller may now prepare/decode without retaining writer capacity.
@@ -1167,7 +1170,7 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
         .unwrap();
     foreground.rollback().await.unwrap();
     assert_eq!(load(&db, "queued").await.payload_json, rows[0].payload_json);
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
     // A separate failure delay also reads its clock after its own admission.
     seed(&maintenance, "unclaimed", "pending", 0, now, None).await;
     let snapshot = load(&maintenance, "unclaimed").await;
@@ -1202,13 +1205,13 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![SqliteWriteClass::Maintenance]
+        vec![PostgresWriteClass::Maintenance]
     );
-    // Reuse the physical reader/single-writer fixture for point panics before
+    // Reuse the read-only reader and one-connection writer fixture for point panics before
     // a snapshot, after a source write, and after a real commit acknowledgement
     // would have returned. No panic is promoted into a successful claim/repair.
     for fault in [
@@ -1263,11 +1266,11 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
                 .unwrap()
                 .iter()
                 .filter_map(|event| match event {
-                    SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                    PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![SqliteWriteClass::Maintenance; 3],
+            vec![PostgresWriteClass::Maintenance; 3],
             "three selected IDs, no retry/refill after panic"
         );
         assert!(
@@ -1276,7 +1279,7 @@ async fn action_outbox_routes_cancellation_and_clock_after_writer_admission() {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|class| *class == SqliteReadClass::Maintenance)
+                .all(|class| *class == PostgresReadClass::Maintenance)
         );
         let writer = tokio::time::timeout(std::time::Duration::from_secs(1), db.begin())
             .await

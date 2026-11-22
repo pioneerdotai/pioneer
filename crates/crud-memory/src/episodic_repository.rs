@@ -1198,7 +1198,7 @@ pub async fn count_canceled_index_jobs_for_workspace<C: ConnectionTrait>(
 }
 
 pub async fn search_source_batch(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     ids: &[String],
 ) -> Result<
@@ -3401,9 +3401,9 @@ pub async fn reset_projection_batch(
 mod tests {
     use super::*;
     use crate::{MemoryStore, util::unix_to_datetime};
+    use pioneer_postgres_pools::PostgresDatabase;
     use pioneer_postgres_test::with_database;
     use pioneer_protocol::ThreadEpisodicSourceContext;
-    use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{DbBackend, PaginatorTrait, Statement, TransactionTrait};
     use std::time::Duration;
 
@@ -3466,7 +3466,7 @@ mod tests {
                     .await?
                     .context("contender backend PID")?
                     .try_get_by_index(0)?;
-                let store = MemoryStore::new(SqliteDatabase::new(
+                let store = MemoryStore::new(PostgresDatabase::new(
                     fixture.connect_read_only().await?,
                     contender,
                 ));

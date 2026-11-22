@@ -1,5 +1,5 @@
 use pioneer_crud_conversations::tool_result_access::tool_result_access_source;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::json;
 
@@ -34,7 +34,7 @@ async fn disclosure_reads_observer_arguments_without_decoding_deep_storage() {
     .await
     .unwrap();
 
-    let database = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
+    let database = PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
     let found = tool_result_access_source(
         &database,
         "tool-access",

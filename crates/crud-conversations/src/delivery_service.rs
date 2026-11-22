@@ -1,7 +1,7 @@
 //! Claim and settle persisted turn deliveries on their owning service.
 use anyhow::{Context, Result};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -52,7 +52,7 @@ where
 }
 
 pub async fn next_turn_event_delivery_deadline(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     consumer: &str,
 ) -> Result<Option<i64>> {
     Ok(turn_event_delivery::next_deadline(db, consumer)
@@ -61,7 +61,7 @@ pub async fn next_turn_event_delivery_deadline(
 }
 
 pub async fn claim_due_turn_event_deliveries_with_deadline(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     consumer: &str,
     now_unix: i64,
     limit: u64,
@@ -176,7 +176,7 @@ pub async fn claim_due_turn_event_deliveries_with_deadline(
 }
 
 pub async fn settle_turn_event_deliveries(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     settlements: &[TurnEventDeliverySettlement],
 ) -> Result<u64> {
     anyhow::ensure!(
@@ -204,7 +204,7 @@ pub async fn settle_turn_event_deliveries(
 }
 
 pub async fn complete_turn_event_delivery(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     id: &str,
     claim_token: &str,
     now_unix: i64,
@@ -238,7 +238,7 @@ pub async fn complete_turn_event_delivery(
 }
 
 pub async fn defer_turn_event_delivery_for_foreground_start(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     id: &str,
     claim_token: &str,
     now_unix: i64,
@@ -272,7 +272,7 @@ pub async fn defer_turn_event_delivery_for_foreground_start(
 }
 
 pub async fn fail_turn_event_delivery(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     id: &str,
     claim_token: &str,
     attempt_count: i64,

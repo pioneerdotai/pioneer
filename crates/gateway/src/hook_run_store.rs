@@ -53,7 +53,6 @@ fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
 fn postgres_diagnostic(error: &sea_orm::SqlxPostgresError) -> HookRunStoreDiagnostic {
     HookRunStoreDiagnostic {
         cause_class: postgres_cause(error.code().as_bytes()),
-        ..Default::default()
     }
 }
 
@@ -522,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn untyped_sqlite_looking_errors_remain_unclassified_and_discard_canaries() {
+    fn untyped_database_looking_errors_remain_unclassified_and_discard_canaries() {
         use anyhow::Context;
         let canary = "SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY";
         for error in [
@@ -531,7 +530,7 @@ mod tests {
                 "CANTOPEN (code: 14) {canary}"
             ))),
             anyhow::Error::new(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
-                format!("SQLite constraint (code: 19) {canary}"),
+                format!("PostgreSQL constraint (SQLSTATE 23505) {canary}"),
             ))),
             Err::<(), _>(anyhow::anyhow!("{canary}"))
                 .context("database locked")
@@ -602,7 +601,6 @@ mod tests {
                     safe.diagnostic(),
                     HookRunStoreDiagnostic {
                         cause_class: HookRunStoreCauseClass::PostgresConstraint,
-                        ..Default::default()
                     }
                 );
                 let encoded = format!("{safe:?} {safe}");
@@ -753,16 +751,6 @@ mod tests {
             assert_eq!(fields["operation"], "append_audit_events");
             assert_eq!(fields["phase"], "turn.pre_prompt_compile");
             assert_eq!(fields["cause_class"], "postgres_constraint");
-            assert!(
-                fields
-                    .get("sqlite_primary_code")
-                    .is_none_or(serde_json::Value::is_null)
-            );
-            assert!(
-                fields
-                    .get("sqlite_extended_code")
-                    .is_none_or(serde_json::Value::is_null)
-            );
             assert!(event.exception.values.is_empty());
             let encoded =
                 serde_json::to_string(&events).expect("serialize entire captured telemetry");

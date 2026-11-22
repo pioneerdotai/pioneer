@@ -300,7 +300,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<(bool, Vec<AppendedTaskEvent>)> {
         let change = TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = self
-            .run_serialized_write(|| self.request_task_finish_once(task_id, reason.clone(), at))
+            .retry_write_on_conflict(|| self.request_task_finish_once(task_id, reason.clone(), at))
             .await;
         if let Ok((_, events)) = &result {
             change.completed(inserted_task_events(events));
@@ -360,7 +360,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     ) -> Result<Vec<AppendedTaskEvent>> {
         let change = TaskWorkChange::for_tasks(&self.connection, [task_id.to_owned()]);
         let result = async {
-            self.run_serialized_write(|| self.discard_finished_task_queue_once(task_id, at))
+            self.retry_write_on_conflict(|| self.discard_finished_task_queue_once(task_id, at))
                 .await
         }
         .await;

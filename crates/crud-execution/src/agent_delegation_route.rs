@@ -21,7 +21,7 @@ use sea_orm::{
 use std::collections::BTreeMap;
 
 pub async fn create_route(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     input: &AgentDelegationRouteInput,
 ) -> Result<agent_delegation_route::Model> {
     let tx = db
@@ -37,7 +37,7 @@ pub async fn create_route(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_route(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     route_id: &str,
     expected_generation: i64,
     expected_policy_generation: i64,
@@ -66,7 +66,7 @@ pub async fn revoke_route(
 }
 
 pub async fn expire_prepared_routes(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     prepared: &PreparedAgentDelegationRouteExpiryBatch,
     now: DateTimeWithTimeZone,
 ) -> Result<u64> {

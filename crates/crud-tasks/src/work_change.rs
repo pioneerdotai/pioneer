@@ -3,12 +3,12 @@ use crate::event_records::AppendedTaskEvent;
 /// Covers only Task mutations that can create runnable/dependent work. The
 /// guard starts outside DB admission so cancellation retains uncertainty.
 pub struct TaskWorkChange {
-    changes: Vec<pioneer_sqlite::WorkChange>,
-    frozen: pioneer_sqlite::WorkChange,
+    changes: Vec<pioneer_postgres_pools::WorkChange>,
+    frozen: pioneer_postgres_pools::WorkChange,
     frozen_keys: Option<Vec<String>>,
 }
 impl TaskWorkChange {
-    pub fn new(database: &pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(database: &pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self {
             frozen: database.work_signal("maintenance.frozen").changing(),
             frozen_keys: None,
@@ -27,7 +27,7 @@ impl TaskWorkChange {
         }
     }
     pub fn for_tasks(
-        database: &pioneer_sqlite::SqliteDatabase,
+        database: &pioneer_postgres_pools::PostgresDatabase,
         tasks: impl IntoIterator<Item = String>,
     ) -> Self {
         let mut change = Self::new(database);
@@ -39,7 +39,11 @@ impl TaskWorkChange {
         change.frozen_keys = (!keys.is_empty()).then_some(keys);
         change
     }
-    pub fn for_source(database: &pioneer_sqlite::SqliteDatabase, kind: &str, id: &str) -> Self {
+    pub fn for_source(
+        database: &pioneer_postgres_pools::PostgresDatabase,
+        kind: &str,
+        id: &str,
+    ) -> Self {
         let mut change = Self::new(database);
         change.frozen_keys = Some(vec![format!("{kind}:{id}")]);
         change
@@ -64,13 +68,13 @@ pub fn inserted_task_events(events: &[AppendedTaskEvent]) -> bool {
 /// producers. Keep payloads out of this comparison and never notify for a
 /// repeated finalization or an item-only event.
 pub struct TaskTurnChange {
-    change: pioneer_sqlite::WorkChange,
-    portable: pioneer_sqlite::WorkChange,
+    change: pioneer_postgres_pools::WorkChange,
+    portable: pioneer_postgres_pools::WorkChange,
     before: Vec<(String, TurnDependencyFacts)>,
 }
 impl TaskTurnChange {
     pub async fn begin(
-        database: &pioneer_sqlite::SqliteDatabase,
+        database: &pioneer_postgres_pools::PostgresDatabase,
         ids: Vec<String>,
     ) -> anyhow::Result<Self> {
         let change = database.work_signal("tasks.lifecycle").changing();
@@ -88,7 +92,10 @@ impl TaskTurnChange {
             before,
         })
     }
-    pub async fn completed(self, database: &pioneer_sqlite::SqliteDatabase) -> anyhow::Result<()> {
+    pub async fn completed(
+        self,
+        database: &pioneer_postgres_pools::PostgresDatabase,
+    ) -> anyhow::Result<()> {
         let mut changed = false;
         let mut terminal_turns = Vec::new();
         for (id, before) in self.before {
@@ -116,7 +123,7 @@ struct TurnDependencyFacts {
     receipt: Option<(i64, Option<i64>, String)>,
 }
 async fn turn_dependency_facts(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     id: &str,
 ) -> anyhow::Result<TurnDependencyFacts> {
     use pioneer_entity::{turn, turn_event_projection_stream_state as stream};

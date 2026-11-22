@@ -7,8 +7,8 @@ use pioneer_entity::{
     compaction_frozen_span as span, compaction_frozen_sweep_consumer as consumer,
     compaction_frozen_sweep_fanout as fanout, compaction_frozen_sweep_work as work,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, OnConflict, Order, Query};
@@ -47,7 +47,7 @@ fn addressed_scope(targets: Option<&[String]>) -> Condition {
     }
 }
 
-pub async fn fanout_step(db: &SqliteDatabase, targets: Option<&[String]>) -> Result<bool> {
+pub async fn fanout_step(db: &PostgresDatabase, targets: Option<&[String]>) -> Result<bool> {
     // An explicit insertion ordinal bounds each service round.
     let cursor = db
         .query_one(
@@ -233,7 +233,7 @@ pub enum Completion {
     Retry,
 }
 
-pub async fn next_retry_deadline(db: &SqliteDatabase) -> Result<Option<i64>> {
+pub async fn next_retry_deadline(db: &PostgresDatabase) -> Result<Option<i64>> {
     Ok(work::Entity::find()
         .select_only()
         .column(work::Column::RetryAt)
@@ -252,7 +252,7 @@ pub enum Admission {
 }
 
 pub async fn discover(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     active: &[(&str, i64)],
     kind: i64,
     round: &mut ServiceRound,
@@ -421,7 +421,7 @@ impl Work {
     /// Completion validates geometry in this same short writer boundary.
     /// Expected protection stays pending until invalidation; errors retain a
     /// bounded retry. CAS never clears newer domain work in either case.
-    pub async fn finish(&self, db: &SqliteDatabase, completion: Completion) -> Result<()> {
+    pub async fn finish(&self, db: &PostgresDatabase, completion: Completion) -> Result<()> {
         retry_conflict(|| async {
             let tx = db.begin().await?;
             let valid = if let Completion::Complete(guard) = &completion {

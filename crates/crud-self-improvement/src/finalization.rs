@@ -238,7 +238,7 @@ pub async fn prepare<C: ConnectionTrait>(
         temporal_key,
         None,
     )?;
-    // Aggregate history on the reader, never under the serialized writer.
+    // Aggregate history on the reader before starting the write transaction.
     // Completed ranges are immutable; another completion moves the cursor and
     // invalidates this run's workspace fence. Reconciliation cannot rewind a
     // cursor while this frozen run is unresolved; reactivation changes the epoch.

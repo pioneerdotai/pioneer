@@ -5,11 +5,11 @@ use crate::turn_item_terminal::{
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud_conversations::{read_model_repair, turn_payload};
-use pioneer_protocol::{ToolCallStatus, TurnItem, TurnItemTimeoutReason};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase, SqliteReadClass,
-    SqliteWriteClass, is_retryable_database_conflict, retry_with_backoff,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
+    PostgresReadClass, PostgresWriteClass, is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::{ToolCallStatus, TurnItem, TurnItemTimeoutReason};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -204,12 +204,12 @@ pub trait EpisodicRepair: Sync {
 }
 
 pub struct ExecutionReadModelRepair<'a, E> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
     episodic: E,
 }
 
 impl<'a, E: EpisodicRepair> ExecutionReadModelRepair<'a, E> {
-    pub fn new(connection: &'a SqliteDatabase, episodic: E) -> Self {
+    pub fn new(connection: &'a PostgresDatabase, episodic: E) -> Self {
         Self {
             connection,
             episodic,
@@ -221,8 +221,8 @@ impl<'a, E: EpisodicRepair> ExecutionReadModelRepair<'a, E> {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if self.connection.read_class() != SqliteReadClass::Maintenance
-            || self.connection.write_class() != SqliteWriteClass::Maintenance
+        if self.connection.read_class() != PostgresReadClass::Maintenance
+            || self.connection.write_class() != PostgresWriteClass::Maintenance
         {
             bail!("background database quantum requires maintenance-scoped reads and writes");
         }
@@ -1089,7 +1089,7 @@ pub struct ReadModelInvariantViolation {
 }
 
 pub async fn list_execution_invariant_violations(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
 ) -> Result<Vec<ReadModelInvariantViolation>> {
     let terminal_turn_item_rows = pioneer_entity::turn_item::Entity::find()
         .filter(pioneer_entity::turn_item::Column::Status.is_in([

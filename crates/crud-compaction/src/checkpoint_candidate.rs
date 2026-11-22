@@ -24,7 +24,7 @@ use crate::{
 
 /// Saves complete intermediate results without publishing a working pointer.
 pub async fn compaction_save_candidate(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     checkpoint: &Checkpoint,
     portion: i64,
 ) -> Result<()> {
@@ -148,7 +148,7 @@ pub async fn compaction_save_candidate(
 }
 
 async fn prepare_raw_ownership(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     checkpoint: &pioneer_compaction::Checkpoint,
 ) -> Result<Option<Vec<(i64, SourceRef, String)>>> {
     if crate::source_projection::projection_identity(db, &checkpoint.operation_id)

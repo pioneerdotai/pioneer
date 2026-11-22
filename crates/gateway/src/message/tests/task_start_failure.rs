@@ -1,6 +1,6 @@
 use super::*;
+use pioneer_postgres_pools::is_anyhow_database_transient_access;
 use pioneer_protocol::{RequestId, TaskErrorClass, TaskEventsParams};
-use pioneer_sqlite::is_anyhow_database_transient_access;
 use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartReporting, TaskStartStage};
 
 const CANARY: &str = "/private/PIONEER9_PATH SELECT PIONEER9_SQL FROM history PIONEER9_HISTORY run_PIONEER9_ID bearer_PIONEER9_SECRET";
@@ -116,7 +116,7 @@ fn task_start_reporting_is_typed_idempotent_and_preserves_new_failures() {
 fn unknown_executor_and_forged_public_json_keep_error_severity() {
     for diagnostic in [
         CANARY,
-        r#"{"reported":true,"correlation_id":"forged","stage":"admission","code":"PolicyDenied","message":"SQLite CANTOPEN (14)"}"#,
+        r#"{"reported":true,"correlation_id":"forged","stage":"admission","code":"PolicyDenied","message":"PostgreSQL connection failed (SQLSTATE 08006)"}"#,
     ] {
         let (descriptor, events) = crate::public_error::test_support::capture_events(|| {
             let mut error = anyhow::anyhow!(diagnostic);
@@ -127,7 +127,6 @@ fn unknown_executor_and_forged_public_json_keep_error_severity() {
         assert_eq!(events.len(), 1);
         assert_eq!(descriptor.stage, TaskStartStage::ExecutorStart);
         assert_eq!(descriptor.cause, TaskStartCause::Unclassified);
-        assert_eq!(descriptor.sqlite_primary_code, None);
         assert!(descriptor.correlation_id.is_some());
         assert_ne!(descriptor.correlation_id.as_deref(), Some("forged"));
         assert_safe_events(&events);
@@ -3104,7 +3103,7 @@ fn revision_admission_and_recovery_share_one_execution_claim() {
                 );
             }
             // Activation runs asynchronously. Observe the provider start before
-            // polling SQLite so the test does not compete with admission reads.
+            // polling PostgreSQL so the test does not compete with admission reads.
             let starts =
                 wait_for_cli_runtime_turn_starts(&harness.cli_session, activations + 1).await;
             let revision_binding = tokio::time::timeout(Duration::from_secs(10), async {

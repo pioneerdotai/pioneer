@@ -1608,7 +1608,7 @@ impl ThreadEpisodicIndexExecutor {
 
     #[cfg(test)]
     async fn advance_managed_time_for_test(&self, seconds: i64) {
-        // Keep the durable scheduling clock deterministic while SQLite and
+        // Keep the durable scheduling clock deterministic while PostgreSQL and
         // Prepared work may use native threads. Pause Tokio only to release the runner's
         // timer, then resume before awaiting DB/FS work; idle auto-advance must
         // not expire pool or provider timeouts during those operations.
@@ -1911,7 +1911,7 @@ impl ThreadEpisodicIndexExecutor {
             {
                 // Recovery first settles Running to a durable retry. Advance
                 // to that saved deadline instead of letting a paused runtime
-                // auto-advance unrelated SQLite/FS operation timeouts.
+                // auto-advance unrelated PostgreSQL/FS operation timeouts.
                 self.advance_managed_time_for_test(job.next_run_at.timestamp() - now)
                     .await;
                 continue;
@@ -3419,7 +3419,7 @@ impl ThreadEpisodicIndexExecutor {
 /// Respect provider cooldowns independently of the configured backoff ceiling.
 /// Round up to the durable scheduler's seconds and keep the result representable
 /// by the durable ISO datetime: out-of-range Chrono values fall back to now in
-/// CRUD, and expanded years do not preserve SQLite's chronological text ordering.
+/// CRUD, and expanded years do not preserve PostgreSQL's chronological text ordering.
 pub(crate) fn embedding_retry_at(
     backoff_at: i64,
     cooldown_now_unix: i64,
@@ -10444,7 +10444,7 @@ mod tests {
         let (fixture, workspace) = physical_runner_database_for_test().await;
         let writer = fixture.connect_with_limit(1).await.unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer);
         database.validate_reader().await.unwrap();
         let store = Arc::new(CrudStore::new(database));
         mark_thread_episodic_workspace_refill_complete_for_test(&store, &workspace).await;
@@ -11821,7 +11821,7 @@ mod tests {
             .await
             .unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, connection);
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, connection);
         let workspace_manager = WorkspaceManager::new(database.clone());
         let workspace_id = workspace_manager
             .create_workspace(&pioneer_protocol::generate_id(21), Some("Episodic test"))
@@ -14041,9 +14041,9 @@ mod tests {
         let (fixture, workspace) = physical_runner_database_for_test().await;
         let writer = fixture.connect_with_limit(1).await.unwrap();
         let reader = fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+        let database = pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
             reader,
-            pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, evidence.clone()),
+            pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, evidence.clone()),
             evidence,
         );
         database.validate_reader().await.unwrap();
@@ -14053,19 +14053,21 @@ mod tests {
     }
     #[derive(Default)]
     struct SearchSchedulingEvidence {
-        reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-        writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
+        reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+        writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteClass>>,
     }
-    impl pioneer_sqlite::SqliteReadObserver for SearchSchedulingEvidence {
-        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-            if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+    impl pioneer_postgres_pools::PostgresReadObserver for SearchSchedulingEvidence {
+        fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+            if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } =
+                event
+            {
                 self.reads.lock().unwrap().push(class);
             }
         }
     }
-    impl pioneer_sqlite::SqliteWriteObserver for SearchSchedulingEvidence {
-        fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
-            if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
+    impl pioneer_postgres_pools::PostgresWriteObserver for SearchSchedulingEvidence {
+        fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
+            if let pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } = event {
                 self.writes.lock().unwrap().push(class);
             }
         }
@@ -14198,8 +14200,8 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_projection_commits_text_vector_and_job_together_on_scoped_runtime() {
-        use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+    async fn postgres_projection_commits_text_vector_and_job_together_on_scoped_runtime() {
+        use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
         use sea_orm::TransactionTrait;
         let root = TempDir::new().unwrap();
         let evidence = Arc::new(SearchSchedulingEvidence::default());
@@ -14207,7 +14209,7 @@ mod tests {
         assert!(
             store
                 .database_connection()
-                .reader_query_only_enabled()
+                .reader_is_read_only()
                 .await
                 .unwrap()
         );
@@ -14293,7 +14295,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|class| *class == SqliteReadClass::Maintenance)
+                .all(|class| *class == PostgresReadClass::Maintenance)
         );
         assert!(
             evidence
@@ -14301,7 +14303,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|class| *class == SqliteWriteClass::Maintenance)
+                .all(|class| *class == PostgresWriteClass::Maintenance)
         );
         evidence.reads.lock().unwrap().clear();
         evidence.writes.lock().unwrap().clear();
@@ -14319,7 +14321,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|class| *class == SqliteReadClass::Interactive)
+                .all(|class| *class == PostgresReadClass::Interactive)
         );
         let (comparison, comparison_job, comparison_input) = sql_search_pending(
             &maintenance,
@@ -14451,7 +14453,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_plain_text_queries_and_bounded_pages_use_actual_unicode_tokenizer() {
+    async fn postgres_plain_text_queries_and_bounded_pages_use_actual_unicode_tokenizer() {
         let (store, workspace) = setup_thread_episodic_store().await;
         for (id, text) in [
             ("operators", "AND OR NOT альфа 東京 a"),
@@ -14532,7 +14534,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_shared_vector_occurrences_keep_stable_rank_ties_across_pages() {
+    async fn postgres_shared_vector_occurrences_keep_stable_rank_ties_across_pages() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let text = "sharedrankneedle same canonical text";
         let artifact = store
@@ -14687,7 +14689,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_publication_rechecks_target_even_when_source_and_claim_are_unchanged() {
+    async fn postgres_publication_rechecks_target_even_when_source_and_claim_are_unchanged() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let (item, job, resolved) =
             sql_search_pending(&store, &workspace, "late_target", "latepublicationneedle").await;
@@ -14762,7 +14764,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_common_retrieval_keeps_lexical_results_and_reports_embedding_failures() {
+    async fn postgres_common_retrieval_keeps_lexical_results_and_reports_embedding_failures() {
         use pioneer_memory::ThreadEpisodicRetrievalMode;
         let (store, workspace) = setup_thread_episodic_store().await;
         let (item, job, resolved) = sql_search_pending(
@@ -14827,7 +14829,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_maximum_page_keeps_lookahead_and_returns_the_last_source() {
+    async fn postgres_maximum_page_keeps_lookahead_and_returns_the_last_source() {
         let (store, workspace) = setup_thread_episodic_store().await;
         for index in 0..257 {
             let (item, job, resolved) = sql_search_pending(
@@ -14868,7 +14870,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_lexical_snippets_keep_short_text_and_late_unicode_context() {
+    async fn postgres_lexical_snippets_keep_short_text_and_late_unicode_context() {
         let (store, workspace) = setup_thread_episodic_store().await;
         let long_text = format!(
             "{} левый контекст latecontextneedle правый контекст",
@@ -14910,7 +14912,7 @@ mod tests {
     }
 
     #[pioneer_postgres_test::postgres_test]
-    async fn sqlite_directory_count_tracks_publication_retry_rollback_recreation_and_exclusion() {
+    async fn postgres_directory_count_tracks_publication_retry_rollback_recreation_and_exclusion() {
         use sea_orm::TransactionTrait;
         let (store, workspace) = setup_thread_episodic_store().await;
         let (item, job, resolved) = sql_search_pending(

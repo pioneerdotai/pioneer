@@ -1,13 +1,13 @@
 use super::*;
 use crate::package_store::PackageStore;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 
 async fn projection_fixture(
     fixture: &pioneer_postgres_test::TestDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
-) -> (SqliteDatabase, PackageStore) {
+) -> (PostgresDatabase, PackageStore) {
     use sea_orm::{DbBackend, Statement};
     let writer = fixture.connection();
     let txn = writer.begin().await.unwrap();
@@ -34,7 +34,7 @@ async fn projection_fixture(
         .unwrap();
     }
     txn.commit().await.unwrap();
-    let db = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone());
+    let db = PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone());
     (db.clone(), PackageStore::new(db))
 }
 

@@ -1,7 +1,7 @@
 //! Bounded discovery of preview artifacts and unowned blobs.
 use anyhow::{Result, ensure};
 use pioneer_entity::{artifact, artifact_blob, html_preview_frozen_result as frozen_result};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, Order, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
@@ -15,7 +15,7 @@ use queries::{bytes, col, json as json_field};
 
 /// Used under the external storage mutation guard before unlinking a key.
 pub async fn artifact_storage_key_is_unreferenced(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     key: &str,
 ) -> Result<bool> {
@@ -31,7 +31,7 @@ pub async fn artifact_storage_key_is_unreferenced(
 }
 
 pub async fn html_preview_gc_blob_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     after: &str,
     cutoff_ms: i64,
 ) -> Result<(String, Vec<(String, ArtifactGcBlobCandidateRecord)>)> {
@@ -40,7 +40,7 @@ pub async fn html_preview_gc_blob_page(
 }
 
 pub async fn html_preview_gc_blob_page_through(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     after: &str,
     cutoff_ms: i64,
     upper: &str,
@@ -95,7 +95,7 @@ pub async fn html_preview_gc_blob_page_through(
 }
 
 pub async fn html_preview_released_copies_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     after: &str,
 ) -> Result<(String, Option<(String, String)>)> {
     let upper = html_preview_artifact_frontier(db).await?;
@@ -103,7 +103,7 @@ pub async fn html_preview_released_copies_page(
 }
 
 pub async fn html_preview_released_copies_page_through(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     after: &str,
     upper: &str,
 ) -> Result<(String, Option<(String, String)>)> {
@@ -163,7 +163,7 @@ pub async fn html_preview_released_copies_page_through(
 }
 
 pub async fn load_html_preview_io_copies(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     claim: &HtmlPreviewIoClaim,
 ) -> Result<HtmlPreviewIoSource<(String, String)>> {
     use HtmlPreviewIoSource as Source;
@@ -224,7 +224,7 @@ pub async fn load_html_preview_io_copies(
 }
 
 pub async fn html_preview_gc_deadline(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     grace_ms: i64,
     pass_cutoff_ms: i64,
 ) -> Result<Option<i64>> {
@@ -253,7 +253,7 @@ pub async fn html_preview_gc_deadline(
     }))
 }
 
-pub async fn html_preview_artifact_frontier(db: &SqliteDatabase) -> Result<String> {
+pub async fn html_preview_artifact_frontier(db: &PostgresDatabase) -> Result<String> {
     Ok(artifact::Entity::find()
         .select_only()
         .column(artifact::Column::Id)
@@ -264,7 +264,7 @@ pub async fn html_preview_artifact_frontier(db: &SqliteDatabase) -> Result<Strin
         .unwrap_or_default())
 }
 
-pub async fn html_preview_blob_frontier(db: &SqliteDatabase) -> Result<String> {
+pub async fn html_preview_blob_frontier(db: &PostgresDatabase) -> Result<String> {
     Ok(artifact_blob::Entity::find()
         .select_only()
         .column(artifact_blob::Column::Id)
@@ -275,7 +275,7 @@ pub async fn html_preview_blob_frontier(db: &SqliteDatabase) -> Result<String> {
         .unwrap_or_default())
 }
 
-pub async fn html_preview_witness_frontier(db: &SqliteDatabase) -> Result<(String, i64)> {
+pub async fn html_preview_witness_frontier(db: &PostgresDatabase) -> Result<(String, i64)> {
     Ok(frozen_result::Entity::find()
         .select_only()
         .columns([

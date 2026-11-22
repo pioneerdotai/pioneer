@@ -108,7 +108,7 @@ impl CrudStore {
         &self,
         domain: &'static str,
         work: &[GatewayControlWake],
-    ) -> pioneer_sqlite::WorkChange {
+    ) -> pioneer_postgres_pools::WorkChange {
         pioneer_crud_execution::gateway_control::control_work_change(&self.connection, domain, work)
     }
 }

@@ -2,11 +2,11 @@ use anyhow::Result;
 use pioneer_crud_artifacts::html_preview_io::{
     HtmlPreviewIoFamily, HtmlPreviewIoLocator, HtmlPreviewIoQueue, ack, find_work, request_at,
 };
-use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
+use pioneer_postgres_test::TestDatabase;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use std::sync::{
     Arc,
@@ -19,18 +19,18 @@ struct Routes {
     writes: AtomicUsize,
 }
 
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
-            assert_eq!(class, SqliteReadClass::Maintenance);
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
+            assert_eq!(class, PostgresReadClass::Maintenance);
             self.reads.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if let SqliteWriteEvent::Acquired { class, .. } = event {
-            assert_eq!(class, SqliteWriteClass::Maintenance);
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if let PostgresWriteEvent::Acquired { class, .. } = event {
+            assert_eq!(class, PostgresWriteClass::Maintenance);
             self.writes.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -48,7 +48,7 @@ impl Routes {
     }
 }
 struct Fixture {
-    db: SqliteDatabase,
+    db: PostgresDatabase,
     routes: Arc<Routes>,
 }
 impl Fixture {
@@ -58,12 +58,12 @@ impl Fixture {
 }
 async fn fixture(database: &TestDatabase) -> Fixture {
     let routes = Arc::new(Routes::default());
-    let writer = SqliteWriteExecutor::with_observer(
+    let writer = PostgresWriteExecutor::with_observer(
         database.connect_with_limit(1).await.unwrap(),
         routes.clone(),
     );
     let reader = database.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::from_executor_with_read_observer(reader, writer, routes.clone())
+    let db = PostgresDatabase::from_executor_with_read_observer(reader, writer, routes.clone())
         .maintenance();
     db.execute_unprepared("INSERT INTO workspace(id,name) VALUES('ws','Fixture')")
         .await

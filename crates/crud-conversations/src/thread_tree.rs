@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Timelike;
 use pioneer_entity::{thread, thread_folder, thread_placement, workspace};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{ThreadFolder, ThreadPlacement, generate_id};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, LockType, OnConflict};
@@ -232,7 +232,7 @@ pub async fn upsert_thread_placement<C: ConnectionTrait>(
 }
 
 pub async fn list_thread_folders(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
 ) -> Result<Vec<ThreadFolder>> {
     let models = list_folders_by_workspace(db, workspace_id).await?;
@@ -243,7 +243,7 @@ pub async fn list_thread_folders(
 }
 
 pub async fn list_thread_placements(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
 ) -> Result<Vec<ThreadPlacement>> {
     let models = list_placements_by_workspace(db, workspace_id).await?;
@@ -254,7 +254,7 @@ pub async fn list_thread_placements(
 }
 
 pub async fn get_thread_placement(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
 ) -> Result<Option<ThreadPlacement>> {
     Ok(find_placement_by_thread_id(db, thread_id)
@@ -263,7 +263,7 @@ pub async fn get_thread_placement(
 }
 
 pub async fn create_thread_folder(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     parent_folder_id: Option<&str>,
     name: &str,
@@ -312,7 +312,7 @@ pub async fn create_thread_folder(
 }
 
 pub async fn delete_thread_folder_promote(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     folder_id: &str,
 ) -> Result<bool> {
@@ -373,7 +373,7 @@ pub async fn delete_thread_folder_promote(
 }
 
 pub async fn move_thread_to_folder(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     thread_id: &str,
     folder_id: Option<&str>,
@@ -413,7 +413,7 @@ pub async fn move_thread_to_folder(
 }
 
 pub async fn move_folder(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     folder_id: &str,
     parent_folder_id: Option<&str>,

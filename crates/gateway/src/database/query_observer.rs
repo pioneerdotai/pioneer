@@ -85,11 +85,10 @@ fn database_query_kind(
     use pioneer_observability::{DatabaseOperation, DatabaseQueryKind};
 
     match operation {
-        DatabaseOperation::Select | DatabaseOperation::Pragma => DatabaseQueryKind::Read,
+        DatabaseOperation::Select => DatabaseQueryKind::Read,
         DatabaseOperation::Insert
         | DatabaseOperation::Update
         | DatabaseOperation::Delete
-        | DatabaseOperation::Replace
         | DatabaseOperation::Transaction
         | DatabaseOperation::Schema => DatabaseQueryKind::Write,
         DatabaseOperation::Other => DatabaseQueryKind::Other,
@@ -112,8 +111,6 @@ pub(super) fn classify_operation(sql: &str) -> pioneer_observability::DatabaseOp
         DatabaseOperation::Update
     } else if token.eq_ignore_ascii_case("delete") {
         DatabaseOperation::Delete
-    } else if token.eq_ignore_ascii_case("replace") {
-        DatabaseOperation::Replace
     } else if token.eq_ignore_ascii_case("begin")
         || token.eq_ignore_ascii_case("commit")
         || token.eq_ignore_ascii_case("rollback")
@@ -127,12 +124,8 @@ pub(super) fn classify_operation(sql: &str) -> pioneer_observability::DatabaseOp
         || token.eq_ignore_ascii_case("vacuum")
         || token.eq_ignore_ascii_case("reindex")
         || token.eq_ignore_ascii_case("analyze")
-        || token.eq_ignore_ascii_case("attach")
-        || token.eq_ignore_ascii_case("detach")
     {
         DatabaseOperation::Schema
-    } else if token.eq_ignore_ascii_case("pragma") {
-        DatabaseOperation::Pragma
     } else {
         DatabaseOperation::Other
     }

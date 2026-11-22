@@ -8,7 +8,9 @@ use pioneer_crud_execution::{
 };
 use pioneer_crud_tasks::view_store::TaskViewStore;
 use pioneer_entity::{agent_execution_grant, task_actor_contract};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver};
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
+};
 use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Set, Statement};
 use std::sync::{
     Arc,
@@ -17,9 +19,9 @@ use std::sync::{
 
 #[derive(Default)]
 struct Writes(AtomicUsize);
-impl SqliteWriteObserver for Writes {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if matches!(event, SqliteWriteEvent::Enqueued { .. }) {
+impl PostgresWriteObserver for Writes {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if matches!(event, PostgresWriteEvent::Enqueued { .. }) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -113,8 +115,8 @@ async fn history_reads_both_durable_containers_without_rewrites_or_writer_admiss
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let writes = Arc::new(Writes::default());
-    let executor = SqliteWriteExecutor::with_observer(writer, writes.clone());
-    let db = SqliteDatabase::from_executor(reader, executor);
+    let executor = PostgresWriteExecutor::with_observer(writer, writes.clone());
+    let db = PostgresDatabase::from_executor(reader, executor);
     let store = TaskViewStore::new(&db);
     db.execute_unprepared(
         "INSERT INTO workspace(id,name) VALUES('W00000000000000000001','History');

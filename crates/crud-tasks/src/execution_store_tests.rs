@@ -25,7 +25,7 @@ async fn task_execution_observation_uses_current_attempt_activity_and_heartbeat(
                  VALUES ('ws_task_observation', 'Observation fixture', true, true)",
             )
             .await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let store = TaskExecutionStore::new(&db);
         let occurrences = TaskOccurrenceRepository::new(db.clone());
         let registries = Registries::default();

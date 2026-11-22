@@ -55,9 +55,9 @@ fn cached_reads_bind_each_input_without_caching_eligibility() {
 async fn complete_postgres_reads_keep_physical_page_order_in_the_read_only_pool() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let db =
-        pioneer_sqlite::SqliteDatabase::new(reader, fixture.connection().clone()).maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = pioneer_postgres_pools::PostgresDatabase::new(reader, fixture.connection().clone())
+        .maintenance();
+    assert!(db.reader_is_read_only().await.unwrap());
 
     for (after, upper) in [("", "z"), ("a'雪; --", "z\"\\雪")] {
         let reads = FrozenReads::get();
@@ -85,5 +85,5 @@ async fn complete_postgres_reads_keep_physical_page_order_in_the_read_only_pool(
             assert!(!plan.iter().any(|row| row.contains("Sort")), "{plan:#?}");
         }
     }
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
 }

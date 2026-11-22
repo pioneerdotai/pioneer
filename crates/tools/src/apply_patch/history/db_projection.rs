@@ -7,19 +7,19 @@ use pioneer_crud::{
     TurnDiffStateRow, TurnDiffStateWrite, find_turn_diff_state, list_turn_diff_states_for_threads,
     upsert_turn_diff_state,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::TransactionTrait;
 
 const MAX_PROJECTION_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROJECTION_ID_BYTES: usize = 4096;
 
 #[derive(Clone)]
-pub struct SqliteTurnDiffStore {
-    db: SqliteDatabase,
+pub struct PostgresTurnDiffStore {
+    db: PostgresDatabase,
 }
 
-impl SqliteTurnDiffStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresTurnDiffStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self { db: db.into() }
     }
 
@@ -246,7 +246,7 @@ fn validate_projection_row(row: &TurnDiffStateRow, state: &TurnDiffState) -> Res
     }
     let expected_applied_through = state
         .applied_through_ordinal
-        .map(|ordinal| sqlite_i64(ordinal.0, "turn diff applied ordinal"))
+        .map(|ordinal| postgres_i64(ordinal.0, "turn diff applied ordinal"))
         .transpose()?;
     if row.applied_through_ordinal != expected_applied_through {
         return Err(anyhow!(
@@ -270,22 +270,22 @@ fn projection_write(state: &TurnDiffState, payload: String) -> Result<TurnDiffSt
     Ok(TurnDiffStateWrite {
         thread_id: state.thread_id.clone(),
         turn_id: state.turn_id.clone(),
-        revision: sqlite_i64(state.revision, "turn diff revision")?,
+        revision: postgres_i64(state.revision, "turn diff revision")?,
         authority: serde_json::to_string(&state.authority)?,
         exact: i64::from(state.exact),
         coverage_json: serde_json::to_string(&state.coverage)?,
         applied_through_ordinal: state
             .applied_through_ordinal
-            .map(|ordinal| sqlite_i64(ordinal.0, "turn diff applied ordinal"))
+            .map(|ordinal| postgres_i64(ordinal.0, "turn diff applied ordinal"))
             .transpose()?,
-        record_count: sqlite_i64(state.record_count, "turn diff record count")?,
+        record_count: postgres_i64(state.record_count, "turn diff record count")?,
         final_state: i64::from(state.final_state),
         state_json: payload,
     })
 }
 
-fn sqlite_i64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
+fn postgres_i64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds PostgreSQL integer range"))
 }
 
 fn same_projection_ignoring_terminal(existing: &TurnDiffState, candidate: &TurnDiffState) -> bool {

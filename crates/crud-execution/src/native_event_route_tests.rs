@@ -2,29 +2,29 @@ use super::*;
 use crate::time::unix_to_datetime;
 use sea_orm::{EntityTrait, Set};
 
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use sea_orm::TransactionTrait;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct CliBindingRoutes {
-    reads: Mutex<Vec<SqliteReadClass>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadClass>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
 }
 
-impl SqliteReadObserver for CliBindingRoutes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
+impl PostgresReadObserver for CliBindingRoutes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
 
-impl SqliteWriteObserver for CliBindingRoutes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for CliBindingRoutes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
@@ -35,9 +35,9 @@ async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacit
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let routes = Arc::new(CliBindingRoutes::default());
-    let db = SqliteDatabase::from_executor_with_read_observer(
+    let db = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, routes.clone()),
+        PostgresWriteExecutor::with_observer(writer, routes.clone()),
         routes.clone(),
     );
     let maintenance_db = db.maintenance();
@@ -64,8 +64,8 @@ async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacit
         .unwrap();
     assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Maintenance,
             ..
         }
     )));
@@ -82,7 +82,7 @@ async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacit
             .reads
             .lock()
             .unwrap()
-            .contains(&SqliteReadClass::Maintenance)
+            .contains(&PostgresReadClass::Maintenance)
     );
 
     let blocker = db.begin().await.unwrap();
@@ -101,8 +101,8 @@ async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacit
             if routes.writes.lock().unwrap()[before..].iter().any(|event| {
                 matches!(
                     event,
-                    SqliteWriteEvent::Enqueued {
-                        class: SqliteWriteClass::Maintenance,
+                    PostgresWriteEvent::Enqueued {
+                        class: PostgresWriteClass::Maintenance,
                         ..
                     }
                 )
@@ -123,7 +123,7 @@ async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacit
             .unwrap()
             .iter()
             .any(|event| matches!(event,
-                SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+                PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. }
                     if queue.maintenance == 0
             ))
     );

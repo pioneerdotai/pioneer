@@ -4,8 +4,8 @@ use pioneer_crud_conversations::{
 };
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_timeline::conversation_display::ConversationDisplayStore;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{AgentMessagePhase, TurnItem, TurnStatus};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 #[tokio::test]
@@ -13,7 +13,7 @@ async fn legacy_final_selector_rejects_commentary_and_ambiguous_finals() {
     for final_count in 0..=2 {
         for final_id in ["a_final", "z_final"] {
             pioneer_postgres_test::with_database(async |fixture| {
-                let db = SqliteDatabase::new(
+                let db = PostgresDatabase::new(
                     fixture.connect_read_only().await?,
                     fixture.connection().clone(),
                 );

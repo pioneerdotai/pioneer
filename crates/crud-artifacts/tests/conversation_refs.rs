@@ -6,11 +6,11 @@ use pioneer_crud_artifacts::{
     ingest::{ArtifactIngestStore, PreparedArtifactIngest},
     mutations::bind_artifact,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
     ArtifactRole,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 use std::collections::BTreeMap;
 
@@ -44,7 +44,7 @@ async fn conversation_artifact_refs_exclude_draft_upload_bindings() {
                  VALUES ('ws_artifact_refs', 'Test Workspace', true, true)",
             )
             .await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let wake = tokio::sync::Notify::new();
         let store = ArtifactIngestStore::new(&db, &wake);
         let prepared = PreparedArtifactIngest::new(

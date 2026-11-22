@@ -659,14 +659,14 @@ fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
             .database_connection();
         assert_eq!(
             database.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             database.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Maintenance
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance
         );
         assert_eq!(database.writer_max_connections(), 1);
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         let delays = [31, 31, 120, 600, 1_800, 7_200, 21_600];
         for attempt in 1..=8 {
             f.attempt().await;
@@ -762,7 +762,7 @@ fn memory_http_403_exhausts_original_eight_attempts_across_database_restart() {
         // Reopen the actual database with the Gateway reader and writer pools.
         let writer = database_fixture.connect_with_limit(1).await.unwrap();
         let reader = database_fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
         // Reconciliation/repeated preparation of the same terminal input is idempotent.
         restarted

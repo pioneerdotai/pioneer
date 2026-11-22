@@ -1215,7 +1215,7 @@ async fn physical_copy_preparation_succeeds_with_disconnected_database() {
         let harness = preview_fixture(database).await;
         let writer = database.connect().await?;
         let reader = database.connect_read_only().await?;
-        let store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        let store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             reader.clone(),
             writer.clone(),
         ));

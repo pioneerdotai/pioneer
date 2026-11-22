@@ -6,7 +6,7 @@ use pioneer_entity::{
     task_occurrence_reconcile_pending as pending, task_occurrence_reconcile_scope as scope,
     task_run,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Expr, OnConflict, Order, Query, SelectStatement};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -178,7 +178,7 @@ fn next_attempt_count(row: &pending::Model) -> i64 {
 }
 
 pub async fn claim(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     candidate: &TaskOccurrenceReconcileCandidate,
     token: String,
     clock: &TaskOccurrenceClock<'_>,
@@ -241,7 +241,7 @@ pub async fn claim(
 }
 
 pub async fn defer_failed_claim(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     snapshot: &pending::Model,
     clock: &TaskOccurrenceClock<'_>,
 ) -> Result<TaskOccurrenceClaimDeferral> {
@@ -321,7 +321,7 @@ struct RunId {
     id: String,
 }
 
-pub async fn expand_scope(db: &SqliteDatabase, clock: &TaskOccurrenceClock<'_>) -> Result<u64> {
+pub async fn expand_scope(db: &PostgresDatabase, clock: &TaskOccurrenceClock<'_>) -> Result<u64> {
     let row = scope::Entity::find()
         .order_by_asc(scope::Column::Generation)
         .order_by_asc(scope::Column::TaskId)
@@ -356,7 +356,7 @@ pub async fn expand_scope(db: &SqliteDatabase, clock: &TaskOccurrenceClock<'_>) 
 }
 
 async fn expand_scope_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &scope::Model,
     clock: &TaskOccurrenceClock<'_>,
 ) -> Result<u64> {

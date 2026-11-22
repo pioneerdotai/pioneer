@@ -3,11 +3,11 @@ use anyhow::{Context, Result};
 use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_conversations::turn_item::turn_item_type_from_db;
 use pioneer_entity::{recovery_job, recovery_terminalization_outbox};
-use pioneer_protocol::{RecoveryJobStatus, TurnItemType, TurnStatus, generate_id};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::{RecoveryJobStatus, TurnItemType, TurnStatus, generate_id};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -645,7 +645,7 @@ pub trait RecoverySettlement: Sync {
 }
 
 pub async fn claim_records(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     now_unix: i64,
     claim_lease_secs: u64,
     limit: u64,
@@ -745,7 +745,7 @@ pub async fn claim_records(
 }
 
 pub async fn classify_claim(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     record: &ClaimedRecoveryTerminalizationRecord,
     now_unix: i64,
     settlement: &impl RecoverySettlement,
@@ -942,7 +942,7 @@ pub async fn classify_claim(
 }
 
 pub async fn classify_claim_batch(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     records: &[ClaimedRecoveryTerminalizationRecord],
     now_unix: i64,
     settlement: &impl RecoverySettlement,
@@ -1219,7 +1219,7 @@ mod tests {
     async fn malformed_terminalization_is_quarantined_without_blocking_later_rows() -> Result<()> {
         with_database(async |fixture| {
             async fn terminal_job(
-                db: &SqliteDatabase,
+                db: &PostgresDatabase,
                 turn_id: &str,
                 item_id: &str,
                 now_unix: i64,
@@ -1260,7 +1260,7 @@ mod tests {
                 Ok(terminal)
             }
 
-            let db = SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
+            let db = PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
             db.execute_unprepared(
                 "INSERT INTO workspace (id, name) VALUES ('ws_recovery_poison', 'Recovery');
                  INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status) VALUES

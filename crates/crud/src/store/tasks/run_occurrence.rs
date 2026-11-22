@@ -76,7 +76,7 @@ impl CrudStore {
                     let repair = &repair;
                     async move {
                         repair
-                            .run_serialized_write(|| {
+                            .retry_write_on_conflict(|| {
                                 repair.commit_task_run_occurrence(
                                     *prepared.clone(),
                                     Some(claim.clone()),
@@ -95,7 +95,7 @@ impl CrudStore {
         run_id: &str,
         fallback_completed_at: i64,
     ) -> Result<TaskRunOccurrenceTerminalizationOutcome> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             match self
                 .prepare_task_run_occurrence(run_id.to_owned(), fallback_completed_at, false)
                 .await?

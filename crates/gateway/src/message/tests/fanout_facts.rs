@@ -5,11 +5,12 @@ use pioneer_crud::{
     NewWorkspaceMembership, insert_active_device_session, insert_thread_membership,
     insert_workspace_membership,
 };
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+    PostgresWriteExecutor,
+};
 use pioneer_protocol::{
     AuthSessionId, ClientInstallationDescriptor, ClientKind, DeviceId, PrincipalId, TokenFamilyId,
-};
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
 };
 use sea_orm::Statement;
 
@@ -20,7 +21,7 @@ type Principal = Arc<crate::auth::AuthenticatedSessionPrincipal>;
 
 struct Fixture {
     _directory: tempfile::TempDir,
-    database: SqliteDatabase,
+    database: PostgresDatabase,
     processor: MessageProcessor,
     workspace: String,
     statements: Arc<std::sync::Mutex<Vec<Statement>>>,
@@ -40,13 +41,13 @@ impl Fixture {
             move |info| statements.lock().unwrap().push(info.statement.clone())
         });
         let observer = Arc::new(NativeSchedulingObserver::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         database.validate_reader().await.unwrap();
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         assert!(
             database
                 .query_one_raw(Statement::from_string(
@@ -307,7 +308,7 @@ fn delivered(rx: &mut crate::session::test_support::OutboundTestReceiver) {
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
+async fn ordinary_fanout_shares_bounded_prefix_on_scoped_read_only_readers() {
     let f = Fixture::new().await;
     let principal = f.member(10, true).await;
     let mut receivers = Vec::new();
@@ -315,10 +316,10 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
         receivers.push(f.connect(principal.clone()).await.1);
     }
     for (processor, class) in [
-        (f.processor.clone(), SqliteReadClass::Interactive),
+        (f.processor.clone(), PostgresReadClass::Interactive),
         (
             f.processor.scoped_for_background_reconciliation(),
-            SqliteReadClass::Maintenance,
+            PostgresReadClass::Maintenance,
         ),
     ] {
         let held_writer = f.database.begin().await.unwrap();
@@ -365,29 +366,35 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
                 let finished = reads
                     .iter()
                     .filter_map(|event| match event {
-                        SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                             Some((*class, *outcome))
                         }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
                 // The scope resolves thread and workspace in one joined read.
-                assert_eq!(finished, vec![(class, SqliteReadOutcome::Ok); 7]);
+                assert_eq!(finished, vec![(class, PostgresReadOutcome::Ok); 7]);
                 assert_eq!(
                     reads
                         .iter()
-                        .filter(|event| matches!(event, SqliteReadEvent::AdmissionAcquired { .. }))
+                        .filter(|event| matches!(
+                            event,
+                            PostgresReadEvent::AdmissionAcquired { .. }
+                        ))
                         .count(),
                     reads
                         .iter()
-                        .filter(|event| matches!(event, SqliteReadEvent::AdmissionReleased { .. }))
+                        .filter(|event| matches!(
+                            event,
+                            PostgresReadEvent::AdmissionReleased { .. }
+                        ))
                         .count()
                 );
                 assert!(
                     reads
                         .iter()
                         .filter_map(|event| match event {
-                            SqliteReadEvent::AdmissionReleased {
+                            PostgresReadEvent::AdmissionReleased {
                                 active,
                                 queue_depth,
                                 ..

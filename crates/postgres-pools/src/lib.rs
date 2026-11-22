@@ -5,34 +5,36 @@ use std::time::Duration;
 mod database;
 mod query_scope;
 mod reader;
+mod statement_route;
 pub use query_scope::DiagnosticStream;
 mod work_signal;
 mod writer;
 pub use work_signal::{WorkChange, WorkSignal, WorkSubscription, wait_for_unix_deadline};
 
-pub use database::{SqliteDatabase, SqliteReadTransaction};
+pub use database::{PostgresDatabase, PostgresReadTransaction};
 pub use reader::{
-    DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,
-    SqliteReadOutcome,
+    DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, PostgresReadClass, PostgresReadEvent,
+    PostgresReadObserver, PostgresReadOutcome,
 };
 pub use writer::{
     DEFAULT_MAX_CRITICAL_BURST, DEFAULT_MAX_MAINTENANCE_WAIT_MS, DEFAULT_MAX_NON_MAINTENANCE_BURST,
-    SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
-    SqliteWriteGrantReason, SqliteWriteObserver, SqliteWritePolicy, SqliteWriteQueueSnapshot,
+    PostgresQueryStream, PostgresTransaction, PostgresWriteClass, PostgresWriteEvent,
+    PostgresWriteExecutor, PostgresWriteGrantReason, PostgresWriteObserver, PostgresWritePolicy,
+    PostgresWriteQueueSnapshot,
 };
 
 /// Current admission state captured under its native owner lock. This is not
 /// a milestone/histogram sample. Revision is local to that owner; time is the
 /// shared process monotonic clock, milliseconds. Reader oldest remains absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SqliteAdmissionSnapshot {
+pub struct PostgresAdmissionSnapshot {
     pub revision: u64,
     pub sampled_monotonic_ms: u64,
     pub consent_generation: u64,
     pub depth: usize,
     pub oldest_waited_ms: Option<u64>,
 }
-impl SqliteAdmissionSnapshot {
+impl PostgresAdmissionSnapshot {
     fn capture(revision: u64, depth: usize, oldest: Option<std::time::Instant>) -> Self {
         let consent_generation = pioneer_observability::telemetry_consent_snapshot().1;
         let at = std::time::Instant::now();

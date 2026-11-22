@@ -19,7 +19,7 @@ async fn fixture() -> CompactionStore {
     }
     let reader = fixture.connect_read_only().await.unwrap();
     CompactionStore::new(
-        pioneer_sqlite::SqliteDatabase::new(reader, writer),
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
         Default::default(),
     )
 }

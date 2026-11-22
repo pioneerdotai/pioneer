@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use pioneer_crud_access::{
     authorization_scope::resolve_turn_authorization_scope, turn_execution::*,
 };
-use pioneer_protocol::{PersistedActorRef, TurnKind, TurnStatus, TurnWorkOwner};
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresReadOutcome, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
+use pioneer_protocol::{PersistedActorRef, TurnKind, TurnStatus, TurnWorkOwner};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use std::sync::{Arc, Mutex};
 
@@ -25,22 +25,22 @@ async fn seed(database: &impl ConnectionTrait) -> Result<()> {
 
 #[derive(Default)]
 struct ReadEvents {
-    events: Mutex<Vec<SqliteReadEvent>>,
+    events: Mutex<Vec<PostgresReadEvent>>,
 }
 
-impl SqliteReadObserver for ReadEvents {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for ReadEvents {
+    fn observe(&self, event: PostgresReadEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
 
 #[derive(Default)]
 struct WriteEvents {
-    events: Mutex<Vec<SqliteWriteEvent>>,
+    events: Mutex<Vec<PostgresWriteEvent>>,
 }
 
-impl SqliteWriteObserver for WriteEvents {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for WriteEvents {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
@@ -205,9 +205,9 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
         });
         let reads = Arc::new(ReadEvents::default());
         let writes = Arc::new(WriteEvents::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, writes.clone()),
+            PostgresWriteExecutor::with_observer(writer, writes.clone()),
             reads.clone(),
         );
         database.validate_reader().await.unwrap();
@@ -217,9 +217,9 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
         let held_writer = database.begin().await?;
         held_writer.execute_unprepared("SELECT id FROM turn WHERE id='turn' FOR UPDATE").await?;
         for (store, class) in [
-            (&interactive, SqliteReadClass::Interactive),
-            (&maintenance, SqliteReadClass::Maintenance),
-            (&critical, SqliteReadClass::Maintenance),
+            (&interactive, PostgresReadClass::Interactive),
+            (&maintenance, PostgresReadClass::Maintenance),
+            (&critical, PostgresReadClass::Maintenance),
         ] {
             reader_statements.lock().unwrap().clear();
             writer_statements.lock().unwrap().clear();
@@ -320,7 +320,7 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
             let finished = events
                 .iter()
                 .filter_map(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                    PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                         Some((*class, *outcome))
                     }
                     _ => None,
@@ -328,7 +328,7 @@ async fn authorization_projections_use_only_required_columns_on_scoped_physical_
                 .collect::<Vec<_>>();
             assert_eq!(
                 finished,
-                vec![(class, SqliteReadOutcome::Ok); statements.len()]
+                vec![(class, PostgresReadOutcome::Ok); statements.len()]
             );
         }
         held_writer.rollback().await.unwrap();
@@ -379,12 +379,12 @@ async fn activity_discovery_pages_survive_filtered_scopes_and_duplicate_active_r
     use pioneer_protocol::PrincipalId;
 
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = SqliteDatabase::new(
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     )
     .maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
     db.execute_unprepared(
         "INSERT INTO gateway_identity(id,singleton_key,identity_bootstrap_version)
              VALUES('G00000000000000000001',1,1);

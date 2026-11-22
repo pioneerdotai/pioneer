@@ -3,14 +3,14 @@ use pioneer_crud_compaction::store::CompactionStore;
 use pioneer_crud_conversations::turn_item::{ItemWrite, upsert};
 use pioneer_crud_payloads::storage::PreparedPayload;
 use pioneer_entity::compaction_item_revision as revision;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 
 async fn store(fixture: &pioneer_postgres_test::TestDatabase) -> CompactionStore {
     let read = fixture.connect_read_only().await.unwrap();
     let write = fixture.connect_with_limit(1).await.unwrap();
-    let db = SqliteDatabase::new(read, write);
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::new(read, write);
+    assert!(db.reader_is_read_only().await.unwrap());
     CompactionStore::new(db, Default::default()).with_maintenance_access()
 }
 

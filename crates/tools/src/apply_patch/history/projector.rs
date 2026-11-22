@@ -307,7 +307,7 @@ impl TurnRecordProjector {
             .get_or_insert_with(|| format!("unresolved commit ordinal {}", ordinal.0));
     }
 
-    /// Feed a decoded SQLite intent status. Promoted rows are intentionally
+    /// Feed a decoded PostgreSQL intent status. Promoted rows are intentionally
     /// ignored because their immutable applied record is the source log.
     pub fn push_ordinal_status(
         &mut self,

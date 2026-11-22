@@ -40,10 +40,8 @@ pub enum DatabaseOperation {
     Insert,
     Update,
     Delete,
-    Replace,
     Transaction,
     Schema,
-    Pragma,
     Other,
 }
 
@@ -60,7 +58,7 @@ pub struct DatabaseOperationMetric {
 }
 
 impl DatabaseOperation {
-    pub const CARDINALITY: usize = 9;
+    pub const CARDINALITY: usize = 7;
 
     const fn as_str(self) -> &'static str {
         match self {
@@ -68,23 +66,18 @@ impl DatabaseOperation {
             Self::Insert => "insert",
             Self::Update => "update",
             Self::Delete => "delete",
-            Self::Replace => "replace",
             Self::Transaction => "transaction",
             Self::Schema => "schema",
-            Self::Pragma => "pragma",
             Self::Other => "other",
         }
     }
 
     const fn kind(self) -> &'static str {
         match self {
-            Self::Select | Self::Pragma => "read",
-            Self::Insert
-            | Self::Update
-            | Self::Delete
-            | Self::Replace
-            | Self::Transaction
-            | Self::Schema => "write",
+            Self::Select => "read",
+            Self::Insert | Self::Update | Self::Delete | Self::Transaction | Self::Schema => {
+                "write"
+            }
             Self::Other => "other",
         }
     }
@@ -113,7 +106,7 @@ pub struct DatabaseAdmissionMetric {
 
 /// End-to-end reader observation, including maintenance admission and SQLx
 /// pool acquisition. The class and outcome are selected from fixed enums in
-/// pioneer-sqlite; no query or request data is accepted here.
+/// pioneer-postgres-pools; no query or request data is accepted here.
 #[derive(Clone, Copy, Debug)]
 pub struct DatabaseReadMetric {
     pub class: &'static str,

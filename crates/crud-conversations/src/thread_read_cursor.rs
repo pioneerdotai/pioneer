@@ -1,11 +1,11 @@
 //! Authorization, validation, and monotonic advancement of a viewed position.
 use anyhow::{Context, Result};
 use pioneer_crud_access::authorization_scope::principal_current_thread_access_kind;
-use pioneer_protocol::{PrincipalId, ThreadReadResponse};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::{PrincipalId, ThreadReadResponse};
 use sea_orm::TransactionTrait;
 use std::{fmt, time::Duration};
 
@@ -46,7 +46,7 @@ impl fmt::Display for ThreadReadFailure {
 impl std::error::Error for ThreadReadFailure {}
 
 pub async fn mark_thread_read(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     request: MarkThreadReadRequest,
 ) -> Result<ThreadReadResponse> {
     retry_with_backoff(
@@ -62,7 +62,7 @@ pub async fn mark_thread_read(
 }
 
 async fn mark_thread_read_once(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     request: MarkThreadReadRequest,
 ) -> Result<ThreadReadResponse> {
     let principal_id = request.principal_id.to_string();
@@ -216,7 +216,7 @@ mod tests {
             fixture.connection().execute_unprepared(
                 "INSERT INTO workspace (id,name) VALUES ('ws_unread_authoritative','Unread fixture')",
             ).await?;
-            let db = SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
+            let db = PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
             let now = unix_to_datetime(1_700_000_000);
             create_gateway_singleton(&db, &gateway_id, 0, now)
                 .await

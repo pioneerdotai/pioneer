@@ -1,5 +1,5 @@
 use pioneer_crud_compaction::sweep_work as frozen_sweep_work;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 async fn seed_scope(db: &impl ConnectionTrait) {
@@ -11,13 +11,13 @@ async fn seed_scope(db: &impl ConnectionTrait) {
     db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
 }
 
-async fn header(db: &SqliteDatabase, id: &str, count: i64, next: i64, ready: i64) {
+async fn header(db: &PostgresDatabase, id: &str, count: i64, next: i64, ready: i64) {
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,imports_sha256,message_count,import_count,next_ordinal,next_import,ready) VALUES($1,'ws','thread','fixture','fixture',$2,$2,$3,$3,$4)",
         [id.into(),count.into(),next.into(),ready.into()])).await.unwrap();
 }
 
-async fn query(db: &SqliteDatabase, text: &str) -> i64 {
+async fn query(db: &PostgresDatabase, text: &str) -> i64 {
     db.query_one_raw(Statement::from_string(DbBackend::Postgres, text))
         .await
         .unwrap()
@@ -26,11 +26,11 @@ async fn query(db: &SqliteDatabase, text: &str) -> i64 {
         .unwrap()
 }
 
-async fn exec(db: &SqliteDatabase, text: &str) {
+async fn exec(db: &PostgresDatabase, text: &str) {
     db.execute_unprepared(text).await.unwrap();
 }
 
-async fn work(db: &SqliteDatabase, id: &str, kind: i64) -> frozen_sweep_work::Work {
+async fn work(db: &PostgresDatabase, id: &str, kind: i64) -> frozen_sweep_work::Work {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -47,7 +47,7 @@ async fn work(db: &SqliteDatabase, id: &str, kind: i64) -> frozen_sweep_work::Wo
     }
 }
 
-async fn drain_metadata(db: &SqliteDatabase) {
+async fn drain_metadata(db: &PostgresDatabase) {
     for _ in 0..5000 {
         if !frozen_sweep_work::fanout_step(db, None).await.unwrap() {
             return;
@@ -62,7 +62,7 @@ async fn empty_physical_queue_does_not_hide_interrupted_fanout() {
     let writer = fixture.connection();
     seed_scope(writer).await;
     let reader = fixture.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::new(reader, writer.clone()).maintenance();
+    let db = PostgresDatabase::new(reader, writer.clone()).maintenance();
     assert!(matches!(
         frozen_sweep_work::discover(&db, &[], 0, &mut Default::default(), None, false)
             .await

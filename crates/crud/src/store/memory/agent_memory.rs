@@ -358,7 +358,7 @@ impl CrudStore {
             .await
     }
 
-    /// The dedupe decision and creation event share the serialized transaction.
+    /// The dedupe decision and creation event share a write transaction.
     pub async fn insert_agent_memory_candidate_with_outcome(
         &self,
         mut candidate: NewAgentMemoryCandidate,
@@ -398,7 +398,7 @@ impl CrudStore {
             .await
     }
 
-    /// Compare metadata bytes inside the serialized transaction; preparation
+    /// Compare metadata bytes inside the write transaction; preparation
     /// and any conflict reread/recompute belong outside this writer operation.
     pub async fn update_agent_memory_candidate_metadata_if_unchanged(
         &self,

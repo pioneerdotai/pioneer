@@ -8,24 +8,24 @@ use pioneer_entity::{
     compaction_lifecycle_pending as pending, compaction_lifecycle_scope as scope,
     compaction_lifecycle_sequence as sequence, compaction_runner_state as runner,
 };
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
 use std::{sync::Arc, time::Duration};
 const NOW: i64 = 2_000_000_000_000;
 
-async fn open(fixture: &TestDatabase) -> (CrudStore, SqliteWriteExecutor) {
+async fn open(fixture: &TestDatabase) -> (CrudStore, PostgresWriteExecutor) {
     let writer = fixture.connect_with_limit(1).await.unwrap();
-    let executor = SqliteWriteExecutor::new(writer);
+    let executor = PostgresWriteExecutor::new(writer);
     let reader = fixture.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::from_executor(reader, executor.clone());
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::from_executor(reader, executor.clone());
+    assert!(db.reader_is_read_only().await.unwrap());
     (CrudStore::new(db), executor)
 }
 
-async fn fixture() -> (Arc<TestDatabase>, CrudStore, SqliteWriteExecutor) {
+async fn fixture() -> (Arc<TestDatabase>, CrudStore, PostgresWriteExecutor) {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (store, writer) = open(&fixture).await;
     for sql in [
@@ -161,7 +161,7 @@ async fn expand_all(store: &CrudStore, now: i64) {
     panic!("bounded fixture scopes must drain");
 }
 async fn replace_item_with_started_payload(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     compressed: bool,
     updated_at: Option<&str>,
 ) {

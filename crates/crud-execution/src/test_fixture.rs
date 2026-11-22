@@ -1,8 +1,8 @@
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot, ToolStoragePayload,
     TurnItem,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Set, Statement, TransactionTrait};
 
 pub(crate) async fn fixture_event_scope(
@@ -10,8 +10,8 @@ pub(crate) async fn fixture_event_scope(
     workspace: &str,
     thread: &str,
     turn: &str,
-) -> SqliteDatabase {
-    let db = SqliteDatabase::new(
+) -> PostgresDatabase {
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );

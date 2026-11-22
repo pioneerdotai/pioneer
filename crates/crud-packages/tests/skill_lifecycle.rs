@@ -3,15 +3,15 @@ use pioneer_crud_packages::{
     mcp_audit_event, mcp_installation_transactions, mcp_server_installation, plugins,
     skill_audit_event, skill_installation, skill_lifecycle, skill_workspace_policy,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 #[path = "support/plugin_ownership.rs"]
 mod plugin_fixture;
 use plugin_fixture::{mcp, mcp_audit, ownership, parent, policy, skill, skill_audit};
 
-async fn package(fixture: &TestDatabase) -> Result<SqliteDatabase> {
+async fn package(fixture: &TestDatabase) -> Result<PostgresDatabase> {
     let connection = fixture.connection();
     connection
         .execute_unprepared("INSERT INTO workspace (id, name) VALUES ('ws','Workspace')")
@@ -19,7 +19,7 @@ async fn package(fixture: &TestDatabase) -> Result<SqliteDatabase> {
     let publication = connection.begin().await?;
     plugins::insert_parent(&publication, &parent("plugin-a", "ws"), None).await?;
     publication.commit().await?;
-    Ok(SqliteDatabase::new(
+    Ok(PostgresDatabase::new(
         fixture.connect_read_only().await?,
         connection.clone(),
     ))

@@ -793,7 +793,7 @@ pub async fn count_unread_task_completion_inbox<C: ConnectionTrait>(
 /// one reader snapshot. Scheduling is inherited from this scoped store.
 /// The snapshot is released before the caller transforms/serializes/fans out.
 pub async fn addressed_patch(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     access: &TaskCompletionInboxAccess<'_>,
     run_ids: &[String],
 ) -> Result<(Vec<TaskCompletionInboxRow>, u64)> {

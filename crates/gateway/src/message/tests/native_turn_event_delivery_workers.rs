@@ -778,8 +778,9 @@ async fn projection_recovery_deadline_storage_errors_remain_errors() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_queries() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+        PostgresWriteExecutor,
     };
     let temp = tempfile::tempdir().unwrap();
     let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
@@ -787,9 +788,9 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let processor = Arc::new(MessageProcessor::with_agent_manager(
@@ -808,9 +809,9 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
             .filter(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::OperationFinished {
-                        class: SqliteReadClass::Maintenance,
-                        outcome: SqliteReadOutcome::Ok,
+                    PostgresReadEvent::OperationFinished {
+                        class: PostgresReadClass::Maintenance,
+                        outcome: PostgresReadOutcome::Ok,
                         ..
                     }
                 )

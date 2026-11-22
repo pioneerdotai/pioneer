@@ -25,11 +25,11 @@ use std::sync::Arc;
 
 #[derive(Default)]
 struct ThreadSnapshotWriteObserver {
-    events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    events: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for ThreadSnapshotWriteObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for ThreadSnapshotWriteObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
@@ -43,7 +43,7 @@ async fn thread_list_batches_preserve_order_limit_effort_and_snapshot_metadata()
             let statements = statements.clone();
             move |info| statements.lock().unwrap().push(info.statement.clone())
         });
-        let db = SqliteDatabase::from(connection);
+        let db = PostgresDatabase::from(connection);
         let store = ThreadDisplayStore::new(&db);
         db.execute_unprepared(
             "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_batch','Batch',TRUE,FALSE)"
@@ -252,16 +252,16 @@ async fn thread_list_batches_preserve_order_limit_effort_and_snapshot_metadata()
 
 #[derive(Default)]
 struct ThreadSnapshotReadObserver {
-    events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+    events: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
     enqueued: tokio::sync::Notify,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for ThreadSnapshotReadObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for ThreadSnapshotReadObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.events.lock().unwrap().push(event);
         if matches!(
             event,
-            pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { .. }
+            pioneer_postgres_pools::PostgresReadEvent::AdmissionEnqueued { .. }
         ) {
             self.enqueued.notify_one();
         }
@@ -270,8 +270,9 @@ impl pioneer_sqlite::SqliteReadObserver for ThreadSnapshotReadObserver {
 
 #[pioneer_postgres_test::postgres_test]
 async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_capacity() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+        PostgresWriteExecutor,
     };
     use sea_orm::StreamTrait;
     use std::time::Duration;
@@ -298,9 +299,9 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
     });
     let reads = Arc::new(ThreadSnapshotReadObserver::default());
     let writes = Arc::new(ThreadSnapshotWriteObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, writes.clone()),
+        PostgresWriteExecutor::with_observer(writer, writes.clone()),
         reads.clone(),
     );
     database.validate_reader().await.unwrap();
@@ -310,9 +311,9 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
     let held_writer = database.begin().await.unwrap();
     let mut selected = Vec::new();
     for (store, class) in [
-        (&interactive, SqliteReadClass::Interactive),
-        (&maintenance, SqliteReadClass::Maintenance),
-        (&critical, SqliteReadClass::Maintenance),
+        (&interactive, PostgresReadClass::Interactive),
+        (&maintenance, PostgresReadClass::Maintenance),
+        (&critical, PostgresReadClass::Maintenance),
     ] {
         reader_statements.lock().unwrap().clear();
         writer_statements.lock().unwrap().clear();
@@ -338,20 +339,20 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
         let finished = events
             .iter()
             .filter_map(|event| match event {
-                SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                     Some((*class, *outcome))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(finished, vec![(class, SqliteReadOutcome::Ok); 3]);
-        if class == SqliteReadClass::Maintenance {
+        assert_eq!(finished, vec![(class, PostgresReadOutcome::Ok); 3]);
+        if class == PostgresReadClass::Maintenance {
             assert_eq!(
                 events
                     .iter()
                     .filter(|event| matches!(
                         event,
-                        SqliteReadEvent::AdmissionReleased {
+                        PostgresReadEvent::AdmissionReleased {
                             active: 0,
                             queue_depth: 0,
                             ..
@@ -366,9 +367,9 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
     // Tree task activity uses the same physical readers and scheduling
     // classes, even while the writer is occupied by another operation.
     for (store, class) in [
-        (&interactive, SqliteReadClass::Interactive),
-        (&maintenance, SqliteReadClass::Maintenance),
-        (&critical, SqliteReadClass::Maintenance),
+        (&interactive, PostgresReadClass::Interactive),
+        (&maintenance, PostgresReadClass::Maintenance),
+        (&critical, PostgresReadClass::Maintenance),
     ] {
         reader_statements.lock().unwrap().clear();
         writer_statements.lock().unwrap().clear();
@@ -396,12 +397,12 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
                 .unwrap()
                 .iter()
                 .filter_map(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, outcome, .. } =>
+                    PostgresReadEvent::OperationFinished { class, outcome, .. } =>
                         Some((*class, *outcome)),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![(class, SqliteReadOutcome::Ok)]
+            vec![(class, PostgresReadOutcome::Ok)]
         );
     }
     held_writer.rollback().await.unwrap();
@@ -435,7 +436,7 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
             if reads.events.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::AdmissionEnqueued {
+                    PostgresReadEvent::AdmissionEnqueued {
                         active: 1,
                         queue_depth: 1,
                         ..
@@ -459,8 +460,8 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
         let events = reads.events.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 active: 1,
                 queue_depth: 0,
                 ..
@@ -468,9 +469,9 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
-                outcome: SqliteReadOutcome::Cancelled,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
+                outcome: PostgresReadOutcome::Cancelled,
                 ..
             }
         )));
@@ -502,7 +503,7 @@ async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_c
             .iter()
             .filter(|event| matches!(
                 event,
-                SqliteReadEvent::AdmissionReleased {
+                PostgresReadEvent::AdmissionReleased {
                     active: 0,
                     queue_depth: 0,
                     ..
@@ -797,7 +798,7 @@ async fn member_thread_collection_filters_private_workspace_and_internal_rows_in
                 let statements = statements.clone();
                 move |info| statements.lock().unwrap().push(info.statement.clone())
             });
-            let connection = SqliteDatabase::from(fixture.database.clone());
+            let connection = PostgresDatabase::from(fixture.database.clone());
             let store = ThreadDisplayStore::new(&connection);
             for (principal, workspace, expected) in [
                 (&fixture.member_id, &fixture.red_workspace_id, &member_a_red),
@@ -918,7 +919,7 @@ async fn member_thread_collection_filters_private_workspace_and_internal_rows_in
 #[tokio::test]
 async fn list_threads_for_workspace_includes_latest_turn_marker() {
     pioneer_postgres_test::with_database(async |fixture| {
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, fixture.connection().clone());
         let store = ThreadDisplayStore::new(&db);
         let workspace_id = "ws_000000000000000001";
         let thread_id = "thr_000000000000000003";

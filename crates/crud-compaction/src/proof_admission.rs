@@ -5,7 +5,7 @@ use pioneer_entity::{
     compaction_checkpoint as checkpoint, compaction_operation as operation,
     compaction_runner_plan as plan, compaction_runner_state as runner,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QuerySelect, Statement,
@@ -183,7 +183,7 @@ impl RawAdmissionRead {
 /// New candidate writers already close it in their atomic coverage write set.
 /// This is an immutable portion boundary, not a revision counter: it never
 /// advances on edits, and introduces no new schema/state/publication fence.
-pub async fn freeze_checkpoint(db: &SqliteDatabase, id: &str) -> Result<()> {
+pub async fn freeze_checkpoint(db: &PostgresDatabase, id: &str) -> Result<()> {
     let row = checkpoint_row(db, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint to freeze missing"))?;

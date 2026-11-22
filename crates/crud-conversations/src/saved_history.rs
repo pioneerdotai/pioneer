@@ -255,7 +255,7 @@ pub async fn revision<C: ConnectionTrait>(
 }
 
 pub async fn saved_history_start(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
 ) -> Result<Option<(SavedHistorySnapshot, SavedHistoryKey, String)>> {
     let read = db.begin_read().await?;
@@ -272,7 +272,7 @@ pub async fn saved_history_start(
 }
 
 pub async fn saved_history_input(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     input_id: &str,
 ) -> Result<Option<pioneer_protocol::UserInput>> {

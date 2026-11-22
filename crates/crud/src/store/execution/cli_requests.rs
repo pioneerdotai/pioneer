@@ -24,7 +24,7 @@ impl CrudStore {
         ];
         let cli_result =
             async {
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request create transaction",
                     )?;
@@ -68,7 +68,7 @@ impl CrudStore {
             self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -117,7 +117,7 @@ impl CrudStore {
             self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -256,7 +256,7 @@ impl CrudStore {
             self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction =
                     self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request resolve transaction",
@@ -303,7 +303,7 @@ impl CrudStore {
             self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction =
                     self.connection.begin().await.context(
                         "failed to begin human interaction response acceptance transaction",
@@ -352,7 +352,7 @@ impl CrudStore {
             self.control_work_change("gateway.cli", &control_wakes),
         ];
         let cli_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -404,7 +404,7 @@ impl CrudStore {
         let cli_result =
             async {
                 let request_id = request_id.to_owned();
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request cancel transaction",
                     )?;
@@ -455,7 +455,7 @@ impl CrudStore {
         let cli_result =
             async {
                 let request_id = request_id.to_owned();
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let transaction = self.connection.begin().await.context(
                         "failed to begin CLI runtime pending request expire transaction",
                     )?;

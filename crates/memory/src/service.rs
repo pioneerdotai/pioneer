@@ -4087,10 +4087,9 @@ mod tests {
             .connect_read_only()
             .await
             .expect("open PostgreSQL test reader");
-        let store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-            reader,
-            database.connection().clone(),
-        )));
+        let store = Arc::new(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(reader, database.connection().clone()),
+        ));
         let service = MemoryService::new(
             store.clone(),
             Arc::new(InMemoryMemoryBackend::default()),

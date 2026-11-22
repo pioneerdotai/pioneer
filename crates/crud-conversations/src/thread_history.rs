@@ -2,11 +2,11 @@
 
 use anyhow::{Context, Result};
 use pioneer_entity::thread;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ThreadHistoryEvent, ThreadHistoryEventPayload, ThreadMode,
     constants::events::{TURN_BLOCKED, TURN_COMPLETED, TURN_FAILED, TURN_STARTED},
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{EntityTrait, QuerySelect};
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +24,7 @@ pub struct ThreadHistorySnapshot {
 }
 
 pub async fn get_thread_history(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
     limit_events: Option<u64>,
 ) -> Result<Option<ThreadHistorySnapshot>> {

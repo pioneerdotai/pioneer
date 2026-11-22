@@ -7,17 +7,17 @@ use pioneer_crud_conversations::{
     turn_payload,
 };
 use pioneer_crud_payloads::storage::PreparedPayload;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ItemCompletedNotification, ItemUpdatedNotification, PersistedActorRef, PromptManifest,
     PromptManifestProfile, SandboxMode, ThreadHistoryEventPayload, ToolCallStatus,
     TurnCompletedNotification, TurnItem, TurnStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 
 async fn append(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     sequence: i64,
     seconds: i64,
     event: TurnEventPayload,
@@ -59,7 +59,7 @@ async fn thread_history_decodes_legacy_cli_runtime_codex_manifest_without_losing
              VALUES ('turn', 'thread', 'completed', 'agent');",
             )
             .await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, connection.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, connection.clone());
         let thread = pioneer_entity::thread::Entity::find_by_id("thread")
             .one(connection)
             .await?
@@ -261,7 +261,7 @@ async fn thread_history_never_exposes_retained_turn_llm_context() {
         use pioneer_protocol::ToolOutputPolicySnapshot;
 
         let connection = fixture.connection();
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, connection.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, connection.clone());
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_history_llm_context";
         let thread_id = "thr_history_llm_context";

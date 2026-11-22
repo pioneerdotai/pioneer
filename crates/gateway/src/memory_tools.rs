@@ -3190,7 +3190,7 @@ mod tests {
             );
         }
         assert_eq!(
-            classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")),
+            classify_memory_write_failure(anyhow::anyhow!("lock unavailable (SQLSTATE 55P03)")),
             MemoryWriteFailure::Unclassified
         );
         assert_eq!(
@@ -3208,7 +3208,7 @@ mod tests {
         );
         assert_eq!(
             classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom(
-                "SQLITE_BUSY".into()
+                "SQLSTATE 55P03".into()
             ))),
             MemoryWriteFailure::Unclassified
         );

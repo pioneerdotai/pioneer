@@ -1,13 +1,13 @@
 use super::*;
 use crate::{recovery_store::RecoveryStore, time::unix_to_datetime};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{RecoveryAction, RecoveryJobStatus, RecoveryTrigger};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, EntityTrait, Set, TransactionTrait};
 
 #[tokio::test]
 async fn blocked_tool_recovery_resume_without_snapshot_leaves_turn_blocked() {
     pioneer_postgres_test::with_database(async |fixture| {
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connection().clone(),
         );

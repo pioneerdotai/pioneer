@@ -6,11 +6,11 @@ use crate::values::unix_to_datetime;
 use crate::{task_event, task_result_candidate, task_result_review_event, task_run_turn};
 use anyhow::{Context, Result, bail};
 use pioneer_crud_execution::{execution_admission_lease, native_terminal_effect_outbox};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     TaskEventPayload, TaskResultCandidateStatus, TaskResultReviewDecision,
     TaskResultReviewEventKind, TaskResultReviewerKind, TaskTriggerStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 use std::collections::HashMap;
 
@@ -150,7 +150,7 @@ fn projected_legacy_task_run_turn(event: &TaskEventPayload) -> Option<PreparedLe
 }
 
 pub async fn prepare_task_events_for_write(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     events: Vec<TaskEventPayload>,
 ) -> Result<Vec<task_event::PreparedTaskEvent>> {
     if events.len() > MAX_ATOMIC_TASK_EVENT_BATCH_SIZE {
@@ -226,7 +226,7 @@ pub async fn prepare_task_events_for_write(
     Ok(prepared)
 }
 pub async fn refresh_task_event_preflight(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     events: Vec<task_event::PreparedTaskEvent>,
 ) -> Result<Vec<task_event::PreparedTaskEvent>> {
     let mut refreshed = Vec::with_capacity(events.len());

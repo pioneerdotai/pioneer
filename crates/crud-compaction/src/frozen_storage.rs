@@ -3,7 +3,7 @@
 use crate::frozen_geometry::{PhysicalDeleteResult, duplicate_cleanup_statements};
 use crate::frozen_views::{import, message};
 use anyhow::{Result, ensure};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 
 use crate::frozen_copy::{
     CopyRevisions, StagedCopyCheck, checked_copy_dependencies, lock_copy_headers, span_revision,
@@ -108,7 +108,7 @@ async fn candidate<C: ConnectionTrait>(
 }
 
 pub async fn equivalent(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     owner: &str,
     descriptor: &pioneer_compaction::frozen::FrozenHistoryRef,
@@ -144,7 +144,7 @@ pub async fn equivalent(
 // Register metadata only. Ready manifests and candidate rows are immutable;
 // candidate scope is revalidated when publishing the prepared ranges.
 async fn register(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     h: &history::Model,
     kind: i64,
     base: Option<String>,
@@ -239,7 +239,7 @@ async fn same_import_target<C: ConnectionTrait>(
 /// New captures supply their already-prepared references. Only compare against
 /// a ready range layout; an unconverted old manifest is never borrowed from.
 pub async fn prepare(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     owner: &str,
     id: &str,
@@ -320,7 +320,7 @@ pub async fn prepare(
 /// Flatten a prefix to physical ranges. Incomplete range copies are invisible;
 /// each batch is restart-safe. A constant-size transaction publishes the layout.
 async fn publish(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     h: &history::Model,
     l: &layout::Model,
     prefix: i64,
@@ -648,7 +648,7 @@ pub struct FrozenConversionProgress {
 /// One resumable maintenance quantum; a corrupt manifest is quarantined so it
 /// cannot prevent subsequent manifests from being converted.
 pub async fn maintain(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     progress: &mut FrozenConversionProgress,
     target_manifests: Option<&[String]>,
 ) -> Result<(bool, Option<(i64, PhysicalDeleteResult)>)> {
@@ -815,7 +815,7 @@ pub async fn maintain(
 }
 
 async fn maintain_layout(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     l: &layout::Model,
     verified: Option<CopyRevisions>,
 ) -> Result<Option<PhysicalDeleteResult>> {

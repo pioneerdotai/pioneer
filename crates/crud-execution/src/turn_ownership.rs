@@ -1,21 +1,21 @@
 //! Durable ownership and activation fences for native execution.
 use crate::execution_heartbeat::Registries;
 use crate::gateway_control::{GatewayControlWake, control_work_change};
-use crate::retry::run_serialized_write;
+use crate::retry::retry_write_on_conflict;
 use crate::time::{unix_to_datetime, utc_now};
 use crate::turn_execution::{self, TurnExecutionRecord};
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::projection_receipts::has_accepted_terminal;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::TransactionTrait;
 
 pub struct TurnOwnership<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
     execution_heartbeats: &'a Registries,
 }
 
 impl<'a> TurnOwnership<'a> {
-    pub fn new(connection: &'a SqliteDatabase, execution_heartbeats: &'a Registries) -> Self {
+    pub fn new(connection: &'a PostgresDatabase, execution_heartbeats: &'a Registries) -> Self {
         Self {
             connection,
             execution_heartbeats,
@@ -31,7 +31,7 @@ impl<'a> TurnOwnership<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 if has_accepted_terminal(&tx, &expected.turn_id).await? {
                     return Ok(false);
@@ -67,7 +67,7 @@ impl<'a> TurnOwnership<'a> {
         let control_change =
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 let Some(current) = turn_execution::find(&tx, &expected.turn_id).await? else {
                     return Ok(false);
@@ -113,7 +113,7 @@ impl<'a> TurnOwnership<'a> {
         let control_result = async {
             let turn_id = turn_id.to_owned();
             let owner_id = owner_id.to_owned();
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 turn_execution::mark_running_owned(
                     self.connection,
                     turn_id.as_str(),
@@ -136,7 +136,7 @@ impl<'a> TurnOwnership<'a> {
         &self,
         expected: &TurnExecutionRecord,
     ) -> Result<bool> {
-        run_serialized_write(|| async {
+        retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             if has_accepted_terminal(&tx, &expected.turn_id).await? {
                 return Ok(false);
@@ -188,7 +188,7 @@ impl<'a> TurnOwnership<'a> {
             let _ownership_change = self.execution_heartbeats.changing(new_owner_id);
             let expected = expected.clone();
             let new_owner_id = new_owner_id.to_owned();
-            run_serialized_write(|| async {
+            retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()
@@ -233,7 +233,7 @@ impl<'a> TurnOwnership<'a> {
             "gateway.control",
             &[GatewayControlWake::Resources],
         );
-        let result = run_serialized_write(|| async {
+        let result = retry_write_on_conflict(|| async {
             let transaction = self.connection.begin().await?;
             let changed = crate::agent_execution::record_agent_execution_progress(
                 &transaction,

@@ -854,7 +854,7 @@ impl NodePreparation {
             if !self.scan.done() {
                 if let Some(proof) = self.scan.step(store).await? {
                     store
-                        .run_serialized_write(|| stage_import(&store.connection, &proof))
+                        .retry_write_on_conflict(|| stage_import(&store.connection, &proof))
                         .await?;
                 }
                 return Ok(());
@@ -865,14 +865,18 @@ impl NodePreparation {
         }
         if let Some(alias) = self.aliases.front() {
             store
-                .run_serialized_write(|| stage_alias(&store.connection, &self.scan.row.id, alias))
+                .retry_write_on_conflict(|| {
+                    stage_alias(&store.connection, &self.scan.row.id, alias)
+                })
                 .await?;
             self.aliases.pop_front();
             return Ok(());
         }
         if let Some(event) = self.events.front() {
             store
-                .run_serialized_write(|| stage_event(&store.connection, &self.scan.row.id, event))
+                .retry_write_on_conflict(|| {
+                    stage_event(&store.connection, &self.scan.row.id, event)
+                })
                 .await?;
             self.events.pop_front();
             return Ok(());
@@ -1005,7 +1009,7 @@ impl NodePreparation {
             })
             .collect::<BTreeSet<_>>();
         store
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 #[cfg(any(test, feature = "test-support"))]
                 let _writer = PublicationWriterTestGuard::enter_seal(&row.operation_id);
                 let tx = store.connection.begin().await?;
@@ -1653,7 +1657,10 @@ mod tests {
             db.execute_unprepared(sql).await.unwrap();
         }
         CompactionStore::new(
-            pioneer_sqlite::SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), db),
+            pioneer_postgres_pools::PostgresDatabase::new(
+                fixture.connect_read_only().await.unwrap(),
+                db,
+            ),
             Default::default(),
         )
     }
@@ -1874,7 +1881,7 @@ pub struct CheckpointProjectionPageTestRead {
 pub struct CheckpointProjectionPageTestObserver {
     key: (usize, String),
     token: std::sync::Arc<()>,
-    _database: pioneer_sqlite::SqliteDatabase,
+    _database: pioneer_postgres_pools::PostgresDatabase,
     reads: std::sync::Arc<std::sync::Mutex<Vec<CheckpointProjectionPageTestRead>>>,
 }
 
@@ -1905,7 +1912,7 @@ impl Drop for CheckpointProjectionPageTestObserver {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn observe_checkpoint_projection_page_test_reads(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     manifest: &str,
 ) -> CheckpointProjectionPageTestObserver {
     let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1951,7 +1958,7 @@ fn checkpoint_projection_page_test_observers() -> &'static CheckpointProjectionP
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn record_checkpoint_projection_page_test_read(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     manifest: &str,
     start: i64,
     end: i64,
@@ -1981,7 +1988,7 @@ pub fn record_checkpoint_projection_page_test_read(
 pub struct CheckpointProjectionPageTestHook {
     key: (usize, String),
     token: std::sync::Arc<()>,
-    _database: pioneer_sqlite::SqliteDatabase,
+    _database: pioneer_postgres_pools::PostgresDatabase,
     reached: Option<tokio::sync::oneshot::Receiver<()>>,
     release: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -2027,7 +2034,7 @@ impl Drop for CheckpointProjectionPageTestHook {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn arm_checkpoint_projection_page_test_hook(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     manifest: &str,
 ) -> CheckpointProjectionPageTestHook {
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
@@ -2072,7 +2079,7 @@ fn checkpoint_projection_page_test_hooks() -> &'static std::sync::Mutex<
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn checkpoint_projection_page_test_pause(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     manifest: &str,
 ) {
     let key = (database.runtime_identity(), manifest.to_owned());

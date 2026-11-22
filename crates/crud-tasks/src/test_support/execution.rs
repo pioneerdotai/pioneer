@@ -13,12 +13,12 @@ use pioneer_crud_execution::{
     recovery_job::RecoveryJobRecord,
     recovery_store::RecoveryStore,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     RecoveryAction, RecoveryJobStatus, RecoveryTrigger, Task, TaskEventPayload, TaskExecutorKind,
     TaskOccurrenceContract, TaskOccurrenceStatus, TaskRun, TaskRunExecutionStatus, TaskRunStatus,
     TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus, TaskStatus, TurnItemType,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set, Statement,
     TransactionTrait,
@@ -26,7 +26,7 @@ use sea_orm::{
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-pub async fn ensure_test_agent_identity(db: &SqliteDatabase, workspace_id: &str, timestamp: i64) {
+pub async fn ensure_test_agent_identity(db: &PostgresDatabase, workspace_id: &str, timestamp: i64) {
     let now = unix_to_datetime(timestamp);
     ensure_pioneer_for_workspace(db, workspace_id, now.clone())
         .await
@@ -34,7 +34,7 @@ pub async fn ensure_test_agent_identity(db: &SqliteDatabase, workspace_id: &str,
 }
 
 pub async fn attach_test_agent_execution_contract(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     task_id: &str,
     run_id: &str,
@@ -181,7 +181,11 @@ pub(crate) async fn drain_custom_publisher_fanout(
     delivered
 }
 
-pub(crate) async fn seed_task_resume_thread(db: &SqliteDatabase, workspace: &str, thread_id: &str) {
+pub(crate) async fn seed_task_resume_thread(
+    db: &PostgresDatabase,
+    workspace: &str,
+    thread_id: &str,
+) {
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_by_actor_kind)
@@ -193,7 +197,7 @@ pub(crate) async fn seed_task_resume_thread(db: &SqliteDatabase, workspace: &str
 }
 
 pub async fn seed_task_owned_resume_conflict(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     suffix: &str,
 ) -> (Task, TaskRun, RecoveryJobRecord, String, String) {

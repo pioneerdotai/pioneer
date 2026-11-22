@@ -5,7 +5,7 @@ use pioneer_entity::{
     cli_runtime_native_event as event, native_event_cleanup_job as job,
     native_event_cleanup_scheduler as scheduler,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -90,23 +90,23 @@ fn bounded_ids(rows: Vec<Candidate>) -> (Vec<String>, i64) {
     }
     (ids, bytes)
 }
-pub async fn run_quantum(db: &SqliteDatabase) -> Result<NativeEventCleanupMetrics> {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
-    if db.read_class() != SqliteReadClass::Maintenance
-        || db.write_class() != SqliteWriteClass::Maintenance
+pub async fn run_quantum(db: &PostgresDatabase) -> Result<NativeEventCleanupMetrics> {
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
+    if db.read_class() != PostgresReadClass::Maintenance
+        || db.write_class() != PostgresWriteClass::Maintenance
     {
         anyhow::bail!("background database quantum requires maintenance-scoped reads and writes");
     }
-    pioneer_sqlite::retry_with_backoff(
+    pioneer_postgres_pools::retry_with_backoff(
         || run(db, chrono::Utc::now().timestamp_micros()),
-        pioneer_sqlite::is_retryable_database_conflict,
-        pioneer_sqlite::DEFAULT_LOCK_RETRY_ATTEMPTS,
-        std::time::Duration::from_millis(pioneer_sqlite::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        pioneer_postgres_pools::is_retryable_database_conflict,
+        pioneer_postgres_pools::DEFAULT_LOCK_RETRY_ATTEMPTS,
+        std::time::Duration::from_millis(pioneer_postgres_pools::DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
     )
     .await
 }
 
-pub async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventCleanupMetrics> {
+pub async fn run(db: &PostgresDatabase, now: i64) -> Result<NativeEventCleanupMetrics> {
     let now = std::cmp::max(now, 1);
     let started = Instant::now();
     let mut metrics = NativeEventCleanupMetrics {
@@ -157,7 +157,7 @@ pub async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventCleanupMetr
     Ok(metrics)
 }
 async fn defer(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     turn: &str,
     now: i64,
     reason: &str,
@@ -183,7 +183,7 @@ async fn defer(
     Ok(())
 }
 async fn apply(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     prepared: &Prepared,
     now: i64,
     metrics: &mut NativeEventCleanupMetrics,

@@ -1,6 +1,6 @@
 use super::*;
 
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 const LEGACY_ACCEPTED_IMPORT_CURRENT_SQL: &str = r#"
@@ -43,7 +43,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn db(&self) -> SqliteDatabase {
+    fn db(&self) -> PostgresDatabase {
         self.store.database_connection()
     }
 }
@@ -53,7 +53,7 @@ async fn fixture() -> Fixture {
     let reader = fixture.connect_read_only().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let store =
-        CompactionStore::for_test(SqliteDatabase::new(reader, writer)).with_maintenance_access();
+        CompactionStore::for_test(PostgresDatabase::new(reader, writer)).with_maintenance_access();
     let db = store.database_connection();
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
@@ -173,11 +173,11 @@ fn canonical_branches() -> Vec<CanonicalBranch> {
     ]
 }
 
-async fn install_canonical_sources(db: &SqliteDatabase) {
+async fn install_canonical_sources(db: &PostgresDatabase) {
     install_canonical_sources_with_storage(db, false).await;
 }
 
-async fn install_canonical_sources_with_storage(db: &SqliteDatabase, compressed: bool) {
+async fn install_canonical_sources_with_storage(db: &PostgresDatabase, compressed: bool) {
     use pioneer_crud_conversations::{turn_event, turn_item};
     use pioneer_crud_payloads::storage::PreparedPayload;
     for source in canonical_branches() {
@@ -233,7 +233,7 @@ async fn install_canonical_sources_with_storage(db: &SqliteDatabase, compressed:
     }
 }
 
-async fn install_checkpoint_and_task_basis(db: &SqliteDatabase) {
+async fn install_checkpoint_and_task_basis(db: &PostgresDatabase) {
     for sql in [
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,2,'succeeded','agent')",
         "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','source-thread','checkpoint-owner',1)",
@@ -339,7 +339,7 @@ async fn install_manifest(
     prepared(store, manifest, source.clone()).await
 }
 
-async fn update_import_field(db: &SqliteDatabase, manifest: &str, column: &str, value: &str) {
+async fn update_import_field(db: &PostgresDatabase, manifest: &str, column: &str, value: &str) {
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Postgres,
         format!("UPDATE compaction_frozen_import_data SET {column}=$1 WHERE manifest_id=$2"),
@@ -350,7 +350,7 @@ async fn update_import_field(db: &SqliteDatabase, manifest: &str, column: &str, 
 }
 
 async fn assert_matches_oracle(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     prepared: &PreparedFrozenImport,
     expected: bool,
     case: &str,
@@ -391,7 +391,7 @@ async fn assert_matches_oracle(
     snapshot.rollback().await.unwrap();
 }
 
-async fn set_branch_workspace(db: &SqliteDatabase, branch: &Branch, workspace: &str) {
+async fn set_branch_workspace(db: &PostgresDatabase, branch: &Branch, workspace: &str) {
     match branch.name {
         "context" | "item" | "event" | "input" => {
             db.execute_raw(Statement::from_sql_and_values(

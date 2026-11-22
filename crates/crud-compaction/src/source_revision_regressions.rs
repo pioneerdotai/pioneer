@@ -2,7 +2,7 @@ use crate::{
     canonical_history::PagedSource, plan_test_support::seed_revision_fixture,
     store::CompactionStore,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, Statement};
 
 async fn scalar(store: &CompactionStore, sql: &str) -> i64 {
@@ -26,7 +26,7 @@ async fn canonical_revisions_preserve_independent_edits_deletes_and_compressed_s
     seed_revision_fixture(fixture.connection(), true).await;
     let reader = fixture.connect_read_only().await.unwrap();
     let store =
-        CompactionStore::for_test(SqliteDatabase::new(reader, fixture.connection().clone()));
+        CompactionStore::for_test(PostgresDatabase::new(reader, fixture.connection().clone()));
     writer
         .execute_unprepared(
             "UPDATE turn_input SET payload='{\"edited\":true}' WHERE id='input-250'",

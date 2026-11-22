@@ -226,11 +226,11 @@ fn validate_task_record(record: &pioneer_crud::ActiveTaskExecutionAuthorityRecor
 #[cfg(test)]
 mod tests {
     use pioneer_crud::CrudStore;
+    use pioneer_postgres_pools::PostgresDatabase;
     use pioneer_protocol::{
         SandboxMode, TaskStatus, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnStatus, default_turn_permission_profile_snapshot,
     };
-    use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{ConnectionTrait, EntityTrait, Set};
 
     use super::{QUARANTINE_REASON, run_with_batch_size};
@@ -255,7 +255,7 @@ mod tests {
         .await
         .expect("workspace should insert");
 
-        let store = CrudStore::new(SqliteDatabase::new(
+        let store = CrudStore::new(PostgresDatabase::new(
             database.connect_read_only().await?,
             connection.clone(),
         ));

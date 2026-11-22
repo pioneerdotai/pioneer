@@ -1,4 +1,4 @@
-use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
+use crate::patch_history_observer::{PostgresPatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result};
 use pioneer_agent::{
     AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
@@ -4244,7 +4244,7 @@ impl McpService {
                     );
                 }
             };
-            Some(Arc::new(SqlitePatchObserver::new(
+            Some(Arc::new(PostgresPatchObserver::new(
                 self.inner.crud_store.database_connection(),
                 identity.clone(),
                 admission_permit,

@@ -14,10 +14,7 @@ fn assert_typed_diagnostic(error: DbErr, code: &str, class: HookRunStoreCauseCla
         let safe = append_audit_error(error);
         assert_eq!(
             safe.diagnostic(),
-            HookRunStoreDiagnostic {
-                cause_class: class,
-                ..Default::default()
-            }
+            HookRunStoreDiagnostic { cause_class: class }
         );
         for canary in [
             "SQL_CANARY",

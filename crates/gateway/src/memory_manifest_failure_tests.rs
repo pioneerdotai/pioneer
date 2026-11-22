@@ -101,13 +101,13 @@ async fn manifest_constraint_text_and_unscoped_json_are_not_transient() -> anyho
 struct OtherDatabase;
 impl std::fmt::Display for OtherDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SQLite BUSY SQL secret")
+        f.write_str("PostgreSQL lock unavailable SQL secret")
     }
 }
 impl std::error::Error for OtherDatabase {}
 impl sea_orm::sqlx::error::DatabaseError for OtherDatabase {
     fn message(&self) -> &str {
-        "SQLite BUSY SQL secret"
+        "PostgreSQL lock unavailable SQL secret"
     }
     fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
         Some("55P03".into())

@@ -55,7 +55,7 @@ async fn exercise_gateway_gate(
 }
 
 async fn test_store(database: &TestDatabase) -> pioneer_crud::CrudStore {
-    pioneer_crud::CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+    pioneer_crud::CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         database.connect_read_only().await.unwrap(),
         database.connection().clone(),
     ))

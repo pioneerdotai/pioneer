@@ -1953,7 +1953,7 @@ mod task_child_failure_tests {
                     TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Policy)
                         .with_correlation_id("existing-correlation".to_owned()),
                 )
-                .context("PRIVATE_SQL_PATH_HISTORY_SECRET unable to open database file"),
+                .context("PRIVATE_SQL_PATH_HISTORY_SECRET PostgreSQL connection failed"),
             );
             assert!(!batch.retry_transient_storage_access());
             let display = format!("{batch}");

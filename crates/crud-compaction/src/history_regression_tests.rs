@@ -30,8 +30,10 @@ async fn store_recording_statements(statements: Option<RecordedStatements>) -> C
             statements.lock().unwrap().push(info.statement.clone());
         });
     }
-    let store = CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(reader, writer))
-        .with_maintenance_access();
+    let store = CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(
+        reader, writer,
+    ))
+    .with_maintenance_access();
     let db = store.database_connection();
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',TRUE,FALSE)",
@@ -430,8 +432,8 @@ async fn cancellation_releases_writer_and_reader_is_physically_read_only() {
         })
         .await
         .unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer);
+    assert!(database.reader_is_read_only().await.unwrap());
     let store = CompactionStore::for_test(database.clone()).with_maintenance_access();
     let hold = database.begin().await.unwrap();
     assert!(
@@ -456,7 +458,7 @@ async fn cancellation_releases_writer_and_reader_is_physically_read_only() {
     .await
     .unwrap()
     .unwrap();
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     database.close().await.unwrap();
 }
 

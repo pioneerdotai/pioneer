@@ -634,7 +634,7 @@ async fn preview_history_replay(format_version: u32) {
             .filter(|event| {
                 matches!(
                     event,
-                    pioneer_sqlite::SqliteReadEvent::AdmissionAcquired { .. }
+                    pioneer_postgres_pools::PostgresReadEvent::AdmissionAcquired { .. }
                 )
             })
             .count();
@@ -643,7 +643,7 @@ async fn preview_history_replay(format_version: u32) {
             .filter(|event| {
                 matches!(
                     event,
-                    pioneer_sqlite::SqliteReadEvent::AdmissionReleased { .. }
+                    pioneer_postgres_pools::PostgresReadEvent::AdmissionReleased { .. }
                 )
             })
             .count();
@@ -654,11 +654,21 @@ async fn preview_history_replay(format_version: u32) {
         let writes = database_observer.writes();
         let acquired = writes
             .iter()
-            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_postgres_pools::PostgresWriteEvent::Acquired { .. }
+                )
+            })
             .count();
         let released = writes
             .iter()
-            .filter(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Released { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    pioneer_postgres_pools::PostgresWriteEvent::Released { .. }
+                )
+            })
             .count();
         assert_eq!(
             acquired, released,

@@ -1,6 +1,6 @@
 use pioneer_crud_access::authorization_scope::list_running_task_scopes;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::PrincipalId;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 use std::sync::{
     Arc,
@@ -37,7 +37,7 @@ async fn tree_task_activity_is_a_bounded_read_without_history_or_conversation_st
                 counter.fetch_add(1, Ordering::Relaxed);
             });
         }
-        let db = SqliteDatabase::new(reader, writer);
+        let db = PostgresDatabase::new(reader, writer);
         let principal = PrincipalId::new("P00000000000000000001").unwrap();
         counter.store(0, Ordering::Relaxed);
         let page = list_running_task_scopes(

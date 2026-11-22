@@ -20,6 +20,7 @@ use pioneer_crud::{
     principal_status_from_db, record_failed_device_activation, replace_current_refresh,
     revoke_session_family_for_refresh_reuse, touch_active_auth_session, touch_active_device,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthDeviceActivateParams, AuthDeviceCreateResponse, AuthDeviceSnapshot,
     AuthGatewaySnapshot, AuthLogoutResponse, AuthMeResponse, AuthPrincipalSnapshot,
@@ -31,8 +32,7 @@ use pioneer_protocol::{
     DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
     RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
-use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
@@ -60,7 +60,7 @@ const MAX_DIAGNOSTIC_TEXT: usize = 255;
 const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// The startup owner joins this worker before closing SQLite. Dropping startup
+/// The startup owner joins this worker before closing PostgreSQL. Dropping startup
 /// on an error also cancels it; an indefinitely parked Weak worker cannot leak.
 pub(crate) struct AuthMaintenanceGuard {
     cancellation: tokio_util::sync::CancellationToken,
@@ -86,7 +86,7 @@ impl Drop for AuthMaintenanceGuard {
 }
 
 pub(crate) struct GatewayAuthService {
-    database: SqliteDatabase,
+    database: PostgresDatabase,
     config: GatewayAuthConfig,
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
@@ -198,7 +198,7 @@ fn typed_id<T, E>(
 
 impl GatewayAuthService {
     pub(crate) fn new(
-        database: impl Into<SqliteDatabase>,
+        database: impl Into<PostgresDatabase>,
         config: GatewayAuthConfig,
         identity: Arc<IdentityBootstrapSnapshot>,
         access_key: &AuthKeyMaterial,
@@ -282,10 +282,7 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(refresh_transaction_acquire_error)?;
         transaction_acquire_stage.succeed();
@@ -717,10 +714,7 @@ impl GatewayAuthService {
         let now = chrono::Utc::now().fixed_offset();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -844,7 +838,7 @@ impl GatewayAuthService {
     pub(crate) async fn validate_session_lease_with_database(
         &self,
         principal: &AuthenticatedSessionPrincipal,
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<SessionLeaseFacts, AuthError> {
         self.validate_session_lease_in_scope(principal, None, database)
             .await
@@ -853,7 +847,7 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<SessionLeaseFacts, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -873,7 +867,7 @@ impl GatewayAuthService {
     pub(crate) async fn load_notification_session_leases(
         &self,
         session_ids: &[AuthSessionId],
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<std::collections::HashMap<String, AuthSessionLeaseRow>, AuthError> {
         let rows = load_session_leases(database, session_ids)
             .await
@@ -1042,10 +1036,7 @@ impl GatewayAuthService {
         let now = datetime(now_unix)?;
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|error| storage_error(error.into()))?;
 
@@ -1177,10 +1168,7 @@ impl GatewayAuthService {
     ) -> Result<u64, AuthError> {
         let database = self.database.maintenance();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expired = match expire_stale_pending_sessions(
@@ -1212,10 +1200,7 @@ impl GatewayAuthService {
     ) -> Result<u64, AuthError> {
         let database = self.database.maintenance();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expired =
@@ -1392,10 +1377,7 @@ impl GatewayAuthService {
         self.validate_session_lease(current).await?;
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -1584,10 +1566,7 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -2068,10 +2047,7 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let exact_session =
@@ -2836,7 +2812,7 @@ fn storage_error(_error: anyhow::Error) -> AuthError {
 
 fn refresh_transaction_acquire_error(error: sea_orm::DbErr) -> AuthError {
     let error = anyhow::Error::new(error);
-    if pioneer_sqlite::is_anyhow_database_transient_access(&error) {
+    if pioneer_postgres_pools::is_anyhow_database_transient_access(&error) {
         AuthError::new(AuthErrorCode::TemporarilyUnavailable)
     } else {
         AuthError::new(AuthErrorCode::InvalidCredential)
@@ -4196,7 +4172,7 @@ mod tests {
                 })
                 .chain(futures_util::stream::pending()),
             );
-            // A real transaction owns the serialized writer at frame admission.
+            // A real write transaction is open at frame admission.
             // The signal controls this synthetic RPC's next poll/commit boundary;
             // no database capacity survives into the outbound acknowledgement.
             let transaction = service.database.begin().await.unwrap();
@@ -4695,19 +4671,19 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct LeaseReadObserver(Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>);
+    struct LeaseReadObserver(Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>);
 
-    impl pioneer_sqlite::SqliteReadObserver for LeaseReadObserver {
-        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+    impl pioneer_postgres_pools::PostgresReadObserver for LeaseReadObserver {
+        fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
             self.0.lock().unwrap().push(event);
         }
     }
 
     #[tokio::test]
-    async fn lease_reads_one_statement_on_the_callers_scoped_query_only_reader() {
+    async fn lease_reads_one_statement_on_the_callers_scoped_read_only_reader() {
         pioneer_postgres_test::with_database(async |test_database| {
-            use pioneer_sqlite::{
-                SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+            use pioneer_postgres_pools::{
+                PostgresReadClass, PostgresReadEvent, PostgresReadOutcome, PostgresWriteExecutor,
             };
             use sea_orm::ConnectOptions;
             let writer = test_database.connection().clone();
@@ -4729,9 +4705,9 @@ mod tests {
                 });
             let reader = Database::connect(options).await.unwrap();
             let observer = Arc::new(LeaseReadObserver::default());
-            service.database = SqliteDatabase::from_executor_with_read_observer(
+            service.database = PostgresDatabase::from_executor_with_read_observer(
                 reader,
-                SqliteWriteExecutor::new(writer),
+                PostgresWriteExecutor::new(writer),
                 observer.clone(),
             )
             .with_critical_writes();
@@ -4760,7 +4736,7 @@ mod tests {
                 let operations: Vec<_> = events
                     .iter()
                     .filter_map(|event| match event {
-                        SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                             Some((*class, *outcome))
                         }
                         _ => None,
@@ -4768,13 +4744,13 @@ mod tests {
                     .collect();
                 assert_eq!(
                     operations,
-                    vec![(scope.read_class(), SqliteReadOutcome::Ok)]
+                    vec![(scope.read_class(), PostgresReadOutcome::Ok)]
                 );
-                if scope.read_class() == SqliteReadClass::Maintenance {
+                if scope.read_class() == PostgresReadClass::Maintenance {
                     assert!(events.iter().any(|event| matches!(
                         event,
-                        SqliteReadEvent::AdmissionReleased {
-                            class: SqliteReadClass::Maintenance,
+                        PostgresReadEvent::AdmissionReleased {
+                            class: PostgresReadClass::Maintenance,
                             active: 0,
                             ..
                         }
@@ -4793,7 +4769,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+                    .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
                     .count(),
                 2
             );

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{native_terminal_effect_outbox, task_result_candidate, thread, turn};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     NativeTerminalEffectGate, NativeTerminalEffectKind, NativeTerminalEffectPayload,
     NativeTerminalEffectPreparation, NativeTerminalEffectSpec,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait, LockType};
 use sea_orm::{
@@ -1326,7 +1326,7 @@ fn probe_snapshot(row: &native_terminal_effect_outbox::Model) -> Condition {
 /// Also used after failed reservation/commit: only the original snapshot may
 /// be deferred, including NULL token. A committed reservation won't match it.
 pub async fn reserve_gate_probe(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     token: Option<String>,
     clock: &(dyn Fn() -> i64 + Send + Sync),
@@ -1345,7 +1345,7 @@ pub async fn reserve_gate_probe(
 }
 
 pub async fn defer_gate_probe(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     reservation_committed: bool,
     clock: &(dyn Fn() -> i64 + Send + Sync),
@@ -1369,7 +1369,7 @@ pub async fn defer_gate_probe(
 }
 
 async fn write_gate_probe(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     token: Option<String>,
     attempts: i64,
@@ -1420,7 +1420,7 @@ async fn write_gate_probe(
 }
 
 pub async fn probe_waiting_gate(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     clock: &(dyn Fn() -> i64 + Send + Sync),
 ) -> Result<u64> {
@@ -1471,7 +1471,7 @@ pub async fn probe_waiting_gate(
 }
 
 pub async fn discover_gate_probes(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     now: i64,
     limit: u64,
 ) -> Result<Vec<native_terminal_effect_outbox::Model>> {
@@ -1542,7 +1542,7 @@ pub async fn next_execution_deadline<C: ConnectionTrait>(db: &C) -> Result<Optio
 }
 
 pub async fn claim_due<F: FnMut() -> String>(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     discovery_now: DateTimeWithTimeZone,
     claim_lease_secs: u64,
     limit: u64,
@@ -1647,7 +1647,7 @@ fn execution_snapshot(row: &native_terminal_effect_outbox::Model) -> Condition {
 }
 
 async fn claim_one(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     token: String,
     claim_lease_secs: u64,
@@ -1739,7 +1739,7 @@ async fn claim_one(
 }
 
 pub async fn defer_execution_claim(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     row: &native_terminal_effect_outbox::Model,
     clock: &(dyn Fn() -> i64 + Send + Sync),
 ) -> Result<bool> {
@@ -1909,8 +1909,8 @@ pub async fn store_handler_checkpoint<C: ConnectionTrait>(
     if checkpoint_json.len() > MAX_EFFECT_HANDLER_CHECKPOINT_BYTES {
         bail!("native terminal-effect handler checkpoint exceeds its durable byte limit");
     }
-    // Pure preparation precedes SqliteDatabase's statement-scoped writer.
-    // CrudStore's run_serialized_write is a lock-retry wrapper, not a reservation.
+    // Pure preparation precedes PostgresDatabase's statement-scoped writer.
+    // CrudStore's retry_write_on_conflict is a lock-retry wrapper, not a reservation.
     let checkpoint_sha256 = payload_sha256_hex(checkpoint_json);
     let updated = native_terminal_effect_outbox::Entity::update_many()
         .col_expr(
@@ -1948,7 +1948,7 @@ pub async fn store_handler_checkpoint<C: ConnectionTrait>(
 }
 
 pub async fn mark_failed(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     effect_id: &str,
     claim_token: &str,
     error_code: &str,
@@ -2518,7 +2518,7 @@ pub struct NativeTerminalEffectStatusRecord {
 }
 
 pub async fn claim_records(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     now_unix: i64,
     claim_lease_secs: u64,
     limit: u64,
@@ -2727,7 +2727,7 @@ pub async fn claim_records(
 }
 
 pub async fn load_status(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     effect_id: &str,
 ) -> Result<Option<NativeTerminalEffectStatusRecord>> {
     let row = native_terminal_effect_outbox::Entity::find_by_id(effect_id.to_owned())
@@ -2859,7 +2859,7 @@ mod tests {
             let workspace_id = "ws_terminal_effect_malformed";
             let thread_id = "thr_terminal_effect_malformed";
             let turn_id = "turn_terminal_effect_malformed";
-            let db = SqliteDatabase::new(
+            let db = PostgresDatabase::new(
                 fixture.connect_read_only().await?,
                 fixture.connection().clone(),
             );
@@ -2969,7 +2969,7 @@ mod tests {
     async fn native_terminal_effect_handler_checkpoint_is_bounded_immutable_and_claim_fenced()
     -> Result<()> {
         with_database(async |fixture| {
-            let storage = SqliteDatabase::from(fixture.connection().clone());
+            let storage = PostgresDatabase::from(fixture.connection().clone());
             let db = &storage;
             let timestamp = 1_700_003_000;
             let turn_id = "checkpoint-turn";

@@ -574,11 +574,11 @@ async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_ack
         }
         assert_eq!(
             store.database_connection().read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             store.database_connection().write_class(),
-            pioneer_sqlite::SqliteWriteClass::Maintenance
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance
         );
     }
 }
@@ -1055,9 +1055,9 @@ async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes
 
 #[pioneer_postgres_test::postgres_test]
 async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() {
-    use pioneer_sqlite::{
-        SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteEvent,
-        SqliteWriteObserver,
+    use pioneer_postgres_pools::{
+        PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresReadOutcome,
+        PostgresWriteEvent, PostgresWriteObserver,
     };
     use sea_orm::StreamTrait;
     use std::{
@@ -1066,16 +1066,16 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     };
     #[derive(Default)]
     struct Observer {
-        reads: Mutex<Vec<SqliteReadEvent>>,
-        writes: Mutex<Vec<SqliteWriteEvent>>,
+        reads: Mutex<Vec<PostgresReadEvent>>,
+        writes: Mutex<Vec<PostgresWriteEvent>>,
         queued: tokio::sync::Notify,
     }
-    impl SqliteReadObserver for Observer {
-        fn observe(&self, event: SqliteReadEvent) {
+    impl PostgresReadObserver for Observer {
+        fn observe(&self, event: PostgresReadEvent) {
             self.reads.lock().unwrap().push(event);
             if matches!(
                 event,
-                SqliteReadEvent::AdmissionEnqueued {
+                PostgresReadEvent::AdmissionEnqueued {
                     queue_depth: 1,
                     active: 1,
                     ..
@@ -1085,8 +1085,8 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
             }
         }
     }
-    impl SqliteWriteObserver for Observer {
-        fn observe(&self, event: SqliteWriteEvent) {
+    impl PostgresWriteObserver for Observer {
+        fn observe(&self, event: PostgresWriteEvent) {
             self.writes.lock().unwrap().push(event);
         }
     }
@@ -1102,9 +1102,9 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     let reader = fixture.connect_read_only().await.unwrap();
     let reader_proof = reader.clone();
     let observer = Arc::new(Observer::default());
-    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+    let database = pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
         reader,
-        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let interactive = CompactionStore::for_test(database.clone());
@@ -1158,7 +1158,7 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     assert!(waiting.await.unwrap_err().is_cancelled());
     assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionCancelled {
+        PostgresReadEvent::AdmissionCancelled {
             queue_depth: 0,
             active: 1,
             ..
@@ -1179,14 +1179,17 @@ async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() 
     .unwrap();
     assert_eq!(resumed, page);
     let reads = observer.reads.lock().unwrap().clone();
-    for class in [SqliteReadClass::Interactive, SqliteReadClass::Maintenance] {
+    for class in [
+        PostgresReadClass::Interactive,
+        PostgresReadClass::Maintenance,
+    ] {
         assert_eq!(reads.iter().filter(|event| matches!(event,
-            SqliteReadEvent::OperationFinished { class: actual, outcome: SqliteReadOutcome::Ok, .. } if *actual == class
+            PostgresReadEvent::OperationFinished { class: actual, outcome: PostgresReadOutcome::Ok, .. } if *actual == class
         )).count(), 2);
     }
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::AdmissionReleased {
+        PostgresReadEvent::AdmissionReleased {
             queue_depth: 0,
             active: 0,
             ..

@@ -841,16 +841,16 @@ async fn concurrent_failure_reuses_one_retry_and_does_not_finalize_the_occurrenc
 #[tokio::test]
 async fn terminal_preparation_and_commit_keep_maintenance_reads_and_critical_writer_scope() {
     pioneer_postgres_test::with_database(async |database| {
-        use pioneer_sqlite::{
-            SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteExecutor,
+        use pioneer_postgres_pools::{
+            PostgresDatabase, PostgresReadClass, PostgresWriteClass, PostgresWriteExecutor,
         };
         let writer = database.connect_with_limit(1).await.unwrap();
         let reader = database.connect_read_only().await.unwrap();
         seed_postgres_task_fixture(&writer).await;
         let observer = Arc::new(DispatchDatabaseObserver::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         let (runtime, run, _, result) =
@@ -878,7 +878,7 @@ async fn terminal_preparation_and_commit_keep_maintenance_reads_and_critical_wri
             1,
             "the whole batch must use one writer transaction"
         );
-        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Critical);
+        observer.assert_scope(PostgresReadClass::Maintenance, PostgresWriteClass::Critical);
         let retry = store
             .prepare_task_terminal_transition(completed(&run, &result, run.created_at + 99))
             .await
@@ -896,7 +896,7 @@ async fn terminal_preparation_and_commit_keep_maintenance_reads_and_critical_wri
             1,
             "the whole batch must use one writer transaction"
         );
-        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Critical);
+        observer.assert_scope(PostgresReadClass::Maintenance, PostgresWriteClass::Critical);
         Ok(())
     })
     .await
@@ -908,16 +908,18 @@ struct TerminalQueueObserver {
     armed: std::sync::atomic::AtomicBool,
     enqueued: Notify,
     cancelled: Notify,
-    cancelled_queue: std::sync::Mutex<Option<pioneer_sqlite::SqliteWriteQueueSnapshot>>,
+    cancelled_queue: std::sync::Mutex<Option<pioneer_postgres_pools::PostgresWriteQueueSnapshot>>,
 }
-impl pioneer_sqlite::SqliteWriteObserver for TerminalQueueObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for TerminalQueueObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         if !self.armed.load(Ordering::SeqCst) {
             return;
         }
         match event {
-            pioneer_sqlite::SqliteWriteEvent::Enqueued { .. } => self.enqueued.notify_one(),
-            pioneer_sqlite::SqliteWriteEvent::Cancelled { queue, .. } => {
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. } => {
+                self.enqueued.notify_one()
+            }
+            pioneer_postgres_pools::PostgresWriteEvent::Cancelled { queue, .. } => {
                 *self.cancelled_queue.lock().unwrap() = Some(queue);
                 self.cancelled.notify_one();
             }
@@ -929,14 +931,16 @@ impl pioneer_sqlite::SqliteWriteObserver for TerminalQueueObserver {
 #[tokio::test]
 async fn cancelling_queued_terminal_commit_releases_capacity_without_partial_events() {
     pioneer_postgres_test::with_database(async |database| {
-        use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor, SqliteWriteQueueSnapshot};
+        use pioneer_postgres_pools::{
+            PostgresDatabase, PostgresWriteExecutor, PostgresWriteQueueSnapshot,
+        };
         let writer = database.connect_with_limit(1).await.unwrap();
         let reader = database.connect_read_only().await.unwrap();
         seed_postgres_task_fixture(&writer).await;
         let observer = Arc::new(TerminalQueueObserver::default());
-        let database = SqliteDatabase::from_executor(
+        let database = PostgresDatabase::from_executor(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
         );
         let (runtime, run, _, result) =
             fixture_with_runtime(TaskRuntime::new(Arc::new(CrudStore::new(database)))).await;
@@ -968,7 +972,7 @@ async fn cancelling_queued_terminal_commit_releases_capacity_without_partial_eve
             .unwrap();
         assert_eq!(
             *observer.cancelled_queue.lock().unwrap(),
-            Some(SqliteWriteQueueSnapshot::default())
+            Some(PostgresWriteQueueSnapshot::default())
         );
         blocker.rollback().await.unwrap();
         assert_eq!(events(&runtime, &run).await, before);
@@ -1825,14 +1829,14 @@ async fn revision_terminal_fixture_with_retry(
     database: &pioneer_postgres_test::TestDatabase,
     retry_policy: Option<TaskRetryPolicy>,
 ) -> RevisionTerminalFixture {
-    use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+    use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
     let writer = database.connect_with_limit(1).await.unwrap();
     let reader = database.connect_read_only().await.unwrap();
     seed_postgres_task_fixture(&writer).await;
     let observer = Arc::new(DispatchDatabaseObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let (runtime, run, _, _) = fixture_with_runtime_and_retry(
@@ -1905,7 +1909,7 @@ fn revision_start_error(run: &TaskRun) -> TaskError {
 
 #[tokio::test]
 async fn terminal_revision_rolls_back_with_run_then_replays_after_restart() {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass};
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
     for (failed, turn_status, run_status, execution_status) in [
         (
             false,
@@ -1991,7 +1995,7 @@ async fn terminal_revision_rolls_back_with_run_then_replays_after_restart() {
         .await
         .unwrap();
         assert_eq!(observer.writes.lock().unwrap().len(), 1);
-        observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Critical);
+        observer.assert_scope(PostgresReadClass::Maintenance, PostgresWriteClass::Critical);
         let saved = store
             .get_task_run_turn(&revision.id)
             .await

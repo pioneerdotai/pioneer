@@ -4,12 +4,12 @@ use pioneer_crud_tasks::task_trigger::upsert_trigger;
 use pioneer_crud_tasks::task_views::{
     get_task_tree_bounded, list_task_agenda_scoped, list_tasks_scoped,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
 use pioneer_protocol::{
     TaskAgendaParams, TaskListParams, TaskStatus, TaskTrigger, TaskTriggerKind, TaskTriggerSpec,
     TaskTriggerStatus,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 
 #[tokio::test]
@@ -47,7 +47,7 @@ async fn agenda_filters_and_orders_before_applying_limit() -> Result<()> {
                 webhook_secret_ref: None,
             }).await?;
         }
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         let access = TaskRootAccessFilter { allowed_root_thread_ids: vec!["visible".to_owned()] };
         let params = TaskAgendaParams {
             workspace_id: "ws".to_owned(),
@@ -80,7 +80,7 @@ async fn tree_limit_rejects_partial_results_and_keeps_exact_children() -> Result
                ('root', 'ws', 'workspace', 'agent', 'draft', 'Root', 'Root', NULL, NULL),
                ('child', 'ws', 'workspace', 'agent', 'draft', 'Child', 'Child', 'root', 'root');",
         ).await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         assert!(get_task_tree_bounded(&db, "root", 1).await.is_err());
         let root = get_task_tree_bounded(&db, "root", 2).await?.unwrap();
         assert_eq!(root.task.id, "root");
@@ -102,7 +102,7 @@ async fn task_list_pages_use_id_order_when_timestamps_match() -> Result<()> {
                ('a-tie', 'ws', 'workspace', 'agent', 'draft', 'A', 'A', '2020-01-01T00:00:00Z'),
                ('z-newer', 'ws', 'workspace', 'agent', 'draft', 'Z', 'Z', '2021-01-01T00:00:00Z');",
         ).await?;
-        let db = SqliteDatabase::new(fixture.connect_read_only().await?, writer.clone());
+        let db = PostgresDatabase::new(fixture.connect_read_only().await?, writer.clone());
         for (offset, expected) in ["z-newer", "a-tie", "b-tie"].into_iter().enumerate() {
             let page = list_tasks_scoped(&db, TaskListParams {
                 workspace_id: "ws".into(),

@@ -4,23 +4,23 @@ use crate::lifecycle_pending::CompactionLifecycleClaim;
 use crate::store::CompactionStore;
 use pioneer_compaction::ModelBudget;
 use pioneer_entity::compaction_lifecycle_pending as pending;
+use pioneer_postgres_pools::{PostgresWriteClass, PostgresWriteExecutor};
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::{SqliteWriteClass, SqliteWriteExecutor};
 use sea_orm::{DbBackend, Statement};
 use std::{sync::Arc, time::Duration};
 
 const NOW: i64 = 2_000_000_000_000;
 
-async fn open(fixture: &TestDatabase) -> (CompactionStore, SqliteWriteExecutor) {
+async fn open(fixture: &TestDatabase) -> (CompactionStore, PostgresWriteExecutor) {
     let writer = fixture.connect_with_limit(1).await.unwrap();
-    let executor = SqliteWriteExecutor::new(writer);
+    let executor = PostgresWriteExecutor::new(writer);
     let reader = fixture.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::from_executor(reader, executor.clone());
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::from_executor(reader, executor.clone());
+    assert!(db.reader_is_read_only().await.unwrap());
     (CompactionStore::for_test(db), executor)
 }
 
-async fn fixture() -> (Arc<TestDatabase>, CompactionStore, SqliteWriteExecutor) {
+async fn fixture() -> (Arc<TestDatabase>, CompactionStore, PostgresWriteExecutor) {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (store, writer) = open(&fixture).await;
     for sql in [
@@ -132,21 +132,21 @@ async fn expand_all(store: &CompactionStore, now: i64) {
 }
 #[derive(Default)]
 struct Routes {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     queued: tokio::sync::Notify,
 }
-impl pioneer_sqlite::SqliteReadObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.reads.lock().unwrap().push(event);
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         if matches!(
             event,
-            pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                class: SqliteWriteClass::Maintenance,
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         ) {
@@ -159,9 +159,9 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
 async fn observed_store(fixture: &TestDatabase, routes: Arc<Routes>) -> CompactionStore {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    CompactionStore::for_test(SqliteDatabase::from_executor_with_read_observer(
+    CompactionStore::for_test(PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, routes.clone()),
+        PostgresWriteExecutor::with_observer(writer, routes.clone()),
         routes,
     ))
 }
@@ -313,8 +313,8 @@ async fn lifecycle_running_missing_binding_retries_without_creating_sources() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn lifecycle_maintenance_routes_clock_after_writer_and_cancellation_preserve_claim() {
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresReadEvent, PostgresWriteEvent};
     use pioneer_postgres_test::TestDatabase;
-    use pioneer_sqlite::{SqliteReadClass, SqliteReadEvent, SqliteWriteEvent};
     let (file, store, writer) = fixture().await;
     operation(&store, "op", "running", NOW + 60_000).await;
     expand_all(&store, NOW).await;
@@ -329,15 +329,15 @@ async fn lifecycle_maintenance_routes_clock_after_writer_and_cancellation_preser
     );
     assert!(routes.reads.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(routes.reads.lock().unwrap().iter().all(|e| !matches!(
         e,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -417,12 +417,12 @@ async fn lifecycle_maintenance_routes_clock_after_writer_and_cancellation_preser
             .unwrap()
             .is_empty()
     );
-    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,SqliteWriteEvent::Cancelled{class:SqliteWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
-    assert!(routes.writes.lock().unwrap().iter().all(|e|!matches!(e,SqliteWriteEvent::Acquired{class,..} if *class!=SqliteWriteClass::Maintenance)));
+    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,PostgresWriteEvent::Cancelled{class:PostgresWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
+    assert!(routes.writes.lock().unwrap().iter().all(|e|!matches!(e,PostgresWriteEvent::Acquired{class,..} if *class!=PostgresWriteClass::Maintenance)));
     assert!(
         store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );

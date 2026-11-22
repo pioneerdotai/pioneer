@@ -2,8 +2,8 @@ use pioneer_crud_conversations::{
     thread_mutations::upsert_thread_with_creator, turn_reads::get_turn_for_thread,
     turn_writes::write_turn_prompt_manifest,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::*;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Set, Statement, TransactionTrait};
 
 fn unix_to_datetime(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
@@ -15,7 +15,7 @@ fn unix_to_datetime(seconds: i64) -> chrono::DateTime<chrono::FixedOffset> {
 async fn connection_with_workspace(
     fixture: &pioneer_postgres_test::TestDatabase,
     workspace: &str,
-) -> SqliteDatabase {
+) -> PostgresDatabase {
     let writer = fixture.connection();
     writer
         .execute_unprepared("UPDATE workspace SET is_current = false WHERE is_current")
@@ -29,7 +29,7 @@ async fn connection_with_workspace(
         ))
         .await
         .unwrap();
-    SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
+    PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone())
 }
 
 #[tokio::test]

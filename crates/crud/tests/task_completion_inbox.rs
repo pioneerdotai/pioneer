@@ -1,22 +1,22 @@
 //! CRUD integration coverage for the completed-run inbox and access boundaries.
 use pioneer_crud::{CrudStore, TaskCompletionInboxAccess, count_unread_task_completion_inbox};
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 use pioneer_postgres_test::{TestDatabase, scoped_database};
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
 use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 use std::sync::Arc;
 
 const A: &str = "P0000000000000000000A";
 const B: &str = "P0000000000000000000B";
 
-async fn open(fixture: &TestDatabase) -> (CrudStore, SqliteWriteExecutor) {
-    let writer = SqliteWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
+async fn open(fixture: &TestDatabase) -> (CrudStore, PostgresWriteExecutor) {
+    let writer = PostgresWriteExecutor::new(fixture.connect_with_limit(1).await.unwrap());
     let reader = fixture.connect_read_only().await.unwrap();
-    let db = SqliteDatabase::from_executor(reader, writer.clone());
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    let db = PostgresDatabase::from_executor(reader, writer.clone());
+    assert!(db.reader_is_read_only().await.unwrap());
     (CrudStore::new(db), writer)
 }
 
-async fn fixture() -> (Arc<TestDatabase>, CrudStore, SqliteWriteExecutor) {
+async fn fixture() -> (Arc<TestDatabase>, CrudStore, PostgresWriteExecutor) {
     let fixture = scoped_database().await.unwrap();
     let (store, writer) = open(&fixture).await;
     let db = store.with_maintenance_access().database_connection();

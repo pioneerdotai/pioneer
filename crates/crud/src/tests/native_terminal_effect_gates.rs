@@ -3,11 +3,11 @@ use crate::{ClaimedNativeTerminalEffectRecord, DB_ID_LEN};
 use pioneer_crud_execution::native_terminal_effect_outbox as outbox;
 use pioneer_crud_tasks::task_result_candidate;
 use pioneer_entity::native_terminal_effect_outbox as effect;
-use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
+use pioneer_postgres_test::{TestDatabase, with_database};
 use sea_orm::{ActiveModelTrait, DatabaseBackend, IntoActiveModel, QueryTrait};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -21,12 +21,12 @@ struct Routes {
     writes: AtomicUsize,
     queued: AtomicUsize,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
         if matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         ) {
@@ -34,17 +34,17 @@ impl SqliteReadObserver for Routes {
         }
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         match event {
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.writes.fetch_add(1, Ordering::SeqCst);
             }
-            SqliteWriteEvent::Enqueued {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Enqueued {
+                class: PostgresWriteClass::Maintenance,
                 ..
             } => {
                 self.queued.fetch_add(1, Ordering::SeqCst);
@@ -76,9 +76,9 @@ impl<'a> Fixture<'a> {
         // Queue the scheduling cases behind a deliberately occupied writer slot.
         let writer = database.connect_with_limit(1).await.unwrap();
         let reader = database.connect_read_only().await.unwrap();
-        let db = SqliteDatabase::from_executor_with_read_observer(
+        let db = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, routes.clone()),
+            PostgresWriteExecutor::with_observer(writer, routes.clone()),
             routes.clone(),
         );
         db.validate_reader().await.unwrap();

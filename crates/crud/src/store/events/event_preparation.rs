@@ -6,8 +6,8 @@ use crate::{TurnExecutionRecord, TurnItemAttemptDeadlines};
 use anyhow::{Context, Result};
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use pioneer_crud_execution::{event_append as turn_event, native_terminal_effect_outbox};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::generate_id;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
@@ -67,7 +67,7 @@ pub(crate) fn deserialize_turn_event_projection_context(
 }
 
 pub(crate) async fn prepare_turn_event_for_permanent_storage(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     event: TurnEventPayload,
 ) -> Result<turn_event::PreparedTurnEvent> {
     turn_event::PreparedTurnEvent::prepare_for_storage(event)?
@@ -76,7 +76,7 @@ pub(crate) async fn prepare_turn_event_for_permanent_storage(
 }
 
 pub(crate) async fn prepare_projected_turn_event_for_permanent_storage(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     event: TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<PreparedProjectedTurnEvent> {
@@ -85,7 +85,7 @@ pub(crate) async fn prepare_projected_turn_event_for_permanent_storage(
 }
 
 pub(crate) async fn prepare_turn_event_envelope_for_permanent_storage(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     event: TurnEventPayload,
 ) -> Result<PreparedTurnEventEnvelope> {
     let event = prepare_turn_event_for_permanent_storage(db, event).await?;

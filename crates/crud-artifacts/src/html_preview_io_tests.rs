@@ -7,11 +7,11 @@ use pioneer_compaction::{SourceRef, frozen::FrozenMessageRef};
 use pioneer_entity::{
     artifact, compaction_frozen_history as history, html_preview_frozen_result as frozen_result,
 };
-use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::{
-    SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
-    SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteClass,
+    PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
+use pioneer_postgres_test::TestDatabase;
 use sea_orm::{DbBackend, Statement};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -19,16 +19,16 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Routes {
-    reads: Mutex<Vec<SqliteReadEvent>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadEvent>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
         self.reads.lock().unwrap().push(event);
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
@@ -42,34 +42,34 @@ impl Routes {
         let writes = self.writes.lock().unwrap();
         assert!(reads.iter().all(|e| !matches!(
             e,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
                 ..
             }
         )));
         assert!(writes.iter().all(|e| !matches!(
             e,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Interactive | SqliteWriteClass::Critical,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Interactive | PostgresWriteClass::Critical,
                 ..
             }
         )));
         (
             reads
                 .iter()
-                .filter(|e| matches!(e, SqliteReadEvent::OperationFinished { .. }))
+                .filter(|e| matches!(e, PostgresReadEvent::OperationFinished { .. }))
                 .count(),
             writes
                 .iter()
-                .filter(|e| matches!(e, SqliteWriteEvent::Acquired { .. }))
+                .filter(|e| matches!(e, PostgresWriteEvent::Acquired { .. }))
                 .count(),
         )
     }
 }
 
 struct Fixture<'a> {
-    db: SqliteDatabase,
-    writer: SqliteWriteExecutor,
+    db: PostgresDatabase,
+    writer: PostgresWriteExecutor,
     routes: Arc<Routes>,
     database: &'a TestDatabase,
     wake: tokio::sync::Notify,
@@ -98,7 +98,7 @@ impl Fixture<'_> {
     }
 
     async fn reopen_reader(&mut self) {
-        self.db = SqliteDatabase::from_executor_with_read_observer(
+        self.db = PostgresDatabase::from_executor_with_read_observer(
             self.database.connect_read_only().await.unwrap(),
             self.writer.clone(),
             self.routes.clone(),
@@ -114,12 +114,12 @@ impl Fixture<'_> {
 async fn fixture(database: &TestDatabase) -> Fixture<'_> {
     let connection = database.connect_with_limit(1).await.unwrap();
     let routes = Arc::new(Routes::default());
-    let writer = SqliteWriteExecutor::with_observer(connection, routes.clone());
+    let writer = PostgresWriteExecutor::with_observer(connection, routes.clone());
     let reader = database.connect_read_only().await.unwrap();
     let db =
-        SqliteDatabase::from_executor_with_read_observer(reader, writer.clone(), routes.clone())
+        PostgresDatabase::from_executor_with_read_observer(reader, writer.clone(), routes.clone())
             .maintenance();
-    assert!(db.reader_query_only_enabled().await.unwrap());
+    assert!(db.reader_is_read_only().await.unwrap());
     let f = Fixture {
         db,
         writer,
@@ -1510,7 +1510,7 @@ async fn io_business_retry_preserves_cas_class_through_artifact_error_boundary()
             let store = f.queue();
             let connection = &f.db;
             let result: Result<()> = store
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     async move {
                         let tx = connection.begin().await?;

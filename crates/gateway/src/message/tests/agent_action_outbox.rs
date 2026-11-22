@@ -112,19 +112,18 @@ async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_rem
         1
     );
     let writes = observer.writes.lock().unwrap().clone();
-    assert!(
-        writes
-            .iter()
-            .any(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
-    );
+    assert!(writes.iter().any(|event| matches!(
+        event,
+        pioneer_postgres_pools::PostgresWriteEvent::Acquired { .. }
+    )));
     assert!(
         writes
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
-            .all(|class| class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
     let bad = agent_action_outbox::Entity::find_by_id("a-malformed")
         .one(&database)
@@ -222,10 +221,10 @@ async fn agent_action_outbox_local_claim_failure_between_healthy_rows_dispatches
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
-            .all(|class| class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
 }
 
@@ -374,13 +373,14 @@ async fn agent_action_outbox_creation_and_polling_panics_preserve_remainder_and_
                 .unwrap()
                 .iter()
                 .filter_map(|event| match event {
-                    pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                    pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } =>
+                        Some(*class),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![pioneer_sqlite::SqliteWriteClass::Maintenance; 5]
+            vec![pioneer_postgres_pools::PostgresWriteClass::Maintenance; 5]
         );
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         let writer = tokio::time::timeout(
             Duration::from_secs(1),
             processor.crud_store.database_connection().begin(),
@@ -398,7 +398,7 @@ struct PanicAckConnection<C>(C);
 impl<C: pioneer_crud::GatewayControlConnection> pioneer_crud::GatewayControlConnection
     for PanicAckConnection<C>
 {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange> {
         self.0.gateway_control_change()
     }
 }
@@ -512,14 +512,14 @@ async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![pioneer_sqlite::SqliteWriteClass::Maintenance; 6],
+        vec![pioneer_postgres_pools::PostgresWriteClass::Maintenance; 6],
         "three claims + three ACKs, no compensation/retry"
     );
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     let writer = tokio::time::timeout(
         Duration::from_secs(1),
         processor.crud_store.database_connection().begin(),
@@ -650,8 +650,8 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
     use sea_orm::{DbErr, RuntimeErr, SqlxError};
     use std::borrow::Cow;
 
-    // SQLx's typed DatabaseError boundary, as used by the SQLite driver. The
-    // text is deliberately unrelated to the numeric IOERR code: classification
+    // SQLx's typed DatabaseError boundary, as used by the PostgreSQL driver. The
+    // text is deliberately unrelated to the I/O error SQLSTATE: classification
     // must preserve the driver failure without inspecting its Display payload.
     #[derive(Debug)]
     struct DriverIo;
@@ -666,7 +666,7 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
             "private provider payload must not become diagnostics"
         }
         fn code(&self) -> Option<Cow<'_, str>> {
-            Some("10".into()) // SQLITE_IOERR
+            Some("58030".into()) // io_error
         }
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
             self
@@ -722,7 +722,7 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
             anyhow::Error::new(DbErr::RecordNotFound("missing admission".into())),
             anyhow::Error::new(DbErr::Type("invalid persisted field".into())),
             anyhow::Error::new(malformed),
-            anyhow::anyhow!("SQLITE_IOERR is merely untrusted text here"),
+            anyhow::anyhow!("SQLSTATE 58030 is merely untrusted text here"),
         ] {
             let proof_error = agent_start_proof_error(error, semantic);
             assert_eq!(proof_error.downcast_ref::<Failure>(), Some(&semantic));

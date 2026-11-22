@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) async fn read_fixture_item(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     row: pioneer_entity::turn_item::Model,
 ) -> anyhow::Result<TurnItem> {
     let mut items = pioneer_crud_conversations::turn_payload::hydrate_items(db, vec![row]).await?;
@@ -40,7 +40,7 @@ pub(crate) async fn postgres_store_with_workspace(
         .connect_read_only()
         .await
         .expect("read-only PostgreSQL pool");
-    CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+    CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         reader,
         connection.clone(),
     ))
@@ -71,7 +71,9 @@ pub(super) async fn postgres_store_with_workspace_and_query_counter(
         });
     }
     (
-        CrudStore::new(pioneer_sqlite::SqliteDatabase::new(reader, writer)),
+        CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
+            reader, writer,
+        )),
         query_count,
     )
 }
@@ -547,23 +549,26 @@ pub(super) fn safe_web_fetch_item(item_id: &str) -> TurnItem {
 
 #[derive(Default)]
 pub(super) struct FixtureDatabaseObserver {
-    pub(super) reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    pub(super) events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    pub(super) reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    pub(super) events: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     enqueued: tokio::sync::Notify,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for FixtureDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for FixtureDatabaseObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for FixtureDatabaseObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for FixtureDatabaseObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.events.lock().unwrap().push(event);
-        if matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. }) {
+        if matches!(
+            event,
+            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+        ) {
             self.enqueued.notify_one();
         }
     }
@@ -579,7 +584,10 @@ impl FixtureDatabaseObserver {
                     .unwrap()
                     .iter()
                     .filter(|event| {
-                        matches!(event, pioneer_sqlite::SqliteWriteEvent::Enqueued { .. })
+                        matches!(
+                            event,
+                            pioneer_postgres_pools::PostgresWriteEvent::Enqueued { .. }
+                        )
                     })
                     .count()
                     >= count;

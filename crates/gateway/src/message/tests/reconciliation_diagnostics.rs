@@ -160,9 +160,9 @@ impl DatabaseError for OtherBackend {
 #[test]
 fn untyped_lost_and_other_backend_causes_stay_unclassified() {
     for error in [
-        anyhow::anyhow!("SQLite code 14 unable to open database file {CANARY}"),
-        anyhow::Error::new(DbErr::Custom("SQLITE_CANTOPEN".into())),
-        anyhow::Error::new(DbErr::Query(RuntimeErr::Internal("code 14".into()))),
+        anyhow::anyhow!("PostgreSQL SQLSTATE 08006 connection failure {CANARY}"),
+        anyhow::Error::new(DbErr::Custom("SQLSTATE 08006".into())),
+        anyhow::Error::new(DbErr::Query(RuntimeErr::Internal("SQLSTATE 08006".into()))),
         anyhow::Error::new(DbErr::Exec(RuntimeErr::SqlxError(Arc::new(
             SqlxError::Database(Box::new(OtherBackend)),
         ))))

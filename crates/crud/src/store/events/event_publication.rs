@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use pioneer_crud_conversations::events;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{event_append as turn_event, turn_execution};
-use pioneer_protocol::{TurnStatus, generate_id};
-use pioneer_sqlite::{
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
     retry_with_backoff,
 };
+use pioneer_protocol::{TurnStatus, generate_id};
 use sea_orm::Statement;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::future::Future;
@@ -390,7 +390,7 @@ impl CrudStore {
         };
         let execution_owner_id = execution_owner_id.map(str::to_owned);
 
-        self.run_serialized_turn_event_materialization(|| {
+        self.retry_turn_event_materialization(|| {
             self.materialize_turn_event_with_attempt_deadlines_once(
                 event.clone(),
                 event_timestamp_secs,
@@ -533,7 +533,7 @@ impl CrudStore {
         Ok(())
     }
 
-    async fn run_serialized_turn_event_materialization<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_turn_event_materialization<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,

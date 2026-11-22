@@ -527,11 +527,11 @@ mod tests {
     use super::{CliRuntimeIdentitySeed, runtime_nickname, validate_runtime_catalog};
 
     use pioneer_entity::{agent_identity, agent_presentation_snapshot, workspace};
-    use pioneer_sqlite::SqliteDatabase;
+    use pioneer_postgres_pools::PostgresDatabase;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 
-    async fn catalog_database(fixture: &pioneer_postgres_test::TestDatabase) -> SqliteDatabase {
-        let db = SqliteDatabase::new(
+    async fn catalog_database(fixture: &pioneer_postgres_test::TestDatabase) -> PostgresDatabase {
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await.unwrap(),
             fixture.connection().clone(),
         );
@@ -563,7 +563,7 @@ mod tests {
         }
     }
 
-    async fn sync(db: &SqliteDatabase, instances: &[CliRuntimeIdentitySeed]) {
+    async fn sync(db: &PostgresDatabase, instances: &[CliRuntimeIdentitySeed]) {
         super::sync_cli_runtime_identity_catalog(db, instances, chrono::Utc::now().fixed_offset())
             .await
             .expect("CLI settings projection must succeed");

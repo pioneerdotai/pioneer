@@ -528,7 +528,7 @@ pub(crate) async fn compaction_apply(
     let application =
         prepare_checkpoint_application(checkpoint, expected_head, assertions, has_projection)?;
     store
-        .run_serialized_write(|| async {
+        .retry_write_on_conflict(|| async {
             let txn = store.connection.begin().await?;
             let outcome = application.apply(&txn).await?;
             if outcome == CommitOutcome::Applied {

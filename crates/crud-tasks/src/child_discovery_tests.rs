@@ -19,7 +19,7 @@ use sea_orm::DatabaseTransaction;
 const AT: i64 = 1_700_000_000;
 
 async fn upsert_thread(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread: &Thread,
     actor: PersistedActorRef,
 ) -> Result<bool> {
@@ -97,23 +97,23 @@ fn sample_turn(turn_id: &str) -> Turn {
     }
 }
 
-async fn persist_task(store: &SqliteDatabase, task: &Task) {
+async fn persist_task(store: &PostgresDatabase, task: &Task) {
     let prepared = task::prepare_task_projection(task).unwrap();
     let tx = store.begin().await.unwrap();
     task::upsert_prepared_task(&tx, prepared).await.unwrap();
     tx.commit().await.unwrap();
 }
 
-async fn persist_run(store: &SqliteDatabase, run: &TaskRun) {
+async fn persist_run(store: &PostgresDatabase, run: &TaskRun) {
     let prepared = task_run::prepare_run_projection(run).unwrap();
     let tx = store.begin().await.unwrap();
     task_run::upsert_prepared_run(&tx, prepared).await.unwrap();
     tx.commit().await.unwrap();
 }
 
-async fn fixture() -> (SqliteDatabase, Task) {
+async fn fixture() -> (PostgresDatabase, Task) {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let store = SqliteDatabase::new(
+    let store = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );
@@ -123,7 +123,7 @@ async fn fixture() -> (SqliteDatabase, Task) {
     (store.maintenance(), task)
 }
 
-async fn run(store: &SqliteDatabase, task: &Task, n: u32, status: TaskRunStatus) -> TaskRun {
+async fn run(store: &PostgresDatabase, task: &Task, n: u32, status: TaskRunStatus) -> TaskRun {
     let mut run = sample_task_run(AT);
     run.id = format!("r{n:020}");
     run.run_group_id = run.id.clone();
@@ -137,7 +137,7 @@ async fn run(store: &SqliteDatabase, task: &Task, n: u32, status: TaskRunStatus)
 }
 
 async fn child(
-    store: &SqliteDatabase,
+    store: &PostgresDatabase,
     run: &TaskRun,
     id: &str,
     status: TurnStatus,
@@ -192,7 +192,7 @@ async fn child(
     link
 }
 
-async fn discovered(store: &SqliteDatabase, limit: u64) -> Vec<String> {
+async fn discovered(store: &PostgresDatabase, limit: u64) -> Vec<String> {
     TaskChildWorkRepository::new(&store)
         .list_unreconciled_terminal_task_child_turns(limit)
         .await
@@ -323,7 +323,7 @@ async fn discovery_rejects_cross_task_run_and_turn_thread_links() {
 }
 
 async fn terminal_child(
-    store: &SqliteDatabase,
+    store: &PostgresDatabase,
     task: &Task,
     n: u32,
     id: &str,

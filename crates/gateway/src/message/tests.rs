@@ -4642,18 +4642,18 @@ enum CompletedHistoryDeliveryBarrier {
 
 #[derive(Default)]
 struct NativeSchedulingObserver {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
 }
 
-impl pioneer_sqlite::SqliteReadObserver for NativeSchedulingObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+impl pioneer_postgres_pools::PostgresReadObserver for NativeSchedulingObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
         self.reads.lock().unwrap().push(event);
     }
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for NativeSchedulingObserver {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
@@ -33764,15 +33764,15 @@ struct PausedCliHeartbeatWriter {
     entered: Notify,
     release: Arc<Notify>,
     dropped: Arc<std::sync::atomic::AtomicBool>,
-    acquired_class: std::sync::Mutex<Option<pioneer_sqlite::SqliteWriteClass>>,
+    acquired_class: std::sync::Mutex<Option<pioneer_postgres_pools::PostgresWriteClass>>,
 }
 
-impl pioneer_sqlite::SqliteWriteObserver for PausedCliHeartbeatWriter {
-    fn observe(&self, _event: pioneer_sqlite::SqliteWriteEvent) {}
+impl pioneer_postgres_pools::PostgresWriteObserver for PausedCliHeartbeatWriter {
+    fn observe(&self, _event: pioneer_postgres_pools::PostgresWriteEvent) {}
 
     fn pause_execute_raw_after_acquire_for_test(
         &self,
-        class: pioneer_sqlite::SqliteWriteClass,
+        class: pioneer_postgres_pools::PostgresWriteClass,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
         // Leave the pause armed when another workload acquires the writer.
         if self.workload.is_some_and(|workload| {
@@ -33972,9 +33972,9 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
         } else {
             writer_pause.armed.store(true, Ordering::SeqCst);
             assert!(
-                pioneer_sqlite::SqliteWriteObserver::pause_execute_raw_after_acquire_for_test(
+                pioneer_postgres_pools::PostgresWriteObserver::pause_execute_raw_after_acquire_for_test(
                     writer_pause.as_ref(),
-                    pioneer_sqlite::SqliteWriteClass::Critical,
+                    pioneer_postgres_pools::PostgresWriteClass::Critical,
                 )
                 .is_none(),
                 "an unrelated writer must leave the heartbeat pause armed"
@@ -65406,7 +65406,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                         .upgrade()
                         .ok_or_else(|| "fixture processor stopped".to_owned())?;
                     processor
-                        .with_database_class(pioneer_sqlite::SqliteWriteClass::Critical)
+                        .with_database_class(pioneer_postgres_pools::PostgresWriteClass::Critical)
                         .ensure_agent_listener_task(&thread_id)
                         .await
                         .map_err(|error| format!("{error:#}"))
@@ -67897,7 +67897,7 @@ async fn patch_history_rpc_reads_persisted_steps_records_files_and_diffs() {
     record.environment_id = "workspace".to_owned();
     record.committed_at_unix_ms = 1_700_000_000_000;
     record.side_effects.residual_directories = vec!["residual-parent".to_owned()];
-    let records = pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(
+    let records = pioneer_tools::apply_patch::history::PostgresAppliedPatchStore::new(
         crud_store.database_connection(),
     );
     records
@@ -68188,7 +68188,7 @@ async fn patch_history_parent_scope_exposes_exact_child_timeline_and_aggregate()
     second_record.environment_id = "dynamic-workspace".to_owned();
     second_record.committed_at_unix_ms = 1_700_000_000_200;
 
-    let record_store = pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(
+    let record_store = pioneer_tools::apply_patch::history::PostgresAppliedPatchStore::new(
         crud_store.database_connection(),
     );
     let domain = pioneer_tools::apply_patch::history::SnapshotDomain::new(
@@ -68358,7 +68358,7 @@ async fn patch_history_rpc_keeps_codex_aggregate_only_provenance() {
         }),
     )
     .expect("normalize Codex aggregate");
-    pioneer_tools::apply_patch::history::SqliteCodexAggregateStore::new(
+    pioneer_tools::apply_patch::history::PostgresCodexAggregateStore::new(
         crud_store.database_connection(),
     )
     .ingest_event(&event)
@@ -81297,7 +81297,7 @@ pub(super) async fn setup_postgres_workspace_manager(
         .connect_read_only()
         .await
         .expect("read-only fixture pool");
-    let database = pioneer_sqlite::SqliteDatabase::new(reader, writer.clone());
+    let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer.clone());
     let crud_store = Arc::new(CrudStore::new(database.clone()));
     ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
     let workspace_manager = Arc::new(WorkspaceManager::new(database));
@@ -81339,7 +81339,7 @@ pub(super) async fn setup_pooled_workspace_manager() -> (
 }
 
 async fn setup_pooled_workspace_manager_with_observer(
-    writer_observer: Option<Arc<dyn pioneer_sqlite::SqliteWriteObserver>>,
+    writer_observer: Option<Arc<dyn pioneer_postgres_pools::PostgresWriteObserver>>,
 ) -> (
     Arc<pioneer_postgres_test::TestDatabase>,
     Arc<WorkspaceManager>,
@@ -81352,9 +81352,9 @@ async fn setup_pooled_workspace_manager_with_observer(
     let reader = fixture.connect_read_only().await.unwrap();
     let database = match writer_observer {
         Some(observer) => {
-            pioneer_sqlite::SqliteDatabase::new_with_observer(reader, writer, observer)
+            pioneer_postgres_pools::PostgresDatabase::new_with_observer(reader, writer, observer)
         }
-        None => pioneer_sqlite::SqliteDatabase::new(reader, writer),
+        None => pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
     };
     database.validate_reader().await.unwrap();
     (
@@ -82912,7 +82912,7 @@ async fn memory_remember_get_list_roundtrip() {
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn memory_search_returns_sqlite_hits_filtered_by_control_plane() {
+async fn memory_search_returns_postgres_hits_filtered_by_control_plane() {
     let mut harness = setup_memory_gateway_harness("search_filter", true).await;
     let request_context = harness.request_context().await;
     let scope = workspace_memory_scope(harness.workspace_id.as_str());
@@ -83848,7 +83848,7 @@ async fn memory_tool_remember_writes_memory_with_turn_provenance() {
 
 #[pioneer_postgres_test::postgres_test]
 async fn supervised_memory_mutations_prompt_before_real_database_side_effects() {
-    // Exercise the real approval broker, tools, memory service and SQLite writes.
+    // Exercise the real approval broker, tools, memory service and PostgreSQL writes.
     // Storage adapter behavior is covered separately; this fixture isolates
     // approval and publication through the existing memory service contract.
     let harness = setup_memory_gateway_harness_with_backend(
@@ -84944,7 +84944,7 @@ async fn wait_for_task_status(
     task_id: &str,
     expected_status: pioneer_protocol::TaskStatus,
 ) -> pioneer_protocol::TaskStatus {
-    // The full Gateway suite runs many SQLite/provider scenarios in parallel.
+    // The full Gateway suite runs many PostgreSQL/provider scenarios in parallel.
     // Nested collaborative Task dispatch can be delayed by that contention;
     // keep the oracle bounded, but do not turn a healthy lineage transition
     // into a 2.5-second scheduling flake.
@@ -85047,7 +85047,7 @@ async fn wait_for_result_candidate_status(
     expected_status: TaskResultCandidateStatus,
 ) -> TaskResultCandidate {
     // The full workspace harness runs many database-backed Gateway tests in
-    // parallel. Preserve a bounded deadline, but do not turn scheduler/SQLite
+    // parallel. Preserve a bounded deadline, but do not turn scheduler/PostgreSQL
     // contention into a 2.5-second false failure.
     for _ in 0..1_200 {
         let candidates = crud_store
@@ -86098,9 +86098,9 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         OperationSnapshot, Transport, runner::RunnerState,
     };
     use pioneer_crud::compaction::{ManifestEntry, PagedSource};
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
     use sea_orm::{DbBackend, Statement};
 
@@ -86109,9 +86109,9 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observed = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observed.clone()),
+        PostgresWriteExecutor::with_observer(writer, observed.clone()),
         observed.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -86189,19 +86189,19 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
     for (label, owner_class, expected_read, expected_write) in [
         (
             "foreground-task",
-            SqliteWriteClass::Critical,
-            SqliteReadClass::Interactive,
-            SqliteWriteClass::Interactive,
+            PostgresWriteClass::Critical,
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
         ),
         (
             "background",
-            SqliteWriteClass::Maintenance,
-            SqliteReadClass::Maintenance,
-            SqliteWriteClass::Maintenance,
+            PostgresWriteClass::Maintenance,
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
         ),
     ] {
         let owner = processor.with_database_class(owner_class);
-        let lifecycle_store = if owner_class == SqliteWriteClass::Critical {
+        let lifecycle_store = if owner_class == PostgresWriteClass::Critical {
             super::ordinary_history_store(owner.crud_store.as_ref())
         } else {
             owner.crud_store.as_ref().clone()
@@ -86280,7 +86280,7 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
             .unwrap()
             .unwrap();
         assert!(observed.reads.lock().unwrap()[read_start..].iter().any(|event| matches!(
-            event, SqliteReadEvent::OperationFinished { class, .. } if *class == expected_read
+            event, PostgresReadEvent::OperationFinished { class, .. } if *class == expected_read
         )));
         let timeline = crate::compaction::HubCompactionObserver {
             hub: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
@@ -86294,10 +86294,10 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         timeline.started(&id, &active).await.unwrap();
         let started_writes = observed.writes.lock().unwrap()[write_start..].to_vec();
         assert!(started_writes.iter().any(|event| matches!(
-            event, SqliteWriteEvent::Acquired { class, .. } if *class == expected_write
+            event, PostgresWriteEvent::Acquired { class, .. } if *class == expected_write
         )));
         assert!(started_writes.iter().all(|event| !matches!(
-            event, SqliteWriteEvent::Acquired { class, .. } if *class != expected_write
+            event, PostgresWriteEvent::Acquired { class, .. } if *class != expected_write
         )));
         lifecycle_store
             .compaction_finish(&id, "failed", "cancelled")
@@ -86312,10 +86312,10 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
         timeline.terminal(&id, &terminal).await.unwrap();
         let terminal_writes = observed.writes.lock().unwrap()[write_start..].to_vec();
         assert!(terminal_writes.iter().any(|event| matches!(
-            event, SqliteWriteEvent::Acquired { class, .. } if *class == expected_write
+            event, PostgresWriteEvent::Acquired { class, .. } if *class == expected_write
         )));
         assert!(terminal_writes.iter().all(|event| !matches!(
-            event, SqliteWriteEvent::Acquired { class, .. } if *class != expected_write
+            event, PostgresWriteEvent::Acquired { class, .. } if *class != expected_write
         )));
         let rows = lifecycle_store
             .database_connection()
@@ -86355,9 +86355,9 @@ async fn compaction_lifecycle_observer_uses_the_operation_scope_for_started_and_
 
 #[pioneer_postgres_test::postgres_test]
 async fn native_foreground_controller_uses_interactive_database_scope() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
     use sea_orm::TransactionTrait;
 
@@ -86367,9 +86367,9 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -86711,38 +86711,38 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     let writes = observer.writes.lock().unwrap()[write_start..].to_vec();
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
     assert!(reads.iter().all(|event| !matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(writes.iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Interactive,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Interactive,
             ..
         }
     )));
     assert!(writes.iter().all(|event| !matches!(
         event,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Maintenance,
             ..
-        } | SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Maintenance,
+        } | PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Maintenance,
             ..
-        } | SqliteWriteEvent::Released {
-            class: SqliteWriteClass::Maintenance,
+        } | PostgresWriteEvent::Released {
+            class: PostgresWriteClass::Maintenance,
             ..
-        } | SqliteWriteEvent::Cancelled {
-            class: SqliteWriteClass::Maintenance,
+        } | PostgresWriteEvent::Cancelled {
+            class: PostgresWriteClass::Maintenance,
             ..
         }
     )));
@@ -86861,8 +86861,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
                 .any(|event| {
                     matches!(
                         event,
-                        SqliteWriteEvent::Enqueued {
-                            class: SqliteWriteClass::Interactive,
+                        PostgresWriteEvent::Enqueued {
+                            class: PostgresWriteClass::Interactive,
                             queue,
                         } if queue.interactive > 0
                     )
@@ -86889,8 +86889,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
             .iter()
             .any(|event| matches!(
                 event,
-                SqliteWriteEvent::Cancelled {
-                    class: SqliteWriteClass::Interactive,
+                PostgresWriteEvent::Cancelled {
+                    class: PostgresWriteClass::Interactive,
                     ..
                 }
             ))
@@ -92993,15 +92993,15 @@ async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readab
     let background = store.with_maintenance_access();
     assert_eq!(
         background.database_connection().read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
+        pioneer_postgres_pools::PostgresReadClass::Maintenance
     );
     assert_eq!(
         background.database_connection().write_class(),
-        pioneer_sqlite::SqliteWriteClass::Maintenance
+        pioneer_postgres_pools::PostgresWriteClass::Maintenance
     );
     assert_eq!(
         store.database_connection().write_class(),
-        pioneer_sqlite::SqliteWriteClass::Interactive
+        pioneer_postgres_pools::PostgresWriteClass::Interactive
     );
     let mut partial = ProviderUsageObservation {
         id: "aux-1".into(),

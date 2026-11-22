@@ -3,7 +3,7 @@ use super::*;
 use crate::message::TaskEventFanoutSummary;
 use pioneer_crud::{TASK_EVENT_FANOUT_BYTE_BUDGET as BYTES, TaskEventFanoutOutcome};
 use pioneer_entity::{task_event, task_event_fanout_pending as pending};
-use pioneer_sqlite::{SqliteWriteClass, SqliteWriteEvent, SqliteWriteObserver};
+use pioneer_postgres_pools::{PostgresWriteClass, PostgresWriteEvent, PostgresWriteObserver};
 use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 const NOW: i64 = 4_000_000_000;
@@ -286,18 +286,18 @@ async fn expired_budget_handler_cannot_change_replacement_holder_or_cursor_reset
 struct PanicObserver {
     maintenance_acquires: AtomicUsize,
     fail_released: AtomicUsize,
-    events: std::sync::Mutex<Vec<SqliteWriteEvent>>,
+    events: std::sync::Mutex<Vec<PostgresWriteEvent>>,
 }
-impl SqliteWriteObserver for PanicObserver {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for PanicObserver {
+    fn observe(&self, event: PostgresWriteEvent) {
         // Never poison the observer mutex, and panic once. Released is called
         // after the executor drops admission capacity, but before commit's
         // caller learns its outcome: this exercises actual commit ambiguity.
         self.events.lock().unwrap().push(event);
         if matches!(
             event,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         ) {
@@ -305,8 +305,8 @@ impl SqliteWriteObserver for PanicObserver {
         }
         if matches!(
             event,
-            SqliteWriteEvent::Released {
-                class: SqliteWriteClass::Maintenance,
+            PostgresWriteEvent::Released {
+                class: PostgresWriteClass::Maintenance,
                 ..
             }
         ) {
@@ -407,15 +407,15 @@ async fn panic_candidate_lifecycle(mode: usize) {
     let events = observer.events.lock().unwrap().clone();
     assert!(events.iter().all(|e| !matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Interactive,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Interactive,
             ..
         }
     )));
     assert!(events.iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));
@@ -437,7 +437,7 @@ async fn panic_candidate_lifecycle(mode: usize) {
                 .unwrap()
                 .is_some()
         );
-        // Exercise serialized writer again after panic, then continue a real
+        // Exercise the write path again after panic, then continue a real
         // quantum with the same owning dispatcher state.
         if mode == 5 {
             processor
@@ -566,15 +566,17 @@ async fn many_tasks_share_inputs_and_only_one_oversized_event_per_quantum() {
 #[pioneer_postgres_test::postgres_test]
 async fn acknowledged_history_is_not_redecoded_and_new_events_survive_restart() {
     use pioneer_entity::task_event_fanout_cursor as cursor;
-    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteExecutor,
+    };
     let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
     let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
     let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observed = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observed.clone()),
+        PostgresWriteExecutor::with_observer(writer, observed.clone()),
         observed.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -649,13 +651,13 @@ async fn acknowledged_history_is_not_redecoded_and_new_events_survive_restart() 
         .unwrap()
         .iter()
         .filter_map(|e| match e {
-            SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+            PostgresReadEvent::OperationFinished { class, .. } => Some(*class),
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
         reads,
-        vec![SqliteReadClass::Maintenance; 2],
+        vec![PostgresReadClass::Maintenance; 2],
         "only due pending and queue-state probes; no Task/cursor/event history reads"
     );
     assert!(rx.try_recv().is_err());

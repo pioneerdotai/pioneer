@@ -48,7 +48,7 @@ impl CrudStore {
                 pioneer_crud_execution::native_execution_window::PreparedWindowTransition::new(
                     transition,
                 )?;
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let window = window.clone();
                 let prepared_event = prepared_event.clone();
                 async move {
@@ -264,7 +264,7 @@ impl CrudStore {
         &self,
         now: DateTimeWithTimeZone,
     ) -> Result<u64> {
-        self.run_serialized_write(|| async {
+        self.retry_write_on_conflict(|| async {
             turn_execution_window::close_active_execution_windows_for_terminal_turns(
                 &self.connection,
                 now,

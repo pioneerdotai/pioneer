@@ -309,7 +309,7 @@ pub async fn compaction_runner_state<C: ConnectionTrait>(
 }
 
 /// A late cleanup from the previous request must not terminate a resumed request.
-/// One bounded conditional write inherits the caller's serialized writer scope.
+/// One bounded conditional write inherits the caller's write scope.
 pub async fn compaction_finish_execution<C: ConnectionTrait>(
     db: &C,
     operation: &str,

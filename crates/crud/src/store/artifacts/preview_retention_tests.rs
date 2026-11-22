@@ -16,11 +16,11 @@ use pioneer_entity::{
     artifact, artifact_binding, artifact_blob, html_preview_frozen_index as frozen_index,
     turn_input,
 };
-use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-    SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
+use pioneer_postgres_test::TestDatabase;
 use sea_orm::sea_query::{ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
@@ -35,16 +35,16 @@ const TEST_INDEX_FRONTIER: &str = "zzzzzzzzzz";
 
 #[derive(Default)]
 struct Routes {
-    reads: Mutex<Vec<SqliteReadEvent>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadEvent>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
     queued: tokio::sync::Notify,
     writer_queued: tokio::sync::Notify,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
         if matches!(
             event,
-            SqliteReadEvent::AdmissionEnqueued {
+            PostgresReadEvent::AdmissionEnqueued {
                 queue_depth: 1,
                 active: 1,
                 ..
@@ -55,9 +55,9 @@ impl SqliteReadObserver for Routes {
         self.reads.lock().unwrap().push(event);
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if matches!(event, SqliteWriteEvent::Enqueued { queue, .. } if queue.maintenance == 1) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if matches!(event, PostgresWriteEvent::Enqueued { queue, .. } if queue.maintenance == 1) {
             self.writer_queued.notify_one();
         }
         self.writes.lock().unwrap().push(event);
@@ -73,26 +73,26 @@ impl Routes {
         let writes = self.writes.lock().unwrap();
         assert!(reads.iter().all(|e| !matches!(
             e,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
                 ..
             }
         )));
         assert!(writes.iter().all(|e| !matches!(
             e,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Interactive | SqliteWriteClass::Critical,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Interactive | PostgresWriteClass::Critical,
                 ..
             }
         )));
         (
             reads
                 .iter()
-                .filter(|e| matches!(e, SqliteReadEvent::OperationFinished { .. }))
+                .filter(|e| matches!(e, PostgresReadEvent::OperationFinished { .. }))
                 .count(),
             writes
                 .iter()
-                .filter(|e| matches!(e, SqliteWriteEvent::Acquired { .. }))
+                .filter(|e| matches!(e, PostgresWriteEvent::Acquired { .. }))
                 .count(),
         )
     }
@@ -100,7 +100,7 @@ impl Routes {
 struct Fixture<'db> {
     store: CrudStore,
     reader: DatabaseConnection,
-    writer: SqliteWriteExecutor,
+    writer: PostgresWriteExecutor,
     routes: Arc<Routes>,
     database: &'db TestDatabase,
 }
@@ -120,7 +120,7 @@ impl Fixture<'_> {
 
     async fn reopen_reader(&mut self) {
         self.reader = self.database.connect_read_only().await.unwrap();
-        self.store = CrudStore::new(SqliteDatabase::from_executor_with_read_observer(
+        self.store = CrudStore::new(PostgresDatabase::from_executor_with_read_observer(
             self.reader.clone(),
             self.writer.clone(),
             self.routes.clone(),
@@ -141,9 +141,9 @@ impl Fixture<'_> {
 async fn fixture(database: &TestDatabase) -> Fixture<'_> {
     let connection = database.connect_with_limit(1).await.unwrap();
     let routes = Arc::new(Routes::default());
-    let writer = SqliteWriteExecutor::with_observer(connection, routes.clone());
+    let writer = PostgresWriteExecutor::with_observer(connection, routes.clone());
     let reader = database.connect_read_only().await.unwrap();
-    let store = CrudStore::new(SqliteDatabase::from_executor_with_read_observer(
+    let store = CrudStore::new(PostgresDatabase::from_executor_with_read_observer(
         reader.clone(),
         writer.clone(),
         routes.clone(),
@@ -186,13 +186,7 @@ async fn fixture(database: &TestDatabase) -> Fixture<'_> {
         )
         .await
         .unwrap();
-    assert!(
-        f.store
-            .connection
-            .reader_query_only_enabled()
-            .await
-            .unwrap()
-    );
+    assert!(f.store.connection.reader_is_read_only().await.unwrap());
     f
 }
 fn reference(source: SourceRef, thread: &str, context: Option<&str>) -> FrozenMessageRef {
@@ -428,7 +422,7 @@ async fn concurrent_reader_sees_new_input_and_adoption_only_after_the_same_commi
     }
 }
 
-// Closed test gate: these exercise the real read-only/serialized-writer fixture.
+// These cases exercise the read-only reader and the scoped write path.
 fn io_queue_key(id: &str) -> String {
     pioneer_crud_artifacts::html_preview_io::HtmlPreviewIoLocator::new(id)
         .key()

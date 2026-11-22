@@ -29,7 +29,7 @@ mod durable_sweep {
         let writer = fixture.connection();
         seed_scope(writer).await;
         let reader = fixture.connect_read_only().await.unwrap();
-        CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(reader, writer.clone()))
+        CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(reader, writer.clone()))
             .with_maintenance_access()
     }
     async fn header(store: &CompactionStore, id: &str, count: i64, next: i64, ready: i64) {
@@ -674,9 +674,9 @@ mod durable_sweep {
 
     #[pioneer_postgres_test::postgres_test]
     async fn durable_boundaries_route_maintenance_cancel_writer_admission_and_rollback_ack() {
-        use pioneer_sqlite::{
-            SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
-            SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+        use pioneer_postgres_pools::{
+            PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteClass,
+            PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
         };
         use std::sync::{
             Arc, Mutex,
@@ -684,23 +684,23 @@ mod durable_sweep {
         };
         #[derive(Default)]
         struct Observer {
-            writes: Mutex<Vec<SqliteWriteEvent>>,
-            reads: Mutex<Vec<SqliteReadEvent>>,
+            writes: Mutex<Vec<PostgresWriteEvent>>,
+            reads: Mutex<Vec<PostgresReadEvent>>,
             armed: AtomicBool,
             queued: tokio::sync::Notify,
         }
-        impl SqliteWriteObserver for Observer {
-            fn observe(&self, event: SqliteWriteEvent) {
+        impl PostgresWriteObserver for Observer {
+            fn observe(&self, event: PostgresWriteEvent) {
                 self.writes.lock().unwrap().push(event);
-                if matches!(event, SqliteWriteEvent::Enqueued { .. })
+                if matches!(event, PostgresWriteEvent::Enqueued { .. })
                     && self.armed.load(Ordering::SeqCst)
                 {
                     self.queued.notify_one();
                 }
             }
         }
-        impl SqliteReadObserver for Observer {
-            fn observe(&self, event: SqliteReadEvent) {
+        impl PostgresReadObserver for Observer {
+            fn observe(&self, event: PostgresReadEvent) {
                 self.reads.lock().unwrap().push(event);
             }
         }
@@ -709,9 +709,9 @@ mod durable_sweep {
         seed_scope(&writer).await;
         let reader = fixture.connect_read_only().await.unwrap();
         let observer = Arc::new(Observer::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         let store = CompactionStore::for_test(database).with_maintenance_access();
@@ -731,7 +731,7 @@ mod durable_sweep {
         }
         observer.armed.store(false, Ordering::SeqCst);
         assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
-            event, SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+            event, PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. }
                 if queue.maintenance == 0
         )));
         held.rollback().await.unwrap();
@@ -754,7 +754,7 @@ mod durable_sweep {
         .await;
         drain(&store, &mut FrozenStorageLifetimeProgress::default()).await;
         assert_eq!(pending(&store, "held", 0).await, 0);
-        assert!(store.connection.reader_query_only_enabled().await.unwrap());
+        assert!(store.connection.reader_is_read_only().await.unwrap());
         assert!(
             observer
                 .reads
@@ -762,8 +762,8 @@ mod durable_sweep {
                 .unwrap()
                 .iter()
                 .all(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, .. } =>
-                        *class == SqliteReadClass::Maintenance,
+                    PostgresReadEvent::OperationFinished { class, .. } =>
+                        *class == PostgresReadClass::Maintenance,
                     _ => true,
                 })
         );
@@ -774,8 +774,8 @@ mod durable_sweep {
                 .unwrap()
                 .iter()
                 .all(|event| match event {
-                    SqliteWriteEvent::Acquired { class, .. } =>
-                        *class == SqliteWriteClass::Maintenance,
+                    PostgresWriteEvent::Acquired { class, .. } =>
+                        *class == PostgresWriteClass::Maintenance,
                     _ => true,
                 })
         );

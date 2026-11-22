@@ -9,7 +9,7 @@ use pioneer_crud_execution::cli_runtime_binding::{
 use pioneer_crud_execution::cli_runtime_store::CliRuntimeStore;
 use pioneer_crud_execution::input_mapping::InputMapping;
 use pioneer_crud_execution::time::unix_to_datetime;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 struct InlineRoot;
@@ -262,7 +262,7 @@ async fn concurrent_cli_fork_intents_have_one_winner_and_stale_cleanup_cannot_de
 async fn cli_runtime_execution_segments_enforce_attempt_ownership_and_sequence() {
     pioneer_postgres_test::with_database(async |fixture| {
         seed_workspace(fixture.connection(), "ws_cli_segments").await?;
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connection().clone(),
         );

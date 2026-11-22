@@ -166,7 +166,7 @@ async fn migrated_store(
             ('ws_run_b', 'Run B', true, false)",
         )
         .await?;
-    let store = SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+    let store = SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
         fixture.connect_read_only().await?,
         writer.clone(),
     ));

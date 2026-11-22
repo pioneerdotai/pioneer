@@ -1,8 +1,8 @@
 // Focused static-stage regressions; intentionally not executed before review.
 use super::*;
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome,
-    SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresReadOutcome,
+    PostgresWriteClass, PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
 use std::sync::{Arc, Mutex};
 
@@ -364,20 +364,20 @@ async fn late_read_uses_current_status_generation_and_binding_and_writer_recheck
 
 #[derive(Default)]
 struct Routes {
-    reads: Mutex<Vec<SqliteReadEvent>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadEvent>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
     queued: tokio::sync::Notify,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if matches!(event, SqliteReadEvent::AdmissionEnqueued { active: 1, .. }) {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if matches!(event, PostgresReadEvent::AdmissionEnqueued { active: 1, .. }) {
             self.queued.notify_one();
         }
         self.reads.lock().unwrap().push(event);
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
     }
 }
@@ -394,9 +394,9 @@ async fn observed_store() -> (CompactionStore, Arc<Routes>) {
         .await
         .unwrap();
     let routes = Arc::new(Routes::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, routes.clone()),
+        PostgresWriteExecutor::with_observer(writer, routes.clone()),
         routes.clone(),
     );
     let (store, _) = fixture_in_store(
@@ -405,7 +405,7 @@ async fn observed_store() -> (CompactionStore, Arc<Routes>) {
         ["cp-0", "cp-1"],
     )
     .await;
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     (store, routes)
 }
 
@@ -444,7 +444,7 @@ async fn ineligible_checkpoint_pages_have_bounded_database_work() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
+        .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
         .count() as u64;
     // Allow discovery plus one admission per page and the frontier/EOF reads.
     // This protects the resource budget, not a particular SQL implementation.
@@ -494,8 +494,8 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
         assert!(routes.writes.lock().unwrap().is_empty());
         assert!(routes.reads.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 active: 1,
                 queue_depth: 0,
                 ..
@@ -514,21 +514,21 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
         assert_eq!(restart.discard.as_ref().unwrap().id, "cp-1");
         assert!(routes.reads.lock().unwrap().iter().all(|e| !matches!(
             e,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
                 ..
             }
         )));
         assert!(routes.reads.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteReadEvent::OperationFinished {
-                outcome: SqliteReadOutcome::Cancelled,
+            PostgresReadEvent::OperationFinished {
+                outcome: PostgresReadOutcome::Cancelled,
                 ..
             }
         )));
         assert!(routes.reads.lock().unwrap().iter().any(|e| matches!(
             e,
-            SqliteReadEvent::AdmissionReleased {
+            PostgresReadEvent::AdmissionReleased {
                 active: 0,
                 queue_depth: 0,
                 ..
@@ -550,15 +550,15 @@ async fn cancelled_discovery_or_late_read_releases_maintenance_capacity_for_retr
     );
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Maintenance,
             ..
         }
     )));
     assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(
         e,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Interactive | SqliteWriteClass::Critical,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Interactive | PostgresWriteClass::Critical,
             ..
         }
     )));

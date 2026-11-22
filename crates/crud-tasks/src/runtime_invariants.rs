@@ -5,7 +5,7 @@ use pioneer_crud_execution::attempt_values::{
     ATTEMPT_STATUS_RUNNING, TURN_ITEM_STATUS_CANCELLED, TURN_ITEM_STATUS_COMPLETED,
     TURN_ITEM_STATUS_FAILED, TURN_ITEM_STATUS_TIMED_OUT,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::collections::HashMap;
 
@@ -57,7 +57,7 @@ pub struct TaskRuntimeInvariantStaleAttemptRecord {
 }
 
 pub async fn load_task_runtime_invariant_snapshot(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
 ) -> Result<TaskRuntimeInvariantSnapshot> {
     let reader = db.begin_read().await?;
     let event_rows = pioneer_entity::task_event::Entity::find()

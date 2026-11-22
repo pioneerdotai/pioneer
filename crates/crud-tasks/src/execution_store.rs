@@ -12,28 +12,28 @@ use anyhow::{Context, Result, bail};
 use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_execution::execution_admission_lease;
 use pioneer_crud_execution::gateway_control::{GatewayControlWake, control_work_change};
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
+    retry_with_backoff,
+};
 use pioneer_protocol::TurnStatus;
 use pioneer_protocol::{
     TaskError, TaskExecutorKind, TaskResult, TaskRunExecution, TaskRunExecutionStatus,
     TaskRunStatus, generate_id,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    retry_with_backoff,
-};
 use sea_orm::{ConnectionTrait, EntityTrait, QuerySelect, TransactionTrait};
 use std::{future::Future, time::Duration};
 
 pub struct TaskExecutionStore<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> TaskExecutionStore<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -98,7 +98,7 @@ impl<'a> TaskExecutionStore<'a> {
         let result = async {
             let run_id = run_id.to_owned();
             let worker_id = worker_id.to_owned();
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.claim_task_run_execution_with_occurrence_once(
                     run_id.clone(),
                     executor_kind,
@@ -219,7 +219,7 @@ impl<'a> TaskExecutionStore<'a> {
             _ => bail!("active Task occurrence sync requires queued or waiting-review status"),
         };
         let run_id = run_id.to_owned();
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             let run_id = run_id.clone();
             let expected_run_status_db = expected_run_status_db.clone();
             let desired_occurrence_status = desired_occurrence_status.clone();
@@ -289,7 +289,7 @@ impl<'a> TaskExecutionStore<'a> {
         executor_kind: TaskExecutorKind,
         now: i64,
     ) -> Result<TaskRunExecution> {
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             self.reserve_execution_for_run_once(run_id.to_owned(), executor_kind, now)
         })
         .await
@@ -369,7 +369,7 @@ impl<'a> TaskExecutionStore<'a> {
             .map(task_run_execution_from_db_model)
             .transpose()?;
         let result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let tx = self.connection.begin().await?;
                 let outcome = task_run_execution::claim_execution(
                     &tx,
@@ -409,7 +409,7 @@ impl<'a> TaskExecutionStore<'a> {
                 .map(task_run_execution_from_db_model)
                 .transpose()?;
             let result = async {
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
                     let tx = self.connection.begin().await?;
                     let outcome = task_run_execution::mark_execution_running(
                         &tx,
@@ -460,7 +460,7 @@ impl<'a> TaskExecutionStore<'a> {
                 .map(task_run_execution_from_db_model)
                 .transpose()?;
             let result = async {
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -596,7 +596,7 @@ impl<'a> TaskExecutionStore<'a> {
     ) -> Result<Option<TaskRunExecution>> {
         let change = self.connection.work_signal("tasks.lifecycle").changing();
         let result = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()

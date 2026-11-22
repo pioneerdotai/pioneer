@@ -168,7 +168,7 @@ pub async fn find_turn_item_type<C: ConnectionTrait>(
 pub use crate::turn_item::find_turn_item_metadata;
 
 pub async fn find_turn_item(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     item_id: &str,
 ) -> Result<Option<turn_item::Model>> {
@@ -217,7 +217,7 @@ pub struct TimelineAssistantItemRow {
 }
 
 pub async fn timeline_assistant_items(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace_id: &str,
     thread_id: &str,
     targets: &[(String, String)],
@@ -360,7 +360,7 @@ pub struct ExactAgentMessageRow {
 }
 
 pub async fn exact_agent_messages(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
     targets: &[(String, String, String)],
 ) -> Result<Vec<ExactAgentMessageRow>> {
@@ -446,7 +446,7 @@ async fn capture_item_text<C: ConnectionTrait>(
 }
 
 pub async fn list_turn_items_by_ids(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     item_ids: &[String],
 ) -> Result<Vec<turn_item::Model>> {
@@ -465,7 +465,7 @@ pub async fn list_turn_items_by_ids(
 }
 
 pub async fn list_turn_items_by_type(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     item_type: &str,
 ) -> Result<Vec<turn_item::Model>> {
@@ -482,7 +482,7 @@ pub async fn list_turn_items_by_type(
 }
 
 pub async fn list_turn_items_by_type_for_turns(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_ids: &[String],
     item_type: &str,
 ) -> Result<Vec<turn_item::Model>> {
@@ -617,7 +617,7 @@ pub async fn find_turn_inputs_for_turns<C: ConnectionTrait>(
 }
 
 pub async fn find_completed_turn_items(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
 ) -> Result<Vec<turn_item::Model>> {
     crate::turn_payload::items(
@@ -676,7 +676,7 @@ pub async fn get_turn_location(
 }
 
 pub async fn get_turn_for_thread(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<Option<(String, pioneer_protocol::Turn)>> {
@@ -753,7 +753,7 @@ pub async fn get_turn_item_type(
 }
 
 pub async fn get_turn_item(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     item_id: &str,
 ) -> Result<Option<pioneer_protocol::TurnItem>> {
@@ -767,7 +767,7 @@ pub async fn get_turn_item(
 }
 
 pub async fn list_decoded_turn_items_by_type(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
     item_type: &str,
 ) -> Result<Vec<pioneer_protocol::TurnItem>> {

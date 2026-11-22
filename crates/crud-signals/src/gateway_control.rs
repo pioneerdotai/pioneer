@@ -98,10 +98,10 @@ impl GatewayControlWake {
 }
 
 pub fn control_work_change(
-    database: &pioneer_sqlite::SqliteDatabase,
+    database: &pioneer_postgres_pools::PostgresDatabase,
     domain: &'static str,
     work: &[GatewayControlWake],
-) -> pioneer_sqlite::WorkChange {
+) -> pioneer_postgres_pools::WorkChange {
     let change = database.work_signal(domain).changing();
     if matches!(domain, "gateway.control" | "gateway.cli") {
         change.with_keys(&work.iter().map(GatewayControlWake::key).collect::<Vec<_>>())

@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use migration::Migrator;
 use pioneer_config::AppConfig;
 use pioneer_postgres::BundledPostgres;
-use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+use pioneer_postgres_pools::{PostgresDatabase, PostgresWriteExecutor};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 #[path = "query_fingerprint.rs"]
@@ -26,7 +26,7 @@ pub(crate) async fn inspect_applied_migration_names(
         runtime_home,
         app_config,
         OperatorAccess::ReadOnly,
-        async |database| {
+        async |database, _| {
             pioneer_crud::CrudStore::new(database)
                 .with_maintenance_access()
                 .inspect_applied_migration_names()
@@ -40,7 +40,7 @@ pub async fn initialize_with_startup(
     runtime_home: &Path,
     app_config: &AppConfig,
     startup: &pioneer_observability::GatewayStartupTrace,
-) -> Result<(SqliteDatabase, Option<BundledPostgres>)> {
+) -> Result<(PostgresDatabase, Option<BundledPostgres>)> {
     use pioneer_observability::{DatabaseRole, GatewayStartupStage};
     let database_config = &app_config.gateway.database;
     ensure_postgres_pool_config(database_config)?;
@@ -48,7 +48,7 @@ pub async fn initialize_with_startup(
     let capacity = database_config.max_connections.max(4);
     let postgres;
     let (mut writer_options, mut reader_options) =
-        if let Some(options) = development_options(app_config, capacity)? {
+        if let Some(options) = external_options(runtime_home, app_config, capacity)? {
             postgres = None;
             options
         } else {
@@ -89,7 +89,7 @@ pub async fn initialize_with_startup(
             let stage = startup.stage(GatewayStartupStage::DatabaseMigrate);
             if let Err(error) = Migrator::up(&writer, None).await {
                 let _ = writer.close().await;
-                return Err(error).context("apply development PostgreSQL migrations");
+                return Err(error).context("apply Gateway PostgreSQL migrations");
             }
             stage.succeed();
         }
@@ -97,7 +97,7 @@ pub async fn initialize_with_startup(
             Ok(reader) => reader,
             Err(_) => {
                 let _ = writer.close().await;
-                anyhow::bail!("open private Gateway PostgreSQL reader pool");
+                anyhow::bail!("open Gateway PostgreSQL reader pool");
             }
         };
         let fingerprints = Arc::new(QueryFingerprintLimiter::default());
@@ -108,15 +108,15 @@ pub async fn initialize_with_startup(
             fingerprints.clone(),
         );
         configure_observability(&mut reader, DatabaseRole::Reader, capacity, fingerprints);
-        let executor = SqliteWriteExecutor::with_observer(writer, super::write_observer());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let executor = PostgresWriteExecutor::with_observer(writer, super::write_observer());
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
             executor,
             super::read_observer(),
         );
         if let Err(error) = database.maintenance().validate_reader().await {
             let _ = database.close().await;
-            return Err(error).context("validate private Gateway PostgreSQL read pool");
+            return Err(error).context("validate Gateway PostgreSQL read pool");
         }
         Ok(database)
     }
@@ -132,37 +132,86 @@ pub async fn initialize_with_startup(
     }
 }
 
-fn development_options(
+fn external_options(
+    runtime_home: &Path,
     config: &AppConfig,
     capacity: u32,
 ) -> Result<Option<(ConnectOptions, ConnectOptions)>> {
-    let Some(url) = &config.gateway.database.development_url else {
-        return Ok(None);
+    let database_config = &config.gateway.database;
+    let (url, source) = if let Some(url) = &database_config.development_url {
+        anyhow::ensure!(
+            pioneer_config::RuntimeEnvironment::current()
+                == pioneer_config::RuntimeEnvironment::Development,
+            "gateway.database.development_url is only available in development"
+        );
+        (url.as_str().to_owned(), "gateway.database.development_url")
+    } else {
+        let Some(url) = external_database_url(runtime_home)? else {
+            return Ok(None);
+        };
+        (url, "DATABASE_URL")
     };
-    anyhow::ensure!(
-        pioneer_config::RuntimeEnvironment::current()
-            == pioneer_config::RuntimeEnvironment::Development,
-        "gateway.database.development_url is only available in development"
-    );
-    let parsed = url::Url::parse(url.as_str())
-        .map_err(|_| anyhow::anyhow!("invalid development PostgreSQL URL"))?;
-    anyhow::ensure!(
-        matches!(parsed.scheme(), "postgres" | "postgresql")
-            && !parsed.username().is_empty()
-            && parsed.path() != "/postgres"
-            && parsed.path().len() > 1,
-        "development PostgreSQL URL must select an explicit role and an application database"
-    );
-    let mut writer = ConnectOptions::new(parsed.to_string());
-    writer
-        .min_connections(0)
-        .max_connections(capacity)
-        .sqlx_logging(false);
+    let writer = external_writer_options(&url, source, capacity, database_config)?;
     let mut reader = writer.clone();
     reader.map_sqlx_postgres_opts(|options| {
         options.options([("default_transaction_read_only", "on")])
     });
     Ok(Some((writer, reader)))
+}
+
+fn external_database_url(runtime_home: &Path) -> Result<Option<String>> {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) => return Ok(Some(url)),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("DATABASE_URL must be UTF-8"),
+    }
+
+    let entries = match dotenvy::from_path_iter(runtime_home.join(".env")) {
+        Ok(entries) => entries,
+        Err(error) if error.not_found() => return Ok(None),
+        Err(_) => anyhow::bail!("open Gateway runtime .env"),
+    };
+    for entry in entries {
+        // dotenvy syntax errors include the original line and can expose credentials.
+        let (key, value) = entry.map_err(|_| anyhow::anyhow!("parse Gateway runtime .env"))?;
+        if key == "DATABASE_URL" {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn external_writer_options(
+    url: &str,
+    source: &str,
+    capacity: u32,
+    config: &pioneer_config::GatewayDatabaseConfig,
+) -> Result<ConnectOptions> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| anyhow::anyhow!("{source} must be a valid PostgreSQL URL"))?;
+    let session = url
+        .parse::<sea_orm::sqlx::postgres::PgConnectOptions>()
+        .map_err(|_| anyhow::anyhow!("{source} must be a valid PostgreSQL URL"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "postgres" | "postgresql")
+            && !parsed.username().is_empty()
+            && !parsed.path().trim_start_matches('/').is_empty()
+            && !session.get_username().is_empty()
+            && session.get_database().is_some_and(|database| {
+                !matches!(database, "" | "postgres" | "template0" | "template1")
+            }),
+        "{source} must select an explicit role and a PostgreSQL application database"
+    );
+
+    let mut writer = ConnectOptions::new(parsed.to_string());
+    writer
+        .min_connections(0)
+        .max_connections(capacity)
+        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+        .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
+        .idle_timeout(Duration::from_millis(config.idle_timeout_ms))
+        .sqlx_logging(false);
+    Ok(writer)
 }
 
 fn ensure_postgres_pool_config(database: &pioneer_config::GatewayDatabaseConfig) -> Result<()> {
@@ -191,6 +240,25 @@ fn configure_observability(
     );
 }
 
+/// Coordinates Gateway and offline writers that share a runtime home.
+pub(crate) fn lock_gateway_database_owner(runtime_home: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let owner = options
+        .open(runtime_home.join("gateway-database.lock"))
+        .context("open Gateway database ownership lock")?;
+    match fs4::FileExt::try_lock(&owner) {
+        Ok(()) => Ok(owner),
+        Err(fs4::TryLockError::WouldBlock) => Err(pioneer_postgres::ClusterBusy.into()),
+        Err(error) => Err(error).context("lock Gateway database ownership"),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperatorAccess {
     ReadOnly,
@@ -201,12 +269,20 @@ pub(crate) async fn with_existing_database<T>(
     runtime_home: &Path,
     app_config: &AppConfig,
     access: OperatorAccess,
-    operation: impl AsyncFnOnce(SqliteDatabase) -> Result<T>,
+    operation: impl AsyncFnOnce(PostgresDatabase, Option<PathBuf>) -> Result<T>,
 ) -> Result<Option<T>> {
     let mut owned = None;
     let prepared = async {
-        let (writer, reader) = if let Some((writer, reader)) = development_options(app_config, 2)? {
-            operator_pools(writer, reader, access).await?
+        let (writer, reader, data_directory, _external_owner) = if let Some((writer, reader)) =
+            external_options(runtime_home, app_config, 2)?
+        {
+            let owner = if access == OperatorAccess::Write {
+                Some(lock_gateway_database_owner(runtime_home)?)
+            } else {
+                None
+            };
+            let (writer, reader) = operator_pools(writer, reader, access).await?;
+            (writer, reader, None, owner)
         } else {
             let directory = pioneer_postgres::data_directory(runtime_home);
             match std::fs::metadata(directory.join("PG_VERSION")) {
@@ -221,32 +297,34 @@ pub(crate) async fn with_existing_database<T>(
                 Some(installed) => installed.binary_path,
                 None => std::env::current_exe().context("locate Gateway executable")?,
             };
-            match BundledPostgres::start_existing(runtime_home, &executable).await {
-                Ok(instance) => {
-                    let writer = instance.connect_options(2);
-                    let reader = instance.reader_options(2);
-                    owned = Some(instance);
-                    operator_pools(writer, reader, access).await?
-                }
-                Err(error)
-                    if access == OperatorAccess::ReadOnly
-                        && error
-                            .downcast_ref::<pioneer_postgres::ClusterBusy>()
-                            .is_some() =>
-                {
-                    let reader = BundledPostgres::running_reader(runtime_home).await?;
-                    (reader.clone(), reader)
-                }
-                Err(error) => return Err(error),
-            }
+            let (writer, reader) =
+                match BundledPostgres::start_existing(runtime_home, &executable).await {
+                    Ok(instance) => {
+                        let writer = instance.connect_options(2);
+                        let reader = instance.reader_options(2);
+                        owned = Some(instance);
+                        operator_pools(writer, reader, access).await?
+                    }
+                    Err(error)
+                        if access == OperatorAccess::ReadOnly
+                            && error
+                                .downcast_ref::<pioneer_postgres::ClusterBusy>()
+                                .is_some() =>
+                    {
+                        let reader = BundledPostgres::running_reader(runtime_home).await?;
+                        (reader.clone(), reader)
+                    }
+                    Err(error) => return Err(error),
+                };
+            (writer, reader, Some(directory), None)
         };
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, super::write_observer()),
+            PostgresWriteExecutor::with_observer(writer, super::write_observer()),
             super::read_observer(),
         )
         .maintenance();
-        let result = operation(database.clone()).await;
+        let result = operation(database.clone(), data_directory).await;
         let closed = database.close().await;
         let result = result?;
         closed.context("close Gateway operator pools")?;
@@ -364,6 +442,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_runtime_dotenv_selects_external_postgres_for_startup_and_inspection()
+    -> anyhow::Result<()> {
+        pioneer_postgres_test::with_empty_database(async |fixture| {
+            let home = tempfile::tempdir()?;
+            std::fs::write(
+                home.path().join(".env"),
+                format!("DATABASE_URL={}\n", fixture.url()),
+            )?;
+            let mut config = pioneer_config::AppConfig::load()?;
+            config.gateway.database.development_url = None;
+            let trace = pioneer_observability::GatewayStartupTrace::start();
+            let owner = super::lock_gateway_database_owner(home.path())?;
+
+            let (database, bundled) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(bundled.is_none());
+            let transaction = database.begin().await?;
+            transaction
+                .execute_unprepared(
+                    "INSERT INTO workspace (id, name) VALUES ('external', 'External database')",
+                )
+                .await?;
+            transaction.commit().await?;
+
+            let busy = super::with_existing_database(
+                home.path(),
+                &config,
+                super::OperatorAccess::Write,
+                async |_, _| Ok(()),
+            )
+            .await
+            .unwrap_err();
+            assert!(busy.is::<pioneer_postgres::ClusterBusy>());
+
+            let migrations = super::inspect_applied_migration_names(home.path(), &config)
+                .await?
+                .expect("external database migration history");
+            assert_eq!(migrations.len(), Migrator::migrations().len());
+            database.close().await?;
+            drop(owner);
+            let _owner = super::lock_gateway_database_owner(home.path())?;
+
+            let (restarted, bundled) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(bundled.is_none());
+            assert!(restarted.reader_is_read_only().await?);
+            let workspace = restarted
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT name FROM workspace WHERE id = 'external'",
+                ))
+                .await?
+                .expect("workspace persisted across restart");
+            assert_eq!(
+                workspace.try_get::<String>("", "name")?,
+                "External database"
+            );
+            restarted.close().await?;
+            assert!(!home.path().join("postgres").exists());
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn installer_inspection_reads_postgres_history_without_applying_migrations()
     -> anyhow::Result<()> {
         pioneer_postgres_test::with_empty_database(async |fixture| {
@@ -404,16 +547,16 @@ mod tests {
             DatabaseOperation::Select
         );
         assert_eq!(
-            super::classify_operation("insert into turn values (?)"),
+            super::classify_operation("insert into turn values ($1)"),
             DatabaseOperation::Insert
         );
         assert_eq!(
-            super::classify_operation("BEGIN IMMEDIATE"),
+            super::classify_operation("BEGIN"),
             DatabaseOperation::Transaction
         );
         assert_eq!(
-            super::classify_operation("PRAGMA journal_mode"),
-            DatabaseOperation::Pragma
+            super::classify_operation("EXPLAIN SELECT 1"),
+            DatabaseOperation::Select
         );
         assert_eq!(
             super::classify_operation("WITH rows AS (...) SELECT 1"),
@@ -655,7 +798,7 @@ mod tests {
             assert!(process.is_none());
             assert_eq!(database.reader_max_connections(), 4);
             assert_eq!(database.writer_max_connections(), 4);
-            assert!(database.reader_query_only_enabled().await?);
+            assert!(database.reader_is_read_only().await?);
             database.execute_unprepared(
                 "CREATE TABLE routing_probe (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, value text NOT NULL)"
             ).await?;

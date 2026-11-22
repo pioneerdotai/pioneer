@@ -438,11 +438,11 @@ async fn native_cancellation_inherits_operation_scope_and_cancelled_writer_wait_
     let maintenance = store.with_maintenance_access();
     assert_eq!(
         maintenance.database_connection().read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
+        pioneer_postgres_pools::PostgresReadClass::Maintenance
     );
     assert_eq!(
         maintenance.database_connection().write_class(),
-        pioneer_sqlite::SqliteWriteClass::Maintenance
+        pioneer_postgres_pools::PostgresWriteClass::Maintenance
     );
     let context = store
         .native_cancellation_context(&turn.id)
@@ -473,36 +473,37 @@ async fn native_cancellation_inherits_operation_scope_and_cancelled_writer_wait_
 
 #[derive(Default)]
 struct CancellationRoutes {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     changed: tokio::sync::Notify,
 }
-impl pioneer_sqlite::SqliteReadObserver for CancellationRoutes {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for CancellationRoutes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for CancellationRoutes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for CancellationRoutes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
         self.changed.notify_one();
     }
 }
 #[pioneer_postgres_test::postgres_test]
 async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_reservation() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresWriteClass, PostgresWriteEvent,
+        PostgresWriteExecutor,
     };
     use sea_orm::IntoActiveModel;
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
     let routes = Arc::new(CancellationRoutes::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, routes.clone()),
+        PostgresWriteExecutor::with_observer(writer, routes.clone()),
         routes.clone(),
     );
     let store = CrudStore::new(database.clone());
@@ -554,12 +555,12 @@ async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_re
             .reads
             .lock()
             .unwrap()
-            .contains(&SqliteReadClass::Maintenance)
+            .contains(&PostgresReadClass::Maintenance)
     );
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Maintenance,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Maintenance,
             ..
         }
     )));
@@ -586,8 +587,8 @@ async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_re
             if routes.writes.lock().unwrap()[before..].iter().any(|e| {
                 matches!(
                     e,
-                    SqliteWriteEvent::Enqueued {
-                        class: SqliteWriteClass::Maintenance,
+                    PostgresWriteEvent::Enqueued {
+                        class: PostgresWriteClass::Maintenance,
                         ..
                     }
                 )
@@ -602,7 +603,7 @@ async fn native_cancellation_physical_routes_atomic_event_order_and_cancelled_re
     queued.abort();
     assert!(queued.await.unwrap_err().is_cancelled());
     assert!(routes.writes.lock().unwrap()[before..].iter().any(|e| matches!(e,
-        SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+        PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
     blocker.rollback().await.unwrap();
     let (interactive, background) = tokio::join!(
         cancel(&store, &turn, &plan, "cancel"),
@@ -1260,7 +1261,7 @@ async fn native_cancellation_owner_change_and_health_restore_cannot_clear_fence(
 }
 
 async fn migrate_with<M: MigratorTrait>(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     steps: Option<u32>,
     down: bool,
 ) -> std::result::Result<(), sea_orm::DbErr> {
@@ -1279,7 +1280,7 @@ async fn migrate_with<M: MigratorTrait>(
     }
 }
 
-async fn assert_upgrade_schema(db: &pioneer_sqlite::SqliteDatabase, installed: bool) {
+async fn assert_upgrade_schema(db: &pioneer_postgres_pools::PostgresDatabase, installed: bool) {
     use migration::SchemaManager;
     let transaction = db.begin().await.unwrap();
     let schema = SchemaManager::new(&*transaction);
@@ -1939,7 +1940,7 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
                             .unwrap();
                     // Commit real canonical acceptance without its aggregate projection.
                     store
-                        .run_serialized_write(|| async {
+                        .retry_write_on_conflict(|| async {
                             let tx = store.connection.begin().await?;
                             let event =
                                 pioneer_crud_execution::event_append::append_prepared_event(

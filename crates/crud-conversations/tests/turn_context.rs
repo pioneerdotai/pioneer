@@ -174,7 +174,7 @@ async fn turn_llm_context_repository_round_trips_and_cleans_terminal_turns() {
         let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
             .unwrap()
             .fixed_offset();
-        let db = pioneer_sqlite::SqliteDatabase::new(
+        let db = pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connection().clone(),
         );

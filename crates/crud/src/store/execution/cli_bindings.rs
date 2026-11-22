@@ -266,7 +266,7 @@ impl CrudStore {
         metadata: CliRuntimeTurnMcpMetadata,
     ) -> Result<CliRuntimeTurnBindingRecord> {
         let turn_id = turn_id.to_owned();
-        let result = self.run_serialized_write(|| async {
+        let result = self.retry_write_on_conflict(|| async {
             let transaction = self
                 .connection
                 .begin()

@@ -2,7 +2,7 @@ use pioneer_crud_conversations::turn_order::{
     latest_turn_id_by_creation_order, turn_before_launch_and_intervening_by_creation_order,
     turn_ids_after_by_creation_order,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
 #[pioneer_postgres_test::postgres_test]
@@ -30,7 +30,7 @@ async fn cli_predecessor_uses_history_timestamp_sequence_and_insertion_ordinal()
     )
     .await
     .unwrap();
-    let scoped = SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
+    let scoped = PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), db.clone());
     let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap();
     assert_eq!(
         turn_before_launch_and_intervening_by_creation_order(

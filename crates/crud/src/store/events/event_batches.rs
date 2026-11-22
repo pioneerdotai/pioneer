@@ -100,7 +100,7 @@ impl CrudStore {
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
 
-        self.run_serialized_write(|| {
+        self.retry_write_on_conflict(|| {
             self.materialize_turn_events_atomically_once(
                 _ownership_change.as_ref(),
                 events.clone(),

@@ -17,4 +17,4 @@ cargo run --locked -p pioneer-migration -- --database-url "$PIONEER_POSTGRES_URL
 SeaORM applies PostgreSQL migrations and their ledger entries in the same
 transaction. On a disposable database, `down -n 1` rolls back the last migration
 and `reset` rolls back the whole chain. The shared `vector` extension survives
-rollback. Use the 0.x release history to inspect the SQLite migration chain.
+rollback. The pre-1.0 migration chain is available in the 0.x release history.

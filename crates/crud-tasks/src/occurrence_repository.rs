@@ -10,11 +10,11 @@ use crate::task_occurrence_reconcile::{
 use crate::values::unix_to_datetime;
 use anyhow::{Context, Result};
 use pioneer_entity::task_occurrence_reconcile_pending as pending;
-use pioneer_protocol::generate_id;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     retry_with_backoff,
 };
+use pioneer_protocol::generate_id;
 use sea_orm::{EntityTrait, TransactionTrait};
 use std::{future::Future, time::Duration};
 
@@ -31,11 +31,11 @@ pub enum TaskOccurrenceTerminalRepairOutcome {
 
 #[derive(Clone)]
 pub struct TaskOccurrenceRepository {
-    connection: SqliteDatabase,
+    connection: PostgresDatabase,
 }
 
 impl TaskOccurrenceRepository {
-    pub fn new(connection: SqliteDatabase) -> Self {
+    pub fn new(connection: PostgresDatabase) -> Self {
         Self { connection }
     }
 
@@ -43,7 +43,7 @@ impl TaskOccurrenceRepository {
         Self::new(self.connection.maintenance())
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -153,7 +153,7 @@ impl TaskOccurrenceRepository {
         run_id: &str,
         now: i64,
     ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
-        self.run_serialized_write(|| self.commit_terminal_task_occurrence(run_id, now, None))
+        self.retry_write_on_conflict(|| self.commit_terminal_task_occurrence(run_id, now, None))
             .await
     }
 
@@ -270,7 +270,7 @@ impl TaskOccurrenceRepository {
             .get_task_occurrence_contract(&contract.occurrence_id)
             .await?;
         let result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self
                     .connection
                     .begin()

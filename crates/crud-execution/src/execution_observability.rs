@@ -1,6 +1,6 @@
 //! Immutable, scoped operation revisions. Financial evidence is retained apart
 //! from transcript payloads; all access uses the caller's database class.
-use crate::retry::run_serialized_write;
+use crate::retry::retry_write_on_conflict;
 use anyhow::{Context, Result, ensure};
 use pioneer_crud_conversations::{events::TurnEventPayload, turn_context::NewTurnLlmContextEntry};
 use pioneer_entity::{
@@ -531,7 +531,7 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
         &self,
         prepared: PreparedExecutionObservation,
     ) -> Result<()> {
-        run_serialized_write(|| async {
+        retry_write_on_conflict(|| async {
             let tx = self.connection.begin().await?;
             commit(&tx, &prepared).await?;
             tx.commit().await?;

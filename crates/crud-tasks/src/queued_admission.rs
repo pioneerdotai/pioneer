@@ -140,7 +140,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 )
                 .await?;
             let prepared = &prepared;
-            self.run_serialized_write(|| async move {
+            self.retry_write_on_conflict(|| async move {
                 let prepared = self.refresh_queue_admission(prepared).await?;
                 let transaction = self.connection.begin().await?;
                 let outcome = async {

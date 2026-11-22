@@ -8,11 +8,11 @@ use pioneer_crud_execution::{
     time::unix_to_datetime,
     turn_item_terminal::terminal_turn_item_status_from_payload,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 async fn publish_item(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     payload: TurnEventPayload,
     at: i64,
 ) -> anyhow::Result<()> {
@@ -45,7 +45,7 @@ async fn publish_item(
 #[pioneer_postgres_test::postgres_test]
 async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = SqliteDatabase::new(
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );
@@ -126,7 +126,7 @@ async fn timeline_approval_action_filters_before_pagination_and_anchor_lookup() 
         let owner_session_id = "S".repeat(21);
         let other_principal_id = "Q".repeat(21);
         let other_session_id = "R".repeat(21);
-        let db = SqliteDatabase::new(
+        let db = PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connection().clone(),
         );

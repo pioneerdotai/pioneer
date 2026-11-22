@@ -9,7 +9,7 @@ use pioneer_crud_compaction::frozen_import::{
 };
 use pioneer_crud_compaction::frozen_storage::{FrozenConversionProgress, maintain, prepare};
 use pioneer_entity::compaction_frozen_message_data;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{
     ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, Statement, TransactionTrait,
 };
@@ -17,7 +17,7 @@ use sea_orm::{
 #[pioneer_postgres_test::postgres_test]
 async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
-    let db = SqliteDatabase::new(
+    let db = PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connection().clone(),
     );
@@ -123,7 +123,7 @@ fn shared_descriptor(
     }
 }
 
-async fn capture(db: &SqliteDatabase, id: &str, refs: &[FrozenMessageRef], register: bool) {
+async fn capture(db: &PostgresDatabase, id: &str, refs: &[FrozenMessageRef], register: bool) {
     let descriptor = shared_descriptor(id, refs);
     compaction_begin_frozen_history_with_imports(
         db,

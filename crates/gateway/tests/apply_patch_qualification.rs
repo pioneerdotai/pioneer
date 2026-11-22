@@ -15,9 +15,9 @@ use pioneer_tools::apply_patch::file_mutation::{
 use pioneer_tools::apply_patch::history::{
     AppliedPatchRecord, AppliedPatchRecordOutcome, ChangeKind, CommitOrdinal,
     CommittedTextSnapshot, DurablePatchChange, HistoryQueryLimits, InvocationIdentity, LineEnding,
-    LineEndingMetadata, PatchSideEffects, SnapshotDomain, SqliteAppliedPatchStore,
-    SqliteCommitIntentStore, SqliteSnapshotStore, SqliteTurnDiffStore, TextEncoding,
-    TextSnapshotRef, TurnDiffAuthority, TurnDiffState, replay_turn_pages,
+    LineEndingMetadata, PatchSideEffects, PostgresAppliedPatchStore, PostgresCommitIntentStore,
+    PostgresSnapshotStore, PostgresTurnDiffStore, SnapshotDomain, TextEncoding, TextSnapshotRef,
+    TurnDiffAuthority, TurnDiffState, replay_turn_pages,
 };
 use pioneer_tools::apply_patch::{
     Hunk, HunkLine, UpdateFile, apply_update_with_candidate_limit, parse,
@@ -185,10 +185,10 @@ async fn durable_history_storage_and_query_resource_gates() {
             )
             .await
             .unwrap();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let snapshots = SqliteSnapshotStore::new(database.clone());
-        let intents = SqliteCommitIntentStore::new(database.clone());
-        let projections = SqliteTurnDiffStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
+        let projections = PostgresTurnDiffStore::new(database.clone());
         let domain = SnapshotDomain::new("thread:qualification", "pioneer", "thread_history");
         let alpha = snapshot(b"alpha\n");
         let beta = snapshot(b"beta\n");

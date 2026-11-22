@@ -126,6 +126,8 @@ def copy_runtime(pg, vector, prefix, destination, target):
     shutil.copytree(prefix / "share", destination / "share")
     shutil.copyfile(pg / "COPYRIGHT", destination / "LICENSE.postgresql")
     shutil.copyfile(vector / "LICENSE", destination / "LICENSE.pgvector")
+    shutil.copyfile(Path(__file__).resolve().parents[2] / "crates/postgres/LICENSE.pgconfig",
+                    destination / "LICENSE.pgconfig")
     if "apple-darwin" in target:
         relocate_macos(prefix, destination)
     for path in (destination / "bin").iterdir():

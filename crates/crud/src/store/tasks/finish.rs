@@ -27,7 +27,7 @@ impl CrudStore {
             [task_id.to_owned()],
         );
         let result = async {
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 self.request_task_finish_once(task_id, reason.clone(), at, &action)
             })
             .await

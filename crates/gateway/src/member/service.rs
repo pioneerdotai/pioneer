@@ -12,10 +12,7 @@ use pioneer_protocol::{
     RoleKey, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
     WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
 };
-use sea_orm::{
-    ConnectionTrait, SqliteTransactionMode, TransactionOptions, TransactionSession,
-    TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, TransactionSession, TransactionTrait};
 use sha2::Digest as _;
 
 use crate::administrative_audit::AdministrativeAuditWriter;
@@ -150,10 +147,7 @@ impl MemberService {
         }
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin Member suspension transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -273,10 +267,7 @@ impl MemberService {
         }
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin Member restore transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -388,10 +379,7 @@ impl MemberService {
         }
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin Member removal transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -799,10 +787,7 @@ impl MemberService {
         }
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin workspace member add transaction")
             .map_err(MemberServiceError::Unavailable)?;
@@ -901,10 +886,7 @@ impl MemberService {
         }
         let database = self.store.database_connection();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .context("failed to begin workspace member removal transaction")
             .map_err(MemberServiceError::Unavailable)?;

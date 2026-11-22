@@ -5,12 +5,12 @@ use pioneer_entity::{
     task_occurrence_reconcile_pending as pending, task_occurrence_reconcile_sequence as sequence,
     task_run, turn,
 };
-use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_protocol::TaskRunStatus;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     retry_with_backoff,
 };
+use pioneer_postgres_test::{TestDatabase, with_database};
+use pioneer_protocol::TaskRunStatus;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set, Statement,
@@ -18,9 +18,9 @@ use sea_orm::{
 };
 use std::time::Duration;
 
-async fn store(database: &TestDatabase) -> SqliteDatabase {
+async fn store(database: &TestDatabase) -> PostgresDatabase {
     let reader = database.connect_read_only().await.unwrap();
-    SqliteDatabase::new(reader, database.connection().clone()).maintenance()
+    PostgresDatabase::new(reader, database.connection().clone()).maintenance()
 }
 #[tokio::test]
 async fn terminal_parent_mismatch_is_removed_when_turn_projection_catches_up() {

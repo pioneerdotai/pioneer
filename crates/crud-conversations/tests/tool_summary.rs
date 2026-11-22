@@ -4,8 +4,8 @@ use pioneer_crud_conversations::{
     turn_item::{self, ItemWrite},
 };
 use pioneer_crud_payloads::{BLOCK_BYTES, storage::PreparedPayload};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::with_database;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 #[tokio::test]
@@ -46,7 +46,7 @@ async fn tool_summary_keeps_first_labels_and_counts_only_matching_items() -> Res
         }, &payload).await?;
         tx.commit().await?;
 
-        let scoped = SqliteDatabase::from_single_connection(connection.clone());
+        let scoped = PostgresDatabase::from_single_connection(connection.clone());
         let summary = tool_summary::list(&scoped, "turn", 1).await?;
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].item_id, "1-first");

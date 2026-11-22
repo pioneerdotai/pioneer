@@ -24,7 +24,7 @@ impl CrudStore {
         task_child_cleanup::ready(&self.connection, thread_id, turn_id).await
     }
 
-    /// Revalidate under the serialized writer and delete both capsule parts
+    /// Revalidate in the write transaction and delete both capsule parts
     /// atomically. Until commit, their presence is the durable retry token.
     pub async fn cleanup_terminal_task_child_capsule(
         &self,
@@ -40,7 +40,7 @@ impl CrudStore {
             self.connection.work_signal("maintenance.native").changing(),
         ];
         let maintenance_result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let tx =
                     task_child_cleanup::begin_authoritative(&self.connection).await?;
                 task_child_cleanup::lock_authority(&tx, thread_id, turn_id).await?;

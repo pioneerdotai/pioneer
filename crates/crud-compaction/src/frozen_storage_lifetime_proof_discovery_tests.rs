@@ -17,7 +17,7 @@ async fn metadata_fixture() -> (
     db.set_metric_callback(move |info| {
         captured.lock().unwrap().push(info.statement.clone());
     });
-    let store = CompactionStore::for_test(pioneer_sqlite::SqliteDatabase::new(
+    let store = CompactionStore::for_test(pioneer_postgres_pools::PostgresDatabase::new(
         db,
         fixture.connection().clone(),
     ))

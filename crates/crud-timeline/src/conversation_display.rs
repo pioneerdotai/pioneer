@@ -10,15 +10,15 @@ use pioneer_crud_conversations::{
 use pioneer_crud_tasks::{
     delivery as task_delivery, status::task_status_from_db, task as task_repository, task_run,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, ArtifactStatus, TaskStatus,
     TurnItem, UserInput,
 };
-use pioneer_sqlite::SqliteDatabase;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub struct ConversationDisplayStore<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 fn terminal_task_history_marker(status: TaskStatus) -> Option<&'static str> {
@@ -63,7 +63,7 @@ pub struct ConversationEntry {
 }
 
 impl<'a> ConversationDisplayStore<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 

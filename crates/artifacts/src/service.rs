@@ -1669,10 +1669,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     async fn scoped_store(database: &TestDatabase) -> Arc<CrudStore> {
-        Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-            database.connect_read_only().await.unwrap(),
-            database.connection().clone(),
-        )))
+        Arc::new(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(
+                database.connect_read_only().await.unwrap(),
+                database.connection().clone(),
+            ),
+        ))
     }
 
     struct TestHarness {

@@ -94,7 +94,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             let change = self.connection.work_signal("recovery.due").changing();
             let result = async {
                 let _ownership_change = heartbeats.changing(execution_owner_id);
-                self.run_serialized_write(|| async {
+                self.retry_write_on_conflict(|| async {
             let now = unix_to_datetime(now_unix);
             let Some(task_run_turn_model) =
                 task_run_turn::find_turn_by_thread_and_turn(&self.connection, thread_id, turn_id)

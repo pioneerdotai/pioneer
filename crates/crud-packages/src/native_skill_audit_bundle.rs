@@ -1,6 +1,6 @@
 //! Atomic, replayable delivery of native skill audit and dependency evidence.
 use anyhow::{Context, Result, bail};
-use pioneer_sqlite::{
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
     retry_with_backoff,
 };

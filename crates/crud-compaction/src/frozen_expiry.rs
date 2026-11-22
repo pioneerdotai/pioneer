@@ -8,7 +8,7 @@ use pioneer_entity::{
     compaction_operation as operation, compaction_operation_projection as projection,
     compaction_runner_plan as plan, compaction_runner_state as runner,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
@@ -28,7 +28,7 @@ use crate::sweep_work::retry_conflict;
 // unresolved checkpoint ownership is a separate prerequisite. Retaining
 // unknown Task inputs block both known workspace interpretations.
 pub async fn publish_expiry(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     readers: &ReaderCounts,
     header: &history::Model,
 ) -> Result<bool> {
@@ -324,7 +324,7 @@ impl LayoutCheck {
         self.done
     }
 
-    async fn new(db: &SqliteDatabase, id: &str, kind: i64) -> Result<Self> {
+    async fn new(db: &PostgresDatabase, id: &str, kind: i64) -> Result<Self> {
         let header = history::Entity::find_by_id(id)
             .one(db)
             .await?
@@ -333,7 +333,7 @@ impl LayoutCheck {
         let scan = LayoutScan::new(header, kind, kind + 1)?;
         Ok(Self { scan, done: false })
     }
-    pub async fn step(&mut self, db: &SqliteDatabase) -> Result<()> {
+    pub async fn step(&mut self, db: &PostgresDatabase) -> Result<()> {
         self.scan.step(db).await?;
         self.done = self.scan.done();
         Ok(())
@@ -444,7 +444,7 @@ impl ExpiryPreparation {
 
     pub async fn step(
         &mut self,
-        db: &SqliteDatabase,
+        db: &PostgresDatabase,
         readers: &ReaderCounts,
     ) -> Result<ExpiryStep> {
         if !self.roots_checked {

@@ -2,8 +2,8 @@
 //! a lease authority: only a fresh DB observation can establish Empty.
 use crate::turn_execution::{self, TurnExecutionRecord};
 use anyhow::{Context, Result};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -40,7 +40,7 @@ impl Registries {
     /// True means a fresh database observation permits the owner to park.
     pub async fn supervise(
         &self,
-        db: &SqliteDatabase,
+        db: &PostgresDatabase,
         owner_id: &str,
         lease_seconds: i64,
     ) -> Result<bool> {
@@ -90,7 +90,7 @@ impl Registries {
 }
 
 /// Extend active receipts using the PostgreSQL clock at each UPDATE attempt.
-pub async fn renew(db: &SqliteDatabase, owner: &str, lease_seconds: i64) -> Result<u64> {
+pub async fn renew(db: &PostgresDatabase, owner: &str, lease_seconds: i64) -> Result<u64> {
     retry_with_backoff(
         || turn_execution::heartbeat_owner(db, owner, lease_seconds),
         is_retryable_database_conflict,
@@ -334,7 +334,7 @@ mod parked_tests {
     #[tokio::test]
     async fn parked_heartbeat_has_no_database_dependency_but_bootstrap_errors_are_unknown() {
         pioneer_postgres_test::with_database(async |fixture| {
-            let db = SqliteDatabase::new(
+            let db = PostgresDatabase::new(
                 fixture.connect_read_only().await?,
                 fixture.connection().clone(),
             );

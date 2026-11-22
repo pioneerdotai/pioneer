@@ -1,8 +1,8 @@
 //! Atomic skill publication and removal.
 
 use anyhow::{Context, Result, bail};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{SkillId, SkillPackId};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
 use crate::plugins::{PluginNativeWrite, PluginOwnershipWrite};
@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub async fn insert_with_policy(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     installation: &SkillInstallationRecord,
     policy: &WorkspaceSkillPolicyRecord,
     event_timestamp_secs: i64,
@@ -69,7 +69,7 @@ pub async fn insert_with_policy(
 }
 
 pub async fn install(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     installation: &SkillInstallationRecord,
     policy: &WorkspaceSkillPolicyRecord,
     audit_records: &[SkillAuditEventRecord],
@@ -186,7 +186,7 @@ pub async fn install(
 }
 
 pub async fn uninstall(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     expected: &SkillInstallationRecord,
     audit_records: &[SkillAuditEventRecord],
     native: Option<&PluginNativeWrite>,
@@ -434,7 +434,7 @@ pub async fn revalidate_generic_skill_update_fence<C: ConnectionTrait>(
 }
 
 pub async fn update(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     skill_id: &SkillId,
     patch: &SkillInstallationPatch,
     audit_records: &[SkillAuditEventRecord],
@@ -581,7 +581,7 @@ pub async fn update(
 }
 
 pub async fn delete_with_workspace_policy(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace_id: &str,
     skill_id: &SkillId,
 ) -> Result<bool> {

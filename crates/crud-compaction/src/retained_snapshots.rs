@@ -11,7 +11,7 @@ use pioneer_crud_tasks::{
     },
     task_child_producers,
 };
-use pioneer_sqlite::{
+use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, retry_with_backoff,
 };
 use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, QuerySelect, Statement, TransactionTrait};

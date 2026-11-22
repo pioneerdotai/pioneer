@@ -1,5 +1,5 @@
 //! Scoped native runtime journal rows and idempotent append.
-use crate::retry::run_serialized_write;
+use crate::retry::retry_write_on_conflict;
 use anyhow::{Context, Result};
 use pioneer_entity::cli_runtime_native_event;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -225,11 +225,11 @@ fn native_event_record_from_model(
 }
 
 pub struct NativeEventRepository<'a> {
-    connection: &'a pioneer_sqlite::SqliteDatabase,
+    connection: &'a pioneer_postgres_pools::PostgresDatabase,
 }
 
 impl<'a> NativeEventRepository<'a> {
-    pub fn new(connection: &'a pioneer_sqlite::SqliteDatabase) -> Self {
+    pub fn new(connection: &'a pioneer_postgres_pools::PostgresDatabase) -> Self {
         Self { connection }
     }
 }
@@ -254,7 +254,7 @@ impl NativeEventRepository<'_> {
         let cli_result = async {
             let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
             let maintenance_result = async {
-                run_serialized_write(|| async {
+                retry_write_on_conflict(|| async {
                     append_native_event(self.connection, event.clone()).await
                 })
                 .await
@@ -294,7 +294,7 @@ impl NativeEventRepository<'_> {
         let cli_result = async {
             let cleanup_change = crate::terminal_cleanup::Change::native(self.connection);
             let maintenance_result = async {
-                run_serialized_write(|| async {
+                retry_write_on_conflict(|| async {
                     append_native_event_if_absent_with_outcome(self.connection, event.clone()).await
                 })
                 .await

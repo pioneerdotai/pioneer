@@ -1783,7 +1783,7 @@ impl MessageProcessor {
         workspace: &str,
         installation: &str,
     ) {
-        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let maintenance = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         let store = &maintenance.crud_store;
         let Ok(Some(owner)) = store.find_mcp_plugin_owner(installation).await else {
             return;

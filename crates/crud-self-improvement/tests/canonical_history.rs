@@ -40,7 +40,7 @@ async fn migrated_store(
         .await?;
     let store = HistoryFixture {
         writer: writer.clone(),
-        history: SelfImprovementStore::new(pioneer_sqlite::SqliteDatabase::new(
+        history: SelfImprovementStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             writer.clone(),
         )),

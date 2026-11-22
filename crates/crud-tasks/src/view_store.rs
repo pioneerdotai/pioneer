@@ -23,11 +23,11 @@ use pioneer_crud_execution::{
     gateway_control::{GatewayControlWake, control_work_change},
     native_terminal_effect_outbox,
 };
-use pioneer_protocol::*;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     retry_with_backoff,
 };
+use pioneer_protocol::*;
 use sea_orm::{EntityTrait, TransactionTrait};
 use std::{collections::HashMap, future::Future, time::Duration};
 
@@ -38,15 +38,15 @@ pub struct TaskRunChildAnchor {
 }
 
 pub struct TaskViewStore<'a> {
-    connection: &'a SqliteDatabase,
+    connection: &'a PostgresDatabase,
 }
 
 impl<'a> TaskViewStore<'a> {
-    pub fn new(connection: &'a SqliteDatabase) -> Self {
+    pub fn new(connection: &'a PostgresDatabase) -> Self {
         Self { connection }
     }
 
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T>
+    async fn retry_write_on_conflict<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -246,7 +246,7 @@ impl<'a> TaskViewStore<'a> {
         let change = TaskWorkChange::for_tasks(self.connection, [binding.task_id.clone()]);
         let before = self.get_task_run_thread_binding(&binding.id).await?;
         let result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 task_run_thread_binding::upsert_binding(
                     self.connection,
                     task_run_thread_binding::NewTaskRunThreadBinding {
@@ -354,7 +354,7 @@ impl<'a> TaskViewStore<'a> {
         let change = TaskWorkChange::for_source(self.connection, "v", id);
         let before = self.get_task_run_turn(id).await?;
         let result = async {
-            self.run_serialized_write(|| async {
+            self.retry_write_on_conflict(|| async {
                 let transaction = self.connection.begin().await?;
                 let row = task_run_turn::update_turn_status(&transaction, id, status, completed_at)
                     .await?;
@@ -435,7 +435,7 @@ impl<'a> TaskViewStore<'a> {
                 let prepared_candidate =
                     task_result_candidate::prepare_protocol_candidate(&candidate)?;
                 let persisted = self
-                    .run_serialized_write(|| {
+                    .retry_write_on_conflict(|| {
                         let prepared_candidate = prepared_candidate.clone();
                         async {
                             let candidate_status =
@@ -520,7 +520,7 @@ impl<'a> TaskViewStore<'a> {
             control_work_change(self.connection, "gateway.control", &control_wakes);
         let control_result = async {
             let persisted = self
-                .run_serialized_write(|| async {
+                .retry_write_on_conflict(|| async {
                     let Some(current) =
                         task_result_candidate::find_candidate_by_id(self.connection, id).await?
                     else {
@@ -666,7 +666,7 @@ impl<'a> TaskViewStore<'a> {
         let result = async {
             let prepared_review =
                 task_result_review_event::prepare_protocol_review_event(&review_event)?;
-            self.run_serialized_write(|| {
+            self.retry_write_on_conflict(|| {
                 let prepared_review = prepared_review.clone();
                 async {
                     task_result_review_event::upsert_review_event(self.connection, prepared_review)

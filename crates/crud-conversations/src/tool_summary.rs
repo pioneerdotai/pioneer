@@ -4,11 +4,11 @@ use pioneer_crud_payloads::{
     storage::{self, CapturedPayload, Selection},
 };
 use pioneer_entity::turn_item as item;
-use pioneer_protocol::{ToolErrorClass, ToolOutcomeStatus, TurnItemType};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     is_retryable_database_conflict, retry_with_backoff,
 };
+use pioneer_protocol::{ToolErrorClass, ToolOutcomeStatus, TurnItemType};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     entity::prelude::DateTimeWithTimeZone,
@@ -37,7 +37,7 @@ struct CapturedToolItem {
 }
 
 pub async fn list(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     turn_id: &str,
     limit: usize,
 ) -> Result<Vec<PostTurnToolSummary>> {

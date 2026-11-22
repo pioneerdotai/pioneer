@@ -32,7 +32,7 @@ pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 pioneer-apps.workspace = true
 pioneer-packages.workspace = true
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 serde_json.workspace = true
 serde.workspace = true
@@ -50,7 +50,7 @@ pioneer-crud-execution = { workspace = true, features = ["test-support"] }
 pioneer-crud-conversations = { workspace = true, features = ["test-support"] }
 pioneer-crud-compaction = { workspace = true, features = ["test-support"] }
 pioneer-crud-memory = { workspace = true, features = ["test-support"] }
-pioneer-sqlite = { workspace = true, features = ["test-support"] }
+pioneer-postgres-pools = { workspace = true, features = ["test-support"] }
 pioneer-crud-tasks = { workspace = true, features = ["test-support"] }
 pioneer-crud-access = { workspace = true, features = ["test-support"] }
 pioneer-postgres-test.workspace = true

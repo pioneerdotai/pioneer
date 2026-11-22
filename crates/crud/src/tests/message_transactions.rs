@@ -75,7 +75,7 @@ async fn concurrent_first_messages_share_one_thread_and_read_it_in_their_transac
             cached: false,
         };
 
-        let second_store = CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+        let second_store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
             fixture.connect_read_only().await?,
             fixture.connect().await?,
         ));

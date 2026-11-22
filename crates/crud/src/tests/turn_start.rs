@@ -1013,7 +1013,7 @@ async fn materialize_turn_start_persists_explicit_reasoning_effort() {
 }
 
 async fn read_fixture_event_payload(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     row: &pioneer_entity::turn_event::Model,
 ) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context;

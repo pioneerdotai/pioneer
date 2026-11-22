@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use pioneer_crud_execution::read_model_repair::{
     ReadModelInvariantKind, ReadModelInvariantViolation, RepairSummary,
 };
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
@@ -17,7 +17,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
     pub async fn repair_terminal_tasks_missing_completed_at(&self) -> Result<RepairSummary> {
         let terminal_statuses = ["completed", "failed", "blocked", "cancelled"];
         let high_watermark = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 pioneer_entity::task::Entity::find()
                     .filter(pioneer_entity::task::Column::Status.is_in(terminal_statuses))
                     .filter(pioneer_entity::task::Column::CompletedAt.is_null())
@@ -38,7 +38,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             let cursor_for_query = cursor.clone();
             let high_watermark_for_query = high_watermark.clone();
             let rows = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let cursor = cursor_for_query.clone();
                     let high_watermark = high_watermark_for_query.clone();
                     async move {
@@ -73,7 +73,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
             let ids_for_write = ids.clone();
             let repaired = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let ids = ids_for_write.clone();
                     async move {
                         let transaction = self
@@ -113,7 +113,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
 
     pub async fn repair_terminal_runs_missing_completed_at(&self) -> Result<RepairSummary> {
         let high_watermark = self
-            .run_serialized_write(|| async {
+            .retry_write_on_conflict(|| async {
                 crate::task_run::missing_completion_high_watermark(&self.connection).await
             })
             .await?;
@@ -127,7 +127,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             let cursor_for_query = cursor.clone();
             let high_watermark_for_query = high_watermark.clone();
             let rows = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let cursor = cursor_for_query.clone();
                     let high_watermark = high_watermark_for_query.clone();
                     async move {
@@ -147,7 +147,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
             cursor = rows.last().cloned();
             summary.detected = summary.detected.saturating_add(rows.len());
             let repaired = self
-                .run_serialized_write(|| {
+                .retry_write_on_conflict(|| {
                     let ids = rows.clone();
                     async move {
                         let transaction = self
@@ -176,7 +176,7 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
 }
 
 pub async fn list_task_invariant_violations(
-    connection: &SqliteDatabase,
+    connection: &PostgresDatabase,
 ) -> Result<Vec<ReadModelInvariantViolation>> {
     let mut violations = Vec::new();
     let terminal_tasks_missing_completed_at = pioneer_entity::task::Entity::find()

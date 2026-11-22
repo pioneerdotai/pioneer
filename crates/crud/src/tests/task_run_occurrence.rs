@@ -676,28 +676,28 @@ async fn resume_of_old_blocked_run_invalidates_claim_then_subsequent_completion_
 
 #[derive(Default)]
 struct Routes {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     maintenance_queued: tokio::sync::Notify,
     watch_claim: std::sync::atomic::AtomicBool,
     critical_queued: tokio::sync::Notify,
     watch_repair: std::sync::atomic::AtomicBool,
 }
-impl pioneer_sqlite::SqliteReadObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
         if self.watch_claim.load(Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             )
@@ -707,8 +707,8 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
         if self.watch_repair.load(Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Critical,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Critical,
                     ..
                 }
             )
@@ -732,9 +732,12 @@ async fn observed_store(
         })
         .await
         .unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, routes.clone());
     CrudStore::new(
-        pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
+        pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
+            reader, executor, routes,
+        ),
     )
 }
 async fn populate_disk_pair(store: &CrudStore) -> String {
@@ -841,7 +844,7 @@ async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_l
 
 #[pioneer_postgres_test::postgres_test]
 async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_executor() {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass, SqliteWriteEvent};
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass, PostgresWriteEvent};
     use std::time::Duration;
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let routes = Arc::new(Routes::default());
@@ -860,7 +863,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
     assert!(
         routes.writes.lock().unwrap().is_empty(),
@@ -891,7 +894,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
         before,
         "cancelled queued claim never changed durable attempt"
     );
-    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
+    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,PostgresWriteEvent::Cancelled {class:PostgresWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
     let claim = store
@@ -905,9 +908,9 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
-    assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(e,SqliteWriteEvent::Enqueued {class,..} if *class!=SqliteWriteClass::Maintenance)));
+    assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(e,PostgresWriteEvent::Enqueued {class,..} if *class!=PostgresWriteClass::Maintenance)));
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
     let events_before = pioneer_entity::turn_event::Entity::find()
@@ -943,7 +946,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     cancellation.abort();
     assert!(cancellation.await.unwrap_err().is_cancelled());
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(e,
-        SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Critical,queue,..} if queue.critical == 0)));
+        PostgresWriteEvent::Cancelled {class:PostgresWriteClass::Critical,queue,..} if queue.critical == 0)));
     hold.rollback().await.unwrap();
     assert_eq!(
         turns::Entity::find_by_id(&id)
@@ -990,27 +993,27 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));
     assert!(!routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Interactive,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Interactive,
             ..
         }
     )));
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     // Mutating RETURNING must route to the writer, even through query_one_raw.
     store.with_maintenance_access().connection.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "UPDATE task_run_occurrence_reconcile_sequence SET generation=generation WHERE singleton=$1 RETURNING generation",[1_i64.into()])).await.unwrap().unwrap();
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     store.connection.close().await.unwrap();
 }
 

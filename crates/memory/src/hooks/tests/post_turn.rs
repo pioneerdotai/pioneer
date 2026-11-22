@@ -852,9 +852,9 @@ async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_
     fact["facts"][0]["semantic"]["scope_hint"] = serde_json::json!("project_workspace");
     fact["facts"][0]["semantic"]["sensitivity"] = serde_json::json!("none");
     fact["facts"][0]["semantic"]["durability"] = serde_json::json!("project_lifetime");
-    fact["facts"][0]["content"] = serde_json::json!("Pioneer uses SQLite.");
-    fact["facts"][0]["value"] = serde_json::json!("SQLite");
-    fact["facts"][0]["evidence"]["quote_or_span"] = serde_json::json!("Pioneer uses SQLite.");
+    fact["facts"][0]["content"] = serde_json::json!("Pioneer uses PostgreSQL.");
+    fact["facts"][0]["value"] = serde_json::json!("PostgreSQL");
+    fact["facts"][0]["evidence"]["quote_or_span"] = serde_json::json!("Pioneer uses PostgreSQL.");
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(fact.to_string()));
     let hook = MemoryPostTurnExtractorHook {
         write_provider: Some(write_provider.clone()),
@@ -863,7 +863,7 @@ async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_
     };
     let mut request = test_post_turn_hook_request(
         memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        "Investigate this in the background. Pioneer uses SQLite.",
+        "Investigate this in the background. Pioneer uses PostgreSQL.",
         "The accepted background investigation is complete.",
     );
     request.context.thread_id =
@@ -2513,7 +2513,7 @@ async fn conflicting_candidate_replay_merges_sources_without_creation_or_revival
 
         let reader = database.connect_read_only().await?;
         let store = Arc::new(
-            CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
+            CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
                 reader,
                 database.connection().clone(),
             ))

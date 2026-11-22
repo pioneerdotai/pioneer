@@ -4,11 +4,11 @@ use crate::task_event_context::TaskEventContextRepository;
 use crate::test_support::task_projection::NoFrozenOutput;
 use crate::test_support::webhook::{AT, request, webhook_fixture};
 use migration::{Migrator, MigratorTrait};
-use pioneer_protocol::{TaskEventPayload, TaskOccurrenceContract, TaskStatus, TaskTriggerStatus};
-use pioneer_sqlite::{
-    SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass, SqliteWriteEvent,
-    SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresReadClass, PostgresReadEvent, PostgresReadObserver, PostgresWriteClass,
+    PostgresWriteEvent, PostgresWriteObserver,
 };
+use pioneer_protocol::{TaskEventPayload, TaskOccurrenceContract, TaskStatus, TaskTriggerStatus};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use std::sync::{Arc, Mutex, atomic::Ordering};
@@ -16,26 +16,26 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct Routes {
-    reads: Mutex<Vec<SqliteReadClass>>,
-    writes: Mutex<Vec<SqliteWriteEvent>>,
+    reads: Mutex<Vec<PostgresReadClass>>,
+    writes: Mutex<Vec<PostgresWriteEvent>>,
     watch_interactive: std::sync::atomic::AtomicBool,
     interactive_queued: tokio::sync::Notify,
 }
-impl SqliteReadObserver for Routes {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
+impl PostgresReadObserver for Routes {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl SqliteWriteObserver for Routes {
-    fn observe(&self, event: SqliteWriteEvent) {
+impl PostgresWriteObserver for Routes {
+    fn observe(&self, event: PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
         if self.watch_interactive.load(Ordering::SeqCst)
             && matches!(
                 event,
-                SqliteWriteEvent::Enqueued {
-                    class: SqliteWriteClass::Interactive,
+                PostgresWriteEvent::Enqueued {
+                    class: PostgresWriteClass::Interactive,
                     ..
                 }
             )
@@ -51,9 +51,12 @@ async fn observed_store(
 ) -> TaskEventStore<NoFrozenOutput> {
     let writer = fixture.connect_with_limit(1).await.unwrap();
     let reader = fixture.connect_read_only().await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, routes.clone());
     TaskEventStore::new(
-        pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
+        pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
+            reader, executor, routes,
+        ),
         NoFrozenOutput,
     )
 }
@@ -91,7 +94,7 @@ async fn postgres_store_with_workspace(
         .await
         .expect("read-only PostgreSQL pool");
     TaskEventStore::new(
-        pioneer_sqlite::SqliteDatabase::new(reader, connection.clone()),
+        pioneer_postgres_pools::PostgresDatabase::new(reader, connection.clone()),
         NoFrozenOutput,
     )
 }
@@ -134,26 +137,26 @@ impl TaskEventStore<NoFrozenOutput> {
     }
 }
 #[pioneer_postgres_test::postgres_test]
-async fn webhook_admission_inherits_request_and_maintenance_classes_with_query_only_readers() {
+async fn webhook_admission_inherits_request_and_maintenance_classes_with_read_only_readers() {
     let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     postgres_store_with_workspace(&fixture, "ws_task").await;
     let routes = Arc::new(Routes::default());
     let store = observed_store(&fixture, routes.clone()).await;
     let (_, trigger) = webhook_fixture(&store).await;
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     let mut accepted = Vec::new();
     for (number, scoped, read_class, write_class) in [
         (
             1,
             store.clone(),
-            SqliteReadClass::Interactive,
-            SqliteWriteClass::Interactive,
+            PostgresReadClass::Interactive,
+            PostgresWriteClass::Interactive,
         ),
         (
             2,
             store.with_maintenance_access(),
-            SqliteReadClass::Maintenance,
-            SqliteWriteClass::Maintenance,
+            PostgresReadClass::Maintenance,
+            PostgresWriteClass::Maintenance,
         ),
     ] {
         routes.reads.lock().unwrap().clear();
@@ -197,14 +200,14 @@ async fn webhook_admission_inherits_request_and_maintenance_classes_with_query_o
         let enqueued = writes
             .iter()
             .filter_map(|event| match event {
-                SqliteWriteEvent::Enqueued { class, .. } => Some(*class),
+                PostgresWriteEvent::Enqueued { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert!(!enqueued.is_empty());
         assert!(enqueued.iter().all(|class| *class == write_class));
     }
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     drop(store);
     // Open independent writer and reader pools on the same committed database.
     let reopened = observed_store(&fixture, Arc::new(Routes::default())).await;
@@ -350,7 +353,7 @@ async fn cancelled_webhook_waiter_releases_writer_queue_and_can_be_admitted_agai
     waiting.abort();
     assert!(waiting.await.unwrap_err().is_cancelled());
     assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(event,
-        SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Interactive, queue, .. } if queue.interactive == 0)));
+        PostgresWriteEvent::Cancelled { class: PostgresWriteClass::Interactive, queue, .. } if queue.interactive == 0)));
     hold.rollback().await.unwrap();
     assert!(store.get_task_run(&run.id).await.unwrap().is_none());
     assert!(

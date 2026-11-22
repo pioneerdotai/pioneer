@@ -8,7 +8,7 @@ use pioneer_entity::{
     turn_item, turn_llm_context,
 };
 use pioneer_observability::portable_payload as observe;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, Order, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -145,7 +145,7 @@ async fn source_high_water<C: ConnectionTrait, E: EntityTrait>(
 /// Scope is inherited from this handle. Background callers must use maintenance.
 /// Metadata discovery is bounded; payload parsing/hashing follows released reads.
 pub async fn compaction_source_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -158,7 +158,7 @@ pub async fn compaction_source_page(
 /// Discover versioned identities without materializing already covered
 /// payloads. The projection fetches only its uncovered sources afterward.
 pub async fn compaction_source_metadata_page(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -169,7 +169,7 @@ pub async fn compaction_source_metadata_page(
 }
 
 pub async fn compaction_source_metadata_page_at_fence(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -191,7 +191,7 @@ pub async fn compaction_source_metadata_page_at_fence(
 }
 
 pub async fn compaction_item_created_at(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread_id: &str,
     turn_id: &str,
@@ -224,7 +224,7 @@ pub async fn compaction_item_created_at(
 
 #[allow(clippy::too_many_arguments)]
 async fn compaction_source_page_inner(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -248,7 +248,7 @@ async fn compaction_source_page_inner(
 }
 
 pub async fn compaction_source_page_inner_bounded(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -338,7 +338,7 @@ struct CanonicalSourceMetadata {
 
 #[allow(clippy::too_many_arguments)]
 async fn read_source_page<E: EntityTrait>(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     projection: CanonicalProjection<E>,
     kind: PagedSource,
     turn: &str,
@@ -765,7 +765,7 @@ pub struct CanonicalFragment {
 /// maintained atomically by source-table triggers, including deletes/reinserts.
 /// The same revision must be supplied for every subsequent fragment.
 pub async fn compaction_source_fragment(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -787,7 +787,7 @@ pub async fn compaction_source_fragment(
 }
 
 async fn compaction_payload_fragment(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -928,7 +928,7 @@ pub async fn compaction_tool_result_id<C: ConnectionTrait>(
 /// Prefer an already retained full shell source. Other tools use their canonical result.
 /// Both lookups and fragments retain the same workspace/thread/turn scope.
 pub async fn compaction_tool_result_fragment(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -965,7 +965,7 @@ pub async fn compaction_tool_result_fragment(
 }
 
 pub async fn compaction_reference_fragment(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     reference: &SourceRef,
@@ -1075,7 +1075,7 @@ fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Res
 }
 
 pub async fn compaction_reference_payload(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     reference: &SourceRef,
@@ -1173,7 +1173,7 @@ fn logical_payload_bytes<E: EntityTrait>(payload: E::Column, reference: Option<E
 }
 
 async fn read_source_payload<E: EntityTrait, P>(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     projection: CanonicalProjection<E, P>,
     id: &str,
     expected_revision: i64,
@@ -1224,7 +1224,7 @@ async fn read_source_payload<E: EntityTrait, P>(
 
 /// Batch canonical history by row count and original UTF-8 bytes.
 pub async fn compaction_reference_payload_batch(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     workspace: &str,
     thread: &str,
     references: &[SourceRef],
@@ -1509,7 +1509,7 @@ struct SourceFragmentRow {
 }
 
 async fn read_source_fragment<E: EntityTrait, P>(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     projection: CanonicalProjection<E, P>,
     id: &str,
     offset: i64,

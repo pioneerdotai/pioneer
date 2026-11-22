@@ -13,33 +13,34 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::reader::{
-    MaintenanceReadLimiter, SqliteMaintenanceReadPermit, SqliteReadClass, SqliteReadObserver,
-    SqliteReadOperation, SqliteReadOutcome, noop_read_observer, reader_pool_context,
+    MaintenanceReadLimiter, PostgresMaintenanceReadPermit, PostgresReadClass, PostgresReadObserver,
+    PostgresReadOperation, PostgresReadOutcome, noop_read_observer, reader_pool_context,
 };
+use crate::statement_route::{StatementRoute, statement_route};
 use crate::writer::{
-    SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteConnection,
-    SqliteWriteExecutor, SqliteWriteObserver,
+    PostgresQueryStream, PostgresTransaction, PostgresWriteClass, PostgresWriteConnection,
+    PostgresWriteExecutor, PostgresWriteObserver,
 };
 
 /// The private owner of the Gateway reader pool.
 ///
 /// The Gateway opens PostgreSQL sessions with read-only transactions. This
 /// wrapper also rejects mutation entry points and routes reads with an explicit
-/// scheduling class through [`SqliteDatabase`].
+/// scheduling class through [`PostgresDatabase`].
 #[derive(Clone)]
-struct SqliteReadPool {
+struct PostgresReadPool {
     connection: DatabaseConnection,
     maintenance: Arc<MaintenanceReadLimiter>,
-    observer: Arc<dyn SqliteReadObserver>,
+    observer: Arc<dyn PostgresReadObserver>,
 }
 
-impl std::fmt::Debug for SqliteReadPool {
+impl std::fmt::Debug for PostgresReadPool {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SqliteReadPool")
+        formatter.write_str("PostgresReadPool")
     }
 }
 
-impl SqliteReadPool {
+impl PostgresReadPool {
     #[cfg(test)]
     fn new(connection: DatabaseConnection) -> Self {
         Self::with_observer(connection, noop_read_observer())
@@ -47,7 +48,7 @@ impl SqliteReadPool {
 
     fn with_observer(
         connection: DatabaseConnection,
-        observer: Arc<dyn SqliteReadObserver>,
+        observer: Arc<dyn PostgresReadObserver>,
     ) -> Self {
         Self {
             connection,
@@ -75,8 +76,8 @@ impl SqliteReadPool {
             .get_max_connections()
     }
 
-    async fn query_only_enabled(&self, class: SqliteReadClass) -> Result<bool, DbErr> {
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+    async fn is_read_only(&self, class: PostgresReadClass) -> Result<bool, DbErr> {
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
@@ -85,26 +86,26 @@ impl SqliteReadPool {
             let row = observe_control(
                 self.connection.query_one_raw(Statement::from_string(
                     DbBackend::Postgres,
-                    "SELECT current_setting('transaction_read_only') AS query_only",
+                    "SELECT current_setting('transaction_read_only') AS read_only",
                 )),
                 "bootstrap",
             )
             .in_pool(reader_pool_context(class))
             .await?
             .ok_or_else(|| DbErr::Custom("read-only pool check returned no row".to_owned()))?;
-            Ok(row.try_get::<String>("", "query_only")? == "on")
+            Ok(row.try_get::<String>("", "read_only")? == "on")
         }
         .await;
         operation.finish(if result.is_ok() {
-            SqliteReadOutcome::Ok
+            PostgresReadOutcome::Ok
         } else {
-            SqliteReadOutcome::Error
+            PostgresReadOutcome::Error
         });
         result
     }
 
-    async fn ping(&self, class: SqliteReadClass) -> Result<(), DbErr> {
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+    async fn ping(&self, class: PostgresReadClass) -> Result<(), DbErr> {
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
@@ -116,33 +117,33 @@ impl SqliteReadPool {
         }
         .await;
         operation.finish(if result.is_ok() {
-            SqliteReadOutcome::Ok
+            PostgresReadOutcome::Ok
         } else {
-            SqliteReadOutcome::Error
+            PostgresReadOutcome::Error
         });
         result
     }
 
     async fn acquire(
         &self,
-        class: SqliteReadClass,
-    ) -> Result<Option<SqliteMaintenanceReadPermit>, DbErr> {
+        class: PostgresReadClass,
+    ) -> Result<Option<PostgresMaintenanceReadPermit>, DbErr> {
         let _startup_wait = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbAdmission,
         );
         match class {
-            SqliteReadClass::Interactive => Ok(None),
-            SqliteReadClass::Maintenance => self.maintenance.acquire().await.map(Some),
+            PostgresReadClass::Interactive => Ok(None),
+            PostgresReadClass::Maintenance => self.maintenance.acquire().await.map(Some),
         }
     }
 
     async fn query_one_raw(
         &self,
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         statement: Statement,
     ) -> Result<Option<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
@@ -154,20 +155,20 @@ impl SqliteReadPool {
         }
         .await;
         operation.finish(if result.is_ok() {
-            SqliteReadOutcome::Ok
+            PostgresReadOutcome::Ok
         } else {
-            SqliteReadOutcome::Error
+            PostgresReadOutcome::Error
         });
         result
     }
 
     async fn query_all_raw(
         &self,
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         statement: Statement,
     ) -> Result<Vec<QueryResult>, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
             let _startup_execute = pioneer_observability::turn_startup::current_stage(
@@ -179,20 +180,20 @@ impl SqliteReadPool {
         }
         .await;
         operation.finish(if result.is_ok() {
-            SqliteReadOutcome::Ok
+            PostgresReadOutcome::Ok
         } else {
-            SqliteReadOutcome::Error
+            PostgresReadOutcome::Error
         });
         result
     }
 
     async fn stream_raw(
         &self,
-        class: SqliteReadClass,
+        class: PostgresReadClass,
         statement: Statement,
-    ) -> Result<SqliteQueryStream, DbErr> {
+    ) -> Result<PostgresQueryStream, DbErr> {
         Self::ensure_read_statement(&statement)?;
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
             let stream = open_stream(self.connection.stream_raw(statement))
@@ -202,16 +203,16 @@ impl SqliteReadPool {
         }
         .await;
         match result {
-            Ok((stream, permit)) => Ok(SqliteQueryStream::read(stream, permit, operation)),
+            Ok((stream, permit)) => Ok(PostgresQueryStream::read(stream, permit, operation)),
             Err(error) => {
-                operation.finish(SqliteReadOutcome::Error);
+                operation.finish(PostgresReadOutcome::Error);
                 Err(error)
             }
         }
     }
 
-    async fn begin(&self, class: SqliteReadClass) -> Result<SqliteReadTransaction, DbErr> {
-        let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
+    async fn begin(&self, class: PostgresReadClass) -> Result<PostgresReadTransaction, DbErr> {
+        let mut operation = PostgresReadOperation::start(self.observer.clone(), class);
         let result = async {
             let permit = self.acquire(class).await?;
             let transaction = observe_control(
@@ -227,14 +228,14 @@ impl SqliteReadPool {
         }
         .await;
         match result {
-            Ok((transaction, permit)) => Ok(SqliteReadTransaction::new(
+            Ok((transaction, permit)) => Ok(PostgresReadTransaction::new(
                 transaction,
                 permit,
                 operation,
                 class,
             )),
             Err(error) => {
-                operation.finish(SqliteReadOutcome::Error);
+                operation.finish(PostgresReadOutcome::Error);
                 Err(error)
             }
         }
@@ -243,28 +244,28 @@ impl SqliteReadPool {
 
 /// Read-only snapshot transaction acquired from the physical reader pool.
 ///
-/// Unlike [`SqliteTransaction`], this type never owns writer admission. Its
+/// Unlike [`PostgresTransaction`], this type never owns writer admission. Its
 /// mutation APIs reject all calls, and maintenance admission is retained until
 /// commit, rollback, or drop.
-pub struct SqliteReadTransaction {
+pub struct PostgresReadTransaction {
     inner: Option<DatabaseTransaction>,
-    _maintenance_permit: Option<SqliteMaintenanceReadPermit>,
-    operation: Option<SqliteReadOperation>,
-    class: SqliteReadClass,
+    _maintenance_permit: Option<PostgresMaintenanceReadPermit>,
+    operation: Option<PostgresReadOperation>,
+    class: PostgresReadClass,
 }
 
-impl std::fmt::Debug for SqliteReadTransaction {
+impl std::fmt::Debug for PostgresReadTransaction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SqliteReadTransaction")
+        formatter.write_str("PostgresReadTransaction")
     }
 }
 
-impl SqliteReadTransaction {
+impl PostgresReadTransaction {
     fn new(
         inner: DatabaseTransaction,
-        maintenance_permit: Option<SqliteMaintenanceReadPermit>,
-        operation: SqliteReadOperation,
-        class: SqliteReadClass,
+        maintenance_permit: Option<PostgresMaintenanceReadPermit>,
+        operation: PostgresReadOperation,
+        class: PostgresReadClass,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -277,14 +278,14 @@ impl SqliteReadTransaction {
     fn inner(&self) -> &DatabaseTransaction {
         self.inner
             .as_ref()
-            .expect("SQLite read transaction was already completed")
+            .expect("PostgreSQL read transaction was already completed")
     }
 
     pub async fn commit(mut self) -> Result<(), DbErr> {
         let result = observe_control(
             self.inner
                 .take()
-                .expect("SQLite read transaction was already completed")
+                .expect("PostgreSQL read transaction was already completed")
                 .commit(),
             "commit",
         )
@@ -293,9 +294,9 @@ impl SqliteReadTransaction {
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
             operation.finish(if result.is_ok() {
-                SqliteReadOutcome::Ok
+                PostgresReadOutcome::Ok
             } else {
-                SqliteReadOutcome::Error
+                PostgresReadOutcome::Error
             });
         }
         self.operation.take();
@@ -306,7 +307,7 @@ impl SqliteReadTransaction {
         let result = observe_control(
             self.inner
                 .take()
-                .expect("SQLite read transaction was already completed")
+                .expect("PostgreSQL read transaction was already completed")
                 .rollback(),
             "rollback",
         )
@@ -315,9 +316,9 @@ impl SqliteReadTransaction {
         self._maintenance_permit.take();
         if let Some(operation) = self.operation.as_mut() {
             operation.finish(if result.is_ok() {
-                SqliteReadOutcome::Cancelled
+                PostgresReadOutcome::Cancelled
             } else {
-                SqliteReadOutcome::Error
+                PostgresReadOutcome::Error
             });
         }
         self.operation.take();
@@ -326,7 +327,7 @@ impl SqliteReadTransaction {
 }
 
 // Drop-triggered rollback is its own control command, never a successful SQL query.
-impl Drop for SqliteReadTransaction {
+impl Drop for PostgresReadTransaction {
     fn drop(&mut self) {
         if self.inner.is_some() {
             let _pool = reader_pool_context(self.class).enter();
@@ -338,39 +339,39 @@ impl Drop for SqliteReadTransaction {
 }
 
 #[async_trait]
-impl TransactionSession for SqliteReadTransaction {
+impl TransactionSession for PostgresReadTransaction {
     async fn commit(self) -> Result<(), DbErr> {
-        SqliteReadTransaction::commit(self).await
+        PostgresReadTransaction::commit(self).await
     }
 
     async fn rollback(self) -> Result<(), DbErr> {
-        SqliteReadTransaction::rollback(self).await
+        PostgresReadTransaction::rollback(self).await
     }
 }
 
 #[async_trait]
-impl ConnectionTrait for SqliteReadTransaction {
+impl ConnectionTrait for PostgresReadTransaction {
     fn get_database_backend(&self) -> DbBackend {
         ConnectionTrait::get_database_backend(self.inner())
     }
 
     async fn execute_raw(&self, _statement: Statement) -> Result<ExecResult, DbErr> {
-        Err(SqliteReadPool::reject_write())
+        Err(PostgresReadPool::reject_write())
     }
 
     async fn execute_unprepared(&self, _sql: &str) -> Result<ExecResult, DbErr> {
-        Err(SqliteReadPool::reject_write())
+        Err(PostgresReadPool::reject_write())
     }
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
-        SqliteReadPool::ensure_read_statement(&statement)?;
+        PostgresReadPool::ensure_read_statement(&statement)?;
         query_cpu::observe(self.inner().query_one_raw(statement))
             .in_pool(reader_pool_context(self.class))
             .await
     }
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
-        SqliteReadPool::ensure_read_statement(&statement)?;
+        PostgresReadPool::ensure_read_statement(&statement)?;
         query_cpu::observe(self.inner().query_all_raw(statement))
             .in_pool(reader_pool_context(self.class))
             .await
@@ -385,7 +386,7 @@ impl ConnectionTrait for SqliteReadTransaction {
     }
 }
 
-impl StreamTrait for SqliteReadTransaction {
+impl StreamTrait for PostgresReadTransaction {
     type Stream<'a> = DiagnosticStream<TransactionStream<'a>>;
 
     fn get_database_backend(&self) -> DbBackend {
@@ -397,7 +398,7 @@ impl StreamTrait for SqliteReadTransaction {
         statement: Statement,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
-            SqliteReadPool::ensure_read_statement(&statement)?;
+            PostgresReadPool::ensure_read_statement(&statement)?;
             let scope = QueryScope::new();
             let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope)
                 .in_pool(reader_pool_context(self.class))
@@ -420,17 +421,18 @@ impl StreamTrait for SqliteReadTransaction {
 /// Scoped database access with independent read and write pools.
 ///
 /// Calls which return rows are classified from the actual SQL so that
-/// `INSERT`, `UPDATE`, and `DELETE ... RETURNING` still use the writer. All
-/// transactions and execution APIs are unconditionally routed to the writer.
+/// row locks and mutations returning rows use the writer. Use a writer
+/// transaction when a lock must protect later statements. `begin_read` opens
+/// a read-only snapshot on the reader pool.
 #[derive(Clone, Debug)]
-pub struct SqliteDatabase {
-    reader: SqliteReadPool,
-    writer: SqliteWriteExecutor,
-    read_class: SqliteReadClass,
-    write_class: SqliteWriteClass,
+pub struct PostgresDatabase {
+    reader: PostgresReadPool,
+    writer: PostgresWriteExecutor,
+    read_class: PostgresReadClass,
+    write_class: PostgresWriteClass,
 }
 
-impl SqliteDatabase {
+impl PostgresDatabase {
     /// Runtime-local, coalesced hints shared by all scopes and store wrappers.
     /// Domain owners use stable names and subscribe independently.
     pub fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
@@ -451,31 +453,34 @@ impl SqliteDatabase {
     }
 
     pub fn new(reader: DatabaseConnection, writer: DatabaseConnection) -> Self {
-        Self::from_executor(reader, SqliteWriteExecutor::new(writer))
+        Self::from_executor(reader, PostgresWriteExecutor::new(writer))
     }
 
     pub fn new_with_observer(
         reader: DatabaseConnection,
         writer: DatabaseConnection,
-        observer: Arc<dyn SqliteWriteObserver>,
+        observer: Arc<dyn PostgresWriteObserver>,
     ) -> Self {
-        Self::from_executor(reader, SqliteWriteExecutor::with_observer(writer, observer))
+        Self::from_executor(
+            reader,
+            PostgresWriteExecutor::with_observer(writer, observer),
+        )
     }
 
-    pub fn from_executor(reader: DatabaseConnection, writer: SqliteWriteExecutor) -> Self {
+    pub fn from_executor(reader: DatabaseConnection, writer: PostgresWriteExecutor) -> Self {
         Self::from_executor_with_read_observer(reader, writer, noop_read_observer())
     }
 
     pub fn from_executor_with_read_observer(
         reader: DatabaseConnection,
-        writer: SqliteWriteExecutor,
-        read_observer: Arc<dyn SqliteReadObserver>,
+        writer: PostgresWriteExecutor,
+        read_observer: Arc<dyn PostgresReadObserver>,
     ) -> Self {
         Self {
-            reader: SqliteReadPool::with_observer(reader, read_observer),
+            reader: PostgresReadPool::with_observer(reader, read_observer),
             writer,
-            read_class: SqliteReadClass::Interactive,
-            write_class: SqliteWriteClass::Interactive,
+            read_class: PostgresReadClass::Interactive,
+            write_class: PostgresWriteClass::Interactive,
         }
     }
 
@@ -488,28 +493,28 @@ impl SqliteDatabase {
 
     pub fn with_critical_writes(&self) -> Self {
         let mut scoped = self.clone();
-        scoped.write_class = SqliteWriteClass::Critical;
+        scoped.write_class = PostgresWriteClass::Critical;
         scoped
     }
 
     pub fn with_interactive_writes(&self) -> Self {
         let mut scoped = self.clone();
-        scoped.write_class = SqliteWriteClass::Interactive;
+        scoped.write_class = PostgresWriteClass::Interactive;
         scoped
     }
 
     pub fn maintenance(&self) -> Self {
         let mut scoped = self.clone();
-        scoped.read_class = SqliteReadClass::Maintenance;
-        scoped.write_class = SqliteWriteClass::Maintenance;
+        scoped.read_class = PostgresReadClass::Maintenance;
+        scoped.write_class = PostgresWriteClass::Maintenance;
         scoped
     }
 
-    pub const fn read_class(&self) -> SqliteReadClass {
+    pub const fn read_class(&self) -> PostgresReadClass {
         self.read_class
     }
 
-    pub const fn write_class(&self) -> SqliteWriteClass {
+    pub const fn write_class(&self) -> PostgresWriteClass {
         self.write_class
     }
 
@@ -521,13 +526,13 @@ impl SqliteDatabase {
         self.reader.max_connections()
     }
 
-    pub async fn reader_query_only_enabled(&self) -> Result<bool, DbErr> {
-        self.reader.query_only_enabled(self.read_class).await
+    pub async fn reader_is_read_only(&self) -> Result<bool, DbErr> {
+        self.reader.is_read_only(self.read_class).await
     }
 
     pub async fn validate_reader(&self) -> Result<(), DbErr> {
         self.reader.ping(self.read_class).await?;
-        if !self.reader.query_only_enabled(self.read_class).await? {
+        if !self.reader.is_read_only(self.read_class).await? {
             return Err(DbErr::Custom(
                 "Gateway read pool requires read-only transactions".to_owned(),
             ));
@@ -538,11 +543,11 @@ impl SqliteDatabase {
     /// Opens a consistent, read-only snapshot on the reader pool. Pure read
     /// workflows which need transaction-level consistency must use this API;
     /// [`TransactionTrait::begin`] intentionally remains the write boundary.
-    pub async fn begin_read(&self) -> Result<SqliteReadTransaction, DbErr> {
+    pub async fn begin_read(&self) -> Result<PostgresReadTransaction, DbErr> {
         self.reader.begin(self.read_class).await
     }
 
-    fn writer_connection(&self) -> SqliteWriteConnection {
+    fn writer_connection(&self) -> PostgresWriteConnection {
         self.writer.connection(self.write_class)
     }
 
@@ -569,26 +574,26 @@ impl SqliteDatabase {
     }
 }
 
-impl From<DatabaseConnection> for SqliteDatabase {
+impl From<DatabaseConnection> for PostgresDatabase {
     fn from(connection: DatabaseConnection) -> Self {
         Self::from_single_connection(connection)
     }
 }
 
-impl From<&DatabaseConnection> for SqliteDatabase {
+impl From<&DatabaseConnection> for PostgresDatabase {
     fn from(connection: &DatabaseConnection) -> Self {
         Self::from_single_connection(connection.clone())
     }
 }
 
-impl From<&SqliteDatabase> for SqliteDatabase {
-    fn from(database: &SqliteDatabase) -> Self {
+impl From<&PostgresDatabase> for PostgresDatabase {
+    fn from(database: &PostgresDatabase) -> Self {
         database.clone()
     }
 }
 
 #[async_trait]
-impl ConnectionTrait for SqliteDatabase {
+impl ConnectionTrait for PostgresDatabase {
     fn get_database_backend(&self) -> DbBackend {
         ConnectionTrait::get_database_backend(&self.writer_connection())
     }
@@ -618,8 +623,8 @@ impl ConnectionTrait for SqliteDatabase {
     }
 }
 
-impl StreamTrait for SqliteDatabase {
-    type Stream<'a> = SqliteQueryStream;
+impl StreamTrait for PostgresDatabase {
+    type Stream<'a> = PostgresQueryStream;
 
     fn get_database_backend(&self) -> DbBackend {
         StreamTrait::get_database_backend(&self.writer_connection())
@@ -639,8 +644,8 @@ impl StreamTrait for SqliteDatabase {
 }
 
 #[async_trait]
-impl TransactionTrait for SqliteDatabase {
-    type Transaction = SqliteTransaction;
+impl TransactionTrait for PostgresDatabase {
+    type Transaction = PostgresTransaction;
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
         self.writer_connection().begin().await
@@ -695,157 +700,29 @@ impl TransactionTrait for SqliteDatabase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatementRoute {
-    Read,
-    Write,
-}
-
-/// Classify the outer SQLite statement without recording or exporting SQL.
-/// Unknown statements intentionally fall back to the writer. `WITH` needs
-/// top-level token scanning because SQLite permits it before both SELECT and
-/// mutating statements.
-fn statement_route(sql: &str) -> StatementRoute {
-    let mut scanner = SqlScanner::new(sql);
-    let Some(first) = scanner.next_top_level_word() else {
-        return StatementRoute::Write;
-    };
-
-    if first.eq_ignore_ascii_case("select")
-        || first.eq_ignore_ascii_case("values")
-        || first.eq_ignore_ascii_case("explain")
-    {
-        return StatementRoute::Read;
-    }
-    if !first.eq_ignore_ascii_case("with") {
-        return StatementRoute::Write;
-    }
-
-    while let Some(token) = scanner.next_top_level_word() {
-        if token.eq_ignore_ascii_case("select") || token.eq_ignore_ascii_case("values") {
-            return StatementRoute::Read;
-        }
-        if token.eq_ignore_ascii_case("insert")
-            || token.eq_ignore_ascii_case("update")
-            || token.eq_ignore_ascii_case("delete")
-            || token.eq_ignore_ascii_case("replace")
-        {
-            return StatementRoute::Write;
-        }
-    }
-    StatementRoute::Write
-}
-
-struct SqlScanner<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    depth: usize,
-}
-
-impl<'a> SqlScanner<'a> {
-    fn new(sql: &'a str) -> Self {
-        Self {
-            bytes: sql.as_bytes(),
-            offset: 0,
-            depth: 0,
-        }
-    }
-
-    fn next_top_level_word(&mut self) -> Option<&'a str> {
-        while self.offset < self.bytes.len() {
-            match self.bytes[self.offset] {
-                b'(' => {
-                    self.depth = self.depth.saturating_add(1);
-                    self.offset += 1;
-                }
-                b')' => {
-                    self.depth = self.depth.saturating_sub(1);
-                    self.offset += 1;
-                }
-                b'\'' | b'"' | b'`' => self.skip_quoted(self.bytes[self.offset]),
-                b'[' => self.skip_bracketed_identifier(),
-                b'-' if self.bytes.get(self.offset + 1) == Some(&b'-') => self.skip_line_comment(),
-                b'/' if self.bytes.get(self.offset + 1) == Some(&b'*') => self.skip_block_comment(),
-                byte if byte.is_ascii_alphabetic() || byte == b'_' => {
-                    let start = self.offset;
-                    self.offset += 1;
-                    while self.bytes.get(self.offset).is_some_and(|byte| {
-                        byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$'
-                    }) {
-                        self.offset += 1;
-                    }
-                    if self.depth == 0 {
-                        return std::str::from_utf8(&self.bytes[start..self.offset]).ok();
-                    }
-                }
-                _ => self.offset += 1,
-            }
-        }
-        None
-    }
-
-    fn skip_quoted(&mut self, delimiter: u8) {
-        self.offset += 1;
-        while self.offset < self.bytes.len() {
-            if self.bytes[self.offset] == delimiter {
-                if self.bytes.get(self.offset + 1) == Some(&delimiter) {
-                    self.offset += 2;
-                    continue;
-                }
-                self.offset += 1;
-                break;
-            }
-            self.offset += 1;
-        }
-    }
-
-    fn skip_bracketed_identifier(&mut self) {
-        self.offset += 1;
-        while self.offset < self.bytes.len() {
-            if self.bytes[self.offset] == b']' {
-                self.offset += 1;
-                break;
-            }
-            self.offset += 1;
-        }
-    }
-
-    fn skip_line_comment(&mut self) {
-        self.offset += 2;
-        while self.offset < self.bytes.len() && self.bytes[self.offset] != b'\n' {
-            self.offset += 1;
-        }
-    }
-
-    fn skip_block_comment(&mut self) {
-        self.offset += 2;
-        while self.offset + 1 < self.bytes.len() {
-            if self.bytes[self.offset] == b'*' && self.bytes[self.offset + 1] == b'/' {
-                self.offset += 2;
-                return;
-            }
-            self.offset += 1;
-        }
-        self.offset = self.bytes.len();
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SqliteDatabase, SqliteReadClass, SqliteReadPool, StatementRoute, statement_route};
-    use crate::{SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteExecutor};
+    use super::{
+        PostgresDatabase, PostgresReadClass, PostgresReadPool, StatementRoute, statement_route,
+    };
+    use crate::{
+        PostgresReadEvent, PostgresReadObserver, PostgresReadOutcome, PostgresWriteExecutor,
+    };
     use futures_util::StreamExt;
-    use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait};
+    use sea_orm::sea_query::{Alias, Expr, LockBehavior, LockType, Query};
+    use sea_orm::{
+        ConnectionTrait, DbBackend, DbErr, RuntimeErr, Statement, StreamTrait, TransactionTrait,
+    };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingReadObserver {
-        events: Mutex<Vec<SqliteReadEvent>>,
+        events: Mutex<Vec<PostgresReadEvent>>,
     }
 
-    impl SqliteReadObserver for RecordingReadObserver {
-        fn observe(&self, event: SqliteReadEvent) {
+    impl PostgresReadObserver for RecordingReadObserver {
+        fn observe(&self, event: PostgresReadEvent) {
             self.events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -854,7 +731,7 @@ mod tests {
     }
 
     impl RecordingReadObserver {
-        fn events(&self) -> Vec<SqliteReadEvent> {
+        fn events(&self) -> Vec<PostgresReadEvent> {
             self.events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -881,17 +758,17 @@ mod tests {
         (reader, writer)
     }
 
-    async fn test_database() -> SqliteDatabase {
+    async fn test_database() -> PostgresDatabase {
         let (reader, writer) = test_pools().await;
-        SqliteDatabase::new(reader, writer)
+        PostgresDatabase::new(reader, writer)
     }
 
-    async fn observed_test_database() -> (SqliteDatabase, Arc<RecordingReadObserver>) {
+    async fn observed_test_database() -> (PostgresDatabase, Arc<RecordingReadObserver>) {
         let (reader, writer) = test_pools().await;
         let observer = Arc::new(RecordingReadObserver::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::new(writer),
+            PostgresWriteExecutor::new(writer),
             observer.clone(),
         );
         (database, observer)
@@ -905,10 +782,7 @@ mod tests {
             statement_route("-- leading comment\nSELECT 'delete is data'"),
             StatementRoute::Read
         );
-        assert_eq!(
-            statement_route("EXPLAIN QUERY PLAN SELECT 1"),
-            StatementRoute::Read
-        );
+        assert_eq!(statement_route("EXPLAIN SELECT 1"), StatementRoute::Read);
     }
 
     #[test]
@@ -926,18 +800,17 @@ mod tests {
             StatementRoute::Write
         );
         assert_eq!(
-            statement_route("REPLACE INTO item(id) VALUES (1) RETURNING id"),
+            statement_route(
+                "MERGE INTO item USING (VALUES (1)) AS input(id) ON item.id = input.id WHEN MATCHED THEN DELETE RETURNING item.id"
+            ),
             StatementRoute::Write
         );
-        assert_eq!(
-            statement_route("PRAGMA journal_mode"),
-            StatementRoute::Write
-        );
+        assert_eq!(statement_route("TRUNCATE item"), StatementRoute::Write);
         assert_eq!(statement_route(""), StatementRoute::Write);
     }
 
     #[test]
-    fn routes_cte_by_its_outer_statement() {
+    fn routes_cte_by_its_bodies_and_outer_statement() {
         assert_eq!(
             statement_route(
                 "WITH rows AS (SELECT 'update ignored' AS value) SELECT value FROM rows"
@@ -962,38 +835,239 @@ mod tests {
             ),
             StatementRoute::Read
         );
+        assert_eq!(
+            statement_route(
+                "WITH a AS (SELECT 1), b AS (DELETE FROM item RETURNING id) SELECT * FROM b"
+            ),
+            StatementRoute::Write
+        );
+        assert_eq!(
+            statement_route("WITH a AS (SELECT * FROM item FOR KEY SHARE) SELECT * FROM a"),
+            StatementRoute::Write
+        );
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn plain_reads_and_reading_ctes_use_the_read_only_session() {
+        let database = test_database().await;
+        let read = Query::select()
+            .expr_as(
+                Expr::cust("current_setting('transaction_read_only')"),
+                Alias::new("mode"),
+            )
+            .to_owned();
+        let row = database.query_one(&read).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<String>("", "mode").unwrap(), "on");
+
+        for sql in [
+            "SELECT current_setting('transaction_read_only') AS mode,
+                'FOR UPDATE' AS \"FOR SHARE\" /* outer /* nested */ FOR NO KEY UPDATE */",
+            "WITH \"update\"(value) AS NOT MATERIALIZED
+                (SELECT $tag$FOR UPDATE; )$tag$),
+                extra AS (WITH quoted AS (SELECT E'it\\'s FOR SHARE') SELECT * FROM quoted)
+             SELECT current_setting('transaction_read_only') AS mode FROM \"update\", extra
+             -- FOR KEY SHARE",
+            "WITH RECURSIVE chain(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM chain WHERE n < 2)
+                SEARCH BREADTH FIRST BY n SET traversal
+                CYCLE n SET cycle_flag USING visited
+             SELECT current_setting('transaction_read_only') AS mode FROM chain WHERE n = 2",
+            "SELECT current_setting('transaction_read_only') AS mode
+             FROM (VALUES (1)) AS lengths(update)
+             WHERE substring('x' FOR update) = 'x'",
+        ] {
+            let rows = database
+                .query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap_or_else(|error| panic!("read probe failed: {error}"));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].try_get::<String>("", "mode").unwrap(), "on");
+        }
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn row_locks_use_writer_and_survive_until_the_same_transaction_commits() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let reader = fixture.connect_read_only().await.unwrap();
+        let database =
+            PostgresDatabase::new(reader.clone(), fixture.connect_with_limit(1).await.unwrap());
+        let competitor =
+            PostgresDatabase::new(reader, fixture.connect_with_limit(1).await.unwrap());
+        database
+            .execute_unprepared(
+                "CREATE TABLE lock_probe (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+                 INSERT INTO lock_probe VALUES (1, 10)",
+            )
+            .await
+            .unwrap();
+        for strength in [
+            LockType::Update,
+            LockType::NoKeyUpdate,
+            LockType::Share,
+            LockType::KeyShare,
+        ] {
+            let locking_read = Query::select()
+                .expr_as(
+                    Expr::cust("current_setting('transaction_read_only')"),
+                    Alias::new("mode"),
+                )
+                .from(Alias::new("lock_probe"))
+                .lock_with_behavior(strength, LockBehavior::Nowait)
+                .to_owned();
+            let row = database.query_one(&locking_read).await.unwrap().unwrap();
+            assert_eq!(
+                row.try_get::<String>("", "mode").unwrap(),
+                "off",
+                "{strength:?}"
+            );
+        }
+
+        let transaction = database.begin().await.unwrap();
+        let nowait = Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT value FROM (SELECT value FROM lock_probe WHERE id = 1 FOR /* lock */ UPDATE NOWAIT) AS locked",
+        );
+        let initial = transaction
+            .query_one_raw(nowait.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.try_get::<i32>("", "value").unwrap(), 10);
+        let conflict = competitor
+            .query_one_raw(nowait.clone())
+            .await
+            .expect_err("the open transaction owns the row lock");
+        let DbErr::Query(RuntimeErr::SqlxError(error)) = conflict else {
+            panic!("expected a PostgreSQL row-lock error, got {conflict}");
+        };
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55P03")
+        );
+        {
+            let mut skipped = competitor
+                .stream_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "WITH unlocked AS (SELECT value FROM lock_probe FOR UPDATE SKIP LOCKED)
+                     SELECT value FROM unlocked",
+                ))
+                .await
+                .unwrap();
+            assert!(skipped.next().await.transpose().unwrap().is_none());
+        }
+
+        transaction
+            .execute_unprepared("UPDATE lock_probe SET value = 20 WHERE id = 1")
+            .await
+            .unwrap();
+        let own_write = transaction
+            .query_one_raw(nowait.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(own_write.try_get::<i32>("", "value").unwrap(), 20);
+        transaction.commit().await.unwrap();
+
+        let released = competitor.query_one_raw(nowait).await.unwrap().unwrap();
+        assert_eq!(released.try_get::<i32>("", "value").unwrap(), 20);
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn row_returning_mutations_use_writer_for_queries_and_streams() {
+        let database = test_database().await;
+        database
+            .execute_unprepared(
+                "CREATE TABLE returning_probe (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);
+                 INSERT INTO returning_probe VALUES (1, 10), (2, 20)",
+            )
+            .await
+            .unwrap();
+        let changed = database
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "WITH changed AS (
+                     WITH step AS (SELECT $1::integer AS increment)
+                     UPDATE returning_probe SET value = value + step.increment
+                     FROM step RETURNING returning_probe.id, value
+                 )
+                 SELECT value FROM changed ORDER BY id",
+                [1_i32.into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed[0].try_get::<i32>("", "value").unwrap(), 11);
+        assert_eq!(changed[1].try_get::<i32>("", "value").unwrap(), 21);
+
+        {
+            let mut rows = database
+                .stream_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE returning_probe SET value = $1 WHERE id = $2 RETURNING value",
+                    [22_i32.into(), 2_i32.into()],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<i32>("", "value")
+                    .unwrap(),
+                22
+            );
+            assert!(rows.next().await.is_none());
+        }
+        let saved = database
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT value, current_setting('transaction_read_only') AS mode
+                 FROM returning_probe ORDER BY id",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].try_get::<i32>("", "value").unwrap(), 11);
+        assert_eq!(saved[1].try_get::<i32>("", "value").unwrap(), 22);
+        assert_eq!(saved[0].try_get::<String>("", "mode").unwrap(), "on");
     }
 
     #[pioneer_postgres_test::postgres_test]
     async fn database_scopes_carry_consistent_read_and_write_classes() {
         let database = test_database().await;
 
-        assert_eq!(database.read_class(), SqliteReadClass::Interactive);
-        assert_eq!(database.write_class(), crate::SqliteWriteClass::Interactive);
+        assert_eq!(database.read_class(), PostgresReadClass::Interactive);
+        assert_eq!(
+            database.write_class(),
+            crate::PostgresWriteClass::Interactive
+        );
         assert_eq!(
             database.with_critical_writes().read_class(),
-            SqliteReadClass::Interactive
+            PostgresReadClass::Interactive
         );
         assert_eq!(
             database.with_critical_writes().write_class(),
-            crate::SqliteWriteClass::Critical
+            crate::PostgresWriteClass::Critical
         );
         assert_eq!(
             database.maintenance().read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             database.maintenance().write_class(),
-            crate::SqliteWriteClass::Maintenance
+            crate::PostgresWriteClass::Maintenance
         );
         let background_critical = database.maintenance().with_critical_writes();
         assert_eq!(
             background_critical.read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             background_critical.write_class(),
-            crate::SqliteWriteClass::Critical
+            crate::PostgresWriteClass::Critical
         );
     }
 
@@ -1001,11 +1075,11 @@ mod tests {
     async fn private_reader_rejects_every_write_entry_point() {
         let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let connection = fixture.connect_read_only().await.expect("open test reader");
-        let reader = SqliteReadPool::new(connection);
+        let reader = PostgresReadPool::new(connection);
 
         let query_error = reader
             .query_one_raw(
-                SqliteReadClass::Interactive,
+                PostgresReadClass::Interactive,
                 Statement::from_string(
                     DbBackend::Postgres,
                     "DELETE FROM item RETURNING id".to_owned(),
@@ -1017,7 +1091,7 @@ mod tests {
 
         let stream_error = match reader
             .stream_raw(
-                SqliteReadClass::Maintenance,
+                PostgresReadClass::Maintenance,
                 Statement::from_string(
                     DbBackend::Postgres,
                     "INSERT INTO item DEFAULT VALUES RETURNING id".to_owned(),
@@ -1060,6 +1134,27 @@ mod tests {
             .await
             .expect_err("row-returning mutation must be rejected");
         assert!(returning_error.to_string().contains("database read pool"));
+
+        let cte_error = transaction
+            .query_all_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "WITH removed AS (DELETE FROM workspace RETURNING id) SELECT id FROM removed",
+            ))
+            .await
+            .expect_err("read transaction must reject a modifying CTE");
+        assert!(cte_error.to_string().contains("database read pool"));
+
+        let lock_error = match transaction
+            .stream_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT id FROM workspace FOR KEY SHARE SKIP LOCKED",
+            ))
+            .await
+        {
+            Ok(_) => panic!("read transaction must reject a locking query"),
+            Err(error) => error,
+        };
+        assert!(lock_error.to_string().contains("database read pool"));
 
         transaction.commit().await.expect("commit read transaction");
         database.close().await.expect("close test database");
@@ -1201,24 +1296,24 @@ mod tests {
         let events = observer.events();
         assert!(matches!(
             events.first(),
-            Some(SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
-                outcome: SqliteReadOutcome::Ok,
+            Some(PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
+                outcome: PostgresReadOutcome::Ok,
                 ..
             })
         ));
         assert!(matches!(
             events.get(1),
-            Some(SqliteReadEvent::AdmissionEnqueued {
-                class: SqliteReadClass::Maintenance,
+            Some(PostgresReadEvent::AdmissionEnqueued {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 1,
                 active: 0,
             })
         ));
         assert!(matches!(
             events.get(2),
-            Some(SqliteReadEvent::AdmissionAcquired {
-                class: SqliteReadClass::Maintenance,
+            Some(PostgresReadEvent::AdmissionAcquired {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 0,
                 active: 1,
                 ..
@@ -1226,8 +1321,8 @@ mod tests {
         ));
         assert!(matches!(
             events.get(3),
-            Some(SqliteReadEvent::AdmissionReleased {
-                class: SqliteReadClass::Maintenance,
+            Some(PostgresReadEvent::AdmissionReleased {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 0,
                 active: 0,
                 ..
@@ -1235,9 +1330,9 @@ mod tests {
         ));
         assert!(matches!(
             events.get(4),
-            Some(SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
-                outcome: SqliteReadOutcome::Ok,
+            Some(PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
+                outcome: PostgresReadOutcome::Ok,
                 ..
             })
         ));
@@ -1250,7 +1345,7 @@ mod tests {
 
         database
             .reader
-            .ping(SqliteReadClass::Maintenance)
+            .ping(PostgresReadClass::Maintenance)
             .await
             .expect("ping observed maintenance reader");
 
@@ -1258,26 +1353,26 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                SqliteReadEvent::AdmissionEnqueued {
-                    class: SqliteReadClass::Maintenance,
+                PostgresReadEvent::AdmissionEnqueued {
+                    class: PostgresReadClass::Maintenance,
                     queue_depth: 1,
                     active: 0,
                 },
-                SqliteReadEvent::AdmissionAcquired {
-                    class: SqliteReadClass::Maintenance,
+                PostgresReadEvent::AdmissionAcquired {
+                    class: PostgresReadClass::Maintenance,
                     queue_depth: 0,
                     active: 1,
                     ..
                 },
-                SqliteReadEvent::AdmissionReleased {
-                    class: SqliteReadClass::Maintenance,
+                PostgresReadEvent::AdmissionReleased {
+                    class: PostgresReadClass::Maintenance,
                     queue_depth: 0,
                     active: 0,
                     ..
                 },
-                SqliteReadEvent::OperationFinished {
-                    class: SqliteReadClass::Maintenance,
-                    outcome: SqliteReadOutcome::Ok,
+                PostgresReadEvent::OperationFinished {
+                    class: PostgresReadClass::Maintenance,
+                    outcome: PostgresReadOutcome::Ok,
                     ..
                 },
             ]
@@ -1399,8 +1494,8 @@ mod tests {
         let _ = waiting.await;
         assert!(observer.events().iter().any(|event| matches!(
             event,
-            SqliteReadEvent::AdmissionCancelled {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::AdmissionCancelled {
+                class: PostgresReadClass::Maintenance,
                 queue_depth: 0,
                 active: 1,
                 ..
@@ -1420,9 +1515,9 @@ mod tests {
         .expect("run maintenance read after cancellation");
         assert!(observer.events().iter().any(|event| matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
-                outcome: SqliteReadOutcome::Cancelled,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
+                outcome: PostgresReadOutcome::Cancelled,
                 ..
             }
         )));

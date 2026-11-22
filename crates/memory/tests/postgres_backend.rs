@@ -13,9 +13,9 @@ use std::sync::Arc;
 async fn store(database: &TestDatabase) -> Arc<CrudStore> {
     let writer = database.connect().await.unwrap();
     let reader = database.connect_read_only().await.unwrap();
-    Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-        reader, writer,
-    )))
+    Arc::new(CrudStore::new(
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
+    ))
 }
 fn scope(key: &str) -> MemoryScope {
     MemoryScope {

@@ -1,10 +1,10 @@
 use pioneer_crud::CrudStore;
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::{TestDatabase, with_database};
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 async fn open(fixture: &TestDatabase) -> CrudStore {
-    CrudStore::new(SqliteDatabase::new(
+    CrudStore::new(PostgresDatabase::new(
         fixture.connect_read_only().await.unwrap(),
         fixture.connect().await.unwrap(),
     ))

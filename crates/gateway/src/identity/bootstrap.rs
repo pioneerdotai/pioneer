@@ -3,11 +3,11 @@ use pioneer_crud::{
     GatewayIdentityRecord, GatewayPrincipalRecord, create_superuser, ensure_gateway_singleton,
     load_identity_invariant_rows, load_superusers_for_gateway, set_identity_bootstrap_version,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     GATEWAY_ID_LEN, GatewayId, PRINCIPAL_ID_LEN, PrincipalId, PrincipalKind, PrincipalStatus,
     generate_id,
 };
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, TransactionSession, TransactionTrait};
 
 use super::invariants::validate_identity_invariants;
@@ -97,7 +97,7 @@ where
 }
 
 pub(crate) async fn bootstrap_identity(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
 ) -> Result<IdentityBootstrapOutcome> {
     let connection = connection.into().maintenance();
     let mut bootstrap = begin_identity_bootstrap(&connection).await?;
@@ -359,8 +359,9 @@ mod tests {
         with_database(async |fixture| {
             let pool = fixture.connect().await?;
             let peer = fixture.connect().await?;
-            let database = pioneer_sqlite::SqliteDatabase::from_single_connection(pool);
-            let second_database = pioneer_sqlite::SqliteDatabase::from_single_connection(peer);
+            let database = pioneer_postgres_pools::PostgresDatabase::from_single_connection(pool);
+            let second_database =
+                pioneer_postgres_pools::PostgresDatabase::from_single_connection(peer);
             let (first, second) = tokio::join!(
                 bootstrap_identity(&database),
                 bootstrap_identity(&second_database)

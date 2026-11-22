@@ -15,10 +15,10 @@ pub type ReaderCounts = Arc<Mutex<BTreeMap<String, Readers>>>;
 #[derive(Debug, Default)]
 pub struct Readers {
     count: usize,
-    blocked_cleanup: Vec<pioneer_sqlite::WorkSignal>,
+    blocked_cleanup: Vec<pioneer_postgres_pools::WorkSignal>,
 }
 impl Readers {
-    pub fn block_cleanup(&mut self, released: &pioneer_sqlite::WorkSignal) {
+    pub fn block_cleanup(&mut self, released: &pioneer_postgres_pools::WorkSignal) {
         if !self
             .blocked_cleanup
             .iter()
@@ -34,7 +34,7 @@ impl Readers {
 pub fn cleanup_blocked(
     readers: &ReaderCounts,
     manifest: &str,
-    released: &pioneer_sqlite::WorkSignal,
+    released: &pioneer_postgres_pools::WorkSignal,
 ) -> bool {
     let mut readers = readers
         .lock()
@@ -379,7 +379,7 @@ mod tests {
         for _ in 0..32 {
             let readers: ReaderCounts = Default::default();
             let hold = FrozenReadHold::register(&readers, "m");
-            let signal = pioneer_sqlite::WorkSignal::default();
+            let signal = pioneer_postgres_pools::WorkSignal::default();
             let mut wake = signal.subscribe();
             let start = std::sync::Barrier::new(2);
             let blocked = std::thread::scope(|scope| {
@@ -447,7 +447,7 @@ pub fn changed_root_keys(before: Option<String>, after: Option<String>) -> Optio
 }
 
 pub fn complete_keys(
-    change: pioneer_sqlite::WorkChange,
+    change: pioneer_postgres_pools::WorkChange,
     keys: &Option<Vec<String>>,
     changed: bool,
 ) {

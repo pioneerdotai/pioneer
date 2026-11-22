@@ -353,7 +353,7 @@ impl MessageProcessor {
                 break;
             }
             let processor =
-                Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
+                Arc::new(self.scoped_with_database_class(PostgresWriteClass::Maintenance));
             let cancel = CancellationToken::new();
             let suspending = Arc::new(AtomicBool::new(false));
             let task_cancel = cancel.clone();
@@ -361,7 +361,7 @@ impl MessageProcessor {
             let turn = row.turn_id.clone();
             // Construct before spawn so cancellation of an unpolled future also
             // releases the 16-job capacity and wakes its discovery owner.
-            struct CompletionWake(pioneer_sqlite::WorkSignal, Arc<AtomicBool>);
+            struct CompletionWake(pioneer_postgres_pools::WorkSignal, Arc<AtomicBool>);
             impl Drop for CompletionWake {
                 fn drop(&mut self) {
                     self.1.store(true, Ordering::Release);
@@ -523,7 +523,7 @@ impl MessageProcessor {
             return Ok(());
         }
         let mut storage_error = None;
-        let processor = Arc::new(self.scoped_with_database_class(SqliteWriteClass::Maintenance));
+        let processor = Arc::new(self.scoped_with_database_class(PostgresWriteClass::Maintenance));
         let store = &processor.crud_store;
         let clock = || i64::try_from(self.compaction_clock.now_ms()).unwrap_or(i64::MAX);
         // One shared input budget: 4 seed + 4 scope + 8 pending. Neither an

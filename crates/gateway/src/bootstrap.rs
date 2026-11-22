@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::ConnectionTrait;
 use tracing::{info, warn};
 
@@ -9,12 +9,12 @@ use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 const STARTUP_TURN_PROJECTION_REPLAY_LIMIT: u64 = 256;
 const STARTUP_TURN_FINALIZATION_RECONCILIATION_LIMIT: u64 = 256;
 
-pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
+pub async fn bootstrap(connection: impl Into<PostgresDatabase>) -> Result<()> {
     let connection = connection.into().maintenance();
     let patch_intents =
-        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+        pioneer_tools::apply_patch::history::PostgresCommitIntentStore::new(connection.clone());
     let patch_records =
-        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+        pioneer_tools::apply_patch::history::PostgresAppliedPatchStore::new(connection.clone());
     let terminalized_patch_intents = patch_intents
         .terminalize_pending_gaps(&patch_records)
         .await
@@ -27,12 +27,12 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
     }
     let repaired_patch_projections = repair_patch_history_projections(&connection).await?;
     let patch_snapshot_reconciliation =
-        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+        pioneer_tools::apply_patch::history::PostgresSnapshotStore::new(connection.clone())
             .reconcile_references()
             .await
             .context("failed to reconcile patch snapshot references")?;
     let snapshot_metrics =
-        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+        pioneer_tools::apply_patch::history::PostgresSnapshotStore::new(connection.clone())
             .metrics()
             .await
             .context("failed to read patch snapshot metrics")?;
@@ -93,15 +93,15 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
     Ok(())
 }
 
-async fn repair_patch_history_projections(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+async fn repair_patch_history_projections(connection: impl Into<PostgresDatabase>) -> Result<u64> {
     const REPLAY_PAGE_SIZE: usize = 256;
     let connection = connection.into();
     let records_store =
-        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+        pioneer_tools::apply_patch::history::PostgresAppliedPatchStore::new(connection.clone());
     let intent_store =
-        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+        pioneer_tools::apply_patch::history::PostgresCommitIntentStore::new(connection.clone());
     let projection_store =
-        pioneer_tools::apply_patch::history::SqliteTurnDiffStore::new(connection.clone());
+        pioneer_tools::apply_patch::history::PostgresTurnDiffStore::new(connection.clone());
     let mut repaired = 0u64;
     let mut turn_cursor = None::<(String, String)>;
     loop {
@@ -138,9 +138,9 @@ async fn repair_patch_history_projections(connection: impl Into<SqliteDatabase>)
 }
 
 async fn repair_patch_history_turn(
-    records_store: &pioneer_tools::apply_patch::history::SqliteAppliedPatchStore,
-    intent_store: &pioneer_tools::apply_patch::history::SqliteCommitIntentStore,
-    projection_store: &pioneer_tools::apply_patch::history::SqliteTurnDiffStore,
+    records_store: &pioneer_tools::apply_patch::history::PostgresAppliedPatchStore,
+    intent_store: &pioneer_tools::apply_patch::history::PostgresCommitIntentStore,
+    projection_store: &pioneer_tools::apply_patch::history::PostgresTurnDiffStore,
     thread_id: &str,
     turn_id: &str,
     replay_page_size: usize,
@@ -177,7 +177,7 @@ async fn repair_patch_history_turn(
 }
 
 async fn reconcile_prepared_turn_finalizations(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
     now_unix: i64,
 ) -> Result<pioneer_crud::TurnFinalizationReconciliationSummary> {
     let store = pioneer_crud::CrudStore::new(connection);
@@ -191,7 +191,7 @@ async fn reconcile_prepared_turn_finalizations(
 }
 
 async fn replay_due_turn_event_projections(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
     now_unix: i64,
 ) -> Result<pioneer_crud::TurnProjectionReplaySummary> {
     let store = pioneer_crud::CrudStore::new(connection);
@@ -201,7 +201,7 @@ async fn replay_due_turn_event_projections(
         .context("failed to replay pending Turn event projections during bootstrap")
 }
 
-async fn repair_thread_foreground_statuses(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+async fn repair_thread_foreground_statuses(connection: impl Into<PostgresDatabase>) -> Result<u64> {
     let store = pioneer_crud::CrudStore::new(connection);
     store
         .reconcile_thread_foreground_statuses(chrono::Utc::now().fixed_offset().timestamp())
@@ -209,7 +209,7 @@ async fn repair_thread_foreground_statuses(connection: impl Into<SqliteDatabase>
         .context("failed to reconcile thread foreground statuses during bootstrap")
 }
 
-async fn cleanup_turn_llm_context(connection: impl Into<SqliteDatabase>) -> Result<(u64, u64)> {
+async fn cleanup_turn_llm_context(connection: impl Into<PostgresDatabase>) -> Result<(u64, u64)> {
     let store = pioneer_crud::CrudStore::new(connection).with_maintenance_access();
     let terminal = store
         .delete_turn_llm_context_for_terminal_turns()
@@ -222,7 +222,7 @@ async fn cleanup_turn_llm_context(connection: impl Into<SqliteDatabase>) -> Resu
 }
 
 async fn repair_turns_completed_after_final_agent_message(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
 ) -> Result<u64> {
     let store = pioneer_crud::CrudStore::new(connection);
     store
@@ -234,7 +234,7 @@ async fn repair_turns_completed_after_final_agent_message(
 }
 
 async fn repair_terminal_turn_execution_windows(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
 ) -> Result<u64> {
     let store = pioneer_crud::CrudStore::new(connection);
     store
@@ -243,7 +243,7 @@ async fn repair_terminal_turn_execution_windows(
         .context("failed to repair active execution windows for terminal turns during bootstrap")
 }
 
-async fn cleanup_turn_runtime_snapshots(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+async fn cleanup_turn_runtime_snapshots(connection: impl Into<PostgresDatabase>) -> Result<u64> {
     let store = pioneer_crud::CrudStore::new(connection);
     store
         .delete_turn_runtime_snapshots_for_closed_turns()

@@ -260,10 +260,12 @@ mod tests {
     #[tokio::test]
     async fn cancelled_worker_does_not_touch_an_unmigrated_database() {
         pioneer_postgres_test::with_empty_database(async |database| {
-            let store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-                database.connect_read_only().await?,
-                database.connection().clone(),
-            )));
+            let store = Arc::new(CrudStore::new(
+                pioneer_postgres_pools::PostgresDatabase::new(
+                    database.connect_read_only().await?,
+                    database.connection().clone(),
+                ),
+            ));
             let cancellation = CancellationToken::new();
             cancellation.cancel();
             tokio::time::timeout(Duration::from_secs(1), run(store, cancellation))

@@ -4,11 +4,11 @@ use pioneer_crud_conversations::thread_agents_doc::{
     ThreadAgentsDocStatus, now,
 };
 use pioneer_crud_conversations::thread_tree::{create_thread_folder, move_thread_to_folder};
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_postgres_test::TestDatabase;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
-async fn create_workspace(fixture: &TestDatabase, workspace_id: &str) -> Result<SqliteDatabase> {
+async fn create_workspace(fixture: &TestDatabase, workspace_id: &str) -> Result<PostgresDatabase> {
     let writer = fixture.connection();
     writer
         .execute_raw(Statement::from_sql_and_values(
@@ -17,7 +17,7 @@ async fn create_workspace(fixture: &TestDatabase, workspace_id: &str) -> Result<
             [workspace_id.into()],
         ))
         .await?;
-    Ok(SqliteDatabase::new(
+    Ok(PostgresDatabase::new(
         fixture.connect_read_only().await?,
         writer.clone(),
     ))

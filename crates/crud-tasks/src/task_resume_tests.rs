@@ -15,8 +15,8 @@ use crate::{
 use pioneer_crud_execution::{
     agent_execution::load_agent_execution, recovery_store::RecoveryStore,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::*;
-use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{ConnectionTrait, DbBackend, Set, Statement};
 
 async fn resume_fixture(
@@ -38,7 +38,7 @@ async fn resume_fixture(
         writer.execute_raw(statement).await.unwrap();
     }
     TaskEventStore::new(
-        SqliteDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()),
+        PostgresDatabase::new(fixture.connect_read_only().await.unwrap(), writer.clone()),
         NoFrozenOutput,
     )
 }

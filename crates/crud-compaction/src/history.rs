@@ -488,7 +488,7 @@ pub async fn compaction_latest_task_basis_turn<C: ConnectionTrait>(
 /// Snapshot rows are immutable (insert-if-absent); decoding is outside DB
 /// capacity. Inline history arrays retain their original bytes.
 pub async fn compaction_task_basis_snapshot(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -501,7 +501,7 @@ pub async fn compaction_task_basis_snapshot(
     .await
 }
 async fn compaction_task_basis_snapshot_inner(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     workspace: &str,
     thread: &str,
     turn: &str,

@@ -314,7 +314,7 @@ async fn recovery_fixture_on_workspace(
     };
     let background = harness
         .processor
-        .with_database_class(pioneer_sqlite::SqliteWriteClass::Maintenance);
+        .with_database_class(pioneer_postgres_pools::PostgresWriteClass::Maintenance);
     let gateway = Arc::new(GatewayMemoryProvider::new(Arc::downgrade(&background)));
     let writes = Arc::new(ControlledCheckpointWrites {
         gateway: gateway.clone(),
@@ -838,13 +838,13 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
     assert!(error.safe_for_user);
     assert_eq!(
         error.message.as_str(),
-        "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None"
+        "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates"
     );
     // The worker also appends its known safe metadata to the outbox message.
     assert_eq!(
         status.last_error_message.as_deref(),
         Some(
-            "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None; failure_stage=candidates; failure_class=invalid_stored_data"
+            "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates; failure_stage=candidates; failure_class=invalid_stored_data"
         )
     );
     assert!(
@@ -973,8 +973,6 @@ fn manifest_worker_sentry_diagnostic_is_safe_with_real_gateway_hook_and_outbox()
     };
     assert_eq!(fields["failure_class"], json!("invalid_stored_data"));
     assert_eq!(fields["failure_stage"], json!("candidates"));
-    assert!(!fields.contains_key("sqlite_primary_code"));
-    assert!(!fields.contains_key("sqlite_extended_code"));
     let postgres_event = events.iter().find(|event| {
         matches!(event.contexts.get("Rust Tracing Fields"), Some(sentry::protocol::Context::Other(fields)) if fields.get("postgres_sqlstate") == Some(&json!("42P01")))
         && event.message.as_deref() == Some("memory post-turn extractor exhausted durable delivery")
@@ -987,8 +985,6 @@ fn manifest_worker_sentry_diagnostic_is_safe_with_real_gateway_hook_and_outbox()
     assert_eq!(postgres_fields["failure_class"], json!("unclassified"));
     assert_eq!(postgres_fields["failure_stage"], json!("candidates"));
     assert_eq!(postgres_fields["postgres_sqlstate"], json!("42P01"));
-    assert!(!postgres_fields.contains_key("sqlite_primary_code"));
-    assert!(!postgres_fields.contains_key("sqlite_extended_code"));
     assert!(
         !serde_json::to_string(postgres_event)
             .unwrap()
@@ -1464,14 +1460,14 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
         let database = store.database_connection();
         assert_eq!(
             database.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             database.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Maintenance
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance
         );
         assert_eq!(database.writer_max_connections(), 1);
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         let turn_id = "turn-manifest-restart";
         let thread_id = "thread-manifest-restart";
         let effect_id = "manifest-restart-effect";
@@ -1591,7 +1587,7 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
 
         let writer = database_fixture.connect_with_limit(1).await.unwrap();
         let reader = database_fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
         let persisted = restarted
             .native_terminal_effect_status(effect_id)
@@ -1791,9 +1787,9 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
         // Reopen the same PostgreSQL database through new reader and writer pools.
         let writer = database_fixture.connect_with_limit(1).await.unwrap();
         let reader = database_fixture.connect_read_only().await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         assert_eq!(database.writer_max_connections(), 1);
         let persisted = restarted
             .native_terminal_effect_status(&effect_id)

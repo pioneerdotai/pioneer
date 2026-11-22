@@ -98,7 +98,7 @@ pub async fn find_event_model_by_id(
 }
 
 pub async fn find_event_by_id(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     event_id: &str,
 ) -> Result<Option<AppendedTurnEvent>> {
     crate::turn_payload::events(
@@ -114,7 +114,7 @@ pub async fn find_event_by_id(
 /// Read finite rows after the claim commit. The caller decodes each body
 /// independently so one corrupt legacy body cannot suppress healthy deliveries.
 pub async fn find_event_models_by_ids(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     ids: &[String],
 ) -> Result<Vec<(String, Result<turn_event::Model>)>> {
     anyhow::ensure!(
@@ -138,7 +138,7 @@ pub async fn find_event_models_by_ids(
 }
 
 pub async fn latest_event_for_turn(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     turn_id: &str,
 ) -> Result<Option<AppendedTurnEvent>> {
     crate::turn_payload::events(
@@ -155,7 +155,7 @@ pub async fn latest_event_for_turn(
 }
 
 pub async fn list_events_for_turn(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     turn_id: &str,
     after_sequence: Option<i64>,
@@ -187,7 +187,7 @@ pub(crate) fn turn_event_page_query(
 }
 
 pub async fn list_events_for_thread(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     limit: Option<u64>,
 ) -> Result<Vec<turn_event::Model>> {

@@ -28,7 +28,11 @@ async fn run() -> Result<ExitCode> {
 
     with_test_run(|prefix| async move {
         let mut command = Command::new(program);
-        command.args(args).env(RUN_PREFIX, prefix);
+        // Database fixtures choose their own target inside the test process.
+        command
+            .args(args)
+            .env_remove("DATABASE_URL")
+            .env(RUN_PREFIX, prefix);
         let mut command = CommandWrap::from(command);
         command.wrap(KillOnDrop);
         #[cfg(unix)]

@@ -191,14 +191,14 @@ pub async fn find_queued_delivery_for_run<C: ConnectionTrait>(
 }
 
 pub async fn load_rows(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     query: sea_orm::Select<task_event::Entity>,
 ) -> Result<Vec<task_event::Model>> {
     Ok(query.all(db).await?)
 }
 
 pub async fn list_events_for_task(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     task_id: &str,
     after_sequence: Option<i64>,
     limit: Option<u64>,
@@ -250,7 +250,7 @@ fn fanout_metadata_query(
 /// First fetch IDs/sequence/byte lengths, then only an admissible prefix.
 /// Oversized immutable events are supported singly, with no new domain limit.
 pub async fn fanout_page(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     task_id: &str,
     after: i64,
     limit: usize,
@@ -307,7 +307,7 @@ pub async fn fanout_page(
 }
 
 pub async fn list_events_for_run(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     run_id: &str,
 ) -> Result<Vec<task_event::Model>> {
     load_rows(
@@ -321,7 +321,7 @@ pub async fn list_events_for_run(
 }
 
 pub async fn list_events_for_thread_turn(
-    db: &pioneer_sqlite::SqliteDatabase,
+    db: &pioneer_postgres_pools::PostgresDatabase,
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> Result<Vec<task_event::Model>> {
