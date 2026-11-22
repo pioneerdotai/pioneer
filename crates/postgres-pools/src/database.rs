@@ -956,6 +956,7 @@ mod tests {
             "SELECT 1 OPERATOR(PG_CATALOG.+) 2",
             r#"SELECT NULL::vector OPERATOR("public".<=>) NULL::vector"#,
             "SELECT pg_visible_in_snapshot('10'::xid8, pg_current_snapshot()::pg_snapshot)",
+            "SELECT floor(extract(epoch FROM statement_timestamp()))::bigint",
             "EXPLAIN ANALYZE SELECT 1",
         ] {
             assert_eq!(statement_route(sql), StatementRoute::Read, "{sql}");

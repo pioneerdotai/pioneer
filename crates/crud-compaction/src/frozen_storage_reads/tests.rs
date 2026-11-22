@@ -81,8 +81,14 @@ async fn complete_postgres_reads_keep_physical_page_order_in_the_read_only_pool(
                 .into_iter()
                 .map(|row| row.try_get("", "QUERY PLAN").unwrap())
                 .collect();
-            assert!(plan.iter().any(|row| row.contains("Index Scan")));
-            assert!(!plan.iter().any(|row| row.contains("Sort")), "{plan:#?}");
+            // Eligibility subplans can sort their own inputs. The index
+            // must supply the outer page in order, directly under LIMIT.
+            assert!(
+                plan.get(1).is_some_and(|row| {
+                    row.starts_with("  ->  Index Scan") || row.starts_with("  ->  Index Only Scan")
+                }),
+                "{plan:#?}"
+            );
         }
     }
     assert!(db.reader_is_read_only().await.unwrap());

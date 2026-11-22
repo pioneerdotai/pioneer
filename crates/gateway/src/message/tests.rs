@@ -47102,26 +47102,23 @@ async fn production_settings_recovery_transitions_projection_before_new_source_p
                 vector_search: config.clone(),
                 ..Default::default()
             };
-            // The production setters used by settings dispatch update the selection.
-            processor
-                .apply_thread_episodic_runtime_config(runtime_config.clone())
-                .await;
-            processor.apply_thread_episodic_workspace_vector_search_configs(
-                std::collections::BTreeMap::from([(workspace.clone(), config.clone())]),
-            );
             let selected =
                 refill::ThreadEpisodicWorkspaceProjectionTarget::from_vector_search_config(&config);
+            // Check provider preflight before publishing settings that wake the
+            // executor and let it contend for the same refill lock.
+            let error = refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                selected,
+                Some(resolver.clone()),
+                None,
+            )
+            .await
+            .expect_err("unavailable provider must fail refill preparation");
             assert!(
-                refill::refill_once_with_projection_resolver(
-                    store.clone(),
-                    root.path(),
-                    &workspace,
-                    selected.clone(),
-                    Some(resolver.clone()),
-                    None
-                )
-                .await
-                .is_err()
+                format!("{error:#}").contains("controlled resolution failure"),
+                "{error:#}"
             );
             assert!(
                 !refill::projection_reset_is_pending(&store, &workspace)
@@ -47130,6 +47127,12 @@ async fn production_settings_recovery_transitions_projection_before_new_source_p
             );
             let (unavailable_tx, unavailable_rx) = tokio::sync::oneshot::channel();
             *resolver.unavailable_signal.lock().await = Some(unavailable_tx);
+            processor
+                .apply_thread_episodic_runtime_config(runtime_config.clone())
+                .await;
+            processor.apply_thread_episodic_workspace_vector_search_configs(
+                std::collections::BTreeMap::from([(workspace.clone(), config.clone())]),
+            );
             let pending =
                 save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, item_id)
                     .await

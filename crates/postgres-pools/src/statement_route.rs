@@ -292,6 +292,7 @@ fn read_function(name: &ObjectName) -> bool {
             "rtrim",
             "split_part",
             "starts_with",
+            "statement_timestamp",
             "string_agg",
             "strpos",
             "substr",
