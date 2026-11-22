@@ -235,6 +235,24 @@ impl CrudStore {
         snapshot: &OperationSnapshot,
         execution_turn: Option<&str>,
     ) -> Result<OperationRecord> {
+        self.compaction_admit_for_turn_with_preparation(
+            workspace,
+            thread,
+            snapshot,
+            execution_turn,
+            None,
+        )
+        .await
+    }
+
+    pub async fn compaction_admit_for_turn_with_preparation(
+        &self,
+        workspace: &str,
+        thread: &str,
+        snapshot: &OperationSnapshot,
+        execution_turn: Option<&str>,
+        preparation: Option<&str>,
+    ) -> Result<OperationRecord> {
         let change = self.connection.work_signal("compaction").changing();
         let result = async {
             repositories::compaction::compaction_admit_for_turn(
@@ -243,6 +261,7 @@ impl CrudStore {
                 thread,
                 snapshot,
                 execution_turn,
+                preparation,
             )
             .await
         }
@@ -251,6 +270,14 @@ impl CrudStore {
             change.completed(true);
         }
         result
+    }
+
+    pub async fn compaction_latest_blocked_sequence(&self, turn: &str) -> Result<Option<i64>> {
+        repositories::compaction::latest_blocked_sequence(&self.connection, turn).await
+    }
+
+    pub async fn validate_context_preparation(&self, turn: &str, item: &str) -> Result<()> {
+        repositories::compaction::ensure_current_preparation(&self.connection, turn, item).await
     }
     pub async fn compaction_operation_for_plan(
         &self,
@@ -1757,6 +1784,25 @@ impl CrudStore {
             operation,
             execution_turn,
             deadline_ms,
+        )
+        .await
+    }
+
+    pub async fn compaction_resume_for_preparation(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+        invalid_completion: bool,
+        preparation: Option<&str>,
+    ) -> Result<bool> {
+        repositories::compaction::runner::resume_failed_operation(
+            self,
+            operation,
+            execution_turn,
+            deadline_ms,
+            invalid_completion,
+            preparation,
         )
         .await
     }

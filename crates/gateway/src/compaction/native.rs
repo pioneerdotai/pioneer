@@ -26,15 +26,7 @@ fn history_check_metadata(
     })
 }
 
-pub(crate) fn native_owner(workspace: &str, thread: &str) -> String {
-    // Lengths disambiguate arbitrary scope identifiers without parsing them.
-    format!(
-        "native:{}:{workspace}:{}:{thread}",
-        workspace.len(),
-        thread.len()
-    )
-}
-
+pub(crate) use pioneer_crud::compaction::native_owner;
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(super) async fn prepare_native_projection(

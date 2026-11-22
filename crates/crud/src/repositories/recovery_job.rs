@@ -612,7 +612,15 @@ pub async fn mark_claimed_job_active<C: ConnectionTrait>(
         return Ok(ClaimedJobActivation::BlockedByActiveRecovery);
     }
 
+    let frontier = super::turn_event::max_sequence_for_turn(db, &job.turn_id).await?;
+    let mut policy: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&job.policy_snapshot).unwrap_or_default();
+    policy.insert("active_attempt_start_sequence".to_owned(), frontier.into());
     let affected = recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::PolicySnapshot,
+            sea_orm::sea_query::Expr::value(serde_json::Value::Object(policy).to_string()),
+        )
         .col_expr(
             recovery_job::Column::Status,
             sea_orm::sea_query::Expr::value(active.to_owned()),

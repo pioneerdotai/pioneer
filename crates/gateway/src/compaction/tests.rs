@@ -4857,15 +4857,19 @@ async fn gateway_correction_uses_saved_summary_after_source_delete() {
 }
 
 #[tokio::test]
-async fn gateway_cancellation_still_prevents_publication_of_completed_summary() {
+async fn gateway_stop_fences_a_summary_waiting_to_publish() {
     let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    f.store
+        .compaction_bind_execution_turn("operation", "turn")
+        .await
+        .unwrap();
     let mut hook =
         arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
     let runner = f.runner.clone();
     let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
     hook.reached().await;
     f.store
-        .compaction_finish("operation", "cancelled", "user_stop")
+        .compaction_stop_execution("ws", "thread", "owner", "turn")
         .await
         .unwrap();
     hook.release();
@@ -4874,6 +4878,16 @@ async fn gateway_cancellation_still_prevents_publication_of_completed_summary() 
         CompactionExit::Reconcile(FailureKind::Cancelled)
     ));
     assert_eq!(f.store.compaction_head("owner").await.unwrap(), None);
+    assert_eq!(
+        f.store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running",
+        "the publication transaction must honor Stop before reconciliation"
+    );
     assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
 }
 
@@ -6002,20 +6016,20 @@ async fn admission_and_runner_remove_technical_compact_and_reference_only_payloa
 #[tokio::test]
 async fn control_reconciliation_preserves_applied_result_after_deadline_and_stop() {
     let f = fixture("source", vec![], true, false).await;
+    f.store
+        .compaction_bind_execution_turn("operation", "turn")
+        .await
+        .unwrap();
     let applied = f.runner.run(CancellationToken::new()).await.unwrap();
     f.clock.advance(900001);
     assert_eq!(
         f.runner.reconcile(FailureKind::Deadline).await.unwrap(),
         applied
     );
-    let cancel = CancellationToken::new();
-    f.runner
-        .store
-        .compaction_finish(&f.runner.snapshot.id, "cancelled", "cancelled")
+    f.store
+        .compaction_stop_execution("ws", "thread", "owner", "turn")
         .await
         .unwrap();
-    cancel.cancel();
-    assert!(cancel.is_cancelled());
     assert_eq!(
         f.runner.reconcile(FailureKind::Cancelled).await.unwrap(),
         applied

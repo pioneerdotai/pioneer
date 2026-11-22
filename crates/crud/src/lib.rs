@@ -1675,6 +1675,7 @@ pub struct RecoveryTerminalCleanupPlan {
 }
 
 struct PreparedRecoveryTerminalizationCommit {
+    stop_native_compaction: bool,
     outbox_updated_at: DateTimeWithTimeZone,
     job_updated_at: DateTimeWithTimeZone,
     turn_updated_at: DateTimeWithTimeZone,
@@ -30900,14 +30901,16 @@ impl CrudStore {
         let control_change = self.control_work_change("gateway.control", &control_wakes);
         let control_result = async {
             self.run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
                 let outcome = recovery_job::mark_claimed_job_active(
-                    &self.connection,
+                    &tx,
                     job_id,
                     claim_token,
                     active_attempt_id,
                     unix_to_datetime(now_unix),
                 )
                 .await?;
+                tx.commit().await?;
                 Ok(match outcome {
                     recovery_job::ClaimedJobActivation::Activated => {
                         ClaimedRecoveryActivation::Activated
@@ -33554,6 +33557,8 @@ impl CrudStore {
         };
         Ok(PreparedRecoveryTerminalizationOutcome::Commit(
             PreparedRecoveryTerminalizationCommit {
+                stop_native_compaction: job_status == RecoveryJobStatus::Blocked
+                    && blocked_diagnostic.is_some(),
                 outbox_updated_at: outbox.updated_at,
                 job_updated_at: job.updated_at,
                 turn_updated_at: turn_model.updated_at,
@@ -33798,7 +33803,9 @@ impl CrudStore {
                     recovery_job::find_job_by_id(&transaction, record.recovery_job_id.as_str())
                         .await?
                         .context("recovery terminalization job disappeared")?;
-                if job.updated_at != prepared.job_updated_at {
+                if job.updated_at != prepared.job_updated_at
+                    || recovery_job_status_from_db(&job.status) != Some(record.recovery_status)
+                {
                     anyhow::bail!("recovery terminalization is stale: job identity/status changed");
                 }
                 let turn_model = turn::find_turn_by_id(&transaction, record.turn_id.as_str())
@@ -33811,6 +33818,8 @@ impl CrudStore {
                 if turn_model.updated_at != prepared.turn_updated_at
                     || thread_model.id != prepared.thread_id
                     || thread_model.workspace_id != prepared.workspace_id
+                    || (prepared.terminal_event.is_some()
+                        && turn_status_from_db(&turn_model.status) != Some(TurnStatus::InProgress))
                 {
                     anyhow::bail!(
                         "recovery terminalization target changed during commit preparation"
@@ -33847,6 +33856,15 @@ impl CrudStore {
                     .await?;
                 }
                 if let Some(terminal_event) = prepared.terminal_event {
+                    if prepared.stop_native_compaction {
+                        compaction::lifecycle::stop_native_operations_for_no_progress(
+                            &transaction,
+                            &prepared.workspace_id,
+                            &prepared.thread_id,
+                            &record.turn_id,
+                        )
+                        .await?;
+                    }
                     self.append_and_project_turn_event_in_transaction(
                         &transaction,
                         terminal_event,
@@ -46622,6 +46640,26 @@ mod tests {
         store
             .materialize_item_started(
                 ItemStartedNotification {
+                    workspace_id: "ws_diag_atomic".into(),
+                    thread_id: "thr_diag_atomic".into(),
+                    turn_id: "turn_diag_atomic".into(),
+                    item: TurnItem::SystemEvent {
+                        id: "pending-preparation".into(),
+                        level: pioneer_protocol::SystemEventLevel::Info,
+                        message: "Native context preparation".into(),
+                        code: Some("runtime_operation".into()),
+                        details: Some(serde_json::json!({
+                            "operation_kind": "context_preparation", "status": "started"
+                        })),
+                    },
+                },
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
                     workspace_id: "ws_diag_atomic".to_owned(),
                     thread_id: "thr_diag_atomic".to_owned(),
                     turn_id: "turn_diag_atomic".to_owned(),
@@ -46809,6 +46847,15 @@ mod tests {
             expected.clone()
         };
         let terminal_turn = applied.newly_terminal_turn.unwrap();
+        let owner = compaction::native_owner("ws_diag_atomic", "thr_diag_atomic");
+        let stop = pioneer_entity::compaction_execution_stop::Entity::find_by_id((
+            owner,
+            terminal_turn.id.clone(),
+        ))
+        .one(&restarted.connection)
+        .await
+        .unwrap();
+        assert_eq!(stop.is_some(), status == RecoveryJobStatus::Exhausted);
         assert_eq!(
             terminal_turn.error.as_deref(),
             Some(expected_turn_message.as_str())

@@ -1055,7 +1055,7 @@ pub(crate) async fn compaction_resume_deadline(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
-    resume_failed_operation(store, operation, execution_turn, deadline_ms, false).await
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, false, None).await
 }
 
 pub(crate) async fn compaction_resume_invalid_completion(
@@ -1064,15 +1064,16 @@ pub(crate) async fn compaction_resume_invalid_completion(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
-    resume_failed_operation(store, operation, execution_turn, deadline_ms, true).await
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, true, None).await
 }
 
-async fn resume_failed_operation(
+pub(crate) async fn resume_failed_operation(
     store: &CrudStore,
     operation: &str,
     execution_turn: &str,
     deadline_ms: u64,
     invalid_completion: bool,
+    preparation: Option<&str>,
 ) -> Result<bool> {
     let Some(record) =
         super::compaction::compaction_operation(&store.connection, operation).await?
@@ -1224,6 +1225,9 @@ async fn resume_failed_operation(
     );
     store.run_serialized_write(|| async {
         let tx = store.connection.begin().await?;
+        if let Some(item) = preparation {
+            super::compaction::ensure_current_preparation(&tx, execution_turn, item).await?;
+        }
         // Decode the bound header result in this same writer transition. An
         // expired saved Commit is an explicit error, not an ordinary stale CAS.
         super::compaction_source_projection::compaction_bound_source_projection(&tx, operation)
