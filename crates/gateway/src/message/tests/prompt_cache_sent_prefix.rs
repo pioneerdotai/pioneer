@@ -918,10 +918,16 @@ async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output
             1 => ("second_result", "cache_large"),
             _ => return None,
         };
-        Some(json!({"id":format!("response_{round}"),"model":MODEL,"choices":[{
+        let mut reply = json!({"id":format!("response_{round}"),"model":MODEL,"choices":[{
             "index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
                 "tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":"{}"}}]}
-        }]}))
+        }]});
+        if round == 0 {
+            // Leave room for the first bounded result while making the next
+            // result compete for the remaining measured input budget.
+            reply["usage"] = json!({"prompt_tokens":13_500,"completion_tokens":20,"total_tokens":13_520});
+        }
+        Some(reply)
     }).await;
     let provider = Arc::new(LoopProvider {
         inner: Arc::new(ChatCompletionsApiCompatibleProvider::new(
@@ -931,7 +937,7 @@ async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output
             AuthStyle::Bearer,
         )),
         requests: Default::default(),
-        context_limit: Some(24_000),
+        context_limit: Some(40_000),
     });
     let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai", provider,
@@ -956,13 +962,14 @@ async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output
     .await;
 
     let mut sent = Vec::new();
-    for _ in 0..3 {
-        sent.push(
-            timeout(Duration::from_secs(15), wire.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-        );
+    for round in 1..=3 {
+        match timeout(Duration::from_secs(30), wire.recv()).await {
+            Ok(Some(request)) => sent.push(request),
+            _ => {
+                let durable_turn = harness.crud_store.get_turn(&thread.id, &turn.id).await;
+                panic!("missing HTTP request {round}; durable turn: {durable_turn:?}");
+            }
+        }
     }
     let result = |round: usize, id: &str| {
         sent[round]["messages"]
