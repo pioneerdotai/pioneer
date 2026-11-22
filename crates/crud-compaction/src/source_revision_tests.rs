@@ -23,6 +23,13 @@ async fn fixture() -> PostgresDatabase {
 
 async fn fixture_with_portable_sources(portable: bool) -> PostgresDatabase {
     let database = pioneer_postgres_test::scoped_database().await.unwrap();
+    seed_fixture(&database, portable).await
+}
+
+async fn seed_fixture(
+    database: &pioneer_postgres_test::TestDatabase,
+    portable: bool,
+) -> PostgresDatabase {
     let writer = database.connection().clone();
     let reader = database.connect_read_only().await.unwrap();
     let db = PostgresDatabase::new(reader, writer).maintenance();
@@ -70,6 +77,91 @@ async fn fixture_with_portable_sources(portable: bool) -> PostgresDatabase {
         .unwrap();
     set_root_leaf(&db, &canonical_branches()[2].branch.source).await;
     db
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn message_edit_can_update_the_projection_while_context_retirement_waits() {
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let db = seed_fixture(&fixture, false).await;
+    db.execute_unprepared(
+        r#"UPDATE turn_llm_context SET payload='{"ready":true}' WHERE id='context-source'"#,
+    )
+    .await
+    .unwrap();
+    let edit = db.with_interactive_writes().begin().await.unwrap();
+    edit.execute_unprepared(
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at)
+         VALUES ('edit-event','source-thread','other-source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    let pid: i32 = edit
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT pg_backend_pid()",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    let epoch = "SELECT version FROM compaction_projection_epoch WHERE thread_id='source-thread'";
+    let before: i64 = edit
+        .query_one_raw(Statement::from_string(DbBackend::Postgres, epoch))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+
+    let retire = db.execute_unprepared(
+        r#"UPDATE turn_llm_context SET payload='{"retired":true}' WHERE id='context-source'"#,
+    );
+    tokio::pin!(retire);
+    let observer = fixture.connection();
+    tokio::select! {
+        result = &mut retire => panic!("retirement completed before the message edit: {result:?}"),
+        waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = observer.query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT EXISTS (SELECT FROM pg_stat_activity
+                     WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+                    [pid.into()],
+                )).await.unwrap().unwrap().try_get_by_index(0).unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }) => waiting.expect("retirement must wait for the message edit"),
+    }
+    assert!(
+        edit.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("{epoch} FOR UPDATE NOWAIT"),
+        ))
+        .await
+        .expect("the message edit can still acquire the projection epoch row")
+        .is_some()
+    );
+    assert_eq!(
+        edit.execute_unprepared("DELETE FROM turn_input WHERE id='input-source'")
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    edit.commit().await.unwrap();
+    assert_eq!(retire.await.unwrap().rows_affected(), 1);
+    let after: i64 = observer
+        .query_one_raw(Statement::from_string(DbBackend::Postgres, epoch))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(after, before + 2);
 }
 
 #[derive(Clone)]

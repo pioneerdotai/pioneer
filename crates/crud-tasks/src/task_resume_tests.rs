@@ -195,19 +195,62 @@ async fn task_owned_blocked_turn_resume_reopens_the_full_aggregate() {
         assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_none());
         let registries = Registries::default();
         let resume_wake = Arc::new(Notify::new());
-        let outcome = store
-            .resume_task_owned_turn(
-                &registries,
-                &resume_wake,
-                thread_id,
-                turn_id,
-                Some(job.id.as_str()),
-                timestamp + 6,
-                "test-owner",
-                timestamp + 51,
-            )
+        let publication = database.begin().await.unwrap();
+        crate::event_log::lock_task(&publication, &task.id)
             .await
-            .expect("task-owned resume should commit");
+            .unwrap();
+        let pid: i32 = publication
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_backend_pid()",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index(0)
+            .unwrap();
+        let resume = store.resume_task_owned_turn(
+            &registries,
+            &resume_wake,
+            thread_id,
+            turn_id,
+            Some(job.id.as_str()),
+            timestamp + 6,
+            "test-owner",
+            timestamp + 51,
+        );
+        tokio::pin!(resume);
+        let observer = fixture.connection();
+        tokio::select! {
+            outcome = &mut resume => panic!("resume completed before publication: {outcome:?}"),
+            waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = observer.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT EXISTS (SELECT FROM pg_stat_activity
+                         WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
+                        [pid.into()],
+                    )).await.unwrap().unwrap().try_get_by_index(0).unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }) => waiting.expect("resume must wait for task publication"),
+        }
+        assert!(
+            publication
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT id FROM task WHERE id=$1 FOR UPDATE NOWAIT",
+                    [task.id.clone().into()],
+                ))
+                .await
+                .expect("publication can still acquire the task row")
+                .is_some()
+        );
+        publication.commit().await.unwrap();
+        let outcome = resume.await.expect("task-owned resume should commit");
         assert!(futures_util::FutureExt::now_or_never(fanout.wait(None)).is_some());
         let delivered = drain_custom_publisher_fanout(&store).await;
         assert_eq!(delivered.len(), 2);

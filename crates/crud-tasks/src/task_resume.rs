@@ -296,6 +296,11 @@ impl<B: TaskOutputBinder + Clone> TaskEventStore<B> {
                 .await
                 .context("failed to begin task-owned turn resume transaction")?;
 
+            // The normal event pipeline takes this lock before touching Task
+            // rows. Resume must follow that order even though it writes the
+            // aggregate before appending its events.
+            crate::event_log::lock_task(&tx, &run.task_id).await?;
+
             let stable_task_run_turn =
                 pioneer_entity::task_run_turn::Entity::find_by_id(&task_run_turn_model.id)
                     .lock_exclusive()

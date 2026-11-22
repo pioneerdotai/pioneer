@@ -10,6 +10,8 @@ mod m20261119_000007_history_storage;
 mod m20261119_000008_memory;
 mod m20261119_000009_relations;
 mod m20261119_000010_database_rules;
+mod m20261122_000011_history_epoch_lock_order;
+mod m20261122_000012_package_component_lock_order;
 
 pub struct Migrator;
 
@@ -27,6 +29,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261119_000008_memory::Migration),
             Box::new(m20261119_000009_relations::Migration),
             Box::new(m20261119_000010_database_rules::Migration),
+            Box::new(m20261122_000011_history_epoch_lock_order::Migration),
+            Box::new(m20261122_000012_package_component_lock_order::Migration),
         ]
     }
 }

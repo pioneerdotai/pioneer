@@ -2,7 +2,9 @@
 use super::*;
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+};
 
 #[path = "../tests/support/plugin_ownership.rs"]
 mod plugin_fixture;
@@ -56,10 +58,27 @@ async fn package_update_retains_native_identity_policy_overrides_and_successful_
             override_fields_json: "[\"enabled\",\"allow_implicit_invocation\"]".into(),
             pending_after: "{\"kind\":\"native\",\"native_committed\":true}".into(),
         };
-        store
-            .upsert_workspace_skill_policy_with_plugin_change(&policy(&first), Some(&write), 2)
+        // The policy changes the component's overrides while another native
+        // writer owns the unchanged installation row.
+        let native_writer = fixture.connection().begin().await.unwrap();
+        pioneer_entity::skill_installation::Entity::find_by_id(first.skill_id.to_string())
+            .lock_exclusive()
+            .one(&native_writer)
             .await
+            .unwrap()
             .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.upsert_workspace_skill_policy_with_plugin_change(
+                &policy(&first),
+                Some(&write),
+                2,
+            ),
+        )
+        .await
+        .expect("publishing overrides must not wait for the unchanged installation")
+        .unwrap();
+        native_writer.rollback().await.unwrap();
         store
             .finish_plugin_mutation(&id, native.revision, "installed", None)
             .await
