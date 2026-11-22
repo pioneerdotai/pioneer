@@ -44,23 +44,6 @@ pub async fn quarantine_claim<C: ConnectionTrait>(
     Ok(affected)
 }
 
-pub async fn quarantine_claim_batch<C: ConnectionTrait>(
-    db: &C,
-    job_ids: &[String],
-    claim_token: &str,
-    reason_code: &str,
-    error: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<u64> {
-    let affected =
-        execution::quarantine_claim_batch(db, job_ids, claim_token, reason_code, error, now)
-            .await?;
-    if affected > 0 {
-        context_writes::settle_shell_controls_for_recovery_jobs(db, job_ids).await?;
-    }
-    Ok(affected)
-}
-
 pub async fn cancel_claim<C: ConnectionTrait>(
     db: &C,
     job_id: &str,
@@ -71,20 +54,6 @@ pub async fn cancel_claim<C: ConnectionTrait>(
     let affected = execution::cancel_claim(db, job_id, claim_token, reason, now).await?;
     if affected {
         context_writes::settle_shell_controls_for_recovery_jobs(db, &[job_id.to_owned()]).await?;
-    }
-    Ok(affected)
-}
-
-pub async fn cancel_claim_batch<C: ConnectionTrait>(
-    db: &C,
-    job_ids: &[String],
-    claim_token: &str,
-    reason: &str,
-    now: DateTimeWithTimeZone,
-) -> Result<u64> {
-    let affected = execution::cancel_claim_batch(db, job_ids, claim_token, reason, now).await?;
-    if affected > 0 {
-        context_writes::settle_shell_controls_for_recovery_jobs(db, job_ids).await?;
     }
     Ok(affected)
 }

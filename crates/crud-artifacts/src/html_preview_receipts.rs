@@ -8,11 +8,10 @@ use pioneer_entity::{
     turn_llm_context,
 };
 use queries::{bytes, col, json as json_field, revision};
-use sea_orm::sea_query::{Expr, ExprTrait, JoinType, Order, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, JoinType};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
 };
-use serde_json::Value;
 
 pub struct HtmlPreviewReceipts<'a> {
     connection: &'a pioneer_postgres_pools::PostgresDatabase,
@@ -254,6 +253,8 @@ impl HtmlPreviewReceipts<'_> {
         after: &(String, i64),
         upper: &(String, i64),
     ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
+        use sea_orm::sea_query::{Order, Query};
+
         // Page source rows, even if expired/already verified; never search the
         // whole candidate pool inside one background quantum.
         let query = Query::select()

@@ -6,7 +6,6 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect,
-    QueryTrait, TransactionTrait,
 };
 
 use pioneer_crud_conversations::events::{AppendedTurnEvent, TurnEventPayload};
@@ -193,6 +192,8 @@ pub async fn append_event(
     payload: &TurnEventPayload,
     created_at: DateTimeWithTimeZone,
 ) -> Result<AppendedTurnEvent> {
+    use sea_orm::TransactionTrait;
+
     let prepared = PreparedTurnEvent::prepare(payload.clone())?
         .preflight_idempotency(db)
         .await?;

@@ -10,11 +10,13 @@ use pioneer_postgres_pools::{
     PostgresReadClass, PostgresWriteClass, is_retryable_database_conflict, retry_with_backoff,
 };
 use pioneer_protocol::{ToolCallStatus, TurnItem, TurnItemTimeoutReason};
+#[cfg(test)]
+use sea_orm::ConnectionTrait;
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, TransactionTrait,
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

@@ -9,5 +9,5 @@ pub use manifest::{
     MCP_SCHEMA, MCP_SCHEMA_BYTES, Manifest, PLUGIN_SCHEMA, PLUGIN_SCHEMA_BYTES, SPEC_VERSION,
     parse_manifest,
 };
-use pioneer_packages::{Boundary, Diagnostic, Entry, PackageMcpServer, Snapshot, load_mcp};
+use pioneer_packages::{Boundary, Diagnostic, Entry, Snapshot, load_mcp};
 use pioneer_packages::{diagnostic, package_mcp};

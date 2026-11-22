@@ -1,9 +1,9 @@
-use crate::{CrudStore, GatewayControlWake, compaction, terminal_cleanup};
+use crate::{CrudStore, GatewayControlWake, terminal_cleanup};
 use anyhow::{Context, Result};
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::turn_execution;
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status;
-use pioneer_protocol::{Turn, TurnStatus};
+use pioneer_protocol::TurnStatus;
 use sea_orm::TransactionTrait;
 
 impl CrudStore {

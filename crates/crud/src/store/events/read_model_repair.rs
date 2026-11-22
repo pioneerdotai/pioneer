@@ -3,10 +3,7 @@ use crate::{
     RepairSummary,
 };
 use anyhow::Result;
-use pioneer_crud_conversations::read_model_repair;
 use pioneer_crud_execution::read_model_repair::ReadModelRepairTimings;
-use pioneer_crud_memory::episodic_source_store::PreparedSourceSave;
-use sea_orm::DatabaseTransaction;
 
 impl CrudStore {
     pub async fn list_read_model_invariant_violations(
@@ -84,10 +81,10 @@ impl CrudStore {
     #[cfg(test)]
     pub(crate) async fn apply_one_terminal_turn_item_payload_repair(
         &self,
-        transaction: &DatabaseTransaction,
+        transaction: &sea_orm::DatabaseTransaction,
         row: &pioneer_entity::turn_item::Model,
         payload: &pioneer_crud_payloads::storage::PreparedPayload,
-        episodic: Option<&PreparedSourceSave>,
+        episodic: Option<&pioneer_crud_memory::episodic_source_store::PreparedSourceSave>,
     ) -> Result<bool> {
         self.execution_read_model_repair()
             .apply_one_terminal_turn_item_payload_repair(transaction, row, payload, episodic)

@@ -713,6 +713,7 @@ async fn refill_once_with_projection(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn refill_once_with_workspace_projection(
     crud_store: Arc<CrudStore>,
     thread_episodic_lock_root: &Path,
@@ -741,6 +742,7 @@ pub(crate) async fn refill_once_with_workspace_projection(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn refill_once_with_projection_resolver(
     crud_store: Arc<CrudStore>,
     thread_episodic_lock_root: &Path,
@@ -758,7 +760,6 @@ pub(crate) async fn refill_once_with_projection_resolver(
         refill_status_sender,
         ThreadEpisodicIndexExecutorConfig::default(),
         None,
-        #[cfg(test)]
         None,
     )
     .await

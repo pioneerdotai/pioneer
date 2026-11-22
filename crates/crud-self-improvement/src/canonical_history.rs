@@ -9,8 +9,8 @@ use pioneer_entity::{
     self_improvement_source_turn, task, task_delivery, task_run_turn, thread, turn, turn_event,
 };
 use pioneer_protocol::{
-    SystemEventLevel, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, TurnItem, TurnKind,
-    TurnOrigin, TurnStatus, UserInput, task_delivery_id_from_result_item_id,
+    SystemEventLevel, ThreadOriginKind, ThreadSidebarVisibility, TurnItem, TurnKind, TurnOrigin,
+    TurnStatus, UserInput, task_delivery_id_from_result_item_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};

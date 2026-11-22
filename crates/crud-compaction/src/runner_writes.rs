@@ -5,8 +5,8 @@ use pioneer_compaction::Checkpoint;
 use pioneer_compaction::runner::{FailureKind, RunnerPhase, RunnerState};
 use pioneer_entity::{
     compaction_attempt_observation, compaction_checkpoint, compaction_context, compaction_coverage,
-    compaction_execution_stop, compaction_manifest, compaction_operation, compaction_runner_plan,
-    compaction_runner_state, thread, turn,
+    compaction_manifest, compaction_operation, compaction_runner_plan, compaction_runner_state,
+    thread, turn,
 };
 use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::sea_query::{Alias, Asterisk, Expr, ExprTrait, Func, JoinType, OnConflict, Query};

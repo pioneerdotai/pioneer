@@ -6,9 +6,9 @@ use crate::store::execution::recovery_settlement;
 use crate::{
     ClaimedRecoveryTerminalizationRecord, CrudStore, GatewayControlWake,
     RecoveryTerminalCleanupPlan, RecoveryTerminalizationApplyOutcome,
-    RecoveryTerminalizationClaimDisposition, compaction, terminal_cleanup,
+    RecoveryTerminalizationClaimDisposition, terminal_cleanup,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_crud_access::turn_execution::turn_status_from_db;
 use pioneer_crud_conversations::turn_reads;
 use pioneer_crud_execution::recovery_terminalization_outbox::{
@@ -17,7 +17,6 @@ use pioneer_crud_execution::recovery_terminalization_outbox::{
 use pioneer_crud_execution::recovery_terminalization_plan::PreparedRecoveryTerminalizationOutcome;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{native_terminal_effect_outbox, recovery_job};
-use pioneer_protocol::{Thread, Turn};
 use sea_orm::TransactionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 

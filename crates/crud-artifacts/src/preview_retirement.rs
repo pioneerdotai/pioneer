@@ -1,20 +1,17 @@
 //! Bounded discovery and transactional retirement of temporary HTML media.
 use crate::html_preview::archive_result;
-use crate::html_preview_retention_queries::{
-    self as queries, bytes, col, json as json_field, revision,
-};
+use crate::html_preview_retention_queries::{self as queries, bytes, json as json_field};
 use crate::visibility::temporary_preview_predicate;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
     artifact, artifact_binding, artifact_blob, artifact_external_ref, artifact_projection,
-    artifact_version, compaction_source_revision, thread as thread_entity, turn as turn_entity,
-    turn_input, turn_llm_context,
+    artifact_version, turn_llm_context,
 };
 use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase, WorkSignal,
     is_retryable_database_conflict, retry_with_backoff,
 };
-use sea_orm::sea_query::{BinOper, Expr, ExprTrait, JoinType, Order, Query};
+use sea_orm::sea_query::{BinOper, Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
     TransactionTrait,

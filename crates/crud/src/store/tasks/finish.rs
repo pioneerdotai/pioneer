@@ -5,7 +5,6 @@ use anyhow::Result;
 use pioneer_crud_execution::agent_action_commit::agent_action_commit_exists;
 use pioneer_crud_tasks::event_records::materialize_task_events;
 use pioneer_crud_tasks::finish::FinishPreparation;
-use pioneer_crud_tasks::work_change::TaskWorkChange;
 use sea_orm::TransactionTrait;
 
 impl CrudStore {

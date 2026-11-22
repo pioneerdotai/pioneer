@@ -9,7 +9,6 @@ use crate::{
     ResolveAgentMemoryQuarantine,
 };
 use anyhow::Result;
-use pioneer_crud_access::policy;
 use pioneer_protocol::{MemoryCandidateStatus, MemoryScope};
 
 impl CrudStore {
@@ -361,7 +360,7 @@ impl CrudStore {
     /// The dedupe decision and creation event share a write transaction.
     pub async fn insert_agent_memory_candidate_with_outcome(
         &self,
-        mut candidate: NewAgentMemoryCandidate,
+        candidate: NewAgentMemoryCandidate,
         event_timestamp_secs: i64,
     ) -> Result<(AgentMemoryCandidateRecord, bool)> {
         self.memory_store()

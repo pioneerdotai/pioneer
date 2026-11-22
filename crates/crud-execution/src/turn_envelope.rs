@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use pioneer_entity::{thread, turn};
 use pioneer_protocol::{NativeContextBudget, NativeSummaryContext, TurnExecutionSecuritySnapshot};
-use sea_orm::sea_query::{Expr, ExprTrait};
+use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 use serde_json::Value;
 

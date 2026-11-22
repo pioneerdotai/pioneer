@@ -1,5 +1,6 @@
 use anyhow::Result;
 use pioneer_crud_access::membership::PersistedThreadAccessClass;
+#[cfg(test)]
 use pioneer_crud_conversations::thread_metadata::prepare_preview_author_json;
 use pioneer_crud_conversations::thread_mutations::ThreadManagementChange;
 use pioneer_crud_conversations::thread_state::NativeThreadNameFence;
@@ -23,7 +24,7 @@ pub async fn upsert_thread<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    upsert_projected_thread(
+    if thread_mutations::upsert_projected_thread(
         db,
         thread_model,
         None,
@@ -31,7 +32,11 @@ pub async fn upsert_thread<C: ConnectionTrait>(
         created_at,
         updated_at,
     )
-    .await
+    .await?
+    {
+        task_child_producers::thread(db, &thread_model.id).await?;
+    }
+    Ok(())
 }
 
 pub async fn upsert_thread_with_creator<C: ConnectionTrait>(
@@ -102,29 +107,6 @@ pub async fn insert_user_thread_with_creator<C: ConnectionTrait>(
     )
     .await?;
     task_child_producers::thread(db, &thread_model.id).await
-}
-
-pub(crate) async fn upsert_projected_thread<C: ConnectionTrait>(
-    db: &C,
-    thread_model: &Thread,
-    creator: Option<&PersistedActorRef>,
-    preview_author_json: Option<String>,
-    created_at: DateTimeWithTimeZone,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<()> {
-    if thread_mutations::upsert_projected_thread(
-        db,
-        thread_model,
-        creator,
-        preview_author_json,
-        created_at,
-        updated_at,
-    )
-    .await?
-    {
-        task_child_producers::thread(db, &thread_model.id).await?;
-    }
-    Ok(())
 }
 
 pub async fn update_user_thread_management(

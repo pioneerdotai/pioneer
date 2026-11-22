@@ -17,7 +17,7 @@ use pioneer_entity::{
     compaction_frozen_import_data, compaction_task_output, task_delivery, turn_event,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 

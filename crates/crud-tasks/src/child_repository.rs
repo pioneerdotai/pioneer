@@ -10,14 +10,13 @@ use pioneer_crud_execution::turn_runtime_snapshot::delete_turn_runtime_snapshot;
 use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::TurnStatus;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use pioneer_entity::{task_child_reconcile_pending as point, task_child_reconcile_scope as scope};
 use pioneer_protocol::generate_id;
+#[cfg(test)]
+use sea_orm::ConnectionTrait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    TransactionTrait,
-};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
 fn token() -> String {
     generate_id(32)

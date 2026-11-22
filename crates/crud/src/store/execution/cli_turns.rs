@@ -8,7 +8,7 @@ use crate::store::events::event_preparation::{
 use crate::{
     CliRuntimeNativeEventRecord, CliRuntimeTurnAttemptRecord, CliRuntimeTurnAttemptStatus,
     CliRuntimeTurnBindingRecord, CliRuntimeTurnTerminalGuard, CrudStore, GatewayControlWake,
-    NewCliRuntimeNativeEvent, NewCliRuntimeTurnBinding, compaction, terminal_cleanup,
+    NewCliRuntimeNativeEvent, NewCliRuntimeTurnBinding, terminal_cleanup,
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud_access::turn_execution::turn_status_from_db;
@@ -24,9 +24,8 @@ use pioneer_crud_execution::event_storage_validation::validate_turn_event_execut
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{cli_runtime_binding, recovery_job, turn_execution};
 use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_turn_binding_state;
-use pioneer_protocol::{Task, Turn, TurnStatus, generate_id};
-use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
+use pioneer_protocol::TurnStatus;
+use sea_orm::TransactionTrait;
 
 impl CrudStore {
     pub async fn prepare_cli_runtime_initial_turn_attempt(
@@ -51,7 +50,6 @@ impl CrudStore {
                 root.locator().is_some(),
             )?;
             self.retry_write_on_conflict(|| async {
-                let prepared_binding = binding.clone();
                 let transaction = self
                     .connection
                     .begin()

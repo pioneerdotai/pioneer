@@ -3,8 +3,6 @@
 use crate::{
     AppendedTaskEvent, CrudStore, TaskRunChildAnchor, TaskRuntimeInvariantSnapshot,
     TerminalTaskOccurrenceMismatch, TerminalTaskOccurrenceMismatchPage,
-    list_terminal_task_occurrence_mismatches, record_agent_execution_progress,
-    scan_terminal_task_occurrence_mismatches,
 };
 use anyhow::Result;
 use pioneer_protocol::{

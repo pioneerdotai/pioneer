@@ -2,7 +2,6 @@
 
 use crate::{AgentCommitInput, CrudStore, NewUserNotificationOutbox, TaskRootAccessFilter};
 use anyhow::Result;
-use pioneer_crud_tasks::user_notification_outbox;
 use pioneer_protocol::{TaskDeliveriesParams, TaskDeliveriesResponse, TaskDelivery};
 use std::collections::HashMap;
 

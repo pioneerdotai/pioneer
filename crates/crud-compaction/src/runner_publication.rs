@@ -1,4 +1,3 @@
-use crate::SOURCE_PAGE_BYTES;
 use crate::checkpoint_apply::CommitOutcome;
 #[cfg(test)]
 use crate::proof_test_metrics::{PublicationWriterTestGuard, record_publication_heavy_check};
@@ -16,17 +15,16 @@ use crate::runner_state::update_runner_state;
 use crate::runner_writes::checkpoint_identity;
 use crate::store::CompactionStore;
 #[cfg(test)]
-use crate::{CHECKPOINT_SOURCE_LIMIT, SOURCE_PAGE_ROWS};
+use crate::{CHECKPOINT_SOURCE_LIMIT, SOURCE_PAGE_BYTES, SOURCE_PAGE_ROWS};
 use anyhow::{Result, ensure};
 #[cfg(test)]
 use pioneer_compaction::SourceRef;
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
 use pioneer_entity::{
-    compaction_attempt_observation, compaction_checkpoint, compaction_context, compaction_coverage,
-    compaction_execution_stop, compaction_manifest, compaction_operation, compaction_runner_plan,
-    compaction_runner_state, thread, turn,
+    compaction_checkpoint, compaction_context, compaction_coverage, compaction_execution_stop,
+    compaction_manifest, compaction_operation, compaction_runner_state, turn,
 };
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, JoinType, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, JoinType, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
@@ -592,7 +590,7 @@ pub(crate) async fn compaction_apply_runner(
 
 use sea_orm::QuerySelect;
 
-use sea_orm::{QueryTrait, Statement};
+use sea_orm::Statement;
 
 #[cfg(test)]
 use crate::manifest::source_validation_statement as compaction_manifest_sources_current_statement;

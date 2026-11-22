@@ -41,7 +41,6 @@ use pioneer_entity::package_component;
 pub use plugins::{
     PackageNativeWrite, PackageOwnershipWrite, PluginNativeWrite, PluginOwnershipWrite,
 };
-pub(crate) use plugins::{native_package_removal, validate_native_write_input};
 use sea_orm::TransactionTrait;
 
 pub struct PackageStore {
@@ -789,7 +788,7 @@ impl PackageStore {
         workspace: &str,
         kind: &str,
     ) -> Result<()> {
-        validate_native_write_input(Some(write))?;
+        plugins::validate_native_write_input(Some(write))?;
         self.retry_write_on_conflict(|| async move {
             let db = self.connection.begin().await?;
             plugins::validate_native_write(&db, Some(write), workspace, kind, &write.child_id)

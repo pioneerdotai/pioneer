@@ -350,10 +350,6 @@ impl ClientCore {
         self.packages(PackageKind::Plugin)
             .acquire_plugin_demand(self, workspace, plugin_id)
     }
-    fn publish_plugins(&self, workspace: &str, p: &mut PluginPublication) -> ClientTransition {
-        self.packages(PackageKind::Plugin)
-            .publish_plugins(workspace, p)
-    }
     pub fn plugin_details_publication(
         &self,
         workspace: &str,
@@ -361,14 +357,6 @@ impl ClientCore {
     ) -> Option<PluginPublication> {
         self.packages(PackageKind::Plugin)
             .plugin_details_publication(workspace, plugin_id)
-    }
-    fn project_plugin_native_snapshots(
-        &self,
-        workspace: &str,
-        publication: &mut PluginPublication,
-    ) {
-        self.packages(PackageKind::Plugin)
-            .project_plugin_native_snapshots(workspace, publication)
     }
     pub fn plugin_intent_for(
         &self,
@@ -382,47 +370,6 @@ impl ClientCore {
     pub fn plugin_intent(&self, workspace: &str, intent: PluginIntent) -> ClientTransition {
         self.packages(PackageKind::Plugin)
             .plugin_intent(workspace, intent)
-    }
-    fn plugin_intent_with_management(
-        &self,
-        workspace: &str,
-        intent: PluginIntent,
-        managing: bool,
-    ) -> ClientTransition {
-        self.packages(PackageKind::Plugin)
-            .plugin_intent_with_management(workspace, intent, managing)
-    }
-    fn plugin_intent_bound(
-        &self,
-        workspace: &str,
-        intent: PluginIntent,
-        managing: bool,
-        parent: Option<String>,
-        origin: Option<&PluginCommandOrigin>,
-        continuing_read: bool,
-    ) -> ClientTransition {
-        self.packages(PackageKind::Plugin).plugin_intent_bound(
-            workspace,
-            intent,
-            managing,
-            parent,
-            origin,
-            continuing_read,
-        )
-    }
-    fn plugin_work_current(&self, work: &Work) -> bool {
-        self.packages(PackageKind::Plugin).plugin_work_current(work)
-    }
-    fn plugin_work_parent(&self, work: &Work) -> Option<Option<String>> {
-        self.packages(PackageKind::Plugin).plugin_work_parent(work)
-    }
-    fn admit_plugin_child(
-        &self,
-        work: &Work,
-        admit: impl FnOnce() -> anyhow::Result<u64>,
-    ) -> anyhow::Result<u64> {
-        self.packages(PackageKind::Plugin)
-            .admit_plugin_child(work, admit)
     }
     pub(crate) fn refresh_plugins_for_native_notification(
         &self,
@@ -456,10 +403,60 @@ impl ClientCore {
             self.packages(kind).plugin_demand_changed(scope, demand);
         }
     }
+    pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
+        for kind in [PackageKind::Plugin, PackageKind::App] {
+            self.packages(kind).start_plugins_controller(self);
+        }
+    }
+}
+#[cfg(test)]
+impl ClientCore {
+    fn publish_plugins(&self, workspace: &str, p: &mut PluginPublication) -> ClientTransition {
+        self.packages(PackageKind::Plugin)
+            .publish_plugins(workspace, p)
+    }
+
+    fn plugin_intent_bound(
+        &self,
+        workspace: &str,
+        intent: PluginIntent,
+        managing: bool,
+        parent: Option<String>,
+        origin: Option<&PluginCommandOrigin>,
+        continuing_read: bool,
+    ) -> ClientTransition {
+        self.packages(PackageKind::Plugin).plugin_intent_bound(
+            workspace,
+            intent,
+            managing,
+            parent,
+            origin,
+            continuing_read,
+        )
+    }
+
+    fn plugin_work_current(&self, work: &Work) -> bool {
+        self.packages(PackageKind::Plugin).plugin_work_current(work)
+    }
+
+    fn plugin_work_parent(&self, work: &Work) -> Option<Option<String>> {
+        self.packages(PackageKind::Plugin).plugin_work_parent(work)
+    }
+
+    fn admit_plugin_child(
+        &self,
+        work: &Work,
+        admit: impl FnOnce() -> anyhow::Result<u64>,
+    ) -> anyhow::Result<u64> {
+        self.packages(PackageKind::Plugin)
+            .admit_plugin_child(work, admit)
+    }
+
     fn resume_pending_plugin_reads(&self) {
         self.packages(PackageKind::Plugin)
             .resume_pending_plugin_reads()
     }
+
     fn settle_plugin_work(
         &self,
         work: &Work,
@@ -473,11 +470,6 @@ impl ClientCore {
             mutation_dispatched,
             catalog_read_succeeded,
         )
-    }
-    pub(crate) fn start_plugins_controller(self: &Arc<Self>) {
-        for kind in [PackageKind::Plugin, PackageKind::App] {
-            self.packages(kind).start_plugins_controller(self);
-        }
     }
 }
 impl PackageClient<'_> {

@@ -1,14 +1,12 @@
 use crate::{
     ActiveExecutionAuthorityRecord, ActiveTaskExecutionAuthorityRecord, CrudStore,
     TurnExecutionBinding, TurnExecutionRecord, TurnExecutionSecuritySnapshotRecord,
-    TurnExecutionStatus,
 };
 use anyhow::Result;
 use pioneer_crud_execution::turn_ownership::TurnOwnership;
 use pioneer_crud_execution::{execution_heartbeat, turn_admission, turn_execution};
 use pioneer_crud_tasks::execution_store::TaskExecutionStore;
 use pioneer_protocol::{TurnExecutionSecuritySnapshot, TurnStatus};
-use std::collections::HashMap;
 
 impl CrudStore {
     pub async fn list_active_execution_authorities(

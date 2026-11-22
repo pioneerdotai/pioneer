@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use pioneer_crud_execution::cli_runtime_binding;
 use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_pending_request;
 use sea_orm::TransactionTrait;
-use sea_orm::entity::prelude::DateTimeWithTimeZone;
 
 impl CrudStore {
     pub async fn create_cli_runtime_pending_request(

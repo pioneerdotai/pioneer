@@ -2,13 +2,13 @@
 //! only the candidate workspace's canonical records can release storage.
 use pioneer_entity::{
     agent_execution, agent_execution_resource_state, agent_turn_response_execution, artifact,
-    artifact_binding, artifact_blob, artifact_projection, artifact_version,
-    compaction_frozen_history, compaction_source_revision, compaction_task_output,
-    html_preview_frozen_index, html_preview_frozen_result, html_preview_frozen_turn,
-    native_terminal_effect_outbox, portable_payload_value, recovery_job,
-    recovery_terminalization_outbox, task, task_delivery, task_run, task_run_conversation_snapshot,
-    task_run_turn, thread, thread_cli_runtime_binding, turn, turn_cli_runtime_binding,
-    turn_event_delivery, turn_finalization, turn_llm_context, turn_runtime_snapshot,
+    artifact_blob, artifact_projection, artifact_version, compaction_frozen_history,
+    compaction_source_revision, compaction_task_output, html_preview_frozen_index,
+    html_preview_frozen_result, html_preview_frozen_turn, native_terminal_effect_outbox,
+    portable_payload_value, recovery_job, recovery_terminalization_outbox, task, task_delivery,
+    task_run, task_run_conversation_snapshot, task_run_turn, thread, thread_cli_runtime_binding,
+    turn, turn_cli_runtime_binding, turn_event_delivery, turn_finalization, turn_llm_context,
+    turn_runtime_snapshot,
 };
 use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, IntoIden, IntoTableRef, JoinType, Query, SelectStatement,

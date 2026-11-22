@@ -10,15 +10,12 @@ use crate::{
     TurnItemAttemptDeadlines, UnactivatedTurnPhaseChanged, turn_event_was_appended_before_error,
 };
 use anyhow::{Context, Result};
-use pioneer_crud_conversations::events;
 use pioneer_crud_execution::time::unix_to_datetime;
-use pioneer_crud_execution::{event_append as turn_event, turn_execution};
 use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_retryable_database_conflict,
     retry_with_backoff,
 };
 use pioneer_protocol::{TurnStatus, generate_id};
-use sea_orm::Statement;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::future::Future;
 use std::time::Duration;
@@ -252,9 +249,11 @@ impl CrudStore {
         &self,
         event_id: &str,
     ) -> Result<Option<CanonicalTurnEventPayload>> {
-        Ok(turn_event::find_event_by_id(&self.connection, event_id)
-            .await?
-            .map(|event| event.payload))
+        Ok(
+            pioneer_crud_execution::event_append::find_event_by_id(&self.connection, event_id)
+                .await?
+                .map(|event| event.payload),
+        )
     }
 
     /// Pause the ordinary parent's projector after durable acceptance. The

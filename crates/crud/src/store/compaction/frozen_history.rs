@@ -9,7 +9,6 @@ use pioneer_crud_compaction::accepted_import::{
 };
 use pioneer_crud_compaction::frozen_lifetime::FrozenReadHold;
 use pioneer_crud_compaction::frozen_maintenance;
-use pioneer_entity::compaction_frozen_history as history;
 use std::time::{Duration, Instant};
 
 impl CrudStore {
@@ -279,15 +278,6 @@ impl CrudStore {
             .await
     }
 
-    pub(crate) async fn acquire_frozen_header(
-        &self,
-        workspace: &str,
-        descriptor: &FrozenHistoryRef,
-    ) -> Result<(history::Model, FrozenReadHold)> {
-        self.compaction_store()
-            .acquire_frozen_header(workspace, descriptor)
-            .await
-    }
     pub async fn compaction_acquire_frozen_history(
         &self,
         workspace: &str,

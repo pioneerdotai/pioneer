@@ -6,12 +6,10 @@ use crate::store::events::event_preparation::{
 use crate::{
     AgentCommitInput, AgentExecutionGraphCommitInput, AgentExecutionGraphCommitResult,
     AgentTurnResponseInput, CrudStore, GatewayControlWake, NewThreadMembership, NewTurnAdmission,
-    NewTurnExecution, PersistedThreadAccessClass, TurnExecutorKind, commit_agent_action,
-    commit_agent_execution_graph, compaction, insert_agent_turn_response, insert_thread_membership,
-    load_agent_execution, load_agent_turn_response, terminal_cleanup,
+    NewTurnExecution, PersistedThreadAccessClass, TurnExecutorKind, insert_thread_membership,
+    terminal_cleanup,
 };
 use anyhow::{Context, Result, bail};
-use pioneer_crud_conversations::events;
 use pioneer_crud_conversations::thread_creation::{
     NewUserThreadCreation, lock_and_validate_initial_turn,
 };
@@ -20,14 +18,9 @@ use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use pioneer_crud_execution::{execution_heartbeat, turn_admission, turn_execution};
 use pioneer_crud_timeline::timeline_live_projection::project_cli_runtime_turn_binding_state;
-use pioneer_protocol::{
-    PersistedActorRef, ThreadMode, Turn, TurnExecutionSecuritySnapshot, TurnItem,
-};
+use pioneer_protocol::{PersistedActorRef, TurnExecutionSecuritySnapshot, TurnItem};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{
-    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    TransactionTrait,
-};
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use std::collections::HashSet;
 
 pub(crate) async fn insert_new_user_thread_for_initial_turn(

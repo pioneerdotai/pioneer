@@ -4,12 +4,9 @@ use crate::store::events::event_preparation::{
     prepare_turn_event_for_permanent_storage, serialize_turn_event_projection_context,
 };
 use crate::store::events::projection_receipts;
-use crate::{
-    AppendedTurnEvent, CrudStore, TurnExecutionStatus, UnactivatedTurnPhaseChanged, compaction,
-    finalize_agent_execution, load_agent_execution, load_agent_turn_response, terminal_cleanup,
-};
+use crate::{CrudStore, TurnExecutionStatus, UnactivatedTurnPhaseChanged, terminal_cleanup};
 use anyhow::{Context, Result, bail};
-use pioneer_crud_conversations::{events, turn_event_delivery};
+use pioneer_crud_conversations::turn_event_delivery;
 use pioneer_crud_execution::cli_mcp_completion::cli_mcp_observation_is_superseded;
 use pioneer_crud_execution::event_storage_validation::{
     validate_turn_event_durable_owner, validate_turn_event_execution_owner,
@@ -26,12 +23,8 @@ use pioneer_crud_timeline::timeline_live_projection::project_semantic_timeline_l
 use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, retry_with_backoff,
 };
-use pioneer_protocol::{Task, Turn, TurnStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Statement, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;

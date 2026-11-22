@@ -3,8 +3,7 @@
 use crate::{
     CrudStore, NewTaskRunConversationSnapshot, TaskCompletionInboxAccess, TaskCompletionInboxRow,
     TaskExecutionAdmissionRecord, TaskFinalizationRevision, TaskRootAccessFilter,
-    TaskRunConversationSnapshotRecord, list_task_occurrences, upsert_task_actor_contract,
-    upsert_task_occurrence_contract,
+    TaskRunConversationSnapshotRecord,
 };
 use anyhow::Result;
 use pioneer_crud_conversations::thread_lineage::task_thread_lineage_from_db_model;
@@ -12,12 +11,11 @@ use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_tasks::finalization_revision::task_finalization_revision_for_connection;
 use pioneer_crud_tasks::task_trigger::task_trigger_from_db_model;
 use pioneer_crud_tasks::{
-    conversation_snapshot as task_run_conversation_snapshot, task_actor_contract,
-    task_execution_admission, task_trigger,
+    conversation_snapshot as task_run_conversation_snapshot, task_execution_admission, task_trigger,
 };
 use pioneer_protocol::{
     Task, TaskAgendaParams, TaskAgendaResponse, TaskGetResponse, TaskListParams, TaskThreadLineage,
-    TaskTree, TaskTrigger, Turn,
+    TaskTree, TaskTrigger,
 };
 
 impl CrudStore {

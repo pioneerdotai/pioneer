@@ -155,6 +155,7 @@ impl WorkspaceManager {
         .await
     }
 
+    #[cfg(test)]
     pub async fn create_workspace(
         &self,
         requested_workspace_id: &str,

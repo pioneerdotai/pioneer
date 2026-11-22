@@ -22,7 +22,7 @@ use pioneer_crud_conversations::{
 };
 use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{RecoveryJobStatus, ToolCallStatus, Turn, TurnItem, TurnStatus};
-use sea_orm::{ConnectionTrait, EntityTrait, entity::prelude::DateTimeWithTimeZone};
+use sea_orm::{EntityTrait, entity::prelude::DateTimeWithTimeZone};
 use std::future::Future;
 
 #[derive(Debug, Clone, PartialEq)]

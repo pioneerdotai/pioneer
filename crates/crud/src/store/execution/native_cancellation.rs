@@ -1,17 +1,16 @@
 use crate::store::events::event_preparation::TurnEventProjectionContext;
 use crate::{
     CanonicalTurnEventPayload, CrudStore, NativeCancellationContext, TurnExecutionRecord,
-    TurnExecutionStatus, compaction, utc_now,
+    TurnExecutionStatus, utc_now,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_crud_execution::cli_runtime_store::native_recovery_start_transition_allowed;
 use pioneer_crud_execution::native_cancellation_context;
 use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_crud_execution::{
     event_append as turn_event, native_terminal_effect_outbox, turn_execution,
 };
-use pioneer_protocol::{Turn, TurnStatus};
-use sea_orm::{Statement, TransactionTrait};
+use sea_orm::TransactionTrait;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedNativeCancellation {

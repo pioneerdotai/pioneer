@@ -151,7 +151,7 @@ impl CrudStore {
     pub async fn reconcile_thread_episodic_source_version(
         &self,
         expected_source_payload: &str,
-        mut item: NewThreadEpisodicItemRecord,
+        item: NewThreadEpisodicItemRecord,
         now_unix: i64,
     ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
         self.memory_store()

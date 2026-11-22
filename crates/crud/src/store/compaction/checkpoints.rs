@@ -139,19 +139,4 @@ impl CrudStore {
             .compaction_checkpoint_source(workspace, thread, checkpoint)
             .await
     }
-
-    pub(crate) async fn prepare_checkpoint_ancestry(
-        &self,
-        operation: &str,
-        checkpoint: &str,
-        generation: u64,
-    ) -> Result<()> {
-        pioneer_crud_compaction::runner_writes::prepare_checkpoint_ancestry(
-            &self.connection,
-            operation,
-            checkpoint,
-            generation,
-        )
-        .await
-    }
 }

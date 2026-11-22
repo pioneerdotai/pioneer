@@ -20,19 +20,16 @@ use crate::{SOURCE_PAGE_BYTES, SOURCE_PAGE_ROWS};
 use anyhow::{Result, ensure};
 use pioneer_compaction::{SourceRef, frozen::FrozenMessageRef};
 use pioneer_entity::{
-    compaction_checkpoint as checkpoint, compaction_checkpoint_event_input as event_input,
-    compaction_checkpoint_import as import, compaction_checkpoint_replay_alias as replay_alias,
-    compaction_context as context, compaction_coverage as coverage,
-    compaction_delivery_output as delivery_output, compaction_event_revision as ack,
-    compaction_frozen_history as history, compaction_manifest as manifest,
-    compaction_operation_projection as projection, compaction_runner_plan as plan,
-    compaction_runner_state as runner, compaction_task_output as task_output,
-    task_delivery as delivery, task_result_candidate as candidate, thread, turn,
+    compaction_checkpoint as checkpoint, compaction_checkpoint_import as import,
+    compaction_coverage as coverage, compaction_delivery_output as delivery_output,
+    compaction_event_revision as ack, compaction_frozen_history as history,
+    compaction_task_output as task_output, task_delivery as delivery,
+    task_result_candidate as candidate, thread, turn,
 };
-use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, OnConflict, Order, Query};
+use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, Order, Query};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, QueryTrait, RelationTrait, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QuerySelect, Statement,
+    TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

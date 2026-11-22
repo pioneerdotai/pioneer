@@ -6,7 +6,6 @@ use crate::{TurnExecutionRecord, TurnItemAttemptDeadlines};
 use anyhow::{Context, Result};
 use pioneer_crud_execution::turn_execution::terminal_turn_execution_status_for_event;
 use pioneer_crud_execution::{event_append as turn_event, native_terminal_effect_outbox};
-use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::generate_id;
 use sea_orm::ConnectionTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -110,7 +109,7 @@ pub(crate) async fn prepare_projected_turn_event_from_envelope<C: ConnectionTrai
         projection_context_json,
         claim_token,
     } = prepared;
-    let mut projection = TurnProjector::new()
+    let projection = TurnProjector::new()
         .prepare(db, event.id(), event.payload(), created_at)
         .await?;
     let terminal_effect_activation =

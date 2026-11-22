@@ -1,7 +1,6 @@
 use crate::ProjectionReceiptCleanupOutcome;
 use crate::store::events::turn_projector::TurnProjector;
 use anyhow::{Context, Result, bail};
-use pioneer_crud_access::policy;
 use pioneer_crud_compaction::frozen_lifetime;
 use pioneer_crud_conversations::projection_receipts;
 use pioneer_crud_conversations::turn_finalization;
@@ -10,7 +9,6 @@ use pioneer_postgres_pools::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, PostgresDatabase,
     PostgresReadClass, PostgresWriteClass, retry_with_backoff,
 };
-use pioneer_protocol::Turn;
 use sea_orm::{ConnectionTrait, Statement};
 use std::future::Future;
 use std::time::Duration;

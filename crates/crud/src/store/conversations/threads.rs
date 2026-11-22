@@ -4,7 +4,7 @@ use crate::{
     PrivateThreadParticipantMutation, ResolvedThreadAgentsDocRecord, ThreadAgentsDocRecord,
     ThreadAgentsDocRevisionRecord, ThreadAgentsDocSaveReason, ThreadAgentsDocScopeContext,
     ThreadAgentsDocSummaryRecord, ThreadManagementChange, ThreadReadPosition,
-    find_workspace_membership, insert_thread_membership, list_accessible_threads_for_principal,
+    find_workspace_membership, insert_thread_membership,
 };
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::thread_metadata;
@@ -14,8 +14,7 @@ use pioneer_postgres_pools::run_database_attempt;
 use pioneer_protocol::{
     GatewayId, PersistedActorRef, PrincipalId, Thread, ThreadFolder, ThreadPlacement,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
-use std::collections::HashMap;
+use sea_orm::TransactionTrait;
 
 impl CrudStore {
     /// Persists a thread through the normal write path.
@@ -328,7 +327,7 @@ impl CrudStore {
     async fn attach_latest_thread_turn_snapshots(
         &self,
         threads: &mut [Thread],
-        creator_executions: &HashMap<String, String>,
+        creator_executions: &std::collections::HashMap<String, String>,
     ) -> Result<()> {
         pioneer_crud_timeline::thread_display::ThreadDisplayStore::new(&self.connection)
             .attach_latest_thread_turn_snapshots(threads, creator_executions)

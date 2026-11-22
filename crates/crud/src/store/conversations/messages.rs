@@ -4,8 +4,7 @@ use crate::store::events::event_preparation::{
 };
 use crate::{
     CrudStore, DeleteTurnMessageRequest, DeleteTurnMessageResult, EditTurnMessageRequest,
-    GatewayControlWake, compaction, list_turn_message_revisions, terminal_cleanup,
-    turn_message_revision_from_model,
+    GatewayControlWake, terminal_cleanup,
 };
 use anyhow::{Context, Result};
 use pioneer_crud_conversations::message_commands::{
@@ -13,7 +12,7 @@ use pioneer_crud_conversations::message_commands::{
     revalidate_message_delete, revalidate_message_edit,
 };
 use pioneer_crud_execution::time::unix_to_datetime;
-use pioneer_protocol::{Turn, TurnMessageEditedEvent, TurnMessageRevision};
+use pioneer_protocol::{TurnMessageEditedEvent, TurnMessageRevision};
 use sea_orm::TransactionTrait;
 
 impl CrudStore {

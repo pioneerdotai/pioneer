@@ -3,10 +3,9 @@ use crate::store::events::event_preparation::{
     TURN_EVENT_PROJECTION_LEASE_SECS, prepare_projected_turn_event_for_permanent_storage,
 };
 use crate::{
-    CrudStore, GatewayControlWake, PrepareTurnFinalizationOutcome, TurnWorkOwner,
-    collaboration_from_model, compaction, terminal_cleanup,
+    CrudStore, GatewayControlWake, PrepareTurnFinalizationOutcome, TurnWorkOwner, terminal_cleanup,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_crud_access::turn_execution::{
     turn_kind_from_db, turn_origin_from_db, turn_status_from_db,
 };
@@ -14,16 +13,16 @@ use pioneer_crud_conversations::protocol_projection::{
     parse_turn_permission_profile, parse_turn_prompt_manifest,
 };
 use pioneer_crud_conversations::thread_metadata;
+use pioneer_crud_conversations::turn_finalization;
 use pioneer_crud_conversations::turn_item_events::{
     is_agent_diff_updated_item, latest_agent_diff_raw_payload_for_item,
 };
 use pioneer_crud_conversations::turn_reads;
-use pioneer_crud_conversations::{events, turn_finalization};
 use pioneer_crud_execution::time::unix_to_datetime;
-use pioneer_crud_execution::{event_append as turn_event, turn_execution_window};
+use pioneer_crud_execution::turn_execution_window;
 use pioneer_crud_tasks::finalization_revision::task_finalization_revision_for_connection;
 use pioneer_protocol::{Turn, TurnStatus};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
+use sea_orm::TransactionTrait;
 use std::fmt;
 
 /// Safe operation boundary used when reporting PostgreSQL storage failures.

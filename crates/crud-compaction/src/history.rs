@@ -6,13 +6,13 @@ use pioneer_compaction::SourceRef;
 use pioneer_crud_conversations::events::CanonicalTurnEventPayload;
 use pioneer_crud_execution::canonical_id::canonical_agent_id;
 use pioneer_entity::{
-    compaction_event_revision, compaction_input_revision, compaction_source_revision, task,
-    task_delivery, task_run, task_run_conversation_snapshot, task_run_turn, thread, thread_lineage,
-    turn, turn_event, turn_input, turn_llm_context,
+    compaction_event_revision, compaction_input_revision, task, task_delivery, task_run,
+    task_run_conversation_snapshot, task_run_turn, thread, thread_lineage, turn, turn_event,
+    turn_input, turn_llm_context,
 };
 use pioneer_observability::portable_payload as observe;
-use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
-use sea_orm::{ColumnTrait, DbBackend, EntityTrait, QueryFilter, QueryTrait};
+use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, Order, Query};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, FromQueryResult};
 
 pub use crate::history_fence::HistoryReadFence;

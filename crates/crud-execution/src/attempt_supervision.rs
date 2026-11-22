@@ -9,9 +9,7 @@ use pioneer_crud_conversations::turn_item::{turn_item_type_from_db, turn_item_ty
 use pioneer_crud_conversations::{turn_event_reads, turn_liveness, turn_reads};
 use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType};
-use sea_orm::{
-    ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect, TransactionTrait};
 
 #[derive(Debug, Clone)]
 pub struct TimeoutCandidate {

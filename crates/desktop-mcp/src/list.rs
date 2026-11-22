@@ -127,12 +127,6 @@ impl McpCatalogView {
             }
         }
     }
-
-    pub(super) fn mcp_capability_labels(
-        counts: &[mcp_presentation::McpCapabilityCount],
-    ) -> Vec<String> {
-        crate::McpServerCard::mcp_capability_labels(counts)
-    }
 }
 
 fn empty_state(

@@ -5,16 +5,12 @@ use crate::{
     NewTurnExecution, PersistedThreadAccessClass, TurnWorkOwner,
 };
 use anyhow::{Context, Result, bail};
-use pioneer_crud_conversations::events;
 use pioneer_crud_conversations::message_completion::completed_message_turn_events;
 use pioneer_crud_conversations::thread_creation::NewUserThreadCreation;
-use pioneer_crud_execution::time::unix_to_datetime;
 use pioneer_protocol::{
-    GatewayId, PersistedActorRef, PrincipalId, SandboxMode, Task, Thread, ThreadMode, Turn,
-    TurnExecutionSecuritySnapshot, TurnItem, TurnKind, TurnStatus, UserInput,
+    GatewayId, PersistedActorRef, PrincipalId, SandboxMode, Thread, Turn,
+    TurnExecutionSecuritySnapshot, TurnItem, TurnStatus, UserInput,
 };
-use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizedTurnRuntimeDraft {
@@ -89,6 +85,10 @@ impl CrudStore {
         message_revision: i64,
         changed_at_unix: i64,
     ) -> Result<()> {
+        use pioneer_crud_execution::time::unix_to_datetime;
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
+
         let turn_id = turn_id.to_owned();
         let input = input.to_vec();
         self.retry_write_on_conflict(|| {

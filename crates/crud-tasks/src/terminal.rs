@@ -28,16 +28,13 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud_execution::execution_reads::load_agent_execution_resource_state;
 use pioneer_protocol::{
-    TaskActorContract, TaskCompletionBehavior, TaskError, TaskErrorClass, TaskEventPayload,
-    TaskGetResponse, TaskOccurrenceContract, TaskOccurrenceStatus, TaskRescheduleReason,
-    TaskResult, TaskRetryBackoffKind, TaskRun, TaskRunExecutionStatus, TaskRunStatus, TaskRunTurn,
-    TaskRunTurnKind, TaskRunTurnStatus, TaskWriteLockStatus, generate_id,
+    TaskActorContract, TaskCompletionBehavior, TaskErrorClass, TaskEventPayload, TaskGetResponse,
+    TaskOccurrenceContract, TaskOccurrenceStatus, TaskRescheduleReason, TaskRunExecutionStatus,
+    TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, TransactionTrait, prelude::DateTimeWithTimeZone,
 };
-
-const ID_LEN: usize = 21;
 
 /// A rejected domain transition must propagate without a database-conflict retry.
 #[derive(Debug)]

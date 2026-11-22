@@ -1,6 +1,6 @@
 //! Attach and release retained history roots for runtime and Task snapshots.
 use crate::{frozen_lifetime, store::CompactionStore};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use pioneer_crud_execution::turn_runtime_snapshot::{
     self, NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord,
 };

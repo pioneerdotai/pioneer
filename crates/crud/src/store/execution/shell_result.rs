@@ -1,7 +1,6 @@
 use crate::CrudStore;
 use anyhow::Result;
 use pioneer_compaction::SourceRef;
-use sea_orm::TransactionTrait;
 
 impl CrudStore {
     pub async fn shell_control_receipt(

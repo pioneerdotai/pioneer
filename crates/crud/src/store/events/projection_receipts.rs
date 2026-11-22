@@ -28,32 +28,6 @@ pub async fn mark_projected_claimed(
     Ok(true)
 }
 
-pub async fn advance_projected_through<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    expected_current_sequence: i64,
-    projected_through_sequence: i64,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
-    let Some(new) = projection_stream::advance_projected_through(
-        db,
-        turn_id,
-        expected_current_sequence,
-        projected_through_sequence,
-        updated_at,
-    )
-    .await?
-    else {
-        return Ok(false);
-    };
-    // The guarded UPDATE changes the watermark and preserves the other
-    // facts used by Task-child receipt invalidation.
-    let mut old = new.clone();
-    old.projected_through_sequence = expected_current_sequence;
-    task_child_producers::receipt_change(db, Some(&old), Some(&new)).await?;
-    Ok(true)
-}
-
 /// Records the active causal blocker. Repeating the same transition is a
 /// no-op; a different blocker on an already quarantined stream is an invariant
 /// violation because successors never own stream quarantine.

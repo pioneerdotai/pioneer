@@ -3,18 +3,15 @@ use crate::{
     AgentCommitInput, AgentDelegationRouteInput, AgentThreadCreationCommitInput, AppendedTaskEvent,
     CrudStore, DueTaskTriggerReconciliation, GatewayControlWake, NewTaskExecutionAdmission,
     NewTaskRunConversationSnapshot, NewUserNotificationOutbox, TaskEventPayload,
-    commit_agent_action, commit_agent_delivery_action, commit_agent_thread_creation,
-    insert_task_notification_idempotent,
 };
 use anyhow::{Context, Result, bail};
 use pioneer_crud_compaction::frozen_lifetime;
-use pioneer_crud_conversations::events;
 use pioneer_crud_tasks::event_records::{DeferredAppendedTaskEvent, materialize_task_events};
 use pioneer_crud_tasks::event_store::TaskEventStore;
 use pioneer_crud_tasks::task_projector::TaskOutputBinder;
 use pioneer_crud_tasks::{task_event, task_execution_admission, user_notification_outbox};
 use pioneer_protocol::{
-    Task, TaskDelivery, TaskError, TaskExecutorKind, TaskThreadLineage, TaskTrigger, Thread,
+    TaskDelivery, TaskError, TaskExecutorKind, TaskThreadLineage, TaskTrigger, Thread,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{ConnectionTrait, TransactionTrait};
@@ -293,6 +290,7 @@ impl CrudStore {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_task_events_once(
         &self,
         events: Vec<TaskEventPayload>,
@@ -717,16 +715,6 @@ impl CrudStore {
         events: Vec<TaskEventPayload>,
     ) -> Result<Vec<task_event::PreparedTaskEvent>> {
         pioneer_crud_tasks::event_pipeline::prepare_task_events_for_write(&self.connection, events)
-            .await
-    }
-
-    /// Refresh only portable/idempotency facts. Preserve every domain fence,
-    /// projection and delivery boundary of a caller-owned prepared transition.
-    async fn refresh_task_event_preflight(
-        &self,
-        events: Vec<task_event::PreparedTaskEvent>,
-    ) -> Result<Vec<task_event::PreparedTaskEvent>> {
-        pioneer_crud_tasks::event_pipeline::refresh_task_event_preflight(&self.connection, events)
             .await
     }
 

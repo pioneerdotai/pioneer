@@ -1,11 +1,9 @@
 //! Bounded progress for the existing frozen-storage worker. Physical eligibility
 //! is durable; no connection or capacity permit is retained between quanta.
 use crate::checkpoint_proofs;
-use crate::frozen_expiry::{
-    ExpiryPreparation, ExpiryStep, LayoutCheck, terminal_runner, unknown_predicate,
-};
+use crate::frozen_expiry::{ExpiryPreparation, ExpiryStep, LayoutCheck, terminal_runner};
 use crate::frozen_geometry::{
-    CheckedGeometry, PhysicalDeleteResult, SWEEP_BYTES, SWEEP_ROWS, geometry_values, healthy,
+    CheckedGeometry, PhysicalDeleteResult, SWEEP_BYTES, SWEEP_ROWS, geometry_values,
     physical_delete, physical_table, sweep_guard, sweep_validation,
 };
 #[cfg(test)]
@@ -25,10 +23,7 @@ use pioneer_entity::{
     compaction_operation as operation, compaction_operation_projection as projection,
     compaction_runner_state as runner, task, task_run_conversation_snapshot as task_input,
 };
-use pioneer_observability::portable_payload as observe;
-use sea_orm::sea_query::{
-    Alias, Expr, ExprTrait, Func, JoinType, Order, Query, SimpleExpr, UnionType,
-};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, JoinType, Order, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     QueryTrait, Statement, TransactionTrait,
@@ -41,7 +36,6 @@ use std::{
 use crate::frozen_storage_reads as read_queries;
 use read_queries::discard_preflight;
 
-const FRAGMENT_BYTES: i64 = 64 * 1024;
 const META_ROWS: u64 = 64;
 
 /// Owned by one existing maintenance worker, and dropped on cancellation.
@@ -507,8 +501,8 @@ async fn delete_free_key<C: ConnectionTrait>(
     } else {
         "next_import"
     };
-    let health = healthy("h");
-    let unknown = unknown_predicate("p");
+    let health = crate::frozen_geometry::healthy("h");
+    let unknown = crate::frozen_expiry::unknown_predicate("p");
     // Original exact-key retention oracle for existing focused tests.
     // Production uses the common interval guard plus physical_delete.
     let sql = format!(
