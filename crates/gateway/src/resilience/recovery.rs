@@ -5874,8 +5874,8 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
-        RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RecoveryTimeoutOutcome,
+        RetainedProviderHistoryRow, RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
         assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
     };
     use migration::{Migrator, MigratorTrait};
@@ -11606,7 +11606,7 @@ mod tests {
         assert_eq!(immediate.run_count, 1);
         assert!(matches!(
             timeout_events.as_slice(),
-            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id == &job.id
+            [RecoveryCoordinatorEvent::RetryScheduled { job_id, .. }] if job_id.as_str() == job.id.as_str()
         ));
 
         let late_events = coordinator
