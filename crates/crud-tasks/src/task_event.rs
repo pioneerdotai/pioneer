@@ -109,6 +109,24 @@ impl fmt::Display for TaskEventIdempotencyPreflightRace {
 
 impl StdError for TaskEventIdempotencyPreflightRace {}
 
+#[derive(Debug)]
+pub struct TaskChildCompletionReplay {
+    pub idempotency_key: String,
+    pub completed_at: Option<i64>,
+}
+
+impl fmt::Display for TaskChildCompletionReplay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "task event idempotency key `{}` already exists with a different payload",
+            self.idempotency_key
+        )
+    }
+}
+
+impl StdError for TaskChildCompletionReplay {}
+
 pub fn is_idempotency_preflight_race(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -451,7 +469,12 @@ async fn append_prepared_event_inner<C: ConnectionTrait>(
             batch,
             &existing,
         );
-        return existing_event_outcome_after_preflight(existing, cached, idempotency_key);
+        return existing_event_outcome_after_preflight(
+            existing,
+            cached,
+            idempotency_key,
+            &prepared.payload,
+        );
     }
 
     let PreparedTaskEvent {
@@ -552,6 +575,7 @@ fn existing_event_outcome_after_preflight(
     model: task_event::Model,
     preflight: Option<SemanticallyMatchingExistingTaskEvent>,
     idempotency_key: &str,
+    attempted_payload: &TaskEventPayload,
 ) -> Result<DeferredAppendedTaskEvent> {
     let Some(preflight) = preflight else {
         // The metadata-only writer never parses an unexpected raw/legacy body.
@@ -560,11 +584,31 @@ fn existing_event_outcome_after_preflight(
         }
         .into());
     };
-    anyhow::ensure!(
-        preflight.equivalent,
-        "task event idempotency key `{}` already exists with a different payload",
-        idempotency_key
-    );
+    if !preflight.equivalent {
+        if let (
+            TaskEventPayload::TaskRunTurnCompleted {
+                task_run_turn: existing,
+            },
+            TaskEventPayload::TaskRunTurnCompleted {
+                task_run_turn: attempted,
+            },
+        ) = (preflight.payload.as_ref(), attempted_payload)
+        {
+            let mut attempted = attempted.clone();
+            attempted.completed_at = existing.completed_at;
+            if &attempted == existing {
+                return Err(TaskChildCompletionReplay {
+                    idempotency_key: idempotency_key.to_owned(),
+                    completed_at: existing.completed_at,
+                }
+                .into());
+            }
+        }
+        anyhow::bail!(
+            "task event idempotency key `{}` already exists with a different payload",
+            idempotency_key
+        );
+    }
     Ok(appended_task_event_from_known_payload(
         model,
         // The caller materializes this winner only after releasing its writer.

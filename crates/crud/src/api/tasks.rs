@@ -71,6 +71,7 @@ pub use pioneer_crud_tasks::task_actor_contract::{
     upgrade_task_actor_contract_model_to_current, upsert_task_actor_contract,
     upsert_task_occurrence_contract,
 };
+pub use pioneer_crud_tasks::task_event::TaskChildCompletionReplay;
 pub use pioneer_crud_tasks::task_execution_admission::{
     NewTaskExecutionAdmission, TaskExecutionAdmissionRecord,
 };

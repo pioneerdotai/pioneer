@@ -747,6 +747,34 @@ async fn task_review_projector_replays_new_runtime_events_idempotently() {
             .await
             .expect("replay should be idempotent");
 
+        let mut repeated_turn = turn.clone();
+        repeated_turn.completed_at = Some(timestamp + 11);
+        let conflict = events
+            .append_task_events(
+                vec![TaskEventPayload::TaskRunTurnCompleted {
+                    task_run_turn: repeated_turn.clone(),
+                }],
+                timestamp + 11,
+            )
+            .await
+            .expect_err("a replay with a new clock value must leave the committed event intact");
+        let replay = conflict
+            .downcast_ref::<crate::task_event::TaskChildCompletionReplay>()
+            .expect("only the original completion time is needed to recover this replay");
+        assert_eq!(replay.completed_at, turn.completed_at);
+
+        repeated_turn.round += 1;
+        let conflict = events
+            .append_task_events(
+                vec![TaskEventPayload::TaskRunTurnCompleted {
+                    task_run_turn: repeated_turn,
+                }],
+                timestamp + 11,
+            )
+            .await
+            .expect_err("a different round must remain a payload conflict");
+        assert!(!conflict.is::<crate::task_event::TaskChildCompletionReplay>());
+
         assert_eq!(
             store
                 .get_task_run_primary_thread_binding(run.id.as_str())

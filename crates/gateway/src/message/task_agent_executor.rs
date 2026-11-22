@@ -4960,8 +4960,7 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.run_id.clone(),
         );
         self.complete_child_turn(&processor, child_runtime, handle)
-            .await?;
-        Ok(true)
+            .await
     }
 
     /// Reopen and dispatch a blocked task child through the native
@@ -5413,7 +5412,7 @@ impl TaskAgentExecutor {
         processor: &Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bus = processor.task_runtime.event_bus();
         let generation = bus.closing_run_generation(&child_runtime.task_run_turn.run_id);
         let parent = match child_runtime.task_run_turn.reviews_candidate_id.as_deref() {
@@ -5457,7 +5456,14 @@ impl TaskAgentExecutor {
         if let (Some((run, turn)), Some(episode)) = (identity, result_episode) {
             bus.handoff_result_closing(&run, &turn, episode, generation);
         }
-        result
+        match result {
+            // The terminal child remains discoverable. The claimed background
+            // path defers it through its existing next-attempt deadline.
+            Err(error) if error.is::<crate::compaction::frozen::TaskOutputHistoryChanged>() => {
+                Ok(false)
+            }
+            result => result.map(|()| true),
+        }
     }
 
     async fn complete_child_turn_observed(
@@ -5508,44 +5514,7 @@ impl TaskAgentExecutor {
             .review_policy
             .clone()
             .filter(|policy| policy.is_enabled());
-        if let Some(candidate) = processor
-            .crud_store
-            .get_accepted_task_result_candidate(child_runtime.task_run_turn.run_id.as_str())
-            .await?
-            && candidate.task_run_turn_id == child_runtime.task_run_turn.id
-            && let Some(result) = candidate.result
-        {
-            handle
-                .complete_run(
-                    Some(result),
-                    candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
-                )
-                .await?;
-            closing.finish(Fact::Duplicate);
-            mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
-            return Ok(());
-        }
-        if let Some(candidate) = processor
-            .crud_store
-            .get_task_result_candidate_by_turn(child_runtime.task_run_turn.id.as_str())
-            .await?
-            && matches!(
-                candidate.status,
-                TaskResultCandidateStatus::PendingReview
-                    | TaskResultCandidateStatus::ExtractionFailed
-                    | TaskResultCandidateStatus::Rejected
-                    | TaskResultCandidateStatus::Superseded
-                    | TaskResultCandidateStatus::Cancelled
-            )
-        {
-            closing.finish(match candidate.status {
-                TaskResultCandidateStatus::PendingReview => Fact::PendingReview,
-                TaskResultCandidateStatus::ExtractionFailed => Fact::InvalidResult,
-                TaskResultCandidateStatus::Rejected => Fact::Rejected,
-                TaskResultCandidateStatus::Superseded => Fact::Superseded,
-                TaskResultCandidateStatus::Cancelled => Fact::Cancelled,
-                _ => Fact::Returned,
-            });
+        if reuse_published_child_result(processor, &child_runtime, &handle, closing).await? {
             return Ok(());
         }
 
@@ -5610,9 +5579,19 @@ impl TaskAgentExecutor {
                     None => pending_review_result_candidate(&completed_turn, result, completed_at),
                 };
                 let candidate_for_review = candidate.clone();
-                handle
+                if let Err(error) = handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 closing.finish(
                     if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
                         Fact::InvalidResult
@@ -5636,14 +5615,24 @@ impl TaskAgentExecutor {
                 let candidate =
                     accepted_result_candidate(&completed_turn, result.clone(), completed_at);
                 let review_event = runtime_auto_accept_review_event(&candidate, completed_at);
-                handle
+                if let Err(error) = handle
                     .record_auto_accepted_result_candidate(
                         completed_turn,
                         candidate,
                         review_event,
                         completed_at,
                     )
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 handle.complete_run(Some(result), completed_at).await?;
                 closing.finish(Fact::Accepted);
                 mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
@@ -5659,9 +5648,19 @@ impl TaskAgentExecutor {
                 let candidate =
                     extraction_failed_result_candidate(&completed_turn, error, completed_at);
                 let candidate_for_review = candidate.clone();
-                handle
+                if let Err(error) = handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 closing.finish(
                     if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
                         Fact::InvalidResult
@@ -9595,6 +9594,101 @@ async fn ensure_task_run_occurrence_anchor(
         )
         .await;
     Ok(())
+}
+
+async fn reuse_published_child_result(
+    processor: &Arc<MessageProcessor>,
+    child_runtime: &TaskRunChildRuntime,
+    handle: &TaskExecutionHandle,
+    closing: &mut Closing,
+) -> Result<bool> {
+    let turn = &child_runtime.task_run_turn;
+    if let Some(candidate) = processor
+        .crud_store
+        .get_accepted_task_result_candidate(turn.run_id.as_str())
+        .await?
+        && candidate.task_run_turn_id == turn.id
+        && let Some(result) = candidate.result
+    {
+        handle
+            .complete_run(
+                Some(result),
+                candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
+            )
+            .await?;
+        closing.finish(Fact::Duplicate);
+        mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+        return Ok(true);
+    }
+    if let Some(candidate) = processor
+        .crud_store
+        .get_task_result_candidate_by_turn(turn.id.as_str())
+        .await?
+        && matches!(
+            candidate.status,
+            TaskResultCandidateStatus::PendingReview
+                | TaskResultCandidateStatus::ExtractionFailed
+                | TaskResultCandidateStatus::Rejected
+                | TaskResultCandidateStatus::Superseded
+                | TaskResultCandidateStatus::Cancelled
+        )
+    {
+        closing.finish(match candidate.status {
+            TaskResultCandidateStatus::PendingReview => Fact::PendingReview,
+            TaskResultCandidateStatus::ExtractionFailed => Fact::InvalidResult,
+            TaskResultCandidateStatus::Rejected => Fact::Rejected,
+            TaskResultCandidateStatus::Superseded => Fact::Superseded,
+            TaskResultCandidateStatus::Cancelled => Fact::Cancelled,
+            _ => Fact::Returned,
+        });
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn recover_child_completion_replay(
+    processor: &Arc<MessageProcessor>,
+    child_runtime: &TaskRunChildRuntime,
+    handle: &TaskExecutionHandle,
+    closing: &mut Closing,
+    error: anyhow::Error,
+) -> Result<()> {
+    use pioneer_crud::TaskChildCompletionReplay;
+
+    let Some(replay) = error.downcast_ref::<TaskChildCompletionReplay>() else {
+        return Err(error);
+    };
+    let turn = &child_runtime.task_run_turn;
+    let retry_attempt = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(&turn.run_id)
+        .await?
+        .map_or(0, |occurrence| occurrence.retry_attempt);
+    let key = format!("run:{}:turn:{}:completed", turn.run_id, turn.turn_id);
+    let key = if retry_attempt == 0 {
+        key
+    } else {
+        format!("{key}:run:{}:retry:{retry_attempt}", turn.run_id)
+    };
+    if replay.idempotency_key != key {
+        return Err(error);
+    }
+    // Check the committed child projection after the rejected batch rolled
+    // back. A reopened or replaced execution is not this completion.
+    let mut published_turn = turn.clone();
+    published_turn.status = TaskRunTurnStatus::CandidateCreated;
+    published_turn.completed_at = replay.completed_at;
+    if processor
+        .crud_store
+        .get_task_run_turn_by_turn(&turn.thread_id, &turn.turn_id)
+        .await?
+        .as_ref()
+        == Some(&published_turn)
+        && reuse_published_child_result(processor, child_runtime, handle, closing).await?
+    {
+        return Ok(());
+    }
+    Err(error)
 }
 
 async fn mark_task_run_occurrence_turn_completed(

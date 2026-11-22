@@ -767,6 +767,35 @@ fn authorize(
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) struct TaskOutputHistoryChanged;
+
+impl std::fmt::Display for TaskOutputHistoryChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("child history changed while freezing its completed output")
+    }
+}
+
+impl std::error::Error for TaskOutputHistoryChanged {}
+
+async fn existing_task_output(
+    store: &CrudStore,
+    workspace: &str,
+    turn: &pioneer_protocol::TaskRunTurn,
+) -> Result<Option<pioneer_crud::compaction::TaskOutputSnapshot>> {
+    let snapshot = store.compaction_task_output(workspace, &turn.id).await?;
+    if let Some(snapshot) = &snapshot {
+        ensure!(
+            snapshot.task_id == turn.task_id
+                && snapshot.run_id == turn.run_id
+                && snapshot.source_thread == turn.thread_id
+                && snapshot.source_turn == turn.turn_id,
+            "Task output snapshot execution identity changed"
+        );
+    }
+    Ok(snapshot)
+}
+
 /// Capture a completed result-producing turn before publishing its candidate.
 /// An accepted review or delayed delivery subsequently refers to this exact
 /// work. Retries reuse the original manifest and never read newer child turns.
@@ -777,14 +806,7 @@ pub(crate) async fn capture_task_output(
 ) -> Result<pioneer_crud::compaction::TaskOutputSnapshot> {
     // Preserve the caller's scope: live completion is request work, while
     // recovery callers already carry maintenance reads/critical writes.
-    if let Some(snapshot) = store.compaction_task_output(workspace, &turn.id).await? {
-        ensure!(
-            snapshot.task_id == turn.task_id
-                && snapshot.run_id == turn.run_id
-                && snapshot.source_thread == turn.thread_id
-                && snapshot.source_turn == turn.turn_id,
-            "Task output snapshot execution identity changed"
-        );
+    if let Some(snapshot) = existing_task_output(store, workspace, turn).await? {
         return Ok(snapshot);
     }
     let started = std::time::Instant::now();
@@ -817,13 +839,15 @@ pub(crate) async fn capture_task_output(
     )
     .await?;
     let history = &prepared.descriptor;
-    ensure!(
-        store
-            .compaction_projection_version(workspace, &turn.thread_id)
+    if store
+        .compaction_projection_version(workspace, &turn.thread_id)
+        .await?
+        != epoch
+    {
+        return existing_task_output(store, workspace, turn)
             .await?
-            == epoch,
-        "child history changed while freezing its completed output"
-    );
+            .ok_or_else(|| TaskOutputHistoryChanged.into());
+    }
     let output = store
         .compaction_record_task_output(workspace, &turn.id, &history)
         .await?;
