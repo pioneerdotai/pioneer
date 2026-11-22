@@ -263,7 +263,7 @@ async fn run_gateway_start_failure(
         .event_bus()
         .subscribe(Default::default());
     let created = create_task_for_test(&processor, params).await.unwrap();
-    let run_id = created.run.as_ref().unwrap().id.clone();
+    assert!(created.run.is_some(), "immediate Task must return a run");
     if matches!(case, PreparationFailure::TerminalHistory) {
         processor
             .wait_for_completed_history_preparation_barrier()
@@ -295,7 +295,7 @@ async fn run_gateway_start_failure(
             .unwrap();
         assert!(turn.status != TurnStatus::InProgress);
         // Terminal dispatch never replaces cancellation with start failure.
-        return (response.runs[0].error.clone(), run_id);
+        return (response.runs[0].error.clone(), response.runs[0].id.clone());
     }
     let expected_status = if matches!(
         case,
@@ -345,6 +345,8 @@ async fn run_gateway_start_failure(
         "only configured retry_on can create another run"
     );
     assert_eq!(saved.runs[0].attempt_number, 1);
+    // The create response returns the latest run; a retry can already exist.
+    let run_id = saved.runs[0].id.clone();
     let error = saved.runs[0].error.clone().unwrap();
     if !matches!(
         case,
@@ -436,7 +438,7 @@ async fn run_gateway_start_failure(
             .get_task_run_conversation_snapshot(&run_id)
             .await
             .unwrap()
-            .unwrap();
+            .expect("the first attempt must retain its accepted history");
         let retry = &saved.runs[1];
         assert_eq!(retry.attempt_number, 2);
         assert_eq!(retry.retry_of_run_id.as_deref(), Some(run_id.as_str()));

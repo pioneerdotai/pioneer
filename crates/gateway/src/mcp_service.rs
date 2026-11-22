@@ -6739,23 +6739,28 @@ mod tests {
             .expect("required MCP installation should persist");
     }
 
-    async fn wait_for_catalog(crud_store: &CrudStore, installation_id: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if crud_store
+    async fn wait_for_live_catalog(
+        service: &McpService,
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        installation_id: &str,
+    ) {
+        // The actor commits the catalog before it publishes Ready.
+        wait_for_runtime_state(
+            service,
+            workspace_id,
+            installation_id,
+            DomainRuntimeState::Ready,
+        )
+        .await;
+        assert!(
+            crud_store
                 .find_mcp_server_catalog_snapshot(installation_id)
                 .await
                 .expect("catalog lookup should succeed")
-                .is_some()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() <= deadline,
-                "test MCP catalog should be persisted"
-            );
-            sleep(Duration::from_millis(25)).await;
-        }
+                .is_some(),
+            "test MCP catalog should be persisted"
+        );
     }
 
     async fn wait_for_runtime_state(
@@ -6887,14 +6892,7 @@ mod tests {
             .reload_workspace(workspace_id.as_str())
             .await
             .expect("invoker MCP runtime should start");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
-        wait_for_runtime_state(
-            &service,
-            &workspace_id,
-            &installation_id,
-            DomainRuntimeState::Ready,
-        )
-        .await;
+        wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
         let projection = service
             .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
                 workspace_id: workspace_id.clone(),
@@ -7160,7 +7158,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let explicit_tool = tool_ref("mcp-tool:workspace:resend:send", "resend", "send");
             let projection = service
@@ -9997,7 +9995,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let materialization = service
                 .materialize_mcp_tools(AgentMcpMaterializationRequest {
@@ -10051,7 +10049,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let materialization = service
                 .materialize_mcp_tools(AgentMcpMaterializationRequest {
@@ -10186,7 +10184,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let failure = expect_mcp_materialization_failure(
                 service
@@ -10240,7 +10238,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let materialization = service
                 .materialize_mcp_tools(AgentMcpMaterializationRequest {
@@ -10299,7 +10297,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let materialization = service
                 .materialize_mcp_tools(AgentMcpMaterializationRequest {
@@ -10360,7 +10358,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
             let materialization = service
                 .materialize_mcp_tools(AgentMcpMaterializationRequest {
@@ -10465,7 +10463,7 @@ mod tests {
                 .reload_workspace(workspace_id.as_str())
                 .await
                 .expect("MCP workspace should reload");
-            wait_for_catalog(&crud_store, installation_id.as_str()).await;
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
             crud_store
                 .delete_mcp_server_catalog_snapshot(installation_id.as_str())
                 .await
