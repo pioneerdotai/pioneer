@@ -10631,6 +10631,7 @@ mod tests {
             .into_job();
         assert_eq!(job.next_run_at_unix, now + 2);
         assert_eq!(job.scheduled_at_unix, now + 2);
+        let initial_policy = job.policy_snapshot.clone();
         let restarted = Arc::new(CrudStore::new(store.database_connection()));
         for run in 1..=3 {
             // Recreate the coordinator between attempts: only durable state
@@ -10684,7 +10685,7 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("active_attempt_start_sequence");
-            assert_eq!(saved_policy, job.policy_snapshot);
+            assert_eq!(saved_policy, initial_policy);
             assert_eq!(
                 saved.diagnostic.as_ref().unwrap().last_failure,
                 Some(pioneer_protocol::RecoveryProviderFailure::from(&renewed))
