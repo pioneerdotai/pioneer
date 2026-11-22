@@ -22,7 +22,7 @@ impl ToolHandler for ParallelTools {
         invocation: ToolInvocation,
         _: ToolEventTrace,
     ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
-        if invocation.tool_name == "cache_slow" {
+        if matches!(invocation.tool_name.as_str(), "cache_slow" | "cache_large") {
             // Released only by the committed fast-result event, after actual
             // Gateway persistence has ACKed it. Call ordinal is slow, error;
             // completion/persistence order is error, slow.
@@ -44,7 +44,7 @@ impl ToolHandler for ParallelTools {
     }
 }
 
-struct TurnTools(Arc<dyn ToolHandler>);
+struct TurnTools(Arc<dyn ToolHandler>, &'static [&'static str]);
 
 #[async_trait]
 impl pioneer_agent::TurnToolProvider for TurnTools {
@@ -58,7 +58,8 @@ impl pioneer_agent::TurnToolProvider for TurnTools {
             pioneer_protocol::LlmRetentionPolicy::UntilTurnTerminal { max_bytes: 8_192 };
         Ok(pioneer_agent::TurnToolMaterialization {
             bundles: vec![ToolExtensionBundle {
-                specs: NAMES
+                specs: self
+                    .1
                     .iter()
                     .map(|name| {
                         ConfiguredToolSpec::new(
@@ -75,7 +76,8 @@ impl pioneer_agent::TurnToolProvider for TurnTools {
                         )
                     })
                     .collect(),
-                handlers: NAMES
+                handlers: self
+                    .1
                     .iter()
                     .map(|name| ((*name).into(), self.0.clone()))
                     .collect(),
@@ -90,6 +92,7 @@ impl pioneer_agent::TurnToolProvider for TurnTools {
 struct LoopProvider {
     inner: Arc<dyn Provider>,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
+    context_limit: Option<u64>,
 }
 
 #[async_trait]
@@ -107,6 +110,20 @@ impl Provider for LoopProvider {
         let mut caps = self.inner.capabilities();
         caps.streaming = false;
         caps
+    }
+    fn keeps_tools_when_disabled(&self, model: &str) -> bool {
+        self.inner.keeps_tools_when_disabled(model)
+    }
+    async fn model_limits(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<pioneer_provider::catalog::CatalogLimits> {
+        let mut limits = self.inner.model_limits(model).await?;
+        if let Some(limit) = self.context_limit {
+            limits.context_window = limit;
+            limits.max_input = None;
+        }
+        Ok(limits)
     }
     async fn prepare_input_budget(
         &self,
@@ -144,6 +161,18 @@ async fn transport_with_final(
     mpsc::UnboundedReceiver<serde_json::Value>,
     tokio::task::JoinHandle<()>,
 ) {
+    scripted_transport(responses, final_text, |_| None).await
+}
+
+async fn scripted_transport(
+    responses: bool,
+    final_text: &str,
+    scripted_reply: impl Fn(usize) -> Option<JsonValue> + Clone + Send + Sync + 'static,
+) -> (
+    String,
+    mpsc::UnboundedReceiver<JsonValue>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let root = format!("http://{}/v1", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::unbounded_channel();
@@ -151,10 +180,15 @@ async fn transport_with_final(
     let final_text = final_text.to_owned();
     let router = axum::Router::new().route(if responses {"/v1/responses"} else {"/v1/chat/completions"}, axum::routing::post(
         move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+            let round = count.fetch_add(1, Ordering::SeqCst);
             tx.send(body).unwrap();
             let final_text = final_text.clone();
+            let scripted = scripted_reply(round);
             async move {
+                if let Some(reply) = scripted {
+                    return axum::Json(reply);
+                }
+                let first = round == 0;
                 let calls = NAMES.iter().enumerate().map(|(i, name)| if responses {
                     json!({"type":"function_call","id":format!("fc_{i}"),"call_id":format!("cache_call_{i}"),
                         "name":name,"arguments":"{}","status":"completed"})
@@ -190,6 +224,107 @@ async fn transport_with_final(
     )
 }
 
+async fn start_fixture_turn(
+    harness: &Phase13CompactionHarness,
+    input: &[UserInput],
+) -> (
+    pioneer_protocol::Thread,
+    Turn,
+    tokio::sync::broadcast::Receiver<AgentDurableEvent>,
+) {
+    let processor = &harness.processor;
+    let store = &harness.crud_store;
+    let workspace = &harness.workspace_id;
+    let mut thread = phase_13_test_thread(workspace, "sent-prefix", phase_13_now_secs());
+    thread.model = MODEL.into();
+    let mut turn = phase_13_turn("sent-turn", TurnStatus::InProgress);
+    turn.mode = ThreadMode::Agent;
+    store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            input,
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut loaded_thread = thread.clone();
+    loaded_thread.turns = vec![turn.clone()];
+    processor
+        .thread_manager
+        .system_thread_restore_persisted(loaded_thread, Some(SandboxMode::FullAccess))
+        .await
+        .unwrap();
+    let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+        authenticated_test_superuser().as_ref(),
+        workspace,
+        &thread.id,
+        &turn.permission_profile,
+        None,
+    );
+    authority.bind_test_provider_authority(
+        "openai",
+        MODEL,
+        processor
+            .provider_registry()
+            .authority_fingerprint_for_workspace(workspace, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    assert!(
+        store
+            .set_turn_execution_authorization_context(
+                &turn.id,
+                &authority.to_persisted_json().unwrap()
+            )
+            .await
+            .unwrap()
+    );
+    processor
+        .agent_manager
+        .ensure_thread(&thread.id, workspace)
+        .await
+        .unwrap();
+    let committed = processor
+        .agent_manager
+        .subscribe_committed(&thread.id)
+        .await
+        .unwrap();
+    processor
+        .ensure_agent_listener_task(&thread.id)
+        .await
+        .unwrap();
+    processor
+        .agent_manager
+        .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+            &thread.id,
+            &turn.id,
+            ThreadMode::Agent,
+            pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            MODEL,
+            "openai",
+            HashMap::new(),
+            pioneer_skills::SkillCatalogSnapshot {
+                version: 1,
+                generated_at_unix: 0,
+                skills: vec![],
+            },
+            input.to_vec(),
+            vec![],
+            vec![],
+            HashMap::new(),
+            vec![],
+            turn.permission_profile.clone(),
+            test_full_access_execution_security_snapshot(),
+        )
+        .await
+        .unwrap();
+    (thread, turn, committed)
+}
+
 #[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wires() {
     for responses in [true, false] {
@@ -216,6 +351,7 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         let provider = Arc::new(LoopProvider {
             inner,
             requests: Default::default(),
+            context_limit: None,
         });
         let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
@@ -234,9 +370,10 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         processor
             .agent_manager
-            .set_turn_tool_provider(Some(Arc::new(TurnTools(Arc::new(ParallelTools(
-                release.clone(),
-            ))))))
+            .set_turn_tool_provider(Some(Arc::new(TurnTools(
+                Arc::new(ParallelTools(release.clone())),
+                &NAMES,
+            ))))
             .await;
         let images = tempfile::tempdir().unwrap();
         let path = images.path().join("prefix.webp");
@@ -256,92 +393,7 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
                 path: path.to_string_lossy().into_owned(),
             },
         ];
-        let mut thread = phase_13_test_thread(workspace, "sent-prefix", phase_13_now_secs());
-        thread.model = MODEL.into();
-        let mut turn = phase_13_turn("sent-turn", TurnStatus::InProgress);
-        turn.mode = ThreadMode::Agent;
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &input,
-                pioneer_protocol::PersistedActorRef::Principal(
-                    authenticated_test_superuser().principal_id.clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        let mut loaded_thread = thread.clone();
-        loaded_thread.turns = vec![turn.clone()];
-        processor
-            .thread_manager
-            .system_thread_restore_persisted(loaded_thread, Some(SandboxMode::FullAccess))
-            .await
-            .unwrap();
-        let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
-            authenticated_test_superuser().as_ref(),
-            workspace,
-            &thread.id,
-            &turn.permission_profile,
-            None,
-        );
-        authority.bind_test_provider_authority(
-            "openai",
-            MODEL,
-            registry
-                .authority_fingerprint_for_workspace(workspace, "openai")
-                .unwrap()
-                .as_str(),
-        );
-        assert!(
-            store
-                .set_turn_execution_authorization_context(
-                    &turn.id,
-                    &authority.to_persisted_json().unwrap()
-                )
-                .await
-                .unwrap()
-        );
-        processor
-            .agent_manager
-            .ensure_thread(&thread.id, workspace)
-            .await
-            .unwrap();
-        let mut committed = processor
-            .agent_manager
-            .subscribe_committed(&thread.id)
-            .await
-            .unwrap();
-        processor
-            .ensure_agent_listener_task(&thread.id)
-            .await
-            .unwrap();
-        processor
-            .agent_manager
-            .start_turn_with_hook_context_permission_profile_and_security_snapshot(
-                &thread.id,
-                &turn.id,
-                ThreadMode::Agent,
-                pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                MODEL,
-                "openai",
-                HashMap::new(),
-                pioneer_skills::SkillCatalogSnapshot {
-                    version: 1,
-                    generated_at_unix: 0,
-                    skills: vec![],
-                },
-                input,
-                vec![],
-                vec![],
-                HashMap::new(),
-                vec![],
-                turn.permission_profile.clone(),
-                test_full_access_execution_security_snapshot(),
-            )
-            .await
-            .unwrap();
+        let (thread, turn, mut committed) = start_fixture_turn(&harness, &input).await;
         let mut acked_tools = Vec::new();
         let mut failed_tool_recorded = false;
         let mut bounded_item_id = None;
@@ -678,6 +730,452 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
     }
 }
 
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_disclosure_appends_to_the_sent_gateway_input() {
+    crate::compaction::load_test_catalog();
+    let (root, mut wire, server) = scripted_transport(true, "done", |round| {
+        let call = |id: &str, name: &str, arguments: String| {
+            json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,
+                "name":name,"arguments":arguments,"status":"completed"})
+        };
+        let discover = |id: &str, domain: &str| {
+            call(id, "request_tools", json!({"domains":[domain],"reason":"Read fixture context"}).to_string())
+        };
+        let output = match round {
+            0 => vec![discover("discover_threads", "threads")],
+            1 => vec![
+                call("slow_result", "cache_slow", "{}".into()),
+                call("fast_result", "cache_error", "{}".into()),
+            ],
+            2 => vec![discover("discover_task", "task")],
+            3 => vec![discover("repeat_task", "task")],
+            _ => return None,
+        };
+        Some(json!({"id":format!("response_{round}"),"status":"completed","model":MODEL,"output":output}))
+    })
+    .await;
+    let address = root
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/v1")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let inner = ResponsesApiCompatibleProvider::new(
+        "openai",
+        "https://api.openai.com/v1",
+        "fixture",
+        AuthStyle::Bearer,
+    )
+    .with_fixture_endpoint(address);
+    let provider = Arc::new(LoopProvider {
+        inner: Arc::new(inner),
+        requests: Default::default(),
+        context_limit: None,
+    });
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let harness = setup_phase_13_compaction_harness(registry).await;
+    let processor = &harness.processor;
+    processor.bind_context_compaction().await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    // Materialize one optional tool from each domain. The real request_tools
+    // handler and router decide when each definition becomes visible.
+    processor
+        .agent_manager
+        .set_turn_tool_provider(Some(Arc::new(TurnTools(
+            Arc::new(ParallelTools(release.clone())),
+            &["cache_slow", "cache_error", "threads_list", "task_get"],
+        ))))
+        .await;
+    let (thread, turn, mut committed) = start_fixture_turn(
+        &harness,
+        &[UserInput::Text {
+            text: "Discover threads, check two results, then discover tasks.".into(),
+            text_elements: vec![],
+        }],
+    )
+    .await;
+    let mut parallel_order = Vec::new();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match committed.recv().await {
+                Ok(AgentDurableEvent::TurnLlmContextAppended {
+                    source, tool_name, ..
+                }) if source == "tool_result_v2" && NAMES.contains(&tool_name.as_str()) => {
+                    if tool_name == "cache_error" {
+                        release.add_permits(1);
+                    }
+                    parallel_order.push(tool_name);
+                }
+                Ok(AgentDurableEvent::TurnCompleted { .. })
+                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(
+                    AgentDurableEvent::TurnFailed { .. } | AgentDurableEvent::TurnBlocked { .. },
+                ) => {
+                    panic!("turn failed before the final request")
+                }
+                Err(error) => panic!("committed event stream lost result order: {error}"),
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let (_, completed) = harness
+        .crud_store
+        .get_turn(&thread.id, &turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, TurnStatus::Completed, "{completed:?}");
+    assert_eq!(parallel_order, ["cache_error", "cache_slow"]);
+
+    let mut sent = Vec::new();
+    for _ in 0..5 {
+        let body = wire
+            .try_recv()
+            .expect("local HTTP must capture each request");
+        assert!(body.get("tools").is_none(), "lost positional declarations");
+        sent.push(body["input"].as_array().unwrap().clone());
+    }
+    for pair in sent.windows(2) {
+        let [previous, next] = pair else {
+            unreachable!()
+        };
+        assert!(next.len() > previous.len());
+        assert_eq!(
+            serde_json::to_vec(&next[..previous.len()]).unwrap(),
+            serde_json::to_vec(previous).unwrap(),
+        );
+    }
+    let initial = &sent[0][0];
+    assert_eq!(initial["type"], "additional_tools");
+    let tools = initial["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "request_tools"));
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"] != "threads_list" && tool["name"] != "task_get")
+    );
+    for (round, id, name) in [
+        (1, "discover_threads", "threads_list"),
+        (3, "discover_task", "task_get"),
+    ] {
+        let new = &sent[round][sent[round - 1].len()..];
+        let result = new
+            .iter()
+            .position(|item| item["type"] == "function_call_output" && item["call_id"] == id)
+            .unwrap();
+        let batches = new
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item["type"] == "additional_tools")
+            .collect::<Vec<_>>();
+        let [(position, batch)] = batches.as_slice() else {
+            panic!("one declaration batch required for {name}");
+        };
+        assert!(*position > result);
+        let names = batch["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [name]);
+    }
+    let parallel = &sent[2][sent[1].len()..];
+    for (kind, expected) in [
+        ("function_call", ["slow_result", "fast_result"]),
+        ("function_call_output", ["fast_result", "slow_result"]),
+    ] {
+        assert_eq!(
+            parallel
+                .iter()
+                .filter(|item| item["type"] == kind)
+                .map(|item| item["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+    }
+    for round in [2, 4] {
+        assert!(
+            sent[round][sent[round - 1].len()..]
+                .iter()
+                .all(|item| item["type"] != "additional_tools")
+        );
+    }
+    server.abort();
+}
+
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output() {
+    crate::compaction::load_test_catalog();
+    let (root, mut wire, server) = scripted_transport(false, "done", |round| {
+        let (id, name) = match round {
+            0 => ("first_result", "cache_slow"),
+            1 => ("second_result", "cache_large"),
+            _ => return None,
+        };
+        let mut reply = json!({"id":format!("response_{round}"),"model":MODEL,"choices":[{
+            "index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":"{}"}}]}
+        }]});
+        if round == 0 {
+            // Leave room for the first bounded result while making the next
+            // result compete for the remaining measured input budget.
+            reply["usage"] = json!({"prompt_tokens":13_500,"completion_tokens":20,"total_tokens":13_520});
+        }
+        Some(reply)
+    }).await;
+    let provider = Arc::new(LoopProvider {
+        inner: Arc::new(ChatCompletionsApiCompatibleProvider::new(
+            "openai",
+            root,
+            "fixture",
+            AuthStyle::Bearer,
+        )),
+        requests: Default::default(),
+        context_limit: Some(40_000),
+    });
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai", provider,
+    ));
+    let harness = setup_phase_13_compaction_harness(registry).await;
+    let processor = &harness.processor;
+    processor.bind_context_compaction().await;
+    processor
+        .agent_manager
+        .set_turn_tool_provider(Some(Arc::new(TurnTools(
+            Arc::new(ParallelTools(Arc::new(tokio::sync::Semaphore::new(2)))),
+            &["cache_slow", "cache_large"],
+        ))))
+        .await;
+    let (thread, turn, mut committed) = start_fixture_turn(
+        &harness,
+        &[UserInput::Text {
+            text: "Read both large fixture results.".into(),
+            text_elements: vec![],
+        }],
+    )
+    .await;
+
+    let mut sent = Vec::new();
+    for round in 1..=3 {
+        match timeout(Duration::from_secs(30), wire.recv()).await {
+            Ok(Some(request)) => sent.push(request),
+            _ => {
+                let durable_turn = harness.crud_store.get_turn(&thread.id, &turn.id).await;
+                panic!("missing HTTP request {round}; durable turn: {durable_turn:?}");
+            }
+        }
+    }
+    let result = |round: usize, id: &str| {
+        sent[round]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["role"] == "tool" && item["tool_call_id"] == id)
+            .unwrap()
+    };
+    let old = result(1, "first_result");
+    assert_eq!(
+        serde_json::to_vec(old).unwrap(),
+        serde_json::to_vec(result(2, "first_result")).unwrap(),
+    );
+    let large = result(2, "second_result")["content"].as_str().unwrap();
+    assert!(large.len() < old["content"].as_str().unwrap().len());
+    assert!(large.contains("BOUNDED_BEGIN") && large.contains("BOUNDED_END"));
+    assert!(!large.contains("BOUNDED_MIDDLE"));
+    let (_, shortened) = large
+        .split_once("\n[Result shortened. Full source: ")
+        .unwrap();
+    let (locator, _) = shortened
+        .split_once("; use threads_tools_result_read.]\n")
+        .unwrap();
+    let mut params: pioneer_protocol::ThreadToolResultReadParams =
+        serde_json::from_str(locator).unwrap();
+    assert_eq!(params.workspace_id, harness.workspace_id);
+    assert_eq!(params.thread_id, thread.id);
+    assert_eq!(params.turn_id, turn.id);
+    params.max_tokens = Some(512);
+    params.max_bytes = Some(2_048);
+    let page = processor.read_thread_tool_result(params).await.unwrap();
+    assert!(page.text.contains("BOUNDED_BEGIN"));
+    assert!(!page.eof, "the source still contains the complete output");
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match committed.recv().await {
+                Ok(AgentDurableEvent::TurnCompleted { .. })
+                | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Ok(
+                    AgentDurableEvent::TurnFailed { .. } | AgentDurableEvent::TurnBlocked { .. },
+                ) => {
+                    panic!("turn failed after sending the bounded result")
+                }
+                Err(error) => panic!("committed event stream unavailable: {error}"),
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let (_, completed) = harness
+        .crud_store
+        .get_turn(&thread.id, &turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, TurnStatus::Completed, "{completed:?}");
+    let restored = crate::compaction::frozen::capture_execution_basis_prepared(
+        &harness.crud_store,
+        &harness.workspace_id,
+        &thread.id,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let restored_result = restored
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("second_result"))
+        .unwrap();
+    assert_eq!(restored_result.content, large);
+    server.abort();
+}
+
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_no_tools_round_keeps_only_supported_wire_prefix() {
+    crate::compaction::load_test_catalog();
+    for public_responses in [true, false] {
+        let (root, mut wire, server) = scripted_transport(true, "done", |round| {
+            if round >= 2 {
+                return None;
+            }
+            Some(json!({"id":format!("round_{round}"),"status":"completed","model":MODEL,"output":[{
+                "type":"function_call","id":format!("fc_{round}"),"call_id":format!("failure_{round}"),
+                "name":"cache_error","arguments":"{}","status":"completed"
+            }]}))
+        }).await;
+        let inner = if public_responses {
+            let address = root
+                .strip_prefix("http://")
+                .unwrap()
+                .strip_suffix("/v1")
+                .unwrap()
+                .parse()
+                .unwrap();
+            ResponsesApiCompatibleProvider::new(
+                "openai",
+                "https://api.openai.com/v1",
+                "fixture",
+                AuthStyle::Bearer,
+            )
+            .with_fixture_endpoint(address)
+        } else {
+            ResponsesApiCompatibleProvider::new("openai", root, "fixture", AuthStyle::Bearer)
+        };
+        let provider = Arc::new(LoopProvider {
+            inner: Arc::new(inner),
+            requests: Default::default(),
+            context_limit: None,
+        });
+        let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai", provider,
+        ));
+        let mut config = test_tool_loop_config();
+        config.retry.max_recoverable_retry_rounds_per_episode = 1;
+        let harness = setup_phase_13_compaction_harness_with_tool_config(registry, config).await;
+        let processor = &harness.processor;
+        processor.bind_context_compaction().await;
+        processor
+            .agent_manager
+            .set_turn_tool_provider(Some(Arc::new(TurnTools(
+                Arc::new(ParallelTools(Arc::new(tokio::sync::Semaphore::new(0)))),
+                &["cache_error"],
+            ))))
+            .await;
+        let (thread, turn, mut events) = start_fixture_turn(
+            &harness,
+            &[UserInput::Text {
+                text: "Read the fixture, report an error if unavailable.".into(),
+                text_elements: vec![],
+            }],
+        )
+        .await;
+        timeout(Duration::from_secs(15), async {
+            loop {
+                match events.recv().await {
+                    Ok(AgentDurableEvent::TurnCompleted { .. })
+                    | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(
+                        AgentDurableEvent::TurnFailed { .. }
+                        | AgentDurableEvent::TurnBlocked { .. },
+                    ) => panic!("turn did not complete after retry exhaustion"),
+                    Err(error) => panic!("committed event stream unavailable: {error}"),
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (_, completed) = harness
+            .crud_store
+            .get_turn(&thread.id, &turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, TurnStatus::Completed, "{completed:?}");
+        let _initial = wire.try_recv().unwrap();
+        let retry = wire.try_recv().unwrap();
+        let final_request = wire.try_recv().unwrap();
+        assert!(retry.get("tool_choice").is_none());
+        let previous = retry["input"].as_array().unwrap();
+        let next = final_request["input"].as_array().unwrap();
+        assert!(
+            next.iter().any(
+                |item| item["call_id"] == "failure_1" && item["type"] == "function_call_output"
+            )
+        );
+        if public_responses {
+            assert_eq!(previous[0]["type"], "additional_tools");
+            assert!(
+                previous[0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "cache_error")
+            );
+            assert_eq!(&next[..previous.len()], previous);
+            assert!(
+                next[previous.len()..]
+                    .iter()
+                    .all(|item| item["type"] != "additional_tools")
+            );
+            assert!(final_request.get("tools").is_none());
+            assert_eq!(final_request["tool_choice"], "none");
+            for key in [
+                "instructions",
+                "model",
+                "parallel_tool_calls",
+                "max_output_tokens",
+                "reasoning",
+            ] {
+                assert_eq!(final_request.get(key), retry.get(key), "{key}");
+            }
+        } else {
+            assert!(!retry["tools"].as_array().unwrap().is_empty());
+            assert!(final_request.get("tools").is_none());
+            assert!(final_request.get("tool_choice").is_none());
+            assert!(next.iter().all(|item| item["type"] != "additional_tools"));
+        }
+        server.abort();
+    }
+}
+
 #[test]
 fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
     run_standard_stack_message_test("detached prepared input continuity", async {
@@ -710,6 +1208,7 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
             let provider = Arc::new(LoopProvider {
                 inner,
                 requests: Default::default(),
+                context_limit: None,
             });
             // Real adapters and existing catalog models; only HTTP replies
             // and the fixture tool execution are controlled here.
@@ -737,9 +1236,10 @@ fn sequential_detached_executions_keep_the_sent_input_prefix_on_both_wires() {
             processor.bind_context_compaction().await;
             processor
                 .agent_manager
-                .set_turn_tool_provider(Some(Arc::new(TurnTools(Arc::new(ParallelTools(
-                    Arc::new(tokio::sync::Semaphore::new(1)),
-                ))))))
+                .set_turn_tool_provider(Some(Arc::new(TurnTools(
+                    Arc::new(ParallelTools(Arc::new(tokio::sync::Semaphore::new(1)))),
+                    &NAMES,
+                ))))
                 .await;
             let parent = "detached-prefix-parent";
             let started = processor

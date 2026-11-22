@@ -1450,6 +1450,10 @@ impl crate::traits::Provider for OpenAiProvider {
         }
     }
 
+    fn keeps_tools_when_disabled(&self, _model: &str) -> bool {
+        self.base_url == BASE_URL
+    }
+
     fn usage_api(&self) -> &'static str {
         "responses"
     }

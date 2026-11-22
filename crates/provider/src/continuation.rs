@@ -287,8 +287,8 @@ pub(crate) struct PrefixProof {
     authority: String,
     messages: usize,
     prefix_sha256: String,
-    /// Converse binds previous messages. Its request-level system/toolConfig
-    /// are not part of that documented message signature contract.
+    /// Converse binds previous messages independently of system/toolConfig.
+    /// Unsigned Messages replies use this for the history before inline updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     messages_sha256: Option<String>,
     response_sha256: String,
@@ -340,6 +340,19 @@ fn message_prefix(body: &Value, count: usize) -> Result<Value> {
     Ok(Value::Array(messages[..count].to_vec()))
 }
 
+fn message_prefix_hash_without_system(body: &Value, count: usize) -> Result<String> {
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("native prefix lacks messages"))?;
+    let messages = messages
+        .iter()
+        .filter(|message| message["role"] != "system")
+        .take(count)
+        .collect::<Vec<_>>();
+    ensure!(messages.len() == count, "native prefix shortened");
+    hash(&serde_json::to_value(messages)?)
+}
+
 /// Claude's prefix-bound generations support operator instructions and tool
 /// changes appended to messages. Save/reconstruct their actual wire positions,
 /// rather than overwriting the system/tools preceding already signed answers.
@@ -347,20 +360,67 @@ fn message_prefix(body: &Value, count: usize) -> Result<Value> {
 pub(crate) fn stabilize_anthropic_prefix(
     body: &mut Value,
     states: &[ProviderReplayState],
+    model: &str,
+    authority: &str,
 ) -> Result<bool> {
-    let Some(context) = states.iter().rev().find_map(|state| {
-        (retention(state) == Retention::Prefix)
-            .then(|| state.payload.get("prefix_context"))
-            .flatten()
-    }) else {
-        return Ok(false);
-    };
+    let (signed, latest) = (
+        states.iter().rposition(|state| {
+            retention(state) == Retention::Prefix && state.payload.get("prefix_context").is_some()
+        }),
+        states
+            .iter()
+            .rposition(|state| state.payload.get("prefix_context").is_some()),
+    );
+    let unsigned_context = latest
+        .filter(|latest| Some(*latest) != signed)
+        .and_then(|index| {
+            let state = &states[index];
+            let context = state.payload.get("prefix_context")?;
+            let proof: PrefixProof =
+                serde_json::from_value(state.payload.get("prefix_proof")?.clone()).ok()?;
+            let count = proof
+                .messages
+                .checked_sub(context["insertions"].as_array()?.len())?;
+            let digest = proof.messages_sha256.as_ref()?;
+            (proof.version == 1
+                && proof.provider == "anthropic"
+                && proof.model == model
+                && state.model.as_deref() == Some(model)
+                && proof.authority == authority
+                && *digest == message_prefix_hash_without_system(body, count).ok()?)
+            .then_some(context)
+        });
+    if let Some(context) = unsigned_context {
+        // An optional unsigned proof cannot turn a valid ordinary request into
+        // an invalid inline update. Keep the original body until it fits.
+        let mut candidate = body.clone();
+        if let Ok(beta) = apply_anthropic_prefix(&mut candidate, context) {
+            *body = candidate;
+            return Ok(beta);
+        }
+    }
+    match signed {
+        Some(index) => apply_anthropic_prefix(body, &states[index].payload["prefix_context"]),
+        None => Ok(false),
+    }
+}
+
+fn apply_anthropic_prefix(body: &mut Value, context: &Value) -> Result<bool> {
     let requested_system = body.get("system").cloned().unwrap_or(Value::Null);
-    let requested_tools = body.get("tools").cloned().unwrap_or(Value::Null);
+    let wanted = body["tools"].as_array().cloned().unwrap_or_default();
     let root_system = context.get("system").cloned().unwrap_or(Value::Null);
     let root_tools = context.get("tools").cloned().unwrap_or(Value::Null);
     let mut effective_system = root_system.clone();
     let mut effective_tools = root_tools.as_array().cloned().unwrap_or_default();
+    // Even a historical definition followed by tool_removal would disclose
+    // that definition again. A signed prefix with such a definition cannot
+    // be replayed under the current authorization.
+    const TOOL_CONFLICT: &str =
+        "Anthropic native prefix contains a tool definition outside the current permitted set";
+    ensure!(
+        effective_tools.iter().all(|tool| wanted.contains(tool)),
+        TOOL_CONFLICT
+    );
     let mut requires_tools_beta = false;
     let messages = body["messages"]
         .as_array_mut()
@@ -401,6 +461,7 @@ pub(crate) fn stabilize_anthropic_prefix(
                             && definition["name"].is_string(),
                         "invalid native tool addition"
                     );
+                    ensure!(wanted.contains(definition), TOOL_CONFLICT);
                     effective_tools.retain(|tool| tool["name"] != definition["name"]);
                     effective_tools.push(definition.clone());
                 }
@@ -414,13 +475,6 @@ pub(crate) fn stabilize_anthropic_prefix(
         updates.push(
             serde_json::json!({"type":"text", "text": requested_system.as_str().unwrap_or("")}),
         );
-    }
-    let wanted = requested_tools.as_array().cloned().unwrap_or_default();
-    for tool in &effective_tools {
-        if !wanted.iter().any(|wanted| wanted["name"] == tool["name"]) {
-            updates.push(serde_json::json!({"type":"tool_removal", "tool":{"type":"tool_reference", "name":tool["name"]}}));
-            requires_tools_beta = true;
-        }
     }
     for tool in &wanted {
         if !effective_tools.iter().any(|old| old == tool) {
@@ -478,7 +532,12 @@ pub(crate) fn bind_prefix(
     body: &Value,
 ) -> Result<()> {
     state.model = Some(model.into());
-    if retention(state) != Retention::Prefix {
+    let retention = retention(state);
+    let ordinary_anthropic = retention == Retention::Ordinary
+        && state.provider == "anthropic"
+        && claude_prefix_rule(Some(model)) == Some(true)
+        && authority == replay_authority("anthropic", &[crate::providers::anthropic::BASE_URL]);
+    if retention != Retention::Prefix && !ordinary_anthropic {
         return Ok(());
     }
     if state.provider == "anthropic" && claude_prefix_rule(Some(model)).is_none() {
@@ -488,11 +547,11 @@ pub(crate) fn bind_prefix(
         // verification to Messages without inventing an API restriction.
         return Ok(());
     }
-    let count = body["messages"]
+    let messages = body["messages"]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("native prefix lacks messages"))?
-        .len();
-    let proof = PrefixProof {
+        .ok_or_else(|| anyhow::anyhow!("native prefix lacks messages"))?;
+    let count = messages.len();
+    let mut proof = PrefixProof {
         version: 1,
         provider: state.provider.clone(),
         model: model.into(),
@@ -505,14 +564,20 @@ pub(crate) fn bind_prefix(
         response_sha256: hash(response_content(state))?,
     };
     if state.provider == "anthropic" {
-        let insertions: Vec<_> = body["messages"]
-            .as_array()
-            .unwrap()
+        let insertions: Vec<_> = messages
             .iter()
             .enumerate()
             .filter(|(_, message)| message["role"] == "system")
             .map(|(index, message)| serde_json::json!({"index":index, "message":message}))
             .collect();
+        if ordinary_anthropic {
+            // The unsigned response can carry sent positions without locking
+            // history against compaction. Use them only for an exact append.
+            proof.messages_sha256 = Some(message_prefix_hash_without_system(
+                body,
+                count - insertions.len(),
+            )?);
+        }
         state.payload["prefix_context"] = serde_json::json!({
             "system":body.get("system"), "tools":body.get("tools"), "insertions":insertions,
         });

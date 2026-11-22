@@ -593,6 +593,10 @@ impl Provider for AuthorityBoundProvider {
         self.model_tool_calling_with_catalog(model, catalog.as_deref())
     }
 
+    fn keeps_tools_when_disabled(&self, model: &str) -> bool {
+        self.inner.keeps_tools_when_disabled(model)
+    }
+
     fn native_file_tool_capability(
         &self,
         model: &str,

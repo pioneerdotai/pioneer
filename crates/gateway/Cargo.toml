@@ -104,6 +104,7 @@ toml.workspace = true
 [dev-dependencies]
 pioneer-postgres-pools = { workspace = true, features = ["test-support"] }
 pioneer-postgres-test.workspace = true
+pioneer-provider = { workspace = true, features = ["test-support"] }
 pioneer-cli-agent-runtime = { workspace = true, features = ["test-support"] }
 sentry = { workspace = true, features = ["test"] }
 pioneer-client.workspace = true

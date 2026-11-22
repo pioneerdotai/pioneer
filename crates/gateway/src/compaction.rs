@@ -24,7 +24,6 @@ pub(crate) mod native_budget;
 mod origins;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;
-mod result_budget;
 mod service;
 pub(crate) use service::apply_cli_usage;
 #[cfg(test)]

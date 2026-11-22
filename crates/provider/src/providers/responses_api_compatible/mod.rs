@@ -29,6 +29,8 @@ pub struct ResponsesApiCompatibleProvider {
     input_types: ProviderInputCapabilities,
     provisional_messages: bool,
     gateway_caching: bool,
+    #[cfg(feature = "test-support")]
+    fixture_endpoint: Option<String>,
 }
 
 /// Public formatting omits the original response retained for local diagnostics.
@@ -266,6 +268,8 @@ impl ResponsesApiCompatibleProvider {
             input_types: ProviderInputCapabilities::disabled_for_all_file_types(),
             provisional_messages: false,
             gateway_caching: false,
+            #[cfg(feature = "test-support")]
+            fixture_endpoint: None,
         }
     }
     /// Publish unresolved message text through StartProvisional/Resolve events.
@@ -313,9 +317,23 @@ impl ResponsesApiCompatibleProvider {
             input_types,
             provisional_messages: false,
             gateway_caching: false,
+            #[cfg(feature = "test-support")]
+            fixture_endpoint: None,
         }
     }
+    /// Redirect only HTTP transport for cross-crate wire tests.
+    #[cfg(feature = "test-support")]
+    pub fn with_fixture_endpoint(mut self, address: std::net::SocketAddr) -> Self {
+        assert!(address.ip().is_loopback());
+        self.fixture_endpoint = Some(format!("http://{address}/v1/responses"));
+        self
+    }
+
     fn endpoint(&self) -> String {
+        #[cfg(feature = "test-support")]
+        if let Some(endpoint) = &self.fixture_endpoint {
+            return endpoint.clone();
+        }
         if self.root.ends_with("/responses") {
             self.root.clone()
         } else {
@@ -652,6 +670,12 @@ impl Provider for ResponsesApiCompatibleProvider {
     fn name(&self) -> &str {
         &self.name
     }
+    fn keeps_tools_when_disabled(&self, _model: &str) -> bool {
+        self.name == "openai"
+            && self.root == "https://api.openai.com/v1"
+            && matches!(&self.auth, AuthStyle::Bearer)
+    }
+
     fn usage_api(&self) -> &'static str {
         "responses"
     }
@@ -682,7 +706,7 @@ impl Provider for ResponsesApiCompatibleProvider {
         let mut request = self.project(request)?;
         // Budget exactly the selected wire projection; unsupported routes retain
         // the established full-list representation and calibration identity.
-        request.tool_declarations = self.declarations_for_request(&request);
+        self.select_declarations(&mut request)?;
         crate::attachments::input_estimate::prepare_responses(
             &self.name,
             &self.capabilities(),

@@ -6747,123 +6747,6 @@ async fn native_target_rechecks_complete_request_before_checkpoint_publication()
 }
 
 #[pioneer_postgres_test::postgres_test]
-async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_original() {
-    use pioneer_agent::compaction::request::NativeRequestProjection;
-    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderToolCall};
-    let f = fixture("fixture", vec![], true, false).await;
-    let original = format!("BEGIN {} END", "long result ".repeat(6000));
-    let payload = serde_json::json!({"storage":{"kind":"shell","stdout":original}}).to_string();
-    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('sized-result','turn','sized-item','command_execution','completed',$1::text::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
-    let source = f
-        .store
-        .compaction_tool_item_reference("ws", "thread", "turn", "sized-item")
-        .await
-        .unwrap()
-        .unwrap();
-    let mut tool = ChatMessage::tool_result("call", "shell", &original);
-    tool.provenance = Some(MessageProvenance {
-        logical_turn_id: None,
-        workspace_id: "ws".into(),
-        thread_id: "thread".into(),
-        context_thread: None,
-        unit_id: "turn:round".into(),
-        complete: true,
-        protected_input: false,
-        inherited: false,
-        sources: vec![MessageSourceRef {
-            scope: source.scope.clone(),
-            id: source.id.clone(),
-            version: source.version.clone(),
-        }],
-        source_aliases: vec![],
-        ambiguous_input_aliases: vec![],
-    });
-    let request = ChatRequest {
-        tool_declarations: None,
-        service_mode: None,
-        model: "small".into(),
-        messages: vec![
-            ChatMessage::user("Keep this input exactly"),
-            ChatMessage::assistant_tool_calls(
-                None::<String>,
-                vec![ProviderToolCall {
-                    id: "call".into(),
-                    name: "shell".into(),
-                    arguments: "{}".into(),
-                }],
-            ),
-            tool,
-        ],
-        temperature: None,
-        max_tokens: None,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        reasoning: None,
-        compiled_prompt: None,
-    };
-    let budget = ModelBudget::new(Some(4096), None, None);
-    let full = NativeRequestProjection::full(request, vec![], budget.clone(), false).unwrap();
-    assert!(!full.fits);
-    let reduced = super::result_budget::shrink_results(
-        &f.store.with_maintenance_access(),
-        "ws",
-        &full,
-        &[],
-        &budget,
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(reduced.fits);
-    assert_eq!(&reduced.request.messages[..2], &full.request.messages[..2]);
-    let result = &reduced.request.messages[2];
-    assert_eq!(result.tool_call_id.as_deref(), Some("call"));
-    assert_eq!(result.provenance, full.request.messages[2].provenance);
-    assert!(result.content.starts_with("BEGIN") && result.content.ends_with("END"));
-    assert!(
-        result.content.contains("sized-item")
-            && result.content.contains("threads_tools_result_read")
-    );
-    assert!(pioneer_compaction::text_tokens(&serde_json::to_string(result).unwrap()) < 4096);
-    assert_eq!(
-        super::history::reference_payload(&f.store, "ws", "thread", &source)
-            .await
-            .unwrap(),
-        payload
-    );
-    let mut stale = full;
-    stale.request.messages[2]
-        .provenance
-        .as_mut()
-        .unwrap()
-        .sources[0]
-        .version = "item-revision:999".into();
-    assert!(
-        super::result_budget::shrink_results(&f.store, "ws", &stale, &[], &budget, false)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        super::result_budget::shrink_results(
-            &f.store,
-            "other-workspace",
-            &stale,
-            &[],
-            &budget,
-            false
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert_eq!(*f.provider.count.borrow(), 0);
-}
-
-#[pioneer_postgres_test::postgres_test]
 async fn pending_runtime_origins_resolve_versions_with_scope_and_whole_round_identity() {
     use pioneer_agent::compaction::history::{
         NativeHistoryLayout, PendingOriginKind, pending_origin,
@@ -10278,15 +10161,20 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
 
 #[pioneer_postgres_test::postgres_test]
 async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_generation() {
-    native_preparation_with_context_cap(false).await;
+    native_preparation_with_context_cap(false, false).await;
 }
 
 #[pioneer_postgres_test::postgres_test]
 async fn native_selected_cap_compacts_fitting_request_and_freezes_summary_admission() {
-    native_preparation_with_context_cap(true).await;
+    native_preparation_with_context_cap(true, false).await;
 }
 
-async fn native_preparation_with_context_cap(selected_cap: bool) {
+#[pioneer_postgres_test::postgres_test]
+async fn responses_keeps_the_new_wire_prefix_after_real_compaction() {
+    native_preparation_with_context_cap(true, true).await;
+}
+
+async fn native_preparation_with_context_cap(selected_cap: bool, wire: bool) {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef, ProviderRegistry};
     // Retain the original over-technical-window case. The additional case
@@ -10305,9 +10193,42 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
     providers
         .insert("summary-fixture", f.provider.clone())
         .unwrap();
-    providers
-        .insert("main-fixture", Arc::new(SmallWindowMain))
-        .unwrap();
+    let capture = if wire {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider = pioneer_provider::providers::ResponsesApiCompatibleProvider::new(
+            "openai",
+            "https://api.openai.com/v1",
+            "fixture",
+            pioneer_provider::providers::AuthStyle::Bearer,
+        )
+        .with_fixture_endpoint(listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(body).unwrap();
+                    axum::Json(
+                        serde_json::json!({"id":"fixture_response","status":"completed",
+                        "model":"gpt-4o","output":[{"id":"msg_fixture","type":"message",
+                        "role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"done","annotations":[]}]}]}),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        providers
+            .insert("main-fixture", Arc::new(provider))
+            .unwrap();
+        Some((rx, server))
+    } else {
+        providers
+            .insert("main-fixture", Arc::new(SmallWindowMain))
+            .unwrap();
+        None
+    };
     let mut context = NativeContext {
         context_budget: None,
         summary_context: None,
@@ -10344,29 +10265,38 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
     });
     use base64::Engine;
     let mut current = ChatMessage::user("Continue");
-    current
-        .content_parts
-        .push(pioneer_provider::MessageContentPart::file(
-            pioneer_provider::MessageAttachment {
-                mime_type: "application/pdf".into(),
-                name: Some("retained.pdf".into()),
-                size_bytes: None,
-                sha256: None,
-                artifact: None,
-                source: pioneer_provider::AttachmentDataSource::Bytes {
-                    base64_data: base64::engine::general_purpose::STANDARD
-                        .encode(crate::media_test_fixtures::pdf()),
+    if !wire {
+        current
+            .content_parts
+            .push(pioneer_provider::MessageContentPart::file(
+                pioneer_provider::MessageAttachment {
+                    mime_type: "application/pdf".into(),
+                    name: Some("retained.pdf".into()),
+                    size_bytes: None,
+                    sha256: None,
+                    artifact: None,
+                    source: pioneer_provider::AttachmentDataSource::Bytes {
+                        base64_data: base64::engine::general_purpose::STANDARD
+                            .encode(crate::media_test_fixtures::pdf()),
+                    },
                 },
-            },
-        ));
+            ));
+    }
     let request = ChatRequest {
-        tool_declarations: None,
+        tool_declarations: wire
+            .then(|| pioneer_provider::tool_declarations::ToolDeclarations::pending(None)),
         service_mode: None,
         model: "gpt-4o".into(),
         messages: vec![history, current],
         temperature: None,
         max_tokens: Some(2048),
-        tools: None,
+        tools: wire.then(|| {
+            vec![pioneer_provider::ToolDefinition {
+                name: "lookup".into(),
+                description: "Inspect fixture".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }]
+        }),
         tool_choice: None,
         parallel_tool_calls: None,
         reasoning: None,
@@ -10450,13 +10380,15 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
     assert_eq!(prepared.request.max_tokens, Some(2048));
     assert_eq!(prepared.request.messages.len(), 2);
     assert_eq!(prepared.request.messages[1].content, "Continue");
-    assert_eq!(prepared.request.messages[1].content_parts.len(), 1);
-    let pioneer_provider::MessageContentPart::File { file } =
-        &prepared.request.messages[1].content_parts[0]
-    else {
-        panic!("lost retained media")
-    };
-    assert!(file.sha256.is_some());
+    if !wire {
+        assert_eq!(prepared.request.messages[1].content_parts.len(), 1);
+        let pioneer_provider::MessageContentPart::File { file } =
+            &prepared.request.messages[1].content_parts[0]
+        else {
+            panic!("lost retained media")
+        };
+        assert!(file.sha256.is_some());
+    }
     assert!(prepared.request.messages[0].content.contains(HEADINGS[0]));
     assert!(prepared.receipt.identity.checkpoint.is_some());
     let count = f.provider.calls.lock().unwrap().len();
@@ -10674,6 +10606,57 @@ async fn native_preparation_with_context_cap(selected_cap: bool) {
         .unwrap()
         .try_get::<i64>("", "total")
         .unwrap();
+    if let Some((mut wire, server)) = capture {
+        use pioneer_provider::tool_declarations::ToolDeclarations;
+        context
+            .provider
+            .chat(prepared.request.clone())
+            .await
+            .unwrap();
+        let sent = wire.try_recv().unwrap();
+        assert!(sent.get("tools").is_none());
+        let prefix = sent["input"].as_array().unwrap();
+        assert_eq!(prefix[0]["type"], "additional_tools");
+        assert_eq!(prefix[0]["tools"][0]["name"], "lookup");
+        assert!(prefix[1].to_string().contains(HEADINGS[0]));
+        let mut appended = prepared.request.clone();
+        appended.tool_declarations =
+            Some(ToolDeclarations::pending(appended.tool_declarations.take()));
+        appended
+            .messages
+            .push(ChatMessage::user("One more observation"));
+        let appended = super::test_support::prepare_native_request(
+            &f.store,
+            &providers,
+            &settings,
+            &context,
+            appended,
+            None,
+            false,
+            f.observer.clone(),
+            f.clock.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            appended.receipt.identity.checkpoint,
+            prepared.receipt.identity.checkpoint
+        );
+        context.provider.chat(appended.request).await.unwrap();
+        let next = wire.try_recv().unwrap();
+        assert!(next.get("tools").is_none());
+        let next = next["input"].as_array().unwrap();
+        assert_eq!(&next[..prefix.len()], prefix);
+        assert_eq!(next.len(), prefix.len() + 1);
+        assert!(
+            next.last()
+                .unwrap()
+                .to_string()
+                .contains("One more observation")
+        );
+        assert_eq!(f.provider.calls.lock().unwrap().len(), count);
+        server.abort();
+    }
     let again = super::test_support::prepare_native_request(
         &f.store,
         &providers,
