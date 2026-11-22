@@ -10,7 +10,6 @@ mod m20261119_000007_history_storage;
 mod m20261119_000008_memory;
 mod m20261119_000009_relations;
 mod m20261119_000010_database_rules;
-mod m20261121_000011_dev_app_identity;
 
 pub struct Migrator;
 
@@ -28,7 +27,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20261119_000008_memory::Migration),
             Box::new(m20261119_000009_relations::Migration),
             Box::new(m20261119_000010_database_rules::Migration),
-            Box::new(m20261121_000011_dev_app_identity::Migration),
         ]
     }
 }

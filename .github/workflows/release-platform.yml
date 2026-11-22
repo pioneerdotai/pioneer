@@ -252,6 +252,13 @@ jobs:
     needs: [build-gateway-default, prepare-postgres]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
       WINDOWS_SIGNING_REQUIRED: "false"
       WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
       WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
@@ -276,6 +283,14 @@ jobs:
           role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-default
           path: gateway-inputs
       - uses: ./.github/actions/download-release-input
+        if: runner.os == 'macOS'
+        with:
+          role: notary-gateway-default-${{ fromJSON(inputs.platform).target }}
+          path: notary-logs
+          optional: 'true'
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
+      - uses: ./.github/actions/download-release-input
         with:
           role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
           path: postgres-runtime
@@ -296,6 +311,14 @@ jobs:
           path: gateway-final/assets/
           retention-days: 7
           if-no-files-found: error
+      - name: retain-notarization-reports
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: notary-gateway-default-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: notary-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   package-gateway-computer-use:
     needs: [build-gateway-computer-use, prepare-cua, prepare-postgres]

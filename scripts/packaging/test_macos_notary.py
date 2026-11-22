@@ -12,10 +12,13 @@ from pathlib import Path
 import runpy
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import zipfile
 
 NOTARY = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+GATEWAY = runpy.run_path(str(Path(__file__).with_name("package-gateway.py")))
 SUBMISSION_ID = "11111111-2222-3333-4444-555555555555"
 CREDENTIALS = dict(APPLE_NOTARIZATION_KEY_ID="fixture-key-id",
                    APPLE_NOTARIZATION_ISSUER_ID="fixture-issuer-id",
@@ -80,6 +83,73 @@ def inputs(root, retained=False):
 
 
 class MacosNotaryTests(unittest.TestCase):
+    def test_default_gateway_delivers_exact_signed_notarized_archive(self):
+        identity = "Developer ID Application: Fixture"
+        expected_code = {
+            "pioneer", "libonnxruntime.dylib", "cua/postgres/lib/vector.so",
+            *(f"cua/postgres/bin/{name}" for name in ("postgres", "initdb", "pg_ctl", "psql")),
+        }
+        extension = "cua/postgres/share/extension/vector.control"
+        signature = b"fixture Developer ID signature"
+        transport = NotaryTransport()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = SimpleNamespace(target="x86_64-apple-darwin", inputs=root/"inputs",
+                                   postgres=root/"inputs/cua/postgres", notary_log_dir=root/"notary")
+            for entry in expected_code | {extension}:
+                path = args.inputs / entry
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"\xcf\xfa\xed\xfe" if entry in expected_code else b"extension")
+            binary = args.inputs / "pioneer"
+            binary.chmod(0o755)
+            submitted = []
+
+            def run(arguments, **options):
+                if arguments[0] == "codesign":
+                    path = Path(arguments[-1])
+                    if "--sign" in arguments:
+                        self.assertIn("--timestamp", arguments)
+                        self.assertEqual(arguments[arguments.index("--sign") + 1], identity)
+                        path.write_bytes(path.read_bytes() + signature)
+                    else:
+                        self.assertTrue(path.read_bytes().endswith(signature))
+                    return subprocess.CompletedProcess(arguments, 0, "",
+                                                       f"Authority={identity}\nTeamIdentifier=TESTTEAM\n")
+                if arguments[1:3] == ["notarytool", "submit"]:
+                    archive = Path(arguments[3])
+                    with zipfile.ZipFile(archive) as payload:
+                        self.assertEqual(set(payload.namelist()), expected_code | {extension})
+                        for entry in expected_code:
+                            self.assertTrue(payload.read(entry).endswith(signature), entry)
+                        self.assertEqual(payload.read(extension), b"extension")
+                        mode = payload.getinfo("cua/postgres/bin/postgres").external_attr >> 16
+                        self.assertEqual(mode & 0o777, 0o755)
+                    submitted.append(hashlib.sha256(archive.read_bytes()).hexdigest())
+                return transport.run(arguments, **options)
+
+            with (patch.dict(os.environ, CREDENTIALS, MACOS_DESKTOP_SIGN_IDENTITY=identity),
+                  patch.object(subprocess, "run", run)):
+                # Rejection blocks distribution and retains the exact submission.
+                archive = root / "published.zip"
+                transport.report_status = "Rejected"
+                with self.assertRaisesRegex(ValueError, "Notarization Rejected"):
+                    GATEWAY["package_macos_default"](args, binary, archive)
+                self.assertFalse(archive.exists())
+
+                # A separate accepted release publishes the submitted bytes.
+                args.notary_log_dir = root / "accepted"
+                transport.report_status = "Accepted"
+                receipt = GATEWAY["package_macos_default"](args, binary, archive)
+                resumed = root / "resumed.zip"
+                self.assertEqual(GATEWAY["package_macos_default"](args, binary, resumed), receipt)
+                self.assertEqual(resumed.read_bytes(), archive.read_bytes())
+
+            self.assertEqual(receipt, dict(id=SUBMISSION_ID, status="Accepted", sha256=submitted[-1]))
+            self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), submitted[-1])
+            self.assertEqual(len(submitted), 2)
+            self.assertFalse(any(tool == "stapler" for tool, _ in transport.actions))
+
     def test_delivered_ticket_validation_recovers_network_errors_but_rejects_invalid_tickets(self):
         network = (68, 'Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost."\n'
                        'CloudKit\'s response is inconsistent with expections: (null)\n'

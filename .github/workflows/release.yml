@@ -229,6 +229,11 @@ jobs:
                   raise ValueError(f'Invalid producer attempt: {name}')
               if hashlib.sha256(path.read_bytes()).hexdigest() != receipt['sha256']:
                   raise ValueError(f'Asset checksum mismatch: {name}')
+              if variant == 'default' and 'apple-darwin' in target:
+                  notarization = receipt.get('notarization', {})
+                  if (notarization.get('status') != 'Accepted' or not notarization.get('id')
+                          or notarization.get('sha256') != receipt['sha256']):
+                      raise ValueError(f'Missing accepted notarization for exact Gateway archive: {name}')
               receipts[name] = receipt
               if variant in ('default', 'computer-use'):
                   prefix = 'cua/postgres/'

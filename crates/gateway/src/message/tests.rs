@@ -49537,6 +49537,7 @@ async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
             test_summary_config(),
             test_tool_loop_config(),
         );
+        let processor = with_enabled_test_cli_runtime_catalog(processor);
 
         let request = json!({
             "jsonrpc": "2.0",
@@ -49552,12 +49553,27 @@ async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
             .process_request_for_connection(connection_a, &request.to_string())
             .await;
 
-        let (_response, notification_a) = recv_response_and_notification_by_id_method(
+        let (response, notification_a) = recv_response_and_notification_by_id_method(
             &mut rx_a,
             "workspacecreate000001",
             events::WORKSPACE_CHANGED,
         )
         .await;
+        assert_eq!(response.result["workspace"]["id"], "ws_000000000000000114");
+        let (_, resolved) = super::agent_action_tools::resolve_workspace_task_launch(
+            &processor,
+            "ws_000000000000000114",
+            "openai",
+            "gpt-5",
+            None,
+            Some(&pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id: "codex".into(),
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+            }),
+            "first-workspace-turn",
+        ).await.expect("the first Codex launch must resolve before startup reconciliation");
+        let (identity, _) = resolved.expect("the launch has a persisted agent identity");
+        assert_eq!(identity.source_kind, pioneer_protocol::AgentIdentitySourceKind::CliRuntimeInstance);
         let notification_b =
             recv_notification_by_method(&mut rx_b, events::WORKSPACE_CHANGED).await;
 

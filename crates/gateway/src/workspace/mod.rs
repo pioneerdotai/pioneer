@@ -160,18 +160,27 @@ impl WorkspaceManager {
         requested_workspace_id: &str,
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
+        self.create_workspace_with_cli_identities(requested_workspace_id, requested_name, &[])
+            .await
+    }
+
+    pub(crate) async fn create_workspace_with_cli_identities(
+        &self,
+        requested_workspace_id: &str,
+        requested_name: Option<&str>,
+        cli_identities: &[pioneer_crud::CliRuntimeIdentitySeed],
+    ) -> Result<Workspace, WorkspaceError> {
         let workspace_id = normalize_workspace_id(requested_workspace_id)?;
         let name = normalize_workspace_name(requested_name)?;
         let result = async {
             let transaction = self.connection.begin().await?;
             let (model, inserted) =
                 workspace_repository::create(&transaction, &workspace_id, name).await?;
-            pioneer_crud::ensure_pioneer_for_workspace(
-                &transaction,
-                &model.id,
-                chrono::Utc::now().fixed_offset(),
-            )
-            .await?;
+            let now = chrono::Utc::now().fixed_offset();
+            pioneer_crud::ensure_pioneer_for_workspace(&transaction, &model.id, now).await?;
+            pioneer_crud::ensure_cli_identities_for_workspace(
+                &transaction, &model.id, cli_identities, now,
+            ).await?;
             transaction.commit().await?;
             Ok::<_, anyhow::Error>((model, inserted))
         }

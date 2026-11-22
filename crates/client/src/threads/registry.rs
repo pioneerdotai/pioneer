@@ -2077,14 +2077,19 @@ impl ClientCore {
         );
     }
     pub fn promote_thread(&self, id: &str) -> bool {
-        self.navigate(
-            crate::navigation::NavigationIntent::PromoteThread {
-                thread_id: id.to_owned(),
-            },
-            None,
-        )
-        .outcome()
-            == crate::core::ClientTransitionOutcome::Changed
+        let promoted = self
+            .navigate(
+                crate::navigation::NavigationIntent::PromoteThread {
+                    thread_id: id.to_owned(),
+                },
+                None,
+            )
+            .outcome()
+            == crate::core::ClientTransitionOutcome::Changed;
+        if promoted {
+            self.refresh_thread_capabilities_after_promotion(id);
+        }
+        promoted
     }
     pub fn apply_thread_conversation_event(
         &self,
@@ -13847,6 +13852,95 @@ mod tests {
         assert!(Arc::ptr_eq(&snapshot, &core.thread_snapshot(&id).unwrap()));
         assert!(core.thread_workspace_draft("ws").is_none());
         assert!(!core.thread_start_snapshot().in_progress);
+    }
+
+    #[test]
+    fn first_turn_refreshes_draft_capabilities_without_reopening() {
+        use crate::threads::capabilities::{ThreadCapabilityIntent, ThreadCapabilityRequestState};
+        use pioneer_protocol::constants::methods::AUTHORIZATION_CAPABILITIES;
+
+        let (core, requests, waiting) = history_owner_fixture();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut policy = core.authorization_snapshot(None, None).unwrap();
+        let auth = core.current_auth().unwrap();
+        core.begin_authorization_epoch(Some(("endpoint".into(), 7)));
+        let (generation, connection) = core.current_auth_ticket();
+        core.finish_current_auth(generation, connection, auth).unwrap();
+        assert_eq!(
+            core.accept_authorization_projection(generation, connection, policy.clone()),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted,
+        );
+        let resources = pioneer_protocol::AuthorizationOperationalResourceProjection {
+            fingerprint: "draft-policy".into(),
+            ..Default::default()
+        };
+        policy.workspace = Some(pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot {
+            workspace_id: "ws".into(),
+            capabilities: Default::default(),
+            operational_resources: resources.clone(),
+            execution_draft_policy: pioneer_protocol::AuthorizationExecutionDraftPolicyProjection {
+                fingerprint: "draft-policy".into(),
+                resources,
+                permission_options: vec![],
+                can_attach_artifacts: false,
+                mcp_invocation_limits: Default::default(),
+            },
+        });
+        core.upsert_thread(thread("a", "ws"));
+        core.start_thread_capability_controller();
+        core.activate_thread(Some("a"), Some("ws"));
+        core.remember_thread_draft("ws", Some("a".into()));
+        core.thread_capability_intent(ThreadCapabilityIntent::Observe {
+            thread_id: "a".into(),
+        });
+        let (request, draft) = requests.recv_timeout(timeout).unwrap();
+        assert_eq!(request["method"], AUTHORIZATION_CAPABILITIES);
+        assert!(policy.thread.is_none());
+        draft.send(Ok(serde_json::to_value(&policy).unwrap())).unwrap();
+        let wait_for_ready = || {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if let Some(publication) = core.thread_capability_snapshot("a") {
+                    match &publication.request {
+                        ThreadCapabilityRequestState::Ready => return publication,
+                        ThreadCapabilityRequestState::Failed { message } => {
+                            panic!("capability lookup failed: {message}");
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "capability lookup must settle");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        assert!(wait_for_ready().snapshot.as_ref().unwrap().thread.is_none());
+
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: composer_admission(),
+        }));
+        let (request, durable) = requests.recv_timeout(timeout)
+            .expect("the open composer must request durable thread permissions");
+        assert_eq!(request["method"], AUTHORIZATION_CAPABILITIES);
+        assert_eq!(request["params"]["thread_id"], "a");
+        policy.thread = Some(pioneer_protocol::AuthorizationThreadCapabilitySnapshot {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            capabilities: pioneer_protocol::AuthorizationThreadCapabilities {
+                can_write: true,
+                can_start_turn: true,
+                ..Default::default()
+            },
+        });
+        durable.send(Ok(serde_json::to_value(policy).unwrap())).unwrap();
+        let publication = wait_for_ready();
+        let thread = publication.snapshot.as_ref().unwrap().thread.as_ref().unwrap();
+        assert!(thread.capabilities.can_start_turn);
+        assert_eq!(core.active_thread_id().as_deref(), Some("a"));
+        assert!(core.thread_workspace_draft("ws").is_none());
+        core.shutdown();
+        wait_history_owner_exit(&waiting);
     }
 
     #[test]

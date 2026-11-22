@@ -165,6 +165,13 @@ pub async fn fanout_step(db: &PostgresDatabase, targets: Option<&[String]>) -> R
             tx.commit().await?;
             return Ok(());
         }
+        if next.is_some() {
+            // Frozen-history triggers acquire the queue allocator lock before
+            // updating consumers. A fanout that enqueues work must take it in
+            // the same order, before its consumer compare-and-set.
+            tx.execute_unprepared("SELECT pg_catalog.pg_advisory_xact_lock(1885955182, 2)")
+                .await?;
+        }
         let changed = tx
             .execute(
                 &Query::update()

@@ -1,6 +1,61 @@
 // Included in durable_sweep: same guarded fixtures and actual sweep driver.
 
 #[pioneer_postgres_test::postgres_test]
+async fn frozen_history_can_publish_while_fanout_waits_for_the_allocator() {
+    let store = blank().await;
+    header(&store, "foreground", 0, 0, 0).await;
+    header_kind(&store, "consumer", 0, 1, 1, 0).await;
+    header_kind(&store, "source", 0, 1, 1, 0).await;
+    row(&store, "source", 0, 0).await;
+    exec(&store, "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('consumer',0,0,0)").await;
+    exec(&store, "INSERT INTO compaction_frozen_span(manifest_id,kind,start,\"end\",source_manifest) VALUES('consumer',0,0,1,'source')").await;
+
+    let foreground = store.connection.with_interactive_writes().begin().await.unwrap();
+    foreground.execute_unprepared(
+        "UPDATE compaction_frozen_history SET identity_sha256='publishing' WHERE id='foreground'",
+    ).await.unwrap();
+    let pid: i32 = foreground
+        .query_one_raw(Statement::from_string(DbBackend::Postgres, "SELECT pg_backend_pid()"))
+        .await.unwrap().unwrap().try_get_by_index(0).unwrap();
+    let maintenance = store.connection.clone();
+    let fanout = tokio::spawn(async move {
+        frozen_sweep_work::fanout_step(&maintenance, Some(&["consumer".into()])).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while query(&store, &format!(
+            "SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND {pid}=ANY(pg_blocking_pids(pid))"
+        )).await == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.expect("fanout must encounter the real allocator lock");
+
+    // Before the fix, fanout has already taken this row and cannot release it
+    // until our allocator lock is free. Detect that inversion without waiting
+    // for PostgreSQL to choose a victim or fanout's retry to conceal it.
+    foreground.execute_unprepared(
+        "SELECT revision FROM compaction_frozen_sweep_consumer WHERE manifest_id='consumer' AND kind=0 FOR UPDATE NOWAIT",
+    ).await.expect("publication must be able to lock the consumer");
+    foreground.execute_unprepared(
+        "UPDATE compaction_frozen_history SET identity_sha256='updated' WHERE id='consumer'",
+    ).await.unwrap();
+    foreground.commit().await.unwrap();
+    assert!(fanout.await.unwrap().unwrap());
+
+    let revision = work(&store, "source", 0).await.revision;
+    for _ in 0..4 {
+        assert!(
+            frozen_sweep_work::fanout_step(&store.connection, Some(&["consumer".into()]))
+                .await
+                .unwrap()
+        );
+        if work(&store, "source", 0).await.revision > revision {
+            return;
+        }
+    }
+    panic!("consumer work must still be delivered after the concurrent publication");
+}
+
+#[pioneer_postgres_test::postgres_test]
 async fn unrelated_continuous_fanout_allows_physical_admission_delete_and_clean_skip() {
     for kind in [0, 1] {
         let store = blank().await;

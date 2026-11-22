@@ -211,16 +211,8 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
         {
             ensure_pioneer_for_workspace(db, workspace.id.as_str(), now.clone()).await?;
             report.workspace_count = report.workspace_count.saturating_add(1);
-            for instance in instances {
-                project_cli_runtime_identity(
-                    db,
-                    workspace.id.as_str(),
-                    instance,
-                    now.clone(),
-                    &mut report,
-                )
+            project_workspace_cli_identities(db, &workspace.id, instances, now, &mut report)
                 .await?;
-            }
             let mut retired_after: Option<String> = None;
             loop {
                 let mut removed_query = agent_identity::Entity::find()
@@ -291,6 +283,37 @@ pub async fn sync_cli_runtime_identity_catalog<C: ConnectionTrait>(
         }
     }
     Ok(report)
+}
+
+/// Projects current CLI identities into one workspace during its creation.
+pub async fn ensure_cli_identities_for_workspace<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    instances: &[CliRuntimeIdentitySeed],
+    now: DateTime<chrono::FixedOffset>,
+) -> Result<()> {
+    validate_runtime_catalog(instances)?;
+    project_workspace_cli_identities(
+        db,
+        workspace_id,
+        instances,
+        now,
+        &mut AgentIdentityCatalogSyncReport::default(),
+    )
+    .await
+}
+
+async fn project_workspace_cli_identities<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    instances: &[CliRuntimeIdentitySeed],
+    now: DateTime<chrono::FixedOffset>,
+    report: &mut AgentIdentityCatalogSyncReport,
+) -> Result<()> {
+    for instance in instances {
+        project_cli_runtime_identity(db, workspace_id, instance, now, report).await?;
+    }
+    Ok(())
 }
 
 async fn project_cli_runtime_identity<C: ConnectionTrait>(

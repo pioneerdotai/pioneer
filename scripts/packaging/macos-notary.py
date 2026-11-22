@@ -29,6 +29,32 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def mach_o_files(root):
+    magic_values = (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            with path.open("rb") as source:
+                if source.read(4) in magic_values:
+                    yield path
+
+
+def verify_code_signatures(root):
+    teams = set()
+    for path in mach_o_files(root):
+        subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
+        details = subprocess.run(["codesign", "--display", "--verbose=4", str(path)],
+                                 check=True, capture_output=True, text=True)
+        lines = (details.stdout + details.stderr).splitlines()
+        team = next((line.removeprefix("TeamIdentifier=") for line in lines
+                     if line.startswith("TeamIdentifier=")), "")
+        if not team or team == "not set" or not any(
+                line.startswith("Authority=Developer ID Application:") for line in lines):
+            raise ValueError(f"Gateway payload requires Developer ID signatures: {path}")
+        teams.add(team)
+    if len(teams) != 1:
+        raise ValueError("Gateway executable composition requires one signing team")
+
+
 def transient(result):
     output = (result.stdout + result.stderr).lower()
     if any(marker in output for marker in ("revoked", "invalid signature", "not code-signed", "ticket data is invalid")):
@@ -71,10 +97,12 @@ def validate_ticket(path, log=None):
     command(["xcrun", "stapler", "validate", str(path)], log, retry=True)
 
 
-def notarize(submit, staples, log_dir):
+def notarize(submit, staples, log_dir, *, standalone_zip=False):
     submit, log_dir = Path(submit), Path(log_dir)
     staples = [Path(path) for path in staples]
-    if not submit.is_file() or not staples:
+    if standalone_zip and (submit.suffix != ".zip" or staples):
+        raise ValueError("Standalone notarization requires a ZIP of non-stapleable code")
+    if not submit.is_file() or (not staples and not standalone_zip):
         raise ValueError("Notarization requires a complete container and staple objects")
     if any(path.suffix not in (".app", ".dmg", ".pkg") or not path.exists() for path in staples):
         raise ValueError("Only existing Apple-supported objects may be stapled")

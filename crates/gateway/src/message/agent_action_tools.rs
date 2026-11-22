@@ -32,7 +32,7 @@ pub(crate) struct CurrentAgentIdentitySourceFence {
     fingerprint: String,
 }
 
-fn cli_identity_catalog(
+pub(super) fn cli_identity_catalog(
     processor: &MessageProcessor,
     configured: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
 ) -> anyhow::Result<Vec<pioneer_crud::CliRuntimeIdentitySeed>> {

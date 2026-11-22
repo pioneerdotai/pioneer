@@ -1,14 +1,15 @@
 //! Shared Sentry, tracing, and consent-gated OpenTelemetry setup for Pioneer runtime binaries.
 //!
 //! `PIONEER_SENTRY_DSN` is used by non-desktop binaries. `PIONEER_DESKTOP_SENTRY_DSN`
-//! is used by the desktop app. A local `.env` file is loaded automatically before
-//! reading these values. Runtime environment variables take precedence over `.env`
-//! and build-time values with the same names. Sentry is initialized only when
+//! is used by the desktop app. Sentry reads these settings from a local `.env`
+//! without exporting them into the process. Runtime environment variables take
+//! precedence over `.env` and build-time values. Sentry is initialized only when
 //! `PIONEER_SENTRY_ENVIRONMENT` is exactly `production`.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, OnceLock};
 
 use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
 use sentry::{ClientInitGuard, ClientOptions};
@@ -134,7 +135,7 @@ const BUILD_DESKTOP_SENTRY_DSN: Option<&str> = option_env!("PIONEER_DESKTOP_SENT
 const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIRONMENT");
 const PRODUCTION_SENTRY_ENVIRONMENT: &str = "production";
 
-static LOAD_DOTENV: Once = Once::new();
+static LOCAL_SENTRY_VALUES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 // Runtime binaries participate by default. The gateway explicitly closes this
 // gate before Sentry initialization and reopens it only after loading consent.
 // One atomic value keeps consent and its generation consistent. Bit zero is
@@ -187,8 +188,6 @@ impl SentryTarget {
 
 #[must_use]
 pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
-    load_local_dotenv();
-
     let environment = configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT);
     if !sentry_enabled_for_environment(environment.as_deref()) {
         return None;
@@ -417,12 +416,27 @@ fn telemetry_sample_allowed_for_state(
     enabled && started_generation == Some(current_generation)
 }
 
-fn load_local_dotenv() {
-    LOAD_DOTENV.call_once(|| match dotenvy::dotenv() {
-        Ok(_) => {}
+fn read_local_sentry_values() -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    match dotenvy::dotenv_iter() {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok((key, value)) = entry else {
+                    eprintln!("failed to load Sentry configuration from .env");
+                    break;
+                };
+                if matches!(
+                    key.as_str(),
+                    SENTRY_DSN_ENV | DESKTOP_SENTRY_DSN_ENV | SENTRY_ENVIRONMENT_ENV
+                ) {
+                    values.entry(key).or_insert(value);
+                }
+            }
+        }
         Err(error) if error.not_found() => {}
-        Err(_) => eprintln!("failed to load .env"),
-    });
+        Err(_) => eprintln!("failed to load Sentry configuration from .env"),
+    }
+    values
 }
 
 /// Sentry spans and routed error/breadcrumb events, also usable for local capture.
@@ -821,12 +835,16 @@ impl Visit for EventFieldVisitor {
 }
 
 fn configured_value(env_name: &str, build_value: Option<&str>) -> Option<String> {
-    std::env::var(env_name)
-        .ok()
-        .as_deref()
-        .and_then(non_empty)
-        .map(str::to_owned)
-        .or_else(|| build_value.and_then(non_empty).map(str::to_owned))
+    let runtime_value = match std::env::var(env_name) {
+        Ok(value) => non_empty(&value).map(str::to_owned),
+        Err(std::env::VarError::NotPresent) => LOCAL_SENTRY_VALUES
+            .get_or_init(read_local_sentry_values)
+            .get(env_name)
+            .and_then(|value| non_empty(value))
+            .map(str::to_owned),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    };
+    runtime_value.or_else(|| build_value.and_then(non_empty).map(str::to_owned))
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -863,6 +881,44 @@ mod tests {
         assert!(!sentry_enabled_for_environment(Some("staging")));
         assert!(!sentry_enabled_for_environment(Some("Production")));
         assert!(!sentry_enabled_for_environment(None));
+    }
+
+    #[test]
+    fn sentry_dotenv_does_not_set_process_configuration() {
+        const IN_CHILD: &str = "PIONEER_TEST_SENTRY_DOTENV_CHILD";
+        if std::env::var_os(IN_CHILD).is_some() {
+            assert!(super::init_sentry(super::SentryTarget::Shared).is_none());
+            assert_eq!(
+                super::configured_value(super::SENTRY_ENVIRONMENT_ENV, None).as_deref(),
+                Some("development")
+            );
+            assert!(std::env::var_os("DATABASE_URL").is_none());
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".env"),
+            "PIONEER_SENTRY_ENVIRONMENT=development\nDATABASE_URL=sqlite:legacy.db?mode=rwc\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::sentry_dotenv_does_not_set_process_configuration",
+            ])
+            .current_dir(directory.path())
+            .env(IN_CHILD, "1")
+            .env_remove("DATABASE_URL")
+            .env_remove(super::SENTRY_ENVIRONMENT_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     impl<S> Layer<S> for CountingLayer

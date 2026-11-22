@@ -282,25 +282,10 @@ def daemon_name(target):
 
 
 def verify_macos(root):
-    app = root / "cua/Pioneer Gateway.app"
-    teams = set()
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            with path.open("rb") as source:
-                magic = source.read(4)
-            if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
-                subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
-                details = subprocess.run(["codesign", "--display", "--verbose=4", str(path)],
-                                         check=True, capture_output=True, text=True)
-                lines = (details.stdout + details.stderr).splitlines()
-                team = next((line.removeprefix("TeamIdentifier=") for line in lines
-                             if line.startswith("TeamIdentifier=")), "")
-                if not team or team == "not set" or not any(line.startswith("Authority=Developer ID Application:") for line in lines):
-                    raise ValueError(f"Gateway payload requires Developer ID signatures: {path}")
-                teams.add(team)
-    if len(teams) != 1:
-        raise ValueError("Gateway executable composition has inconsistent signing teams")
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+    notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+    notary["verify_code_signatures"](root)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                    str(root / "cua/Pioneer Gateway.app")], check=True)
 
 
 def validate_tree(target, root, verify_signatures=False, development=False):

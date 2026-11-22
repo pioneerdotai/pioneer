@@ -192,6 +192,8 @@ BEGIN
  JOIN package_installation existing ON existing.id=a.id
  JOIN package_installation incoming ON incoming.id=NEW.id
  WHERE a.slug=NEW.slug AND existing.workspace_id=incoming.workspace_id
+   AND ((existing.source_upload_id NOT LIKE 'dev:%' AND incoming.source_upload_id NOT LIKE 'dev:%')
+     OR existing.source_upload_id=incoming.source_upload_id)
 )) IS NOT TRUE THEN
         RETURN NEW;
     END IF;

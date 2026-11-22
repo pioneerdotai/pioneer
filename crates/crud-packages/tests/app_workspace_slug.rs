@@ -12,9 +12,11 @@ async fn install(
     db: &DatabaseConnection,
     id: &str,
     workspace: &str,
+    source_upload_id: &str,
 ) -> Result<app_installation::Model, TransactionError<DbErr>> {
     let id = id.to_owned();
     let workspace = workspace.to_owned();
+    let source_upload_id = source_upload_id.to_owned();
     db.transaction::<_, _, DbErr>(|tx| {
         Box::pin(async move {
             let created = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000)
@@ -23,7 +25,7 @@ async fn install(
             package_installation::Entity::insert(package_installation::ActiveModel {
                 id: Set(id.clone()),
                 workspace_id: Set(workspace),
-                source_upload_id: Set(format!("upload-{id}")),
+                source_upload_id: Set(source_upload_id),
                 package_path: Set(format!("/managed/{id}/package")),
                 data_path: Set(format!("/managed/{id}/data")),
                 package_fingerprint: Set("package".into()),
@@ -84,10 +86,12 @@ async fn app_workspace_rules_reapply_enforces_scope_and_preserves_installations(
             .await
             .unwrap();
         }
-        let original = install(db, "app-one", "ws-one").await.unwrap();
-        let second = install(db, "app-two", "ws-two").await.unwrap();
+        let original = install(db, "app-one", "ws-one", "upload-one").await?;
+        let second = install(db, "app-two", "ws-two", "upload-two").await?;
+        let dev_one = install(db, "app-dev-one", "ws-one", "dev:one").await?;
+        let dev_two = install(db, "app-dev-two", "ws-one", "dev:two").await?;
         assert!(
-            install(db, "same-workspace-duplicate", "ws-one")
+            install(db, "same-workspace-duplicate", "ws-one", "upload-duplicate")
                 .await
                 .is_err(),
             "database must enforce workspace uniqueness without CRUD preflight"
@@ -113,12 +117,29 @@ async fn app_workspace_rules_reapply_enforces_scope_and_preserves_installations(
         Migrator::up(db, None).await?;
         assert!(slug_trigger_installed(db).await?);
         assert!(
-            install(db, "reapplied-existing-duplicate", "ws-one")
+            install(
+                db,
+                "reapplied-existing-duplicate",
+                "ws-one",
+                "upload-reapplied-duplicate",
+            )
+            .await
+            .is_err()
+        );
+        assert_no_parent(db, "reapplied-existing-duplicate").await;
+        install(db, "app-dev-three", "ws-one", "dev:three").await?;
+        assert!(
+            install(db, "app-dev-duplicate", "ws-one", "dev:one")
                 .await
                 .is_err()
         );
-        assert_no_parent(db, "reapplied-existing-duplicate").await;
-        for (id, expected) in [("app-one", original), ("app-two", second)] {
+        assert_no_parent(db, "app-dev-duplicate").await;
+        for (id, expected) in [
+            ("app-one", original),
+            ("app-two", second),
+            ("app-dev-one", dev_one),
+            ("app-dev-two", dev_two),
+        ] {
             assert_eq!(
                 app_installation::Entity::find_by_id(id)
                     .one(db)
@@ -140,10 +161,12 @@ async fn app_workspace_rules_reapply_enforces_scope_and_preserves_installations(
                 "package cleanup must remove only the owned App metadata"
             );
         }
-        install(db, "reapplied-one", "ws-one").await.unwrap();
-        install(db, "reapplied-two", "ws-two").await.unwrap();
+        install(db, "reapplied-one", "ws-one", "upload-reapplied-one").await?;
+        install(db, "reapplied-two", "ws-two", "upload-reapplied-two").await?;
         assert!(
-            install(db, "reapplied-duplicate", "ws-one").await.is_err(),
+            install(db, "reapplied-duplicate", "ws-one", "upload-duplicate")
+                .await
+                .is_err(),
             "reapply must restore workspace-scoped uniqueness"
         );
         assert_no_parent(db, "reapplied-duplicate").await;

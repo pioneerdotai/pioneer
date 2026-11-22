@@ -1,1 +1,0 @@
-LOCK TABLE package_installation IN SHARE ROW EXCLUSIVE MODE;

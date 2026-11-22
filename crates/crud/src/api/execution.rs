@@ -60,7 +60,8 @@ pub use pioneer_crud_execution::agent_identity::{
 };
 pub use pioneer_crud_execution::agent_identity_catalog::{
     AgentIdentityCatalogSyncReport, CliRuntimeIdentitySeed, cli_runtime_identity_fingerprint,
-    ensure_pioneer_for_workspace, sync_cli_runtime_identity_catalog,
+    ensure_cli_identities_for_workspace, ensure_pioneer_for_workspace,
+    sync_cli_runtime_identity_catalog,
 };
 pub use pioneer_crud_execution::agent_queue::AgentQueueEntryInput;
 pub use pioneer_crud_execution::agent_thread_creation::AgentThreadCreationCommitInput;
