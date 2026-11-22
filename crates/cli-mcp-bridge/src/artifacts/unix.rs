@@ -77,8 +77,9 @@ impl PrivateSessionDirectory {
         if !self.cleanup_armed {
             return Ok(());
         }
-        revalidate_directory(&self.path, self.identity)?;
-        fs::remove_dir(&self.path)?;
+        remove_if_present(revalidate_directory(&self.path, self.identity), || {
+            fs::remove_dir(&self.path)
+        })?;
         self.cleanup_armed = false;
         Ok(())
     }
@@ -119,16 +120,13 @@ impl PrivateBootstrapArtifact {
         if !self.cleanup_armed {
             return Ok(());
         }
-        match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-            Ok(_) => {
-                if file_identity(&self.path)? != self.identity {
-                    return Err(PrivateArtifactError::Replaced);
-                }
-                fs::remove_file(&self.path)?;
+        let validation = file_identity(&self.path).and_then(|identity| {
+            if identity != self.identity {
+                return Err(PrivateArtifactError::Replaced);
             }
-        }
+            Ok(())
+        });
+        remove_if_present(validation, || fs::remove_file(&self.path))?;
         self.cleanup_armed = false;
         Ok(())
     }
@@ -137,6 +135,17 @@ impl PrivateBootstrapArtifact {
 impl Drop for PrivateBootstrapArtifact {
     fn drop(&mut self) {
         let _ = self.cleanup();
+    }
+}
+
+fn remove_if_present(
+    validation: Result<(), PrivateArtifactError>,
+    remove: impl FnOnce() -> io::Result<()>,
+) -> Result<(), PrivateArtifactError> {
+    // Already clean, whether the path was absent at validation or disappeared before removal.
+    match validation.and_then(|()| remove().map_err(Into::into)) {
+        Err(PrivateArtifactError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -296,6 +305,59 @@ mod tests {
         bootstrap.cleanup().expect("bootstrap cleanup");
         assert!(bootstrap.is_consumed().expect("consumed bootstrap"));
         directory.cleanup().expect("directory cleanup");
+        assert!(!directory.path().exists());
+    }
+
+    #[test]
+    fn cleanup_accepts_already_removed_session_artifacts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut directory = create(&temp.path().join("managed"), "missing").expect("directory");
+        let mut bootstrap = directory
+            .write_bootstrap(&document(directory.path()))
+            .expect("bootstrap");
+        fs::remove_file(bootstrap.path()).expect("remove bootstrap");
+        fs::remove_dir(directory.path()).expect("remove session directory");
+
+        // Creating artifacts still requires the original directory to exist.
+        assert!(matches!(
+            directory.write_bootstrap(&document(directory.path())),
+            Err(PrivateArtifactError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        bootstrap.cleanup().expect("absent bootstrap is clean");
+        directory
+            .cleanup()
+            .expect("absent session directory is clean");
+        assert!(!bootstrap.cleanup_armed);
+        assert!(!directory.cleanup_armed);
+    }
+
+    #[test]
+    fn cleanup_accepts_disappearance_after_validation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let directory = create(&temp.path().join("managed"), "race").expect("directory");
+        let validation = revalidate_directory(directory.path(), directory.identity);
+        assert!(validation.is_ok());
+        fs::remove_dir(directory.path()).expect("remove session directory after validation");
+
+        remove_if_present(validation, || fs::remove_dir(directory.path()))
+            .expect("concurrent removal completes cleanup");
+    }
+
+    #[test]
+    fn cleanup_propagates_nonempty_directory_and_can_retry() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut directory = create(&temp.path().join("managed"), "not-empty").expect("directory");
+        let blocker = directory.path().join("unexpected-file");
+        fs::write(&blocker, b"unexpected").expect("write blocker");
+        assert!(matches!(
+            directory.cleanup(),
+            Err(PrivateArtifactError::Io(error))
+                if matches!(error.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists)
+        ));
+        assert!(blocker.is_file());
+
+        fs::remove_file(blocker).expect("remove blocker");
+        directory.cleanup().expect("retry cleanup");
         assert!(!directory.path().exists());
     }
 

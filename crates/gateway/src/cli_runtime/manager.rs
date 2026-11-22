@@ -2,6 +2,7 @@
 // Owns reusable CLI runtime sessions across provider kinds.
 
 use crate::cli_runtime::continuation::{CliSessionLaunchSpec, requires_restart};
+use crate::cli_runtime::mcp::supervisor::CliMcpBridgeSupervisorError;
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -11,6 +12,7 @@ use pioneer_cli_agent_runtime::codex::{
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions;
 use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
+use pioneer_cli_mcp_bridge::PrivateArtifactError;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::future::Future;
@@ -861,7 +863,16 @@ impl CLIAgentRuntimeManager {
                 let result = factory
                     .start_session_with_launch_spec(&instance, &launch_spec, &startup)
                     .await
-                    .map_err(|e| format!("{e:#}"));
+                    .map_err(|error| {
+                        // Capture the original typed failure before rollback can mask it.
+                        log_session_lifecycle_failure(
+                            &instance,
+                            "startup",
+                            "start_session",
+                            &error,
+                        );
+                        format!("{error:#}")
+                    });
                 let outcome = result.map(|session| {
                     startup.retain_session(session);
                 });
@@ -1340,11 +1351,55 @@ fn current_time_millis() -> u64 {
     }
 }
 
+fn log_session_lifecycle_failure(
+    instance: &CliSessionInstanceId,
+    stage: &'static str,
+    fallback_operation: &'static str,
+    error: &anyhow::Error,
+) {
+    // Only bounded labels and OS codes leave this boundary, never error text.
+    let (operation, error_code, io_error) =
+        match error.downcast_ref::<CliMcpBridgeSupervisorError>() {
+            Some(CliMcpBridgeSupervisorError::Artifact { operation, error }) => {
+                let (code, io_error) = match error {
+                    PrivateArtifactError::InvalidRoot => ("invalid_root", None),
+                    PrivateArtifactError::InsecureRoot => ("insecure_root", None),
+                    PrivateArtifactError::AlreadyExists => ("already_exists", None),
+                    PrivateArtifactError::Replaced => ("artifact_replaced", None),
+                    PrivateArtifactError::Bootstrap(_) => ("bootstrap_encode_failed", None),
+                    PrivateArtifactError::Io(error) => ("io", Some(error)),
+                };
+                (*operation, code, io_error)
+            }
+            _ => {
+                let io_error = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+                let code = if io_error.is_some() {
+                    "io"
+                } else {
+                    "unclassified"
+                };
+                (fallback_operation, code, io_error)
+            }
+        };
+    tracing::warn!(
+        boot_id = instance.boot_id().as_str(),
+        generation = instance.generation(),
+        stage,
+        operation,
+        error_code,
+        io_kind = ?io_error.map(std::io::Error::kind),
+        os_error_code = io_error.and_then(std::io::Error::raw_os_error),
+        "CLI session lifecycle operation failed"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CLIAgentRuntimeMachineRequestResponder, CLIAgentRuntimeManager, CLIAgentRuntimeSession,
-        CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey,
+        CLIAgentRuntimeSessionFactory, CLIAgentRuntimeSessionKey, CLIAgentRuntimeSessionLifecycle,
         CLIAgentRuntimeSessionStartOptions, CLIAgentRuntimeSessionStartup,
     };
     use crate::cli_runtime::claude_mcp::{
@@ -1356,16 +1411,117 @@ mod tests {
     use crate::cli_runtime::continuation::{
         CliMcpSessionLaunch, CliProviderContinuation, CliSessionLaunchSpec,
     };
+    use crate::cli_runtime::mcp::supervisor::CliMcpBridgeSupervisorError;
+    use crate::cli_runtime::session_instance::CliSessionInstanceId;
     use crate::turn_mcp::projection::{
         McpProjectionLimits, McpSelectionReason, ResolvedMcpTurnProjection, ResolvedMcpTurnTool,
     };
     use anyhow::Result;
     use async_trait::async_trait;
+    use pioneer_cli_mcp_bridge::PrivateArtifactError;
     use serde_json::{Value as JsonValue, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Mutex, Notify};
+
+    struct FailingStartupAndCleanup;
+
+    #[async_trait]
+    impl CLIAgentRuntimeSessionFactory for FailingStartupAndCleanup {
+        async fn start_session_with_launch_spec(
+            &self,
+            _instance: &CliSessionInstanceId,
+            _launch_spec: &CliSessionLaunchSpec,
+            _startup: &CLIAgentRuntimeSessionStartup,
+        ) -> Result<Arc<dyn CLIAgentRuntimeSession>> {
+            Err(anyhow::Error::new(CliMcpBridgeSupervisorError::Artifact {
+                operation: "write_mcp_bootstrap",
+                error: PrivateArtifactError::Io(std::io::Error::from_raw_os_error(2)),
+            })
+            .context("startup detail /private/bootstrap.json"))
+        }
+    }
+
+    #[async_trait]
+    impl CLIAgentRuntimeSessionLifecycle for FailingStartupAndCleanup {
+        async fn after_session_close_result(&self, _instance: &CliSessionInstanceId) -> Result<()> {
+            Err(CliMcpBridgeSupervisorError::Artifact {
+                operation: "cleanup_mcp_endpoint_directory",
+                error: PrivateArtifactError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "private cleanup detail",
+                )),
+            }
+            .into())
+        }
+    }
+
+    #[test]
+    fn startup_and_cleanup_failures_are_logged_with_the_same_session_instance() {
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let failures = Arc::new(FailingStartupAndCleanup);
+                let manager = CLIAgentRuntimeManager::new_with_lifecycle(
+                    failures.clone(),
+                    Duration::from_secs(30),
+                    failures,
+                )
+                .unwrap();
+                let key = key("startup-and-cleanup-failures");
+                let error = manager.get_or_start(key.clone()).await.err().unwrap();
+                // The returned error and ownership fence are unchanged.
+                assert!(error.to_string().contains("private cleanup detail"));
+                manager
+                    .cached(&key)
+                    .expect("failed cleanup retains owner")
+                    .instance
+            })
+        });
+
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let events: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("CLI session lifecycle operation failed"))
+            .collect();
+        assert_eq!(events.len(), 2, "{logs}");
+        assert!(events[0].contains("stage=\"startup\""));
+        assert!(events[0].contains("operation=\"write_mcp_bootstrap\""));
+        assert!(events[0].contains("os_error_code=2"));
+        assert!(events[1].contains("stage=\"cleanup\""));
+        assert!(events[1].contains("operation=\"cleanup_mcp_endpoint_directory\""));
+        assert!(events[1].contains("PermissionDenied"));
+        for event in events {
+            assert!(event.contains(&format!("boot_id=\"{}\"", instance.boot_id().as_str())));
+            assert!(event.contains(&format!("generation={}", instance.generation())));
+            assert!(!event.contains("/private/bootstrap.json"));
+            assert!(!event.contains("private cleanup detail"));
+        }
+    }
 
     #[derive(Default)]
     struct FakeFactory {

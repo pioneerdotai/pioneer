@@ -1,5 +1,7 @@
 //! Completion ownership for one entry in the existing CLI session registry.
-use super::{CLIAgentRuntimeSession, CLIAgentRuntimeSessionLifecycle};
+use super::{
+    CLIAgentRuntimeSession, CLIAgentRuntimeSessionLifecycle, log_session_lifecycle_failure,
+};
 use crate::cli_runtime::session_instance::CliSessionInstanceId;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -315,7 +317,18 @@ impl CliSessionOwner {
                 Boundary::Child,
                 WorkKind::Child,
                 ExecutorRole::Child,
-                async move { owner.drain(lifecycle).await.map_err(|e| format!("{e:#}")) },
+                async move {
+                    let instance = owner.instance.clone();
+                    owner.drain(lifecycle).await.map_err(|error| {
+                        log_session_lifecycle_failure(
+                            &instance,
+                            "cleanup",
+                            "close_session",
+                            &error,
+                        );
+                        format!("{error:#}")
+                    })
+                },
             )));
         }
     }
