@@ -602,7 +602,10 @@ impl CliMcpBridgeSupervisor {
                         .bootstrap
                         .as_ref()
                         .ok_or(CliMcpBridgeSupervisorError::InvalidTransition)?
-                        .is_consumed()?
+                        .is_consumed()
+                        .map_err(CliMcpBridgeSupervisorError::artifact(
+                            "check_mcp_bootstrap_consumption",
+                        ))?
                 };
                 if consumed {
                     break;
