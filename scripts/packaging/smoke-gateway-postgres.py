@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import sys
@@ -18,6 +19,8 @@ from urllib.request import urlopen
 import uuid
 
 from websockets.sync.client import connect
+
+POSTGRES = runpy.run_path(str(Path(__file__).with_name("postgres-runtime.py")))
 
 
 def cli(binary, env, *args):
@@ -160,7 +163,7 @@ def verify_vector(runtime, pid_file, port):
         "LD_LIBRARY_PATH": str(runtime / "lib"),
     })
     query = (
-        "SELECT current_setting('server_version_num')::int / 10000, "
+        "SELECT current_setting('server_version_num')::int, "
         "'[1,2]'::vector <-> '[1,2]'::vector, extversion "
         "FROM pg_extension WHERE extname='vector'"
     )
@@ -169,9 +172,13 @@ def verify_vector(runtime, pid_file, port):
          "-p", str(port), "-U", "pioneer", "-d", "pioneer", "-c", query],
         env=env, text=True, timeout=15,
     )
-    if result.strip() != "18|0|0.8.7":
-        raise RuntimeError("Packaged PostgreSQL 18 with pgvector did not answer the distance query")
-    print("Bundled PostgreSQL 18 with pgvector 0.8.7 returned the expected distance", flush=True)
+    postgres_version = POSTGRES["PG_VERSION"]
+    vector_version = POSTGRES["VECTOR_VERSION"]
+    major, minor = map(int, postgres_version.split("."))
+    if result.strip() != f"{major * 10000 + minor}|0|{vector_version}":
+        raise RuntimeError("Packaged PostgreSQL or pgvector version or distance is incorrect")
+    print(f"Bundled PostgreSQL {postgres_version} with pgvector {vector_version} "
+          "returned the expected distance", flush=True)
 
 
 def stop(binary, env, pid, pid_file):

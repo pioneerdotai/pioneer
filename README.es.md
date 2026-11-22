@@ -83,7 +83,7 @@ Los agentes recuperan el contexto relevante respetando los permisos de los espac
 
 Pioneer es un workspace de Rust con una aplicación de escritorio nativa basada en GPUI y un gateway que utiliza PostgreSQL. Los clientes se conectan a través de una API JSON-RPC sobre WebSocket.
 
-Los paquetes del gateway incluyen PostgreSQL 18 y pgvector. El gateway crea su directorio de datos al iniciarse por primera vez y lo vuelve a usar tras reinicios y actualizaciones. Desktop instala el mismo entorno de base de datos para su gateway local.
+Los paquetes del gateway incluyen PostgreSQL 19 y pgvector. El gateway crea su directorio de datos al iniciarse por primera vez y lo vuelve a usar tras reinicios y actualizaciones dentro de la misma versión principal de PostgreSQL. Desktop instala el mismo entorno de base de datos para su gateway local.
 
 ```mermaid
 flowchart TB

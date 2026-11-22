@@ -12,12 +12,12 @@ import tarfile
 import tempfile
 import urllib.request
 
-PG_VERSION = "18.7"
+PG_VERSION = "19.0"
 VECTOR_VERSION = "0.8.7"
 SOURCES = {
     f"postgresql-{PG_VERSION}": (
         f"https://ftp.postgresql.org/pub/source/v{PG_VERSION}/postgresql-{PG_VERSION}.tar.bz2",
-        "441dfae4280cae3e0425e5f876f80559fb0731c140f1aae22b3e5a54d0411bfd",
+        "a89fd70efbad6a08c7dbed8d4872e3af30170d9e5ca9dc7906523be95b4e692d",
     ),
     f"pgvector-{VECTOR_VERSION}": (
         f"https://codeload.github.com/pgvector/pgvector/tar.gz/refs/tags/v{VECTOR_VERSION}",
@@ -28,8 +28,7 @@ PROGRAMS = ("postgres", "initdb", "pg_ctl", "psql")
 
 
 def postgres_binary_target(target):
-    # PostgreSQL 18's MSVC backend export generator does not accept ARM64.
-    # Windows 11 runs the bundled x64 server as a separate emulated process.
+    # Windows 11 ARM64 runs the bundled x64 server as a separate emulated process.
     if target == "aarch64-pc-windows-msvc":
         return "x86_64-pc-windows-msvc"
     return target

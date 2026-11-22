@@ -83,9 +83,12 @@ Agents retrieve relevant context within workspace and thread permissions and a b
 
 Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by PostgreSQL. Clients connect over a JSON-RPC WebSocket API.
 
-Gateway releases include PostgreSQL 18 and pgvector. Starting a local Gateway initializes its private database in the Gateway data directory. The same database is opened on later starts and application updates. Desktop installs the same database runtime when it sets up a local Gateway.
+Gateway releases include PostgreSQL 19 and pgvector. Starting a local Gateway initializes its private database in the Gateway data directory. The same database is opened on later starts and application updates within the same PostgreSQL major version. Desktop installs the same database runtime when it sets up a local Gateway.
 
-For a self-hosted Gateway with an external PostgreSQL 18 server or cluster,
+Bundled PostgreSQL 18 clusters from development builds require a PostgreSQL
+major-version upgrade before switching to a Gateway with bundled PostgreSQL 19.
+
+For a self-hosted Gateway with an external PostgreSQL 18 or 19 server or cluster,
 set `DATABASE_URL` in the Gateway process environment or in
 `~/.pioneer/.env` under the service account.
 
@@ -104,7 +107,7 @@ Otherwise Gateway checks the process environment, then `~/.pioneer.dev/.env`.
 Use a separate database for development.
 
 On first initialization of a bundled cluster, Gateway uses PGConfig's
-`DESKTOP` profile. The calculator receives the detected RAM budget, logical CPU
+`DESKTOP` profile with its PostgreSQL 18 tuning rules. The calculator receives the detected RAM budget, logical CPU
 count and storage type. On Linux, the RAM input respects a detected cgroup limit. PGConfig supplies the
 server connection limit, currently 100. Gateway sets its pool sizes separately.
 The generated file is `postgres/data/pioneer-tuning.conf`. Add manual

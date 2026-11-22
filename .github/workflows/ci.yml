@@ -267,7 +267,7 @@ jobs:
     services:
       swap: *linux-swap
       postgres: &postgres-test-service
-        image: pgvector/pgvector:0.8.7-pg18-trixie
+        image: pgvector/pgvector:0.8.7-pg19-trixie
         env:
           POSTGRES_USER: pioneer_test
           POSTGRES_PASSWORD: pioneer_test

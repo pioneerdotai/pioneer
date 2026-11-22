@@ -28,7 +28,7 @@ mod windows;
 const ROLE: &str = "pioneer";
 const READER_ROLE: &str = "pioneer_reader";
 const DATABASE: &str = "pioneer";
-const POSTGRES_MAJOR: &str = "18";
+const POSTGRES_MAJOR: &str = "19";
 const START_TIMEOUT: Duration = Duration::from_secs(40);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -163,7 +163,7 @@ impl Cluster {
             .context("read PostgreSQL data version")?;
         ensure!(
             version.trim() == POSTGRES_MAJOR,
-            "private PostgreSQL data needs a major version upgrade"
+            "private PostgreSQL data needs a major version upgrade to {POSTGRES_MAJOR}"
         );
         Ok(Self {
             directory,
