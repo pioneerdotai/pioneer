@@ -336,20 +336,44 @@ async fn sqlite_startup_conflict_exhausts_three_attempts_with_exit_and_late_stde
 #[tokio::test]
 async fn sqlite_startup_conflict_uses_one_deadline_including_backoff() {
     let mut fixture = StartupFixture::new(
-        &format!(
-            "if [ \"$attempt\" = 1 ]; then\nsleep 0.3\n{BUSY}\nfi\nwhile read line; do :; done"
-        ),
+        &format!("if [ \"$attempt\" = 1 ]; then\n{BUSY}\nfi\nwhile read line; do :; done"),
         "ready",
     )
     .await;
-    fixture.instance.startup_probe_timeout_ms = 1000;
-    let started = Instant::now();
-    let error = fixture.start().await.err().unwrap();
-    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    let budget = Duration::from_secs(20);
+    fixture.instance.startup_probe_timeout_ms = budget.as_millis() as u64;
+    let gate = PhaseGate::new(StartupPhase::RetryDelay, 1);
+    let future = PHASE_GATE.scope(gate.clone(), fixture.start());
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => panic!("startup finished before retry delay: {}", result.is_ok()),
+        entered = tokio_timeout(Duration::from_secs(5), gate.entered.notified()) => entered.unwrap()
+    }
+    assert_eq!(fixture.starts().len(), 1);
+
+    // Spend half the original budget in backoff, then let the real child start.
+    tokio::time::pause();
+    tokio::time::advance(budget / 2).await;
+    tokio::time::resume();
+    gate.release.notify_one();
+    tokio::select! {
+        result = &mut future => panic!("startup finished before its second child started: {}", result.is_ok()),
+        () = fixture.wait_for_starts(2) => {}
+    }
     assert_eq!(fixture.starts().len(), 2);
-    // A fresh 1s timeout on the second attempt would exceed 1.4s.
-    assert!(started.elapsed() < Duration::from_millis(1250));
+
+    // The shared deadline expires here. A fresh budget on retry would leave
+    // the second child waiting for several more seconds.
+    tokio::time::pause();
+    tokio::time::advance(budget / 2).await;
+    tokio::time::resume();
+    let error = tokio_timeout(Duration::from_secs(2), &mut future)
+        .await
+        .expect("the second attempt must share the original deadline")
+        .err()
+        .expect("startup must time out");
     let failure = error.downcast_ref::<OpenCodeStartupFailure>().unwrap();
+    assert_eq!(failure.stage, OpenCodeStartupStage::Timeout, "{error:#}");
     let owner = fixture.startup.session().expect("retained startup owner");
     let cleanup = owner.close().await;
     match failure.cleanup_error.as_deref() {
