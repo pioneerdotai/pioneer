@@ -655,7 +655,7 @@ fn workspace_releases() -> &'static tokio::sync::watch::Sender<()> {
 }
 
 // A single coalesced release signal covers all workspaces, including releases
-// by attempts interrupted while a serialized writer commit was settling.
+// by attempts interrupted while a write transaction was committing.
 pub fn thread_episodic_workspace_releases() -> tokio::sync::watch::Receiver<()> {
     workspace_releases().subscribe()
 }
@@ -700,8 +700,8 @@ pub async fn try_lock_thread_episodic_workspace(
         .map(|guard| Arc::new(ThreadEpisodicWorkspaceGuard { guard: Some(guard) }))
 }
 
-mod sqlite;
-pub use sqlite::SqliteThreadEpisodicBackend;
+mod postgres;
+pub use postgres::PostgresThreadEpisodicBackend;
 
 fn finalize_thread_episodic_search_output(
     request: ThreadEpisodicSearchRequest,

@@ -14,12 +14,12 @@ pub use manifest_failure::{
 };
 mod ownership_route;
 mod policy;
+mod postgres;
 mod quality;
 mod quality_gate;
 mod ranking;
 mod recall_visibility;
 mod service;
-mod sqlite;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod write;
@@ -59,6 +59,7 @@ pub use lifecycle::{
     memory_transition_restores_product_eligibility, validate_lifecycle_transition,
 };
 pub use policy::{MemoryPolicyDecision, MemoryPolicyEngine};
+pub use postgres::PostgresMemoryBackend;
 pub use quality::{
     MemoryOntologyClassification, MemoryQualityAuditItemKind, MemoryQualityAuditRecord,
     MemoryQualityAuditStatus, MemorySourceContextClassification, MemorySourceContextInput,
@@ -66,10 +67,9 @@ pub use quality::{
     classify_semantic_memory_fact, resolve_semantic_write_source_context,
 };
 pub use service::MemoryService;
-pub use sqlite::SqliteMemoryBackend;
 pub use thread_episodic::{
     PioneerAdaptiveCutoff, PioneerAdaptiveCutoffConfig, PioneerAdaptiveCutoffDiagnostics,
-    PioneerAdaptiveCutoffReason, SqliteThreadEpisodicBackend, THREAD_EPISODIC_INDEX_BATCH_BYTES,
+    PioneerAdaptiveCutoffReason, PostgresThreadEpisodicBackend, THREAD_EPISODIC_INDEX_BATCH_BYTES,
     THREAD_EPISODIC_INDEX_BATCH_ITEMS, ThreadEpisodicCandidateSuppression,
     ThreadEpisodicCandidateSuppressionReason, ThreadEpisodicFilteredSearchCandidates,
     ThreadEpisodicIndexDocument, ThreadEpisodicIndexEmbedding, ThreadEpisodicRankedSearchHit,

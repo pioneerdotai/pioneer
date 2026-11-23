@@ -168,3 +168,8 @@ empty_audit = "Aún no hay eventos de auditoría."
 [skills.catalog]
 source = "Fuente"
 trust = "Confianza"
+
+[skills.settings]
+title = "Ajustes"
+enabled_description = "Hace que esta habilidad esté disponible para los agentes en el espacio de trabajo actual."
+implicit_description = "Permite a los agentes aplicar esta habilidad automáticamente aunque no se mencione explícitamente en la solicitud."

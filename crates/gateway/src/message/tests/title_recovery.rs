@@ -240,7 +240,7 @@ async fn start_title_user_turn(
     .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names() {
     for (path, manual, attachment_first) in [
         (TitleCompletion::TerminalOnly, false, false),
@@ -421,7 +421,7 @@ async fn codex_title_deadline_waits_for_fresh_completion_and_keeps_manual_names(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn title_process_exit_recovers_only_after_completion_and_exhausts_its_budget() {
     let thread = "title-process-failure";
     let input = vec![UserInput::Text {
@@ -465,167 +465,173 @@ async fn title_process_exit_recovers_only_after_completion_and_exhausts_its_budg
 
 #[tokio::test]
 async fn collaborative_title_recovers_on_hidden_composer_result_delivery_once() {
-    let provider = Arc::new(CaptureSummaryProvider::new(
-        r#"<task_result>{"summary":"answer ready","data":{"answer":"ready"}}</task_result>"#,
-    ));
-    provider.pause_first.store(true, Ordering::SeqCst);
-    let sessions = Arc::new(SessionManager::new());
-    let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
-    let connection = register_authenticated_test_connection(&sessions, tx).await;
-    let (manager, store, workspace) = setup_workspace_manager().await;
-    let original = review_enabled_processor(
-        phase_13_provider_registry(provider.clone()),
-        sessions.clone(),
-        manager,
-        store.clone(),
-    );
-    let mut processor = original.as_ref().clone();
-    let fixture = tempfile::tempdir().unwrap();
-    configure_title_process(&mut processor, fixture.path());
-    std::fs::remove_file(fixture.path().join("hang")).unwrap();
-    let processor = Arc::new(processor);
-    sessions
-        .set_connection_workspace(connection, Some(workspace.clone()))
-        .await;
-    processor.bind_task_bridge().await;
-    let thread = "title-composer-root";
-    let started = processor
-        .thread_manager
-        .thread_start_seeded(
-            connection,
-            workspace.clone(),
-            ThreadStartParams {
-                thread_id: thread.into(),
-                workspace_id: workspace.clone(),
-                name: Some(FALLBACK.into()),
-                model: Some("test-model".into()),
-                model_provider: Some("openai".into()),
-                sandbox: Some(SandboxMode::FullAccess),
-                mode: Some(ThreadMode::Agent),
-                origin_kind: Some(ThreadOriginKind::Collaborative),
-                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
-                visibility: None,
-                agent_nickname: None,
-                agent_role: None,
-            },
-            None,
-            None,
-        )
+    pioneer_postgres_test::with_database(async |fixture| {
+        let provider = Arc::new(CaptureSummaryProvider::new(
+            r#"<task_result>{"summary":"answer ready","data":{"answer":"ready"}}</task_result>"#,
+        ));
+        provider.pause_first.store(true, Ordering::SeqCst);
+        let sessions = Arc::new(SessionManager::new());
+        let (tx, mut rx) = crate::session::test_support::outbound_channel(256);
+        let connection = register_authenticated_test_connection(&sessions, tx).await;
+        let (manager, store, workspace) =
+            crate::message::tests::setup_postgres_workspace_manager(fixture).await;
+        let original = review_enabled_processor(
+            phase_13_provider_registry(provider.clone()),
+            sessions.clone(),
+            manager,
+            store.clone(),
+        );
+        let mut processor = original.as_ref().clone();
+        let fixture = tempfile::tempdir().unwrap();
+        configure_title_process(&mut processor, fixture.path());
+        std::fs::remove_file(fixture.path().join("hang")).unwrap();
+        let processor = Arc::new(processor);
+        sessions
+            .set_connection_workspace(connection, Some(workspace.clone()))
+            .await;
+        processor.bind_task_bridge().await;
+        let thread = "title-composer-root";
+        let started = processor
+            .thread_manager
+            .thread_start_seeded(
+                connection,
+                workspace.clone(),
+                ThreadStartParams {
+                    thread_id: thread.into(),
+                    workspace_id: workspace.clone(),
+                    name: Some(FALLBACK.into()),
+                    model: Some("test-model".into()),
+                    model_provider: Some("openai".into()),
+                    sandbox: Some(SandboxMode::FullAccess),
+                    mode: Some(ThreadMode::Agent),
+                    origin_kind: Some(ThreadOriginKind::Collaborative),
+                    sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                    visibility: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_thread_model(
+                &started.response.thread,
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        // Fixture starts at the state produced by the process/deadline regression.
+        processor
+            .title_job_runtime
+            .lock()
+            .await
+            .insert(thread.into(), waiting_for_source(FALLBACK));
+        let request = generate_test_request_id("title-composer", "start");
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc":"2.0","id":request,"method":"turn/start",
+                    "params":{"thread_id":thread,"turn_id":"title-composer-user-turn",
+                        "input":[{"type":"text","text":FALLBACK}],"model":"test-model",
+                        "model_provider":"openai","mode":"Agent"}
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, &request).await;
+        let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while provider.call_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .unwrap();
-    store
-        .upsert_thread_model(
-            &started.response.thread,
-            pioneer_protocol::PersistedActorRef::System,
-        )
-        .await
-        .unwrap();
-    // Fixture starts at the state produced by the process/deadline regression.
-    processor
-        .title_job_runtime
-        .lock()
-        .await
-        .insert(thread.into(), waiting_for_source(FALLBACK));
-    let request = generate_test_request_id("title-composer", "start");
-    processor
-        .process_request_for_connection(
-            connection,
-            &json!({
-                "jsonrpc":"2.0","id":request,"method":"turn/start",
-                "params":{"thread_id":thread,"turn_id":"title-composer-user-turn",
-                    "input":[{"type":"text","text":FALLBACK}],"model":"test-model",
-                    "model_provider":"openai","mode":"Agent"}
+        assert_eq!(
+            processor
+                .title_job_runtime
+                .lock()
+                .await
+                .get(thread)
+                .cloned(),
+            Some(waiting_for_source(FALLBACK)),
+            "admission is not successful execution"
+        );
+        assert_eq!(process_count(fixture.path()), 0);
+        let tasks = store
+            .list_tasks_created_by_turn(&workspace, thread, "title-composer-user-turn")
+            .await
+            .unwrap();
+        let task = tasks
+            .iter()
+            .find(|task| {
+                task.metadata
+                    .as_ref()
+                    .and_then(|m| m.composer_work.as_ref())
+                    .is_some_and(|work| work.launch.thread_id == thread)
             })
-            .to_string(),
-        )
-        .await;
-    let response = recv_response_by_id(&mut rx, &request).await;
-    let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while provider.call_count() == 0 {
-            tokio::task::yield_now().await;
-        }
+            .unwrap();
+        let run = store
+            .get_task(&task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runs
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        let lineage = wait_for_child_lineage_for_run(store.clone(), &run).await;
+        assert_ne!(lineage.child_thread_id, thread);
+        provider.release_paused_call();
+        assert_eq!(
+            wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            process_count(fixture.path()),
+            0,
+            "hidden child completion alone is not a user response"
+        );
+        processor
+            .process_due_task_deliveries(now_timestamp_secs() + 1, 16)
+            .await
+            .unwrap();
+        wait_for_thread_name_equals(store.clone(), thread, "Recovered title").await;
+        wait_for_title_state(&processor, thread, None).await;
+        assert_eq!(process_count(fixture.path()), 1);
+        // Restore only a pending ticket to prove that durable delivery replay, not
+        // a generated name check, prevents a second request series.
+        store.update_thread_name(thread, FALLBACK).await.unwrap();
+        processor
+            .title_job_runtime
+            .lock()
+            .await
+            .insert(thread.into(), waiting_for_source(FALLBACK));
+        processor
+            .process_due_task_deliveries(now_timestamp_secs() + 100, 16)
+            .await
+            .unwrap();
+        assert_eq!(
+            processor
+                .title_job_runtime
+                .lock()
+                .await
+                .get(thread)
+                .cloned(),
+            Some(waiting_for_source(FALLBACK))
+        );
+        assert_eq!(process_count(fixture.path()), 1);
+        Ok(())
     })
     .await
     .unwrap();
-    assert_eq!(
-        processor
-            .title_job_runtime
-            .lock()
-            .await
-            .get(thread)
-            .cloned(),
-        Some(waiting_for_source(FALLBACK)),
-        "admission is not successful execution"
-    );
-    assert_eq!(process_count(fixture.path()), 0);
-    let tasks = store
-        .list_tasks_created_by_turn(&workspace, thread, "title-composer-user-turn")
-        .await
-        .unwrap();
-    let task = tasks
-        .iter()
-        .find(|task| {
-            task.metadata
-                .as_ref()
-                .and_then(|m| m.composer_work.as_ref())
-                .is_some_and(|work| work.launch.thread_id == thread)
-        })
-        .unwrap();
-    let run = store
-        .get_task(&task.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .runs
-        .last()
-        .unwrap()
-        .id
-        .clone();
-    let lineage = wait_for_child_lineage_for_run(store.clone(), &run).await;
-    assert_ne!(lineage.child_thread_id, thread);
-    provider.release_paused_call();
-    assert_eq!(
-        wait_for_task_status(store.clone(), &task.id, TaskStatus::Completed).await,
-        TaskStatus::Completed
-    );
-    assert_eq!(
-        process_count(fixture.path()),
-        0,
-        "hidden child completion alone is not a user response"
-    );
-    processor
-        .process_due_task_deliveries(now_timestamp_secs() + 1, 16)
-        .await
-        .unwrap();
-    wait_for_thread_name_equals(store.clone(), thread, "Recovered title").await;
-    wait_for_title_state(&processor, thread, None).await;
-    assert_eq!(process_count(fixture.path()), 1);
-    // Restore only a pending ticket to prove that durable delivery replay, not
-    // a generated name check, prevents a second request series.
-    store.update_thread_name(thread, FALLBACK).await.unwrap();
-    processor
-        .title_job_runtime
-        .lock()
-        .await
-        .insert(thread.into(), waiting_for_source(FALLBACK));
-    processor
-        .process_due_task_deliveries(now_timestamp_secs() + 100, 16)
-        .await
-        .unwrap();
-    assert_eq!(
-        processor
-            .title_job_runtime
-            .lock()
-            .await
-            .get(thread)
-            .cloned(),
-        Some(waiting_for_source(FALLBACK))
-    );
-    assert_eq!(process_count(fixture.path()), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn title_recovery_excludes_internal_origins_and_hidden_user_threads() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not generate"));
     let harness =
@@ -695,7 +701,7 @@ async fn title_recovery_excludes_internal_origins_and_hidden_user_threads() {
     assert_eq!(provider.call_count(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn first_title_user_text_ignores_a_task_occurrence_in_the_same_timestamp_bucket() {
     let harness = setup_phase_13_compaction_harness(test_provider()).await;
     let thread = phase_13_test_thread(

@@ -1165,7 +1165,7 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                             overlay_bootstrap_root.as_path(),
                         )
                         .await
-                        .map_err(|error| anyhow!("failed to prepare Codex MCP bridge: {error}"))?;
+                        .context("failed to prepare Codex MCP bridge")?;
                     let reservation = self
                         .bridge_supervisor
                         .coordinator()

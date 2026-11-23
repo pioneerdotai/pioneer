@@ -1,0 +1,24 @@
+name: Save Intel Mac release compiler cache
+description: Record compiler cache statistics and retain entries for the next release.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        echo "Gateway build step: $(( $(date +%s) - RELEASE_COMPILE_STARTED )) s" >> "$GITHUB_STEP_SUMMARY"
+        {
+          echo '~~~text'
+          "$SCCACHE_PATH" --show-stats
+          echo '~~~'
+        } >> "$GITHUB_STEP_SUMMARY"
+        "$SCCACHE_PATH" --stop-server
+        echo "RELEASE_CACHE_SAVE_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+    - uses: actions/upload-artifact@v6
+      with:
+        name: ${{ env.RELEASE_CACHE_PREFIX }}${{ github.run_attempt }}
+        path: ${{ env.SCCACHE_DIR }}
+        compression-level: 0
+        retention-days: 14
+        if-no-files-found: warn
+    - shell: bash
+      run: echo "Compiler cache upload took $(( $(date +%s) - RELEASE_CACHE_SAVE_STARTED )) s" >> "$GITHUB_STEP_SUMMARY"

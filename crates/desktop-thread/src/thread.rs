@@ -30,6 +30,7 @@ pub struct ThreadViewConfig {
     client: Arc<ClientCore>,
     thread_id: String,
     initial: Vec<ClientPublicationReference>,
+    api_provider_title: Option<fn(&str) -> Option<String>>,
     registrar: Arc<dyn ClientBindingRegistrar>,
     files: Arc<dyn ThreadFilePort>,
     audio: Arc<dyn ThreadAudioPort>,
@@ -52,10 +53,16 @@ impl ThreadViewConfig {
             audio,
             external,
             initial: Vec::new(),
+            api_provider_title: None,
         }
     }
     pub fn with_initial_publications(mut self, initial: Vec<ClientPublicationReference>) -> Self {
         self.initial = initial;
+        self
+    }
+
+    pub fn with_api_provider_title(mut self, title: fn(&str) -> Option<String>) -> Self {
+        self.api_provider_title = Some(title);
         self
     }
 }
@@ -210,6 +217,9 @@ impl ThreadView {
             window,
             cx,
         );
+        composer.update(cx, |composer, _| {
+            composer.api_provider_title = config.api_provider_title;
+        });
         let header = ThreadHeaderView::new(
             config.client.clone(),
             config.thread_id.clone(),

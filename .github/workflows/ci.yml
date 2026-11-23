@@ -5,13 +5,12 @@ on:
   pull_request:
   merge_group:
 
-# Keep only the latest run for each PR/branch; other refs stay independent.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-test-build:
@@ -67,17 +66,57 @@ jobs:
 
   linux-build:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-build
-    runs-on: ubuntu-latest
-    # Compile once for all shards; keep doctests on the same build/dependency tree.
+    runs-on: ubuntu-24.04
+    container: &linux-container
+      # Reap orphaned descendants so the process-group tests see completed cleanup.
+      options: --init
+      image: &linux-image ghcr.io/pioneerdotai/pioneer-ci-linux@sha256:a6fa1023a0f0df98944db716e54817bdb01918832852bf1e8f1c4d765244dd64
+      credentials: &linux-registry-credentials
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    # swapon acts on the runner VM. Only this setup service needs the capability.
+    services:
+      swap: &linux-swap
+        image: *linux-image
+        credentials: *linux-registry-credentials
+        volumes:
+          - /mnt/pioneer-ci-swap:/swap
+        options: >-
+          --user 0 --cap-drop ALL --cap-add SYS_ADMIN
+          --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+          --health-cmd "test -f /tmp/swap-ready" --health-interval 2s
+          --health-retries 60
+        entrypoint: /bin/sh
+        command: >-
+          -ec "umask 077 &&
+          dd if=/dev/zero of=/swap/archive bs=1M count=8192 status=none &&
+          mkswap /swap/archive &&
+          swapon /swap/archive &&
+          touch /tmp/swap-ready &&
+          exec sleep infinity"
+    permissions:
+      contents: read
+      packages: read
+    # Compile once for all shards. End this job after publishing the archive.
     timeout-minutes: 180
     outputs:
       archive-id: ${{ steps.upload-tests.outputs.artifact-id }}
     env: &linux-env
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
+      # whisper.cpp defaults to -march=native, but archived tests run on other CPUs.
+      # Use the x86_64 baseline rather than inheriting the build runner's ISA.
+      GGML_NATIVE: "OFF"
+      GGML_SSE42: "OFF"
+      GGML_AVX: "OFF"
+      GGML_AVX2: "OFF"
+      GGML_BMI2: "OFF"
+      GGML_F16C: "OFF"
+      GGML_FMA: "OFF"
 
     steps:
-      - uses: actions/checkout@v5
+      - &linux-checkout
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
           submodules: recursive
@@ -101,19 +140,12 @@ jobs:
           echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
-      - name: free-linux-build-disk
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The Rust cache can fill the hosted runner before any build starts.
-          # These preinstalled SDKs are unused by this Linux Rust job.
-          sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-
       - name: rust-cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-x86_64-unknown-linux-gnu-no-debug-v1
+          # whisper-rs-sys does not track arbitrary GGML_* environment changes.
+          # Exclude cached native objects compiled for a previous runner CPU.
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3
 
       - name: rustfmt-check
         shell: bash
@@ -121,41 +153,11 @@ jobs:
           set -euo pipefail
           cargo fmt --all --check
 
-      - &linux-dependencies
-        name: install-linux-build-dependencies
-        timeout-minutes: 10
+      - &linux-bindgen
+        name: configure-linux-bindgen
         shell: bash
         run: |
           set -euo pipefail
-          # Replace the runner's regional mirrors: both Azure and EC2 have
-          # stalled dependency downloads. Appending preferred entries still lets
-          # APT fall back to those slow mirrors for individual package requests.
-          # Keep the official archive first and an independent DNS fallback.
-          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n' | \
-            sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          apt_options=(
-            -o Acquire::Retries=3
-            -o Acquire::http::Timeout=30
-            -o Acquire::https::Timeout=30
-          )
-          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
-          sudo apt-get "${apt_options[@]}" install -y \
-            pkg-config \
-            libasound2-dev \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libssl-dev \
-            libpipewire-0.3-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libfontconfig-dev \
-            libfreetype6-dev \
-            libwebkit2gtk-4.1-dev \
-            libx11-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libgl1-mesa-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
@@ -167,23 +169,149 @@ jobs:
           # Official pre-built binary; use the same version to archive and run.
           curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      - name: archive-workspace-tests
+        shell: bash
+        env:
+          # Gateway and CRUD test binaries can use most of the hosted runner's
+          # memory while linking. Compile them one at a time for the archive.
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
+        run: |
+          set -euo pipefail
+          # Archive compilation has exited with SIGTERM without a Cargo error.
+          # Record runner capacity and preserve the original command's exit status.
+          archive_resources() {
+            df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+            free -m
+            for metric in memory.swap.current memory.swap.peak memory.swap.max; do
+              if [[ -r /sys/fs/cgroup/$metric ]]; then
+                echo "$metric: $(cat "/sys/fs/cgroup/$metric")"
+              fi
+            done
+            if [[ -r /sys/fs/cgroup/memory.events ]]; then
+              cat /sys/fs/cgroup/memory.events
+            fi
+          }
+          archive_exit() {
+            archive_status=$?
+            trap - EXIT
+            set +e
+            echo "Archive exit status: $archive_status"
+            archive_resources
+            exit "$archive_status"
+          }
+          trap archive_exit EXIT
+          # Bash otherwise runs EXIT with status 0 when the runner sends TERM.
+          trap 'exit 143' TERM
+          archive_resources
+          # mkswap reserves one header page from the 8 GiB file.
+          required_swap_kib=$((8 * 1024 * 1024 - $(getconf PAGESIZE) / 1024))
+          awk -v required="$required_swap_kib" '
+            /^SwapTotal:/ { total = $2 }
+            END { exit !(total >= required) }
+          ' /proc/meminfo || { echo "::error::8 GiB runner swap is unavailable"; exit 1; }
+          swap_limit=$(cat /sys/fs/cgroup/memory.swap.max)
+          if [[ "$swap_limit" != max ]] && (( swap_limit < required_swap_kib * 1024 )); then
+            echo "::error::Build container swap limit is too low ($swap_limit bytes)"
+            exit 1
+          fi
+          mkdir -p target/ci-nextest
+          /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use --timings \
+            --archive-file target/ci-nextest/nextest-tests.tar.zst
+
+      - name: build-postgres-test-runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p pioneer-postgres-test
+          cp target/debug/pioneer-postgres-test target/ci-nextest/pioneer-postgres-test
+          test -s target/ci-nextest/nextest-tests.tar.zst
+          test -x target/ci-nextest/pioneer-postgres-test
+
+      - name: upload-workspace-tests
+        id: upload-tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-nextest-${{ github.run_id }}-${{ github.run_attempt }}
+          # A single relative directory keeps both files at the ZIP root in
+          # both container and host jobs.
+          path: target/ci-nextest/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: remove-nextest-staging-files
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: rm -f target/ci-nextest/nextest-tests.tar.zst target/ci-nextest/pioneer-postgres-test
+
+      - name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cargo-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+          retention-days: 7
+
+  linux-default-server:
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-default-server
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 180
+    env: *linux-env
+    services:
+      swap: *linux-swap
+      postgres: &postgres-test-service
+        image: pgvector/pgvector:0.8.7-pg19-trixie
+        env:
+          POSTGRES_USER: pioneer_test
+          POSTGRES_PASSWORD: pioneer_test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U pioneer_test -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - *linux-checkout
+      - *linux-toolchain
+      - *linux-build-profile
+
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-default-server
+
+      - *linux-bindgen
+
       - name: cargo-check-default-server
         shell: bash
         run: |
           set -euo pipefail
           cargo check --locked -p pioneer-cli
 
+      - *install-nextest
+
       # A separate Cargo invocation keeps CU features out of these server owners.
       - name: cargo-nextest-default-server-contracts
-        id: server-contracts
         env:
-          # This also compiles the large gateway test binary. Bound compiler
-          # concurrency just as for the archive after SIGTERM with jobs=2.
+          PIONEER_TEST_POSTGRES_ADMIN_URL: &postgres-test-url postgresql://pioneer_test:pioneer_test@postgres:5432/postgres
+          # This also links the large Gateway test binary. Limit concurrent
+          # Cargo builds as in the archive job while retaining two test threads.
           CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
         shell: bash
         run: |
           set -euo pipefail
-          /usr/bin/time -v cargo nextest run --locked --no-default-features \
+          cargo run --locked -p pioneer-postgres-test -- cargo nextest run --locked --no-default-features \
             -p pioneer-cli -p pioneer-gateway -p pioneer-tools -p pioneer-promt -p pioneer-agent \
             --test-threads 2 --no-fail-fast --retries 0 \
             -E '(package(pioneer-cli) & test(installer::tests::)) |
@@ -192,83 +320,61 @@ jobs:
                 (package(pioneer-agent) & (test(agent_dispatch_starts_with_main_prompt) | test(computer_use_) | test(request_tools_catalog_is_compiled_for_tool_enabled_native_delivery_plan))) |
                 (package(pioneer-gateway) & test(capability_persistence_order_materializes_before_skill_install_and_native_start))'
 
-      # Keep diagnostics in a separate shell: SIGTERM may kill the build shell
-      # before its EXIT trap can report runner resource exhaustion.
-      - name: diagnose-server-contract-build-failure
-        if: ${{ always() && steps.server-contracts.outcome == 'failure' }}
-        shell: bash
-        run: |
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-          free -m
-          if [[ -r /sys/fs/cgroup/memory.events ]]; then
-            cat /sys/fs/cgroup/memory.events
-          fi
-          sudo journalctl -k --since '1 hour ago' --no-pager | tail -n 150 || true
-          sudo journalctl -u systemd-oomd --since '1 hour ago' --no-pager | tail -n 80 || true
+  linux-doctests:
+    name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-doctests
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 180
+    env: *linux-env
+    services:
+      postgres: *postgres-test-service
 
-      - name: archive-workspace-tests
-        id: archive
-        env:
-          # The full-feature test build used most RAM and swap with jobs=2
-          # before terminating with SIGTERM. Limit concurrent compilation.
-          CARGO_BUILD_JOBS: 1
-        shell: bash
-        run: |
-          set -euo pipefail
-          /usr/bin/time -v cargo nextest archive --locked --workspace --features pioneer-cli/computer-use \
-            --archive-file "$RUNNER_TEMP/nextest-tests.tar.zst"
+    steps:
+      - *linux-checkout
+      - *linux-toolchain
+      - *linux-build-profile
 
-      # A terminated shell's EXIT trap can report zero even though the step
-      # failed with SIGTERM. Collect evidence in a fresh shell instead.
-      - name: diagnose-workspace-archive-failure
-        if: ${{ always() && steps.archive.outcome == 'failure' }}
-        shell: bash
-        run: |
-          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
-          free -m
-          if [[ -r /sys/fs/cgroup/memory.events ]]; then
-            cat /sys/fs/cgroup/memory.events
-          fi
-          sudo journalctl -k --since '1 hour ago' --no-pager | tail -n 150 || true
-          sudo journalctl -u systemd-oomd --since '1 hour ago' --no-pager | tail -n 80 || true
-
-      - name: upload-workspace-tests
-        id: upload-tests
-        uses: actions/upload-artifact@v4
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: linux-nextest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/nextest-tests.tar.zst
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+          shared-key: ci-ubuntu24-x86_64-gnu-no-debug-portable-ggml-v3-doctests
+
+      - *linux-bindgen
 
       - name: cargo-test-doctests
-        if: ${{ !cancelled() && (steps.archive.outcome == 'success' || steps.archive.outcome == 'failure') }}
+        env:
+          PIONEER_TEST_POSTGRES_ADMIN_URL: *postgres-test-url
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --workspace --features pioneer-cli/computer-use --doc
+          cargo run --locked -p pioneer-postgres-test -- cargo test --locked --workspace --features pioneer-cli/computer-use --doc
 
   linux-tests:
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu-shard-${{ matrix.shard }}
     needs: linux-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: *linux-container
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 180
     env: *linux-env
+    services:
+      postgres: *postgres-test-service
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
     steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
+      - *linux-checkout
 
       - *linux-toolchain
       - *linux-build-profile
-      - *linux-dependencies
+      - *linux-bindgen
       - *install-nextest
 
       - name: require-workspace-test-archive
@@ -280,7 +386,8 @@ jobs:
           test -n "$ARCHIVE_ID"
 
       # The producing job's artifact ID also works when only failed shards are rerun.
-      - name: download-workspace-tests
+      - &download-workspace-tests
+        name: download-workspace-tests
         uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.linux-build.outputs.archive-id }}
@@ -288,35 +395,79 @@ jobs:
           merge-multiple: true
 
       - name: cargo-nextest-workspace
+        env:
+          PIONEER_TEST_POSTGRES_ADMIN_URL: *postgres-test-url
+          BROWSER_TESTS: &browser-tests 'package(pioneer-gateway) & test(/^message::html_tools::browser::tests::/)'
         shell: bash
         run: |
           set -euo pipefail
           # Keep target/ at its original path for compile-time paths in tests.
           # Build options, including --locked --workspace, are stored in the archive.
+          chmod +x "$RUNNER_TEMP/nextest/pioneer-postgres-test"
+          "$RUNNER_TEMP/nextest/pioneer-postgres-test" \
+            cargo nextest run --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE" \
+            --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+            --profile ci --partition hash:${{ matrix.shard }}/16 -E "not ($BROWSER_TESTS)" \
+            --test-threads 2 --no-fail-fast --retries 0 \
+            --status-level pass --final-status-level fail --failure-output immediate-final
+
+  linux-browser-tests:
+    name: ci-linux-browser-tests
+    needs: linux-build
+    # The hosted image provides a sandboxed Chrome for the browser integration tests.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env: *linux-env
+
+    steps:
+      - *linux-checkout
+      - *install-nextest
+      - *download-workspace-tests
+
+      - name: cargo-nextest-browser
+        env:
+          BROWSER_TESTS: *browser-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep paths embedded by the container build valid on the host runner.
+          runner_work="$(dirname "$(dirname "$GITHUB_WORKSPACE")")"
+          if [[ ! -e /__w ]]; then
+            sudo ln -s "$runner_work" /__w
+          fi
+          test "$GITHUB_WORKSPACE" -ef "/__w/${GITHUB_WORKSPACE#"$runner_work"/}"
           cargo nextest run --archive-file "$RUNNER_TEMP/nextest/nextest-tests.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" \
             --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
-            --partition hash:${{ matrix.shard }}/4 \
-            --test-threads 2 --no-fail-fast --retries 0 \
-            --status-level pass --final-status-level fail --failure-output immediate-final
+            --test-threads 2 --no-fail-fast --retries 0 --failure-output immediate-final \
+            -E "$BROWSER_TESTS"
 
   linux-result:
     # Preserve the Linux check name used by branch protection.
     name: ci-ubuntu-latest-x86_64-unknown-linux-gnu
-    needs: [linux-build, linux-tests]
-    if: ${{ always() }}
+    needs: [linux-build, linux-default-server, linux-doctests, linux-tests, linux-browser-tests]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: require-all-linux-checks
         env:
           BUILD_RESULT: ${{ needs.linux-build.result }}
+          DEFAULT_SERVER_RESULT: ${{ needs.linux-default-server.result }}
+          DOCTESTS_RESULT: ${{ needs.linux-doctests.result }}
           LINUX_RESULT: ${{ needs.linux-tests.result }}
+          BROWSER_RESULT: ${{ needs.linux-browser-tests.result }}
         shell: bash
         run: |
           set -euo pipefail
-          # Require the build, rustfmt, doctests, archive upload and all four shards.
-          echo "Linux build and doctests: ${BUILD_RESULT}"
-          echo "Linux checks: ${LINUX_RESULT}"
+          echo "Linux build and archive: ${BUILD_RESULT}"
+          echo "Linux default server: ${DEFAULT_SERVER_RESULT}"
+          echo "Linux doctests: ${DOCTESTS_RESULT}"
+          echo "Linux test shards: ${LINUX_RESULT}"
+          echo "Linux browser tests: ${BROWSER_RESULT}"
           test "${BUILD_RESULT}" = success
+          test "${DEFAULT_SERVER_RESULT}" = success
+          test "${DOCTESTS_RESULT}" = success
           test "${LINUX_RESULT}" = success
+          test "${BROWSER_RESULT}" = success

@@ -12,7 +12,7 @@ Do not attach a debugger that suspends the hosting process as a substitute.
 
 | Action | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| `sql-cpu` | Parent Gateway SQL command CPU | Parent Gateway SQL command CPU | Parent Gateway SQL command CPU |
+| `sql-cpu` | Parent Gateway SQL query capture | Parent Gateway SQL query capture | Parent Gateway SQL query capture |
 | `cpu` | xctrace Time Profiler `.trace` | perf `cpu-clock`, DWARF stack `perf.data` | Native adapter unavailable |
 | `allocations` | xctrace Allocations, from attach onward | Unavailable | Unavailable |
 | `allocation-history` | malloc_history `-allEvents`, prepared launch required | Unavailable | Unavailable |
@@ -57,10 +57,11 @@ and its bounded manifest result.
 
 `sql-cpu` supports only the owner parent Gateway: selector `gateway` or exactly
 one live run ID, without `--child`. Desktop/child targets are rejected by the
-server. It creates a local SQL Session inside that Gateway using existing SQLite
-instrumentation; it requires no native profiler, version probe, attach permission,
-module hashing or symbols. No native output is created. Explicit `--frequency`
-is rejected for this action: SQL command CPU is not sampled at a requested Hz.
+server. It creates a local SQL session inside that Gateway. PostgreSQL queries
+contribute query fingerprints, and the SeaORM observer records elapsed time in
+the database metrics. PostgreSQL server CPU is unmeasured by this capture.
+The action requires no native profiler or attach permission. It accepts an
+interval via `--seconds` and produces the SQL sidecar.
 Its client reply budget is 120 seconds (at most 60 seconds collection plus
 bounded storage/inventory/reply); no native timeout is increased.
 

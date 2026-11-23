@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_message_revision")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub revision: i64,
@@ -15,8 +15,11 @@ pub struct Model {
     pub input_json: String,
     #[sea_orm(column_type = "Text")]
     pub mentions_json: String,
+    #[sea_orm(column_type = "Text")]
     pub changed_by_actor_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub changed_by_actor_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub change_kind: String,
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
@@ -26,7 +29,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

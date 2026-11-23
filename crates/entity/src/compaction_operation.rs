@@ -9,9 +9,15 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_operation_owner_fingerprint_key"
+    )]
     pub owner: String,
-    #[sea_orm(column_type = "Text")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_operation_owner_fingerprint_key"
+    )]
     pub fingerprint: String,
     #[sea_orm(column_type = "Text")]
     pub status: String,
@@ -39,7 +45,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_context: HasOne<super::compaction_context::Entity>,
+    pub compaction_context: BelongsTo<super::compaction_context::Entity>,
     #[sea_orm(has_many)]
     pub compaction_manifests: HasMany<super::compaction_manifest::Entity>,
     #[sea_orm(has_one)]

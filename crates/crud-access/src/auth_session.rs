@@ -1,0 +1,2383 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{Context, Result, bail};
+use pioneer_entity::{
+    audit_event, auth_refresh_credential, auth_session, device, gateway_identity,
+    gateway_principal, invitation, invitation_workspace_grant,
+};
+use pioneer_protocol::{
+    AUDIT_METADATA_VERSION_V1, AuthSessionId, AuthSessionRevokeReason, AuthSessionStatus,
+    BoundedServerGeneratedMetadata, ClientInstallationDescriptor, ClientKind,
+    DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DeviceId, DeviceStatus, GatewayId,
+    INVITATION_MAX_WORKSPACE_GRANTS, INVITATION_MIN_WORKSPACE_GRANTS, INVITATION_TTL_SECONDS,
+    InvitationId, PrincipalId, RefreshCredentialId, RequestId, RoleKey, TokenFamilyId, WorkspaceId,
+};
+use sea_orm::entity::prelude::DateTimeWithTimeZone;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement,
+    sea_query::{Expr, JoinType},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalCredentialRevocation {
+    pub session_ids: Vec<AuthSessionId>,
+    pub device_ids: Vec<DeviceId>,
+}
+
+#[derive(Clone)]
+pub struct NewPendingDeviceSessionRow {
+    pub device_id: DeviceId,
+    pub session_id: AuthSessionId,
+    pub gateway_id: GatewayId,
+    pub principal_id: PrincipalId,
+    pub token_family_id: TokenFamilyId,
+    pub issuer: PendingSessionIssuer,
+    pub activation_token_hash: [u8; 32],
+    pub activation_locator_hash: [u8; 32],
+    pub activation_expires_at: DateTimeWithTimeZone,
+    pub now: DateTimeWithTimeZone,
+}
+
+#[derive(Clone)]
+pub struct NewRefreshCredentialRow {
+    pub id: RefreshCredentialId,
+    pub session_id: AuthSessionId,
+    pub token_family_id: TokenFamilyId,
+    pub generation: u64,
+    pub token_hash: [u8; 32],
+    pub issued_at: DateTimeWithTimeZone,
+    pub expires_at: DateTimeWithTimeZone,
+}
+
+#[derive(Clone)]
+pub struct NewActiveDeviceSessionRow {
+    pub device_id: DeviceId,
+    pub session_id: AuthSessionId,
+    pub gateway_id: GatewayId,
+    pub principal_id: PrincipalId,
+    pub token_family_id: TokenFamilyId,
+    pub installation: ClientInstallationDescriptor,
+    pub activation_token_hash: [u8; 32],
+    pub activation_locator_hash: [u8; 32],
+    pub refresh_expires_at: DateTimeWithTimeZone,
+    pub now: DateTimeWithTimeZone,
+}
+
+#[derive(Clone)]
+pub enum PendingSessionIssuer {
+    LocalCli,
+    AuthenticatedSession(AuthSessionId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceActivationFailureOutcome {
+    AttemptRecorded { failed_attempts: u32 },
+    RequestRevoked { failed_attempts: u32 },
+}
+
+impl PendingSessionIssuer {
+    fn session_id(&self) -> Option<String> {
+        match self {
+            Self::LocalCli => None,
+            Self::AuthenticatedSession(session_id) => Some(session_id.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingSessionIssuer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalCli => formatter.write_str("LocalCli"),
+            Self::AuthenticatedSession(session_id) => formatter
+                .debug_tuple("AuthenticatedSession")
+                .field(session_id)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NewPendingDeviceSessionRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewPendingDeviceSessionRow")
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("gateway_id", &self.gateway_id)
+            .field("principal_id", &self.principal_id)
+            .field("token_family_id", &self.token_family_id)
+            .field("issuer", &self.issuer)
+            .field("activation_token_hash", &"[redacted]")
+            .field("activation_locator_hash", &"[redacted]")
+            .field("activation_expires_at", &self.activation_expires_at)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewRefreshCredentialRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewRefreshCredentialRow")
+            .field("id", &self.id)
+            .field("session_id", &self.session_id)
+            .field("token_family_id", &self.token_family_id)
+            .field("generation", &self.generation)
+            .field("token_hash", &"[redacted]")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewActiveDeviceSessionRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewActiveDeviceSessionRow")
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("gateway_id", &self.gateway_id)
+            .field("principal_id", &self.principal_id)
+            .field("token_family_id", &self.token_family_id)
+            .field("installation", &self.installation)
+            .field("activation_token_hash", &"[redacted]")
+            .field("activation_locator_hash", &"[redacted]")
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthPersistenceInvariantReport {
+    pub violations: Vec<String>,
+}
+
+impl AuthPersistenceInvariantReport {
+    pub fn is_valid(&self) -> bool {
+        self.violations.is_empty()
+    }
+}
+
+pub const fn client_kind_to_db(value: ClientKind) -> &'static str {
+    match value {
+        ClientKind::Desktop => "desktop",
+        ClientKind::Mobile => "mobile",
+        ClientKind::Other => "other",
+    }
+}
+
+pub const fn device_status_to_db(value: DeviceStatus) -> &'static str {
+    match value {
+        DeviceStatus::Pending => "pending",
+        DeviceStatus::Active => "active",
+        DeviceStatus::Revoked => "revoked",
+    }
+}
+
+pub const fn auth_session_status_to_db(value: AuthSessionStatus) -> &'static str {
+    match value {
+        AuthSessionStatus::Pending => "pending",
+        AuthSessionStatus::Active => "active",
+        AuthSessionStatus::Revoked => "revoked",
+        AuthSessionStatus::Expired => "expired",
+    }
+}
+
+pub const fn revoke_reason_to_db(value: AuthSessionRevokeReason) -> &'static str {
+    match value {
+        AuthSessionRevokeReason::Logout => "logout",
+        AuthSessionRevokeReason::SelfRevoke => "self_revoke",
+        AuthSessionRevokeReason::DeviceRevoke => "device_revoke",
+        AuthSessionRevokeReason::ActivationAttemptsExceeded => "activation_attempts_exceeded",
+        AuthSessionRevokeReason::RefreshReuse => "refresh_reuse",
+        AuthSessionRevokeReason::PrincipalSuspended => "principal_suspended",
+        AuthSessionRevokeReason::PrincipalRemoved => "principal_removed",
+        AuthSessionRevokeReason::Superseded => "superseded",
+        AuthSessionRevokeReason::SecurityReset => "security_reset",
+    }
+}
+
+pub async fn insert_pending_device_session<C: ConnectionTrait>(
+    db: &C,
+    row: NewPendingDeviceSessionRow,
+) -> Result<(device::Model, auth_session::Model)> {
+    let device = device::ActiveModel {
+        id: Set(row.device_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        installation_id: Set(None),
+        display_name: Set(None),
+        client_kind: Set(None),
+        platform: Set(None),
+        client_version: Set(None),
+        status: Set(device_status_to_db(DeviceStatus::Pending).to_owned()),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(None),
+        revoked_at: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert pending device")?;
+    let session = auth_session::ActiveModel {
+        id: Set(row.session_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        device_id: Set(row.device_id.to_string()),
+        token_family_id: Set(row.token_family_id.to_string()),
+        created_by_session_id: Set(row.issuer.session_id()),
+        activation_token_hash: Set(row.activation_token_hash.to_vec()),
+        activation_locator_hash: Set(row.activation_locator_hash.to_vec()),
+        activation_failed_attempts: Set(0),
+        activation_expires_at: Set(row.activation_expires_at),
+        activated_at: Set(None),
+        status: Set(auth_session_status_to_db(AuthSessionStatus::Pending).to_owned()),
+        refresh_generation: Set(0),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(None),
+        last_refreshed_at: Set(None),
+        refresh_expires_at: Set(None),
+        revoked_at: Set(None),
+        revoke_reason: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert pending auth session")?;
+    Ok((device, session))
+}
+
+pub async fn insert_active_device_session<C: ConnectionTrait>(
+    db: &C,
+    row: NewActiveDeviceSessionRow,
+) -> Result<(device::Model, auth_session::Model)> {
+    let device = device::ActiveModel {
+        id: Set(row.device_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        installation_id: Set(Some(row.installation.installation_id.clone())),
+        display_name: Set(Some(row.installation.display_name.clone())),
+        client_kind: Set(Some(
+            client_kind_to_db(row.installation.client_kind).to_owned(),
+        )),
+        platform: Set(row.installation.platform.clone()),
+        client_version: Set(row.installation.client_version.clone()),
+        status: Set(device_status_to_db(DeviceStatus::Active).to_owned()),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(Some(row.now)),
+        revoked_at: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert active device")?;
+    let session = auth_session::ActiveModel {
+        id: Set(row.session_id.to_string()),
+        gateway_id: Set(row.gateway_id.to_string()),
+        principal_id: Set(row.principal_id.to_string()),
+        device_id: Set(row.device_id.to_string()),
+        token_family_id: Set(row.token_family_id.to_string()),
+        created_by_session_id: Set(None),
+        activation_token_hash: Set(row.activation_token_hash.to_vec()),
+        activation_locator_hash: Set(row.activation_locator_hash.to_vec()),
+        activation_failed_attempts: Set(0),
+        activation_expires_at: Set(row.now),
+        activated_at: Set(Some(row.now)),
+        status: Set(auth_session_status_to_db(AuthSessionStatus::Active).to_owned()),
+        refresh_generation: Set(0),
+        created_at: Set(row.now),
+        updated_at: Set(row.now),
+        last_seen_at: Set(Some(row.now)),
+        last_refreshed_at: Set(Some(row.now)),
+        refresh_expires_at: Set(Some(row.refresh_expires_at)),
+        revoked_at: Set(None),
+        revoke_reason: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert active auth session")?;
+    Ok((device, session))
+}
+
+pub async fn activate_pending_device<C: ConnectionTrait>(
+    db: &C,
+    device_id: &DeviceId,
+    installation: &ClientInstallationDescriptor,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<device::Model>> {
+    let result = device::Entity::update_many()
+        .col_expr(
+            device::Column::InstallationId,
+            Expr::value(Some(installation.installation_id.clone())),
+        )
+        .col_expr(
+            device::Column::DisplayName,
+            Expr::value(Some(installation.display_name.clone())),
+        )
+        .col_expr(
+            device::Column::ClientKind,
+            Expr::value(Some(client_kind_to_db(installation.client_kind).to_owned())),
+        )
+        .col_expr(
+            device::Column::Platform,
+            Expr::value(installation.platform.clone()),
+        )
+        .col_expr(
+            device::Column::ClientVersion,
+            Expr::value(installation.client_version.clone()),
+        )
+        .col_expr(device::Column::Status, Expr::value("active"))
+        .col_expr(device::Column::UpdatedAt, Expr::value(now))
+        .col_expr(device::Column::LastSeenAt, Expr::value(Some(now)))
+        .filter(device::Column::Id.eq(device_id.to_string()))
+        .filter(device::Column::Status.eq("pending"))
+        .exec(db)
+        .await
+        .context("failed to activate pending device")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+    load_device(db, device_id).await
+}
+
+pub async fn activate_pending_auth_session<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+    refresh_expires_at: DateTimeWithTimeZone,
+    now: DateTimeWithTimeZone,
+) -> Result<Option<auth_session::Model>> {
+    let result = auth_session::Entity::update_many()
+        .col_expr(auth_session::Column::ActivatedAt, Expr::value(Some(now)))
+        .col_expr(auth_session::Column::Status, Expr::value("active"))
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .col_expr(auth_session::Column::LastSeenAt, Expr::value(Some(now)))
+        .col_expr(
+            auth_session::Column::LastRefreshedAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(
+            auth_session::Column::RefreshExpiresAt,
+            Expr::value(Some(refresh_expires_at)),
+        )
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .filter(auth_session::Column::ActivationExpiresAt.gt(now))
+        .exec(db)
+        .await
+        .context("failed to activate pending auth session")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+    load_session(db, session_id).await
+}
+
+pub async fn insert_refresh_credential<C: ConnectionTrait>(
+    db: &C,
+    row: NewRefreshCredentialRow,
+) -> Result<auth_refresh_credential::Model> {
+    auth_refresh_credential::ActiveModel {
+        id: Set(row.id.to_string()),
+        session_id: Set(row.session_id.to_string()),
+        token_family_id: Set(row.token_family_id.to_string()),
+        generation: Set(i64::try_from(row.generation).context("refresh generation overflow")?),
+        token_hash: Set(row.token_hash.to_vec()),
+        issued_at: Set(row.issued_at),
+        expires_at: Set(row.expires_at),
+        exchange_request_id: Set(None),
+    }
+    .insert(db)
+    .await
+    .context("failed to insert refresh credential")
+}
+
+pub async fn load_device<C: ConnectionTrait>(
+    db: &C,
+    id: &DeviceId,
+) -> Result<Option<device::Model>> {
+    device::Entity::find_by_id(id.to_string())
+        .one(db)
+        .await
+        .context("failed to load device")
+}
+
+pub async fn load_active_device_by_installation<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    installation_id: &str,
+) -> Result<Option<device::Model>> {
+    device::Entity::find()
+        .filter(device::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(device::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(device::Column::InstallationId.eq(installation_id))
+        .filter(device::Column::Status.eq("active"))
+        .one(db)
+        .await
+        .context("failed to load active device by installation")
+}
+
+/// Current lease inputs, excluding credentials and principal presentation.
+/// Ownership is deliberately returned, not trusted through unenforced FKs.
+#[derive(Debug, Clone, sea_orm::FromQueryResult)]
+pub struct AuthSessionLeaseRow {
+    pub session_id: String,
+    pub session_gateway_id: String,
+    pub session_principal_id: String,
+    pub session_device_id: String,
+    pub token_family_id: String,
+    pub session_status: String,
+    pub refresh_generation: i64,
+    pub refresh_expires_at: Option<DateTimeWithTimeZone>,
+    pub device_id: String,
+    pub device_gateway_id: String,
+    pub device_principal_id: String,
+    pub installation_id: Option<String>,
+    pub display_name: Option<String>,
+    pub client_kind: Option<String>,
+    pub device_status: String,
+    pub principal_id: String,
+    pub principal_gateway_id: String,
+    pub principal_kind: String,
+    pub principal_status: String,
+    pub role_key: Option<String>,
+}
+
+pub async fn load_session_lease<C: ConnectionTrait>(
+    db: &C,
+    id: &AuthSessionId,
+) -> Result<Option<AuthSessionLeaseRow>> {
+    session_lease_query()
+        .filter(auth_session::Column::Id.eq(id.to_string()))
+        .into_model::<AuthSessionLeaseRow>()
+        .one(db)
+        .await
+        .context("failed to load session lease facts")
+}
+
+/// Each row is keyed by session; a joined row is still unvalidated input.
+pub async fn load_session_leases<C: ConnectionTrait>(
+    db: &C,
+    ids: &[AuthSessionId],
+) -> Result<Vec<AuthSessionLeaseRow>> {
+    if ids.len() > crate::AUTHORIZATION_FACTS_BATCH_LIMIT {
+        anyhow::bail!("session authorization facts batch exceeds limit");
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    session_lease_query()
+        .filter(auth_session::Column::Id.is_in(ids.iter().map(ToString::to_string)))
+        .limit(crate::AUTHORIZATION_FACTS_BATCH_LIMIT as u64)
+        .into_model::<AuthSessionLeaseRow>()
+        .all(db)
+        .await
+        .context("failed to load bounded session lease facts")
+}
+
+fn session_lease_query() -> sea_orm::Select<auth_session::Entity> {
+    // INNER JOIN preserves missing-related-row failure. Ownership is checked
+    // explicitly by the service where it involves more than one association.
+    auth_session::Entity::find()
+        .select_only()
+        .column_as(auth_session::Column::Id, "session_id")
+        .column_as(auth_session::Column::GatewayId, "session_gateway_id")
+        .column_as(auth_session::Column::PrincipalId, "session_principal_id")
+        .column_as(auth_session::Column::DeviceId, "session_device_id")
+        .column(auth_session::Column::TokenFamilyId)
+        .column_as(auth_session::Column::Status, "session_status")
+        .column(auth_session::Column::RefreshGeneration)
+        .column(auth_session::Column::RefreshExpiresAt)
+        .column_as(device::Column::Id, "device_id")
+        .column_as(device::Column::GatewayId, "device_gateway_id")
+        .column_as(device::Column::PrincipalId, "device_principal_id")
+        .column(device::Column::InstallationId)
+        .column(device::Column::DisplayName)
+        .column(device::Column::ClientKind)
+        .column_as(device::Column::Status, "device_status")
+        .column_as(gateway_principal::Column::Id, "principal_id")
+        .column_as(gateway_principal::Column::GatewayId, "principal_gateway_id")
+        .column_as(gateway_principal::Column::Kind, "principal_kind")
+        .column_as(gateway_principal::Column::Status, "principal_status")
+        .column(gateway_principal::Column::RoleKey)
+        .join(
+            JoinType::InnerJoin,
+            auth_session::Entity::belongs_to(device::Entity)
+                .from(auth_session::Column::DeviceId)
+                .to(device::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            auth_session::Entity::belongs_to(gateway_principal::Entity)
+                .from(auth_session::Column::PrincipalId)
+                .to(gateway_principal::Column::Id)
+                .into(),
+        )
+}
+
+pub async fn load_session<C: ConnectionTrait>(
+    db: &C,
+    id: &AuthSessionId,
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find_by_id(id.to_string())
+        .one(db)
+        .await
+        .context("failed to load auth session")
+}
+
+/// Acquire the session before reading the current credential in a write
+/// transaction. Revocation uses the same session-before-credential order.
+pub async fn lock_session_for_refresh<C: ConnectionTrait>(
+    transaction: &C,
+    id: &AuthSessionId,
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find_by_id(id.as_str())
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .context("failed to lock auth session for refresh")
+}
+
+pub async fn load_active_session_by_device<C: ConnectionTrait>(
+    db: &C,
+    device_id: &DeviceId,
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find()
+        .filter(auth_session::Column::DeviceId.eq(device_id.to_string()))
+        .filter(auth_session::Column::Status.eq("active"))
+        .one(db)
+        .await
+        .context("failed to load active auth session for device")
+}
+
+pub async fn touch_active_device<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    device_id: &DeviceId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = device::Entity::update_many()
+        .col_expr(device::Column::LastSeenAt, Expr::value(Some(now)))
+        .col_expr(device::Column::UpdatedAt, Expr::value(now))
+        .filter(device::Column::Id.eq(device_id.to_string()))
+        .filter(device::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(device::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(device::Column::Status.eq("active"))
+        .exec(db)
+        .await
+        .context("failed to touch active device")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn touch_active_auth_session<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    device_id: &DeviceId,
+    session_id: &AuthSessionId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = auth_session::Entity::update_many()
+        .col_expr(auth_session::Column::LastSeenAt, Expr::value(Some(now)))
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(auth_session::Column::DeviceId.eq(device_id.to_string()))
+        .filter(auth_session::Column::Status.eq("active"))
+        .exec(db)
+        .await
+        .context("failed to touch active auth session")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn load_current_refresh<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+) -> Result<Option<auth_refresh_credential::Model>> {
+    auth_refresh_credential::Entity::find()
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .one(db)
+        .await
+        .context("failed to load current refresh credential")
+}
+
+pub async fn load_session_by_activation_hash<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    token_hash: &[u8; 32],
+) -> Result<Option<auth_session::Model>> {
+    let pending = auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::ActivationTokenHash.eq(token_hash.to_vec()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .one(db)
+        .await
+        .context("failed to lookup pending device activation code")?;
+    if pending.is_some() {
+        return Ok(pending);
+    }
+    auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::ActivationTokenHash.eq(token_hash.to_vec()))
+        .order_by_desc(auth_session::Column::CreatedAt)
+        .order_by_desc(auth_session::Column::Id)
+        .one(db)
+        .await
+        .context("failed to lookup terminal device activation code")
+}
+
+pub async fn load_pending_session_by_activation_locator_hash<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    locator_hash: &[u8; 32],
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::ActivationLocatorHash.eq(locator_hash.to_vec()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .one(db)
+        .await
+        .context("failed to lookup pending device activation request")
+}
+
+pub async fn list_pending_activation_locator_hashes<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+) -> Result<HashSet<Vec<u8>>> {
+    let rows = auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .all(db)
+        .await
+        .context("failed to list pending device activation locators")?;
+    Ok(rows
+        .into_iter()
+        .map(|session| session.activation_locator_hash)
+        .collect())
+}
+
+pub async fn record_failed_device_activation<C: ConnectionTrait>(
+    db: &C,
+    session: auth_session::Model,
+    now: DateTimeWithTimeZone,
+) -> Result<DeviceActivationFailureOutcome> {
+    if session.status != "pending"
+        || session.activation_failed_attempts < 0
+        || session.activation_failed_attempts >= i64::from(DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS)
+    {
+        bail!("cannot record a failed attempt for a terminal activation request");
+    }
+    let failed_attempts = session
+        .activation_failed_attempts
+        .checked_add(1)
+        .context("device activation failed-attempt counter overflow")?;
+    let device_id =
+        DeviceId::new(session.device_id.clone()).context("invalid pending activation device id")?;
+    let mut active: auth_session::ActiveModel = session.into();
+    active.activation_failed_attempts = Set(failed_attempts);
+    active.updated_at = Set(now);
+    if failed_attempts >= i64::from(DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS) {
+        active.status = Set(auth_session_status_to_db(AuthSessionStatus::Revoked).to_owned());
+        active.revoked_at = Set(Some(now));
+        active.revoke_reason = Set(Some(
+            revoke_reason_to_db(AuthSessionRevokeReason::ActivationAttemptsExceeded).to_owned(),
+        ));
+    }
+    active
+        .update(db)
+        .await
+        .context("failed to record device activation attempt")?;
+    let failed_attempts =
+        u32::try_from(failed_attempts).context("device activation failed-attempt overflow")?;
+    if failed_attempts < DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS {
+        return Ok(DeviceActivationFailureOutcome::AttemptRecorded { failed_attempts });
+    }
+    if !mark_device_revoked(db, &device_id, now).await? {
+        bail!("locked device activation request did not own one pending device");
+    }
+    Ok(DeviceActivationFailureOutcome::RequestRevoked { failed_attempts })
+}
+
+pub async fn load_pending_session_for_creator<C: ConnectionTrait>(
+    db: &C,
+    creator_session_id: &AuthSessionId,
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find()
+        .filter(auth_session::Column::CreatedBySessionId.eq(creator_session_id.to_string()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .one(db)
+        .await
+        .context("failed to load pending session for creator")
+}
+
+pub async fn load_pending_local_session<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+) -> Result<Option<auth_session::Model>> {
+    auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(auth_session::Column::CreatedBySessionId.is_null())
+        .filter(auth_session::Column::Status.eq("pending"))
+        .one(db)
+        .await
+        .context("failed to load pending local session")
+}
+
+pub async fn expire_pending_auth_session<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+    device_id: &DeviceId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let session = auth_session::Entity::update_many()
+        .col_expr(auth_session::Column::Status, Expr::value("expired"))
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .col_expr(auth_session::Column::RevokedAt, Expr::value(Some(now)))
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::DeviceId.eq(device_id.to_string()))
+        .filter(auth_session::Column::Status.eq("pending"))
+        .filter(auth_session::Column::ActivationExpiresAt.lte(now))
+        .exec(db)
+        .await
+        .context("failed to expire pending auth session")?;
+    if session.rows_affected != 1 {
+        return Ok(false);
+    }
+    let device = device::Entity::update_many()
+        .col_expr(device::Column::Status, Expr::value("revoked"))
+        .col_expr(device::Column::UpdatedAt, Expr::value(now))
+        .col_expr(device::Column::RevokedAt, Expr::value(Some(now)))
+        .filter(device::Column::Id.eq(device_id.to_string()))
+        .filter(device::Column::Status.eq("pending"))
+        .exec(db)
+        .await
+        .context("failed to expire pending device")?;
+    if device.rows_affected != 1 {
+        bail!("expired pending auth session did not own one pending device");
+    }
+    Ok(true)
+}
+
+pub async fn list_sessions_for_principal<C: ConnectionTrait>(
+    db: &C,
+    principal_id: &PrincipalId,
+) -> Result<Vec<auth_session::Model>> {
+    auth_session::Entity::find()
+        .filter(auth_session::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(auth_session::Column::Status.ne("pending"))
+        .filter(auth_session::Column::ActivatedAt.is_not_null())
+        .order_by_desc(auth_session::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to list auth sessions")
+}
+
+pub async fn revoke_principal_credentials<C: ConnectionTrait>(
+    db: &C,
+    gateway_id: &GatewayId,
+    principal_id: &PrincipalId,
+    reason: AuthSessionRevokeReason,
+    now: DateTimeWithTimeZone,
+) -> Result<PrincipalCredentialRevocation> {
+    let sessions = auth_session::Entity::find()
+        .filter(auth_session::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(auth_session::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(auth_session::Column::Status.is_in(["pending", "active"]))
+        .order_by_asc(auth_session::Column::Id)
+        .all(db)
+        .await
+        .context("failed to load principal sessions for revocation")?;
+    let mut session_ids = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let session_id = AuthSessionId::new(session.id.clone())
+            .context("persisted principal auth session id is invalid")?;
+        mark_session_revoked(db, session, reason, now).await?;
+        delete_refresh_for_session(db, &session_id).await?;
+        session_ids.push(session_id);
+    }
+
+    let devices = device::Entity::find()
+        .filter(device::Column::GatewayId.eq(gateway_id.to_string()))
+        .filter(device::Column::PrincipalId.eq(principal_id.to_string()))
+        .filter(device::Column::Status.is_in(["pending", "active"]))
+        .order_by_asc(device::Column::Id)
+        .all(db)
+        .await
+        .context("failed to load principal devices for revocation")?;
+    let mut device_ids = Vec::with_capacity(devices.len());
+    for device in devices {
+        let device_id =
+            DeviceId::new(device.id).context("persisted principal device id is invalid")?;
+        if mark_device_revoked(db, &device_id, now).await? {
+            device_ids.push(device_id);
+        }
+    }
+    Ok(PrincipalCredentialRevocation {
+        session_ids,
+        device_ids,
+    })
+}
+
+pub async fn mark_session_revoked<C: ConnectionTrait>(
+    db: &C,
+    session: auth_session::Model,
+    reason: AuthSessionRevokeReason,
+    now: DateTimeWithTimeZone,
+) -> Result<auth_session::Model> {
+    let mut active: auth_session::ActiveModel = session.into();
+    active.status = Set(auth_session_status_to_db(AuthSessionStatus::Revoked).to_owned());
+    active.updated_at = Set(now);
+    active.revoked_at = Set(Some(now));
+    active.revoke_reason = Set(Some(revoke_reason_to_db(reason).to_owned()));
+    active
+        .update(db)
+        .await
+        .context("failed to revoke auth session")
+}
+
+pub async fn mark_device_revoked<C: ConnectionTrait>(
+    db: &C,
+    device_id: &DeviceId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = device::Entity::update_many()
+        .col_expr(device::Column::Status, Expr::value("revoked"))
+        .col_expr(device::Column::UpdatedAt, Expr::value(now))
+        .col_expr(device::Column::RevokedAt, Expr::value(Some(now)))
+        .filter(device::Column::Id.eq(device_id.to_string()))
+        .filter(device::Column::Status.ne("revoked"))
+        .exec(db)
+        .await
+        .context("failed to revoke device")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn delete_refresh_for_session<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+) -> Result<u64> {
+    let result = auth_refresh_credential::Entity::delete_many()
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .exec(db)
+        .await
+        .context("failed to delete current refresh credential")?;
+    Ok(result.rows_affected)
+}
+
+pub async fn expire_session_refresh_family<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+    token_family_id: &TokenFamilyId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let session = auth_session::Entity::update_many()
+        .col_expr(
+            auth_session::Column::Status,
+            Expr::value(auth_session_status_to_db(AuthSessionStatus::Expired)),
+        )
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .col_expr(auth_session::Column::RevokedAt, Expr::value(Some(now)))
+        .col_expr(
+            auth_session::Column::RevokeReason,
+            Expr::value(None::<String>),
+        )
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::TokenFamilyId.eq(token_family_id.to_string()))
+        .filter(auth_session::Column::Status.eq("active"))
+        .exec(db)
+        .await
+        .context("failed to expire auth session")?;
+    auth_refresh_credential::Entity::delete_many()
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
+        .exec(db)
+        .await
+        .context("failed to delete expired refresh credential")?;
+    Ok(session.rows_affected == 1)
+}
+
+/// Both expiry workers use the same durable eligibility as their bounded
+/// updates. An empty installation has no clock-driven discovery obligation.
+pub async fn next_auth_session_expiry<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<DateTimeWithTimeZone>> {
+    let active = auth_session::Entity::find()
+        .select_only()
+        .column(auth_session::Column::RefreshExpiresAt)
+        .filter(auth_session::Column::Status.eq("active"))
+        .filter(auth_session::Column::RefreshExpiresAt.is_not_null())
+        .order_by_asc(auth_session::Column::RefreshExpiresAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?;
+    let pending = auth_session::Entity::find()
+        .select_only()
+        .column(auth_session::Column::ActivationExpiresAt)
+        .filter(auth_session::Column::Status.eq("pending"))
+        .order_by_asc(auth_session::Column::ActivationExpiresAt)
+        .into_tuple::<DateTimeWithTimeZone>()
+        .one(db)
+        .await?;
+    Ok(active.into_iter().chain(pending).min())
+}
+
+pub async fn expire_stale_auth_sessions<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    batch_size: u64,
+) -> Result<Vec<AuthSessionId>> {
+    if batch_size == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = auth_session::Entity::find()
+        .filter(auth_session::Column::Status.eq("active"))
+        .filter(auth_session::Column::RefreshExpiresAt.lte(now))
+        .order_by_asc(auth_session::Column::RefreshExpiresAt)
+        .order_by_asc(auth_session::Column::Id)
+        .limit(batch_size)
+        .all(db)
+        .await
+        .context("failed to list expired active auth sessions")?;
+    let mut expired = Vec::with_capacity(rows.len());
+    for row in rows {
+        let device_id = DeviceId::new(row.device_id.clone())
+            .context("expired auth session has an invalid device id")?;
+        let session_id =
+            AuthSessionId::new(row.id).context("expired auth session has an invalid id")?;
+        let token_family_id = TokenFamilyId::new(row.token_family_id)
+            .context("expired auth session has an invalid token family id")?;
+        if expire_session_refresh_family(db, &session_id, &token_family_id, now).await? {
+            mark_device_revoked(db, &device_id, now).await?;
+            expired.push(session_id);
+        }
+    }
+    Ok(expired)
+}
+
+pub async fn expire_stale_pending_sessions<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    batch_size: u64,
+) -> Result<Vec<AuthSessionId>> {
+    if batch_size == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = auth_session::Entity::find()
+        .filter(auth_session::Column::Status.eq("pending"))
+        .filter(auth_session::Column::ActivationExpiresAt.lte(now))
+        .order_by_asc(auth_session::Column::ActivationExpiresAt)
+        .order_by_asc(auth_session::Column::Id)
+        .limit(batch_size)
+        .all(db)
+        .await
+        .context("failed to list expired pending auth sessions")?;
+    let mut expired = Vec::with_capacity(rows.len());
+    for row in rows {
+        let device_id =
+            DeviceId::new(row.device_id).context("pending session has an invalid device id")?;
+        let session_id =
+            AuthSessionId::new(row.id).context("pending session has an invalid auth session id")?;
+        if expire_pending_auth_session(db, &session_id, &device_id, now).await? {
+            expired.push(session_id);
+        }
+    }
+    Ok(expired)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_current_refresh<C: ConnectionTrait>(
+    db: &C,
+    current_id: &RefreshCredentialId,
+    session_id: &AuthSessionId,
+    token_family_id: &TokenFamilyId,
+    expected_generation: u64,
+    expected_hash: &[u8; 32],
+    next_generation: u64,
+    next_hash: &[u8; 32],
+    exchange_request_id: &RequestId,
+    issued_at: DateTimeWithTimeZone,
+    expires_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let expected_generation =
+        i64::try_from(expected_generation).context("refresh generation overflow")?;
+    let result = auth_refresh_credential::Entity::update_many()
+        .col_expr(
+            auth_refresh_credential::Column::Generation,
+            Expr::value(i64::try_from(next_generation).context("refresh generation overflow")?),
+        )
+        .col_expr(
+            auth_refresh_credential::Column::TokenHash,
+            Expr::value(next_hash.to_vec()),
+        )
+        .col_expr(
+            auth_refresh_credential::Column::IssuedAt,
+            Expr::value(issued_at),
+        )
+        .col_expr(
+            auth_refresh_credential::Column::ExpiresAt,
+            Expr::value(expires_at),
+        )
+        .col_expr(
+            auth_refresh_credential::Column::ExchangeRequestId,
+            Expr::value(Some(exchange_request_id.to_string())),
+        )
+        .filter(auth_refresh_credential::Column::Id.eq(current_id.to_string()))
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
+        .filter(auth_refresh_credential::Column::Generation.eq(expected_generation))
+        .filter(auth_refresh_credential::Column::TokenHash.eq(expected_hash.to_vec()))
+        .exec(db)
+        .await
+        .context("failed to replace current refresh credential")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn advance_auth_session_refresh<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+    expected_generation: u64,
+    next_generation: u64,
+    refresh_expires_at: DateTimeWithTimeZone,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let result = auth_session::Entity::update_many()
+        .col_expr(
+            auth_session::Column::RefreshGeneration,
+            Expr::value(i64::try_from(next_generation).context("refresh generation overflow")?),
+        )
+        .col_expr(
+            auth_session::Column::RefreshExpiresAt,
+            Expr::value(Some(refresh_expires_at)),
+        )
+        .col_expr(
+            auth_session::Column::LastRefreshedAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::Status.eq("active"))
+        .filter(
+            auth_session::Column::RefreshGeneration
+                .eq(i64::try_from(expected_generation).context("refresh generation overflow")?),
+        )
+        .exec(db)
+        .await
+        .context("failed to advance auth session refresh generation")?;
+    Ok(result.rows_affected == 1)
+}
+
+pub async fn revoke_session_family_for_refresh_reuse<C: ConnectionTrait>(
+    db: &C,
+    session_id: &AuthSessionId,
+    token_family_id: &TokenFamilyId,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let session = auth_session::Entity::update_many()
+        .col_expr(auth_session::Column::Status, Expr::value("revoked"))
+        .col_expr(auth_session::Column::UpdatedAt, Expr::value(now))
+        .col_expr(auth_session::Column::RevokedAt, Expr::value(Some(now)))
+        .col_expr(
+            auth_session::Column::RevokeReason,
+            Expr::value(Some("refresh_reuse")),
+        )
+        .filter(auth_session::Column::Id.eq(session_id.to_string()))
+        .filter(auth_session::Column::TokenFamilyId.eq(token_family_id.to_string()))
+        .exec(db)
+        .await
+        .context("failed to revoke compromised auth session")?;
+    auth_refresh_credential::Entity::delete_many()
+        .filter(auth_refresh_credential::Column::SessionId.eq(session_id.to_string()))
+        .filter(auth_refresh_credential::Column::TokenFamilyId.eq(token_family_id.to_string()))
+        .exec(db)
+        .await
+        .context("failed to delete compromised refresh credential")?;
+    Ok(session.rows_affected == 1)
+}
+
+pub async fn scan_auth_persistence_invariants<C: ConnectionTrait>(
+    db: &C,
+) -> Result<AuthPersistenceInvariantReport> {
+    let mut violations = scan_auth_schema_invariants(db).await?;
+    let gateways = gateway_identity::Entity::find().all(db).await?;
+    let principals = gateway_principal::Entity::find().all(db).await?;
+    let devices = device::Entity::find().all(db).await?;
+    let sessions = auth_session::Entity::find().all(db).await?;
+    let refreshes = auth_refresh_credential::Entity::find().all(db).await?;
+    let invitations = invitation::Entity::find().all(db).await?;
+    let invitation_grants = invitation_workspace_grant::Entity::find().all(db).await?;
+    let recovery_audits = audit_event::Entity::find()
+        .filter(audit_event::Column::Action.eq("member_recovery_device_created"))
+        .all(db)
+        .await?;
+
+    let gateway_ids = gateways
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<HashSet<_>>();
+    let principal_by_id = principals
+        .iter()
+        .map(|row| (row.id.as_str(), row))
+        .collect::<HashMap<_, _>>();
+    let device_by_id = devices
+        .iter()
+        .map(|row| (row.id.as_str(), row))
+        .collect::<HashMap<_, _>>();
+    let session_by_id = sessions
+        .iter()
+        .map(|row| (row.id.as_str(), row))
+        .collect::<HashMap<_, _>>();
+    let mut invitation_grant_counts = HashMap::<&str, usize>::new();
+    for grant in &invitation_grants {
+        if InvitationId::new(grant.invitation_id.clone()).is_err()
+            || WorkspaceId::new(grant.workspace_id.clone()).is_err()
+        {
+            violations.push(format!(
+                "invitation grant `{}/{}` has invalid domain IDs",
+                grant.invitation_id, grant.workspace_id
+            ));
+        }
+        *invitation_grant_counts
+            .entry(grant.invitation_id.as_str())
+            .or_default() += 1;
+    }
+
+    let mut accepted_invitation_sessions = HashMap::<String, usize>::new();
+    for row in &invitations {
+        let creator = principal_by_id.get(row.created_by_principal_id.as_str());
+        let creator_session = session_by_id.get(row.created_by_session_id.as_str());
+        let grant_count = invitation_grant_counts
+            .get(row.id.as_str())
+            .copied()
+            .unwrap_or_default();
+        let ttl_seconds = row
+            .expires_at
+            .signed_duration_since(row.created_at)
+            .num_seconds();
+        let valid_token_hash = row
+            .token_hash
+            .as_ref()
+            .is_none_or(|token_hash| token_hash.len() == 32);
+        let valid_state = match row.status.as_str() {
+            "pending" => {
+                row.token_hash.is_some()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            "accepted" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_some()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_some()
+                    && row.accepted_device_id.is_some()
+                    && row.accepted_session_id.is_some()
+                    && row.revoke_reason.is_none()
+            }
+            "revoked" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_some()
+                    && row.expired_at.is_none()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.as_deref().is_some_and(|reason| {
+                        matches!(
+                            reason,
+                            "inviter_revoked"
+                                | "inviter_unavailable"
+                                | "grant_authority_lost"
+                                | "workspace_unavailable"
+                        )
+                    })
+            }
+            "expired" => {
+                row.token_hash.is_none()
+                    && row.accepted_at.is_none()
+                    && row.revoked_at.is_none()
+                    && row.expired_at.is_some()
+                    && row.accepted_principal_id.is_none()
+                    && row.accepted_device_id.is_none()
+                    && row.accepted_session_id.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            _ => false,
+        };
+        if InvitationId::new(row.id.clone()).is_err()
+            || GatewayId::new(row.gateway_id.clone()).is_err()
+            || PrincipalId::new(row.created_by_principal_id.clone()).is_err()
+            || AuthSessionId::new(row.created_by_session_id.clone()).is_err()
+            || row.token_format_version != 1
+            || !valid_token_hash
+            || !valid_state
+            || u64::try_from(ttl_seconds).ok() != Some(INVITATION_TTL_SECONDS)
+            || !(INVITATION_MIN_WORKSPACE_GRANTS..=INVITATION_MAX_WORKSPACE_GRANTS)
+                .contains(&grant_count)
+        {
+            violations.push(format!(
+                "invitation `{}` violates its bounded domain contract",
+                row.id
+            ));
+        }
+        if !gateway_ids.contains(row.gateway_id.as_str())
+            || creator.is_none_or(|principal| principal.gateway_id != row.gateway_id)
+            || creator_session.is_none_or(|session| {
+                session.gateway_id != row.gateway_id
+                    || session.principal_id != row.created_by_principal_id
+            })
+        {
+            violations.push(format!(
+                "invitation `{}` has mismatched creator ownership",
+                row.id
+            ));
+        }
+
+        if row.status == "accepted" {
+            let accepted_principal = row
+                .accepted_principal_id
+                .as_deref()
+                .and_then(|id| principal_by_id.get(id));
+            let accepted_device = row
+                .accepted_device_id
+                .as_deref()
+                .and_then(|id| device_by_id.get(id));
+            let accepted_session = row
+                .accepted_session_id
+                .as_deref()
+                .and_then(|id| session_by_id.get(id));
+            let ownership_matches = accepted_principal.is_some_and(|principal| {
+                principal.gateway_id == row.gateway_id && principal.kind == "user"
+            }) && accepted_device.is_some_and(|device| {
+                Some(device.principal_id.as_str()) == row.accepted_principal_id.as_deref()
+                    && device.gateway_id == row.gateway_id
+            }) && accepted_session.is_some_and(|session| {
+                Some(session.principal_id.as_str()) == row.accepted_principal_id.as_deref()
+                    && Some(session.device_id.as_str()) == row.accepted_device_id.as_deref()
+                    && session.gateway_id == row.gateway_id
+                    && session.created_by_session_id.is_none()
+            });
+            if !ownership_matches {
+                violations.push(format!(
+                    "accepted invitation `{}` has mismatched session provenance",
+                    row.id
+                ));
+            } else if let Some(session_id) = row.accepted_session_id.as_ref() {
+                *accepted_invitation_sessions
+                    .entry(session_id.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let mut recovery_sessions = HashMap::<String, usize>::new();
+    for row in &recovery_audits {
+        let metadata =
+            serde_json::from_value::<BoundedServerGeneratedMetadata>(row.metadata_json.clone());
+        let binding = metadata
+            .as_ref()
+            .ok()
+            .and_then(BoundedServerGeneratedMetadata::recovery_device_binding);
+        let valid = row.domain == "administration"
+            && row.metadata_version == i64::from(AUDIT_METADATA_VERSION_V1)
+            && row.target_kind == "device_session"
+            && binding.is_some_and(|(principal_id, device_id, session_id)| {
+                row.target_id == device_id.as_str()
+                    && device_by_id.get(device_id.as_str()).is_some_and(|device| {
+                        device.gateway_id == row.gateway_id
+                            && device.principal_id == principal_id.as_str()
+                            && device.id == row.target_id
+                            && session_by_id
+                                .get(session_id.as_str())
+                                .is_some_and(|session| {
+                                    session.gateway_id == row.gateway_id
+                                        && session.device_id == device.id
+                                        && session.principal_id == device.principal_id
+                                        && session.created_by_session_id.is_none()
+                                })
+                    })
+            });
+        if !valid {
+            violations.push(format!(
+                "recovery audit `{}` has invalid session provenance",
+                row.id
+            ));
+        } else if let Some((_, _, session_id)) = binding {
+            *recovery_sessions.entry(session_id.to_string()).or_default() += 1;
+        }
+    }
+    let mut active_installations = HashSet::new();
+
+    for row in &devices {
+        let metadata_present = row.installation_id.is_some()
+            && row.display_name.is_some()
+            && row.client_kind.is_some();
+        let metadata_absent = row.installation_id.is_none()
+            && row.display_name.is_none()
+            && row.client_kind.is_none()
+            && row.platform.is_none()
+            && row.client_version.is_none();
+        let invalid_domain = DeviceId::new(row.id.clone()).is_err()
+            || GatewayId::new(row.gateway_id.clone()).is_err()
+            || PrincipalId::new(row.principal_id.clone()).is_err()
+            || row
+                .installation_id
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_text(value, 255))
+            || row
+                .display_name
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_text(value, 255))
+            || row
+                .platform
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_text(value, 255))
+            || row
+                .client_version
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_text(value, 255))
+            || row
+                .client_kind
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "desktop" | "mobile" | "other"))
+            || (!metadata_present && !metadata_absent);
+        if invalid_domain {
+            violations.push(format!("device `{}` has invalid domain data", row.id));
+        }
+        if row.status == "active" {
+            if let Some(installation_id) = row.installation_id.as_deref()
+                && !active_installations.insert((
+                    row.gateway_id.as_str(),
+                    row.principal_id.as_str(),
+                    installation_id,
+                ))
+            {
+                violations.push(format!(
+                    "installation `{installation_id}` has multiple active devices"
+                ));
+            }
+        }
+        let owner = principal_by_id.get(row.principal_id.as_str());
+        if !gateway_ids.contains(row.gateway_id.as_str())
+            || owner.is_none_or(|owner| owner.gateway_id != row.gateway_id)
+        {
+            violations.push(format!("device `{}` has mismatched ownership", row.id));
+        }
+        if matches!(row.status.as_str(), "pending" | "active")
+            && owner.is_none_or(|owner| !is_supported_active_auth_owner(owner))
+        {
+            violations.push(format!(
+                "device `{}` has an inactive or unsupported owner",
+                row.id
+            ));
+        }
+        let valid_state = match row.status.as_str() {
+            "pending" => metadata_absent && row.last_seen_at.is_none() && row.revoked_at.is_none(),
+            "active" => metadata_present && row.last_seen_at.is_some() && row.revoked_at.is_none(),
+            "revoked" => {
+                row.revoked_at.is_some()
+                    && ((metadata_absent && row.last_seen_at.is_none())
+                        || (metadata_present && row.last_seen_at.is_some()))
+            }
+            _ => false,
+        };
+        if !valid_state {
+            violations.push(format!("device `{}` has impossible revoke state", row.id));
+        }
+    }
+
+    let mut active_devices = HashSet::new();
+    let mut pending_creators = HashSet::new();
+    let mut pending_local_principals = HashSet::new();
+    let mut pending_activation_locator_hashes = HashSet::new();
+    let mut pending_activation_hashes = HashSet::new();
+    let mut families = HashSet::new();
+    let mut sessions_by_device = HashMap::<&str, Vec<&auth_session::Model>>::new();
+    for row in &sessions {
+        if AuthSessionId::new(row.id.clone()).is_err()
+            || GatewayId::new(row.gateway_id.clone()).is_err()
+            || PrincipalId::new(row.principal_id.clone()).is_err()
+            || DeviceId::new(row.device_id.clone()).is_err()
+            || TokenFamilyId::new(row.token_family_id.clone()).is_err()
+            || row
+                .created_by_session_id
+                .as_ref()
+                .is_some_and(|id| AuthSessionId::new(id.clone()).is_err())
+            || row.activation_token_hash.len() != 32
+            || row.activation_locator_hash.len() != 32
+            || row.activation_failed_attempts < 0
+            || row.activation_failed_attempts > i64::from(DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS)
+        {
+            violations.push(format!("session `{}` has invalid domain IDs", row.id));
+        }
+        sessions_by_device
+            .entry(row.device_id.as_str())
+            .or_default()
+            .push(row);
+        let owner = principal_by_id.get(row.principal_id.as_str());
+        let owned_device = device_by_id.get(row.device_id.as_str());
+        if !gateway_ids.contains(row.gateway_id.as_str())
+            || owner.is_none_or(|owner| owner.gateway_id != row.gateway_id)
+            || owned_device.is_none_or(|device| {
+                device.gateway_id != row.gateway_id || device.principal_id != row.principal_id
+            })
+        {
+            violations.push(format!("session `{}` has mismatched ownership", row.id));
+        }
+        if matches!(row.status.as_str(), "pending" | "active")
+            && owner.is_none_or(|owner| !is_supported_active_auth_owner(owner))
+        {
+            violations.push(format!(
+                "session `{}` has an inactive or unsupported owner",
+                row.id
+            ));
+        }
+        if let Some(creator_session_id) = row.created_by_session_id.as_deref() {
+            let creator = session_by_id.get(creator_session_id);
+            if creator.is_none_or(|creator| {
+                creator.gateway_id != row.gateway_id || creator.principal_id != row.principal_id
+            }) {
+                violations.push(format!(
+                    "session `{}` has a mismatched creator session",
+                    row.id
+                ));
+            }
+            if row.status == "pending" && !pending_creators.insert(creator_session_id) {
+                violations.push(format!(
+                    "session `{creator_session_id}` created multiple pending sessions"
+                ));
+            }
+        } else if row.status == "pending"
+            && !pending_local_principals
+                .insert((row.gateway_id.as_str(), row.principal_id.as_str()))
+        {
+            violations.push(format!(
+                "principal `{}` has multiple pending local sessions",
+                row.principal_id
+            ));
+        }
+        if row.created_by_session_id.is_none()
+            && owner.is_some_and(|owner| owner.kind == "user")
+            && matches!(row.status.as_str(), "pending" | "active")
+        {
+            let accepted_references = accepted_invitation_sessions
+                .get(row.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let recovery_references = recovery_sessions
+                .get(row.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let valid_provenance = match row.status.as_str() {
+                "pending" => accepted_references == 0 && recovery_references == 1,
+                "active" => accepted_references + recovery_references == 1,
+                _ => true,
+            };
+            if !valid_provenance {
+                violations.push(format!(
+                    "User session `{}` has no exact invitation or recovery provenance",
+                    row.id
+                ));
+            }
+        }
+        if row.status == "pending"
+            && !pending_activation_locator_hashes.insert((
+                row.gateway_id.as_str(),
+                row.activation_locator_hash.as_slice(),
+            ))
+        {
+            violations.push(format!(
+                "Gateway `{}` has duplicate pending activation locator",
+                row.gateway_id
+            ));
+        }
+        if row.status == "active" && !active_devices.insert(row.device_id.as_str()) {
+            violations.push(format!(
+                "device `{}` has multiple active sessions",
+                row.device_id
+            ));
+        }
+        if !families.insert(row.token_family_id.as_str()) {
+            violations.push(format!("duplicate token family `{}`", row.token_family_id));
+        }
+        if row.status == "pending"
+            && !pending_activation_hashes.insert(row.activation_token_hash.as_slice())
+        {
+            violations.push("multiple pending sessions share one activation token hash".to_owned());
+        }
+        if row.status == "pending" && owned_device.is_some_and(|device| device.status != "pending")
+        {
+            violations.push(format!(
+                "pending session `{}` does not own a pending device",
+                row.id
+            ));
+        }
+        if row.status == "active" && owned_device.is_some_and(|device| device.status != "active") {
+            violations.push(format!(
+                "active session `{}` belongs to a revoked device",
+                row.id
+            ));
+        }
+        if matches!(row.status.as_str(), "revoked" | "expired")
+            && owned_device.is_some_and(|device| device.status != "revoked")
+        {
+            violations.push(format!(
+                "terminal session `{}` does not own a revoked device",
+                row.id
+            ));
+        }
+        let runtime_absent = row.activated_at.is_none()
+            && row.last_seen_at.is_none()
+            && row.last_refreshed_at.is_none()
+            && row.refresh_expires_at.is_none();
+        let runtime_present = row.activated_at.is_some()
+            && row.last_seen_at.is_some()
+            && row.last_refreshed_at.is_some()
+            && row.refresh_expires_at.is_some();
+        let valid_state = match row.status.as_str() {
+            "pending" => {
+                row.activation_failed_attempts < i64::from(DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS)
+                    && runtime_absent
+                    && row.revoked_at.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            "active" => {
+                row.activation_failed_attempts < i64::from(DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS)
+                    && runtime_present
+                    && row.revoked_at.is_none()
+                    && row.revoke_reason.is_none()
+            }
+            "revoked" => {
+                row.revoked_at.is_some()
+                    && row
+                        .revoke_reason
+                        .as_deref()
+                        .is_some_and(valid_session_revoke_reason)
+            }
+            "expired" => row.revoked_at.is_some() && row.revoke_reason.is_none(),
+            _ => false,
+        };
+        if !valid_state {
+            violations.push(format!("session `{}` has impossible revoke state", row.id));
+        }
+        if row.refresh_generation < 0
+            || row.activation_expires_at < row.created_at
+            || row
+                .refresh_expires_at
+                .is_some_and(|expires_at| expires_at < row.created_at)
+            || (!runtime_absent && !runtime_present)
+        {
+            violations.push(format!("session `{}` has impossible refresh state", row.id));
+        }
+    }
+
+    for row in &devices {
+        let owned_sessions = sessions_by_device
+            .get(row.id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if owned_sessions.is_empty() {
+            violations.push(format!("device `{}` has no auth session", row.id));
+        }
+        if row.status == "active"
+            && !owned_sessions
+                .iter()
+                .any(|session| session.status == "active")
+        {
+            violations.push(format!("active device `{}` has no active session", row.id));
+        }
+        if row.status == "pending"
+            && !owned_sessions
+                .iter()
+                .any(|session| session.status == "pending")
+        {
+            violations.push(format!(
+                "pending device `{}` has no pending session",
+                row.id
+            ));
+        }
+    }
+
+    let mut refresh_sessions = HashSet::new();
+    let mut refresh_families = HashSet::new();
+    let mut refresh_hashes = HashSet::new();
+    for row in &refreshes {
+        if RefreshCredentialId::new(row.id.clone()).is_err()
+            || AuthSessionId::new(row.session_id.clone()).is_err()
+            || TokenFamilyId::new(row.token_family_id.clone()).is_err()
+        {
+            violations.push(format!("refresh `{}` has invalid domain IDs", row.id));
+        }
+        let session = session_by_id.get(row.session_id.as_str());
+        if !refresh_sessions.insert(row.session_id.as_str()) {
+            violations.push(format!(
+                "session `{}` has multiple current refresh credentials",
+                row.session_id
+            ));
+        }
+        if !refresh_families.insert(row.token_family_id.as_str()) {
+            violations.push(format!(
+                "token family `{}` has multiple current refresh credentials",
+                row.token_family_id
+            ));
+        }
+        if !refresh_hashes.insert(row.token_hash.as_slice()) {
+            violations.push("multiple refresh credentials share one token hash".to_owned());
+        }
+        if session.is_none_or(|session| session.token_family_id != row.token_family_id) {
+            violations.push(format!("refresh `{}` has mismatched ownership", row.id));
+        }
+        if row.generation < 0
+            || row.token_hash.len() != 32
+            || row.expires_at < row.issued_at
+            || session.is_some_and(|session| {
+                session.status != "active"
+                    || row.generation != session.refresh_generation
+                    || session.refresh_expires_at.as_ref() != Some(&row.expires_at)
+            })
+        {
+            violations.push(format!(
+                "refresh `{}` does not match its active session",
+                row.id
+            ));
+        }
+    }
+
+    for row in &sessions {
+        let has_refresh = refresh_sessions.contains(row.id.as_str());
+        if row.status == "active" && !has_refresh {
+            violations.push(format!(
+                "active session `{}` has no current refresh credential",
+                row.id
+            ));
+        }
+        if row.status != "active" && has_refresh {
+            violations.push(format!(
+                "terminal session `{}` still has a current refresh credential",
+                row.id
+            ));
+        }
+    }
+
+    const MAX_REPORTED_AUTH_INVARIANTS: usize = 64;
+    if violations.len() > MAX_REPORTED_AUTH_INVARIANTS {
+        violations.truncate(MAX_REPORTED_AUTH_INVARIANTS);
+        violations.push("additional auth persistence violations omitted".to_owned());
+    }
+    Ok(AuthPersistenceInvariantReport { violations })
+}
+
+fn is_supported_active_auth_owner(owner: &gateway_principal::Model) -> bool {
+    if owner.status != "active" {
+        return false;
+    }
+    match owner.kind.as_str() {
+        "superuser" => owner.role_key.is_none(),
+        "user" => owner
+            .role_key
+            .as_deref()
+            .and_then(|value| RoleKey::new(value).ok())
+            .is_some(),
+        _ => false,
+    }
+}
+
+async fn scan_auth_schema_invariants<C: ConnectionTrait>(db: &C) -> Result<Vec<String>> {
+    const REQUIRED_INDEXES: &[&str] = &[
+        "idx_device_owner_status",
+        "idx_device_active_installation",
+        "idx_device_principal_last_seen",
+        "idx_auth_session_token_family",
+        "idx_auth_session_activation_hash",
+        "idx_auth_session_pending_activation_locator_hash",
+        "idx_auth_session_pending_creator",
+        "idx_auth_session_pending_local",
+        "idx_auth_session_active_device",
+        "idx_auth_session_principal_status",
+        "idx_auth_session_device_status",
+        "idx_auth_session_expiry_status",
+        "idx_auth_refresh_token_hash",
+        "idx_auth_refresh_session",
+        "idx_auth_refresh_family",
+    ];
+    const REQUIRED_TABLE_CONSTRAINTS: &[(&str, &[&str])] = &[
+        (
+            "device",
+            &[
+                "device_check",
+                "device_installation_id_check",
+                "device_display_name_check",
+                "device_client_kind_check",
+                "device_check1",
+                "device_status_check",
+                "device_check2",
+            ],
+        ),
+        (
+            "auth_session",
+            &[
+                "auth_session_check",
+                "auth_session_activation_token_hash_check",
+                "auth_session_activation_locator_hash_check",
+                "auth_session_activation_failed_attempts_check",
+                "auth_session_check1",
+                "auth_session_status_check",
+                "auth_session_refresh_generation_check",
+                "auth_session_check2",
+                "auth_session_check3",
+                "auth_session_check4",
+                "auth_session_revoke_reason_check",
+            ],
+        ),
+        (
+            "auth_refresh_credential",
+            &[
+                "auth_refresh_credential_check",
+                "auth_refresh_credential_generation_check",
+                "auth_refresh_credential_token_hash_check",
+                "auth_refresh_credential_check1",
+                "auth_refresh_credential_exchange_request_id_check",
+            ],
+        ),
+    ];
+
+    // SeaORM does not expose indexes and validated CHECK constraints for an
+    // existing PostgreSQL table. Keep checks within the current schema.
+    let index_rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT idx.relname AS name
+             FROM pg_index i
+             JOIN pg_class idx ON idx.oid = i.indexrelid
+             JOIN pg_namespace ns ON ns.oid = idx.relnamespace
+             WHERE ns.nspname = current_schema() AND i.indisvalid AND i.indisready",
+        ))
+        .await
+        .context("failed to inspect auth persistence indexes")?;
+    let index_names = index_rows
+        .iter()
+        .map(|row| row.try_get::<String>("", "name"))
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .context("failed to decode auth persistence index metadata")?;
+
+    let constraint_rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT t.relname AS table_name, c.conname AS constraint_name
+             FROM pg_constraint c
+             JOIN pg_class t ON t.oid = c.conrelid
+             JOIN pg_namespace ns ON ns.oid = t.relnamespace
+             WHERE ns.nspname = current_schema() AND c.contype = 'c'
+               AND c.convalidated AND c.conenforced",
+        ))
+        .await
+        .context("failed to inspect auth persistence constraints")?;
+    let mut constraints_by_table = HashMap::<String, HashSet<String>>::new();
+    for row in constraint_rows {
+        let table = row.try_get("", "table_name")?;
+        let constraint = row.try_get("", "constraint_name")?;
+        constraints_by_table
+            .entry(table)
+            .or_default()
+            .insert(constraint);
+    }
+
+    let mut violations = Vec::new();
+    for required in REQUIRED_INDEXES {
+        if !index_names.contains(*required) {
+            violations.push(format!("required auth index `{required}` is missing"));
+        }
+    }
+    for (table, constraints) in REQUIRED_TABLE_CONSTRAINTS {
+        let Some(actual) = constraints_by_table.get(*table) else {
+            violations.push(format!("required auth table `{table}` is missing"));
+            continue;
+        };
+        for constraint in *constraints {
+            if !actual.contains(*constraint) {
+                violations.push(format!(
+                    "required auth constraint `{constraint}` is missing from `{table}`"
+                ));
+            }
+        }
+    }
+    Ok(violations)
+}
+
+fn valid_session_revoke_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "logout"
+            | "self_revoke"
+            | "device_revoke"
+            | "activation_attempts_exceeded"
+            | "refresh_reuse"
+            | "principal_suspended"
+            | "principal_removed"
+            | "superseded"
+            | "security_reset"
+    )
+}
+
+fn valid_bounded_text(value: &str, max_chars: usize) -> bool {
+    value.trim() == value
+        && !value.is_empty()
+        && value.chars().count() <= max_chars
+        && !value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use pioneer_postgres_test::{TestDatabase, with_database};
+    use sea_orm::{DatabaseConnection, Statement};
+
+    use super::*;
+
+    async fn fixture(fixture: &TestDatabase) -> DatabaseConnection {
+        let db = fixture.connection().clone();
+        db.execute_unprepared(
+            "INSERT INTO gateway_identity(id, singleton_key, identity_bootstrap_version, auth_schema_version, created_at, updated_at) VALUES ('G00000000000000000001', 1, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .await
+        .expect("identity");
+        db.execute_unprepared(
+            "INSERT INTO gateway_principal(id, gateway_id, kind, role_key, status, display_name, nickname, nickname_key, created_at, updated_at, removed_at) VALUES ('P00000000000000000001', 'G00000000000000000001', 'superuser', NULL, 'active', 'Superuser', 'superuser', 'superuser', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)",
+        )
+        .await
+        .expect("principal");
+        db
+    }
+
+    async fn valid_auth_fixture(fixture_database: &TestDatabase) -> DatabaseConnection {
+        let db = fixture(fixture_database).await;
+        insert_active_session_fixture(
+            &db,
+            "D00000000000000000001",
+            "S00000000000000000001",
+            "F00000000000000000001",
+            "R00000000000000000001",
+            "desktop-a",
+            ClientKind::Desktop,
+            [1; 32],
+            [11; 32],
+        )
+        .await;
+        assert!(
+            scan_auth_persistence_invariants(&db)
+                .await
+                .expect("valid invariant scan")
+                .is_valid()
+        );
+        db
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_active_session_fixture(
+        db: &sea_orm::DatabaseConnection,
+        device_raw: &str,
+        session_raw: &str,
+        family_raw: &str,
+        refresh_raw: &str,
+        installation_id: &str,
+        client_kind: ClientKind,
+        activation_hash: [u8; 32],
+        refresh_hash: [u8; 32],
+    ) {
+        let now = chrono::Utc::now().fixed_offset();
+        let refresh_expires_at = now + chrono::Duration::days(90);
+        let device_id = DeviceId::new(device_raw).unwrap();
+        let session_id = AuthSessionId::new(session_raw).unwrap();
+        let token_family_id = TokenFamilyId::new(family_raw).unwrap();
+        insert_pending_device_session(
+            db,
+            NewPendingDeviceSessionRow {
+                device_id: device_id.clone(),
+                session_id: session_id.clone(),
+                gateway_id: gateway_id(),
+                principal_id: principal_id(),
+                token_family_id: token_family_id.clone(),
+                issuer: PendingSessionIssuer::LocalCli,
+                activation_token_hash: activation_hash,
+                activation_locator_hash: [17; 32],
+                activation_expires_at: now + chrono::Duration::minutes(10),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+        let installation = ClientInstallationDescriptor {
+            installation_id: installation_id.to_owned(),
+            display_name: installation_id.to_owned(),
+            client_kind,
+            platform: None,
+            client_version: None,
+        };
+        activate_pending_device(db, &device_id, &installation, now)
+            .await
+            .unwrap()
+            .expect("pending device activates");
+        activate_pending_auth_session(db, &session_id, refresh_expires_at, now)
+            .await
+            .unwrap()
+            .expect("pending session activates");
+        insert_refresh_credential(
+            db,
+            NewRefreshCredentialRow {
+                id: RefreshCredentialId::new(refresh_raw).unwrap(),
+                session_id,
+                token_family_id,
+                generation: 0,
+                token_hash: refresh_hash,
+                issued_at: now,
+                expires_at: refresh_expires_at,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn gateway_id() -> GatewayId {
+        GatewayId::new("G00000000000000000001").unwrap()
+    }
+
+    fn principal_id() -> PrincipalId {
+        PrincipalId::new("P00000000000000000001").unwrap()
+    }
+
+    #[tokio::test]
+    async fn repositories_support_two_independent_devices_and_current_refreshes() {
+        with_database(async |fixture_db| {
+            let db = fixture(fixture_db).await;
+
+            for (device_raw, session_raw, installation) in [
+                (
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                    "desktop-a",
+                ),
+                ("D00000000000000000002", "S00000000000000000002", "mobile-b"),
+            ] {
+                let suffix: u8 = if installation == "desktop-a" { 1 } else { 2 };
+                insert_active_session_fixture(
+                    &db,
+                    device_raw,
+                    session_raw,
+                    if suffix == 1 {
+                        "F00000000000000000001"
+                    } else {
+                        "F00000000000000000002"
+                    },
+                    if suffix == 1 {
+                        "R00000000000000000001"
+                    } else {
+                        "R00000000000000000002"
+                    },
+                    installation,
+                    ClientKind::Other,
+                    [suffix; 32],
+                    [suffix + 10; 32],
+                )
+                .await;
+            }
+
+            assert_eq!(
+                list_sessions_for_principal(&db, &principal_id())
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                scan_auth_persistence_invariants(&db)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+
+            let now = chrono::Utc::now().fixed_offset();
+            let expires = now + chrono::Duration::days(90);
+            let duplicate = insert_refresh_credential(
+                &db,
+                NewRefreshCredentialRow {
+                    id: RefreshCredentialId::new("R00000000000000000003").unwrap(),
+                    session_id: AuthSessionId::new("S00000000000000000001").unwrap(),
+                    token_family_id: TokenFamilyId::new("F00000000000000000001").unwrap(),
+                    generation: 1,
+                    token_hash: [3; 32],
+                    issued_at: now,
+                    expires_at: expires,
+                },
+            )
+            .await;
+            assert!(
+                duplicate.is_err(),
+                "database must reject a second current branch"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_fails_closed_for_dangling_owner() {
+        with_database(async |fixture_db| {
+            let db = fixture(fixture_db).await;
+            insert_active_session_fixture(
+                &db,
+                "D00000000000000000001",
+                "S00000000000000000001",
+                "F00000000000000000001",
+                "R00000000000000000001",
+                "desktop-a",
+                ClientKind::Desktop,
+                [1; 32],
+                [11; 32],
+            )
+            .await;
+            db.execute_unprepared("ALTER TABLE device DROP CONSTRAINT device_principal_id_fkey")
+                .await
+                .unwrap();
+            db.execute_raw(Statement::from_string(
+                db.get_database_backend(),
+                "UPDATE device SET principal_id = 'P00000000000000000099'".to_owned(),
+            ))
+            .await
+            .unwrap();
+
+            let report = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(!report.is_valid());
+            assert!(
+                report
+                    .violations
+                    .iter()
+                    .any(|value| value.contains("mismatched ownership"))
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_uses_character_bounds_for_normalized_device_metadata() {
+        with_database(async |fixture_db| {
+            let db = valid_auth_fixture(fixture_db).await;
+            let device = device::Entity::find_by_id("D00000000000000000001")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut active: device::ActiveModel = device.into();
+            active.display_name = Set(Some("Я".repeat(255)));
+            active.platform = Set(Some("мобильная".to_owned()));
+            active.update(&db).await.unwrap();
+
+            assert!(
+                scan_auth_persistence_invariants(&db)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_rejects_missing_auth_schema_guards_before_new_corruption() {
+        with_database(async |fixture_db| {
+            let db = valid_auth_fixture(fixture_db).await;
+            db.execute_unprepared("DROP INDEX idx_auth_refresh_token_hash")
+                .await
+                .unwrap();
+
+            let report = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(
+                report
+                    .violations
+                    .iter()
+                    .any(|value| value.contains("idx_auth_refresh_token_hash"))
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_rejects_active_sessions_for_inactive_or_malformed_users() {
+        for mutation in [
+            "UPDATE gateway_principal SET kind='user', role_key='member', status='suspended'",
+            "UPDATE gateway_principal SET kind='user', role_key='member', status='removed'",
+            "UPDATE gateway_principal SET kind='user', role_key=NULL, status='active'",
+            "UPDATE gateway_principal SET kind='user', role_key='Viewer', status='active'",
+        ] {
+            with_database(async |fixture_db| {
+                let db = valid_auth_fixture(fixture_db).await;
+                db.execute_unprepared(
+                    "ALTER TABLE gateway_principal DROP CONSTRAINT gateway_principal_check, DROP CONSTRAINT gateway_principal_check2",
+                )
+                .await
+                .unwrap();
+                db.execute_unprepared(mutation).await.unwrap();
+
+                let report = scan_auth_persistence_invariants(&db).await.unwrap();
+                assert!(
+                    report
+                        .violations
+                        .iter()
+                        .any(|value| value.contains("inactive or unsupported owner")),
+                    "expected owner violation for `{mutation}`, got {:?}",
+                    report.violations
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        with_database(async |fixture_db| {
+            let db = valid_auth_fixture(fixture_db).await;
+            db.execute_unprepared(
+                "UPDATE gateway_principal SET kind='user', role_key='viewer', status='active'",
+            )
+            .await
+            .unwrap();
+            let report = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(
+                !report
+                    .violations
+                    .iter()
+                    .any(|value| value.contains("inactive or unsupported owner")),
+                "a structurally valid future role must not be rejected by persistence: {:?}",
+                report.violations
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_detects_every_epic3_corruption_class() {
+        let cases = [
+            (
+                "ALTER TABLE auth_session DROP CONSTRAINT auth_session_device_id_fkey; ALTER TABLE device DROP CONSTRAINT device_check; UPDATE device SET id = 'invalid-device-id'",
+                "invalid domain data",
+            ),
+            (
+                "ALTER TABLE auth_session DROP CONSTRAINT auth_session_check4; UPDATE auth_session SET status = 'revoked'",
+                "impossible revoke state",
+            ),
+            (
+                "DROP INDEX idx_device_active_installation;
+                 INSERT INTO device(id,gateway_id,principal_id,installation_id,display_name,client_kind,status,created_at,updated_at,last_seen_at) VALUES('D00000000000000000002','G00000000000000000001','P00000000000000000001','desktop-a','Duplicate','desktop','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+                 INSERT INTO auth_session(id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,activation_token_hash,activation_locator_hash,activation_failed_attempts,activation_expires_at,activated_at,status,refresh_generation,created_at,updated_at,last_seen_at,last_refreshed_at,refresh_expires_at) VALUES('S00000000000000000002','G00000000000000000001','P00000000000000000001','D00000000000000000002','F00000000000000000002',NULL,sha256(gen_random_uuid()::text::bytea),sha256(gen_random_uuid()::text::bytea),0,(CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,(CURRENT_TIMESTAMP + INTERVAL '90 days'));
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000002','F00000000000000000002',0,sha256(gen_random_uuid()::text::bytea),CURRENT_TIMESTAMP,(CURRENT_TIMESTAMP + INTERVAL '90 days'))",
+                "multiple active devices",
+            ),
+            (
+                "DROP INDEX idx_auth_refresh_session;
+                 INSERT INTO auth_refresh_credential(id,session_id,token_family_id,generation,token_hash,issued_at,expires_at) VALUES('R00000000000000000002','S00000000000000000001','F00000000000000000002',1,sha256(gen_random_uuid()::text::bytea),CURRENT_TIMESTAMP,(CURRENT_TIMESTAMP + INTERVAL '90 days'))",
+                "multiple current refresh credentials",
+            ),
+            (
+                "ALTER TABLE auth_session DROP CONSTRAINT auth_session_created_by_session_id_fkey; UPDATE auth_session SET created_by_session_id = 'S00000000000000000099'",
+                "mismatched creator session",
+            ),
+            (
+                "ALTER TABLE auth_session DROP CONSTRAINT auth_session_activation_failed_attempts_check; ALTER TABLE auth_session DROP CONSTRAINT auth_session_check4; UPDATE auth_session SET activation_failed_attempts = 6",
+                "invalid domain IDs",
+            ),
+        ];
+
+        for (mutation, expected) in cases {
+            with_database(async |fixture_db| {
+                let db = valid_auth_fixture(fixture_db).await;
+                db.execute_unprepared(mutation)
+                    .await
+                    .expect("inject auth corruption");
+                let report = scan_auth_persistence_invariants(&db)
+                    .await
+                    .expect("corruption scan");
+                assert!(
+                    report
+                        .violations
+                        .iter()
+                        .any(|violation| violation.contains(expected)),
+                    "expected `{expected}` in {:?}",
+                    report.violations
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_requires_exact_accepted_invitation_session_provenance_and_ttl() {
+        with_database(async |fixture_db| {
+            let db = valid_auth_fixture(fixture_db).await;
+            db.execute_unprepared(
+                "INSERT INTO gateway_principal(
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                created_at,updated_at,removed_at
+             ) VALUES(
+                'P00000000000000000002','G00000000000000000001','user','member','active',
+                'Member','member','member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+             );
+             INSERT INTO workspace(id,name,is_active,is_current)
+             VALUES('W00000000000000000001','Workspace',true,false)",
+            )
+            .await
+            .unwrap();
+            insert_active_session_fixture(
+                &db,
+                "D00000000000000000002",
+                "S00000000000000000002",
+                "F00000000000000000002",
+                "R00000000000000000002",
+                "member-mobile",
+                ClientKind::Mobile,
+                [2; 32],
+                [12; 32],
+            )
+            .await;
+            db.execute_unprepared(
+                "UPDATE device SET principal_id='P00000000000000000002'
+                 WHERE id='D00000000000000000002';
+             UPDATE auth_session SET principal_id='P00000000000000000002'
+                 WHERE id='S00000000000000000002'",
+            )
+            .await
+            .unwrap();
+
+            let missing = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(missing.violations.iter().any(|violation| {
+                violation.contains("has no exact invitation or recovery provenance")
+            }));
+
+            db.execute_unprepared(
+                "INSERT INTO invitation(
+                id,gateway_id,created_by_principal_id,created_by_session_id,target_role_key,
+                status,token_hash,
+                token_format_version,expires_at,accepted_at,revoked_at,expired_at,
+                accepted_principal_id,accepted_device_id,accepted_session_id,revoke_reason,
+                created_at,updated_at
+             ) VALUES(
+                'I00000000000000000001','G00000000000000000001',
+                'P00000000000000000001','S00000000000000000001','member','accepted',NULL,1,
+                '2026-01-08 00:00:00 +00:00','2026-01-01 00:00:01 +00:00',NULL,NULL,
+                'P00000000000000000002','D00000000000000000002',
+                'S00000000000000000002',NULL,
+                '2026-01-01 00:00:00 +00:00','2026-01-01 00:00:01 +00:00'
+             );
+             INSERT INTO invitation_workspace_grant(invitation_id,workspace_id,created_at)
+             VALUES(
+                'I00000000000000000001','W00000000000000000001',
+                '2026-01-01 00:00:00 +00:00'
+             )",
+            )
+            .await
+            .unwrap();
+            assert!(
+                scan_auth_persistence_invariants(&db)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+
+            db.execute_unprepared(
+                "UPDATE invitation SET expires_at='2026-01-09 00:00:00 +00:00'
+             WHERE id='I00000000000000000001'",
+            )
+            .await
+            .unwrap();
+            let invalid_ttl = scan_auth_persistence_invariants(&db).await.unwrap();
+            assert!(
+                invalid_ttl.violations.iter().any(|violation| {
+                    violation.contains("violates its bounded domain contract")
+                })
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invariant_scan_requires_exact_recovery_audit_for_local_member_activation() {
+        with_database(async |fixture_db| {
+        let db = valid_auth_fixture(fixture_db).await;
+        db.execute_unprepared(
+            "INSERT INTO gateway_principal(
+                id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                created_at,updated_at,removed_at
+             ) VALUES(
+                'P00000000000000000002','G00000000000000000001','user','member','active',
+                'Member','member','member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+             )",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        insert_pending_device_session(
+            &db,
+            NewPendingDeviceSessionRow {
+                device_id: DeviceId::new("D00000000000000000002").unwrap(),
+                session_id: AuthSessionId::new("S00000000000000000002").unwrap(),
+                gateway_id: gateway_id(),
+                principal_id: PrincipalId::new("P00000000000000000002").unwrap(),
+                token_family_id: TokenFamilyId::new("F00000000000000000002").unwrap(),
+                issuer: PendingSessionIssuer::LocalCli,
+                activation_token_hash: [2; 32],
+                activation_locator_hash: [22; 32],
+                activation_expires_at: now + chrono::Duration::minutes(10),
+                now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let missing = scan_auth_persistence_invariants(&db).await.unwrap();
+        assert!(missing.violations.iter().any(|violation| {
+            violation.contains("has no exact invitation or recovery provenance")
+        }));
+
+        db.execute_unprepared(
+            "INSERT INTO audit_event(
+                id,gateway_id,actor_principal_id,actor_session_id,action,domain,target_kind,
+                target_id,workspace_id,metadata_version,metadata_json,created_at
+             ) VALUES(
+                'A00000000000000000001','G00000000000000000001',
+                'P00000000000000000001','S00000000000000000001',
+                'member_recovery_device_created','administration','device_session',
+                'D00000000000000000002',NULL,1,
+                '{\"kind\":\"recovery_device\",\"principal_id\":\"P00000000000000000002\",\"device_id\":\"D00000000000000000002\",\"session_id\":\"S00000000000000000002\"}',
+                CURRENT_TIMESTAMP
+             )",
+        )
+        .await
+        .unwrap();
+        assert!(
+            scan_auth_persistence_invariants(&db)
+                .await
+                .unwrap()
+                .is_valid()
+        );
+            Ok(())
+        }).await.unwrap();
+    }
+}

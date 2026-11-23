@@ -1,5 +1,5 @@
 // Inside mcp_service's existing test module to reuse its runtime,
-// authorization, catalog and file-backed SQLite fixtures. Never spawns a CLI.
+// authorization, catalog and PostgreSQL fixtures. Never spawns a CLI.
 use super::*;
 mod cli_mcp_finalization {
     use super::*;
@@ -123,20 +123,25 @@ mod cli_mcp_finalization {
     }
 
     impl Harness {
-        async fn new(outcome: Outcome) -> Self {
-            Self::with_progress(outcome, Arc::new(CliMcpNoopProgressSink)).await
+        async fn new(db: &pioneer_postgres_test::TestDatabase, outcome: Outcome) -> Self {
+            Self::with_progress(db, outcome, Arc::new(CliMcpNoopProgressSink)).await
         }
 
-        async fn with_progress(outcome: Outcome, progress: Arc<dyn CliMcpProgressSink>) -> Self {
-            Self::with_validation(outcome, progress, None).await
+        async fn with_progress(
+            db: &pioneer_postgres_test::TestDatabase,
+            outcome: Outcome,
+            progress: Arc<dyn CliMcpProgressSink>,
+        ) -> Self {
+            Self::with_validation(db, outcome, progress, None).await
         }
 
         async fn with_validation(
+            db: &pioneer_postgres_test::TestDatabase,
             outcome: Outcome,
             progress: Arc<dyn CliMcpProgressSink>,
             runtime_view: Option<Arc<dyn TurnMcpRuntimeView>>,
         ) -> Self {
-            let fixture = turn_mcp_invoker_fixture().await;
+            let fixture = turn_mcp_invoker_fixture(db).await;
             let projection = fixture
                 .service
                 .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
@@ -461,240 +466,261 @@ mod cli_mcp_finalization {
 
     #[tokio::test]
     async fn caller_dropped_after_execution_is_unconfirmed_delivery_and_cannot_erase_success() {
-        let progress = Arc::new(CompletedProgressGate::default());
-        let h = Harness::with_progress(Outcome::Success, progress.clone()).await;
-        h.start("item", true).await;
-        let mut request = h.request("item");
-        request["params"]["_meta"]["progressToken"] = json!("progress");
-        let call = h.call(request.clone());
-        h.execution.entered.notified().await;
-        h.execution.release.add_permits(1);
-        progress.0.notified().await; // Actual invoker/canonical commit precedes progress.
-        call.abort();
-        assert!(call.await.unwrap_err().is_cancelled());
-        let response = h.facade.handle_message(&h.context, request).await.unwrap();
-        assert_eq!(response["result"]["isError"], false);
-        assert_eq!(response["result"]["_meta"]["pioneer"]["durationMs"], 3892);
-        assert_eq!(
-            response["result"]["content"],
-            json!([{"type":"text", "text":"private-result-canary"}])
-        );
-        h.terminal().await;
-        let TurnItem::DynamicToolCall {
-            success,
-            storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
-            ..
-        } = h.item("item").await
-        else {
-            panic!("canonical result");
-        };
-        assert_eq!(success, Some(true));
-        assert_eq!(
-            metadata.get("status").and_then(|value| value.as_str()),
-            Some("completed")
-        );
-        assert_eq!(
-            metadata
-                .get("responseDelivery")
-                .and_then(|value| value.as_str()),
-            Some("unconfirmed")
-        );
-        assert_eq!(h.completions().await, 1);
-        assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+        pioneer_postgres_test::with_database(async |db| {
+            let progress = Arc::new(CompletedProgressGate::default());
+            let h = Harness::with_progress(db, Outcome::Success, progress.clone()).await;
+            h.start("item", true).await;
+            let mut request = h.request("item");
+            request["params"]["_meta"]["progressToken"] = json!("progress");
+            let call = h.call(request.clone());
+            h.execution.entered.notified().await;
+            h.execution.release.add_permits(1);
+            progress.0.notified().await; // Actual invoker/canonical commit precedes progress.
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+            let response = h.facade.handle_message(&h.context, request).await.unwrap();
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(response["result"]["_meta"]["pioneer"]["durationMs"], 3892);
+            assert_eq!(
+                response["result"]["content"],
+                json!([{"type":"text", "text":"private-result-canary"}])
+            );
+            h.terminal().await;
+            let TurnItem::DynamicToolCall {
+                success,
+                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+                ..
+            } = h.item("item").await
+            else {
+                panic!("canonical result");
+            };
+            assert_eq!(success, Some(true));
+            assert_eq!(
+                metadata.get("status").and_then(|value| value.as_str()),
+                Some("completed")
+            );
+            assert_eq!(
+                metadata
+                    .get("responseDelivery")
+                    .and_then(|value| value.as_str()),
+                Some("unconfirmed")
+            );
+            assert_eq!(h.completions().await, 1);
+            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn caller_dropped_before_result_does_not_invent_execution_or_cancellation_ack() {
-        let h = Harness::new(Outcome::Success).await;
-        h.start("item", true).await;
-        let request = h.request("item");
-        let call = h.call(request.clone());
-        h.execution.entered.notified().await;
-        call.abort();
-        assert!(call.await.unwrap_err().is_cancelled());
-        let response = h.facade.handle_message(&h.context, request).await.unwrap();
-        assert_eq!(response["error"]["data"]["kind"], "response_unconfirmed");
-        assert_eq!(h.completions().await, 0);
-        h.terminal().await;
-        let TurnItem::DynamicToolCall {
-            success,
-            outcome: Some(outcome),
-            ..
-        } = h.item("item").await
-        else {
-            panic!("unconfirmed result");
-        };
-        assert_eq!(success, None);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::Unknown));
-        assert_eq!(
-            outcome.incomplete_reason.as_deref(),
-            Some("cli_mcp_result_unconfirmed")
-        );
-        assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(h.completions().await, 0);
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            h.start("item", true).await;
+            let request = h.request("item");
+            let call = h.call(request.clone());
+            h.execution.entered.notified().await;
+            call.abort();
+            assert!(call.await.unwrap_err().is_cancelled());
+            let response = h.facade.handle_message(&h.context, request).await.unwrap();
+            assert_eq!(response["error"]["data"]["kind"], "response_unconfirmed");
+            assert_eq!(h.completions().await, 0);
+            h.terminal().await;
+            let TurnItem::DynamicToolCall {
+                success,
+                outcome: Some(outcome),
+                ..
+            } = h.item("item").await
+            else {
+                panic!("unconfirmed result");
+            };
+            assert_eq!(success, None);
+            assert_eq!(outcome.error_class, Some(ToolErrorClass::Unknown));
+            assert_eq!(
+                outcome.incomplete_reason.as_deref(),
+                Some("cli_mcp_result_unconfirmed")
+            );
+            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(h.completions().await, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn verified_validation_refusal_is_canonical_before_native_completion_and_turn_close() {
         for stale_generation in [false, true] {
-            let h = Harness::with_validation(
-                Outcome::Success,
-                Arc::new(CliMcpNoopProgressSink),
-                Some(Arc::new(ValidationRefusal)),
-            )
-            .await;
-            let RuntimeEvent::ItemStarted(started) = h.start("item", true).await else {
-                panic!("start");
-            };
-            if stale_generation {
-                let mut metadata = h
-                    .fixture
-                    .crud_store
-                    .get_cli_runtime_turn_binding(&h.fixture.turn_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .mcp
-                    .unwrap();
-                metadata.session_generation += 1;
-                h.fixture
-                    .crud_store
-                    .set_cli_runtime_turn_mcp_metadata(&h.fixture.turn_id, Some(metadata))
-                    .await
-                    .unwrap();
-            }
-            let response = h.call(h.request("item")).await.unwrap();
-            if stale_generation {
-                assert_eq!(
-                    response["error"]["data"]["kind"],
-                    "session_generation_stale"
-                );
-                assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
-                assert_eq!(h.completions().await, 0);
-                h.terminal().await;
-                assert!(matches!(
-                    h.item("item").await,
-                    TurnItem::DynamicToolCall {
-                        success: None,
-                        outcome: Some(pioneer_protocol::ToolOutcome {
-                            error_class: Some(ToolErrorClass::Unknown),
+            pioneer_postgres_test::with_database(async |db| {
+                let h = Harness::with_validation(
+                    db,
+                    Outcome::Success,
+                    Arc::new(CliMcpNoopProgressSink),
+                    Some(Arc::new(ValidationRefusal)),
+                )
+                .await;
+                let RuntimeEvent::ItemStarted(started) = h.start("item", true).await else {
+                    panic!("start");
+                };
+                if stale_generation {
+                    let mut metadata = h
+                        .fixture
+                        .crud_store
+                        .get_cli_runtime_turn_binding(&h.fixture.turn_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .mcp
+                        .unwrap();
+                    metadata.session_generation += 1;
+                    h.fixture
+                        .crud_store
+                        .set_cli_runtime_turn_mcp_metadata(&h.fixture.turn_id, Some(metadata))
+                        .await
+                        .unwrap();
+                }
+                let response = h.call(h.request("item")).await.unwrap();
+                if stale_generation {
+                    assert_eq!(
+                        response["error"]["data"]["kind"],
+                        "session_generation_stale"
+                    );
+                    assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(h.completions().await, 0);
+                    h.terminal().await;
+                    assert!(matches!(
+                        h.item("item").await,
+                        TurnItem::DynamicToolCall {
+                            success: None,
+                            outcome: Some(pioneer_protocol::ToolOutcome {
+                                error_class: Some(ToolErrorClass::Unknown),
+                                ..
+                            }),
                             ..
-                        }),
-                        ..
-                    }
-                ));
-                continue;
-            }
-            assert_eq!(response["error"]["data"]["kind"], "permission_denied");
-            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
-            let before = h.item("item").await;
-            let native = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-                item: None,
-                native_thread_id: started.native_thread_id,
-                native_turn_id: started.native_turn_id,
-                native_item_id: started.native_item_id,
-                item_kind: started.item_kind,
-                text: None,
-                summary: Vec::new(),
-                content: Vec::new(),
-                phase: Default::default(),
-                metadata: started.metadata,
-                native_item_redacted: None,
-                native: None,
-            });
-            assert!(
-                project_cli_runtime_event(&h.projector(), &native)
-                    .durable
-                    .is_empty()
-            );
-            h.terminal().await;
-            assert_eq!(h.item("item").await, before);
-            let TurnItem::DynamicToolCall {
-                status,
-                success,
-                outcome: Some(outcome),
-                storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
-                ..
-            } = before
-            else {
-                panic!("canonical rejection");
-            };
-            assert_eq!(status, ToolCallStatus::Failed);
-            assert_eq!(success, Some(false));
-            assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
-            assert_eq!(
-                outcome.incomplete_reason.as_deref(),
-                Some("permission_denied")
-            );
-            assert!(!outcome.incomplete);
-            assert_eq!(
-                metadata.get("executionAdmission").and_then(|v| v.as_str()),
-                Some("rejected")
-            );
-            assert_eq!(
-                metadata.get("responseDelivery").and_then(|v| v.as_str()),
-                Some("unconfirmed")
-            );
-            assert_eq!(h.completions().await, 1);
-            assert!(
-                h.fixture
-                    .crud_store
-                    .list_running_turn_item_attempts_for_turn(&h.fixture.turn_id)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+                        }
+                    ));
+                    return Ok(());
+                }
+                assert_eq!(response["error"]["data"]["kind"], "permission_denied");
+                assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
+                let before = h.item("item").await;
+                let native = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                    item: None,
+                    native_thread_id: started.native_thread_id,
+                    native_turn_id: started.native_turn_id,
+                    native_item_id: started.native_item_id,
+                    item_kind: started.item_kind,
+                    text: None,
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    phase: Default::default(),
+                    metadata: started.metadata,
+                    native_item_redacted: None,
+                    native: None,
+                });
+                assert!(
+                    project_cli_runtime_event(&h.projector(), &native)
+                        .durable
+                        .is_empty()
+                );
+                h.terminal().await;
+                assert_eq!(h.item("item").await, before);
+                let TurnItem::DynamicToolCall {
+                    status,
+                    success,
+                    outcome: Some(outcome),
+                    storage: pioneer_protocol::ToolStoragePayload::Metadata { metadata },
+                    ..
+                } = before
+                else {
+                    panic!("canonical rejection");
+                };
+                assert_eq!(status, ToolCallStatus::Failed);
+                assert_eq!(success, Some(false));
+                assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
+                assert_eq!(
+                    outcome.incomplete_reason.as_deref(),
+                    Some("permission_denied")
+                );
+                assert!(!outcome.incomplete);
+                assert_eq!(
+                    metadata.get("executionAdmission").and_then(|v| v.as_str()),
+                    Some("rejected")
+                );
+                assert_eq!(
+                    metadata.get("responseDelivery").and_then(|v| v.as_str()),
+                    Some("unconfirmed")
+                );
+                assert_eq!(h.completions().await, 1);
+                assert!(
+                    h.fixture
+                        .crud_store
+                        .list_running_turn_item_attempts_for_turn(&h.fixture.turn_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn managed_result_without_native_completion_survives_terminal_and_projection_recovery() {
-        let h = Harness::new(Outcome::Success).await;
-        h.start("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc", true)
-            .await;
-        let request = h.request("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc");
-        let call = h.call(request.clone());
-        h.execution.entered.notified().await;
-        h.execution.release.add_permits(1);
-        assert!(call.await.unwrap().get("result").is_some());
-        let before = h.item("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc").await;
-        assert!(matches!(
-            &before,
-            TurnItem::DynamicToolCall {
-                status: ToolCallStatus::Completed,
-                success: Some(true),
-                ..
-            }
-        ));
-        assert!(
-            h.facade
-                .handle_message(&h.context, request)
-                .await
-                .unwrap()
-                .get("result")
-                .is_some()
-        );
-        h.terminal().await;
-        let restored = CrudStore::new(h.fixture.crud_store.database_connection());
-        restored
-            .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 64)
-            .await
-            .unwrap();
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            h.start("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc", true)
+                .await;
+            let request = h.request("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc");
+            let call = h.call(request.clone());
+            h.execution.entered.notified().await;
+            h.execution.release.add_permits(1);
+            assert!(call.await.unwrap().get("result").is_some());
+            let before = h.item("exec-22d09e63-3a0d-429b-8585-f87d9f770dfc").await;
+            assert!(matches!(
+                &before,
+                TurnItem::DynamicToolCall {
+                    status: ToolCallStatus::Completed,
+                    success: Some(true),
+                    ..
+                }
+            ));
+            assert!(
+                h.facade
+                    .handle_message(&h.context, request)
+                    .await
+                    .unwrap()
+                    .get("result")
+                    .is_some()
+            );
+            h.terminal().await;
+            let restored = CrudStore::new(h.fixture.crud_store.database_connection());
             restored
-                .get_turn_item(&h.fixture.turn_id, before.item_id())
+                .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 64)
                 .await
-                .unwrap()
-                .unwrap(),
-            before
-        );
-        assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(h.completions().await, 1);
-        assert!(
-            !serde_json::to_string(&before)
-                .unwrap()
-                .contains("private-result-canary")
-        );
+                .unwrap();
+            assert_eq!(
+                restored
+                    .get_turn_item(&h.fixture.turn_id, before.item_id())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(h.completions().await, 1);
+            assert!(
+                !serde_json::to_string(&before)
+                    .unwrap()
+                    .contains("private-result-canary")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -709,355 +735,385 @@ mod cli_mcp_finalization {
         .into_iter()
         .flat_map(|outcome| [(outcome, false), (outcome, true)])
         {
-            let h = Harness::new(outcome).await;
-            h.start("item", true).await;
-            let call = h.call(h.request("item"));
-            h.execution.entered.notified().await;
-            if terminal_first {
-                h.terminal().await;
-            }
-            if matches!(outcome, Outcome::Cancelled) {
-                h.cancel("item").await;
-            } else {
-                h.execution.release.add_permits(1);
-            }
-            let response = call.await.unwrap();
-            if !terminal_first {
-                h.terminal().await;
-            }
-            let TurnItem::DynamicToolCall {
-                status,
-                success,
-                outcome: Some(saved),
-                ..
-            } = h.item("item").await
-            else {
-                panic!("outcome");
-            };
-            match outcome {
-                Outcome::ToolError => {
-                    assert_eq!(response["result"]["isError"], true);
-                    assert_eq!(success, Some(false));
-                    assert_eq!(saved.error_class, Some(ToolErrorClass::ExecutionFailed));
-                    assert!(!saved.incomplete);
+            pioneer_postgres_test::with_database(async |db| {
+                let h = Harness::new(db, outcome).await;
+                h.start("item", true).await;
+                let call = h.call(h.request("item"));
+                h.execution.entered.notified().await;
+                if terminal_first {
+                    h.terminal().await;
                 }
-                Outcome::Cancelled => {
-                    assert_eq!(response["error"]["data"]["kind"], "cancelled");
-                    assert_eq!(saved.error_class, Some(ToolErrorClass::Cancelled));
-                    let mut items = h
-                        .fixture
-                        .crud_store
-                        .list_turn_items_with_status_by_type_for_turns(
-                            std::slice::from_ref(&h.fixture.turn_id),
-                            "dynamic_tool_call",
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        items.remove(&h.fixture.turn_id).unwrap()[0].1.as_deref(),
-                        Some("cancelled")
-                    );
-                    assert_eq!(
-                        saved.incomplete_reason.as_deref(),
-                        Some("mock transport confirmed cancellation")
-                    );
+                if matches!(outcome, Outcome::Cancelled) {
+                    h.cancel("item").await;
+                } else {
+                    h.execution.release.add_permits(1);
                 }
-                Outcome::InvocationError => {
-                    assert_eq!(response["error"]["data"]["kind"], "execution_failed");
-                    assert_eq!(success, Some(false));
-                    assert_eq!(saved.error_class, Some(ToolErrorClass::ExecutionFailed));
+                let response = call.await.unwrap();
+                if !terminal_first {
+                    h.terminal().await;
                 }
-                Outcome::LateCancel => {
-                    assert!(response.get("result").is_some());
-                    assert_eq!(status, ToolCallStatus::Completed);
-                    assert_eq!(success, Some(true));
-                    assert_eq!(saved.error_class, None);
+                let TurnItem::DynamicToolCall {
+                    status,
+                    success,
+                    outcome: Some(saved),
+                    ..
+                } = h.item("item").await
+                else {
+                    panic!("outcome");
+                };
+                match outcome {
+                    Outcome::ToolError => {
+                        assert_eq!(response["result"]["isError"], true);
+                        assert_eq!(success, Some(false));
+                        assert_eq!(saved.error_class, Some(ToolErrorClass::ExecutionFailed));
+                        assert!(!saved.incomplete);
+                    }
+                    Outcome::Cancelled => {
+                        assert_eq!(response["error"]["data"]["kind"], "cancelled");
+                        assert_eq!(saved.error_class, Some(ToolErrorClass::Cancelled));
+                        let mut items = h
+                            .fixture
+                            .crud_store
+                            .list_turn_items_with_status_by_type_for_turns(
+                                std::slice::from_ref(&h.fixture.turn_id),
+                                "dynamic_tool_call",
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            items.remove(&h.fixture.turn_id).unwrap()[0].1.as_deref(),
+                            Some("cancelled")
+                        );
+                        assert_eq!(
+                            saved.incomplete_reason.as_deref(),
+                            Some("mock transport confirmed cancellation")
+                        );
+                    }
+                    Outcome::InvocationError => {
+                        assert_eq!(response["error"]["data"]["kind"], "execution_failed");
+                        assert_eq!(success, Some(false));
+                        assert_eq!(saved.error_class, Some(ToolErrorClass::ExecutionFailed));
+                    }
+                    Outcome::LateCancel => {
+                        assert!(response.get("result").is_some());
+                        assert_eq!(status, ToolCallStatus::Completed);
+                        assert_eq!(success, Some(true));
+                        assert_eq!(saved.error_class, None);
+                    }
+                    Outcome::Unknown => {
+                        assert_eq!(success, None);
+                        assert_eq!(saved.error_class, Some(ToolErrorClass::Unknown));
+                        assert!(saved.incomplete);
+                    }
+                    _ => unreachable!(),
                 }
-                Outcome::Unknown => {
-                    assert_eq!(success, None);
-                    assert_eq!(saved.error_class, Some(ToolErrorClass::Unknown));
-                    assert!(saved.incomplete);
-                }
-                _ => unreachable!(),
-            }
-            assert_eq!(h.completions().await, 1);
+                assert_eq!(h.completions().await, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn deferred_result_fences_late_observations_but_replays_an_earlier_accepted_start() {
         for start_accepted_before_result in [false, true] {
-            let h = Harness::new(Outcome::Success).await;
-            // Correlation is registered independently of canonical projection.
-            let start = h.start("item", false).await;
-            let projected = project_cli_runtime_event(&h.projector(), &start);
-            let AgentDurableEvent::ItemStarted {
-                notification: started,
-            } = &projected.durable[0]
-            else {
-                panic!("start");
-            };
-            let call = h.call(h.request("item"));
-            h.execution.entered.notified().await;
-            let (_, mut turn) = h
-                .fixture
-                .crud_store
-                .get_turn(&h.fixture.thread_id, &h.fixture.turn_id)
-                .await
-                .unwrap()
-                .unwrap();
-            turn.status = TurnStatus::Completed;
-            h.fixture
-                .crud_store
-                .accept_turn_event_before_projection_for_test(
-                    pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
-                        pioneer_protocol::TurnCompletedNotification {
-                            workspace_id: h.fixture.workspace_id.clone(),
-                            thread_id: h.fixture.thread_id.clone(),
-                            turn,
-                        },
-                    ),
-                    chrono::Utc::now().timestamp(),
-                )
-                .await
-                .unwrap();
-            if start_accepted_before_result {
+            pioneer_postgres_test::with_database(async |db| {
+                let h = Harness::new(db, Outcome::Success).await;
+                // Correlation is registered independently of canonical projection.
+                let start = h.start("item", false).await;
+                let projected = project_cli_runtime_event(&h.projector(), &start);
+                let AgentDurableEvent::ItemStarted {
+                    notification: started,
+                } = &projected.durable[0]
+                else {
+                    panic!("start");
+                };
+                let call = h.call(h.request("item"));
+                h.execution.entered.notified().await;
+                let (_, mut turn) = h
+                    .fixture
+                    .crud_store
+                    .get_turn(&h.fixture.thread_id, &h.fixture.turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                turn.status = TurnStatus::Completed;
                 h.fixture
                     .crud_store
                     .accept_turn_event_before_projection_for_test(
-                        pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started.clone()),
+                        pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(
+                            pioneer_protocol::TurnCompletedNotification {
+                                workspace_id: h.fixture.workspace_id.clone(),
+                                thread_id: h.fixture.thread_id.clone(),
+                                turn,
+                            },
+                        ),
                         chrono::Utc::now().timestamp(),
                     )
                     .await
                     .unwrap();
-            }
-            h.execution.release.add_permits(1);
-            assert!(call.await.unwrap().get("result").is_some());
-            assert_eq!(
-                h.completions().await,
-                1,
-                "result is durable before replay or native completion"
-            );
-            assert!(
+                if start_accepted_before_result {
+                    h.fixture
+                        .crud_store
+                        .accept_turn_event_before_projection_for_test(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started.clone()),
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                h.execution.release.add_permits(1);
+                assert!(call.await.unwrap().get("result").is_some());
+                assert_eq!(
+                    h.completions().await,
+                    1,
+                    "result is durable before replay or native completion"
+                );
+                assert!(
+                    h.fixture
+                        .crud_store
+                        .get_turn_item(&h.fixture.turn_id, "item")
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "canonical completion is accepted but has not been projected"
+                );
+                if !start_accepted_before_result {
+                    h.persist_start(&start).await;
+                }
                 h.fixture
                     .crud_store
-                    .get_turn_item(&h.fixture.turn_id, "item")
+                    .materialize_item_updated(
+                        pioneer_protocol::ItemUpdatedNotification {
+                            workspace_id: started.workspace_id.clone(),
+                            thread_id: started.thread_id.clone(),
+                            turn_id: started.turn_id.clone(),
+                            item: started.item.clone(),
+                        },
+                        chrono::Utc::now().timestamp(),
+                    )
                     .await
-                    .unwrap()
-                    .is_none(),
-                "canonical completion is accepted but has not been projected"
-            );
-            if !start_accepted_before_result {
-                h.persist_start(&start).await;
-            }
-            h.fixture
-                .crud_store
-                .materialize_item_updated(
-                    pioneer_protocol::ItemUpdatedNotification {
-                        workspace_id: started.workspace_id.clone(),
-                        thread_id: started.thread_id.clone(),
-                        turn_id: started.turn_id.clone(),
-                        item: started.item.clone(),
-                    },
-                    chrono::Utc::now().timestamp(),
-                )
-                .await
-                .unwrap();
-            let restored = CrudStore::new(h.fixture.crud_store.database_connection());
-            if start_accepted_before_result {
-                // Advance through the predecessor and the earlier start only.
-                // A later accepted completion must not suppress this original start.
+                    .unwrap();
+                let restored = CrudStore::new(h.fixture.crud_store.database_connection());
+                if start_accepted_before_result {
+                    // Advance through the predecessor and the earlier start only.
+                    // A later accepted completion must not suppress this original start.
+                    restored
+                        .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 2)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        h.item("item").await,
+                        TurnItem::DynamicToolCall {
+                            status: ToolCallStatus::InProgress,
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        restored
+                            .list_running_turn_item_attempts_for_turn(&h.fixture.turn_id)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
                 restored
-                    .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 2)
+                    .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 64)
                     .await
                     .unwrap();
                 assert!(matches!(
-                    h.item("item").await,
+                    restored
+                        .get_turn_item(&h.fixture.turn_id, "item")
+                        .await
+                        .unwrap()
+                        .unwrap(),
                     TurnItem::DynamicToolCall {
-                        status: ToolCallStatus::InProgress,
+                        status: ToolCallStatus::Completed,
+                        success: Some(true),
                         ..
                     }
                 ));
-                assert_eq!(
+                assert!(
                     restored
                         .list_running_turn_item_attempts_for_turn(&h.fixture.turn_id)
                         .await
                         .unwrap()
-                        .len(),
-                    1
+                        .is_empty()
                 );
-            }
-            restored
-                .replay_due_turn_event_projections(chrono::Utc::now().timestamp() + 600, 64)
-                .await
-                .unwrap();
-            assert!(matches!(
-                restored
-                    .get_turn_item(&h.fixture.turn_id, "item")
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                TurnItem::DynamicToolCall {
-                    status: ToolCallStatus::Completed,
-                    success: Some(true),
-                    ..
-                }
-            ));
-            assert!(
-                restored
-                    .list_running_turn_item_attempts_for_turn(&h.fixture.turn_id)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(h.completions().await, 1);
-            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
-            let saved = h.item("item").await;
-            h.persist_start(&start).await;
-            assert_eq!(h.item("item").await, saved);
+                assert_eq!(h.completions().await, 1);
+                assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+                let saved = h.item("item").await;
+                h.persist_start(&start).await;
+                assert_eq!(h.item("item").await, saved);
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn terminal_before_confirmed_result_keeps_gap_honest_then_commits_only_that_attempt() {
-        let h = Harness::new(Outcome::Success).await;
-        h.start("item", true).await;
-        let call = h.call(h.request("item"));
-        h.execution.entered.notified().await;
-        h.terminal().await;
-        let TurnItem::DynamicToolCall {
-            success,
-            outcome: Some(gap),
-            ..
-        } = h.item("item").await
-        else {
-            panic!("gap");
-        };
-        assert_eq!(success, None);
-        assert_eq!(gap.error_class, Some(ToolErrorClass::Unknown));
-        assert_eq!(
-            gap.incomplete_reason.as_deref(),
-            Some("cli_mcp_result_unconfirmed")
-        );
-        h.cancel("item").await; // A cancelled waiter cannot undo completed work.
-        h.execution.release.add_permits(1);
-        assert!(call.await.unwrap().get("result").is_some());
-        assert!(matches!(
-            h.item("item").await,
-            TurnItem::DynamicToolCall {
-                success: Some(true),
-                status: ToolCallStatus::Completed,
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            h.start("item", true).await;
+            let call = h.call(h.request("item"));
+            h.execution.entered.notified().await;
+            h.terminal().await;
+            let TurnItem::DynamicToolCall {
+                success,
+                outcome: Some(gap),
                 ..
-            }
-        ));
-        assert_eq!(h.completions().await, 1);
-        assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+            } = h.item("item").await
+            else {
+                panic!("gap");
+            };
+            assert_eq!(success, None);
+            assert_eq!(gap.error_class, Some(ToolErrorClass::Unknown));
+            assert_eq!(
+                gap.incomplete_reason.as_deref(),
+                Some("cli_mcp_result_unconfirmed")
+            );
+            h.cancel("item").await; // A cancelled waiter cannot undo completed work.
+            h.execution.release.add_permits(1);
+            assert!(call.await.unwrap().get("result").is_some());
+            assert!(matches!(
+                h.item("item").await,
+                TurnItem::DynamicToolCall {
+                    success: Some(true),
+                    status: ToolCallStatus::Completed,
+                    ..
+                }
+            ));
+            assert_eq!(h.completions().await, 1);
+            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn identical_calls_and_late_native_events_do_not_mix_or_resurrect_results() {
-        let h = Harness::new(Outcome::Success).await;
-        let start = h.start("A", false).await;
-        h.start("B", true).await;
-        let call = h.call(h.request("A"));
-        h.execution.entered.notified().await;
-        h.execution.release.add_permits(1);
-        assert!(call.await.unwrap().get("result").is_some());
-        let before = h.item("A").await;
-        h.persist_start(&start).await; // Native start projection lost the race.
-        let RuntimeEvent::ItemStarted(started) = start else {
-            panic!("start");
-        };
-        let late = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-            item: None,
-            native_thread_id: started.native_thread_id,
-            native_turn_id: started.native_turn_id,
-            native_item_id: started.native_item_id,
-            item_kind: started.item_kind,
-            text: None,
-            summary: Vec::new(),
-            content: Vec::new(),
-            phase: Default::default(),
-            metadata: started.metadata,
-            native_item_redacted: None,
-            native: None,
-        });
-        assert!(
-            project_cli_runtime_event(&h.projector(), &late)
-                .durable
-                .is_empty()
-        );
-        assert_eq!(h.item("A").await, before);
-        assert!(matches!(
-            h.item("B").await,
-            TurnItem::DynamicToolCall {
-                status: ToolCallStatus::InProgress,
-                ..
-            }
-        ));
-        h.terminal().await;
-        assert_eq!(h.item("A").await, before);
-        assert!(matches!(
-            h.item("B").await,
-            TurnItem::DynamicToolCall { success: None, .. }
-        ));
-        assert_eq!(h.completions().await, 1);
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            let start = h.start("A", false).await;
+            h.start("B", true).await;
+            let call = h.call(h.request("A"));
+            h.execution.entered.notified().await;
+            h.execution.release.add_permits(1);
+            assert!(call.await.unwrap().get("result").is_some());
+            let before = h.item("A").await;
+            h.persist_start(&start).await; // Native start projection lost the race.
+            let RuntimeEvent::ItemStarted(started) = start else {
+                panic!("start");
+            };
+            let late = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                item: None,
+                native_thread_id: started.native_thread_id,
+                native_turn_id: started.native_turn_id,
+                native_item_id: started.native_item_id,
+                item_kind: started.item_kind,
+                text: None,
+                summary: Vec::new(),
+                content: Vec::new(),
+                phase: Default::default(),
+                metadata: started.metadata,
+                native_item_redacted: None,
+                native: None,
+            });
+            assert!(
+                project_cli_runtime_event(&h.projector(), &late)
+                    .durable
+                    .is_empty()
+            );
+            assert_eq!(h.item("A").await, before);
+            assert!(matches!(
+                h.item("B").await,
+                TurnItem::DynamicToolCall {
+                    status: ToolCallStatus::InProgress,
+                    ..
+                }
+            ));
+            h.terminal().await;
+            assert_eq!(h.item("A").await, before);
+            assert!(matches!(
+                h.item("B").await,
+                TurnItem::DynamicToolCall { success: None, .. }
+            ));
+            assert_eq!(h.completions().await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn generation_change_during_execution_cannot_complete_current_item() {
-        let h = Harness::new(Outcome::Success).await;
-        h.start("item", true).await;
-        let call = h.call(h.request("item"));
-        h.execution.entered.notified().await;
-        let mut binding = h
-            .fixture
-            .crud_store
-            .get_cli_runtime_turn_binding(&h.fixture.turn_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .mcp
-            .unwrap();
-        binding.session_generation += 1;
-        h.fixture
-            .crud_store
-            .set_cli_runtime_turn_mcp_metadata(&h.fixture.turn_id, Some(binding))
-            .await
-            .unwrap();
-        h.execution.release.add_permits(1);
-        assert!(call.await.unwrap().get("error").is_some());
-        assert!(matches!(
-            h.item("item").await,
-            TurnItem::DynamicToolCall {
-                status: ToolCallStatus::InProgress,
-                ..
-            }
-        ));
-        assert_eq!(h.completions().await, 0);
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            h.start("item", true).await;
+            let call = h.call(h.request("item"));
+            h.execution.entered.notified().await;
+            let mut binding = h
+                .fixture
+                .crud_store
+                .get_cli_runtime_turn_binding(&h.fixture.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mcp
+                .unwrap();
+            binding.session_generation += 1;
+            h.fixture
+                .crud_store
+                .set_cli_runtime_turn_mcp_metadata(&h.fixture.turn_id, Some(binding))
+                .await
+                .unwrap();
+            h.execution.release.add_permits(1);
+            assert!(call.await.unwrap().get("error").is_some());
+            assert!(matches!(
+                h.item("item").await,
+                TurnItem::DynamicToolCall {
+                    status: ToolCallStatus::InProgress,
+                    ..
+                }
+            ));
+            assert_eq!(h.completions().await, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn foreign_native_thread_cannot_borrow_an_identical_registered_call() {
-        let h = Harness::new(Outcome::Success).await;
-        h.start("item", true).await;
-        let mut request = h.request("item");
-        request["params"]["_meta"]["threadId"] = json!("foreign");
-        request["params"]["_meta"]["x-codex-turn-metadata"]["thread_id"] = json!("foreign");
-        let response = h.facade.handle_message(&h.context, request).await.unwrap();
-        assert_eq!(response["error"]["data"]["kind"], "scope_mismatch");
-        assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(h.completions().await, 0);
-        h.terminal().await;
-        let TurnItem::DynamicToolCall {
-            success,
-            outcome: Some(outcome),
-            ..
-        } = h.item("item").await
-        else {
-            panic!("gap");
-        };
-        assert_eq!(success, None);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::Unknown));
+        pioneer_postgres_test::with_database(async |db| {
+            let h = Harness::new(db, Outcome::Success).await;
+            h.start("item", true).await;
+            let mut request = h.request("item");
+            request["params"]["_meta"]["threadId"] = json!("foreign");
+            request["params"]["_meta"]["x-codex-turn-metadata"]["thread_id"] = json!("foreign");
+            let response = h.facade.handle_message(&h.context, request).await.unwrap();
+            assert_eq!(response["error"]["data"]["kind"], "scope_mismatch");
+            assert_eq!(h.execution.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(h.completions().await, 0);
+            h.terminal().await;
+            let TurnItem::DynamicToolCall {
+                success,
+                outcome: Some(outcome),
+                ..
+            } = h.item("item").await
+            else {
+                panic!("gap");
+            };
+            assert_eq!(success, None);
+            assert_eq!(outcome.error_class, Some(ToolErrorClass::Unknown));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

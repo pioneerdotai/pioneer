@@ -595,26 +595,8 @@ impl ComposerView {
 
                 let menu = if can_use_skills {
                     menu.item(Self::composer_add_menu_item(
-                        t!("chat.composer.add_menu.skills").to_string().into(),
-                        PioneerIconName::Zap,
-                        {
-                            let desktop_entity = desktop_entity.clone();
-                            move |window, cx| {
-                                let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_composer_skills_picker(window, cx);
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                } else {
-                    menu
-                };
-
-                let menu = if can_use_skills {
-                    menu.item(Self::composer_add_menu_item(
                         t!("chat.composer.add_menu.apps").to_string().into(),
-                        PioneerIconName::Plugin,
+                        PioneerIconName::LayoutGridCircles,
                         {
                             let entity = desktop_entity.clone();
                             move |window, cx| {
@@ -636,6 +618,24 @@ impl ComposerView {
                             move |window, cx| {
                                 let _ = entity.update(cx, |view, cx| {
                                     view.open_composer_plugins_picker(window, cx)
+                                });
+                            }
+                        },
+                    ))
+                } else {
+                    menu
+                };
+
+                let menu = if can_use_skills {
+                    menu.item(Self::composer_add_menu_item(
+                        t!("chat.composer.add_menu.skills").to_string().into(),
+                        PioneerIconName::Zap,
+                        {
+                            let desktop_entity = desktop_entity.clone();
+                            move |window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.open_composer_skills_picker(window, cx);
+                                    cx.notify();
                                 });
                             }
                         },

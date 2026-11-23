@@ -378,6 +378,7 @@ pub use skills::{
 pub use system_assets::{
     CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_DARK_REVISION,
     OPENCODE_AGENT_AVATAR_LIGHT_REVISION, PIONEER_AGENT_AVATAR_REVISION,
+    cli_runtime_avatar_revision,
 };
 pub use task::{
     PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskAgentConfiguration,

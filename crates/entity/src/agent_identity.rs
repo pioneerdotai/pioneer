@@ -7,16 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_identity")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_agent_identity_workspace_source")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_identity_workspace_source"
+    )]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uq_agent_identity_workspace_source")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_identity_workspace_source"
+    )]
     pub source_kind: String,
-    #[sea_orm(unique_key = "uq_agent_identity_workspace_source")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_identity_workspace_source"
+    )]
     pub source_id: String,
     pub source_revision: i64,
+    #[sea_orm(column_type = "Text")]
     pub source_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -34,7 +45,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

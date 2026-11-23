@@ -2174,13 +2174,13 @@ mod tests {
     };
     use anyhow::Result;
     use async_trait::async_trait;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CliRuntimeThreadBindingRecord, CliRuntimeTurnBindingRecord, CrudStore,
-        NewCliRuntimeThreadBinding,
+        NewCliRuntimeThreadBinding, NewCliRuntimeTurnBinding,
     };
+    use pioneer_postgres_test::TestDatabase;
+    use sea_orm::ConnectionTrait;
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2241,15 +2241,13 @@ mod tests {
         }
     }
 
-    async fn setup_store() -> (DatabaseConnection, CrudStore) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("sqlite memory connection");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations should apply");
-        let store = CrudStore::new(connection.clone());
-        (connection, store)
+    async fn setup_store(fixture: &TestDatabase) -> Result<CrudStore> {
+        Ok(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connection().clone(),
+            ),
+        ))
     }
 
     fn open_request(thread_id: &str, opened_at: i64) -> CLIAgentRuntimeThreadBindingOpenRequest {
@@ -2285,11 +2283,13 @@ mod tests {
             .fixed_offset()
     }
 
-    async fn deleted_message_fixture() -> (CrudStore, FakeCliRuntimeThreadClient) {
-        let (_connection, store) = setup_store().await;
+    async fn deleted_message_fixture(
+        fixture: &TestDatabase,
+    ) -> Result<(CrudStore, FakeCliRuntimeThreadClient)> {
+        let store = setup_store(fixture).await?;
         let db = store.database_connection();
         for sql in [
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_cli_binding','fixture',1,1)",
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_cli_binding','fixture',true,false)",
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws_cli_binding','','agent','gpt-5','cli_runtime:codex','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             "INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,created_at,updated_at) VALUES ('cli','thread','completed','conversation','user','agent','1970-01-01 00:01:40+00:00','1970-01-01 00:01:40+00:00')",
             "INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,created_at,updated_at) VALUES ('message','thread','completed','conversation','user','message',1,CURRENT_TIMESTAMP,'1970-01-01 00:03:20+00:00','1970-01-01 00:03:20+00:00')",
@@ -2370,7 +2370,36 @@ mod tests {
         )
         .await
         .unwrap();
-        (store, client)
+        Ok((store, client))
+    }
+
+    async fn replace_cli_input_mapping(
+        store: &CrudStore,
+        source: CliRuntimeTurnBindingRecord,
+        input_mapping_json: String,
+    ) -> Result<()> {
+        store
+            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                turn_id: source.turn_id,
+                thread_id: source.thread_id,
+                continuation_thread_id: source.continuation_thread_id,
+                workspace_id: source.workspace_id,
+                runtime_id: source.runtime_id,
+                runtime_kind: source.runtime_kind,
+                native_thread_id: source.native_thread_id,
+                native_turn_id: source.native_turn_id,
+                request_id: source.request_id,
+                status: source.status,
+                model: source.model,
+                cwd: source.cwd,
+                sandbox_json: source.sandbox_json,
+                approval_policy: source.approval_policy,
+                input_mapping_json,
+                created_at: source.created_at,
+                updated_at: source.updated_at,
+            })
+            .await?;
+        Ok(())
     }
 
     async fn resolve_message(store: &CrudStore) -> Option<String> {
@@ -2381,7 +2410,8 @@ mod tests {
 
     #[tokio::test]
     async fn deleted_undelivered_message_keeps_confirmed_cli_session() {
-        let (store, client) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, client) = deleted_message_fixture(fixture).await?;
         assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
         store.database_connection().execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,created_at,updated_at) SELECT 'message-two',thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,'1970-01-01 00:04:10+00:00',updated_at FROM turn WHERE id='message'").await.unwrap();
         assert_eq!(
@@ -2414,11 +2444,14 @@ mod tests {
         assert_eq!(resumed.binding.native_thread_id, binding.native_thread_id);
         assert_eq!(client.starts.lock().unwrap().len(), 1);
         assert_eq!(client.resumes.lock().unwrap().len(), 1);
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn deleted_directly_delivered_message_keeps_head_conflict_check() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         store.database_connection().execute_unprepared(
             "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,native_turn_id,status,created_at,updated_at,frozen_manifest_id) SELECT 'message',thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'provider-message','completed',created_at,updated_at,NULL FROM turn_cli_runtime_binding WHERE turn_id='cli'",
         ).await.unwrap();
@@ -2447,11 +2480,14 @@ mod tests {
             .await
             .unwrap()
         );
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn deleted_message_in_sent_history_is_not_skipped() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         let db = store.database_connection();
         db.execute_unprepared(
             "UPDATE turn SET message_revision=0,message_deleted_at=NULL WHERE id='message'",
@@ -2538,13 +2574,8 @@ mod tests {
         let mut mapping: serde_json::Value =
             serde_json::from_str(&turn_binding.input_mapping_json).unwrap();
         mapping["pioneerContextBasis"]["deliveredSources"] = json!([source]);
-        db.execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE turn_cli_runtime_binding SET input_mapping_json=? WHERE turn_id='cli'",
-            [serde_json::to_string(&mapping).unwrap().into()],
-        ))
-        .await
-        .unwrap();
+        replace_cli_input_mapping(&store, turn_binding, serde_json::to_string(&mapping)?)
+            .await?;
         cursor["pioneerContext"]["deliveredSources"] = json!([]);
         store
             .update_cli_runtime_thread_resume_cursor(
@@ -2557,11 +2588,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn ordinary_message_native_and_completed_task_are_not_skipped() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         let db = store.database_connection();
         for (change, restore) in [
             (
@@ -2586,17 +2620,19 @@ mod tests {
             db.execute_unprepared(restore).await.unwrap();
         }
         assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn newer_unacknowledged_dispatch_prevents_deleted_message_skip() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         let db = store.database_connection();
-        // Bind dates through SeaORM, just as the accepted dispatch does. A
-        // hand-written date string can sort differently in SQLite's TEXT column.
+        // Use the same typed timestamps as the accepted dispatch.
         db.execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at,frozen_manifest_id) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',?,?,NULL FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at,frozen_manifest_id) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',$1,$2,NULL FROM turn_cli_runtime_binding WHERE turn_id='cli'",
             [unix_to_datetime(300).into(), unix_to_datetime(300).into()],
         ))
         .await
@@ -2611,11 +2647,14 @@ mod tests {
             Some("message"),
             "timestamp ties are inconclusive"
         );
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn incomplete_delivery_evidence_does_not_skip_deleted_message() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         let db = store.database_connection();
         for (change, restore) in [
             (
@@ -2640,25 +2679,26 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        db.execute_unprepared("UPDATE turn_cli_runtime_binding SET input_mapping_json=json_remove(input_mapping_json,'$.pioneerContextBasis') WHERE turn_id='cli'").await.unwrap();
+        let mut incomplete = serde_json::from_str::<serde_json::Value>(&source.input_mapping_json)?;
+        incomplete.as_object_mut().unwrap().remove("pioneerContextBasis");
+        replace_cli_input_mapping(&store, source.clone(), serde_json::to_string(&incomplete)?)
+            .await?;
+        let original_mapping = source.input_mapping_json.clone();
         assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
-        db.execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE turn_cli_runtime_binding SET input_mapping_json=? WHERE turn_id='cli'",
-            [source.input_mapping_json.into()],
-        ))
-        .await
-        .unwrap();
+        replace_cli_input_mapping(&store, source, original_mapping).await?;
         assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
         db.execute_unprepared("DELETE FROM turn_cli_runtime_attempt WHERE turn_id='cli'")
             .await
             .unwrap();
         assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn deleted_message_skip_preserves_undispatched_cli_attempt_skip() {
-        let (store, _) = deleted_message_fixture().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let (store, _) = deleted_message_fixture(fixture).await?;
         let db = store.database_connection();
         db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,created_at,updated_at) VALUES ('undispatched','thread','blocked','conversation','user','agent','1970-01-01 00:02:30+00:00','1970-01-01 00:02:30+00:00')").await.unwrap();
         db.execute_unprepared("INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at) SELECT 'undispatched',thread_id,workspace_id,executor_kind,'blocked',owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at FROM turn_execution WHERE turn_id='cli'").await.unwrap();
@@ -2675,6 +2715,8 @@ mod tests {
             .unwrap();
             assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
         }
+        Ok(())
+        }).await.unwrap();
     }
 
     #[test]
@@ -2711,66 +2753,78 @@ mod tests {
 
     #[tokio::test]
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
-        let (_connection, store) = setup_store().await;
-        let client = FakeCliRuntimeThreadClient::new();
-        client.start_result.lock().unwrap().as_mut().unwrap().raw["thread"]["name"] =
-            json!("Opened title");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = setup_store(fixture).await?;
+            let client = FakeCliRuntimeThreadClient::new();
+            client.start_result.lock().unwrap().as_mut().unwrap().raw["thread"]["name"] =
+                json!("Opened title");
 
-        let result =
-            open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))
-                .await
-                .expect("first open should succeed");
+            let result =
+                open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))
+                    .await
+                    .expect("first open should succeed");
 
-        assert_eq!(result.name.as_deref(), Some("Opened title"));
-        assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
-        assert_eq!(result.binding.native_thread_id, "cli-thread-started");
-        assert_eq!(result.binding.native_cwd.as_deref(), Some("/tmp/project"));
-        assert_eq!(result.binding.native_model.as_deref(), Some("gpt-5"));
-        assert_eq!(
-            result.binding.resume_cursor_json,
-            r#"{"threadId":"cli-thread-started"}"#
-        );
-        assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
-        assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            assert_eq!(result.name.as_deref(), Some("Opened title"));
+            assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
+            assert_eq!(result.binding.native_thread_id, "cli-thread-started");
+            assert_eq!(result.binding.native_cwd.as_deref(), Some("/tmp/project"));
+            assert_eq!(result.binding.native_model.as_deref(), Some("gpt-5"));
+            assert_eq!(
+                result.binding.resume_cursor_json,
+                r#"{"threadId":"cli-thread-started"}"#
+            );
+            assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
+            assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn pending_child_fork_never_opens_an_empty_provider_thread() {
-        let (_connection, store) = setup_store().await;
-        let at = unix_to_datetime(100);
-        store
-            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-                thread_id: "child".into(),
-                workspace_id: "ws_cli_binding".into(),
-                runtime_id: "codex".into(),
-                runtime_kind: "codex".into(),
-                native_thread_id: "parent-provider-thread".into(),
-                native_session_id: None,
-                native_root_thread_id: Some("parent-provider-thread".into()),
-                native_cwd: Some("/tmp/project".into()),
-                native_model: Some("gpt-5".into()),
-                resume_cursor_json: r#"{"forkBoundaryTurnId":"completed-provider-turn"}"#.into(),
-                status: "fork_pending".into(),
-                created_at: at,
-                updated_at: at,
-            })
-            .await
-            .expect("persist fork fence");
-        let client = FakeCliRuntimeThreadClient::new();
-        let error = open_cli_runtime_thread_binding(&store, &client, open_request("child", 101))
-            .await
-            .expect_err("uncertain fork must remain fenced");
-        assert!(error.to_string().contains("fork_pending"));
-        assert!(client.starts.lock().unwrap().is_empty());
-        assert!(client.resumes.lock().unwrap().is_empty());
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = setup_store(fixture).await?;
+            let at = unix_to_datetime(100);
+            store
+                .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                    thread_id: "child".into(),
+                    workspace_id: "ws_cli_binding".into(),
+                    runtime_id: "codex".into(),
+                    runtime_kind: "codex".into(),
+                    native_thread_id: "parent-provider-thread".into(),
+                    native_session_id: None,
+                    native_root_thread_id: Some("parent-provider-thread".into()),
+                    native_cwd: Some("/tmp/project".into()),
+                    native_model: Some("gpt-5".into()),
+                    resume_cursor_json: r#"{"forkBoundaryTurnId":"completed-provider-turn"}"#
+                        .into(),
+                    status: "fork_pending".into(),
+                    created_at: at,
+                    updated_at: at,
+                })
+                .await
+                .expect("persist fork fence");
+            let client = FakeCliRuntimeThreadClient::new();
+            let error =
+                open_cli_runtime_thread_binding(&store, &client, open_request("child", 101))
+                    .await
+                    .expect_err("uncertain fork must remain fenced");
+            assert!(error.to_string().contains("fork_pending"));
+            assert!(client.starts.lock().unwrap().is_empty());
+            assert!(client.resumes.lock().unwrap().is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
     fn confirmed_child_fork_remains_usable_before_its_first_new_turn() {
         let at = unix_to_datetime(100);
         let source = CliRuntimeTurnBindingRecord {
-            input_mapping_payload_id: None,
-            input_mapping_read_hold: None,
+            input_mapping_frame: None,
+            input_mapping_has_inline_history: false,
             input_mapping_revision: 0,
             input_mapping_identity: String::new(),
             turn_id: "child-first-answer".into(),
@@ -2824,7 +2878,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_runtime_binding_resume_uses_stored_native_thread() {
-        let (_connection, store) = setup_store().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let store = setup_store(fixture).await?;
         let opened_at = unix_to_datetime(100);
         store
             .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
@@ -2888,56 +2943,67 @@ mod tests {
         let resumes = client.resumes.lock().expect("resumes lock");
         assert_eq!(resumes.len(), 1);
         assert_eq!(resumes[0].0, "cli-thread-existing");
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn cli_runtime_binding_resume_error_keeps_existing_binding() {
-        let (_connection, store) = setup_store().await;
-        let opened_at = unix_to_datetime(100);
-        store
-            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-                thread_id: "thread_cli_error".to_owned(),
-                workspace_id: "ws_cli_binding".to_owned(),
-                runtime_id: "codex".to_owned(),
-                runtime_kind: "codex".to_owned(),
-                native_thread_id: "cli-thread-existing".to_owned(),
-                native_session_id: None,
-                native_root_thread_id: None,
-                native_cwd: Some("/tmp/project".to_owned()),
-                native_model: Some("gpt-5".to_owned()),
-                resume_cursor_json: r#"{"threadId":"cli-thread-existing"}"#.to_owned(),
-                status: "active".to_owned(),
-                created_at: opened_at,
-                updated_at: opened_at,
-            })
-            .await
-            .expect("seed binding should persist");
-        let client = FakeCliRuntimeThreadClient::new();
-        client.set_resume_error("native thread missing");
-
-        let error =
-            open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_error", 200))
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = setup_store(fixture).await?;
+            let opened_at = unix_to_datetime(100);
+            store
+                .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                    thread_id: "thread_cli_error".to_owned(),
+                    workspace_id: "ws_cli_binding".to_owned(),
+                    runtime_id: "codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: "cli-thread-existing".to_owned(),
+                    native_session_id: None,
+                    native_root_thread_id: None,
+                    native_cwd: Some("/tmp/project".to_owned()),
+                    native_model: Some("gpt-5".to_owned()),
+                    resume_cursor_json: r#"{"threadId":"cli-thread-existing"}"#.to_owned(),
+                    status: "active".to_owned(),
+                    created_at: opened_at,
+                    updated_at: opened_at,
+                })
                 .await
-                .expect_err("resume failure should surface");
-        assert!(
-            format!("{error:#}").contains("failed to resume native CLI runtime thread"),
-            "resume error should be actionable"
-        );
+                .expect("seed binding should persist");
+            let client = FakeCliRuntimeThreadClient::new();
+            client.set_resume_error("native thread missing");
 
-        let binding = store
-            .get_cli_runtime_thread_binding("thread_cli_error")
+            let error = open_cli_runtime_thread_binding(
+                &store,
+                &client,
+                open_request("thread_cli_error", 200),
+            )
             .await
-            .expect("binding read should succeed")
-            .expect("binding should remain");
-        assert_eq!(binding.native_thread_id, "cli-thread-existing");
-        assert_eq!(binding.updated_at, opened_at);
-        assert!(client.starts.lock().expect("starts lock").is_empty());
-        assert_eq!(client.resumes.lock().expect("resumes lock").len(), 1);
+            .expect_err("resume failure should surface");
+            assert!(
+                format!("{error:#}").contains("failed to resume native CLI runtime thread"),
+                "resume error should be actionable"
+            );
+
+            let binding = store
+                .get_cli_runtime_thread_binding("thread_cli_error")
+                .await
+                .expect("binding read should succeed")
+                .expect("binding should remain");
+            assert_eq!(binding.native_thread_id, "cli-thread-existing");
+            assert_eq!(binding.updated_at, opened_at);
+            assert!(client.starts.lock().expect("starts lock").is_empty());
+            assert_eq!(client.resumes.lock().expect("resumes lock").len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn cli_runtime_binding_rejects_malformed_cursor_before_provider_resume() {
-        let (_connection, store) = setup_store().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let store = setup_store(fixture).await?;
         let opened_at = unix_to_datetime(100);
         store
             .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
@@ -2957,11 +3023,14 @@ mod tests {
             })
             .await
             .expect("valid cursor fixture should persist");
-        // Simulate corrupt historical bytes; authoritative new writes reject
-        // malformed JSON before touching the existing root.
-        store.database_connection().execute_unprepared(
-            "UPDATE thread_cli_runtime_binding SET resume_cursor_json='{malformed' WHERE thread_id='thread_cli_bad_cursor' AND frozen_manifest_id IS NULL",
-        ).await.unwrap();
+        // An older provider can leave a valid JSON cursor with an incompatible
+        // field type. The Gateway must fence it before calling the provider.
+        let invalid_cursor = r#"{"threadId":[]}"#;
+        fixture.connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE thread_cli_runtime_binding SET resume_cursor_json=$1 WHERE thread_id='thread_cli_bad_cursor' AND frozen_manifest_id IS NULL",
+            [invalid_cursor.to_owned().into()],
+        )).await?;
         let client = FakeCliRuntimeThreadClient::new();
         let malformed = store
             .get_cli_runtime_thread_binding("thread_cli_bad_cursor")
@@ -2993,103 +3062,118 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(preserved.resume_cursor_json, "{malformed");
+        assert_eq!(preserved.resume_cursor_json, invalid_cursor);
         assert_eq!(preserved.updated_at, opened_at);
+        Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn cli_runtime_binding_non_resumable_runtime_starts_new_native_thread() {
-        let (_connection, store) = setup_store().await;
-        let opened_at = unix_to_datetime(100);
-        store
-            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-                thread_id: "thread_cli_non_resumable".to_owned(),
-                workspace_id: "ws_cli_binding".to_owned(),
-                runtime_id: "claude".to_owned(),
-                runtime_kind: "claude".to_owned(),
-                native_thread_id: "cli-thread-existing".to_owned(),
-                native_session_id: Some("native-session-existing".to_owned()),
-                native_root_thread_id: Some("native-root-existing".to_owned()),
-                native_cwd: Some("/tmp/project".to_owned()),
-                native_model: Some("sonnet".to_owned()),
-                resume_cursor_json: r#"{"threadId":"cli-thread-existing"}"#.to_owned(),
-                status: "active".to_owned(),
-                created_at: opened_at,
-                updated_at: opened_at,
-            })
-            .await
-            .expect("seed binding should persist");
-        let client = FakeCliRuntimeThreadClient::new();
-        let mut request = open_request("thread_cli_non_resumable", 200);
-        request.runtime_id = "claude".to_owned();
-        request.runtime_kind = "claude".to_owned();
-        request.model = Some("sonnet".to_owned());
-        request.resume_existing = false;
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = setup_store(fixture).await?;
+            let opened_at = unix_to_datetime(100);
+            store
+                .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                    thread_id: "thread_cli_non_resumable".to_owned(),
+                    workspace_id: "ws_cli_binding".to_owned(),
+                    runtime_id: "claude".to_owned(),
+                    runtime_kind: "claude".to_owned(),
+                    native_thread_id: "cli-thread-existing".to_owned(),
+                    native_session_id: Some("native-session-existing".to_owned()),
+                    native_root_thread_id: Some("native-root-existing".to_owned()),
+                    native_cwd: Some("/tmp/project".to_owned()),
+                    native_model: Some("sonnet".to_owned()),
+                    resume_cursor_json: r#"{"threadId":"cli-thread-existing"}"#.to_owned(),
+                    status: "active".to_owned(),
+                    created_at: opened_at,
+                    updated_at: opened_at,
+                })
+                .await
+                .expect("seed binding should persist");
+            let client = FakeCliRuntimeThreadClient::new();
+            let mut request = open_request("thread_cli_non_resumable", 200);
+            request.runtime_id = "claude".to_owned();
+            request.runtime_kind = "claude".to_owned();
+            request.model = Some("sonnet".to_owned());
+            request.resume_existing = false;
 
-        let result = open_cli_runtime_thread_binding(&store, &client, request)
-            .await
-            .expect("non-resumable runtime should start a fresh native thread");
+            let result = open_cli_runtime_thread_binding(&store, &client, request)
+                .await
+                .expect("non-resumable runtime should start a fresh native thread");
 
-        assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
-        assert_eq!(result.binding.native_thread_id, "cli-thread-started");
-        assert_eq!(
-            result.binding.native_session_id.as_deref(),
-            Some("cli-thread-started")
-        );
-        assert_eq!(result.binding.native_root_thread_id, None);
-        assert_eq!(result.binding.created_at, opened_at);
-        assert_eq!(result.binding.updated_at, unix_to_datetime(200));
-        assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
-        assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
+            assert_eq!(result.binding.native_thread_id, "cli-thread-started");
+            assert_eq!(
+                result.binding.native_session_id.as_deref(),
+                Some("cli-thread-started")
+            );
+            assert_eq!(result.binding.native_root_thread_id, None);
+            assert_eq!(result.binding.created_at, opened_at);
+            assert_eq!(result.binding.updated_at, unix_to_datetime(200));
+            assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
+            assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn claude_start_preserves_cursor_when_durable_uuid_is_unchanged() {
-        let (_connection, store) = setup_store().await;
-        let opened_at = unix_to_datetime(100);
-        store
-            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
-                thread_id: "thread_claude_same_uuid".to_owned(),
-                workspace_id: "ws_cli_binding".to_owned(),
-                runtime_id: "claude".to_owned(),
-                runtime_kind: "claude".to_owned(),
-                native_thread_id: "claude-durable-uuid".to_owned(),
-                native_session_id: Some("claude-durable-uuid".to_owned()),
-                native_root_thread_id: None,
-                native_cwd: Some("/tmp/project".to_owned()),
-                native_model: Some("sonnet".to_owned()),
-                resume_cursor_json: r#"{"threadId":"claude-durable-uuid","providerOpaque":{"cursor":7}}"#.to_owned(),
-                status: "active".to_owned(),
-                created_at: opened_at,
-                updated_at: opened_at,
-            })
-            .await
-            .expect("Claude binding fixture should persist");
-        let client = FakeCliRuntimeThreadClient::new();
-        *client.start_result.lock().expect("start result lock") =
-            Ok(open_snapshot("claude-durable-uuid"));
-        let mut request = open_request("thread_claude_same_uuid", 200);
-        request.runtime_id = "claude".to_owned();
-        request.runtime_kind = "claude".to_owned();
-        request.model = Some("sonnet".to_owned());
-        request.resume_existing = false;
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = setup_store(fixture).await?;
+            let opened_at = unix_to_datetime(100);
+            store
+                .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                    thread_id: "thread_claude_same_uuid".to_owned(),
+                    workspace_id: "ws_cli_binding".to_owned(),
+                    runtime_id: "claude".to_owned(),
+                    runtime_kind: "claude".to_owned(),
+                    native_thread_id: "claude-durable-uuid".to_owned(),
+                    native_session_id: Some("claude-durable-uuid".to_owned()),
+                    native_root_thread_id: None,
+                    native_cwd: Some("/tmp/project".to_owned()),
+                    native_model: Some("sonnet".to_owned()),
+                    resume_cursor_json:
+                        r#"{"threadId":"claude-durable-uuid","providerOpaque":{"cursor":7}}"#
+                            .to_owned(),
+                    status: "active".to_owned(),
+                    created_at: opened_at,
+                    updated_at: opened_at,
+                })
+                .await
+                .expect("Claude binding fixture should persist");
+            let client = FakeCliRuntimeThreadClient::new();
+            *client.start_result.lock().expect("start result lock") =
+                Ok(open_snapshot("claude-durable-uuid"));
+            let mut request = open_request("thread_claude_same_uuid", 200);
+            request.runtime_id = "claude".to_owned();
+            request.runtime_kind = "claude".to_owned();
+            request.model = Some("sonnet".to_owned());
+            request.resume_existing = false;
 
-        let result = open_cli_runtime_thread_binding(&store, &client, request)
-            .await
-            .expect("Claude start should reopen its durable UUID");
+            let result = open_cli_runtime_thread_binding(&store, &client, request)
+                .await
+                .expect("Claude start should reopen its durable UUID");
 
-        assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
-        assert_eq!(result.binding.native_thread_id, "claude-durable-uuid");
-        let cursor: serde_json::Value =
-            serde_json::from_str(&result.binding.resume_cursor_json).unwrap();
-        assert_eq!(cursor["providerOpaque"]["cursor"], 7);
-        assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
-        assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
+            assert_eq!(result.binding.native_thread_id, "claude-durable-uuid");
+            let cursor: serde_json::Value =
+                serde_json::from_str(&result.binding.resume_cursor_json).unwrap();
+            assert_eq!(cursor["providerOpaque"]["cursor"], 7);
+            assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
+            assert!(client.resumes.lock().expect("resumes lock").is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn cli_runtime_context_receipt_requires_exact_provider_and_pioneer_heads() {
-        let (_connection, store) = setup_store().await;
+        pioneer_postgres_test::with_database(async |fixture| {
+        let store = setup_store(fixture).await?;
         let opened_at = unix_to_datetime(100);
         store
             .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
@@ -3188,5 +3272,7 @@ mod tests {
             .unwrap(),
             "a receipt for another provider branch must never authorize resume"
         );
+        Ok(())
+        }).await.unwrap();
     }
 }

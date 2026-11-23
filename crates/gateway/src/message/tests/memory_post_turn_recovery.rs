@@ -314,7 +314,7 @@ async fn recovery_fixture_on_workspace(
     };
     let background = harness
         .processor
-        .with_database_class(pioneer_sqlite::SqliteWriteClass::Maintenance);
+        .with_database_class(pioneer_postgres_pools::PostgresWriteClass::Maintenance);
     let gateway = Arc::new(GatewayMemoryProvider::new(Arc::downgrade(&background)));
     let writes = Arc::new(ControlledCheckpointWrites {
         gateway: gateway.clone(),
@@ -511,7 +511,7 @@ async fn recovery_fixture_on_workspace(
     fixture
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_checkpoint_all_invalid_completes_without_model_or_write_and_stays_resolved() {
     let fixture =
         legacy_checkpoint_fixture("checkpoint-invalid", invalid_facts(), WriteMode::Pass).await;
@@ -541,7 +541,7 @@ async fn legacy_checkpoint_all_invalid_completes_without_model_or_write_and_stay
     fixture.assert_safe_diagnostics().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_checkpoint_permanent_write_result_is_persisted_without_recovery_budget() {
     let fixture = legacy_checkpoint_fixture(
         "checkpoint-permanent",
@@ -629,7 +629,7 @@ async fn assert_transient_recovery(fixture: &LegacyCheckpointFixture) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_checkpoint_transient_write_result_enters_existing_recovery() {
     let fixture = legacy_checkpoint_fixture(
         "checkpoint-transient",
@@ -641,7 +641,7 @@ async fn legacy_checkpoint_transient_write_result_enters_existing_recovery() {
     assert_eq!(fixture.memory_ids().await.len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_checkpoint_mixed_results_replay_real_writes_without_canonical_duplicates() {
     let mut facts = invalid_facts();
     facts.push(name_fact());
@@ -815,7 +815,7 @@ async fn execute_legacy_manifest(fixture: &LegacyCheckpointFixture) {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
     let fixture =
         legacy_recovery_fixture("manifest-bad-data", vec![], WriteMode::Pass, true, false).await;
@@ -838,13 +838,13 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
     assert!(error.safe_for_user);
     assert_eq!(
         error.message.as_str(),
-        "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None"
+        "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates"
     );
     // The worker also appends its known safe metadata to the outbox message.
     assert_eq!(
         status.last_error_message.as_deref(),
         Some(
-            "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates sqlite_primary_code=None sqlite_extended_code=None; failure_stage=candidates; failure_class=invalid_stored_data"
+            "memory manifest loading failed: failure_class=invalid_stored_data failure_stage=candidates; failure_stage=candidates; failure_class=invalid_stored_data"
         )
     );
     assert!(
@@ -871,7 +871,7 @@ async fn legacy_manifest_without_checkpoint_reclassifies_saved_candidate() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_failure_does_not_block_saved_checkpoint_replay() {
     let fixture = legacy_recovery_fixture(
         "manifest-checkpoint",
@@ -888,7 +888,7 @@ async fn legacy_manifest_failure_does_not_block_saved_checkpoint_replay() {
     assert_eq!(fixture.writes.attempts.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_success_continues_real_checkpoint_handler() {
     let fixture = legacy_recovery_fixture(
         "manifest-success",
@@ -912,49 +912,53 @@ fn manifest_worker_sentry_diagnostic_is_safe_with_real_gateway_hook_and_outbox()
             .build()
             .unwrap()
             .block_on(async {
-                let fixture = legacy_recovery_fixture(
-                    "manifest-sentry",
-                    vec![],
-                    WriteMode::Pass,
-                    true,
-                    false,
-                )
-                .await;
-                corrupt_manifest_candidate(&fixture).await;
-                execute_legacy_manifest(&fixture).await;
-                fixture.assert_safe_diagnostics().await;
-                // Actual SQLite query error through the scoped DB handle and Gateway.
-                let sqlite_fixture = legacy_recovery_fixture(
-                    "manifest-sentry-sqlite",
-                    vec![],
-                    WriteMode::Pass,
-                    true,
-                    false,
-                )
-                .await;
-                use sea_orm::ConnectionTrait;
-                sqlite_fixture
-                    .store()
-                    .database_connection()
-                    .execute_raw(sea_orm::Statement::from_string(
-                        sea_orm::DbBackend::Sqlite,
-                        "DROP TABLE agent_memory_candidate".to_owned(),
-                    ))
-                    .await
-                    .unwrap();
-                execute_legacy_manifest(&sqlite_fixture).await;
-                let status = sqlite_fixture.status().await;
-                assert_eq!(
-                    status.last_error_code.as_deref(),
-                    Some("memory.post_turn_extractor.manifest_unclassified")
-                );
-                assert!(
-                    status
-                        .last_error_message
-                        .unwrap()
-                        .contains("sqlite_primary_code=Some(1)")
-                );
-                assert_eq!(sqlite_fixture.model.call_count(), 0);
+                pioneer_postgres_test::with_test_databases(async {
+                    let fixture = legacy_recovery_fixture(
+                        "manifest-sentry",
+                        vec![],
+                        WriteMode::Pass,
+                        true,
+                        false,
+                    )
+                    .await;
+                    corrupt_manifest_candidate(&fixture).await;
+                    execute_legacy_manifest(&fixture).await;
+                    fixture.assert_safe_diagnostics().await;
+                    // Actual PostgreSQL query error through the scoped DB handle and Gateway.
+                    let postgres_fixture = legacy_recovery_fixture(
+                        "manifest-sentry-postgres",
+                        vec![],
+                        WriteMode::Pass,
+                        true,
+                        false,
+                    )
+                    .await;
+                    use sea_orm::ConnectionTrait;
+                    postgres_fixture
+                        .store()
+                        .database_connection()
+                        .execute_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            "ALTER TABLE agent_memory_candidate RENAME TO agent_memory_candidate_fixture_hidden".to_owned(),
+                        ))
+                        .await
+                        .unwrap();
+                    execute_legacy_manifest(&postgres_fixture).await;
+                    let status = postgres_fixture.status().await;
+                    assert_eq!(
+                        status.last_error_code.as_deref(),
+                        Some("memory.post_turn_extractor.manifest_unclassified")
+                    );
+                    assert!(
+                        status
+                            .last_error_message
+                            .unwrap()
+                            .contains("postgres_sqlstate=42P01")
+                    );
+                    assert_eq!(postgres_fixture.model.call_count(), 0);
+                })
+                .await
+                .expect("close isolated PostgreSQL test databases")
             });
     });
     let event = events
@@ -969,23 +973,20 @@ fn manifest_worker_sentry_diagnostic_is_safe_with_real_gateway_hook_and_outbox()
     };
     assert_eq!(fields["failure_class"], json!("invalid_stored_data"));
     assert_eq!(fields["failure_stage"], json!("candidates"));
-    assert!(!fields.contains_key("sqlite_primary_code"));
-    assert!(!fields.contains_key("sqlite_extended_code"));
-    let sqlite_event = events.iter().find(|event| {
-        matches!(event.contexts.get("Rust Tracing Fields"), Some(sentry::protocol::Context::Other(fields)) if fields.get("sqlite_primary_code") == Some(&json!(1)))
+    let postgres_event = events.iter().find(|event| {
+        matches!(event.contexts.get("Rust Tracing Fields"), Some(sentry::protocol::Context::Other(fields)) if fields.get("postgres_sqlstate") == Some(&json!("42P01")))
         && event.message.as_deref() == Some("memory post-turn extractor exhausted durable delivery")
     }).unwrap();
-    let sentry::protocol::Context::Other(sqlite_fields) =
-        &sqlite_event.contexts["Rust Tracing Fields"]
+    let sentry::protocol::Context::Other(postgres_fields) =
+        &postgres_event.contexts["Rust Tracing Fields"]
     else {
         panic!("tracing fields required")
     };
-    assert_eq!(sqlite_fields["failure_class"], json!("unclassified"));
-    assert_eq!(sqlite_fields["failure_stage"], json!("candidates"));
-    assert_eq!(sqlite_fields["sqlite_primary_code"], json!(1));
-    assert_eq!(sqlite_fields["sqlite_extended_code"], json!(1));
+    assert_eq!(postgres_fields["failure_class"], json!("unclassified"));
+    assert_eq!(postgres_fields["failure_stage"], json!("candidates"));
+    assert_eq!(postgres_fields["postgres_sqlstate"], json!("42P01"));
     assert!(
-        !serde_json::to_string(sqlite_event)
+        !serde_json::to_string(postgres_event)
             .unwrap()
             .contains("agent_memory_candidate")
     );
@@ -1006,7 +1007,7 @@ fn manifest_worker_sentry_diagnostic_is_safe_with_real_gateway_hook_and_outbox()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_actual_authorization_failure_has_safe_stage_and_no_invented_domain_cause() {
     let fixture =
         legacy_recovery_fixture("manifest-authority", vec![], WriteMode::Pass, true, false).await;
@@ -1044,7 +1045,7 @@ async fn manifest_actual_authorization_failure_has_safe_stage_and_no_invented_do
     assert!(!format!("{failure:?}").contains(MANIFEST_CANARY));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_without_checkpoint_success_calls_model_once() {
     let fixture = legacy_recovery_fixture(
         "manifest-no-checkpoint-success",
@@ -1070,7 +1071,7 @@ async fn legacy_manifest_without_checkpoint_success_calls_model_once() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_poison_does_not_block_healthy_obligation_in_same_worker_batch() {
     let fixture = legacy_recovery_fixture(
         "manifest-poison-batch",
@@ -1165,7 +1166,7 @@ async fn manifest_poison_does_not_block_healthy_obligation_in_same_worker_batch(
     assert_eq!(fixture.model.call_count(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_typed_transient_worker_retries_in_original_budget_then_continues_gateway() {
     let fixture = recovery_fixture(
         "manifest-original-budget",
@@ -1228,7 +1229,7 @@ async fn manifest_typed_transient_worker_retries_in_original_budget_then_continu
     assert_eq!(fixture.model.call_count(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_typed_transient_result_controls_normal_recovery() {
     let fixture = legacy_recovery_fixture(
         "manifest-legacy-transient",
@@ -1276,7 +1277,7 @@ async fn legacy_manifest_typed_transient_result_controls_normal_recovery() {
     assert_eq!(fixture.model.call_count(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_live_states_receive_new_manifest_classification_on_next_delivery() {
     use pioneer_entity::native_terminal_effect_outbox as outbox;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
@@ -1387,8 +1388,8 @@ async fn legacy_live_states_receive_new_manifest_classification_on_next_delivery
     }
 }
 
-#[tokio::test]
-async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes() {
+#[pioneer_postgres_test::postgres_test]
+async fn manifest_actual_active_query_failure_preserves_postgres_sqlstate() {
     use sea_orm::ConnectionTrait;
     let fixture = legacy_recovery_fixture(
         "manifest-active-query",
@@ -1401,7 +1402,7 @@ async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes(
     fixture
         .store()
         .database_connection()
-        .execute_unprepared("DROP TABLE agent_memory")
+        .execute_unprepared("ALTER TABLE agent_memory RENAME TO agent_memory_fixture_hidden")
         .await
         .unwrap();
     execute_legacy_manifest(&fixture).await;
@@ -1415,7 +1416,7 @@ async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes(
     assert!(error.safe_for_user);
     assert_eq!(
         error.message.as_str(),
-        "memory manifest loading failed: failure_class=unclassified failure_stage=active sqlite_primary_code=Some(1) sqlite_extended_code=Some(1)"
+        "memory manifest loading failed: failure_class=unclassified failure_stage=active postgres_sqlstate=42P01"
     );
     let status = fixture.status().await;
     assert_eq!(status.status, "unresolved");
@@ -1423,14 +1424,14 @@ async fn manifest_actual_active_query_failure_is_unclassified_with_sqlite_codes(
     assert_eq!(
         status.last_error_message.as_deref(),
         Some(
-            "memory manifest loading failed: failure_class=unclassified failure_stage=active sqlite_primary_code=Some(1) sqlite_extended_code=Some(1); failure_stage=active; failure_class=unclassified"
+            "memory manifest loading failed: failure_class=unclassified failure_stage=active postgres_sqlstate=42P01; failure_stage=active; failure_class=unclassified"
         )
     );
     assert_eq!(fixture.model.call_count(), 0);
     assert!(fixture.writes.attempts.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_disabled_runtime_remains_successful_empty_manifest() {
     let harness = setup_memory_gateway_harness("manifest-disabled", false).await;
     let provider = GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
@@ -1449,24 +1450,24 @@ async fn manifest_disabled_runtime_remains_successful_empty_manifest() {
     assert!(!manifest.diagnostics.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_claim_crash() {
-    use sea_orm::{ConnectOptions, ConnectionTrait};
+    use sea_orm::ConnectionTrait;
     for crash_after_claim in [false, true] {
-        let (directory, workspace_manager, original, workspace_id) =
-            setup_pooled_file_workspace_manager().await;
+        let (database_fixture, workspace_manager, original, workspace_id) =
+            setup_pooled_workspace_manager().await;
         let store = original.with_maintenance_access();
         let database = store.database_connection();
         assert_eq!(
             database.read_class(),
-            pioneer_sqlite::SqliteReadClass::Maintenance
+            pioneer_postgres_pools::PostgresReadClass::Maintenance
         );
         assert_eq!(
             database.write_class(),
-            pioneer_sqlite::SqliteWriteClass::Maintenance
+            pioneer_postgres_pools::PostgresWriteClass::Maintenance
         );
         assert_eq!(database.writer_max_connections(), 1);
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         let turn_id = "turn-manifest-restart";
         let thread_id = "thread-manifest-restart";
         let effect_id = "manifest-restart-effect";
@@ -1539,7 +1540,7 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
             .unwrap();
         let requeue_at = now + 3_601;
         // Abort the only mutation: marker, state and budget must all roll back.
-        database.execute_unprepared("CREATE TRIGGER manifest_requeue_abort BEFORE UPDATE ON native_terminal_effect_outbox WHEN NEW.last_error_code = 'memory.post_turn_extractor.legacy_manifest_revalidate' BEGIN SELECT RAISE(ABORT, 'fixture abort'); END").await.unwrap();
+        database.execute_unprepared("CREATE FUNCTION manifest_requeue_abort() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture abort'; END; $$; CREATE TRIGGER manifest_requeue_abort BEFORE UPDATE ON native_terminal_effect_outbox FOR EACH ROW WHEN (NEW.last_error_code = 'memory.post_turn_extractor.legacy_manifest_revalidate') EXECUTE FUNCTION manifest_requeue_abort()").await.unwrap();
         assert!(
             store
                 .requeue_retryable_unresolved_native_terminal_effects(requeue_at, 1)
@@ -1559,7 +1560,7 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
         assert_eq!(rolled_back.attempt_count, 1);
         assert_eq!(rolled_back.max_attempts, 1);
         database
-            .execute_unprepared("DROP TRIGGER manifest_requeue_abort")
+            .execute_unprepared("DROP TRIGGER manifest_requeue_abort ON native_terminal_effect_outbox; DROP FUNCTION manifest_requeue_abort()")
             .await
             .unwrap();
         assert_eq!(
@@ -1584,20 +1585,9 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
         drop(workspace_manager);
         database.close().await.unwrap();
 
-        let url = format!(
-            "sqlite://{}?mode=rw",
-            directory.path().join("gateway.sqlite").display()
-        );
-        let mut writer_options = ConnectOptions::new(url.clone());
-        writer_options.max_connections(1).sqlx_logging(false);
-        let mut reader_options = ConnectOptions::new(url);
-        reader_options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-        let writer = Database::connect(writer_options).await.unwrap();
-        let reader = Database::connect(reader_options).await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        let writer = database_fixture.connect_with_limit(1).await.unwrap();
+        let reader = database_fixture.connect_read_only().await.unwrap();
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
         let persisted = restarted
             .native_terminal_effect_status(effect_id)
@@ -1667,16 +1657,16 @@ async fn legacy_manifest_marker_and_single_budget_survive_database_reopen_and_cl
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reopen() {
     use pioneer_entity::native_terminal_effect_outbox as outbox;
-    use sea_orm::{ColumnTrait, ConnectOptions, EntityTrait, QueryFilter, sea_query::Expr};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
 
     // Ordinary max_attempts=1 is the adjacent control: its timeout still gets
     // ordinary recovery with budget 8. Both historical legacy budgets stay fixed.
     for (legacy, budget) in [(true, 1_u16), (true, 8_u16), (false, 1_u16)] {
-        let (directory, workspace_manager, store, workspace_id) =
-            setup_pooled_file_workspace_manager().await;
+        let (database_fixture, workspace_manager, store, workspace_id) =
+            setup_pooled_workspace_manager().await;
         let fixture = recovery_fixture_on_workspace(
             &format!("manifest-worker-timeout-{legacy}-{budget}"),
             vec![],
@@ -1794,23 +1784,12 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
         drop(fixture);
         database.close().await.unwrap();
 
-        // Reopen the actual file with the existing reader/writer contour.
-        let url = format!(
-            "sqlite://{}?mode=rw",
-            directory.path().join("gateway.sqlite").display()
-        );
-        let mut writer_options = ConnectOptions::new(url.clone());
-        writer_options.max_connections(1).sqlx_logging(false);
-        let mut reader_options = ConnectOptions::new(url);
-        reader_options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-        let writer = Database::connect(writer_options).await.unwrap();
-        let reader = Database::connect(reader_options).await.unwrap();
-        let database = pioneer_sqlite::SqliteDatabase::new(reader, writer).maintenance();
+        // Reopen the same PostgreSQL database through new reader and writer pools.
+        let writer = database_fixture.connect_with_limit(1).await.unwrap();
+        let reader = database_fixture.connect_read_only().await.unwrap();
+        let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer).maintenance();
         let restarted = CrudStore::new(database.clone());
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         assert_eq!(database.writer_max_connections(), 1);
         let persisted = restarted
             .native_terminal_effect_status(&effect_id)
@@ -1891,7 +1870,7 @@ async fn legacy_manifest_worker_timeout_keeps_single_budget_after_database_reope
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn manifest_reports_further_pages_and_clipped_items_without_claiming_global_coverage() {
     let fixture =
         legacy_recovery_fixture("manifest-bounds", vec![], WriteMode::Pass, true, false).await;

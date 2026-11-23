@@ -18,7 +18,7 @@ use pioneer_observability::{PatchOperationMetric, record_patch_operation};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -99,17 +99,8 @@ impl ApplyPatchHandler {
                     .to_owned(),
             ));
         }
-        self.handle_with_source_inner(
-            invocation,
-            source,
-            native_context
-                .as_ref()
-                .map(|(identity, observer)| (identity, observer.as_ref() as &dyn CommitObserver)),
-            native_context
-                .as_ref()
-                .map(|(identity, observer)| (identity, observer.as_ref())),
-        )
-        .await
+        self.handle_with_source_inner(invocation, source, native_context)
+            .await
     }
 
     /// Same canonical pipeline with a trusted history observer.  The
@@ -121,23 +112,34 @@ impl ApplyPatchHandler {
         _trace: crate::events::ToolEventTrace,
         source: PatchRequestSource,
         identity: &InvocationIdentity,
-        observer: &dyn CommitObserver,
+        observer: Arc<dyn CommitObserver>,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        self.handle_with_source_inner(
-            invocation,
-            source,
-            Some((identity, observer)),
-            Some((identity, observer)),
-        )
-        .await
+        self.handle_with_source_inner(invocation, source, Some((identity.clone(), observer)))
+            .await
     }
 
     async fn handle_with_source_inner(
         &self,
         mut invocation: ToolInvocation,
         source: PatchRequestSource,
+        observer: Option<(InvocationIdentity, Arc<dyn CommitObserver>)>,
+    ) -> Result<Box<dyn ToolOutput>, ToolError> {
+        invocation.cancellation = invocation.cancellation.child_token();
+        let _cancel_worker = invocation.cancellation.clone().drop_guard();
+        pioneer_observability::work::spawn_blocking(move || {
+            let observer = observer
+                .as_ref()
+                .map(|(identity, observer)| (identity, observer.as_ref()));
+            Self::execute_patch(invocation, source, observer)
+        })
+        .await
+        .map_err(|error| ToolError::internal(format!("apply_patch worker failed: {error}")))?
+    }
+
+    fn execute_patch(
+        mut invocation: ToolInvocation,
+        source: PatchRequestSource,
         observer: Option<(&InvocationIdentity, &dyn CommitObserver)>,
-        native_history: Option<(&InvocationIdentity, &dyn CommitObserver)>,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let mut operation_metric = PatchOperationMetricGuard::new(
             source,
@@ -326,7 +328,7 @@ impl ApplyPatchHandler {
                 "failed to serialize apply_patch projection: {error}"
             ))
         })?;
-        let payload = if let Some((identity, observer)) = native_history {
+        let payload = if let Some((identity, observer)) = observer {
             let mut payload = payload;
             match observer.record(identity) {
                 Ok(Some(stored)) => {
@@ -934,7 +936,7 @@ mod tests {
         let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
         invocation.apply_patch_preflight = preflight;
         let identity = InvocationIdentity::new("thread", "turn", "call_stale").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_stale", "apply_patch");
 
@@ -944,7 +946,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .expect("observed stale state is a typed tool result, not a transport failure");
@@ -1006,7 +1008,7 @@ mod tests {
                 format!("call_invalid_{index}"),
             )
             .unwrap();
-            let observer = InMemoryCommitObserver::new();
+            let observer = Arc::new(InMemoryCommitObserver::new());
             let trace = crate::events::ToolEventBus::default().start_trace(
                 "turn_invalid",
                 format!("call_invalid_{index}"),
@@ -1019,7 +1021,7 @@ mod tests {
                     trace,
                     PatchRequestSource::ManagedClaude,
                     &identity,
-                    &observer,
+                    observer.clone(),
                 )
                 .await
                 .expect("invalid patch input should remain a typed tool rejection");
@@ -1049,7 +1051,7 @@ mod tests {
         invocation.apply_patch_preflight = preflight;
         let identity =
             InvocationIdentity::new("thread_reject", "turn_reject", "call_reject").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn_reject",
             "call_reject",
@@ -1061,7 +1063,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .unwrap();
@@ -1161,7 +1163,7 @@ mod tests {
                 "call_diagnostics",
             )
             .unwrap();
-            let observer = InMemoryCommitObserver::new();
+            let observer = Arc::new(InMemoryCommitObserver::new());
             let trace = crate::events::ToolEventBus::default().start_trace(
                 "turn_diagnostics",
                 "call_diagnostics",
@@ -1173,7 +1175,7 @@ mod tests {
                     trace,
                     PatchRequestSource::ManagedClaude,
                     &identity,
-                    &observer,
+                    observer.clone(),
                 )
                 .await
                 .unwrap();
@@ -1257,7 +1259,7 @@ mod tests {
                 "call_empty_boundary",
             )
             .unwrap();
-            let observer = InMemoryCommitObserver::new();
+            let observer = Arc::new(InMemoryCommitObserver::new());
             let trace = crate::events::ToolEventBus::default().start_trace(
                 "turn_empty_boundary",
                 "call_empty_boundary",
@@ -1269,7 +1271,7 @@ mod tests {
                     trace,
                     PatchRequestSource::ManagedClaude,
                     &identity,
-                    &observer,
+                    observer.clone(),
                 )
                 .await
                 .unwrap();
@@ -1348,7 +1350,7 @@ mod tests {
         traversal.apply_patch_preflight = preflight;
         let traversal_identity =
             InvocationIdentity::new("thread_codes", "turn_codes", "call_traversal").unwrap();
-        let traversal_observer = InMemoryCommitObserver::new();
+        let traversal_observer = Arc::new(InMemoryCommitObserver::new());
         let traversal_trace = crate::events::ToolEventBus::default().start_trace(
             "turn_codes",
             "call_traversal",
@@ -1360,7 +1362,7 @@ mod tests {
                 traversal_trace,
                 PatchRequestSource::ManagedClaude,
                 &traversal_identity,
-                &traversal_observer,
+                traversal_observer.clone(),
             )
             .await
             .expect("path escape must be a typed tool rejection");
@@ -1391,7 +1393,7 @@ mod tests {
         utf8.apply_patch_preflight = preflight;
         let utf8_identity =
             InvocationIdentity::new("thread_codes", "turn_codes", "call_invalid_utf8").unwrap();
-        let utf8_observer = InMemoryCommitObserver::new();
+        let utf8_observer = Arc::new(InMemoryCommitObserver::new());
         let utf8_trace = crate::events::ToolEventBus::default().start_trace(
             "turn_codes",
             "call_invalid_utf8",
@@ -1403,7 +1405,7 @@ mod tests {
                 utf8_trace,
                 PatchRequestSource::ManagedClaude,
                 &utf8_identity,
-                &utf8_observer,
+                utf8_observer.clone(),
             )
             .await
             .expect("invalid UTF-8 must be a typed tool rejection");
@@ -1429,7 +1431,7 @@ mod tests {
             arguments: serde_json::json!({ "patch": changed }),
         };
         let identity = InvocationIdentity::new("thread", "turn", "call_patch_binding").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn",
             "call_patch_binding",
@@ -1442,7 +1444,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await;
         let error = match result {
@@ -1468,7 +1470,7 @@ mod tests {
         invocation.apply_patch_preflight = preflight;
         invocation.execution_security_snapshot = None;
         let identity = InvocationIdentity::new("thread", "turn", "call_patch_binding").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn",
             "call_patch_binding",
@@ -1481,7 +1483,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await;
         let error = match result {
@@ -1516,7 +1518,7 @@ mod tests {
             ));
         let identity =
             InvocationIdentity::new("thread_policy", "turn_policy", "call_patch_binding").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn_policy",
             "call_patch_binding",
@@ -1529,7 +1531,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .expect("sandbox denial must remain a typed tool rejection");
@@ -1565,7 +1567,7 @@ mod tests {
         let (_, preflight) = extract_permission_intent_with_preflight(&invocation);
         invocation.apply_patch_preflight = preflight;
         let identity = InvocationIdentity::new("thread_move", "turn_move", "call_move").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn_move",
             "call_move",
@@ -1578,7 +1580,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .unwrap();
@@ -1654,7 +1656,7 @@ mod tests {
         assert_ne!(ready.workspace_root(), Path::new("/"));
         invocation.apply_patch_preflight = preflight;
         let identity = InvocationIdentity::new("thread_roots", "turn_roots", "call_roots").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn_roots",
             "call_roots",
@@ -1667,7 +1669,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .unwrap();
@@ -1822,7 +1824,7 @@ mod tests {
             notes.display(),
             budget.display(),
         );
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
 
         for (call, patch) in [("draft", draft), ("final", final_edit)] {
             let mut invocation = invocation(cwd.as_path(), patch.as_str());
@@ -1849,7 +1851,7 @@ mod tests {
                     trace,
                     PatchRequestSource::ManagedClaude,
                     &identity,
-                    &observer,
+                    observer.clone(),
                 )
                 .await
                 .unwrap();
@@ -1912,7 +1914,7 @@ mod tests {
         assert_eq!(ready.workspace_root(), Path::new("/"));
         invocation.apply_patch_preflight = preflight;
         let identity = InvocationIdentity::new("thread_slash", "turn_slash", "call_slash").unwrap();
-        let observer = InMemoryCommitObserver::new();
+        let observer = Arc::new(InMemoryCommitObserver::new());
         let trace = crate::events::ToolEventBus::default().start_trace(
             "turn_slash",
             "call_slash",
@@ -1925,7 +1927,7 @@ mod tests {
                 trace,
                 PatchRequestSource::ManagedClaude,
                 &identity,
-                &observer,
+                observer.clone(),
             )
             .await
             .unwrap();

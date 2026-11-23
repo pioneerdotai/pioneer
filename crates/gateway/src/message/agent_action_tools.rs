@@ -32,7 +32,7 @@ pub(crate) struct CurrentAgentIdentitySourceFence {
     fingerprint: String,
 }
 
-fn cli_identity_catalog(
+pub(super) fn cli_identity_catalog(
     processor: &MessageProcessor,
     configured: &[pioneer_config::EffectiveGatewayCliAgentRuntimeInstanceConfig],
 ) -> anyhow::Result<Vec<pioneer_crud::CliRuntimeIdentitySeed>> {
@@ -3469,7 +3469,7 @@ pub(super) enum AgentActionOutboxDispatch {
 
 // Failure to obtain a proof is different from a proof denying the action.
 // Keep the database cause intact across semantic context boundaries. A driver
-// query/connection failure (including SQLITE_IOERR) cannot establish denial;
+// query or connection failure cannot establish denial;
 // parsed-but-invalid envelopes and missing/denied authority still can.
 pub(super) fn agent_start_has_storage_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|source| {
@@ -3485,8 +3485,7 @@ pub(super) fn agent_start_has_storage_failure(error: &anyhow::Error) -> bool {
                 )
             })
             || source.downcast_ref::<sea_orm::ConnAcquireErr>().is_some()
-    }) || pioneer_sqlite::is_anyhow_sqlite_transient_access(error)
-        || super::agent_runtime::native_preparation_has_typed_sqlite_lock(error)
+    }) || pioneer_postgres_pools::is_anyhow_database_transient_access(error)
 }
 
 pub(super) fn agent_start_proof_error(

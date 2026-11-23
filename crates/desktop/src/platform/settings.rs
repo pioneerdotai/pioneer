@@ -26,6 +26,10 @@ impl DesktopSettingsPlatform {
     }
 }
 impl SettingsPlatform for DesktopSettingsPlatform {
+    fn api_provider_title(&self) -> Option<pioneer_desktop_foundation::ApiProviderTitle> {
+        Some(pioneer_desktop_providers::api_provider_title)
+    }
+
     fn language(&self, cx: &App) -> AppLanguagePreference {
         settings::app_language(cx)
     }

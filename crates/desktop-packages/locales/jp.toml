@@ -147,3 +147,13 @@ repair_notice = "中断した操作を続行するか、設定を再適用する
 fresh_package_required = "保存済みパッケージがないか変更されています。新しいものを選ぶか削除してください。"
 reapply_native_change = "変更は保存されていません。設定から再適用するか削除してください。"
 retained_notice = "データはこのIDに属します。このアプリを更新するかデータを明示的に削除してください。新規インストールには自動で引き継がれません。"
+
+[plugins.details_settings]
+title = "設定"
+enabled_description = "現在のワークスペースでこのプラグインとその機能を有効にします。"
+implicit_description = "リクエストで明示的に指定されていなくても、エージェントがこのプラグインを自動的に使用できるようにします。"
+
+[apps.details_settings]
+title = "設定"
+enabled_description = "現在のワークスペースでこのアプリを使用できるようにします。"
+implicit_description = "リクエストで明示的に指定されていなくても、エージェントがこのアプリを自動的に使用できるようにします。"

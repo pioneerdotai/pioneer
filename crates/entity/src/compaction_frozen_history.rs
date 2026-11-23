@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_history")]
 pub struct Model {
-    pub expired: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]
@@ -24,6 +23,7 @@ pub struct Model {
     pub next_import: i64,
     pub ready: i64,
     pub storage_registered: i64,
+    pub expired: i64,
     #[sea_orm(has_many)]
     pub compaction_frozen_import_data: HasMany<super::compaction_frozen_import_data::Entity>,
     #[sea_orm(has_many)]
@@ -41,7 +41,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",
@@ -49,7 +49,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

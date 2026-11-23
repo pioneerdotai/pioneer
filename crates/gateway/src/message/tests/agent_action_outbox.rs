@@ -5,14 +5,14 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Trans
 async fn outbox_fixture(
     rows: &[(&str, &str, i64)],
 ) -> (
-    tempfile::TempDir,
+    Arc<pioneer_postgres_test::TestDatabase>,
     Arc<MessageProcessor>,
     Arc<NativeSchedulingObserver>,
     chrono::DateTime<chrono::FixedOffset>,
 ) {
     let observer = Arc::new(NativeSchedulingObserver::default());
     let (directory, workspace_manager, store, workspace) =
-        setup_pooled_file_workspace_manager_with_observer(Some(observer.clone())).await;
+        setup_pooled_workspace_manager_with_observer(Some(observer.clone())).await;
     let database = store.database_connection();
     let identity = agent_identity::Entity::find()
         .filter(agent_identity::Column::WorkspaceId.eq(&workspace))
@@ -93,7 +93,7 @@ async fn outbox_fixture(
     (directory, processor, observer, now)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_remainder() {
     let (_directory, processor, observer, now) = outbox_fixture(&[
         ("a-malformed", "{", 0),
@@ -112,19 +112,18 @@ async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_rem
         1
     );
     let writes = observer.writes.lock().unwrap().clone();
-    assert!(
-        writes
-            .iter()
-            .any(|event| matches!(event, pioneer_sqlite::SqliteWriteEvent::Acquired { .. }))
-    );
+    assert!(writes.iter().any(|event| matches!(
+        event,
+        pioneer_postgres_pools::PostgresWriteEvent::Acquired { .. }
+    )));
     assert!(
         writes
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
-            .all(|class| class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
     let bad = agent_action_outbox::Entity::find_by_id("a-malformed")
         .one(&database)
@@ -180,7 +179,7 @@ async fn agent_action_outbox_poison_payloads_keep_retry_contract_and_process_rem
     foreground.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_action_outbox_local_claim_failure_between_healthy_rows_dispatches_final_attempt() {
     let (_directory, processor, observer, _) = outbox_fixture(&[
         ("a", r#"{"kind":"send_message"}"#, 7),
@@ -193,7 +192,7 @@ async fn agent_action_outbox_local_claim_failure_between_healthy_rows_dispatches
         .with_maintenance_access()
         .database_connection();
     // Only the fixture adds this fault trigger; no production schema mechanism.
-    database.execute_unprepared("CREATE TRIGGER reject_b_claim BEFORE UPDATE OF attempts ON agent_action_outbox WHEN OLD.id='b' BEGIN SELECT RAISE(ABORT,'local storage failure'); END").await.unwrap();
+    database.execute_unprepared("CREATE FUNCTION reject_b_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'local storage failure'; END; $$; CREATE TRIGGER reject_b_claim BEFORE UPDATE OF attempts ON agent_action_outbox FOR EACH ROW WHEN (OLD.id='b') EXECUTE FUNCTION reject_b_claim();").await.unwrap();
     observer.writes.lock().unwrap().clear();
     let batch = crate::message::agent_action_tools::process_due_agent_action_outbox(&processor, 64)
         .await
@@ -222,14 +221,14 @@ async fn agent_action_outbox_local_claim_failure_between_healthy_rows_dispatches
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
-            .all(|class| class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_action_outbox_ack_and_both_deferral_errors_preserve_remainder_and_diagnostics() {
     use crate::message::agent_action_tools::{
         AgentActionOutboxDispatch, process_claimed_agent_action_outbox,
@@ -249,7 +248,7 @@ async fn agent_action_outbox_ack_and_both_deferral_errors_preserve_remainder_and
             .await
             .unwrap();
         assert!(batch.errors.is_empty());
-        database.execute_unprepared("CREATE TRIGGER reject_b_ack BEFORE UPDATE ON agent_action_outbox WHEN OLD.id='b' BEGIN SELECT RAISE(ABORT,'local callback failure'); END").await.unwrap();
+        database.execute_unprepared("CREATE FUNCTION reject_b_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'local callback failure'; END; $$; CREATE TRIGGER reject_b_ack BEFORE UPDATE ON agent_action_outbox FOR EACH ROW WHEN (OLD.id='b') EXECUTE FUNCTION reject_b_ack();").await.unwrap();
         let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = dispatched.clone();
         let result = process_claimed_agent_action_outbox(&database, batch, move |row| {
@@ -297,7 +296,7 @@ async fn agent_action_outbox_ack_and_both_deferral_errors_preserve_remainder_and
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_action_outbox_creation_and_polling_panics_preserve_remainder_and_final_dispatch() {
     use crate::message::agent_action_tools::{
         AgentActionOutboxDispatch, process_claimed_agent_action_outbox,
@@ -374,13 +373,14 @@ async fn agent_action_outbox_creation_and_polling_panics_preserve_remainder_and_
                 .unwrap()
                 .iter()
                 .filter_map(|event| match event {
-                    pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                    pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } =>
+                        Some(*class),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![pioneer_sqlite::SqliteWriteClass::Maintenance; 5]
+            vec![pioneer_postgres_pools::PostgresWriteClass::Maintenance; 5]
         );
-        assert!(database.reader_query_only_enabled().await.unwrap());
+        assert!(database.reader_is_read_only().await.unwrap());
         let writer = tokio::time::timeout(
             Duration::from_secs(1),
             processor.crud_store.database_connection().begin(),
@@ -398,7 +398,7 @@ struct PanicAckConnection<C>(C);
 impl<C: pioneer_crud::GatewayControlConnection> pioneer_crud::GatewayControlConnection
     for PanicAckConnection<C>
 {
-    fn gateway_control_change(&self) -> Option<pioneer_sqlite::WorkChange> {
+    fn gateway_control_change(&self) -> Option<pioneer_postgres_pools::WorkChange> {
         self.0.gateway_control_change()
     }
 }
@@ -448,7 +448,7 @@ impl<C: ConnectionTrait> ConnectionTrait for PanicAckConnection<C> {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_remainder() {
     use crate::message::agent_action_tools::{
         AgentActionOutboxDispatch, process_claimed_agent_action_outbox,
@@ -512,14 +512,14 @@ async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+                pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        vec![pioneer_sqlite::SqliteWriteClass::Maintenance; 6],
+        vec![pioneer_postgres_pools::PostgresWriteClass::Maintenance; 6],
         "three claims + three ACKs, no compensation/retry"
     );
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     let writer = tokio::time::timeout(
         Duration::from_secs(1),
         processor.crud_store.database_connection().begin(),
@@ -530,7 +530,7 @@ async fn agent_action_outbox_ack_panic_after_commit_does_not_compensate_or_stop_
     writer.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn start_outbox_refusal_stops_delivery_without_inflating_attempts_and_unknown_error_is_safe()
 {
     use crate::message::agent_action_tools::{
@@ -650,8 +650,8 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
     use sea_orm::{DbErr, RuntimeErr, SqlxError};
     use std::borrow::Cow;
 
-    // SQLx's typed DatabaseError boundary, as used by the SQLite driver. The
-    // text is deliberately unrelated to the numeric IOERR code: classification
+    // SQLx's typed DatabaseError boundary, as used by the PostgreSQL driver. The
+    // text is deliberately unrelated to the I/O error SQLSTATE: classification
     // must preserve the driver failure without inspecting its Display payload.
     #[derive(Debug)]
     struct DriverIo;
@@ -666,7 +666,7 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
             "private provider payload must not become diagnostics"
         }
         fn code(&self) -> Option<Cow<'_, str>> {
-            Some("10".into()) // SQLITE_IOERR
+            Some("58030".into()) // io_error
         }
         fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
             self
@@ -722,7 +722,7 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
             anyhow::Error::new(DbErr::RecordNotFound("missing admission".into())),
             anyhow::Error::new(DbErr::Type("invalid persisted field".into())),
             anyhow::Error::new(malformed),
-            anyhow::anyhow!("SQLITE_IOERR is merely untrusted text here"),
+            anyhow::anyhow!("SQLSTATE 58030 is merely untrusted text here"),
         ] {
             let proof_error = agent_start_proof_error(error, semantic);
             assert_eq!(proof_error.downcast_ref::<Failure>(), Some(&semantic));
@@ -730,7 +730,7 @@ fn agent_start_proof_preserves_typed_storage_faults_without_retrying_semantic_de
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exhausted_start_reconciliation_is_bounded_and_yields_to_an_ordinary_due_row() {
     use sea_orm::ActiveModelTrait;
     let (_directory, processor, _observer, now) = outbox_fixture(&[

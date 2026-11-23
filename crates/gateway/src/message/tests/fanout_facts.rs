@@ -5,13 +5,14 @@ use pioneer_crud::{
     NewWorkspaceMembership, insert_active_device_session, insert_thread_membership,
     insert_workspace_membership,
 };
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+    PostgresWriteExecutor,
+};
 use pioneer_protocol::{
     AuthSessionId, ClientInstallationDescriptor, ClientKind, DeviceId, PrincipalId, TokenFamilyId,
 };
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
-};
-use sea_orm::{ConnectOptions, Statement};
+use sea_orm::Statement;
 
 const THREAD: &str = "T0000000000000000009A";
 const METHOD: &str = "test/bounded-fanout";
@@ -20,7 +21,7 @@ type Principal = Arc<crate::auth::AuthenticatedSessionPrincipal>;
 
 struct Fixture {
     _directory: tempfile::TempDir,
-    database: SqliteDatabase,
+    database: PostgresDatabase,
     processor: MessageProcessor,
     workspace: String,
     statements: Arc<std::sync::Mutex<Vec<Statement>>>,
@@ -30,55 +31,36 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("fanout.sqlite");
-        let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-        options
-            .max_connections(1)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|o| o.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(options).await.unwrap();
-        let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-        writer
-            .execute_unprepared("PRAGMA journal_mode=WAL")
-            .await
-            .unwrap();
-        let mut options =
-            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-        options
-            .max_connections(2)
-            .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(|o| {
-                o.read_only(true)
-                    .create_if_missing(false)
-                    .pragma("query_only", "ON")
-                    .pragma("foreign_keys", "OFF")
-            });
-        let mut reader = Database::connect(options).await.unwrap();
+        let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+        let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+        let mut reader = postgres_fixture.connect_read_only().await.unwrap();
         let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
         reader.set_metric_callback({
             let statements = statements.clone();
             move |info| statements.lock().unwrap().push(info.statement.clone())
         });
         let observer = Arc::new(NativeSchedulingObserver::default());
-        let database = SqliteDatabase::from_executor_with_read_observer(
+        let database = PostgresDatabase::from_executor_with_read_observer(
             reader,
-            SqliteWriteExecutor::with_observer(writer, observer.clone()),
+            PostgresWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
         database.validate_reader().await.unwrap();
-        assert!(database.reader_query_only_enabled().await.unwrap());
-        assert_eq!(
+        assert!(database.reader_is_read_only().await.unwrap());
+        assert!(
             database
                 .query_one_raw(Statement::from_string(
-                    sea_orm::DbBackend::Sqlite,
-                    "SELECT foreign_keys AS value FROM pragma_foreign_keys"
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT current_setting('session_replication_role')='origin'
+                          AND EXISTS (SELECT 1 FROM pg_constraint
+                              WHERE conname='auth_session_device_id_fkey') AS value",
                 ))
                 .await
                 .unwrap()
                 .unwrap()
-                .try_get::<i64>("", "value")
-                .unwrap(),
-            0
+                .try_get::<bool>("", "value")
+                .unwrap()
         );
         let identity = Arc::new(
             crate::identity::bootstrap_identity(&database)
@@ -325,8 +307,8 @@ fn delivered(rx: &mut crate::session::test_support::OutboundTestReceiver) {
     );
 }
 
-#[tokio::test]
-async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
+#[pioneer_postgres_test::postgres_test]
+async fn ordinary_fanout_shares_bounded_prefix_on_scoped_read_only_readers() {
     let f = Fixture::new().await;
     let principal = f.member(10, true).await;
     let mut receivers = Vec::new();
@@ -334,10 +316,10 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
         receivers.push(f.connect(principal.clone()).await.1);
     }
     for (processor, class) in [
-        (f.processor.clone(), SqliteReadClass::Interactive),
+        (f.processor.clone(), PostgresReadClass::Interactive),
         (
             f.processor.scoped_for_background_reconciliation(),
-            SqliteReadClass::Maintenance,
+            PostgresReadClass::Maintenance,
         ),
     ] {
         let held_writer = f.database.begin().await.unwrap();
@@ -365,7 +347,10 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
                     assert_eq!(
                         statements
                             .iter()
-                            .filter(|s| s.sql.contains(&format!("FROM \"{table}\"")))
+                            .filter(|s| {
+                                s.sql.contains(&format!("FROM \"{table}\""))
+                                    || s.sql.contains(&format!("JOIN \"{table}\""))
+                            })
                             .count(),
                         expected,
                         "pre-stage {table}"
@@ -381,28 +366,35 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
                 let finished = reads
                     .iter()
                     .filter_map(|event| match event {
-                        SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        PostgresReadEvent::OperationFinished { class, outcome, .. } => {
                             Some((*class, *outcome))
                         }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(finished, vec![(class, SqliteReadOutcome::Ok); 8]);
+                // The scope resolves thread and workspace in one joined read.
+                assert_eq!(finished, vec![(class, PostgresReadOutcome::Ok); 7]);
                 assert_eq!(
                     reads
                         .iter()
-                        .filter(|event| matches!(event, SqliteReadEvent::AdmissionAcquired { .. }))
+                        .filter(|event| matches!(
+                            event,
+                            PostgresReadEvent::AdmissionAcquired { .. }
+                        ))
                         .count(),
                     reads
                         .iter()
-                        .filter(|event| matches!(event, SqliteReadEvent::AdmissionReleased { .. }))
+                        .filter(|event| matches!(
+                            event,
+                            PostgresReadEvent::AdmissionReleased { .. }
+                        ))
                         .count()
                 );
                 assert!(
                     reads
                         .iter()
                         .filter_map(|event| match event {
-                            SqliteReadEvent::AdmissionReleased {
+                            PostgresReadEvent::AdmissionReleased {
                                 active,
                                 queue_depth,
                                 ..
@@ -431,7 +423,7 @@ async fn ordinary_fanout_shares_bounded_prefix_on_scoped_query_only_readers() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     let f = Fixture::new().await;
     let allowed = f.member(10, true).await;
@@ -565,7 +557,7 @@ async fn ordinary_fanout_durable_leases_private_acl_and_fresh_final_subset() {
     delivered(&mut denied_rx);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_before_serializing() {
     let f = Fixture::new().await;
     let principal = f.member(10, true).await;
@@ -615,10 +607,16 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
             .thread_unsubscribe(connection, THREAD)
             .await;
     }
-    // Corrupt persisted rows deliberately bypass CHECK constraints as well as
-    // unenforced foreign keys; normal fixture creation uses valid typed CRUD.
+    // Inject only the impossible rows this reader must reject. The fixture's
+    // other constraints and triggers continue to enforce the migrated schema.
     f.database
-        .execute_unprepared("PRAGMA ignore_check_constraints=ON")
+        .execute_unprepared(
+            "ALTER TABLE auth_session DROP CONSTRAINT auth_session_device_id_fkey,
+               DROP CONSTRAINT auth_session_refresh_generation_check;
+             ALTER TABLE device DROP CONSTRAINT device_principal_id_fkey;
+             ALTER TABLE gateway_principal DROP CONSTRAINT gateway_principal_kind_check,
+               DROP CONSTRAINT gateway_principal_check;",
+        )
         .await
         .unwrap();
     // Restore each mutation through the runtime writer. No missing/error case
@@ -637,7 +635,7 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
             "UPDATE auth_session SET refresh_generation=0 WHERE id='S00000000000000000010'",
         ),
         (
-            "UPDATE auth_session SET refresh_expires_at='2000-01-01T00:00:00+00:00' WHERE id='S00000000000000000010'",
+            "UPDATE auth_session SET refresh_expires_at='2000-01-01T00:00:00+00:00',created_at='1999-01-01T00:00:00+00:00' WHERE id='S00000000000000000010'",
             "UPDATE auth_session SET refresh_expires_at='2100-01-01T00:00:00+00:00' WHERE id='S00000000000000000010'",
         ),
         (
@@ -653,7 +651,7 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
         delivered(&mut rx);
     }
     f.database
-        .execute_unprepared("DROP TABLE thread_membership")
+        .execute_unprepared("ALTER TABLE thread_membership RENAME TO unavailable_thread_membership")
         .await
         .unwrap();
     assert_eq!(
@@ -664,7 +662,7 @@ async fn ordinary_fanout_rejects_missing_corrupt_and_cross_linked_lease_facts_be
     assert!(rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn authorization_fact_queries_enforce_exact_scopes_rows_and_input_limits() {
     use pioneer_crud::{
         load_session_leases, load_thread_membership_principal_ids,
@@ -742,10 +740,10 @@ async fn authorization_fact_queries_enforce_exact_scopes_rows_and_input_limits()
     );
     assert!(
         f.statements.lock().unwrap().is_empty(),
-        "oversized input must not reach SQLite"
+        "oversized input must not reach PostgreSQL"
     );
     f.database
-        .execute_unprepared("DROP TABLE auth_session")
+        .execute_unprepared("ALTER TABLE auth_session RENAME TO unavailable_auth_session")
         .await
         .unwrap();
     let (_, mut rx) = f.connect(participant).await;
@@ -753,7 +751,7 @@ async fn authorization_fact_queries_enforce_exact_scopes_rows_and_input_limits()
     assert!(rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fanout_keeps_exact_runtime_drafts_and_internal_lineage_as_special_domains() {
     let f = Fixture::new().await;
     let principal = f.member(10, true).await;

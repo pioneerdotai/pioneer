@@ -12,7 +12,7 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(target_os = "macos")]
-const GATEWAY_BUNDLE: &str = "cua/Pioneer Gateway.app";
+const GATEWAY_BUNDLE: &str = "runtime/Pioneer Gateway.app";
 
 pub(super) struct ArchiveInstaller {
     pub binary_path: PathBuf,
@@ -176,11 +176,11 @@ fn extract_archive(input: File, runtime: &Path) -> Result<()> {
                 && (!cfg!(unix) || mode & 0o022 == 0),
             "unsafe Gateway archive member type or permissions"
         );
-        // CU packages contain one platform-specific executable and its CUA tree.
+        // CU packages contain one platform-specific executable and its runtime tree.
         // macOS retains the entire signed bundle at its original relative paths.
         ensure!(
-            normalized == "cua"
-                || normalized.starts_with("cua/")
+            normalized == "runtime"
+                || normalized.starts_with("runtime/")
                 || (!cfg!(target_os = "macos") && normalized == installer_member()),
             "unexpected Gateway archive member"
         );
@@ -237,7 +237,7 @@ fn safe_component(component: &str) -> bool {
 
 fn installer_member() -> &'static str {
     if cfg!(target_os = "macos") {
-        "cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+        "runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
     } else if cfg!(windows) {
         "pioneer.exe"
     } else {
@@ -255,15 +255,16 @@ fn validate_runtime(runtime: &Path, binary: &Path) -> Result<()> {
             "Gateway installer is not executable"
         );
     }
-    let payload = runtime.join("cua");
+    let payload = runtime.join("runtime");
+    let driver_dir = payload.join("cua");
     let daemon = if cfg!(target_os = "macos") {
         "Pioneer Gateway.app/Contents/Helpers/cua-driver"
     } else if cfg!(windows) {
-        "cua-driver.exe"
+        "cua/cua-driver.exe"
     } else {
-        "cua-driver"
+        "cua/cua-driver"
     };
-    let manifest_path = payload.join("manifest.json");
+    let manifest_path = driver_dir.join("manifest.json");
     ensure!(
         fs::metadata(&manifest_path)?.len() <= MAX_METADATA_BYTES,
         "Gateway CUA manifest exceeds size budget"
@@ -279,13 +280,13 @@ fn validate_runtime(runtime: &Path, binary: &Path) -> Result<()> {
             && manifest["daemon"] == daemon
             && manifest["permission_owner"] == "gateway"
             && manifest["sha256"].as_str() == Some(daemon_hash.as_str())
-            && payload.join("LICENSE.cua-driver.md").is_file()
-            && payload.join("THIRD_PARTY_NOTICES.md").is_file(),
+            && driver_dir.join("LICENSE.cua-driver.md").is_file()
+            && driver_dir.join("THIRD_PARTY_NOTICES.md").is_file(),
         "embedded Gateway CUA identity or contents mismatch"
     );
     validate_architecture(&daemon_path)?;
     #[cfg(windows)]
-    validate_architecture(&payload.join("cua-driver-uia.exe"))?;
+    validate_architecture(&driver_dir.join("cua-driver-uia.exe"))?;
     #[cfg(target_os = "macos")]
     {
         let bundle = runtime.join(GATEWAY_BUNDLE);
@@ -415,10 +416,10 @@ pub(super) mod tests {
             &[
                 (installer_member(), b"gateway bytes"),
                 (
-                    "cua/Pioneer Gateway.app/Contents/Frameworks/libmodel.dylib",
+                    "runtime/Pioneer Gateway.app/Contents/Frameworks/libmodel.dylib",
                     b"library bytes",
                 ),
-                ("cua/THIRD_PARTY_NOTICES.md", b"notice bytes"),
+                ("runtime/cua/THIRD_PARTY_NOTICES.md", b"notice bytes"),
             ],
         );
         let runtime = temporary.path().join("runtime");
@@ -429,12 +430,14 @@ pub(super) mod tests {
             b"gateway bytes"
         );
         assert_eq!(
-            fs::read(runtime.join("cua/Pioneer Gateway.app/Contents/Frameworks/libmodel.dylib"))
-                .unwrap(),
+            fs::read(
+                runtime.join("runtime/Pioneer Gateway.app/Contents/Frameworks/libmodel.dylib")
+            )
+            .unwrap(),
             b"library bytes"
         );
         assert_eq!(
-            fs::read(runtime.join("cua/THIRD_PARTY_NOTICES.md")).unwrap(),
+            fs::read(runtime.join("runtime/cua/THIRD_PARTY_NOTICES.md")).unwrap(),
             b"notice bytes"
         );
     }
@@ -444,13 +447,13 @@ pub(super) mod tests {
         for name in [
             "../escaped",
             "/escaped",
-            "cua/../escaped",
-            "cua/./escaped",
-            "cua/a\\b",
-            "cua/a:stream",
-            "cua/CON.txt",
-            "cua/file.",
-            "cua/file ",
+            "runtime/../escaped",
+            "runtime/./escaped",
+            "runtime/cua/a\\b",
+            "runtime/cua/a:stream",
+            "runtime/cua/CON.txt",
+            "runtime/cua/file.",
+            "runtime/cua/file ",
         ] {
             let temporary = tempfile::tempdir().unwrap();
             let archive = temporary.path().join("gateway.zip");
@@ -469,8 +472,8 @@ pub(super) mod tests {
         write_zip(
             &archive,
             &[
-                ("cua/manifest.json", b"first"),
-                ("cua/MANIFEST.json", b"second"),
+                ("runtime/cua/manifest.json", b"first"),
+                ("runtime/cua/MANIFEST.json", b"second"),
             ],
         );
         let runtime = temporary.path().join("runtime");
@@ -482,14 +485,18 @@ pub(super) mod tests {
                 .contains("duplicate Gateway archive member")
         );
         assert_eq!(
-            fs::read(runtime.join("cua/manifest.json")).unwrap(),
+            fs::read(runtime.join("runtime/cua/manifest.json")).unwrap(),
             b"first"
         );
 
         let linked_archive = temporary.path().join("linked.zip");
         let mut writer = zip::ZipWriter::new(File::create(&linked_archive).unwrap());
         writer
-            .add_symlink("cua/link", "../../escaped", SimpleFileOptions::default())
+            .add_symlink(
+                "runtime/cua/link",
+                "../../escaped",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
         writer.finish().unwrap();
         let error = extract_archive(File::open(linked_archive).unwrap(), &runtime).unwrap_err();
@@ -498,7 +505,7 @@ pub(super) mod tests {
                 .to_string()
                 .contains("unsafe Gateway archive member type or permissions")
         );
-        assert!(!runtime.join("cua/link").exists());
+        assert!(!runtime.join("runtime/cua/link").exists());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -529,9 +536,9 @@ pub(super) mod tests {
             }
         );
         let daemon_name = if cfg!(windows) {
-            "cua-driver.exe"
+            "cua/cua-driver.exe"
         } else {
-            "cua-driver"
+            "cua/cua-driver"
         };
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1, "repository": "https://github.com/trycua/cua",
@@ -539,16 +546,16 @@ pub(super) mod tests {
             "sha256": hex::encode(Sha256::digest(&native))
         }))
         .unwrap();
-        let daemon_path = format!("cua/{daemon_name}");
+        let daemon_path = format!("runtime/{daemon_name}");
         let mut members = vec![
             (installer_member(), native.as_slice()),
             (daemon_path.as_str(), native.as_slice()),
-            ("cua/manifest.json", manifest.as_slice()),
-            ("cua/LICENSE.cua-driver.md", b"license".as_slice()),
-            ("cua/THIRD_PARTY_NOTICES.md", b"notices".as_slice()),
+            ("runtime/cua/manifest.json", manifest.as_slice()),
+            ("runtime/cua/LICENSE.cua-driver.md", b"license".as_slice()),
+            ("runtime/cua/THIRD_PARTY_NOTICES.md", b"notices".as_slice()),
         ];
         if cfg!(windows) {
-            members.push(("cua/cua-driver-uia.exe", native.as_slice()));
+            members.push(("runtime/cua/cua-driver-uia.exe", native.as_slice()));
         }
         let asset = directory.join(asset_name);
         write_zip(&asset, &members);

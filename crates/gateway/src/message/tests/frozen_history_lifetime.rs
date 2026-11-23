@@ -1,4 +1,4 @@
-//! Future production-entry fixtures. Never run/compiled before independent review.
+//! Frozen-history fixtures through the Gateway runtime.
 use super::*;
 use pioneer_compaction::{
     CompactionMode, CompactionPlan, CompactionSettings, CoverageDomain, ModelBudget,
@@ -35,7 +35,7 @@ impl crate::compaction::CompactionObserver for Silent {
     }
 }
 struct FrozenFixture {
-    _directory: tempfile::TempDir,
+    _directory: Arc<pioneer_postgres_test::TestDatabase>,
     h: Phase13CompactionHarness,
     origin: pioneer_compaction::frozen::FrozenHistoryRef,
     checkpoint: String,
@@ -131,8 +131,8 @@ async fn ack(h: &Phase13CompactionHarness, delivery: &str, thread: &str, turn: &
 }
 async fn delivery(h: &Phase13CompactionHarness, id: &str, thread: &str, turn: &str) -> SourceRef {
     let db = h.crud_store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES(?1,?2,'frozen-task','frozen-run',?1,'thread','origin_thread',?3,'delivered',1,1,?4)",[id.into(),h.workspace_id.clone().into(),thread.into(),turn.into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES(?1,'frozen-candidate','frozen-rt')",[id.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES($1,$2,'frozen-task','frozen-run',$1,'thread','origin_thread',$3,'delivered',1,1,$4)",[id.into(),h.workspace_id.clone().into(),thread.into(),turn.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES($1,'frozen-candidate','frozen-rt')",[id.into()])).await.unwrap();
     ack(h, id, thread, turn).await
 }
 #[derive(Clone, Copy)]
@@ -153,14 +153,7 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             .with_summary_marker("FROZEN PERMANENT SUMMARY"),
     );
     let (directory, workspace_manager, crud_store, workspace_id) =
-        setup_pooled_file_workspace_manager().await;
-    // The shared harness keeps older cascade fixtures on FK ON. Only this
-    // lifetime family uses the production single-writer FK OFF policy.
-    crud_store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
+        setup_pooled_workspace_manager().await;
     let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
         phase_13_provider_registry(provider.clone()),
@@ -176,22 +169,6 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         crud_store,
         workspace_id,
     };
-    let tx = h.crud_store.database_connection().begin().await.unwrap();
-    let pragma: i64 = tx
-        .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "PRAGMA foreign_keys",
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get("", "foreign_keys")
-        .unwrap();
-    assert_eq!(
-        pragma, 0,
-        "lifetime/proof fixtures use the production writer FK policy"
-    );
-    tx.commit().await.unwrap();
     materialize(
         &h,
         "frozen-source",
@@ -242,7 +219,7 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
     let db = h.crud_store.database_connection();
     for (sql, values) in [
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','fixture','fixture')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-task',$1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','fixture','fixture')",
             vec![h.workspace_id.clone().into()],
         ),
         (
@@ -255,7 +232,7 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         ),
     ] {
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             values,
         ))
@@ -366,20 +343,15 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             .find(|row| row.item_id.as_deref() == Some("frozen-source-turn-answer"))
             .unwrap()
             .reference;
-        let canonical = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT event_type,payload FROM turn_event WHERE id=?1",
-                [event.id.clone().into()],
-            ))
+        let canonical = h
+            .crud_store
+            .persisted_turn_event_for_test(&event.id)
             .await
             .unwrap()
             .unwrap();
-        let event_type: String = canonical.try_get("", "event_type").unwrap();
-        let payload: String = canonical.try_get("", "payload").unwrap();
+        let event_type = "item/completed";
         db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('frozen-aggregate-turn','frozen-source','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-        let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event_payload) =
-            serde_json::from_str(&payload).unwrap()
+        let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event_payload) = canonical
         else {
             panic!("aggregate exemplar must be a completed assistant event");
         };
@@ -390,9 +362,9 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
         .unwrap();
         for i in 0..128 {
             let id = format!("frozen-page-{i:04}-{}", "x".repeat(3072));
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES(?1,'frozen-source','frozen-aggregate-turn',?2,?3,?4,CURRENT_TIMESTAMP)",
-                [id.clone().into(),(10_000_i64+i).into(),event_type.clone().into(),payload.clone().into()])).await.unwrap();
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES($1,'frozen-source','frozen-aggregate-turn',$2,$3,$4::text::json,CURRENT_TIMESTAMP)",
+                [id.clone().into(),(10_000_i64+i).into(),event_type.into(),payload.clone().into()])).await.unwrap();
             let mut reference = exemplar.clone();
             reference.unit_id = format!("page-unit-{i}");
             reference.sources = vec![SourceRef {
@@ -636,26 +608,29 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             // Capture creates an active self-span layout. Prepare the equivalent
             // direct layout while physical bytes are still intact; all guards
             // remain enabled during this fixture-only layout handoff.
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_frozen_layout SET active=0,pending=1 WHERE manifest_id=?1 AND kind=0",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_frozen_layout SET active=0,pending=1 WHERE manifest_id=$1 AND kind=0",
                 [output.history.manifest_id.clone().into()])).await.unwrap();
             let backing = if shared {
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) SELECT 'frozen-output-backing',workspace_id,owner_thread,identity_sha256,message_count,0,?2,ready,next_ordinal,0 FROM compaction_frozen_history WHERE id=?1",
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) SELECT 'frozen-output-backing',workspace_id,owner_thread,identity_sha256,message_count,0,$2,ready,next_ordinal,0 FROM compaction_frozen_history WHERE id=$1",
                     [output.history.manifest_id.clone().into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT 'frozen-output-backing',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=?1",
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT 'frozen-output-backing',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=$1",
                     [output.history.manifest_id.clone().into()])).await.unwrap();
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE compaction_frozen_span SET source_manifest='frozen-output-backing' WHERE manifest_id=?1 AND kind=0",
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "UPDATE compaction_frozen_span SET source_manifest='frozen-output-backing' WHERE manifest_id=$1 AND kind=0",
                     [output.history.manifest_id.clone().into()])).await.unwrap();
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1 AND kind=0",[output.history.manifest_id.clone().into()])).await.unwrap();
+                db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                    "UPDATE compaction_frozen_layout l SET active=1,pending=0,verified_span_revision=(
+                      SELECT revision FROM compaction_frozen_sweep_consumer c
+                       WHERE c.manifest_id=l.manifest_id AND c.kind=l.kind
+                    ) WHERE l.manifest_id=$1 AND l.kind=0",[output.history.manifest_id.clone().into()])).await.unwrap();
                 "frozen-output-backing".to_owned()
             } else {
                 db.execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "UPDATE compaction_frozen_layout SET pending=0 WHERE manifest_id=?1 AND kind=0",
+                    DbBackend::Postgres,
+                    "UPDATE compaction_frozen_layout SET pending=0 WHERE manifest_id=$1 AND kind=0",
                     [output.history.manifest_id.clone().into()],
                 ))
                 .await
@@ -681,13 +656,13 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             // Seed corrupt legacy OUTPUT bytes without changing the valid
             // origin. Re-enable CHECKs before preparation/seal/publication.
             let tx = db.begin().await.unwrap();
-            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+            tx.execute_unprepared("ALTER TABLE compaction_frozen_message_data DROP CONSTRAINT compaction_frozen_message_data_check")
                 .await
                 .unwrap();
-            tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE compaction_frozen_message_data SET reference_json=?2,bytes=1 WHERE manifest_id=?1 AND ordinal=0",
+            tx.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE compaction_frozen_message_data SET reference_json=$2,bytes=1 WHERE manifest_id=$1 AND ordinal=0",
                 [backing.clone().into(),oversized.into()])).await.unwrap();
-            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+            tx.execute_unprepared("ALTER TABLE compaction_frozen_message_data ADD CONSTRAINT compaction_frozen_message_data_check CHECK (bytes BETWEEN 0 AND 262144 AND octet_length(reference_json) = bytes) NOT VALID")
                 .await
                 .unwrap();
             tx.commit().await.unwrap();
@@ -706,8 +681,8 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             );
             let marker: i64 = db
                 .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+                    DbBackend::Postgres,
+                    "SELECT proof_version FROM compaction_checkpoint WHERE id=$1",
                     [cp.id.clone().into()],
                 ))
                 .await
@@ -716,8 +691,8 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
                 .try_get("", "proof_version")
                 .unwrap();
             assert_eq!(marker, 0, "no seal or publication on corrupt output");
-            let badrow=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT length(CAST(reference_json AS BLOB)) AS actual,bytes FROM compaction_frozen_message_data WHERE manifest_id=?1 AND ordinal=0",[backing.into()])).await.unwrap().unwrap();
+            let badrow=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "SELECT octet_length(reference_json)::bigint AS actual,bytes FROM compaction_frozen_message_data WHERE manifest_id=$1 AND ordinal=0",[backing.into()])).await.unwrap().unwrap();
             assert!(
                 badrow.try_get::<i64>("", "actual").unwrap()
                     > pioneer_crud::compaction::SOURCE_PAGE_BYTES as i64
@@ -757,8 +732,8 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             // Persisted pre-upgrade publication, before proof_version existed.
             let applied = commit.applied(&cp.id).unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_runner_state SET generation=?2,state=?3 WHERE operation_id=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_runner_state SET generation=$2,state=$3::text::json WHERE operation_id=$1",
                 [
                     snapshot.id.clone().into(),
                     (applied.generation as i64).into(),
@@ -768,22 +743,22 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
             .await
             .unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_operation SET status='completed' WHERE id=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_operation SET status='completed' WHERE id=$1",
                 [snapshot.id.clone().into()],
             ))
             .await
             .unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_checkpoint SET status='applied' WHERE id=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_checkpoint SET status='applied' WHERE id=$1",
                 [cp.id.clone().into()],
             ))
             .await
             .unwrap();
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_context SET head=?2 WHERE owner=?1",
+                DbBackend::Postgres,
+                "UPDATE compaction_context SET head=$2 WHERE owner=$1",
                 [snapshot.owner.clone().into(), cp.id.clone().into()],
             ))
             .await
@@ -795,8 +770,8 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
                     progress.quantum(&h.crud_store).await.unwrap();
                     let marker: i64 = db
                         .query_one_raw(Statement::from_sql_and_values(
-                            DbBackend::Sqlite,
-                            "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+                            DbBackend::Postgres,
+                            "SELECT proof_version FROM compaction_checkpoint WHERE id=$1",
                             [cp.id.clone().into()],
                         ))
                         .await
@@ -828,8 +803,8 @@ async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
     };
     let n: i64 = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=?1",
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=$1",
             [checkpoint.clone().into()],
         ))
         .await
@@ -859,8 +834,8 @@ async fn expire_and_sweep(f: &FrozenFixture) {
         progress.quantum(&f.h.crud_store).await.unwrap();
         let expired: i64 = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT expired FROM compaction_frozen_history WHERE id=?1",
+                DbBackend::Postgres,
+                "SELECT expired FROM compaction_frozen_history WHERE id=$1",
                 [f.origin.manifest_id.clone().into()],
             ))
             .await
@@ -868,8 +843,8 @@ async fn expire_and_sweep(f: &FrozenFixture) {
             .unwrap()
             .try_get("", "expired")
             .unwrap();
-        let rows:i64=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=?1)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=?1) AS n",[f.origin.manifest_id.clone().into()])).await.unwrap().unwrap().try_get("","n").unwrap();
+        let rows:i64=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT (SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=$1)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=$1) AS n",[f.origin.manifest_id.clone().into()])).await.unwrap().unwrap().try_get("","n").unwrap();
         if expired == 1 && rows == 0 {
             break;
         }
@@ -881,8 +856,8 @@ async fn expire_and_sweep(f: &FrozenFixture) {
     ] {
         let n: i64 = db
             .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                format!("SELECT count(*) AS n FROM {table} WHERE manifest_id=?1"),
+                DbBackend::Postgres,
+                format!("SELECT count(*) AS n FROM {table} WHERE manifest_id=$1"),
                 [f.origin.manifest_id.clone().into()],
             ))
             .await
@@ -893,7 +868,7 @@ async fn expire_and_sweep(f: &FrozenFixture) {
         assert_eq!(n, 0, "origin rows really must be absent");
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn published_local_checkpoint_with_nonempty_proofs_survives_expired_origin_through_processor()
 {
     let f = fixture_with_mode(FixtureMode::TurnContext).await;
@@ -951,7 +926,7 @@ async fn published_local_checkpoint_with_nonempty_proofs_survives_expired_origin
         "shared bytes or proofs cannot resurrect exact replay"
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retained_output_checkpoint_replacement_uses_fresh_ordinals_through_processor_after_expiry()
 {
     let f = fixture().await;
@@ -1019,7 +994,7 @@ async fn retained_output_checkpoint_replacement_uses_fresh_ordinals_through_proc
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_restore() {
     for use_summary in [false, true] {
         let f = fixture().await;
@@ -1031,7 +1006,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
                 vec![],
             ),
             (
-                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-child-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','child','child')",
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-child-task',$1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','child','child')",
                 vec![f.h.workspace_id.clone().into()],
             ),
             (
@@ -1043,7 +1018,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
                 vec![],
             ),
             (
-                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('frozen-child-run','frozen-child-task',?1,'frozen-source',?2,CURRENT_TIMESTAMP,?3)",
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('frozen-child-run','frozen-child-task',$1,'frozen-source',$2,CURRENT_TIMESTAMP,$3)",
                 vec![
                     f.h.workspace_id.clone().into(),
                     serde_json::to_string(&f.origin).unwrap().into(),
@@ -1052,7 +1027,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             ),
         ] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 sql,
                 values,
             ))
@@ -1069,16 +1044,16 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             .unwrap()
             .fixed_offset();
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn SET created_at=? WHERE id='frozen-child-turn'",
+            DbBackend::Postgres,
+            "UPDATE turn SET created_at=$1 WHERE id='frozen-child-turn'",
             [branch_time.into()],
         ))
         .await
         .unwrap();
         if !use_summary {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_context SET head=NULL WHERE owner=?",
+                DbBackend::Postgres,
+                "UPDATE compaction_context SET head=NULL WHERE owner=$1",
                 [crate::compaction::native_owner(&f.h.workspace_id, "frozen-source").into()],
             ))
             .await
@@ -1119,12 +1094,16 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
                     .await
                     .unwrap();
             }
-            // CURRENT_TIMESTAMP-style dates must compare as instants against
-            // the RFC3339 child cutoff, including rows past the boundary.
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE turn_event SET created_at=? WHERE turn_id='running-parent' AND json_extract(payload,'$.payload.item.id') IN (?,?)",
-                [at.format("%Y-%m-%d %H:%M:%S").to_string().into(), format!("{marker}-event").into(), format!("{marker}-round").into()],
-            )).await.unwrap();
+            // Fractional event timestamps within the cutoff second remain visible.
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE turn_event SET created_at=$1
+                 WHERE turn_id='running-parent' AND event_type='item/completed'
+                   AND created_at=$2",
+                [(at + chrono::Duration::milliseconds(500)).into(), at.into()],
+            ))
+            .await
+            .unwrap();
             let envelope = pioneer_provider::CanonicalProviderRoundEnvelope {
                 ui_copies: None,
                 version: 1,
@@ -1159,8 +1138,8 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
                     (at - chrono::Duration::hours(4)).format("%Y-%m-%d %H:%M:%S")
                 )
             };
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "UPDATE turn_llm_context SET created_at=? WHERE turn_id='running-parent' AND sequence=?",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "UPDATE turn_llm_context SET created_at=$1::text::timestamptz WHERE turn_id='running-parent' AND sequence=$2",
                 [provider_date.into(), (offset + 1).into()],
             )).await.unwrap();
         }
@@ -1394,7 +1373,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
         );
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn checkpoint_proofs_do_not_restore_revoked_consumer_read_authority() {
     let f = fixture().await;
     materialize(
@@ -1421,7 +1400,7 @@ async fn checkpoint_proofs_do_not_restore_revoked_consumer_read_authority() {
         "permanent historical evidence cannot grant current thread read"
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
     let f = fixture().await;
     materialize(
@@ -1443,8 +1422,8 @@ async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
     f.h.crud_store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM turn_event WHERE id=?1",
+            DbBackend::Postgres,
+            "DELETE FROM turn_event WHERE id=$1",
             [ack.id.into()],
         ))
         .await
@@ -1480,7 +1459,7 @@ async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
         "old proofs cannot substitute a missing current acceptance"
     );
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() {
     let f = fixture().await;
     materialize(
@@ -1517,17 +1496,12 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
         .find(|source| source.scope.starts_with("event:"))
         .unwrap();
     let db = f.h.crud_store.database_connection();
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT payload FROM turn_event WHERE id=?1",
-            [source.id.clone().into()],
-        ))
-        .await
-        .unwrap()
-        .unwrap();
     let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event) =
-        serde_json::from_str(&row.try_get::<String>("", "payload").unwrap()).unwrap()
+        f.h.crud_store
+            .persisted_turn_event_for_test(&source.id)
+            .await
+            .unwrap()
+            .unwrap()
     else {
         panic!("retained output must reference a completed item event");
     };
@@ -1541,8 +1515,8 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     .unwrap();
     let changed = db
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_event SET payload=?2 WHERE id=?1",
+            DbBackend::Postgres,
+            "UPDATE turn_event SET payload=$2::text::json,payload_payload_id=NULL WHERE id=$1",
             [source.id.clone().into(), payload.into()],
         ))
         .await
@@ -1586,7 +1560,7 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
     use pioneer_crud::compaction::{CanonicalSource, CommitOutcome, SourceAssertion};
     let f = fixture().await;
@@ -1782,7 +1756,7 @@ async fn commit_current(
                 turn_id: turn.into(),
                 thread_id: thread.into(),
                 workspace_id: f.h.workspace_id.clone(),
-                mode_json: "\"Agent\"".into(),
+                mode: pioneer_protocol::ThreadMode::Agent,
                 model: "fixture".into(),
                 provider_name: "fixture".into(),
                 reasoning_effort: None,
@@ -1816,19 +1790,19 @@ async fn commit_current(
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn aggregate_large_checkpoint_keeps_nonempty_imports_through_legacy_backfill_publication_and_expired_reader()
  {
     for legacy in [false, true] {
         let f = fixture_with_mode(FixtureMode::Aggregate { legacy }).await;
         let db = f.h.crud_store.database_connection();
         for sql in [
-            "SELECT sum(length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))) AS bytes FROM compaction_coverage WHERE checkpoint_id=?1",
-            "SELECT sum(length(CAST(m.source_scope AS BLOB))+length(CAST(m.source_id AS BLOB))+length(CAST(m.source_version AS BLOB))+length(CAST(m.source_thread AS BLOB))) AS bytes FROM compaction_manifest m JOIN compaction_checkpoint p ON p.operation_id=m.operation_id WHERE p.id=?1 AND m.reference_only=0",
+            "SELECT sum(octet_length(source_scope)+octet_length(source_id)+octet_length(source_version))::bigint AS bytes FROM compaction_coverage WHERE checkpoint_id=$1",
+            "SELECT sum(octet_length(m.source_scope)+octet_length(m.source_id)+octet_length(m.source_version)+octet_length(m.source_thread))::bigint AS bytes FROM compaction_manifest m JOIN compaction_checkpoint p ON p.operation_id=m.operation_id WHERE p.id=$1 AND m.reference_only=0",
         ] {
             let bytes: i64 = db
                 .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
+                    DbBackend::Postgres,
                     sql,
                     [f.checkpoint.clone().into()],
                 ))
@@ -1880,7 +1854,7 @@ async fn aggregate_large_checkpoint_keeps_nonempty_imports_through_legacy_backfi
         assert_ne!(prepared.descriptor.manifest_id, f.origin.manifest_id);
     }
 }
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn selected_import_understated_retained_output_direct_and_shared_fails_before_payload_seal_and_publication()
  {
     for shared in [false, true] {
@@ -1888,11 +1862,11 @@ async fn selected_import_understated_retained_output_direct_and_shared_fails_bef
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
     use pioneer_crud::compaction::{PublicationTestPause, arm_publication_test_hook};
     let f = fixture_with_mode(FixtureMode::WorkerLegacy).await;
-    // Real timers let SQLite's external worker finish: a paused runtime can
+    // Real timers allow PostgreSQL I/O to complete. A paused runtime can
     // auto-advance to pool timeouts while a database request is in flight.
     let db = f.h.crud_store.database_connection();
     // Run the actual production loop, cancel it, and restart with fresh private
@@ -1919,16 +1893,16 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
         for iteration in 0..20_000 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tokio::task::yield_now().await;
-            let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT h.expired,c.proof_version,(SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=h.id)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=h.id) AS n FROM compaction_frozen_history h JOIN compaction_checkpoint c ON c.id=?2 WHERE h.id=?1",
+            let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "SELECT h.expired,c.proof_version,(SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=h.id)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=h.id) AS n FROM compaction_frozen_history h JOIN compaction_checkpoint c ON c.id=$2 WHERE h.id=$1",
                 [f.origin.manifest_id.clone().into(), f.checkpoint.clone().into()])).await.unwrap().unwrap();
             swept = row.try_get::<i64>("", "expired").unwrap() == 1
                 && row.try_get::<i64>("", "proof_version").unwrap() == 1
                 && row.try_get::<i64>("", "n").unwrap() == 0;
             let selected: i64 = db
                 .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=?1",
+                    DbBackend::Postgres,
+                    "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=$1",
                     [f.checkpoint.clone().into()],
                 ))
                 .await
@@ -1976,8 +1950,8 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
     }
     let n: i64 = db
         .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=?1",
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=$1",
             [f.checkpoint.clone().into()],
         ))
         .await
@@ -2001,14 +1975,9 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_frozen_worker_cancellation_interrupts_backoff_without_detached_work() {
-    let (_directory, _, store, _) = setup_pooled_file_workspace_manager().await;
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
+    let (_directory, _, store, _) = setup_pooled_workspace_manager().await;
     tokio::time::pause();
     let cancellation = tokio_util::sync::CancellationToken::new();
     let worker = tokio::spawn(crate::database::maintenance::run_frozen_worker_for_test(
@@ -2023,7 +1992,8 @@ async fn idle_frozen_worker_cancellation_interrupts_backoff_without_detached_wor
     }
     assert!(!worker.is_finished());
     cancellation.cancel();
-    tokio::time::timeout(Duration::from_millis(1), worker)
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), worker)
         .await
         .unwrap()
         .unwrap();

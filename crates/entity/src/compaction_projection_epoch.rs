@@ -17,7 +17,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

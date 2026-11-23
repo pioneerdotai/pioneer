@@ -1,23 +1,14 @@
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{
-    GatewayIdentityRecord, GatewayPrincipalRecord, LegacyActorBackfillCounts,
-    backfill_legacy_actor_references, create_gateway_singleton, create_superuser,
-    load_gateway_singleton, load_identity_invariant_rows, load_superusers_for_gateway,
-    set_identity_bootstrap_version,
+    GatewayIdentityRecord, GatewayPrincipalRecord, create_superuser, ensure_gateway_singleton,
+    load_identity_invariant_rows, load_superusers_for_gateway, set_identity_bootstrap_version,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     GATEWAY_ID_LEN, GatewayId, PRINCIPAL_ID_LEN, PrincipalId, PrincipalKind, PrincipalStatus,
     generate_id,
 };
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
-    is_anyhow_sqlite_lock, retry_with_backoff,
-};
-use sea_orm::{
-    ConnectionTrait, SqliteTransactionMode, TransactionOptions, TransactionSession,
-    TransactionTrait,
-};
-use std::time::Duration;
+use sea_orm::{ConnectionTrait, TransactionSession, TransactionTrait};
 
 use super::invariants::validate_identity_invariants;
 
@@ -52,7 +43,6 @@ pub(crate) struct IdentityBootstrapSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityBootstrapOutcome {
     pub snapshot: IdentityBootstrapSnapshot,
-    pub backfill_counts: LegacyActorBackfillCounts,
     pub gateway_created: bool,
     pub superuser_created: bool,
 }
@@ -68,22 +58,17 @@ impl<T> IdentityBootstrapTransaction<T>
 where
     T: ConnectionTrait + TransactionSession,
 {
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> &IdentityBootstrapSnapshot {
-        &self.snapshot
-    }
-
     fn created_flags(&self) -> (bool, bool) {
         (self.gateway_created, self.superuser_created)
-    }
-
-    async fn backfill_legacy_actors(&self) -> Result<LegacyActorBackfillCounts> {
-        backfill_legacy_actor_references(&self.transaction, &self.snapshot.superuser.id).await
     }
 
     async fn validate_and_mark(&mut self) -> Result<()> {
         let rows = load_identity_invariant_rows(&self.transaction).await?;
         validate_identity_invariants(&rows, SUPPORTED_IDENTITY_BOOTSTRAP_VERSION)?;
+        if self.snapshot.gateway.identity_bootstrap_version == SUPPORTED_IDENTITY_BOOTSTRAP_VERSION
+        {
+            return Ok(());
+        }
         let gateway = set_identity_bootstrap_version(
             &self.transaction,
             &self.snapshot.gateway.id,
@@ -112,24 +97,16 @@ where
 }
 
 pub(crate) async fn bootstrap_identity(
-    connection: impl Into<SqliteDatabase>,
+    connection: impl Into<PostgresDatabase>,
 ) -> Result<IdentityBootstrapOutcome> {
     let connection = connection.into().maintenance();
     let mut bootstrap = begin_identity_bootstrap(&connection).await?;
     let (gateway_created, superuser_created) = bootstrap.created_flags();
-    let work = async {
-        let backfill_counts = bootstrap.backfill_legacy_actors().await?;
-        bootstrap.validate_and_mark().await?;
-        Ok::<_, anyhow::Error>(backfill_counts)
-    }
-    .await;
-
-    match work {
-        Ok(backfill_counts) => {
+    match bootstrap.validate_and_mark().await {
+        Ok(()) => {
             let snapshot = bootstrap.commit().await?;
             Ok(IdentityBootstrapOutcome {
                 snapshot,
-                backfill_counts,
                 gateway_created,
                 superuser_created,
             })
@@ -147,28 +124,10 @@ async fn begin_identity_bootstrap<D>(
 where
     D: TransactionTrait,
 {
-    retry_with_backoff(
-        || begin_identity_bootstrap_once(connection),
-        is_anyhow_sqlite_lock,
-        DEFAULT_LOCK_RETRY_ATTEMPTS,
-        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-    )
-    .await
-}
-
-async fn begin_identity_bootstrap_once<D>(
-    connection: &D,
-) -> Result<IdentityBootstrapTransaction<D::Transaction>>
-where
-    D: TransactionTrait,
-{
     let transaction = connection
-        .begin_with_options(TransactionOptions {
-            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-            ..Default::default()
-        })
+        .begin()
         .await
-        .context("failed to begin immediate identity bootstrap transaction")?;
+        .context("failed to begin identity bootstrap transaction")?;
 
     match load_or_create_identity(&transaction).await {
         Ok((snapshot, gateway_created, superuser_created)) => Ok(IdentityBootstrapTransaction {
@@ -193,18 +152,10 @@ async fn load_or_create_identity<C>(
 where
     C: ConnectionTrait,
 {
-    let (gateway, gateway_created) = match load_gateway_singleton(transaction).await? {
-        Some(existing) => (existing, false),
-        None => {
-            let id = GatewayId::new(generate_id(GATEWAY_ID_LEN))
-                .context("generated invalid Gateway identity id")?;
-            (
-                create_gateway_singleton(transaction, &id, 0, chrono::Utc::now().fixed_offset())
-                    .await?,
-                true,
-            )
-        }
-    };
+    let id = GatewayId::new(generate_id(GATEWAY_ID_LEN))
+        .context("generated invalid Gateway identity id")?;
+    let (gateway, gateway_created) =
+        ensure_gateway_singleton(transaction, &id, chrono::Utc::now().fixed_offset()).await?;
 
     let superusers = load_superusers_for_gateway(transaction, &gateway.id).await?;
     let (superuser, superuser_created) = match superusers.as_slice() {
@@ -264,26 +215,16 @@ mod tests {
     use super::{
         SUPPORTED_IDENTITY_BOOTSTRAP_VERSION, begin_identity_bootstrap, bootstrap_identity,
     };
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
-        ActorResourceKind, actor_ref_from_db, list_gateway_identities, list_gateway_principals,
-        load_identity_invariant_rows,
+        list_gateway_identities, list_gateway_principals, load_identity_invariant_rows,
     };
-    use pioneer_entity::turn_event;
-    use pioneer_protocol::{PersistedActorRef, PrincipalKind, PrincipalStatus};
-    use sea_orm::{ConnectOptions, ConnectionTrait, Database, EntityTrait};
+    use pioneer_postgres_test::with_database;
+    use pioneer_protocol::{PrincipalKind, PrincipalStatus};
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    async fn database() -> sea_orm::DatabaseConnection {
-        let database = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite");
-        Migrator::up(&database, None).await.expect("run migrations");
-        database
-    }
-
     async fn bootstrap_before_listener(
-        database: &sea_orm::DatabaseConnection,
+        database: &DatabaseConnection,
         listener_opened: &AtomicBool,
     ) -> anyhow::Result<()> {
         bootstrap_identity(database).await?;
@@ -293,199 +234,158 @@ mod tests {
 
     #[tokio::test]
     async fn first_run_creates_one_gateway_and_stable_superuser() {
-        let database = database().await;
+        with_database(async |fixture| {
+            let database = fixture.connection().clone();
 
-        let bootstrap = begin_identity_bootstrap(&database)
-            .await
-            .expect("begin identity bootstrap");
-        assert_eq!(bootstrap.created_flags(), (true, true));
-        let snapshot = bootstrap.commit().await.expect("commit bootstrap");
+            let bootstrap = begin_identity_bootstrap(&database)
+                .await
+                .expect("begin identity bootstrap");
+            assert_eq!(bootstrap.created_flags(), (true, true));
+            let snapshot = bootstrap.commit().await.expect("commit bootstrap");
 
-        assert_eq!(snapshot.gateway.identity_bootstrap_version, 0);
-        assert_eq!(snapshot.superuser.gateway_id, snapshot.gateway.id);
-        assert_eq!(snapshot.superuser.kind, PrincipalKind::Superuser);
-        assert_eq!(snapshot.superuser.status, PrincipalStatus::Active);
-        assert_eq!(snapshot.superuser.role_key, None);
-        assert_eq!(snapshot.superuser.display_name, "Superuser");
-        assert_eq!(snapshot.superuser.nickname, "superuser");
-        assert_eq!(snapshot.superuser.nickname_key, "superuser");
-        assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
-        assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            assert_eq!(snapshot.gateway.identity_bootstrap_version, 0);
+            assert_eq!(snapshot.superuser.gateway_id, snapshot.gateway.id);
+            assert_eq!(snapshot.superuser.kind, PrincipalKind::Superuser);
+            assert_eq!(snapshot.superuser.status, PrincipalStatus::Active);
+            assert_eq!(snapshot.superuser.role_key, None);
+            assert_eq!(snapshot.superuser.display_name, "Superuser");
+            assert_eq!(snapshot.superuser.nickname, "superuser");
+            assert_eq!(snapshot.superuser.nickname_key, "superuser");
+            assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
+            assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn restart_preserves_a_valid_edited_superuser_profile() {
-        let database = database().await;
-        let first = bootstrap_identity(&database)
-            .await
-            .expect("bootstrap initial identity");
-        database
-            .execute_unprepared(
-                "UPDATE gateway_principal \
+        with_database(async |fixture| {
+            let database = fixture.connection().clone();
+            let first = bootstrap_identity(&database)
+                .await
+                .expect("bootstrap initial identity");
+            database
+                .execute_unprepared(
+                    "UPDATE gateway_principal \
                  SET display_name = 'Gateway administrator', \
                      nickname = 'gateway-admin', \
                      nickname_key = 'gateway-admin' \
                  WHERE kind = 'superuser';",
-            )
-            .await
-            .expect("edit Superuser profile");
-
-        let restarted = bootstrap_identity(&database)
-            .await
-            .expect("restart should accept the edited profile");
-
-        assert_eq!(restarted.snapshot.gateway.id, first.snapshot.gateway.id);
-        assert_eq!(restarted.snapshot.superuser.id, first.snapshot.superuser.id);
-        assert_eq!(
-            restarted.snapshot.superuser.display_name,
-            "Gateway administrator"
-        );
-        assert_eq!(restarted.snapshot.superuser.nickname, "gateway-admin");
-        assert_eq!(restarted.snapshot.superuser.nickname_key, "gateway-admin");
-    }
-
-    #[tokio::test]
-    async fn legacy_actor_backfill_covers_the_complete_origin_matrix_and_is_idempotent() {
-        let database = database().await;
-        insert_legacy_actor_matrix(&database).await;
-        let event_payload_before = turn_event::Entity::find_by_id("legacy-event")
-            .one(&database)
-            .await
-            .unwrap()
-            .unwrap()
-            .payload;
-
-        let bootstrap = begin_identity_bootstrap(&database).await.unwrap();
-        let superuser_id = bootstrap.snapshot().superuser.id.clone();
-        let counts = bootstrap.backfill_legacy_actors().await.unwrap();
-        assert_eq!(counts.principal_threads, 3);
-        assert_eq!(counts.system_threads, 2);
-        assert_eq!(counts.principal_turns, 1);
-        assert_eq!(counts.system_turns, 3);
-        bootstrap.commit().await.unwrap();
-
-        let rows = load_identity_invariant_rows(&database).await.unwrap();
-        for row in &rows.actor_references {
-            let actor =
-                actor_ref_from_db(row.actor_kind.as_deref(), row.actor_id.as_deref()).unwrap();
-            match (row.resource_kind, row.resource_id.as_str()) {
-                (
-                    ActorResourceKind::Thread,
-                    "thread-collaborative" | "thread-direct" | "thread-user",
                 )
-                | (ActorResourceKind::Turn, "turn-user") => {
-                    assert_eq!(
-                        actor,
-                        Some(PersistedActorRef::Principal(superuser_id.clone()))
-                    );
-                }
-                (
-                    ActorResourceKind::Thread,
-                    "thread-task" | "thread-system" | "thread-pre-attributed",
-                )
-                | (
-                    ActorResourceKind::Turn,
-                    "turn-scheduled" | "turn-detached" | "turn-attached" | "turn-pre-attributed",
-                ) => {
-                    assert_eq!(actor, Some(PersistedActorRef::System));
-                }
-                (_, "thread-unknown" | "turn-unknown") => assert_eq!(actor, None),
-                other => panic!("unexpected actor fixture {other:?}"),
-            }
-        }
+                .await
+                .expect("edit Superuser profile");
 
-        let repeated = begin_identity_bootstrap(&database).await.unwrap();
-        assert_eq!(
-            repeated.backfill_legacy_actors().await.unwrap(),
-            Default::default()
-        );
-        repeated.commit().await.unwrap();
+            let restarted = bootstrap_identity(&database)
+                .await
+                .expect("restart should accept the edited profile");
 
-        let event_payload_after = turn_event::Entity::find_by_id("legacy-event")
-            .one(&database)
-            .await
-            .unwrap()
-            .unwrap()
-            .payload;
-        assert_eq!(event_payload_after, event_payload_before);
+            assert_eq!(restarted.snapshot.gateway.id, first.snapshot.gateway.id);
+            assert_eq!(restarted.snapshot.superuser.id, first.snapshot.superuser.id);
+            assert_eq!(
+                restarted.snapshot.superuser.display_name,
+                "Gateway administrator"
+            );
+            assert_eq!(restarted.snapshot.superuser.nickname, "gateway-admin");
+            assert_eq!(restarted.snapshot.superuser.nickname_key, "gateway-admin");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn validated_bootstrap_sets_marker_and_restart_preserves_identity() {
-        let database = database().await;
-        let first = bootstrap_identity(&database)
-            .await
-            .expect("validated first bootstrap");
-        assert!(first.gateway_created);
-        assert!(first.superuser_created);
-        assert_eq!(
-            first.snapshot.gateway.identity_bootstrap_version,
-            SUPPORTED_IDENTITY_BOOTSTRAP_VERSION
-        );
+        with_database(async |fixture| {
+            let database = fixture.connection().clone();
+            let first = bootstrap_identity(&database)
+                .await
+                .expect("validated first bootstrap");
+            assert!(first.gateway_created);
+            assert!(first.superuser_created);
+            assert_eq!(
+                first.snapshot.gateway.identity_bootstrap_version,
+                SUPPORTED_IDENTITY_BOOTSTRAP_VERSION
+            );
 
-        let second = bootstrap_identity(&database)
-            .await
-            .expect("validated restart bootstrap");
-        assert!(!second.gateway_created);
-        assert!(!second.superuser_created);
-        assert_eq!(second.snapshot, first.snapshot);
-        assert_eq!(second.backfill_counts, Default::default());
-        assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
-        assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            let second = bootstrap_identity(&database)
+                .await
+                .expect("validated restart bootstrap");
+            assert!(!second.gateway_created);
+            assert!(!second.superuser_created);
+            assert_eq!(second.snapshot, first.snapshot);
+            assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
+            assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn scanner_failure_rolls_back_identity_backfill_and_marker_together() {
-        let database = database().await;
-        insert_legacy_actor_matrix(&database).await;
-        let listener_opened = AtomicBool::new(false);
+    async fn scanner_failure_rolls_back_identity_and_marker_together() {
+        with_database(async |fixture| {
+            let database = fixture.connection().clone();
+            database.execute_unprepared(
+            "INSERT INTO workspace (id, name) VALUES ('identity-test-worksp', 'Identity test');
+             INSERT INTO thread (id, workspace_id, preview, mode, model, model_provider, status, origin_kind)
+             VALUES ('thread-unknown', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'user')",
+        ).await.unwrap();
+            let listener_opened = AtomicBool::new(false);
 
-        let error = match bootstrap_before_listener(&database, &listener_opened).await {
-            Ok(_) => panic!("unknown origins must leave missing actors and fail"),
-            Err(error) => error,
-        };
-        assert!(!listener_opened.load(Ordering::SeqCst));
-        assert!(error.to_string().contains("missing_actor"));
-        assert!(list_gateway_identities(&database).await.unwrap().is_empty());
-        assert!(list_gateway_principals(&database).await.unwrap().is_empty());
-        let rows = load_identity_invariant_rows(&database).await.unwrap();
-        assert!(
-            rows.actor_references
-                .iter()
-                .filter(|row| row.resource_id != "thread-pre-attributed")
-                .filter(|row| row.resource_id != "turn-pre-attributed")
-                .all(|row| row.actor_kind.is_none() && row.actor_id.is_none())
-        );
+            let error = match bootstrap_before_listener(&database, &listener_opened).await {
+                Ok(_) => panic!("unknown origins must leave missing actors and fail"),
+                Err(error) => error,
+            };
+            assert!(!listener_opened.load(Ordering::SeqCst));
+            assert!(error.to_string().contains("missing_actor"));
+            assert!(list_gateway_identities(&database).await.unwrap().is_empty());
+            assert!(list_gateway_principals(&database).await.unwrap().is_empty());
+            let rows = load_identity_invariant_rows(&database).await.unwrap();
+            assert!(
+                rows.actor_references
+                    .iter()
+                    .all(|row| row.actor_kind.is_none() && row.actor_id.is_none())
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_bootstraps_create_one_stable_identity() {
-        let directory = tempfile::tempdir().expect("temporary database directory");
-        let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("gateway.db"));
-        let mut options = ConnectOptions::new(url);
-        options.max_connections(1);
-        let database = Database::connect(options)
-            .await
-            .expect("connect sqlite file");
-        Migrator::up(&database, None).await.expect("run migrations");
-        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(database);
+        with_database(async |fixture| {
+            let pool = fixture.connect().await?;
+            let peer = fixture.connect().await?;
+            let database = pioneer_postgres_pools::PostgresDatabase::from_single_connection(pool);
+            let second_database =
+                pioneer_postgres_pools::PostgresDatabase::from_single_connection(peer);
+            let (first, second) = tokio::join!(
+                bootstrap_identity(&database),
+                bootstrap_identity(&second_database)
+            );
+            let first = first.expect("first concurrent bootstrap");
+            let second = second.expect("second concurrent bootstrap");
 
-        let (first, second) =
-            tokio::join!(bootstrap_identity(&database), bootstrap_identity(&database));
-        let first = first.expect("first concurrent bootstrap");
-        let second = second.expect("second concurrent bootstrap");
-
-        assert_eq!(first.snapshot, second.snapshot);
-        assert_eq!(
-            usize::from(first.gateway_created) + usize::from(second.gateway_created),
-            1
-        );
-        assert_eq!(
-            usize::from(first.superuser_created) + usize::from(second.superuser_created),
-            1
-        );
-        assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
-        assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            assert_eq!(first.snapshot, second.snapshot);
+            assert_eq!(
+                usize::from(first.gateway_created) + usize::from(second.gateway_created),
+                1
+            );
+            assert_eq!(
+                usize::from(first.superuser_created) + usize::from(second.superuser_created),
+                1
+            );
+            assert_eq!(list_gateway_identities(&database).await.unwrap().len(), 1);
+            assert_eq!(list_gateway_principals(&database).await.unwrap().len(), 1);
+            database.close().await?;
+            second_database.close().await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -496,14 +396,8 @@ mod tests {
             ("dangling_actor", "dangling_principal_actor"),
             ("unsupported_marker", "unsupported_bootstrap_version"),
         ] {
-            let directory = tempfile::tempdir().expect("temporary database directory");
-            let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("gateway.db"));
-            let mut options = ConnectOptions::new(url);
-            options.max_connections(1);
-            let database = Database::connect(options)
-                .await
-                .expect("connect corruption drill database");
-            Migrator::up(&database, None).await.expect("run migrations");
+            with_database(async |fixture| {
+            let database = fixture.connection().clone();
             let valid = bootstrap_identity(&database)
                 .await
                 .expect("establish valid identity baseline");
@@ -514,10 +408,10 @@ mod tests {
                         "DROP INDEX idx_gateway_principal_one_superuser; \
                          INSERT INTO gateway_principal \
                             (id, gateway_id, kind, role_key, status, display_name, \
-                             nickname, nickname_key) \
+                             nickname, nickname_key, created_at, updated_at) \
                          VALUES \
                             ('P99999999999999999999', '{}', 'superuser', NULL, 'active', \
-                             'Superuser', 'other-superuser', 'other-superuser');",
+                             'Superuser', 'other-superuser', 'other-superuser', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);",
                         valid.snapshot.gateway.id
                     );
                     database
@@ -528,18 +422,17 @@ mod tests {
                 "partial_actor" => {
                     database
                         .execute_unprepared(
-                            "DROP TRIGGER \
-                                conversation_actor_thread_created_by_actor_kind_pair_insert; \
-                             PRAGMA ignore_check_constraints = ON; \
+                            "ALTER TABLE thread DROP CONSTRAINT thread_check; \
+                             ALTER TABLE thread DISABLE TRIGGER conversation_actor_thread_created_by_actor_kind_pair_insert; \
                              INSERT INTO workspace (id, name, is_active, is_current) \
-                             VALUES ('corrupt-workspace-001', 'Corrupt fixture', 1, 1); \
+                             VALUES ('corrupt-workspace-001', 'Corrupt fixture', true, false); \
                              INSERT INTO thread \
                                 (id, workspace_id, preview, mode, model, model_provider, status, \
                                  origin_kind, created_by_actor_kind, created_by_actor_id) \
                              VALUES \
                                 ('corrupt-thread-part1', 'corrupt-workspace-001', '', 'chat', \
                                  'model', 'provider', 'idle', 'user', 'principal', NULL); \
-                             PRAGMA ignore_check_constraints = OFF;",
+                             ALTER TABLE thread ENABLE TRIGGER conversation_actor_thread_created_by_actor_kind_pair_insert;",
                         )
                         .await
                         .expect("inject partial actor pair");
@@ -548,7 +441,7 @@ mod tests {
                     database
                         .execute_unprepared(
                             "INSERT INTO workspace (id, name, is_active, is_current) \
-                             VALUES ('corrupt-workspace-001', 'Corrupt fixture', 1, 1); \
+                             VALUES ('corrupt-workspace-001', 'Corrupt fixture', true, false); \
                              INSERT INTO thread \
                                 (id, workspace_id, preview, mode, model, model_provider, status, \
                                  origin_kind, created_by_actor_kind, created_by_actor_id) \
@@ -583,42 +476,8 @@ mod tests {
                 error.to_string().contains(expected_code),
                 "{corruption} returned an unsafe or imprecise diagnostic: {error:#}"
             );
+            Ok(())
+            }).await.unwrap();
         }
-    }
-
-    async fn insert_legacy_actor_matrix(database: &sea_orm::DatabaseConnection) {
-        database
-            .execute_unprepared(
-                "INSERT INTO workspace (id, name, is_active, is_current) \
-                 VALUES ('identity-test-worksp', 'Identity test', 1, 1); \
-                 INSERT INTO thread \
-                    (id, workspace_id, preview, mode, model, model_provider, status, origin_kind) \
-                 VALUES \
-                    ('thread-collaborative', 'identity-test-worksp', '', 'chat', 'm', 'p', 'idle', 'collaborative'), \
-                    ('thread-direct', 'identity-test-worksp', '', 'chat', 'm', 'p', 'idle', 'direct_message'), \
-                    ('thread-user', 'identity-test-worksp', '', 'chat', 'm', 'p', 'idle', 'user'), \
-                    ('thread-task', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'task_run'), \
-                    ('thread-system', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'system'), \
-                    ('thread-unknown', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'future_origin'), \
-                    ('thread-pre-attributed', 'identity-test-worksp', '', 'agent', 'm', 'p', 'idle', 'user'); \
-                 UPDATE thread SET created_by_actor_kind = 'system' \
-                 WHERE id = 'thread-pre-attributed'; \
-                 INSERT INTO turn (id, thread_id, status, turn_kind, origin) VALUES \
-                    ('turn-user', 'thread-user', 'completed', 'conversation', 'user'), \
-                    ('turn-scheduled', 'thread-task', 'completed', 'task_run', 'scheduled_task'), \
-                    ('turn-detached', 'thread-task', 'completed', 'task_run', 'detached_task'), \
-                    ('turn-attached', 'thread-task', 'completed', 'task_run', 'attached_task'), \
-                    ('turn-unknown', 'thread-task', 'completed', 'task_run', 'future_origin'), \
-                    ('turn-pre-attributed', 'thread-user', 'completed', 'conversation', 'user'); \
-                 UPDATE turn SET initiated_by_actor_kind = 'system' \
-                 WHERE id = 'turn-pre-attributed'; \
-                 INSERT INTO turn_event \
-                    (id, thread_id, turn_id, sequence, event_type, payload) \
-                 VALUES \
-                    ('legacy-event', 'thread-user', 'turn-user', 1, 'turn/completed', \
-                     '{\"bytes\":\"must remain unchanged\"}');",
-            )
-            .await
-            .expect("insert legacy actor fixture");
     }
 }

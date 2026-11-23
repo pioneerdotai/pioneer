@@ -7,13 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run_execution")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub task_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub task_run_id: String,
+    #[sea_orm(column_type = "Text")]
     pub executor_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub worker_id: Option<String>,
     pub lease_until: Option<DateTimeWithTimeZone>,
     pub heartbeat_at: Option<DateTimeWithTimeZone>,

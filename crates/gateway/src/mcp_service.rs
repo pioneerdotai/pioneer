@@ -1,4 +1,4 @@
-use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
+use crate::patch_history_observer::{PostgresPatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result};
 use pioneer_agent::{
     AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
@@ -261,6 +261,36 @@ impl Drop for McpUpstreamCancellationGuard {
     }
 }
 
+struct GatewayMcpHttpResolver {
+    owner: std::sync::Weak<McpServiceInner>,
+}
+#[async_trait::async_trait]
+impl pioneer_mcp::McpHttpResolver for GatewayMcpHttpResolver {
+    async fn resolve(
+        &self,
+        installation_id: &str,
+        installation: &McpServerInstallation,
+        caller: Option<&pioneer_mcp::McpCaller>,
+    ) -> Result<pioneer_mcp::McpHttpTarget, McpRuntimeError> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| McpRuntimeError::failed("Gateway stopped"))?;
+        let processor = owner
+            .native_tool_processor
+            .read()
+            .expect("native processor lock")
+            .upgrade()
+            .ok_or_else(|| McpRuntimeError::failed("App runtime owner unavailable"))?;
+        processor
+            .resolve_pioneer_mcp_target(installation_id, installation, caller.is_some())
+            .await
+            .map_err(|error| {
+                McpRuntimeError::failed(format!("Pioneer App MCP resolution failed: {error}"))
+            })
+    }
+}
+
 struct GatewayMcpSecretResolver {
     gateway_secrets: Arc<GatewaySecrets>,
 }
@@ -481,7 +511,13 @@ impl McpService {
                     pioneer_tools::StaticPermissionApprovalBroker::default(),
                 )),
                 projection_persistence,
-                connector: RwLock::new(Arc::new(RmcpRuntimeConnector::with_oauth(Arc::new(oauth)))),
+                connector: RwLock::new(Arc::new(
+                    RmcpRuntimeConnector::with_oauth(Arc::new(oauth)).with_http_resolver(Arc::new(
+                        GatewayMcpHttpResolver {
+                            owner: owner.clone(),
+                        },
+                    )),
+                )),
                 lifecycle_gates: std::sync::Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 snapshots: Mutex::new(HashMap::new()),
@@ -1858,6 +1894,43 @@ impl McpService {
         self.inner.tasks.lock().await.contains_key(installation_id)
     }
 
+    /// Read the already admitted execution; never select or manufacture an Agent identity.
+    async fn pioneer_mcp_caller(
+        &self,
+        request: &pioneer_tools::McpToolCallRequest,
+    ) -> Result<pioneer_mcp::McpCaller, McpRuntimeError> {
+        let facts = async {
+            let authority = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+                &self.inner.crud_store,
+                &request.turn_id,
+            )
+            .await?;
+            anyhow::ensure!(
+                authority.workspace_id() == request.workspace_id,
+                "MCP caller workspace differs"
+            );
+            let db = self.inner.crud_store.database_connection();
+            let response = pioneer_crud::load_agent_turn_response(&db, &request.turn_id)
+                .await?
+                .context("MCP responding execution missing")?;
+            let agent = pioneer_crud::load_agent_execution(&db, &response.execution_id)
+                .await?
+                .context("MCP responding Agent missing")?;
+            anyhow::ensure!(
+                agent.workspace_id == request.workspace_id,
+                "MCP Agent workspace differs"
+            );
+            Ok::<_, anyhow::Error>(pioneer_mcp::McpCaller {
+                user_id: authority.initiating_principal_id().as_str().to_owned(),
+                agent_id: agent.agent_identity_id,
+            })
+        }
+        .await;
+        facts.map_err(|error| {
+            McpRuntimeError::failed(format!("Admitted Pioneer MCP caller unavailable: {error}"))
+        })
+    }
+
     async fn call_tool(
         &self,
         request: pioneer_tools::McpToolCallRequest,
@@ -2712,8 +2785,14 @@ impl McpService {
                         };
                         let raw_tool_name = command.request.raw_tool_name.clone();
                         let arguments = command.request.arguments.clone();
+                        let caller = if installation.is_pioneer() {
+                            match self.pioneer_mcp_caller(&command.request).await {
+                                Ok(caller) => Some(caller),
+                                Err(error) => { let _ = command.response_tx.send(Err(error)); continue; }
+                            }
+                        } else { None };
                         let result = session
-                            .call_tool(
+                            .call_tool_with_caller(
                                 raw_tool_name.as_str(),
                                 arguments,
                                 pioneer_mcp::McpInvocationBudget {
@@ -2721,6 +2800,7 @@ impl McpService {
                                 },
                                 Duration::from_millis(command.request.timeout_ms.max(1)),
                                 command.cancellation,
+                                caller,
                             )
                             .await;
                         if let Err(error) = &result
@@ -4244,11 +4324,11 @@ impl McpService {
                     );
                 }
             };
-            Some(SqlitePatchObserver::new(
+            Some(Arc::new(PostgresPatchObserver::new(
                 self.inner.crud_store.database_connection(),
                 identity.clone(),
                 admission_permit,
-            ))
+            )))
         } else {
             None
         };
@@ -4260,9 +4340,8 @@ impl McpService {
             let identity = patch_identity
                 .as_ref()
                 .expect("managed apply_patch identity should be present");
-            let observer = history_observer
-                .as_ref()
-                .expect("managed apply_patch observer should be present");
+            let observer =
+                history_observer.expect("managed apply_patch observer should be present");
             pioneer_tools::handlers::ApplyPatchHandler
                 .handle_with_source_and_observer(
                     invocation,
@@ -5078,7 +5157,6 @@ mod tests {
     };
     use crate::turn_mcp::result::CanonicalMcpToolResult;
     use crate::workspace::DEFAULT_WORKSPACE_ID;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CliRuntimeTurnMcpMetadata, NewCliRuntimeTurnBinding, NewTaskExecutionAdmission,
     };
@@ -5092,165 +5170,168 @@ mod tests {
         TurnNetworkPolicySnapshot, TurnPermissionMode, TurnPermissionProfileSnapshot,
         TurnPermissionProfileSource, TurnStatus,
     };
-    use sea_orm::{ConnectionTrait, Database, EntityTrait};
+    use sea_orm::{ConnectionTrait, EntityTrait};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn html_mcp_projects_six_exact_pngs_and_diagnostics_atomically() {
-        use base64::Engine;
-        use pioneer_artifacts::{
-            ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
-        };
-        let (_mcp, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
-        let root = tempfile::tempdir().unwrap();
-        let artifacts =
-            ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
-        // Match the production caller's retention protection across every read.
-        let _activity = artifacts.html_preview_activity_signaled().await;
-        let frames = [
-            ("light", 360u32),
-            ("light", 768),
-            ("light", 1024),
-            ("dark", 360),
-            ("dark", 768),
-            ("dark", 1024),
-        ];
-        let mut images = Vec::new();
-        let mut previews = Vec::new();
-        let mut expected_pngs = Vec::new();
-        for (index, (appearance, width)) in frames.into_iter().enumerate() {
-            let mut encoded = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-                width,
-                1,
-                image::Rgba([index as u8 * 30, 10, 200, 255]),
-            ))
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .unwrap();
-            let png = encoded.into_inner();
-            let summary = artifacts.ingest_bytes(IngestArtifactBytesRequest {
-                workspace_id: workspace.clone(), primary_thread_id: None,
-                bytes: png.clone(), display_name: format!("{appearance}-{width}.png"),
-                kind: pioneer_protocol::ArtifactKind::Screenshot, mime_type: Some("image/png".into()),
-                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
-                created_by_actor_id: Some("html_preview".into()), binding: None,
-                metadata: BTreeMap::from([("htmlTool".into(), json!({"version":2,"publication":false,
-                    "turnId":"fixture-turn","callId":"fixture-call","index":format!("{appearance}-{width}")}))]),
-            }).await.unwrap();
-            let resolved = artifacts
-                .resolve_provider_attachment(
-                    &workspace,
-                    &summary.artifact.artifact_id,
-                    summary.artifact.version_id.as_deref(),
-                )
-                .await
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            use base64::Engine;
+            use pioneer_artifacts::{
+                ArtifactService, IngestArtifactBytesRequest, LocalArtifactBlobStore,
+            };
+            let (_mcp, store, workspace, _secrets) = test_mcp_service_with_secrets(db_fixture).await;
+            let root = tempfile::tempdir().unwrap();
+            let artifacts =
+                ArtifactService::new(store, Arc::new(LocalArtifactBlobStore::new(root.path())));
+            // Match the production caller's retention protection across every read.
+            let _activity = artifacts.html_preview_activity_signaled().await;
+            let frames = [
+                ("light", 360u32),
+                ("light", 768),
+                ("light", 1024),
+                ("dark", 360),
+                ("dark", 768),
+                ("dark", 1024),
+            ];
+            let mut images = Vec::new();
+            let mut previews = Vec::new();
+            let mut expected_pngs = Vec::new();
+            for (index, (appearance, width)) in frames.into_iter().enumerate() {
+                let mut encoded = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    width,
+                    1,
+                    image::Rgba([index as u8 * 30, 10, 200, 255]),
+                ))
+                .write_to(&mut encoded, image::ImageFormat::Png)
                 .unwrap();
-            images.push(
-                json!({"appearance":appearance,"width":width,"attachment":resolved.attachment}),
-            );
-            previews.push(json!({"appearance":appearance,"width":width,"contentHeight":1,"capturedHeight":1,
-                "diagnostics":[format!("diagnostic-{appearance}-{width}")],"artifact":summary.artifact}));
-            expected_pngs.push(png);
-        }
-        let payload =
-            json!({"formatVersion":2,"previews":previews,"llm_context":{"images":images}});
-        let mut delivered = payload.clone();
-        let content = html_preview_mcp_content(
-            &artifacts,
-            &workspace,
-            &mut delivered,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(content.len(), 13);
-        for (index, (appearance, width)) in frames.into_iter().enumerate() {
+                let png = encoded.into_inner();
+                let summary = artifacts.ingest_bytes(IngestArtifactBytesRequest {
+                    workspace_id: workspace.clone(), primary_thread_id: None,
+                    bytes: png.clone(), display_name: format!("{appearance}-{width}.png"),
+                    kind: pioneer_protocol::ArtifactKind::Screenshot, mime_type: Some("image/png".into()),
+                    created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                    created_by_actor_id: Some("html_preview".into()), binding: None,
+                    metadata: BTreeMap::from([("htmlTool".into(), json!({"version":2,"publication":false,
+                        "turnId":"fixture-turn","callId":"fixture-call","index":format!("{appearance}-{width}")}))]),
+                }).await.unwrap();
+                let resolved = artifacts
+                    .resolve_provider_attachment(
+                        &workspace,
+                        &summary.artifact.artifact_id,
+                        summary.artifact.version_id.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+                images.push(
+                    json!({"appearance":appearance,"width":width,"attachment":resolved.attachment}),
+                );
+                previews.push(json!({"appearance":appearance,"width":width,"contentHeight":1,"capturedHeight":1,
+                    "diagnostics":[format!("diagnostic-{appearance}-{width}")],"artifact":summary.artifact}));
+                expected_pngs.push(png);
+            }
+            let payload =
+                json!({"formatVersion":2,"previews":previews,"llm_context":{"images":images}});
+            let mut delivered = payload.clone();
+            let content = html_preview_mcp_content(
+                &artifacts,
+                &workspace,
+                &mut delivered,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(content.len(), 13);
+            for (index, (appearance, width)) in frames.into_iter().enumerate() {
+                assert_eq!(
+                    content[index * 2],
+                    json!({"type":"text","text":format!("HTML preview: {appearance} {width} CSS px")})
+                );
+                assert_eq!(content[index * 2 + 1]["type"], "image");
+                assert_eq!(content[index * 2 + 1]["mimeType"], "image/png");
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(content[index * 2 + 1]["data"].as_str().unwrap())
+                        .unwrap(),
+                    expected_pngs[index]
+                );
+            }
+            assert!(delivered.get("llm_context").is_none());
+            assert_eq!(delivered["previews"], payload["previews"]);
             assert_eq!(
-                content[index * 2],
-                json!({"type":"text","text":format!("HTML preview: {appearance} {width} CSS px")})
+                serde_json::from_str::<JsonValue>(content[12]["text"].as_str().unwrap()).unwrap(),
+                delivered
             );
-            assert_eq!(content[index * 2 + 1]["type"], "image");
-            assert_eq!(content[index * 2 + 1]["mimeType"], "image/png");
-            assert_eq!(
-                base64::engine::general_purpose::STANDARD
-                    .decode(content[index * 2 + 1]["data"].as_str().unwrap())
-                    .unwrap(),
-                expected_pngs[index]
-            );
-        }
-        assert!(delivered.get("llm_context").is_none());
-        assert_eq!(delivered["previews"], payload["previews"]);
-        assert_eq!(
-            serde_json::from_str::<JsonValue>(content[12]["text"].as_str().unwrap()).unwrap(),
-            delivered
-        );
 
-        // Recorded legacy wire captions must remain byte-for-byte stable.
-        let mut legacy = payload.clone();
-        legacy.as_object_mut().unwrap().remove("formatVersion");
-        legacy["previews"].as_array_mut().unwrap().truncate(3);
-        for preview in legacy["previews"].as_array_mut().unwrap() {
-            preview.as_object_mut().unwrap().remove("appearance");
-        }
-        legacy["llm_context"]["images"]
-            .as_array_mut()
-            .unwrap()
-            .truncate(3);
-        for entry in legacy["llm_context"]["images"].as_array_mut().unwrap() {
-            entry.as_object_mut().unwrap().remove("appearance");
-        }
-        let legacy_content = html_preview_mcp_content(
-            &artifacts,
-            &workspace,
-            &mut legacy,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        for (index, width) in [360, 768, 1024].into_iter().enumerate() {
-            assert_eq!(
-                legacy_content[index * 2],
-                json!({"type":"text","text":format!("HTML preview: {width} CSS px")})
-            );
-        }
+            // Recorded legacy wire captions must remain byte-for-byte stable.
+            let mut legacy = payload.clone();
+            legacy.as_object_mut().unwrap().remove("formatVersion");
+            legacy["previews"].as_array_mut().unwrap().truncate(3);
+            for preview in legacy["previews"].as_array_mut().unwrap() {
+                preview.as_object_mut().unwrap().remove("appearance");
+            }
+            legacy["llm_context"]["images"]
+                .as_array_mut()
+                .unwrap()
+                .truncate(3);
+            for entry in legacy["llm_context"]["images"].as_array_mut().unwrap() {
+                entry.as_object_mut().unwrap().remove("appearance");
+            }
+            let legacy_content = html_preview_mcp_content(
+                &artifacts,
+                &workspace,
+                &mut legacy,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+                assert_eq!(
+                    legacy_content[index * 2],
+                    json!({"type":"text","text":format!("HTML preview: {width} CSS px")})
+                );
+            }
 
-        // Shape failure is rejected, never treated as a legacy or partial result.
-        let mut incomplete = payload.clone();
-        incomplete["llm_context"]["images"]
-            .as_array_mut()
-            .unwrap()
-            .pop();
-        let original = incomplete.clone();
-        let error = html_preview_mcp_content(
-            &artifacts,
-            &workspace,
-            &mut incomplete,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
-        assert_eq!(incomplete, original);
+            // Shape failure is rejected, never treated as a legacy or partial result.
+            let mut incomplete = payload.clone();
+            incomplete["llm_context"]["images"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            let original = incomplete.clone();
+            let error = html_preview_mcp_content(
+                &artifacts,
+                &workspace,
+                &mut incomplete,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+            assert_eq!(incomplete, original);
 
-        // A real but foreign version id cannot silently fall back to the last
-        // artifact's current bytes after five successful image reads.
-        let mut wrong_version = payload.clone();
-        wrong_version["llm_context"]["images"][5]["attachment"]["artifact"]["artifact_version_id"] =
-            payload["llm_context"]["images"][0]["attachment"]["artifact"]["artifact_version_id"]
-                .clone();
-        let original = wrong_version.clone();
-        let error = html_preview_mcp_content(
-            &artifacts,
-            &workspace,
-            &mut wrong_version,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
-        assert_eq!(wrong_version, original);
+            // A real but foreign version id cannot silently fall back to the last
+            // artifact's current bytes after five successful image reads.
+            let mut wrong_version = payload.clone();
+            wrong_version["llm_context"]["images"][5]["attachment"]["artifact"]["artifact_version_id"] =
+                payload["llm_context"]["images"][0]["attachment"]["artifact"]["artifact_version_id"]
+                    .clone();
+            let original = wrong_version.clone();
+            let error = html_preview_mcp_content(
+                &artifacts,
+                &workspace,
+                &mut wrong_version,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ResultInvalid);
+            assert_eq!(wrong_version, original);
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
@@ -5273,267 +5354,270 @@ mod tests {
         let limits = McpProjectionLimits::default();
         let facade_limits = CliMcpFacadeProjectionLimits::transport_bounded(limits.max_tools);
         for changed_schema in [false, true] {
-            let (service, store, workspace, _secrets) = test_mcp_service_with_secrets().await;
-            let thread = "T00000000000000000001";
-            let turn = "U00000000000000000001";
-            seed_started_turn(&store, &workspace, thread, turn).await;
-            let mut schema = recorded["inputSchema"].clone();
-            if changed_schema {
-                schema["properties"]["html"]["maxLength"] = json!(512001);
-            }
-            let mut projection = ResolvedMcpTurnProjection::empty(&workspace, turn);
-            projection.tools.push(ResolvedMcpTurnTool {
-                canonical_callable_name: String::new(),
-                workspace_id: workspace.clone(),
-                server_installation_id: HTML_SERVER_ID.into(),
-                server_name: HTML_SERVER_NAME.into(),
-                raw_tool_name: HTML_PREVIEW.into(),
-                description: Some(recorded["description"].as_str().unwrap().into()),
-                input_schema: schema,
-                annotations: None,
-                timeout_ms: 120_000,
-                catalog_version: HTML_SERVER_ID.into(),
-                installation_fingerprint: HTML_SERVER_ID.into(),
-                schema_fingerprint: String::new(),
-                runtime_generation: 1,
-                selection_reason: crate::turn_mcp::McpSelectionReason::ImplicitPolicy,
-                capability_id: None,
-            });
-            projection.finalize_identity(limits).unwrap();
-            if !changed_schema {
-                assert_eq!(projection.tools[0].canonical_callable_name, HTML_PREVIEW);
-                let mut forged_description = projection.tools[0].clone();
-                forged_description.description = Some("different first-party contract".into());
-                assert!(
-                    crate::turn_mcp::native_tools::exact_definition(&forged_description).is_none()
-                );
-            }
-            let original =
-                build_codex_mcp_session_launch_projection(projection.clone(), "a".repeat(64))
-                    .unwrap();
-            let facade_fingerprint = original
-                .facade_projection(facade_limits)
-                .unwrap()
-                .fingerprint()
-                .as_str()
-                .to_owned();
-            let provider_bindings = original
-                .preflight
-                .tools
-                .iter()
-                .map(|tool| TurnMcpProviderBindingIdentity {
-                    canonical_callable_name: tool.canonical_callable_name.clone(),
-                    provider_callable_name: format!(
-                        "mcp__pioneer__{}",
-                        tool.canonical_callable_name
-                    ),
-                    provider_schema_fingerprint: tool.transformed_schema_fingerprint.clone(),
-                })
-                .collect::<Vec<_>>();
-            service
-                .persist_cli_resolved_mcp_turn_projection(&projection, &provider_bindings)
-                .await
-                .unwrap();
-            let frozen_bindings = store.list_turn_mcp_bindings(turn).await.unwrap();
-            let now = chrono::Utc::now().fixed_offset();
-            store
-                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-                    turn_id: turn.into(),
-                    thread_id: thread.into(),
-                    continuation_thread_id: thread.into(),
+            pioneer_postgres_test::with_database(async |db_fixture| {
+                let (service, store, workspace, _secrets) = test_mcp_service_with_secrets(db_fixture).await;
+                let thread = "T00000000000000000001";
+                let turn = "U00000000000000000001";
+                seed_started_turn(&store, &workspace, thread, turn).await;
+                let mut schema = recorded["inputSchema"].clone();
+                if changed_schema {
+                    schema["properties"]["html"]["maxLength"] = json!(512001);
+                }
+                let mut projection = ResolvedMcpTurnProjection::empty(&workspace, turn);
+                projection.tools.push(ResolvedMcpTurnTool {
+                    canonical_callable_name: String::new(),
                     workspace_id: workspace.clone(),
-                    runtime_id: "runtime-codex".into(),
-                    runtime_kind: "codex".into(),
-                    native_thread_id: "native-thread".into(),
-                    native_turn_id: Some("native-turn".into()),
-                    request_id: None,
-                    status: "running".into(),
-                    model: None,
-                    cwd: None,
-                    sandbox_json: None,
-                    approval_policy: None,
-                    input_mapping_json: "{}".into(),
-                    created_at: now,
-                    updated_at: now,
-                })
-                .await
-                .unwrap();
-            store
-                .set_cli_runtime_turn_mcp_metadata(
-                    turn,
-                    Some(CliRuntimeTurnMcpMetadata {
-                        adapter_kind: "codex_synthetic_mcp".into(),
-                        manifest_hash: projection.manifest_hash.clone(),
-                        projection_fingerprint: facade_fingerprint.clone(),
-                        provider_contract_fingerprint: "a".repeat(64),
-                        isolation_contract_fingerprint: original
-                            .semantic_restart_fingerprint()
-                            .into(),
-                        session_generation: 1,
-                        projection_activation_generation: frozen_bindings[0]
-                            .projection_activation_generation,
-                    }),
-                )
-                .await
-                .unwrap();
-            let session = store
-                .get_cli_runtime_turn_binding(turn)
-                .await
-                .unwrap()
-                .unwrap();
-            let restored = restore_cli_mcp_session_launch(
-                &store,
-                &service,
-                &session,
-                pioneer_protocol::CLIAgentRuntimeKind::Codex,
-                limits,
-            )
-            .await;
-            if changed_schema {
-                // Do not let the changed schema's prefixed projection name mask
-                // a permissive fingerprint fallback: the original raw callable
-                // with this unknown fingerprint must also fail identity lookup.
-                let mut unknown = frozen_bindings[0].clone();
-                unknown.canonical_callable_name = HTML_PREVIEW.into();
-                unknown.callable_name = HTML_PREVIEW.into();
-                assert_eq!(
-                    crate::turn_mcp::native_tools::current_identity(&workspace, &unknown)
-                        .unwrap_err()
-                        .code,
-                    TurnMcpInvocationErrorCode::ToolDrift,
-                );
-                assert!(
-                    format!("{:#}", restored.unwrap_err())
-                        .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
-                );
-                continue;
-            }
-            let CliMcpSessionLaunch::Codex(restored) = restored.unwrap() else {
-                panic!("Codex expected")
-            };
-            // Includes the original input schema, fingerprint, description and raw
-            // callable. Recovery must not rewrite the durable bindings or manifest.
-            assert_eq!(restored.canonical_projection, projection);
-            assert_eq!(restored.preflight, original.preflight);
-            assert_eq!(
-                restored.semantic_restart_fingerprint(),
-                original.semantic_restart_fingerprint()
-            );
-            assert_eq!(
-                restored
+                    server_installation_id: HTML_SERVER_ID.into(),
+                    server_name: HTML_SERVER_NAME.into(),
+                    raw_tool_name: HTML_PREVIEW.into(),
+                    description: Some(recorded["description"].as_str().unwrap().into()),
+                    input_schema: schema,
+                    annotations: None,
+                    timeout_ms: 120_000,
+                    catalog_version: HTML_SERVER_ID.into(),
+                    installation_fingerprint: HTML_SERVER_ID.into(),
+                    schema_fingerprint: String::new(),
+                    runtime_generation: 1,
+                    selection_reason: crate::turn_mcp::McpSelectionReason::ImplicitPolicy,
+                    capability_id: None,
+                });
+                projection.finalize_identity(limits).unwrap();
+                if !changed_schema {
+                    assert_eq!(projection.tools[0].canonical_callable_name, HTML_PREVIEW);
+                    let mut forged_description = projection.tools[0].clone();
+                    forged_description.description = Some("different first-party contract".into());
+                    assert!(
+                        crate::turn_mcp::native_tools::exact_definition(&forged_description).is_none()
+                    );
+                }
+                let original =
+                    build_codex_mcp_session_launch_projection(projection.clone(), "a".repeat(64))
+                        .unwrap();
+                let facade_fingerprint = original
                     .facade_projection(facade_limits)
                     .unwrap()
                     .fingerprint()
-                    .as_str(),
-                facade_fingerprint
-            );
-            assert_eq!(
-                store.list_turn_mcp_bindings(turn).await.unwrap(),
-                frozen_bindings
-            );
-            assert_eq!(
-                store
-                    .get_turn_mcp_projection(turn)
+                    .as_str()
+                    .to_owned();
+                let provider_bindings = original
+                    .preflight
+                    .tools
+                    .iter()
+                    .map(|tool| TurnMcpProviderBindingIdentity {
+                        canonical_callable_name: tool.canonical_callable_name.clone(),
+                        provider_callable_name: format!(
+                            "mcp__pioneer__{}",
+                            tool.canonical_callable_name
+                        ),
+                        provider_schema_fingerprint: tool.transformed_schema_fingerprint.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                service
+                    .persist_cli_resolved_mcp_turn_projection(&projection, &provider_bindings)
                     .await
-                    .unwrap()
-                    .unwrap()
-                    .manifest_hash,
-                projection.manifest_hash
-            );
-
-            let root = tempfile::tempdir().unwrap();
-            let artifacts = Arc::new(ArtifactService::new(
-                store.clone(),
-                Arc::new(LocalArtifactBlobStore::new(root.path())),
-            ));
-            let mut previews = Vec::new();
-            let mut images = Vec::new();
-            let mut pngs = Vec::new();
-            for (index, width) in [360u32, 768, 1024].into_iter().enumerate() {
-                let mut encoded = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-                    width,
-                    1,
-                    image::Rgba([index as u8 * 60, 10, 200, 255]),
-                ))
-                .write_to(&mut encoded, image::ImageFormat::Png)
-                .unwrap();
-                let png = encoded.into_inner();
-                let summary = artifacts
-                    .ingest_bytes(IngestArtifactBytesRequest {
+                    .unwrap();
+                let frozen_bindings = store.list_turn_mcp_bindings(turn).await.unwrap();
+                let now = chrono::Utc::now().fixed_offset();
+                store
+                    .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                        turn_id: turn.into(),
+                        thread_id: thread.into(),
+                        continuation_thread_id: thread.into(),
                         workspace_id: workspace.clone(),
-                        primary_thread_id: Some(thread.into()),
-                        bytes: png.clone(),
-                        display_name: format!("legacy-{width}.png"),
-                        kind: pioneer_protocol::ArtifactKind::Screenshot,
-                        mime_type: Some("image/png".into()),
-                        created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
-                        created_by_actor_id: Some(HTML_PREVIEW.into()),
-                        binding: None,
-                        metadata: BTreeMap::from([(
-                            "htmlTool".into(),
-                            json!({"version":1,"publication":false,
-                        "turnId":turn,"callId":"legacy-preview-call","index":width.to_string()}),
-                        )]),
+                        runtime_id: "runtime-codex".into(),
+                        runtime_kind: "codex".into(),
+                        native_thread_id: "native-thread".into(),
+                        native_turn_id: Some("native-turn".into()),
+                        request_id: None,
+                        status: "running".into(),
+                        model: None,
+                        cwd: None,
+                        sandbox_json: None,
+                        approval_policy: None,
+                        input_mapping_json: "{}".into(),
+                        created_at: now,
+                        updated_at: now,
                     })
                     .await
                     .unwrap();
-                let resolved = artifacts
-                    .resolve_provider_attachment(
-                        &workspace,
-                        &summary.artifact.artifact_id,
-                        summary.artifact.version_id.as_deref(),
+                store
+                    .set_cli_runtime_turn_mcp_metadata(
+                        turn,
+                        Some(CliRuntimeTurnMcpMetadata {
+                            adapter_kind: "codex_synthetic_mcp".into(),
+                            manifest_hash: projection.manifest_hash.clone(),
+                            projection_fingerprint: facade_fingerprint.clone(),
+                            provider_contract_fingerprint: "a".repeat(64),
+                            isolation_contract_fingerprint: original
+                                .semantic_restart_fingerprint()
+                                .into(),
+                            session_generation: 1,
+                            projection_activation_generation: frozen_bindings[0]
+                                .projection_activation_generation,
+                        }),
                     )
                     .await
                     .unwrap();
-                images.push(json!({"width":width,"attachment":resolved.attachment}));
-                previews.push(json!({"width":width,"contentHeight":1,"capturedHeight":1,
-                    "diagnostics":[format!("legacy-{width}")],"artifact":summary.artifact}));
-                pngs.push(png);
-            }
-            // The existing execution seam supplies retained v1 output. Real invocation
-            // validation and real exact-version MCP image reads run on either side;
-            // this test never captures or regenerates a legacy frame in a browser.
-            let payload = json!({"previews":previews,"llm_context":{"images":images}});
-            let execution = Arc::new(TestValidatedMcpExecution {
-                replay: Some((artifacts, payload.clone())),
-                ..Default::default()
-            });
-            let invoker = GatewayTurnMcpInvoker::new(
-                store.clone(),
-                Arc::new(service.clone()),
-                execution.clone(),
-                service.inner.authorization_invalidation_hub.clone(),
-                service.inner.execution_leases.clone(),
-                service.inner.invocation_governor.clone(),
-            );
-            let result = invoker.invoke(TurnMcpInvocation {
-                workspace_id: workspace.clone(), thread_id: thread.into(), turn_id: turn.into(),
-                runtime_id: Some("runtime-codex".into()), session_generation: Some(1),
-                provider_call_id: "legacy-preview-call".into(), native_call: None, admission_deadline: None,
-                canonical_callable_name: HTML_PREVIEW.into(),
-                arguments: json!({"html":"<!doctype html><html></html>","appearance":"dark"}),
-                origin: TurnMcpInvocationOrigin::CliFacade,
-            }, CancellationToken::new()).await.unwrap();
-            assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
-            assert!(!result.is_error);
-            assert_eq!(result.content.as_array().unwrap().len(), 7);
-            for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+                let session = store
+                    .get_cli_runtime_turn_binding(turn)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let restored = restore_cli_mcp_session_launch(
+                    &store,
+                    &service,
+                    &session,
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                    limits,
+                )
+                .await;
+                if changed_schema {
+                    // Do not let the changed schema's prefixed projection name mask
+                    // a permissive fingerprint fallback: the original raw callable
+                    // with this unknown fingerprint must also fail identity lookup.
+                    let mut unknown = frozen_bindings[0].clone();
+                    unknown.canonical_callable_name = HTML_PREVIEW.into();
+                    unknown.callable_name = HTML_PREVIEW.into();
+                    assert_eq!(
+                        crate::turn_mcp::native_tools::current_identity(&workspace, &unknown)
+                            .unwrap_err()
+                            .code,
+                        TurnMcpInvocationErrorCode::ToolDrift,
+                    );
+                    assert!(
+                        format!("{:#}", restored.unwrap_err())
+                            .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
+                    );
+                    return Ok(());
+                }
+                let CliMcpSessionLaunch::Codex(restored) = restored.unwrap() else {
+                    panic!("Codex expected")
+                };
+                // Includes the original input schema, fingerprint, description and raw
+                // callable. Recovery must not rewrite the durable bindings or manifest.
+                assert_eq!(restored.canonical_projection, projection);
+                assert_eq!(restored.preflight, original.preflight);
                 assert_eq!(
-                    result.content[index * 2]["text"],
-                    format!("HTML preview: {width} CSS px")
+                    restored.semantic_restart_fingerprint(),
+                    original.semantic_restart_fingerprint()
                 );
                 assert_eq!(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(result.content[index * 2 + 1]["data"].as_str().unwrap())
-                        .unwrap(),
-                    pngs[index]
+                    restored
+                        .facade_projection(facade_limits)
+                        .unwrap()
+                        .fingerprint()
+                        .as_str(),
+                    facade_fingerprint
                 );
-            }
-            assert_eq!(
-                result.structured_content.unwrap()["previews"],
-                payload["previews"]
-            );
+                assert_eq!(
+                    store.list_turn_mcp_bindings(turn).await.unwrap(),
+                    frozen_bindings
+                );
+                assert_eq!(
+                    store
+                        .get_turn_mcp_projection(turn)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .manifest_hash,
+                    projection.manifest_hash
+                );
+
+                let root = tempfile::tempdir().unwrap();
+                let artifacts = Arc::new(ArtifactService::new(
+                    store.clone(),
+                    Arc::new(LocalArtifactBlobStore::new(root.path())),
+                ));
+                let mut previews = Vec::new();
+                let mut images = Vec::new();
+                let mut pngs = Vec::new();
+                for (index, width) in [360u32, 768, 1024].into_iter().enumerate() {
+                    let mut encoded = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                        width,
+                        1,
+                        image::Rgba([index as u8 * 60, 10, 200, 255]),
+                    ))
+                    .write_to(&mut encoded, image::ImageFormat::Png)
+                    .unwrap();
+                    let png = encoded.into_inner();
+                    let summary = artifacts
+                        .ingest_bytes(IngestArtifactBytesRequest {
+                            workspace_id: workspace.clone(),
+                            primary_thread_id: Some(thread.into()),
+                            bytes: png.clone(),
+                            display_name: format!("legacy-{width}.png"),
+                            kind: pioneer_protocol::ArtifactKind::Screenshot,
+                            mime_type: Some("image/png".into()),
+                            created_by_kind: pioneer_protocol::ArtifactCreatedByKind::Tool,
+                            created_by_actor_id: Some(HTML_PREVIEW.into()),
+                            binding: None,
+                            metadata: BTreeMap::from([(
+                                "htmlTool".into(),
+                                json!({"version":1,"publication":false,
+                            "turnId":turn,"callId":"legacy-preview-call","index":width.to_string()}),
+                            )]),
+                        })
+                        .await
+                        .unwrap();
+                    let resolved = artifacts
+                        .resolve_provider_attachment(
+                            &workspace,
+                            &summary.artifact.artifact_id,
+                            summary.artifact.version_id.as_deref(),
+                        )
+                        .await
+                        .unwrap();
+                    images.push(json!({"width":width,"attachment":resolved.attachment}));
+                    previews.push(json!({"width":width,"contentHeight":1,"capturedHeight":1,
+                        "diagnostics":[format!("legacy-{width}")],"artifact":summary.artifact}));
+                    pngs.push(png);
+                }
+                // The existing execution seam supplies retained v1 output. Real invocation
+                // validation and real exact-version MCP image reads run on either side;
+                // this test never captures or regenerates a legacy frame in a browser.
+                let payload = json!({"previews":previews,"llm_context":{"images":images}});
+                let execution = Arc::new(TestValidatedMcpExecution {
+                    replay: Some((artifacts, payload.clone())),
+                    ..Default::default()
+                });
+                let invoker = GatewayTurnMcpInvoker::new(
+                    store.clone(),
+                    Arc::new(service.clone()),
+                    execution.clone(),
+                    service.inner.authorization_invalidation_hub.clone(),
+                    service.inner.execution_leases.clone(),
+                    service.inner.invocation_governor.clone(),
+                );
+                let result = invoker.invoke(TurnMcpInvocation {
+                    workspace_id: workspace.clone(), thread_id: thread.into(), turn_id: turn.into(),
+                    runtime_id: Some("runtime-codex".into()), session_generation: Some(1),
+                    provider_call_id: "legacy-preview-call".into(), native_call: None, admission_deadline: None,
+                    canonical_callable_name: HTML_PREVIEW.into(),
+                    arguments: json!({"html":"<!doctype html><html></html>","appearance":"dark"}),
+                    origin: TurnMcpInvocationOrigin::CliFacade,
+                }, CancellationToken::new()).await.unwrap();
+                assert_eq!(execution.calls.load(Ordering::SeqCst), 1);
+                assert!(!result.is_error);
+                assert_eq!(result.content.as_array().unwrap().len(), 7);
+                for (index, width) in [360, 768, 1024].into_iter().enumerate() {
+                    assert_eq!(
+                        result.content[index * 2]["text"],
+                        format!("HTML preview: {width} CSS px")
+                    );
+                    assert_eq!(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(result.content[index * 2 + 1]["data"].as_str().unwrap())
+                            .unwrap(),
+                        pngs[index]
+                    );
+                }
+                assert_eq!(
+                    result.structured_content.unwrap()["previews"],
+                    payload["previews"]
+                );
+                Ok(())
+            }).await.unwrap();
         }
     }
 
@@ -5649,7 +5733,6 @@ mod tests {
         manifest_hash: String,
         execution: Arc<TestValidatedMcpExecution>,
         invoker: GatewayTurnMcpInvoker,
-        _database_dir: tempfile::TempDir,
     }
 
     struct TestMcpRuntimeConnector {
@@ -5850,187 +5933,197 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_stop_retains_native_handle_until_a_retry_observes_completion() {
-        let (service, _, workspace) = test_mcp_service().await;
-        let id = "stopping-native-installation";
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (call_tx, _call_rx) = mpsc::channel(1);
-        let completed = Arc::new(CancellationToken::new());
-        let completion = McpTaskCompletion(completed.clone());
-        let (entered, stopping) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        let join = tokio::spawn(async move {
-            let _completion = completion;
-            shutdown_rx.await.expect("native shutdown request");
-            entered.send(()).expect("shutdown observer");
-            released.await.expect("shutdown completion release");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, workspace) = test_mcp_service(db_fixture).await;
+            let id = "stopping-native-installation";
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (call_tx, _call_rx) = mpsc::channel(1);
+            let completed = Arc::new(CancellationToken::new());
+            let completion = McpTaskCompletion(completed.clone());
+            let (entered, stopping) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let join = tokio::spawn(async move {
+                let _completion = completion;
+                shutdown_rx.await.expect("native shutdown request");
+                entered.send(()).expect("shutdown observer");
+                released.await.expect("shutdown completion release");
+                Ok(())
+            });
+            let join = McpTaskJoin::new(join);
+            service.inner.tasks.lock().await.insert(
+                id.into(),
+                McpServerTaskHandle {
+                    name: "stopping-native".into(),
+                    scope_kind: "workspace".into(),
+                    scope_key: workspace,
+                    fingerprint: "configuration".into(),
+                    effective_secret_fingerprint: "material".into(),
+                    call_tx,
+                    oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                    recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                    shutdown_tx: Some(shutdown_tx),
+                    completed,
+                    join,
+                    session: Arc::new(Mutex::new(None)),
+                },
+            );
+            let native = service.clone();
+            let first = tokio::spawn(async move {
+                native
+                    .stop_task_result(id, DomainRuntimeState::Stopped)
+                    .await
+            });
+            stopping.await.expect("native stop was requested");
+            first.abort();
+            assert!(
+                first
+                    .await
+                    .expect_err("caller was cancelled")
+                    .is_cancelled()
+            );
+            assert!(
+                service.task_exists(id).await,
+                "unacknowledged native owner remains reachable"
+            );
+            tokio::time::timeout(Duration::from_secs(1), service.oauth_recovered(id))
+                .await
+                .expect("stopping actors must not receive OAuth recovery commands");
+            assert!(
+                service.inner.tasks.lock().await[id]
+                    .recovery
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            );
+            let native = service.clone();
+            let retry = tokio::spawn(async move {
+                native
+                    .stop_task_result(id, DomainRuntimeState::Stopped)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !retry.is_finished(),
+                "a cancellation signal is not a shutdown acknowledgement"
+            );
+            release.send(()).expect("allow native completion");
+            retry
+                .await
+                .expect("retry join")
+                .expect("native shutdown acknowledged");
+            assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+            service
+                .stop_task_result(id, DomainRuntimeState::Stopped)
+                .await
+                .expect("same retained result on repeat");
+            service.stop_task(id, DomainRuntimeState::Stopped).await;
+            assert!(
+                !service.task_exists(id).await,
+                "legacy stop releases only the confirmed actor"
+            );
+            service.shutdown().await;
             Ok(())
-        });
-        let join = McpTaskJoin::new(join);
-        service.inner.tasks.lock().await.insert(
-            id.into(),
-            McpServerTaskHandle {
-                name: "stopping-native".into(),
-                scope_kind: "workspace".into(),
-                scope_key: workspace,
-                fingerprint: "configuration".into(),
-                effective_secret_fingerprint: "material".into(),
-                call_tx,
-                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
-                recovery: Arc::new(OAuthRecoveryMailbox::default()),
-                shutdown_tx: Some(shutdown_tx),
-                completed,
-                join,
-                session: Arc::new(Mutex::new(None)),
-            },
-        );
-        let native = service.clone();
-        let first = tokio::spawn(async move {
-            native
-                .stop_task_result(id, DomainRuntimeState::Stopped)
-                .await
-        });
-        stopping.await.expect("native stop was requested");
-        first.abort();
-        assert!(
-            first
-                .await
-                .expect_err("caller was cancelled")
-                .is_cancelled()
-        );
-        assert!(
-            service.task_exists(id).await,
-            "unacknowledged native owner remains reachable"
-        );
-        tokio::time::timeout(Duration::from_secs(1), service.oauth_recovered(id))
-            .await
-            .expect("stopping actors must not receive OAuth recovery commands");
-        assert!(
-            service.inner.tasks.lock().await[id]
-                .recovery
-                .pending
-                .lock()
-                .unwrap()
-                .is_none()
-        );
-        let native = service.clone();
-        let retry = tokio::spawn(async move {
-            native
-                .stop_task_result(id, DomainRuntimeState::Stopped)
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !retry.is_finished(),
-            "a cancellation signal is not a shutdown acknowledgement"
-        );
-        release.send(()).expect("allow native completion");
-        retry
-            .await
-            .expect("retry join")
-            .expect("native shutdown acknowledged");
-        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
-        service
-            .stop_task_result(id, DomainRuntimeState::Stopped)
-            .await
-            .expect("same retained result on repeat");
-        service.stop_task(id, DomainRuntimeState::Stopped).await;
-        assert!(
-            !service.task_exists(id).await,
-            "legacy stop releases only the confirmed actor"
-        );
-        service.shutdown().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn delayed_stop_does_not_remove_a_replacement_runtime_with_the_same_installation_id() {
-        let (service, _, workspace) = test_mcp_service().await;
-        let id = "replacement-native-installation";
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (call_tx, _call_rx) = mpsc::channel(1);
-        let completed = Arc::new(CancellationToken::new());
-        let completion = McpTaskCompletion(completed.clone());
-        let (entered, stopping) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        let join = tokio::spawn(async move {
-            let _completion = completion;
-            shutdown_rx.await.expect("original shutdown");
-            entered.send(()).expect("original stop observer");
-            released.await.expect("original completion release");
-            Ok(())
-        });
-        let join = McpTaskJoin::new(join);
-        service.inner.tasks.lock().await.insert(
-            id.into(),
-            McpServerTaskHandle {
-                name: "replacement-native".into(),
-                scope_kind: "workspace".into(),
-                scope_key: workspace.clone(),
-                fingerprint: "original".into(),
-                effective_secret_fingerprint: "material".into(),
-                call_tx,
-                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
-                recovery: Arc::new(OAuthRecoveryMailbox::default()),
-                shutdown_tx: Some(shutdown_tx),
-                completed,
-                join,
-                session: Arc::new(Mutex::new(None)),
-            },
-        );
-        let native = service.clone();
-        let old_stop = tokio::spawn(async move {
-            native
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, workspace) = test_mcp_service(db_fixture).await;
+            let id = "replacement-native-installation";
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (call_tx, _call_rx) = mpsc::channel(1);
+            let completed = Arc::new(CancellationToken::new());
+            let completion = McpTaskCompletion(completed.clone());
+            let (entered, stopping) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let join = tokio::spawn(async move {
+                let _completion = completion;
+                shutdown_rx.await.expect("original shutdown");
+                entered.send(()).expect("original stop observer");
+                released.await.expect("original completion release");
+                Ok(())
+            });
+            let join = McpTaskJoin::new(join);
+            service.inner.tasks.lock().await.insert(
+                id.into(),
+                McpServerTaskHandle {
+                    name: "replacement-native".into(),
+                    scope_kind: "workspace".into(),
+                    scope_key: workspace.clone(),
+                    fingerprint: "original".into(),
+                    effective_secret_fingerprint: "material".into(),
+                    call_tx,
+                    oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                    recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                    shutdown_tx: Some(shutdown_tx),
+                    completed,
+                    join,
+                    session: Arc::new(Mutex::new(None)),
+                },
+            );
+            let native = service.clone();
+            let old_stop = tokio::spawn(async move {
+                native
+                    .stop_task_result(id, DomainRuntimeState::Stopped)
+                    .await
+            });
+            stopping.await.expect("original stop admitted");
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (call_tx, _call_rx) = mpsc::channel(1);
+            let completed = Arc::new(CancellationToken::new());
+            let completion = McpTaskCompletion(completed.clone());
+            let join = tokio::spawn(async move {
+                let _completion = completion;
+                shutdown_rx
+                    .await
+                    .expect("replacement retains its own shutdown sender");
+                Ok(())
+            });
+            let join = McpTaskJoin::new(join);
+            service.inner.tasks.lock().await.insert(
+                id.into(),
+                McpServerTaskHandle {
+                    name: "replacement-native".into(),
+                    scope_kind: "workspace".into(),
+                    scope_key: workspace,
+                    fingerprint: "replacement".into(),
+                    effective_secret_fingerprint: "material".into(),
+                    call_tx,
+                    oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                    recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                    shutdown_tx: Some(shutdown_tx),
+                    completed,
+                    join,
+                    session: Arc::new(Mutex::new(None)),
+                },
+            );
+            release.send(()).expect("finish original runtime");
+            old_stop
+                .await
+                .expect("original stop caller")
+                .expect_err("replacement is not the original owner");
+            assert_eq!(
+                service.inner.tasks.lock().await[id].fingerprint,
+                "replacement"
+            );
+            service
                 .stop_task_result(id, DomainRuntimeState::Stopped)
                 .await
-        });
-        stopping.await.expect("original stop admitted");
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (call_tx, _call_rx) = mpsc::channel(1);
-        let completed = Arc::new(CancellationToken::new());
-        let completion = McpTaskCompletion(completed.clone());
-        let join = tokio::spawn(async move {
-            let _completion = completion;
-            shutdown_rx
+                .expect("stop exact replacement");
+            assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
+            service
+                .stop_task_result(id, DomainRuntimeState::Stopped)
                 .await
-                .expect("replacement retains its own shutdown sender");
+                .expect("same retained result on repeat");
+            service.shutdown().await;
             Ok(())
-        });
-        let join = McpTaskJoin::new(join);
-        service.inner.tasks.lock().await.insert(
-            id.into(),
-            McpServerTaskHandle {
-                name: "replacement-native".into(),
-                scope_kind: "workspace".into(),
-                scope_key: workspace,
-                fingerprint: "replacement".into(),
-                effective_secret_fingerprint: "material".into(),
-                call_tx,
-                oauth_failure_revision: Arc::new(AtomicU64::new(0)),
-                recovery: Arc::new(OAuthRecoveryMailbox::default()),
-                shutdown_tx: Some(shutdown_tx),
-                completed,
-                join,
-                session: Arc::new(Mutex::new(None)),
-            },
-        );
-        release.send(()).expect("finish original runtime");
-        old_stop
-            .await
-            .expect("original stop caller")
-            .expect_err("replacement is not the original owner");
-        assert_eq!(
-            service.inner.tasks.lock().await[id].fingerprint,
-            "replacement"
-        );
-        service
-            .stop_task_result(id, DomainRuntimeState::Stopped)
-            .await
-            .expect("stop exact replacement");
-        assert!(service.inner.tasks.lock().await[id].shutdown_tx.is_none());
-        service
-            .stop_task_result(id, DomainRuntimeState::Stopped)
-            .await
-            .expect("same retained result on repeat");
-        service.shutdown().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -6057,33 +6150,25 @@ mod tests {
         assert!(panic.wait().await.is_err());
     }
 
-    async fn test_mcp_service() -> (McpService, Arc<CrudStore>, String) {
+    async fn test_mcp_service(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> (McpService, Arc<CrudStore>, String) {
         let (service, crud_store, workspace_id, _gateway_secrets) =
-            test_mcp_service_with_secrets().await;
+            test_mcp_service_with_secrets(db).await;
         (service, crud_store, workspace_id)
     }
 
-    async fn test_mcp_service_with_secrets()
-    -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
-        test_mcp_service_with_store(Arc::new(MemorySecretStore::new())).await
+    async fn test_mcp_service_with_secrets(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
+        test_mcp_service_with_store(db, Arc::new(MemorySecretStore::new())).await
     }
 
     async fn test_mcp_service_with_store(
+        db: &pioneer_postgres_test::TestDatabase,
         store: Arc<dyn pioneer_keystore::SecretStore>,
     ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
-        test_mcp_service_with_database(store, "sqlite::memory:").await
-    }
-
-    async fn test_mcp_service_with_database(
-        store: Arc<dyn pioneer_keystore::SecretStore>,
-        database_url: &str,
-    ) -> (McpService, Arc<CrudStore>, String, Arc<GatewaySecrets>) {
-        let connection = Database::connect(database_url)
-            .await
-            .expect("must connect to test sqlite database");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+        let connection = db.connection().clone();
         bootstrap(&connection)
             .await
             .expect("bootstrap should create default workspace");
@@ -6174,141 +6259,148 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cleanup_holder_does_not_abort_later_enabled_rows_or_disappear_on_disable() {
-        let secrets = Arc::new(ConnectReadStore {
-            inner: MemorySecretStore::new(),
-            fail_delete: Default::default(),
-            armed: Default::default(),
-            entered: Default::default(),
-            released: std::sync::Mutex::new(true),
-            resumed: Default::default(),
-        });
-        let (service, store, workspace, _) = test_mcp_service_with_store(secrets.clone()).await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        let a = seed_mcp_installation(&store, &workspace, "a-cleanup", true, false).await;
-        let b = seed_mcp_installation(&store, &workspace, "b-enabled", true, false).await;
-        let mut row = store
-            .find_mcp_server_installation("workspace", &workspace, "a-cleanup")
-            .await
-            .unwrap()
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let secrets = Arc::new(ConnectReadStore {
+                inner: MemorySecretStore::new(),
+                fail_delete: Default::default(),
+                armed: Default::default(),
+                entered: Default::default(),
+                released: std::sync::Mutex::new(true),
+                resumed: Default::default(),
+            });
+            let (service, store, workspace, _) =
+                test_mcp_service_with_store(db_fixture, secrets.clone()).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            let a = seed_mcp_installation(&store, &workspace, "a-cleanup", true, false).await;
+            let b = seed_mcp_installation(&store, &workspace, "b-enabled", true, false).await;
+            let mut row = store
+                .find_mcp_server_installation("workspace", &workspace, "a-cleanup")
+                .await
+                .unwrap()
+                .unwrap();
+            row.transport_kind = "streamable_http".into();
+            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                url: "http://127.0.0.1:9/mcp".into(),
+                headers: Default::default(),
+                startup_timeout_ms: 5000,
+                tool_timeout_ms: 5000,
+            })
             .unwrap();
-        row.transport_kind = "streamable_http".into();
-        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
-            url: "http://127.0.0.1:9/mcp".into(),
-            headers: Default::default(),
-            startup_timeout_ms: 5000,
-            tool_timeout_ms: 5000,
-        })
-        .unwrap();
-        store
-            .upsert_mcp_server_installation(&row, now_timestamp_secs())
-            .await
-            .unwrap();
-        let installation = installation_from_record(&row).unwrap();
-        *secrets.fail_delete.lock().unwrap() = Some(a.clone());
-        assert!(
+            store
+                .upsert_mcp_server_installation(&row, now_timestamp_secs())
+                .await
+                .unwrap();
+            let installation = installation_from_record(&row).unwrap();
+            *secrets.fail_delete.lock().unwrap() = Some(a.clone());
+            assert!(
+                service
+                    .oauth()
+                    .disconnect_managed(&a, &installation, 7, &workspace)
+                    .await
+                    .is_err()
+            );
+            let rows = store
+                .list_mcp_server_installations("workspace", &workspace)
+                .await
+                .unwrap();
+            assert!(
+                rows.iter()
+                    .position(|r| r.id.as_deref() == Some(&a))
+                    .unwrap()
+                    < rows
+                        .iter()
+                        .position(|r| r.id.as_deref() == Some(&b))
+                        .unwrap(),
+                "cleanup must precede B in real repository ordering"
+            );
+            assert!(
+                !service.task_exists(&b).await,
+                "B must not be started by setup"
+            );
+            service.reload_workspace(&workspace).await.unwrap();
+            wait_for_runtime_state(&service, &workspace, &b, DomainRuntimeState::Ready).await;
+            assert!(service.task_exists(&b).await);
+            let before =
+                service.runtime_snapshot("workspace", &workspace).await[&b].runtime_generation;
+            row.enabled = false;
+            store
+                .upsert_mcp_server_installation(&row, now_timestamp_secs())
+                .await
+                .unwrap();
+            service.reload_workspace(&workspace).await.unwrap();
+            wait_for_runtime_state(&service, &workspace, &a, DomainRuntimeState::Disabled).await;
+            assert!(!service.task_exists(&a).await);
+            assert!(
+                service
+                    .oauth()
+                    .bound_to_installation(&a, &installation)
+                    .await
+            );
+            assert_eq!(
+                service.oauth().state(&a).await,
+                Some(pioneer_mcp_oauth::OAuthState::CleanupRequired)
+            );
+            assert!(
+                pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .oauth()
+                    .sign_in(
+                        &a,
+                        &installation,
+                        7,
+                        "http://127.0.0.1:37643/oauth/mcp/callback"
+                    )
+                    .await
+                    .is_err()
+            );
+            *secrets.fail_delete.lock().unwrap() = None;
             service
                 .oauth()
                 .disconnect_managed(&a, &installation, 7, &workspace)
                 .await
-                .is_err()
-        );
-        let rows = store
-            .list_mcp_server_installations("workspace", &workspace)
-            .await
-            .unwrap();
-        assert!(
-            rows.iter()
-                .position(|r| r.id.as_deref() == Some(&a))
-                .unwrap()
-                < rows
-                    .iter()
-                    .position(|r| r.id.as_deref() == Some(&b))
-                    .unwrap(),
-            "cleanup must precede B in real repository ordering"
-        );
-        assert!(
-            !service.task_exists(&b).await,
-            "B must not be started by setup"
-        );
-        service.reload_workspace(&workspace).await.unwrap();
-        wait_for_runtime_state(&service, &workspace, &b, DomainRuntimeState::Ready).await;
-        assert!(service.task_exists(&b).await);
-        let before = service.runtime_snapshot("workspace", &workspace).await[&b].runtime_generation;
-        row.enabled = false;
-        store
-            .upsert_mcp_server_installation(&row, now_timestamp_secs())
-            .await
-            .unwrap();
-        service.reload_workspace(&workspace).await.unwrap();
-        wait_for_runtime_state(&service, &workspace, &a, DomainRuntimeState::Disabled).await;
-        assert!(!service.task_exists(&a).await);
-        assert!(
-            service
-                .oauth()
-                .bound_to_installation(&a, &installation)
-                .await
-        );
-        assert_eq!(
-            service.oauth().state(&a).await,
-            Some(pioneer_mcp_oauth::OAuthState::CleanupRequired)
-        );
-        assert!(
-            pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
-                .await
-                .is_err()
-        );
-        assert!(
-            service
-                .oauth()
-                .sign_in(
-                    &a,
-                    &installation,
-                    7,
-                    "http://127.0.0.1:37643/oauth/mcp/callback"
-                )
-                .await
-                .is_err()
-        );
-        *secrets.fail_delete.lock().unwrap() = None;
-        service
-            .oauth()
-            .disconnect_managed(&a, &installation, 7, &workspace)
-            .await
-            .unwrap();
-        // Confirmed management Clear retains a credential-free signed-out
-        // admission. It must not look like an unprobed installation that can
-        // start anonymous OAuth recovery on the next reconciliation.
-        assert_eq!(
-            service
-                .oauth()
-                .management_projection(&a, &installation)
-                .await,
-            (Some(pioneer_mcp_oauth::OAuthState::AuthRequired), false)
-        );
-        for account in [a.clone(), format!("{a}::promotion")] {
-            assert!(
-                !pioneer_keystore::SecretStore::exists(
-                    &secrets.inner,
-                    &pioneer_keystore::SecretId::mcp_oauth(&account).unwrap(),
-                )
-                .unwrap(),
-                "confirmed Clear must remove the account and promotion fence"
+                .unwrap();
+            // Confirmed management Clear retains a credential-free signed-out
+            // admission. It must not look like an unprobed installation that can
+            // start anonymous OAuth recovery on the next reconciliation.
+            assert_eq!(
+                service
+                    .oauth()
+                    .management_projection(&a, &installation)
+                    .await,
+                (Some(pioneer_mcp_oauth::OAuthState::AuthRequired), false)
             );
-        }
-        let error = pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
-            .await
-            .err()
-            .expect("signed-out admission must not restore an OAuth client");
-        assert_eq!(error.state, DomainRuntimeState::AuthRequired);
-        assert!(!service.task_exists(&a).await);
-        let snapshot = service.runtime_snapshot("workspace", &workspace).await;
-        assert_eq!(snapshot[&a].state, DomainRuntimeState::Disabled);
-        assert_eq!(snapshot[&b].state, DomainRuntimeState::Ready);
-        assert_eq!(snapshot[&b].runtime_generation, before);
-        service.shutdown().await;
+            for account in [a.clone(), format!("{a}::promotion")] {
+                assert!(
+                    !pioneer_keystore::SecretStore::exists(
+                        &secrets.inner,
+                        &pioneer_keystore::SecretId::mcp_oauth(&account).unwrap(),
+                    )
+                    .unwrap(),
+                    "confirmed Clear must remove the account and promotion fence"
+                );
+            }
+            let error = pioneer_mcp::McpOAuthProvider::client(service.oauth(), &a, &installation)
+                .await
+                .err()
+                .expect("signed-out admission must not restore an OAuth client");
+            assert_eq!(error.state, DomainRuntimeState::AuthRequired);
+            assert!(!service.task_exists(&a).await);
+            let snapshot = service.runtime_snapshot("workspace", &workspace).await;
+            assert_eq!(snapshot[&a].state, DomainRuntimeState::Disabled);
+            assert_eq!(snapshot[&b].state, DomainRuntimeState::Ready);
+            assert_eq!(snapshot[&b].runtime_generation, before);
+            service.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     struct OwnedConnectConnector {
         owner: pioneer_mcp_oauth::McpOAuthService,
@@ -6339,137 +6431,161 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gateway_shutdown_waits_for_oauth_connect_caller_before_actor_stop_join() {
-        let secrets = Arc::new(ConnectReadStore {
-            inner: MemorySecretStore::new(),
-            fail_delete: Default::default(),
-            armed: std::sync::atomic::AtomicBool::new(false),
-            entered: tokio::sync::Notify::new(),
-            released: std::sync::Mutex::new(false),
-            resumed: std::sync::Condvar::new(),
-        });
-        struct Release(Arc<ConnectReadStore>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.release();
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let secrets = Arc::new(ConnectReadStore {
+                inner: MemorySecretStore::new(),
+                fail_delete: Default::default(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                released: std::sync::Mutex::new(false),
+                resumed: std::sync::Condvar::new(),
+            });
+            struct Release(Arc<ConnectReadStore>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.release();
+                }
             }
-        }
-        let _release = Release(secrets.clone());
-        let (service, store, workspace, _) = test_mcp_service_with_store(secrets.clone()).await;
-        let id = seed_mcp_installation(&store, &workspace, "owned-connect", true, false).await;
-        let mut row = store
-            .find_mcp_server_installation("workspace", &workspace, "owned-connect")
-            .await
-            .unwrap()
-            .unwrap();
-        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
-            url: "http://127.0.0.1:9/mcp".into(),
-            headers: Default::default(),
-            startup_timeout_ms: 30_000,
-            tool_timeout_ms: 120_000,
-        })
-        .unwrap();
-        store
-            .upsert_mcp_server_installation(&row, crate::message::now_timestamp_secs())
-            .await
-            .unwrap();
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        service.set_connector_for_tests(Arc::new(OwnedConnectConnector {
-            owner: service.oauth().clone(),
-            store: secrets.clone(),
-            completed: completed.clone(),
-        }));
-        service
-            .restart_server("workspace", &workspace, "owned-connect")
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), secrets.entered.notified())
-            .await
-            .unwrap();
-        let owner = service.clone();
-        let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+            let _release = Release(secrets.clone());
+            let (service, store, workspace, _) =
+                test_mcp_service_with_store(db_fixture, secrets.clone()).await;
+            let id = seed_mcp_installation(&store, &workspace, "owned-connect", true, false).await;
+            let mut row = store
+                .find_mcp_server_installation("workspace", &workspace, "owned-connect")
                 .await
-                .is_err()
-        );
-        assert!(!completed.load(Ordering::SeqCst));
-        assert!(
-            service.task_exists(&id).await,
-            "OAuth shutdown must still own connect before actor removal"
-        );
-        secrets.release();
-        tokio::time::timeout(Duration::from_secs(3), shutdown)
-            .await
-            .unwrap()
+                .unwrap()
+                .unwrap();
+            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                url: "http://127.0.0.1:9/mcp".into(),
+                headers: Default::default(),
+                startup_timeout_ms: 30_000,
+                tool_timeout_ms: 120_000,
+            })
             .unwrap();
-        assert!(completed.load(Ordering::SeqCst));
-        assert!(!service.task_exists(&id).await);
-        assert_eq!(
-            service.runtime_snapshot("workspace", &workspace).await[&id].state,
-            DomainRuntimeState::Stopped
-        );
+            store
+                .upsert_mcp_server_installation(&row, crate::message::now_timestamp_secs())
+                .await
+                .unwrap();
+            let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            service.set_connector_for_tests(Arc::new(OwnedConnectConnector {
+                owner: service.oauth().clone(),
+                store: secrets.clone(),
+                completed: completed.clone(),
+            }));
+            service
+                .restart_server("workspace", &workspace, "owned-connect")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), secrets.entered.notified())
+                .await
+                .unwrap();
+            let owner = service.clone();
+            let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+            assert!(!completed.load(Ordering::SeqCst));
+            assert!(
+                service.task_exists(&id).await,
+                "OAuth shutdown must still own connect before actor removal"
+            );
+            secrets.release();
+            tokio::time::timeout(Duration::from_secs(3), shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(completed.load(Ordering::SeqCst));
+            assert!(!service.task_exists(&id).await);
+            assert_eq!(
+                service.runtime_snapshot("workspace", &workspace).await[&id].state,
+                DomainRuntimeState::Stopped
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn management_notification_overload_retires_instead_of_using_reply_reserve() {
-        let (service, _, _) = test_mcp_service().await;
-        let sessions = &service.inner.session_manager;
-        let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
-        let id = sessions
-            .register_connection(sender.clone(), authenticated_test_superuser())
-            .await
-            .unwrap();
-        sender
-            .try_send_data(axum::extract::ws::Message::Text("occupied".into()))
-            .unwrap();
-        service
-            .send_management_notification("test/mcp-management", &json!({"name":"private-server"}))
-            .await;
-        assert!(sessions.connection_principal(id).await.is_err());
-        assert!(
-            sender
-                .send(axum::extract::ws::Message::Close(None))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, _) = test_mcp_service(db_fixture).await;
+            let sessions = &service.inner.session_manager;
+            let (sender, _receiver) = crate::session::test_support::outbound_channel(2);
+            let id = sessions
+                .register_connection(sender.clone(), authenticated_test_superuser())
                 .await
-                .is_err()
-        );
+                .unwrap();
+            sender
+                .try_send_data(axum::extract::ws::Message::Text("occupied".into()))
+                .unwrap();
+            service
+                .send_management_notification(
+                    "test/mcp-management",
+                    &json!({"name":"private-server"}),
+                )
+                .await;
+            assert!(sessions.connection_principal(id).await.is_err());
+            assert!(
+                sender
+                    .send(axum::extract::ws::Message::Close(None))
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn management_notifications_are_superuser_only() {
-        let (service, _, _) = test_mcp_service().await;
-        let session_manager = service.inner.session_manager.clone();
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, _) = test_mcp_service(db_fixture).await;
+            let session_manager = service.inner.session_manager.clone();
 
-        let (superuser_tx, mut superuser_rx) = crate::session::test_support::outbound_channel(2);
-        session_manager
-            .register_connection(superuser_tx, authenticated_test_superuser())
-            .await
-            .expect("register Superuser");
+            let (superuser_tx, mut superuser_rx) =
+                crate::session::test_support::outbound_channel(2);
+            session_manager
+                .register_connection(superuser_tx, authenticated_test_superuser())
+                .await
+                .expect("register Superuser");
 
-        let mut member = authenticated_test_superuser().as_ref().clone();
-        member.principal_id =
-            PrincipalId::new("P0000000000000000000A").expect("Member principal id");
-        member.kind = PrincipalKind::User;
-        member.role_key = Some(RoleKey::member());
-        member.device_id = DeviceId::new("D0000000000000000000A").expect("Member device id");
-        member.session_id = AuthSessionId::new("S0000000000000000000A").expect("Member session id");
-        let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(2);
-        session_manager
-            .register_connection(member_tx, Arc::new(member))
-            .await
-            .expect("register Member");
+            let mut member = authenticated_test_superuser().as_ref().clone();
+            member.principal_id =
+                PrincipalId::new("P0000000000000000000A").expect("Member principal id");
+            member.kind = PrincipalKind::User;
+            member.role_key = Some(RoleKey::member());
+            member.device_id = DeviceId::new("D0000000000000000000A").expect("Member device id");
+            member.session_id =
+                AuthSessionId::new("S0000000000000000000A").expect("Member session id");
+            let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(2);
+            session_manager
+                .register_connection(member_tx, Arc::new(member))
+                .await
+                .expect("register Member");
 
-        service
-            .send_management_notification("test/mcp-management", &json!({"name": "private-server"}))
-            .await;
+            service
+                .send_management_notification(
+                    "test/mcp-management",
+                    &json!({"name": "private-server"}),
+                )
+                .await;
 
-        assert!(
-            superuser_rx.recv().await.is_some(),
-            "Superuser must receive MCP management notifications"
-        );
-        assert!(
-            member_rx.try_recv().is_err(),
-            "Member must not receive MCP management, status, or catalog metadata"
-        );
+            assert!(
+                superuser_rx.recv().await.is_some(),
+                "Superuser must receive MCP management notifications"
+            );
+            assert!(
+                member_rx.try_recv().is_err(),
+                "Member must not receive MCP management, status, or catalog metadata"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     async fn seed_started_turn(
@@ -6618,30 +6734,35 @@ mod tests {
     // Regression source only: NOT_RUN / NOT_COMPILED.
     #[tokio::test]
     async fn admitted_stop_distinguishes_never_started_from_lost_native_owner() {
-        let (service, store, workspace) = test_mcp_service().await;
-        let id = seed_mcp_installation(&store, &workspace, "never-started", false, false).await;
-        let row = store
-            .find_mcp_server_installation("workspace", &workspace, "never-started")
-            .await
-            .unwrap()
-            .unwrap();
-        let _guard = service
-            .installation_lifecycle_guard("workspace", &workspace, "never-started")
-            .await;
-        service.stop_admitted_installation(&row).await.unwrap();
-        // A runtime admission with a lost task is not the same proof as an
-        // installation that was never started by this lifecycle.
-        service
-            .inner
-            .runtime_generations
-            .lock()
-            .await
-            .insert(id.clone(), 1);
-        assert!(service.stop_admitted_installation(&row).await.is_err());
-        service.inner.runtime_generations.lock().await.remove(&id);
-        let mut foreign = row.clone();
-        foreign.id = Some("foreign-native-id".into());
-        assert!(service.stop_admitted_installation(&foreign).await.is_err());
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, store, workspace) = test_mcp_service(db_fixture).await;
+            let id = seed_mcp_installation(&store, &workspace, "never-started", false, false).await;
+            let row = store
+                .find_mcp_server_installation("workspace", &workspace, "never-started")
+                .await
+                .unwrap()
+                .unwrap();
+            let _guard = service
+                .installation_lifecycle_guard("workspace", &workspace, "never-started")
+                .await;
+            service.stop_admitted_installation(&row).await.unwrap();
+            // A runtime admission with a lost task is not the same proof as an
+            // installation that was never started by this lifecycle.
+            service
+                .inner
+                .runtime_generations
+                .lock()
+                .await
+                .insert(id.clone(), 1);
+            assert!(service.stop_admitted_installation(&row).await.is_err());
+            service.inner.runtime_generations.lock().await.remove(&id);
+            let mut foreign = row.clone();
+            foreign.id = Some("foreign-native-id".into());
+            assert!(service.stop_admitted_installation(&foreign).await.is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     async fn configure_mcp_installation_secret(
@@ -6698,23 +6819,28 @@ mod tests {
             .expect("required MCP installation should persist");
     }
 
-    async fn wait_for_catalog(crud_store: &CrudStore, installation_id: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if crud_store
+    async fn wait_for_live_catalog(
+        service: &McpService,
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        installation_id: &str,
+    ) {
+        // The actor commits the catalog before it publishes Ready.
+        wait_for_runtime_state(
+            service,
+            workspace_id,
+            installation_id,
+            DomainRuntimeState::Ready,
+        )
+        .await;
+        assert!(
+            crud_store
                 .find_mcp_server_catalog_snapshot(installation_id)
                 .await
                 .expect("catalog lookup should succeed")
-                .is_some()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() <= deadline,
-                "test MCP catalog should be persisted"
-            );
-            sleep(Duration::from_millis(25)).await;
-        }
+                .is_some(),
+            "test MCP catalog should be persisted"
+        );
     }
 
     async fn wait_for_runtime_state(
@@ -6793,26 +6919,24 @@ mod tests {
         names
     }
 
-    async fn turn_mcp_invoker_fixture() -> TestTurnMcpInvokerFixture {
-        turn_mcp_invoker_fixture_with_connector(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }))
+    async fn turn_mcp_invoker_fixture(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> TestTurnMcpInvokerFixture {
+        turn_mcp_invoker_fixture_with_connector(
+            db,
+            Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }),
+        )
         .await
     }
 
     async fn turn_mcp_invoker_fixture_with_connector(
+        db: &pioneer_postgres_test::TestDatabase,
         connector: Arc<dyn McpRuntimeConnector>,
     ) -> TestTurnMcpInvokerFixture {
-        // Cancellation can retire a pooled connection. Keep the migrated database
-        // alive independently of that connection so audit assertions see its schema.
-        let database_dir = tempfile::tempdir().expect("test database directory should exist");
-        let database_url = format!(
-            "sqlite://{}?mode=rwc",
-            database_dir.path().join("mcp.db").display()
-        );
-        let (service, crud_store, workspace_id, _) =
-            test_mcp_service_with_database(Arc::new(MemorySecretStore::new()), &database_url).await;
+        let (service, crud_store, workspace_id, _) = test_mcp_service_with_secrets(db).await;
         let thread_id = "T00000000000000000001".to_owned();
         let turn_id = "U00000000000000000001".to_owned();
         seed_started_turn(
@@ -6848,7 +6972,7 @@ mod tests {
             .reload_workspace(workspace_id.as_str())
             .await
             .expect("invoker MCP runtime should start");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
         let projection = service
             .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
                 workspace_id: workspace_id.clone(),
@@ -6893,7 +7017,6 @@ mod tests {
             manifest_hash,
             execution,
             invoker,
-            _database_dir: database_dir,
         }
     }
 
@@ -6908,12 +7031,12 @@ mod tests {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "INSERT OR IGNORE INTO gateway_identity(\
+                    "INSERT INTO gateway_identity(\
                         id,singleton_key,identity_bootstrap_version,auth_schema_version,\
                         created_at,updated_at\
                      ) VALUES(\
                         '{GATEWAY_ID}',1,1,0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-                     );\
+                     ) ON CONFLICT DO NOTHING;\
                      INSERT INTO gateway_principal(\
                         id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                         created_at,updated_at,removed_at\
@@ -6958,11 +7081,11 @@ mod tests {
                      ) VALUES(\
                         '{SESSION_ID}','{GATEWAY_ID}','{PRINCIPAL_ID}','{DEVICE_ID}',\
                         'F0000000000000000000A',NULL,\
-                        X'000000000000000000000000000000000000000000000000000000000000000A',\
-                        X'100000000000000000000000000000000000000000000000000000000000000A',\
-                        0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                        decode('000000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                        decode('100000000000000000000000000000000000000000000000000000000000000A','hex'),\
+                        0,(CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',0,\
                         CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                        datetime('now','+90 days'),NULL,NULL\
+                        (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
                      );\
                      UPDATE turn \
                      SET initiated_by_actor_kind='principal',\
@@ -7069,695 +7192,757 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_projection_empty_workspace_is_a_successful_empty_projection() {
-        let (service, _crud_store, workspace_id) = test_mcp_service().await;
-        let projection = service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id: workspace_id.clone(),
-                turn_id: "turn_empty_projection".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect("empty MCP projection should resolve");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            let projection = service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id: workspace_id.clone(),
+                    turn_id: "turn_empty_projection".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect("empty MCP projection should resolve");
 
-        assert_eq!(projection.workspace_id, workspace_id);
-        assert_eq!(projection.turn_id, "turn_empty_projection");
-        assert!(projection.tools.is_empty());
-        assert!(projection.accepted_capabilities.is_empty());
-        assert!(projection.rejected_capabilities.is_empty());
+            assert_eq!(projection.workspace_id, workspace_id);
+            assert_eq!(projection.turn_id, "turn_empty_projection");
+            assert!(projection.tools.is_empty());
+            assert!(projection.accepted_capabilities.is_empty());
+            assert!(projection.rejected_capabilities.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn api_mcp_parity_after_turn_mcp_persistence_commit() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        let turn_id = "turn_api_mcp_parity";
-        seed_started_turn(
-            &crud_store,
-            workspace_id.as_str(),
-            "thread_api_mcp_parity",
-            turn_id,
-        )
-        .await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            let turn_id = "turn_api_mcp_parity";
+            seed_started_turn(
+                &crud_store,
+                workspace_id.as_str(),
+                "thread_api_mcp_parity",
+                turn_id,
+            )
+            .await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let explicit_tool = tool_ref("mcp-tool:workspace:resend:send", "resend", "send");
-        let projection = service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id: workspace_id.clone(),
-                turn_id: turn_id.to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![explicit_tool.clone()],
-            })
-            .await
-            .expect("MCP projection should resolve");
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id: workspace_id.clone(),
-                turn_id: turn_id.to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![explicit_tool],
-            })
-            .await
-            .expect("native MCP materialization should succeed");
+            let explicit_tool = tool_ref("mcp-tool:workspace:resend:send", "resend", "send");
+            let projection = service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id: workspace_id.clone(),
+                    turn_id: turn_id.to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![explicit_tool.clone()],
+                })
+                .await
+                .expect("MCP projection should resolve");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id: workspace_id.clone(),
+                    turn_id: turn_id.to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![explicit_tool],
+                })
+                .await
+                .expect("native MCP materialization should succeed");
 
-        let persistence = materialization
-            .persistence
-            .clone()
-            .expect("native materialization should carry one persistence request");
-        let persisted = service
-            .persist_mcp_projection(persistence)
-            .await
-            .expect("projection must commit before native provider startup");
-        assert_eq!(persisted.turn_id, turn_id);
-        assert_eq!(persisted.manifest_hash, projection.manifest_hash);
-        assert_eq!(persisted.tool_count, projection.tools.len());
+            let persistence = materialization
+                .persistence
+                .clone()
+                .expect("native materialization should carry one persistence request");
+            let persisted = service
+                .persist_mcp_projection(persistence)
+                .await
+                .expect("projection must commit before native provider startup");
+            assert_eq!(persisted.turn_id, turn_id);
+            assert_eq!(persisted.manifest_hash, projection.manifest_hash);
+            assert_eq!(persisted.tool_count, projection.tools.len());
 
-        let durable_projection = crud_store
-            .get_turn_mcp_projection(turn_id)
-            .await
-            .expect("projection header lookup should succeed")
-            .expect("projection header should be durable");
-        assert_eq!(durable_projection.workspace_id, workspace_id);
-        assert_eq!(durable_projection.manifest_hash, projection.manifest_hash);
-        assert_eq!(durable_projection.tool_count, 1);
-        let durable_bindings = crud_store
-            .list_turn_mcp_bindings(turn_id)
-            .await
-            .expect("projection binding lookup should succeed");
-        assert_eq!(durable_bindings.len(), 1);
-        assert_eq!(
-            durable_bindings[0].canonical_callable_name,
-            projection.tools[0].canonical_callable_name
-        );
-        assert_eq!(
-            durable_bindings[0].provider_callable_name,
-            projection.tools[0].canonical_callable_name
-        );
-        assert_eq!(
-            durable_bindings[0].canonical_schema_fingerprint,
-            projection.tools[0].schema_fingerprint
-        );
-        assert_eq!(
-            durable_bindings[0].provider_schema_fingerprint,
-            projection.tools[0].schema_fingerprint
-        );
+            let durable_projection = crud_store
+                .get_turn_mcp_projection(turn_id)
+                .await
+                .expect("projection header lookup should succeed")
+                .expect("projection header should be durable");
+            assert_eq!(durable_projection.workspace_id, workspace_id);
+            assert_eq!(durable_projection.manifest_hash, projection.manifest_hash);
+            assert_eq!(durable_projection.tool_count, 1);
+            let durable_bindings = crud_store
+                .list_turn_mcp_bindings(turn_id)
+                .await
+                .expect("projection binding lookup should succeed");
+            assert_eq!(durable_bindings.len(), 1);
+            assert_eq!(
+                durable_bindings[0].canonical_callable_name,
+                projection.tools[0].canonical_callable_name
+            );
+            assert_eq!(
+                durable_bindings[0].provider_callable_name,
+                projection.tools[0].canonical_callable_name
+            );
+            assert_eq!(
+                durable_bindings[0].canonical_schema_fingerprint,
+                projection.tools[0].schema_fingerprint
+            );
+            assert_eq!(
+                durable_bindings[0].provider_schema_fingerprint,
+                projection.tools[0].schema_fingerprint
+            );
 
-        assert_eq!(
-            projection
-                .tools
-                .iter()
-                .map(|tool| tool.canonical_callable_name.clone())
-                .collect::<Vec<_>>(),
-            materialized_tool_names(&materialization)
-        );
-        assert_eq!(projection.tools.len(), 1);
-        assert_eq!(
-            projection.tools[0].selection_reason,
-            McpSelectionReason::ExplicitTool
-        );
-        assert_eq!(projection.tools[0].server_installation_id, installation_id);
-        let descriptor = projection.tools[0].as_dynamic_descriptor();
-        let configured = materialization.bundles[0]
-            .specs
-            .first()
-            .expect("native API materialization should expose one configured tool");
-        assert_eq!(configured.spec.name, descriptor.callable_name);
-        assert_eq!(configured.spec.parameters, descriptor.parameters);
-        assert_eq!(
-            descriptor.annotations,
-            projection.tools[0].annotations.clone().unwrap_or_default()
-        );
-        assert_eq!(descriptor.timeout_ms, Some(projection.tools[0].timeout_ms));
-        assert_eq!(
-            configured.payload_binding,
-            pioneer_tools::ToolPayloadBinding::Mcp {
-                server_id: descriptor.server_id.clone(),
-                server_name: descriptor.server_name.clone(),
-                raw_tool_name: descriptor.raw_tool_name.clone(),
-                catalog_version: descriptor.catalog_version.clone(),
-                snapshot_version: descriptor.snapshot_version,
-                read_only_hint: descriptor.annotations.read_only_hint,
-                destructive_hint: descriptor.annotations.destructive_hint,
-                open_world_hint: descriptor.annotations.open_world_hint,
-            }
-        );
-        assert_eq!(materialization.mcp_bindings.len(), 1);
-        assert_eq!(
-            materialization.mcp_bindings[0].callable_name,
-            descriptor.callable_name
-        );
+            assert_eq!(
+                projection
+                    .tools
+                    .iter()
+                    .map(|tool| tool.canonical_callable_name.clone())
+                    .collect::<Vec<_>>(),
+                materialized_tool_names(&materialization)
+            );
+            assert_eq!(projection.tools.len(), 1);
+            assert_eq!(
+                projection.tools[0].selection_reason,
+                McpSelectionReason::ExplicitTool
+            );
+            assert_eq!(projection.tools[0].server_installation_id, installation_id);
+            let descriptor = projection.tools[0].as_dynamic_descriptor();
+            let configured = materialization.bundles[0]
+                .specs
+                .first()
+                .expect("native API materialization should expose one configured tool");
+            assert_eq!(configured.spec.name, descriptor.callable_name);
+            assert_eq!(configured.spec.parameters, descriptor.parameters);
+            assert_eq!(
+                descriptor.annotations,
+                projection.tools[0].annotations.clone().unwrap_or_default()
+            );
+            assert_eq!(descriptor.timeout_ms, Some(projection.tools[0].timeout_ms));
+            assert_eq!(
+                configured.payload_binding,
+                pioneer_tools::ToolPayloadBinding::Mcp {
+                    server_id: descriptor.server_id.clone(),
+                    server_name: descriptor.server_name.clone(),
+                    raw_tool_name: descriptor.raw_tool_name.clone(),
+                    catalog_version: descriptor.catalog_version.clone(),
+                    snapshot_version: descriptor.snapshot_version,
+                    read_only_hint: descriptor.annotations.read_only_hint,
+                    destructive_hint: descriptor.annotations.destructive_hint,
+                    open_world_hint: descriptor.annotations.open_world_hint,
+                }
+            );
+            assert_eq!(materialization.mcp_bindings.len(), 1);
+            assert_eq!(
+                materialization.mcp_bindings[0].callable_name,
+                descriptor.callable_name
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_persistence_fault_rolls_back_coordinator_transaction() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let committed_projection = fixture
-            .crud_store
-            .get_turn_mcp_projection(fixture.turn_id.as_str())
-            .await
-            .expect("committed MCP projection query should succeed")
-            .expect("committed MCP projection should exist");
-        let committed_bindings = fixture
-            .crud_store
-            .list_turn_mcp_bindings(fixture.turn_id.as_str())
-            .await
-            .expect("committed MCP bindings query should succeed");
-
-        let projection = fixture
-            .service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id: fixture.workspace_id.clone(),
-                turn_id: fixture.turn_id.clone(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
-            })
-            .await
-            .expect("replacement MCP projection should resolve");
-        let mut attempted = persistence_request_from_projection(&projection)
-            .expect("replacement MCP persistence request should build");
-        attempted.manifest_hash = "manifest-fault-attempt".to_owned();
-        let mut first = attempted.bindings[0].clone();
-        first.callable_name = "mcp_resend_a".to_owned();
-        first.canonical_callable_name = "mcp_resend_a".to_owned();
-        first.provider_callable_name = "mcp_resend_a".to_owned();
-        let mut failing = attempted.bindings[0].clone();
-        failing.callable_name = "mcp_resend_z".to_owned();
-        failing.canonical_callable_name = "mcp_resend_z".to_owned();
-        failing.provider_callable_name = "mcp_resend_z".to_owned();
-        attempted.bindings = vec![first, failing];
-
-        fixture
-            .crud_store
-            .database_connection()
-            .execute_unprepared(
-                format!(
-                    "CREATE TRIGGER fail_turn_mcp_projection_insert \
-                     BEFORE INSERT ON turn_mcp_binding \
-                     WHEN NEW.turn_id = '{}' AND NEW.canonical_callable_name = 'mcp_resend_z' \
-                     BEGIN SELECT RAISE(ABORT, 'injected turn MCP persistence fault'); END",
-                    fixture.turn_id
-                )
-                .as_str(),
-            )
-            .await
-            .expect("fault-injection trigger should install");
-
-        fixture
-            .service
-            .inner
-            .projection_persistence
-            .persist(&attempted)
-            .await
-            .expect_err("injected binding failure must abort the whole projection transaction");
-
-        assert_eq!(
-            fixture
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let committed_projection = fixture
                 .crud_store
                 .get_turn_mcp_projection(fixture.turn_id.as_str())
                 .await
-                .expect("projection query after fault should succeed"),
-            Some(committed_projection)
-        );
-        assert_eq!(
-            fixture
+                .expect("committed MCP projection query should succeed")
+                .expect("committed MCP projection should exist");
+            let committed_bindings = fixture
                 .crud_store
                 .list_turn_mcp_bindings(fixture.turn_id.as_str())
                 .await
-                .expect("binding query after fault should succeed"),
-            committed_bindings
-        );
+                .expect("committed MCP bindings query should succeed");
+
+            let projection = fixture
+                .service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id: fixture.workspace_id.clone(),
+                    turn_id: fixture.turn_id.clone(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
+                })
+                .await
+                .expect("replacement MCP projection should resolve");
+            let mut attempted = persistence_request_from_projection(&projection)
+                .expect("replacement MCP persistence request should build");
+            attempted.manifest_hash = "manifest-fault-attempt".to_owned();
+            let mut first = attempted.bindings[0].clone();
+            first.callable_name = "mcp_resend_a".to_owned();
+            first.canonical_callable_name = "mcp_resend_a".to_owned();
+            first.provider_callable_name = "mcp_resend_a".to_owned();
+            let mut failing = attempted.bindings[0].clone();
+            failing.callable_name = "mcp_resend_z".to_owned();
+            failing.canonical_callable_name = "mcp_resend_z".to_owned();
+            failing.provider_callable_name = "mcp_resend_z".to_owned();
+            attempted.bindings = vec![first, failing];
+
+            fixture
+                .crud_store
+                .database_connection()
+                .execute_unprepared(
+                    format!(
+                        r#"CREATE FUNCTION fail_turn_mcp_projection_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+                            BEGIN RAISE EXCEPTION 'injected turn MCP persistence fault'; END; $$;
+                            CREATE TRIGGER fail_turn_mcp_projection_insert BEFORE INSERT ON turn_mcp_binding
+                            FOR EACH ROW WHEN (NEW.turn_id = '{}' AND NEW.canonical_callable_name = 'mcp_resend_z')
+                            EXECUTE FUNCTION fail_turn_mcp_projection_insert()"#,
+                        fixture.turn_id
+                    )
+                    .as_str(),
+                )
+                .await
+                .expect("fault-injection trigger should install");
+
+            fixture
+                .service
+                .inner
+                .projection_persistence
+                .persist(&attempted)
+                .await
+                .expect_err("injected binding failure must abort the whole projection transaction");
+
+            assert_eq!(
+                fixture
+                    .crud_store
+                    .get_turn_mcp_projection(fixture.turn_id.as_str())
+                    .await
+                    .expect("projection query after fault should succeed"),
+                Some(committed_projection)
+            );
+            assert_eq!(
+                fixture
+                    .crud_store
+                    .list_turn_mcp_bindings(fixture.turn_id.as_str())
+                    .await
+                    .expect("binding query after fault should succeed"),
+                committed_bindings
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_invoker_binding_exact_match_advances_and_unbound_fails_before_execution() {
-        let fixture = turn_mcp_invoker_fixture().await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
 
-        let output = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("exact frozen binding should advance to execution");
-        assert_eq!(output.content[0]["text"], "validated");
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            let output = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("exact frozen binding should advance to execution");
+            assert_eq!(output.content[0]["text"], "validated");
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
 
-        let mut unknown = native_mcp_invocation(&fixture);
-        unknown.canonical_callable_name = "mcp_resend_unbound".to_owned();
-        let error = fixture
-            .invoker
-            .invoke(unknown, CancellationToken::new())
-            .await
-            .expect_err("unbound callable must fail before execution");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolUnbound);
-        assert_eq!(error.reason_code(), "tool_unbound");
-        assert!(!error.to_string().contains("argument-canary"));
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            let mut unknown = native_mcp_invocation(&fixture);
+            unknown.canonical_callable_name = "mcp_resend_unbound".to_owned();
+            let error = fixture
+                .invoker
+                .invoke(unknown, CancellationToken::new())
+                .await
+                .expect_err("unbound callable must fail before execution");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolUnbound);
+            assert_eq!(error.reason_code(), "tool_unbound");
+            assert!(!error.to_string().contains("argument-canary"));
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
 
-        let mut cross_scope = native_mcp_invocation(&fixture);
-        cross_scope.workspace_id = "workspace-cross-scope".to_owned();
-        let error = fixture
-            .invoker
-            .invoke(cross_scope, CancellationToken::new())
-            .await
-            .expect_err("cross-scope invocation must fail before execution");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ScopeMismatch);
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            let mut cross_scope = native_mcp_invocation(&fixture);
+            cross_scope.workspace_id = "workspace-cross-scope".to_owned();
+            let error = fixture
+                .invoker
+                .invoke(cross_scope, CancellationToken::new())
+                .await
+                .expect_err("cross-scope invocation must fail before execution");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ScopeMismatch);
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_turn_mcp_policy_uses_server_name_and_revalidates_revocation() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        authorize_turn_mcp_fixture_for_member(&fixture).await;
-        let binding = fixture
-            .crud_store
-            .list_turn_mcp_bindings(fixture.turn_id.as_str())
-            .await
-            .expect("Member MCP binding should load")
-            .remove(0);
-        assert_ne!(
-            binding.server_installation_id, binding.server_name,
-            "the regression requires distinct policy and frozen-installation identities"
-        );
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            authorize_turn_mcp_fixture_for_member(&fixture).await;
+            let binding = fixture
+                .crud_store
+                .list_turn_mcp_bindings(fixture.turn_id.as_str())
+                .await
+                .expect("Member MCP binding should load")
+                .remove(0);
+            assert_ne!(
+                binding.server_installation_id, binding.server_name,
+                "the regression requires distinct policy and frozen-installation identities"
+            );
 
-        fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("enabled workspace MCP policy should authorize the Member invocation");
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("enabled workspace MCP policy should authorize the Member invocation");
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
 
-        let mut installation = fixture
-            .crud_store
-            .find_mcp_server_installation(
-                "workspace",
-                fixture.workspace_id.as_str(),
-                binding.server_name.as_str(),
-            )
-            .await
-            .expect("Member MCP installation lookup should succeed")
-            .expect("Member MCP installation should exist");
-        installation.enabled = false;
-        fixture
-            .crud_store
-            .upsert_mcp_server_installation(&installation, 1_700_000_100)
-            .await
-            .expect("MCP policy revocation should persist");
+            let mut installation = fixture
+                .crud_store
+                .find_mcp_server_installation(
+                    "workspace",
+                    fixture.workspace_id.as_str(),
+                    binding.server_name.as_str(),
+                )
+                .await
+                .expect("Member MCP installation lookup should succeed")
+                .expect("Member MCP installation should exist");
+            installation.enabled = false;
+            fixture
+                .crud_store
+                .upsert_mcp_server_installation(&installation, 1_700_000_100)
+                .await
+                .expect("MCP policy revocation should persist");
 
-        let error = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("revoked workspace MCP policy must deny the Member invocation");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::PermissionDenied);
-        assert_eq!(
-            fixture.execution.calls.load(Ordering::SeqCst),
-            1,
-            "revoked MCP policy must fail before tool execution"
-        );
+            let error = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("revoked workspace MCP policy must deny the Member invocation");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::PermissionDenied);
+            assert_eq!(
+                fixture.execution.calls.load(Ordering::SeqCst),
+                1,
+                "revoked MCP policy must fail before tool execution"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_task_child_invokes_the_exact_mcp_projection_through_authorized_root_lineage() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        authorize_turn_mcp_fixture_for_member(&fixture).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            authorize_turn_mcp_fixture_for_member(&fixture).await;
 
-        let child_thread_id = "T00000000000000000002";
-        let child_turn_id = "U00000000000000000002";
-        seed_started_turn(
-            fixture.crud_store.as_ref(),
-            fixture.workspace_id.as_str(),
-            child_thread_id,
-            child_turn_id,
-        )
-        .await;
-        const MEMBER_PRINCIPAL_ID: &str = "P0000000000000000000A";
-        let task_id = "task_turn_mcp_task_child";
-        let run_id = "run_turn_mcp_task_child";
-        let parent_context = fixture
-            .crud_store
-            .get_turn_execution_authorization_context(fixture.turn_id.as_str())
-            .await
-            .expect("parent execution authorization context should load")
-            .expect("parent execution authorization context should exist");
-        fixture
-            .crud_store
-            .database_connection()
-            .execute_unprepared(
-                format!(
-                    "UPDATE thread SET access_class='internal' WHERE id='{child_thread_id}'; \
-                     UPDATE turn SET initiated_by_actor_kind='principal', \
-                     initiated_by_actor_id='{MEMBER_PRINCIPAL_ID}' WHERE id='{child_turn_id}'"
-                )
-                .as_str(),
-            )
-            .await
-            .expect("task child actor provenance should persist");
-        fixture
-            .crud_store
-            .append_task_events_with_execution_admission(
-                vec![
-                    TaskEventPayload::TaskCreated {
-                        task: Task {
-                            id: task_id.to_owned(),
-                            workspace_id: fixture.workspace_id.clone(),
-                            owner_kind: TaskOwnerKind::Thread,
-                            owner_id: Some(fixture.thread_id.clone()),
-                            created_by_thread_id: Some(fixture.thread_id.clone()),
-                            created_by_turn_id: Some(fixture.turn_id.clone()),
-                            root_task_id: Some(task_id.to_owned()),
-                            parent_task_id: None,
-                            executor_kind: TaskExecutorKind::Agent,
-                            status: TaskStatus::Running,
-                            title: "MCP child authority fixture".to_owned(),
-                            goal: "Prove exact inherited MCP projection".to_owned(),
-                            priority: 0,
-                            lifecycle_policy: None,
-                            delivery_policy: None,
-                            retry_policy: None,
-                            timeout_policy: None,
-                            concurrency_policy: None,
-                            metadata: None,
-                            result: None,
-                            error: None,
-                            revision: 1,
-                            created_at: 1_700_000_001,
-                            updated_at: 1_700_000_001,
-                            completed_at: None,
-                        },
-                    },
-                    TaskEventPayload::RunCreated {
-                        run: TaskRun {
-                            trigger_input: None,
-                            id: run_id.to_owned(),
-                            task_id: task_id.to_owned(),
-                            trigger_id: None,
-                            parent_run_id: None,
-                            run_group_id: "run_group_turn_mcp_task_child".to_owned(),
-                            attempt_number: 1,
-                            retry_of_run_id: None,
-                            ready_at: Some(1_700_000_001),
-                            run_number: 1,
-                            status: TaskRunStatus::Running,
-                            executor_kind: TaskExecutorKind::Agent,
-                            started_at: Some(1_700_000_001),
-                            completed_at: None,
-                            heartbeat_at: None,
-                            locked_by: None,
-                            lock_expires_at: None,
-                            result: None,
-                            error: None,
-                            created_at: 1_700_000_001,
-                            updated_at: 1_700_000_001,
-                        },
-                        agent_spec: None,
-                    },
-                    TaskEventPayload::ChildThreadLinked {
-                        lineage: ThreadLineage {
-                            child_thread_id: child_thread_id.to_owned(),
-                            child_turn_id: child_turn_id.to_owned(),
-                            parent_thread_id: fixture.thread_id.clone(),
-                            parent_turn_id: Some(fixture.turn_id.clone()),
-                            task_id: task_id.to_owned(),
-                            task_run_id: run_id.to_owned(),
-                            root_thread_id: fixture.thread_id.clone(),
-                            depth: 1,
-                            created_at: 1_700_000_001,
-                        },
-                    },
-                ],
-                1_700_000_001,
-                NewTaskExecutionAdmission {
-                    task_id: task_id.to_owned(),
-                    workspace_id: fixture.workspace_id.clone(),
-                    root_thread_id: fixture.thread_id.clone(),
-                    initiating_principal_id: MEMBER_PRINCIPAL_ID.to_owned(),
-                    authorization_context_json: parent_context.clone(),
-                    created_at: chrono::Utc::now().fixed_offset(),
-                    execution_lease: None,
-                },
-            )
-            .await
-            .expect("task child lineage should persist");
-        fixture
-            .crud_store
-            .set_turn_execution_authorization_context(child_turn_id, parent_context.as_str())
-            .await
-            .expect("task child execution authorization context should persist");
-
-        let child_projection = fixture
-            .service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id: fixture.workspace_id.clone(),
-                turn_id: child_turn_id.to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
-            })
-            .await
-            .expect("task child MCP projection should resolve");
-        assert_eq!(
-            child_projection.manifest_hash, fixture.manifest_hash,
-            "the child must inherit the exact immutable MCP capability projection"
-        );
-        fixture
-            .service
-            .persist_resolved_mcp_turn_projection(&child_projection)
-            .await
-            .expect("task child MCP projection should persist");
-        fixture
-            .crud_store
-            .set_turn_execution_security_snapshot(
+            let child_thread_id = "T00000000000000000002";
+            let child_turn_id = "U00000000000000000002";
+            seed_started_turn(
+                fixture.crud_store.as_ref(),
+                fixture.workspace_id.as_str(),
+                child_thread_id,
                 child_turn_id,
-                &TurnExecutionSecuritySnapshot::unrestricted_full_access(
-                    std::env::temp_dir().display().to_string(),
-                    1_700_000_000_002,
-                ),
             )
-            .await
-            .expect("task child security snapshot should persist");
-        let mut invocation = native_mcp_invocation(&fixture);
-        invocation.thread_id = child_thread_id.to_owned();
-        invocation.turn_id = child_turn_id.to_owned();
-        fixture
-            .invoker
-            .invoke(invocation, CancellationToken::new())
-            .await
-            .expect("authorized task child should invoke its exact frozen MCP projection");
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            .await;
+            const MEMBER_PRINCIPAL_ID: &str = "P0000000000000000000A";
+            let task_id = "task_turn_mcp_task_child";
+            let run_id = "run_turn_mcp_task_child";
+            let parent_context = fixture
+                .crud_store
+                .get_turn_execution_authorization_context(fixture.turn_id.as_str())
+                .await
+                .expect("parent execution authorization context should load")
+                .expect("parent execution authorization context should exist");
+            fixture
+                .crud_store
+                .database_connection()
+                .execute_unprepared(
+                    format!(
+                        "UPDATE thread SET access_class='internal' WHERE id='{child_thread_id}'; \
+                         UPDATE turn SET initiated_by_actor_kind='principal', \
+                         initiated_by_actor_id='{MEMBER_PRINCIPAL_ID}' WHERE id='{child_turn_id}'"
+                    )
+                    .as_str(),
+                )
+                .await
+                .expect("task child actor provenance should persist");
+            fixture
+                .crud_store
+                .append_task_events_with_execution_admission(
+                    vec![
+                        TaskEventPayload::TaskCreated {
+                            task: Task {
+                                id: task_id.to_owned(),
+                                workspace_id: fixture.workspace_id.clone(),
+                                owner_kind: TaskOwnerKind::Thread,
+                                owner_id: Some(fixture.thread_id.clone()),
+                                created_by_thread_id: Some(fixture.thread_id.clone()),
+                                created_by_turn_id: Some(fixture.turn_id.clone()),
+                                root_task_id: Some(task_id.to_owned()),
+                                parent_task_id: None,
+                                executor_kind: TaskExecutorKind::Agent,
+                                status: TaskStatus::Running,
+                                title: "MCP child authority fixture".to_owned(),
+                                goal: "Prove exact inherited MCP projection".to_owned(),
+                                priority: 0,
+                                lifecycle_policy: None,
+                                delivery_policy: None,
+                                retry_policy: None,
+                                timeout_policy: None,
+                                concurrency_policy: None,
+                                metadata: None,
+                                result: None,
+                                error: None,
+                                revision: 1,
+                                created_at: 1_700_000_001,
+                                updated_at: 1_700_000_001,
+                                completed_at: None,
+                            },
+                        },
+                        TaskEventPayload::RunCreated {
+                            run: TaskRun {
+                                trigger_input: None,
+                                id: run_id.to_owned(),
+                                task_id: task_id.to_owned(),
+                                trigger_id: None,
+                                parent_run_id: None,
+                                run_group_id: "run_group_turn_mcp_task_child".to_owned(),
+                                attempt_number: 1,
+                                retry_of_run_id: None,
+                                ready_at: Some(1_700_000_001),
+                                run_number: 1,
+                                status: TaskRunStatus::Running,
+                                executor_kind: TaskExecutorKind::Agent,
+                                started_at: Some(1_700_000_001),
+                                completed_at: None,
+                                heartbeat_at: None,
+                                locked_by: None,
+                                lock_expires_at: None,
+                                result: None,
+                                error: None,
+                                created_at: 1_700_000_001,
+                                updated_at: 1_700_000_001,
+                            },
+                            agent_spec: None,
+                        },
+                        TaskEventPayload::ChildThreadLinked {
+                            lineage: ThreadLineage {
+                                child_thread_id: child_thread_id.to_owned(),
+                                child_turn_id: child_turn_id.to_owned(),
+                                parent_thread_id: fixture.thread_id.clone(),
+                                parent_turn_id: Some(fixture.turn_id.clone()),
+                                task_id: task_id.to_owned(),
+                                task_run_id: run_id.to_owned(),
+                                root_thread_id: fixture.thread_id.clone(),
+                                depth: 1,
+                                created_at: 1_700_000_001,
+                            },
+                        },
+                    ],
+                    1_700_000_001,
+                    NewTaskExecutionAdmission {
+                        task_id: task_id.to_owned(),
+                        workspace_id: fixture.workspace_id.clone(),
+                        root_thread_id: fixture.thread_id.clone(),
+                        initiating_principal_id: MEMBER_PRINCIPAL_ID.to_owned(),
+                        authorization_context_json: parent_context.clone(),
+                        created_at: chrono::Utc::now().fixed_offset(),
+                        execution_lease: None,
+                    },
+                )
+                .await
+                .expect("task child lineage should persist");
+            fixture
+                .crud_store
+                .set_turn_execution_authorization_context(child_turn_id, parent_context.as_str())
+                .await
+                .expect("task child execution authorization context should persist");
+
+            let child_projection = fixture
+                .service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id: fixture.workspace_id.clone(),
+                    turn_id: child_turn_id.to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![tool_ref(
+                        "mcp-tool:workspace:resend:send",
+                        "resend",
+                        "send",
+                    )],
+                })
+                .await
+                .expect("task child MCP projection should resolve");
+            assert_eq!(
+                child_projection.manifest_hash, fixture.manifest_hash,
+                "the child must inherit the exact immutable MCP capability projection"
+            );
+            fixture
+                .service
+                .persist_resolved_mcp_turn_projection(&child_projection)
+                .await
+                .expect("task child MCP projection should persist");
+            fixture
+                .crud_store
+                .set_turn_execution_security_snapshot(
+                    child_turn_id,
+                    &TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                        std::env::temp_dir().display().to_string(),
+                        1_700_000_000_002,
+                    ),
+                )
+                .await
+                .expect("task child security snapshot should persist");
+            let mut invocation = native_mcp_invocation(&fixture);
+            invocation.thread_id = child_thread_id.to_owned();
+            invocation.turn_id = child_turn_id.to_owned();
+            fixture
+                .invoker
+                .invoke(invocation, CancellationToken::new())
+                .await
+                .expect("authorized task child should invoke its exact frozen MCP projection");
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_invoker_rejects_projection_not_bound_to_execution_context() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let context = json!({
-            "version": 3,
-            "initiating_principal_id": "P0000000000000000000A",
-            "initiating_session_id": "S0000000000000000000A",
-            "workspace_id": fixture.workspace_id.as_str(),
-            "root_thread_id": fixture.thread_id.as_str(),
-            "policy_revision": 1,
-            "role_key": "member",
-            "policy_fingerprint": crate::authorization::RoleDefinitionRegistry::new()
-                .policy_fingerprint(),
-            "capability_projection_fingerprint": "a".repeat(64),
-            "permission_profile_cap": pioneer_protocol::task_permission_cap_for_mode(
-                TurnPermissionMode::Supervised,
-            ),
-            "grant_manifest": {
-                "version": 1,
-                "entry_point": "interactive_turn",
-                "operational_projection_fingerprint": "c".repeat(64),
-                "actions": ["agent_turn_start", "mcp_use", "provider_use"],
-                "provider": {
-                    "provider": "test-provider",
-                    "model": "test-model",
-                    "authority_fingerprint": "d".repeat(64),
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let context = json!({
+                "version": 3,
+                "initiating_principal_id": "P0000000000000000000A",
+                "initiating_session_id": "S0000000000000000000A",
+                "workspace_id": fixture.workspace_id.as_str(),
+                "root_thread_id": fixture.thread_id.as_str(),
+                "policy_revision": 1,
+                "role_key": "member",
+                "policy_fingerprint": crate::authorization::RoleDefinitionRegistry::new()
+                    .policy_fingerprint(),
+                "capability_projection_fingerprint": "a".repeat(64),
+                "permission_profile_cap": pioneer_protocol::task_permission_cap_for_mode(
+                    TurnPermissionMode::Supervised,
+                ),
+                "grant_manifest": {
+                    "version": 1,
+                    "entry_point": "interactive_turn",
+                    "operational_projection_fingerprint": "c".repeat(64),
+                    "actions": ["agent_turn_start", "mcp_use", "provider_use"],
+                    "provider": {
+                        "provider": "test-provider",
+                        "model": "test-model",
+                        "authority_fingerprint": "d".repeat(64),
+                    },
                 },
-            },
-            "mcp_projection": {
-                "version": MCP_TURN_PROJECTION_VERSION,
-                "manifest_hash": "b".repeat(64),
-            },
-        })
-        .to_string();
-        fixture
-            .crud_store
-            .set_turn_execution_authorization_context(fixture.turn_id.as_str(), context.as_str())
-            .await
-            .expect("spoofed execution projection should persist for the negative test");
+                "mcp_projection": {
+                    "version": MCP_TURN_PROJECTION_VERSION,
+                    "manifest_hash": "b".repeat(64),
+                },
+            })
+            .to_string();
+            fixture
+                .crud_store
+                .set_turn_execution_authorization_context(
+                    fixture.turn_id.as_str(),
+                    context.as_str(),
+                )
+                .await
+                .expect("spoofed execution projection should persist for the negative test");
 
-        let error = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("projection not bound to execution must fail before execution");
-        assert_eq!(
-            error.code,
-            TurnMcpInvocationErrorCode::ProjectionUnavailable
-        );
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            let error = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("projection not bound to execution must fail before execution");
+            assert_eq!(
+                error.code,
+                TurnMcpInvocationErrorCode::ProjectionUnavailable
+            );
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inactive_turn_mcp_invocation_fails_before_execution() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        fixture
-            .crud_store
-            .update_turn_status(
-                fixture.thread_id.as_str(),
-                fixture.turn_id.as_str(),
-                TurnStatus::Completed,
-                None,
-                1_700_000_100,
-            )
-            .await
-            .expect("test turn status should update");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            fixture
+                .crud_store
+                .update_turn_status(
+                    fixture.thread_id.as_str(),
+                    fixture.turn_id.as_str(),
+                    TurnStatus::Completed,
+                    None,
+                    1_700_000_100,
+                )
+                .await
+                .expect("test turn status should update");
 
-        let error = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("terminal turn must fail before execution");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::TurnNotActive);
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            let error = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("terminal turn must fail before execution");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::TurnNotActive);
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_drift_schema_change_fails_before_execution() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let binding = fixture
-            .crud_store
-            .list_turn_mcp_bindings(fixture.turn_id.as_str())
-            .await
-            .expect("binding lookup should succeed")
-            .remove(0);
-        let mut catalog = fixture
-            .crud_store
-            .find_mcp_server_catalog_snapshot(binding.server_installation_id.as_str())
-            .await
-            .expect("catalog lookup should succeed")
-            .expect("catalog should exist");
-        catalog.tools_json = json!([{
-            "name": "send",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"changed": {"type": "boolean"}}
-            }
-        }])
-        .to_string();
-        fixture
-            .crud_store
-            .upsert_mcp_server_catalog_snapshot(&catalog, 1_700_000_100)
-            .await
-            .expect("drifted catalog should persist");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let binding = fixture
+                .crud_store
+                .list_turn_mcp_bindings(fixture.turn_id.as_str())
+                .await
+                .expect("binding lookup should succeed")
+                .remove(0);
+            let mut catalog = fixture
+                .crud_store
+                .find_mcp_server_catalog_snapshot(binding.server_installation_id.as_str())
+                .await
+                .expect("catalog lookup should succeed")
+                .expect("catalog should exist");
+            catalog.tools_json = json!([{
+                "name": "send",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"changed": {"type": "boolean"}}
+                }
+            }])
+            .to_string();
+            fixture
+                .crud_store
+                .upsert_mcp_server_catalog_snapshot(&catalog, 1_700_000_100)
+                .await
+                .expect("drifted catalog should persist");
 
-        let error = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("schema drift must fail before execution");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolDrift);
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            let error = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("schema drift must fail before execution");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolDrift);
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_drift_runtime_generation_change_fails_before_execution() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        fixture
-            .service
-            .restart_server("workspace", fixture.workspace_id.as_str(), "resend")
-            .await
-            .expect("runtime restart should succeed")
-            .expect("runtime installation should exist");
-        let binding = fixture
-            .crud_store
-            .list_turn_mcp_bindings(fixture.turn_id.as_str())
-            .await
-            .expect("binding lookup should succeed")
-            .remove(0);
-        wait_for_runtime_state(
-            &fixture.service,
-            fixture.workspace_id.as_str(),
-            binding.server_installation_id.as_str(),
-            DomainRuntimeState::Ready,
-        )
-        .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            fixture
+                .service
+                .restart_server("workspace", fixture.workspace_id.as_str(), "resend")
+                .await
+                .expect("runtime restart should succeed")
+                .expect("runtime installation should exist");
+            let binding = fixture
+                .crud_store
+                .list_turn_mcp_bindings(fixture.turn_id.as_str())
+                .await
+                .expect("binding lookup should succeed")
+                .remove(0);
+            wait_for_runtime_state(
+                &fixture.service,
+                fixture.workspace_id.as_str(),
+                binding.server_installation_id.as_str(),
+                DomainRuntimeState::Ready,
+            )
+            .await;
 
-        let error = fixture
-            .invoker
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("runtime generation drift must fail before execution");
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolDrift);
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            let error = fixture
+                .invoker
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("runtime generation drift must fail before execution");
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::ToolDrift);
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_invoker_binding_rejects_stale_cli_session_generation() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let now = chrono::Utc::now().fixed_offset();
-        fixture
-            .crud_store
-            .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
-                turn_id: fixture.turn_id.clone(),
-                thread_id: fixture.thread_id.clone(),
-                continuation_thread_id: fixture.thread_id.clone(),
-                workspace_id: fixture.workspace_id.clone(),
-                runtime_id: "runtime-codex".to_owned(),
-                runtime_kind: "codex".to_owned(),
-                native_thread_id: "native-thread".to_owned(),
-                native_turn_id: Some("native-turn".to_owned()),
-                request_id: Some("request-id".to_owned()),
-                status: "running".to_owned(),
-                model: None,
-                cwd: None,
-                sandbox_json: None,
-                approval_policy: None,
-                input_mapping_json: "{}".to_owned(),
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .expect("CLI turn binding should persist");
-        fixture
-            .crud_store
-            .set_cli_runtime_turn_mcp_metadata(
-                fixture.turn_id.as_str(),
-                Some(CliRuntimeTurnMcpMetadata {
-                    adapter_kind: "codex_dynamic_tools".to_owned(),
-                    manifest_hash: fixture.manifest_hash.clone(),
-                    projection_fingerprint: "projection-fingerprint".to_owned(),
-                    provider_contract_fingerprint: "provider-fingerprint".to_owned(),
-                    isolation_contract_fingerprint: "isolation-fingerprint".to_owned(),
-                    session_generation: 2,
-                    projection_activation_generation: 0,
-                }),
-            )
-            .await
-            .expect("CLI MCP metadata should persist");
-        let mut invocation = native_mcp_invocation(&fixture);
-        invocation.origin = TurnMcpInvocationOrigin::CliFacade;
-        invocation.runtime_id = Some("runtime-codex".to_owned());
-        invocation.session_generation = Some(1);
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let now = chrono::Utc::now().fixed_offset();
+            fixture
+                .crud_store
+                .upsert_cli_runtime_turn_binding(NewCliRuntimeTurnBinding {
+                    turn_id: fixture.turn_id.clone(),
+                    thread_id: fixture.thread_id.clone(),
+                    continuation_thread_id: fixture.thread_id.clone(),
+                    workspace_id: fixture.workspace_id.clone(),
+                    runtime_id: "runtime-codex".to_owned(),
+                    runtime_kind: "codex".to_owned(),
+                    native_thread_id: "native-thread".to_owned(),
+                    native_turn_id: Some("native-turn".to_owned()),
+                    request_id: Some("request-id".to_owned()),
+                    status: "running".to_owned(),
+                    model: None,
+                    cwd: None,
+                    sandbox_json: None,
+                    approval_policy: None,
+                    input_mapping_json: "{}".to_owned(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .expect("CLI turn binding should persist");
+            fixture
+                .crud_store
+                .set_cli_runtime_turn_mcp_metadata(
+                    fixture.turn_id.as_str(),
+                    Some(CliRuntimeTurnMcpMetadata {
+                        adapter_kind: "codex_dynamic_tools".to_owned(),
+                        manifest_hash: fixture.manifest_hash.clone(),
+                        projection_fingerprint: "projection-fingerprint".to_owned(),
+                        provider_contract_fingerprint: "provider-fingerprint".to_owned(),
+                        isolation_contract_fingerprint: "isolation-fingerprint".to_owned(),
+                        session_generation: 2,
+                        projection_activation_generation: 0,
+                    }),
+                )
+                .await
+                .expect("CLI MCP metadata should persist");
+            let mut invocation = native_mcp_invocation(&fixture);
+            invocation.origin = TurnMcpInvocationOrigin::CliFacade;
+            invocation.runtime_id = Some("runtime-codex".to_owned());
+            invocation.session_generation = Some(1);
 
-        let error = fixture
-            .invoker
-            .invoke(invocation, CancellationToken::new())
-            .await
-            .expect_err("stale CLI session generation must fail before execution");
-        assert_eq!(
-            error.code,
-            TurnMcpInvocationErrorCode::SessionGenerationStale
-        );
-        assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            let error = fixture
+                .invoker
+                .invoke(invocation, CancellationToken::new())
+                .await
+                .expect_err("stale CLI session generation must fail before execution");
+            assert_eq!(
+                error.code,
+                TurnMcpInvocationErrorCode::SessionGenerationStale
+            );
+            assert_eq!(fixture.execution.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -7808,616 +7993,708 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn api_mcp_execution_parity_preserves_canonical_rich_result() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let api_materialization = fixture
-            .service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id: fixture.workspace_id.clone(),
-                turn_id: fixture.turn_id.clone(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
-            })
-            .await
-            .expect("native API MCP materialization should succeed");
-        let security = fixture
-            .crud_store
-            .get_turn_execution_security_snapshot(fixture.turn_id.as_str())
-            .await
-            .expect("native API security snapshot should load")
-            .expect("native API security snapshot should exist")
-            .snapshot;
-        let api_tools = pioneer_tools::build_tools_with_environment_and_security_snapshot(
-            std::path::PathBuf::from(security.sandbox.cwd.clone()),
-            fixture.turn_id.clone(),
-            pioneer_tools::PermissionEvaluationContext::for_turn(
-                fixture.workspace_id.clone(),
-                fixture.thread_id.clone(),
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let api_materialization = fixture
+                .service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id: fixture.workspace_id.clone(),
+                    turn_id: fixture.turn_id.clone(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![tool_ref(
+                        "mcp-tool:workspace:resend:send",
+                        "resend",
+                        "send",
+                    )],
+                })
+                .await
+                .expect("native API MCP materialization should succeed");
+            let security = fixture
+                .crud_store
+                .get_turn_execution_security_snapshot(fixture.turn_id.as_str())
+                .await
+                .expect("native API security snapshot should load")
+                .expect("native API security snapshot should exist")
+                .snapshot;
+            let api_tools = pioneer_tools::build_tools_with_environment_and_security_snapshot(
+                std::path::PathBuf::from(security.sandbox.cwd.clone()),
                 fixture.turn_id.clone(),
-                security.permission_profile.clone(),
-            ),
-            pioneer_tools::WebToolsConfig::default(),
-            pioneer_tools::ComputerUseToolsConfig::default(),
-            api_materialization.bundles,
-            BTreeMap::new(),
-            Some(security),
-        )
-        .expect("native API shared tool runtime should build");
-        let api_call = api_tools
-            .router
-            .build_tool_call(pioneer_tools::RawToolCall {
-                call_id: "provider-call-api-reference".to_owned(),
-                tool_name: fixture.callable_name.clone(),
-                arguments: json!({"secret": "argument-canary-must-not-enter-errors"}).to_string(),
-            })
-            .expect("native API MCP call should build");
-        let api_result = api_tools
-            .runtime
-            .execute_tool_call_with_cancellation(api_call, CancellationToken::new())
-            .await
-            .expect("native API MCP call should execute");
-        let api_projection = api_result
-            .projection()
-            .expect("native API MCP result should have a typed projection")
-            .llm_payload();
-        let api_output = canonical_result_from_tool_output(&api_projection)
-            .expect("native API MCP result should have the canonical shape");
+                pioneer_tools::PermissionEvaluationContext::for_turn(
+                    fixture.workspace_id.clone(),
+                    fixture.thread_id.clone(),
+                    fixture.turn_id.clone(),
+                    security.permission_profile.clone(),
+                ),
+                pioneer_tools::WebToolsConfig::default(),
+                pioneer_tools::ComputerUseToolsConfig::default(),
+                api_materialization.bundles,
+                BTreeMap::new(),
+                Some(security),
+            )
+            .expect("native API shared tool runtime should build");
+            let api_call = api_tools
+                .router
+                .build_tool_call(pioneer_tools::RawToolCall {
+                    call_id: "provider-call-api-reference".to_owned(),
+                    tool_name: fixture.callable_name.clone(),
+                    arguments: json!({"secret": "argument-canary-must-not-enter-errors"})
+                        .to_string(),
+                })
+                .expect("native API MCP call should build");
+            let api_result = api_tools
+                .runtime
+                .execute_tool_call_with_cancellation(api_call, CancellationToken::new())
+                .await
+                .expect("native API MCP call should execute");
+            let api_projection = api_result
+                .projection()
+                .expect("native API MCP result should have a typed projection")
+                .llm_payload();
+            let api_output = canonical_result_from_tool_output(&api_projection)
+                .expect("native API MCP result should have the canonical shape");
 
-        let output = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("shared invoker should execute through the native MCP tool machinery");
+            let output = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("shared invoker should execute through the native MCP tool machinery");
 
-        assert_eq!(
-            output, api_output,
-            "native API projected MCP output: {api_projection}"
-        );
-        assert_eq!(
-            output.content,
-            json!([{"type":"text","text":"called send"}])
-        );
-        assert_eq!(
-            output.structured_content,
-            Some(json!({
-                "tool": "send",
-                "arguments": {"secret": "argument-canary-must-not-enter-errors"},
-            }))
-        );
-        assert!(!output.is_error);
-        assert_eq!(output.duration_ms, 1);
-        let output_meta = output
-            .meta
-            .as_ref()
-            .expect("canonical MCP result should preserve safe Gateway metadata");
-        assert_eq!(output_meta["pioneer"]["runtime_state"], "ready");
-        assert_eq!(output_meta["pioneer"]["catalog_drift"], false);
-        assert!(
-            output_meta["pioneer"]["current_catalog_version"]
-                .as_str()
-                .is_some_and(|version| version.starts_with("sha256:"))
-        );
+            assert_eq!(
+                output, api_output,
+                "native API projected MCP output: {api_projection}"
+            );
+            assert_eq!(
+                output.content,
+                json!([{"type":"text","text":"called send"}])
+            );
+            assert_eq!(
+                output.structured_content,
+                Some(json!({
+                    "tool": "send",
+                    "arguments": {"secret": "argument-canary-must-not-enter-errors"},
+                }))
+            );
+            assert!(!output.is_error);
+            assert_eq!(output.duration_ms, 1);
+            let output_meta = output
+                .meta
+                .as_ref()
+                .expect("canonical MCP result should preserve safe Gateway metadata");
+            assert_eq!(output_meta["pioneer"]["runtime_state"], "ready");
+            assert_eq!(output_meta["pioneer"]["catalog_drift"], false);
+            assert!(
+                output_meta["pioneer"]["current_catalog_version"]
+                    .as_str()
+                    .is_some_and(|version| version.starts_with("sha256:"))
+            );
 
-        let audits = fixture
-            .crud_store
-            .list_recent_mcp_audit_event_records("resend", 10)
-            .await
-            .expect("MCP invocation audit should be readable");
-        let outcome = audits
-            .iter()
-            .find(|audit| audit.action == "turn_mcp_invocation_outcome")
-            .expect("shared invoker should write one correlation outcome");
-        let details: JsonValue = serde_json::from_str(outcome.details_json.as_str())
-            .expect("MCP invocation audit details should be valid JSON");
-        assert_eq!(details["provider_call_id"], "provider-call-test");
-        assert_eq!(details["origin"], "native_api");
-        assert_eq!(details["manifest_hash"], fixture.manifest_hash);
-        assert!(!outcome.details_json.contains("argument-canary"));
-        assert_eq!(
-            audits
+            let audits = fixture
+                .crud_store
+                .list_recent_mcp_audit_event_records("resend", 10)
+                .await
+                .expect("MCP invocation audit should be readable");
+            let outcome = audits
                 .iter()
-                .filter(|audit| audit.action == "turn_mcp_invocation_outcome")
-                .count(),
-            1
-        );
+                .find(|audit| audit.action == "turn_mcp_invocation_outcome")
+                .expect("shared invoker should write one correlation outcome");
+            let details: JsonValue = serde_json::from_str(outcome.details_json.as_str())
+                .expect("MCP invocation audit details should be valid JSON");
+            assert_eq!(details["provider_call_id"], "provider-call-test");
+            assert_eq!(details["origin"], "native_api");
+            assert_eq!(details["manifest_hash"], fixture.manifest_hash);
+            assert!(!outcome.details_json.contains("argument-canary"));
+            assert_eq!(
+                audits
+                    .iter()
+                    .filter(|audit| audit.action == "turn_mcp_invocation_outcome")
+                    .count(),
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_permission_ask_uses_exactly_one_shared_mcp_approval() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
-        let broker = Arc::new(CountingPermissionApprovalBroker::new(
-            pioneer_tools::PermissionApprovalResolution::AllowOnce,
-        ));
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
+            let broker = Arc::new(CountingPermissionApprovalBroker::new(
+                pioneer_tools::PermissionApprovalResolution::AllowOnce,
+            ));
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let output = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("approved MCP invocation should execute");
+            let output = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("approved MCP invocation should execute");
 
-        assert!(!output.is_error);
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            assert!(!output.is_error);
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_permission_user_deny_returns_canonical_error_without_second_approval() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
-        let broker = Arc::new(CountingPermissionApprovalBroker::new(
-            pioneer_tools::PermissionApprovalResolution::Deny {
-                message: "denied by test user".to_owned(),
-            },
-        ));
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
+            let broker = Arc::new(CountingPermissionApprovalBroker::new(
+                pioneer_tools::PermissionApprovalResolution::Deny {
+                    message: "denied by test user".to_owned(),
+                },
+            ));
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let output = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("permission denial should be a canonical MCP tool result");
+            let output = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("permission denial should be a canonical MCP tool result");
 
-        assert!(output.is_error);
-        assert_eq!(output.content[0]["text"], "denied by test user");
-        assert_eq!(
-            output.meta.as_ref().and_then(|meta| meta
-                .pointer("/pioneer/reasonCode")
-                .and_then(JsonValue::as_str)),
-            Some("permission_denied")
-        );
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            assert!(output.is_error);
+            assert_eq!(output.content[0]["text"], "denied by test user");
+            assert_eq!(
+                output.meta.as_ref().and_then(|meta| meta
+                    .pointer("/pioneer/reasonCode")
+                    .and_then(JsonValue::as_str)),
+                Some("permission_denied")
+            );
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_permission_approval_cancel_is_typed_and_stops_execution() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
-        let broker = Arc::new(CountingPermissionApprovalBroker::new(
-            pioneer_tools::PermissionApprovalResolution::Cancelled,
-        ));
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
+            let broker = Arc::new(CountingPermissionApprovalBroker::new(
+                pioneer_tools::PermissionApprovalResolution::Cancelled,
+            ));
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let error = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("cancelled approval must stop MCP execution");
+            let error = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("cancelled approval must stop MCP execution");
 
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_permission_policy_deny_bypasses_approval_and_upstream() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let mut snapshot =
-            set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
-        snapshot
-            .permission_profile
-            .effective_policy
-            .mcp_write_or_unknown = PermissionBehavior::Deny;
-        fixture
-            .crud_store
-            .set_turn_execution_security_snapshot(fixture.turn_id.as_str(), &snapshot)
-            .await
-            .expect("denying MCP security snapshot should persist");
-        let broker = Arc::new(CountingPermissionApprovalBroker::new(
-            pioneer_tools::PermissionApprovalResolution::AllowOnce,
-        ));
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let mut snapshot =
+                set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
+            snapshot
+                .permission_profile
+                .effective_policy
+                .mcp_write_or_unknown = PermissionBehavior::Deny;
+            fixture
+                .crud_store
+                .set_turn_execution_security_snapshot(fixture.turn_id.as_str(), &snapshot)
+                .await
+                .expect("denying MCP security snapshot should persist");
+            let broker = Arc::new(CountingPermissionApprovalBroker::new(
+                pioneer_tools::PermissionApprovalResolution::AllowOnce,
+            ));
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let output = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("policy denial should be a canonical MCP tool result");
+            let output = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("policy denial should be a canonical MCP tool result");
 
-        assert!(output.is_error);
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+            assert!(output.is_error);
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_permission_network_policy_denies_before_upstream() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        let mut snapshot =
-            set_invoker_permission_mode(&fixture, TurnPermissionMode::FullAccess).await;
-        snapshot.network = TurnNetworkPolicySnapshot::disabled();
-        snapshot.sandbox.network = TurnNetworkPolicySnapshot::disabled();
-        snapshot.authority_cap.network = TurnNetworkPolicySnapshot::disabled();
-        fixture
-            .crud_store
-            .set_turn_execution_security_snapshot(fixture.turn_id.as_str(), &snapshot)
-            .await
-            .expect("network-denying MCP security snapshot should persist");
-        let persisted = fixture
-            .crud_store
-            .get_turn_execution_security_snapshot(fixture.turn_id.as_str())
-            .await
-            .expect("network-denying MCP security snapshot should be readable")
-            .expect("network-denying MCP security snapshot should exist");
-        assert_eq!(
-            persisted.snapshot.network.mode,
-            pioneer_protocol::TurnNetworkMode::Disabled
-        );
-        let broker = Arc::new(CountingPermissionApprovalBroker::new(
-            pioneer_tools::PermissionApprovalResolution::AllowOnce,
-        ));
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            let mut snapshot =
+                set_invoker_permission_mode(&fixture, TurnPermissionMode::FullAccess).await;
+            snapshot.network = TurnNetworkPolicySnapshot::disabled();
+            snapshot.sandbox.network = TurnNetworkPolicySnapshot::disabled();
+            snapshot.authority_cap.network = TurnNetworkPolicySnapshot::disabled();
+            fixture
+                .crud_store
+                .set_turn_execution_security_snapshot(fixture.turn_id.as_str(), &snapshot)
+                .await
+                .expect("network-denying MCP security snapshot should persist");
+            let persisted = fixture
+                .crud_store
+                .get_turn_execution_security_snapshot(fixture.turn_id.as_str())
+                .await
+                .expect("network-denying MCP security snapshot should be readable")
+                .expect("network-denying MCP security snapshot should exist");
+            assert_eq!(
+                persisted.snapshot.network.mode,
+                pioneer_protocol::TurnNetworkMode::Disabled
+            );
+            let broker = Arc::new(CountingPermissionApprovalBroker::new(
+                pioneer_tools::PermissionApprovalResolution::AllowOnce,
+            ));
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let output = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect("network denial should be a canonical MCP tool result");
+            let output = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect("network denial should be a canonical MCP tool result");
 
-        assert!(output.is_error, "unexpected MCP output: {output:?}");
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+            assert!(output.is_error, "unexpected MCP output: {output:?}");
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_while_approval_is_pending_stops_before_upstream() {
-        let fixture = turn_mcp_invoker_fixture().await;
-        set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
-        let broker = Arc::new(BlockingPermissionApprovalBroker::default());
-        fixture
-            .service
-            .set_permission_approval_broker(broker.clone())
-            .await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let fixture = turn_mcp_invoker_fixture(db_fixture).await;
+            set_invoker_permission_mode(&fixture, TurnPermissionMode::Supervised).await;
+            let broker = Arc::new(BlockingPermissionApprovalBroker::default());
+            fixture
+                .service
+                .set_permission_approval_broker(broker.clone())
+                .await;
 
-        let cancellation = CancellationToken::new();
-        let invocation_cancellation = cancellation.clone();
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, invocation_cancellation)
+            let cancellation = CancellationToken::new();
+            let invocation_cancellation = cancellation.clone();
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, invocation_cancellation)
+                    .await
+            });
+
+            wait_for_test_notification(&broker.started, "pending MCP approval").await;
+            cancellation.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
                 .await
-        });
+                .expect("cancelled MCP approval should finish promptly")
+                .expect("cancelled MCP approval task should not panic")
+                .expect_err("cancelled MCP approval must not execute upstream");
 
-        wait_for_test_notification(&broker.started, "pending MCP approval").await;
-        cancellation.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
-            .await
-            .expect("cancelled MCP approval should finish promptly")
-            .expect("cancelled MCP approval task should not panic")
-            .expect_err("cancelled MCP approval must not execute upstream");
-
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
-        assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+            assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_reaches_upstream_and_late_release_cannot_succeed() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 5_000,
-            }))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 5_000,
+                }),
+            )
             .await;
-        let cancellation = CancellationToken::new();
-        let invocation_cancellation = cancellation.clone();
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, invocation_cancellation)
+            let cancellation = CancellationToken::new();
+            let invocation_cancellation = cancellation.clone();
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, invocation_cancellation)
+                    .await
+            });
+
+            wait_for_test_notification(&control.started, "upstream MCP request").await;
+            cancellation.cancel();
+            wait_for_test_notification(&control.cancelled, "upstream MCP cancellation").await;
+            let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
                 .await
-        });
+                .expect("cancelled upstream MCP request should finish promptly")
+                .expect("cancelled upstream MCP task should not panic")
+                .expect_err("cancelled upstream MCP request must not succeed");
+            control.released.notify_one();
+            tokio::task::yield_now().await;
 
-        wait_for_test_notification(&control.started, "upstream MCP request").await;
-        cancellation.cancel();
-        wait_for_test_notification(&control.cancelled, "upstream MCP cancellation").await;
-        let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
-            .await
-            .expect("cancelled upstream MCP request should finish promptly")
-            .expect("cancelled upstream MCP task should not panic")
-            .expect_err("cancelled upstream MCP request must not succeed");
-        control.released.notify_one();
-        tokio::task::yield_now().await;
-
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
-        assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_dropped_outer_future_does_not_orphan_upstream() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 5_000,
-            }))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 5_000,
+                }),
+            )
             .await;
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, CancellationToken::new())
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, CancellationToken::new())
+                    .await
+            });
+
+            wait_for_test_notification(&control.started, "drop-guard MCP request").await;
+            invocation_task.abort();
+            let task_error = invocation_task
                 .await
-        });
+                .expect_err("aborted outer MCP future should report task cancellation");
+            assert!(task_error.is_cancelled());
+            wait_for_test_notification(&control.cancelled, "drop-guard upstream cancellation")
+                .await;
+            control.released.notify_one();
+            tokio::task::yield_now().await;
 
-        wait_for_test_notification(&control.started, "drop-guard MCP request").await;
-        invocation_task.abort();
-        let task_error = invocation_task
-            .await
-            .expect_err("aborted outer MCP future should report task cancellation");
-        assert!(task_error.is_cancelled());
-        wait_for_test_notification(&control.cancelled, "drop-guard upstream cancellation").await;
-        control.released.notify_one();
-        tokio::task::yield_now().await;
-
-        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
-        let audits = fixture
-            .crud_store
-            .list_recent_mcp_audit_event_records("resend", 20)
-            .await
-            .expect("MCP invocation audit should be readable");
-        assert!(
-            audits
-                .iter()
-                .all(|audit| audit.action != "turn_mcp_invocation_outcome")
-        );
-        assert!(
-            audits
-                .iter()
-                .all(|audit| audit.action != "tool_call_completed")
-        );
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            let audits = fixture
+                .crud_store
+                .list_recent_mcp_audit_event_records("resend", 20)
+                .await
+                .expect("MCP invocation audit should be readable");
+            assert!(
+                audits
+                    .iter()
+                    .all(|audit| audit.action != "turn_mcp_invocation_outcome")
+            );
+            assert!(
+                audits
+                    .iter()
+                    .all(|audit| audit.action != "tool_call_completed")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_terminal_turn_revokes_active_upstream() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 5_000,
-            }))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 5_000,
+                }),
+            )
             .await;
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, CancellationToken::new())
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, CancellationToken::new())
+                    .await
+            });
+
+            wait_for_test_notification(&control.started, "terminal-turn MCP request").await;
+            assert!(
+                fixture
+                    .service
+                    .cancel_turn_mcp_invocations(fixture.turn_id.as_str())
+                    >= 1
+            );
+            wait_for_test_notification(&control.cancelled, "terminal-turn upstream cancellation")
+                .await;
+            let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
                 .await
-        });
+                .expect("terminal-turn MCP cancellation should finish promptly")
+                .expect("terminal-turn MCP task should not panic")
+                .expect_err("terminal-turn MCP request must not succeed");
 
-        wait_for_test_notification(&control.started, "terminal-turn MCP request").await;
-        assert!(
-            fixture
-                .service
-                .cancel_turn_mcp_invocations(fixture.turn_id.as_str())
-                >= 1
-        );
-        wait_for_test_notification(&control.cancelled, "terminal-turn upstream cancellation").await;
-        let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
-            .await
-            .expect("terminal-turn MCP cancellation should finish promptly")
-            .expect("terminal-turn MCP task should not panic")
-            .expect_err("terminal-turn MCP request must not succeed");
-
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn terminal_cua_cache_admission_closes_both_registered_call_orders() {
-        let (service, _, _) = test_mcp_service().await;
-        let tools = Arc::new(
-            pioneer_tools::build_tools(
-                std::env::temp_dir(),
-                "cache-fixture",
-                pioneer_tools::PermissionEvaluationContext::for_turn(
-                    "workspace",
-                    "thread",
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, _) = test_mcp_service(db_fixture).await;
+            let tools = Arc::new(
+                pioneer_tools::build_tools(
+                    std::env::temp_dir(),
                     "cache-fixture",
-                    pioneer_protocol::default_turn_permission_profile_snapshot(),
-                ),
-                pioneer_tools::WebToolsConfig::default(),
-                pioneer_tools::ComputerUseToolsConfig::default(),
-                Vec::new(),
-            )
-            .expect("cache owner tools"),
-        );
-        // The call is already registered but has not materialized tools yet
-        // (e.g. it is waiting at the security/approval boundary).
-        for insert_first in [false, true] {
-            for index in 0..32 {
-                let turn = format!("finished-{insert_first}-{index}");
+                    pioneer_tools::PermissionEvaluationContext::for_turn(
+                        "workspace",
+                        "thread",
+                        "cache-fixture",
+                        pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    ),
+                    pioneer_tools::WebToolsConfig::default(),
+                    pioneer_tools::ComputerUseToolsConfig::default(),
+                    Vec::new(),
+                )
+                .expect("cache owner tools"),
+            );
+            // The call is already registered but has not materialized tools yet
+            // (e.g. it is waiting at the security/approval boundary).
+            for insert_first in [false, true] {
+                for index in 0..32 {
+                    let turn = format!("finished-{insert_first}-{index}");
+                    let cancellation = CancellationToken::new();
+                    let _active = service.register_active_mcp_invocation(
+                        &turn,
+                        "cua-fixture",
+                        "call",
+                        cancellation.clone(),
+                    );
+                    if insert_first {
+                        service
+                            .admit_cua_turn_tools(&turn, &cancellation, || Ok(tools.clone()))
+                            .expect("insert before terminal");
+                    }
+                    assert_eq!(service.cancel_turn_mcp_invocations(&turn), 1);
+                    assert!(cancellation.is_cancelled());
+                    let late = service.admit_cua_turn_tools(&turn, &cancellation, || {
+                        panic!("cancelled registered call must never materialize a cache entry")
+                    });
+                    assert!(
+                        matches!(late, Err(error) if error.code == TurnMcpInvocationErrorCode::Cancelled)
+                    );
+                    assert!(
+                        !service
+                            .inner
+                            .cua_turn_tools
+                            .lock()
+                            .unwrap()
+                            .contains_key(&turn)
+                    );
+                }
+                let live = format!("live-{insert_first}");
                 let cancellation = CancellationToken::new();
                 let _active = service.register_active_mcp_invocation(
-                    &turn,
+                    &live,
                     "cua-fixture",
                     "call",
                     cancellation.clone(),
                 );
-                if insert_first {
-                    service
-                        .admit_cua_turn_tools(&turn, &cancellation, || Ok(tools.clone()))
-                        .expect("insert before terminal");
-                }
-                assert_eq!(service.cancel_turn_mcp_invocations(&turn), 1);
-                assert!(cancellation.is_cancelled());
-                let late = service.admit_cua_turn_tools(&turn, &cancellation, || {
-                    panic!("cancelled registered call must never materialize a cache entry")
-                });
-                assert!(
-                    matches!(late, Err(error) if error.code == TurnMcpInvocationErrorCode::Cancelled)
-                );
-                assert!(
-                    !service
-                        .inner
-                        .cua_turn_tools
-                        .lock()
-                        .unwrap()
-                        .contains_key(&turn)
-                );
+                service
+                    .admit_cua_turn_tools(&live, &cancellation, || Ok(tools.clone()))
+                    .expect("finished turns cannot exhaust live admission");
+                assert_eq!(service.inner.cua_turn_tools.lock().unwrap().len(), 1);
+                service.cancel_turn_mcp_invocations(&live);
             }
-            let live = format!("live-{insert_first}");
-            let cancellation = CancellationToken::new();
-            let _active = service.register_active_mcp_invocation(
-                &live,
-                "cua-fixture",
-                "call",
-                cancellation.clone(),
-            );
-            service
-                .admit_cua_turn_tools(&live, &cancellation, || Ok(tools.clone()))
-                .expect("finished turns cannot exhaust live admission");
-            assert_eq!(service.inner.cua_turn_tools.lock().unwrap().len(), 1);
-            service.cancel_turn_mcp_invocations(&live);
-        }
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn poisoned_active_invocation_registry_still_fails_closed_on_revoke() {
-        let (service, _, _) = test_mcp_service().await;
-        let inner = service.inner.clone();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = inner
-                .active_invocations
-                .lock()
-                .expect("registry should begin healthy");
-            panic!("poison active invocation registry");
-        }));
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _, _) = test_mcp_service(db_fixture).await;
+            let inner = service.inner.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = inner
+                    .active_invocations
+                    .lock()
+                    .expect("registry should begin healthy");
+                panic!("poison active invocation registry");
+            }));
 
-        let cancellation = CancellationToken::new();
-        let _guard = service.register_active_mcp_invocation(
-            "turn-poisoned-registry",
-            "installation-poisoned-registry",
-            "call-poisoned-registry",
-            cancellation.clone(),
-        );
-        assert_eq!(
-            service.cancel_turn_mcp_invocations("turn-poisoned-registry"),
-            1
-        );
-        assert!(cancellation.is_cancelled());
+            let cancellation = CancellationToken::new();
+            let _guard = service.register_active_mcp_invocation(
+                "turn-poisoned-registry",
+                "installation-poisoned-registry",
+                "call-poisoned-registry",
+                cancellation.clone(),
+            );
+            assert_eq!(
+                service.cancel_turn_mcp_invocations("turn-poisoned-registry"),
+                1
+            );
+            assert!(cancellation.is_cancelled());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_runtime_revoke_reaches_active_upstream() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 5_000,
-            }))
-            .await;
-        let binding = fixture
-            .crud_store
-            .list_turn_mcp_bindings(fixture.turn_id.as_str())
-            .await
-            .expect("MCP binding lookup should succeed")
-            .remove(0);
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, CancellationToken::new())
-                .await
-        });
-
-        wait_for_test_notification(&control.started, "runtime-revoke MCP request").await;
-        fixture
-            .service
-            .stop_task(
-                binding.server_installation_id.as_str(),
-                DomainRuntimeState::Stopped,
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 5_000,
+                }),
             )
             .await;
-        wait_for_test_notification(&control.cancelled, "runtime-revoke upstream cancellation")
-            .await;
-        let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
-            .await
-            .expect("runtime-revoked MCP request should finish promptly")
-            .expect("runtime-revoked MCP task should not panic")
-            .expect_err("runtime-revoked MCP request must not succeed");
+            let binding = fixture
+                .crud_store
+                .list_turn_mcp_bindings(fixture.turn_id.as_str())
+                .await
+                .expect("MCP binding lookup should succeed")
+                .remove(0);
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, CancellationToken::new())
+                    .await
+            });
 
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            wait_for_test_notification(&control.started, "runtime-revoke MCP request").await;
+            fixture
+                .service
+                .stop_task(
+                    binding.server_installation_id.as_str(),
+                    DomainRuntimeState::Stopped,
+                )
+                .await;
+            wait_for_test_notification(&control.cancelled, "runtime-revoke upstream cancellation")
+                .await;
+            let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
+                .await
+                .expect("runtime-revoked MCP request should finish promptly")
+                .expect("runtime-revoked MCP task should not panic")
+                .expect_err("runtime-revoked MCP request must not succeed");
+
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_cancel_gateway_shutdown_reaches_active_upstream() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 5_000,
-            }))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 5_000,
+                }),
+            )
             .await;
-        let service = fixture.service.clone();
-        let invocation = native_mcp_invocation(&fixture);
-        let invocation_task = tokio::spawn(async move {
-            service
-                .turn_mcp_invoker()
-                .invoke(invocation, CancellationToken::new())
+            let service = fixture.service.clone();
+            let invocation = native_mcp_invocation(&fixture);
+            let invocation_task = tokio::spawn(async move {
+                service
+                    .turn_mcp_invoker()
+                    .invoke(invocation, CancellationToken::new())
+                    .await
+            });
+
+            wait_for_test_notification(&control.started, "shutdown MCP request").await;
+            fixture.service.shutdown().await;
+            wait_for_test_notification(&control.cancelled, "shutdown upstream cancellation").await;
+            let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
                 .await
-        });
+                .expect("shutdown MCP request should finish promptly")
+                .expect("shutdown MCP task should not panic")
+                .expect_err("shutdown MCP request must not succeed");
 
-        wait_for_test_notification(&control.started, "shutdown MCP request").await;
-        fixture.service.shutdown().await;
-        wait_for_test_notification(&control.cancelled, "shutdown upstream cancellation").await;
-        let error = tokio::time::timeout(Duration::from_secs(2), invocation_task)
-            .await
-            .expect("shutdown MCP request should finish promptly")
-            .expect("shutdown MCP task should not panic")
-            .expect_err("shutdown MCP request must not succeed");
-
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
-        assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::Cancelled);
+            assert_turn_mcp_outcome_reason(&fixture, "cancelled").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_timeout_is_typed_and_cancels_the_active_upstream_request() {
-        let control = Arc::new(PausingMcpControl::default());
-        let fixture =
-            turn_mcp_invoker_fixture_with_connector(Arc::new(PausingMcpRuntimeConnector {
-                control: control.clone(),
-                catalog_timeout_ms: 25,
-            }))
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let control = Arc::new(PausingMcpControl::default());
+            let fixture = turn_mcp_invoker_fixture_with_connector(
+                db_fixture,
+                Arc::new(PausingMcpRuntimeConnector {
+                    control: control.clone(),
+                    catalog_timeout_ms: 25,
+                }),
+            )
             .await;
 
-        let error = fixture
-            .service
-            .turn_mcp_invoker()
-            .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
-            .await
-            .expect_err("timed-out MCP request must not succeed");
-        wait_for_test_notification(&control.cancelled, "timed-out upstream cancellation").await;
+            let error = fixture
+                .service
+                .turn_mcp_invoker()
+                .invoke(native_mcp_invocation(&fixture), CancellationToken::new())
+                .await
+                .expect_err("timed-out MCP request must not succeed");
+            wait_for_test_notification(&control.cancelled, "timed-out upstream cancellation").await;
 
-        assert_eq!(error.code, TurnMcpInvocationErrorCode::TimedOut);
-        assert_eq!(control.calls.load(Ordering::SeqCst), 1);
-        assert_turn_mcp_outcome_reason(&fixture, "timed_out").await;
+            assert_eq!(error.code, TurnMcpInvocationErrorCode::TimedOut);
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert_turn_mcp_outcome_reason(&fixture, "timed_out").await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     struct RefreshFailureConnector {
@@ -8554,254 +8831,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn queued_oauth_recovery_cannot_clear_a_newer_blocked_tool_failure() {
-        let (service, store, workspace) = test_mcp_service().await;
-        let change = Arc::new(tokio::sync::Notify::new());
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        struct Release(Arc<tokio::sync::Notify>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.notify_waiters();
-                self.0.notify_one();
-            }
-        }
-        let _release_on_exit = Release(release.clone());
-        let connects = Arc::new(AtomicUsize::new(0));
-        service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
-            connects: connects.clone(),
-            change: change.clone(),
-            unrelated_degradation: false,
-            tool_barrier: Some((entered.clone(), release.clone())),
-            tool_outcome: None,
-            provider: None,
-        }));
-        let id = seed_mcp_installation(&store, &workspace, "queued-recovery", true, false).await;
-        service.reload_workspace(&workspace).await.unwrap();
-        wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
-        let generation =
-            service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
-        change.notify_one();
-        wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Degraded).await;
-        let tx = service.inner.tasks.lock().await[&id].call_tx.clone();
-        let revision = service.inner.tasks.lock().await[&id]
-            .oauth_failure_revision
-            .load(Ordering::SeqCst);
-        assert!(revision > 0);
-        let (response_tx, response_rx) = oneshot::channel();
-        tx.send(McpServerCommand::Tool(McpServerCallCommand {
-            request: pioneer_tools::McpToolCallRequest {
-                workspace_id: workspace.clone(),
-                turn_id: "test-turn".into(),
-                call_id: "tool-B".into(),
-                callable_name: "send".into(),
-                server_id: id.clone(),
-                server_name: "queued-recovery".into(),
-                raw_tool_name: "send".into(),
-                catalog_version: "test".into(),
-                arguments: json!({}),
-                timeout_ms: 5000,
-                max_arguments_bytes: 1024,
-            },
-            cancellation: CancellationToken::new(),
-            response_tx,
-        }))
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), entered.notified())
-            .await
-            .unwrap();
-        let (done, completed) = oneshot::channel();
-        tx.send(McpServerCommand::OAuthRecovered {
-            store: Arc::new(store.with_maintenance_access()),
-            cancellation: CancellationToken::new(),
-            completed: done,
-            admission: Arc::new(std::sync::Mutex::new(None)),
-            event: None,
-            failure_revision: revision,
-            cause: None,
-        })
-        .await
-        .unwrap();
-        release.notify_one();
-        assert_eq!(
-            response_rx.await.unwrap().unwrap_err().message,
-            "new OAuth failure B"
-        );
-        completed.await.unwrap();
-        let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-        assert_eq!(after.state, DomainRuntimeState::Degraded);
-        assert_eq!(after.last_error.as_deref(), Some("new OAuth failure B"));
-        assert_eq!(after.runtime_generation, generation);
-        service.oauth_recovered(&id).await;
-        assert_eq!(
-            service.runtime_snapshot("workspace", &workspace).await[&id].state,
-            DomainRuntimeState::Ready
-        );
-        assert_eq!(connects.load(Ordering::SeqCst), 1);
-        service.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn real_oauth_recovery_before_actor_receives_notified_error_restores_projection() {
-        use axum::{
-            Json, Router,
-            routing::{get, post},
-        };
-        for (unrelated, failed_predecessor) in [(false, false), (true, false), (false, true)] {
-            let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
-            old.shutdown().await;
-            let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) =
-                crate::session::test_support::outbound_channel(1024);
-            let mut principal = (*authenticated_test_superuser()).clone();
-            principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
-            let client = sessions
-                .register_connection(recipient_tx, Arc::new(principal))
-                .await
-                .unwrap();
-            let service = McpService::new_with_oauth_options(
-                store.clone(),
-                sessions,
-                secrets,
-                Arc::new(AtomicU64::new(1)),
-                Arc::new(AuthorizationInvalidationHub::default()),
-                Arc::new(ExecutionLeaseRegistry::default()),
-                pioneer_mcp_oauth::OAuthServiceOptions {
-                    poll_interval: Duration::from_millis(10),
-                    ..Default::default()
-                },
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let issuer = format!("http://{}", listener.local_addr().unwrap());
-            let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
-            let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
-                .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
-                .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
-            let server = tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
-            });
-            struct Server(tokio::task::JoinHandle<()>);
-            impl Drop for Server {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let _server = Server(server);
-            let mut id =
-                seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
-            let mut row = store
-                .find_mcp_server_installation("workspace", &workspace, "real-recovery")
-                .await
-                .unwrap()
-                .unwrap();
-            row.transport_kind = "streamable_http".into();
-            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
-                url: format!("{issuer}/mcp"),
-                headers: BTreeMap::new(),
-                startup_timeout_ms: 5000,
-                tool_timeout_ms: 120000,
-            })
-            .unwrap();
-            store
-                .upsert_mcp_server_installation(&row, now_timestamp_secs())
-                .await
-                .unwrap();
-            if failed_predecessor {
-                // Publish a fresh reserved child, never adopt the seeded standalone row.
-                id = "S".repeat(21);
-                row.id = Some(id.clone());
-                row.name = "pplugin_retained_failure".into();
-                let now = chrono::Utc::now().fixed_offset();
-                let parent = "P".repeat(21);
-                store
-                    .insert_plugin_installation(&pioneer_crud::PackageRecord {
-                        kind: pioneer_crud::PackageKind::Plugin,
-                        app_manifest_json: None,
-                        app_localizations_json: None,
-                        operation_error_json: None,
-                        id: parent.clone(),
-                        workspace_id: workspace.clone(),
-                        name: "oauth-parent".into(),
-                        version: None,
-                        source_upload_id: "oauth-source".into(),
-                        package_path: "/unused/package".into(),
-                        data_path: "/unused/data".into(),
-                        package_fingerprint: "tree".into(),
-                        enabled: true,
-                        allow_implicit_invocation: false,
-                        state: "installing".into(),
-                        revision: 1,
-                        display_name: None,
-                        short_description: None,
-                        description: None,
-                        long_description: None,
-                        developer_name: None,
-                        author_name: None,
-                        author_email: None,
-                        author_url: None,
-                        homepage: None,
-                        repository: None,
-                        documentation_url: None,
-                        support_url: None,
-                        privacy_policy_url: None,
-                        terms_of_service_url: None,
-                        license: None,
-                        category: None,
-                        brand_color: None,
-                        logo_path: None,
-                        logo_revision: None,
-                        composer_icon_path: None,
-                        composer_icon_revision: None,
-                        pending_json: Some("{}".into()),
-                        last_error: None,
-                        created_at: now,
-                        updated_at: now,
-                    })
-                    .await
-                    .unwrap();
-                let write = pioneer_crud::PluginOwnershipWrite {
-                    kind: pioneer_protocol::PackageKind::Plugin,
-                    plugin_id: parent.clone(),
-                    expected_revision: 1,
-                    member_key: "one".into(),
-                    member_path: None,
-                    package_fingerprint: "tree".into(),
-                    child_id: id.clone(),
-                };
-                let audit = pioneer_crud::McpAuditEventRecord {
-                    turn_id: None,
-                    server_installation_id: Some(id.clone()),
-                    server_name: row.name.clone(),
-                    raw_tool_name: None,
-                    callable_name: None,
-                    catalog_version: None,
-                    action: "install".into(),
-                    decision: "allowed".into(),
-                    reason_code: None,
-                    details_json: "{}".into(),
-                    created_at_unix: 1,
-                };
-                store
-                    .upsert_mcp_server_installation_with_audit_and_ownership(
-                        &row,
-                        &audit,
-                        Some(&write),
-                        1,
-                    )
-                    .await
-                    .unwrap();
-                store
-                    .settle_plugin_installation(&parent, 1, "installed", None)
-                    .await
-                    .unwrap();
-                assert!(
-                    service
-                        .plugin_start_available(&store, &row, None)
-                        .await
-                        .unwrap()
-                );
-            }
-            let installation = installation_from_record(&row).unwrap();
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, store, workspace) = test_mcp_service(db_fixture).await;
+            let change = Arc::new(tokio::sync::Notify::new());
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
             struct Release(Arc<tokio::sync::Notify>);
@@ -8811,165 +8843,42 @@ mod tests {
                     self.0.notify_one();
                 }
             }
-            let _release = Release(release.clone());
+            let _release_on_exit = Release(release.clone());
             let connects = Arc::new(AtomicUsize::new(0));
             service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
                 connects: connects.clone(),
-                change: Arc::new(tokio::sync::Notify::new()),
-                unrelated_degradation: unrelated,
+                change: change.clone(),
+                unrelated_degradation: false,
                 tool_barrier: Some((entered.clone(), release.clone())),
                 tool_outcome: None,
-                provider: Some(service.oauth().clone()),
+                provider: None,
             }));
-            service
-                .oauth()
-                .sign_in(
-                    &id,
-                    &installation,
-                    client,
-                    "http://127.0.0.1:37643/oauth/mcp/callback",
-                )
-                .await
-                .unwrap();
-            let browser = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
-                    else {
-                        continue;
-                    };
-                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                    if value["params"]["state"] == "awaiting_callback" {
-                        break value["params"].clone();
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
-            let state = url
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .unwrap()
-                .1
-                .into_owned();
-            let effect_entered = Arc::new(tokio::sync::Notify::new());
-            let effect_release = Arc::new(tokio::sync::Notify::new());
-            let effect_completed = Arc::new(tokio::sync::Notify::new());
-            if failed_predecessor {
-                *service.inner.oauth_effect_barrier.lock().unwrap() = Some((
-                    effect_entered.clone(),
-                    effect_release.clone(),
-                    effect_completed.clone(),
-                ));
-            }
-            service
-                .oauth()
-                .callback(
-                    &id,
-                    client,
-                    pioneer_mcp_oauth::OAuthCallback {
-                        flow_id: browser["flow_id"].as_str().unwrap().into(),
-                        state,
-                        code: Some("single-code".into()),
-                        issuer: Some(issuer),
-                        error: None,
-                    },
-                )
-                .await
-                .unwrap();
-            if failed_predecessor {
-                // The real callback emitted current Authorized. Hold its existing
-                // Gateway effect boundary, then install an actual failed actor join.
-                tokio::time::timeout(Duration::from_secs(5), effect_entered.notified())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    service.oauth().state(&id).await,
-                    Some(pioneer_mcp_oauth::OAuthState::Authorized)
-                );
-                let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                let (call_tx, _call_rx) = mpsc::channel(1);
-                let completed = Arc::new(CancellationToken::new());
-                let completion = McpTaskCompletion(completed.clone());
-                let join = McpTaskJoin::new(tokio::spawn(async move {
-                    let _completion = completion;
-                    shutdown_rx
-                        .await
-                        .expect("Authorized must request predecessor drain");
-                    anyhow::bail!("retained predecessor cleanup failed")
-                }));
-                service.inner.tasks.lock().await.insert(
-                    id.clone(),
-                    McpServerTaskHandle {
-                        name: row.name.clone(),
-                        scope_kind: row.scope_kind.clone(),
-                        scope_key: row.scope_key.clone(),
-                        fingerprint: row.fingerprint.clone(),
-                        effective_secret_fingerprint: "old".into(),
-                        call_tx,
-                        oauth_failure_revision: Arc::new(AtomicU64::new(0)),
-                        recovery: Arc::new(OAuthRecoveryMailbox::default()),
-                        shutdown_tx: Some(shutdown_tx),
-                        completed: completed.clone(),
-                        join,
-                        session: Arc::new(Mutex::new(None)),
-                    },
-                );
-                service
-                    .inner
-                    .runtime_generations
-                    .lock()
-                    .await
-                    .insert(id.clone(), 42);
-                effect_release.notify_one();
-                tokio::time::timeout(Duration::from_secs(5), effect_completed.notified())
-                    .await
-                    .unwrap();
-                assert!(
-                    completed.is_cancelled(),
-                    "real actor must have finished its failed drain"
-                );
-                assert!(Arc::ptr_eq(
-                    &service.inner.tasks.lock().await[&id].completed,
-                    &completed
-                ));
-                assert_eq!(service.inner.runtime_generations.lock().await[&id], 42);
-                assert_eq!(connects.load(Ordering::SeqCst), 0);
-                assert!(
-                    service
-                        .stop_task_result(&id, DomainRuntimeState::Stopped)
-                        .await
-                        .is_err()
-                );
-                *service.inner.oauth_effect_barrier.lock().unwrap() = None;
-                service.shutdown().await;
-                continue;
-            }
-            let expected = if unrelated {
-                DomainRuntimeState::Degraded
-            } else {
-                DomainRuntimeState::Ready
-            };
-            wait_for_runtime_state(&service, &workspace, &id, expected).await;
+            let id =
+                seed_mcp_installation(&store, &workspace, "queued-recovery", true, false).await;
+            service.reload_workspace(&workspace).await.unwrap();
+            wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
             let generation =
                 service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
-            let (tx, mailbox) = {
-                let tasks = service.inner.tasks.lock().await;
-                (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
-            };
-            let (response_tx, response) = oneshot::channel();
+            change.notify_one();
+            wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Degraded).await;
+            let tx = service.inner.tasks.lock().await[&id].call_tx.clone();
+            let revision = service.inner.tasks.lock().await[&id]
+                .oauth_failure_revision
+                .load(Ordering::SeqCst);
+            assert!(revision > 0);
+            let (response_tx, response_rx) = oneshot::channel();
             tx.send(McpServerCommand::Tool(McpServerCallCommand {
                 request: pioneer_tools::McpToolCallRequest {
                     workspace_id: workspace.clone(),
                     turn_id: "test-turn".into(),
-                    call_id: "tool-A".into(),
+                    call_id: "tool-B".into(),
                     callable_name: "send".into(),
                     server_id: id.clone(),
-                    server_name: "real-recovery".into(),
+                    server_name: "queued-recovery".into(),
                     raw_tool_name: "send".into(),
                     catalog_version: "test".into(),
                     arguments: json!({}),
-                    timeout_ms: 120000,
+                    timeout_ms: 5000,
                     max_arguments_bytes: 1024,
                 },
                 cancellation: CancellationToken::new(),
@@ -8980,50 +8889,427 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(3), entered.notified())
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if mailbox.pending.lock().unwrap().is_some() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
+            let (done, completed) = oneshot::channel();
+            tx.send(McpServerCommand::OAuthRecovered {
+                store: Arc::new(store.with_maintenance_access()),
+                cancellation: CancellationToken::new(),
+                completed: done,
+                admission: Arc::new(std::sync::Mutex::new(None)),
+                event: None,
+                failure_revision: revision,
+                cause: None,
             })
             .await
             .unwrap();
-            assert_eq!(
-                service.inner.tasks.lock().await[&id]
-                    .oauth_failure_revision
-                    .load(Ordering::SeqCst),
-                0,
-                "error A has not reached actor yet"
-            );
             release.notify_one();
             assert_eq!(
-                response.await.unwrap().unwrap_err().message,
-                "notified OAuth failure A"
+                response_rx.await.unwrap().unwrap_err().message,
+                "new OAuth failure B"
             );
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let snapshot =
-                        service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-                    if mailbox.pending.lock().unwrap().is_none() && snapshot.last_error.is_none() {
-                        assert_eq!(snapshot.state, expected);
-                        assert_eq!(snapshot.runtime_generation, generation);
-                        if unrelated {
-                            assert_eq!(
-                                snapshot.status_reason.as_deref(),
-                                Some("unrelated stream limitation")
-                            );
-                        }
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            })
-            .await
-            .unwrap();
+            completed.await.unwrap();
+            let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+            assert_eq!(after.state, DomainRuntimeState::Degraded);
+            assert_eq!(after.last_error.as_deref(), Some("new OAuth failure B"));
+            assert_eq!(after.runtime_generation, generation);
+            service.oauth_recovered(&id).await;
+            assert_eq!(
+                service.runtime_snapshot("workspace", &workspace).await[&id].state,
+                DomainRuntimeState::Ready
+            );
             assert_eq!(connects.load(Ordering::SeqCst), 1);
             service.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_oauth_recovery_before_actor_receives_notified_error_restores_projection() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        for (unrelated, failed_predecessor) in [(false, false), (true, false), (false, true)] {
+            pioneer_postgres_test::with_database(async |db_fixture| {
+                let (old, store, workspace, secrets) = test_mcp_service_with_secrets(db_fixture).await;
+                old.shutdown().await;
+                let sessions = Arc::new(SessionManager::new());
+                let (recipient_tx, mut recipient) =
+                    crate::session::test_support::outbound_channel(1024);
+                let mut principal = (*authenticated_test_superuser()).clone();
+                principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+                let client = sessions
+                    .register_connection(recipient_tx, Arc::new(principal))
+                    .await
+                    .unwrap();
+                let service = McpService::new_with_oauth_options(
+                    store.clone(),
+                    sessions,
+                    secrets,
+                    Arc::new(AtomicU64::new(1)),
+                    Arc::new(AuthorizationInvalidationHub::default()),
+                    Arc::new(ExecutionLeaseRegistry::default()),
+                    pioneer_mcp_oauth::OAuthServiceOptions {
+                        poll_interval: Duration::from_millis(10),
+                        ..Default::default()
+                    },
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let issuer = format!("http://{}", listener.local_addr().unwrap());
+                let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
+                let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
+                    .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
+                    .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+                struct Server(tokio::task::JoinHandle<()>);
+                impl Drop for Server {
+                    fn drop(&mut self) {
+                        self.0.abort();
+                    }
+                }
+                let _server = Server(server);
+                let mut id =
+                    seed_mcp_installation(&store, &workspace, "real-recovery", true, false).await;
+                let mut row = store
+                    .find_mcp_server_installation("workspace", &workspace, "real-recovery")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                row.transport_kind = "streamable_http".into();
+                row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                    url: format!("{issuer}/mcp"),
+                    headers: BTreeMap::new(),
+                    startup_timeout_ms: 5000,
+                    tool_timeout_ms: 120000,
+                })
+                .unwrap();
+                store
+                    .upsert_mcp_server_installation(&row, now_timestamp_secs())
+                    .await
+                    .unwrap();
+                if failed_predecessor {
+                    // Publish a fresh reserved child, never adopt the seeded standalone row.
+                    id = "S".repeat(21);
+                    row.id = Some(id.clone());
+                    row.name = "pplugin_retained_failure".into();
+                    let now = chrono::Utc::now().fixed_offset();
+                    let parent = "P".repeat(21);
+                    store
+                        .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                            kind: pioneer_crud::PackageKind::Plugin,
+                            app_manifest_json: None,
+                            app_localizations_json: None,
+                            operation_error_json: None,
+                            id: parent.clone(),
+                            workspace_id: workspace.clone(),
+                            name: "oauth-parent".into(),
+                            version: None,
+                            source_upload_id: "oauth-source".into(),
+                            package_path: "/unused/package".into(),
+                            data_path: "/unused/data".into(),
+                            package_fingerprint: "tree".into(),
+                            enabled: true,
+                            allow_implicit_invocation: false,
+                            state: "installing".into(),
+                            revision: 1,
+                            display_name: None,
+                            short_description: None,
+                            description: None,
+                            long_description: None,
+                            developer_name: None,
+                            author_name: None,
+                            author_email: None,
+                            author_url: None,
+                            homepage: None,
+                            repository: None,
+                            documentation_url: None,
+                            support_url: None,
+                            privacy_policy_url: None,
+                            terms_of_service_url: None,
+                            license: None,
+                            category: None,
+                            brand_color: None,
+                            logo_path: None,
+                            logo_revision: None,
+                            composer_icon_path: None,
+                            composer_icon_revision: None,
+                            pending_json: Some("{}".into()),
+                            last_error: None,
+                            created_at: now,
+                            updated_at: now,
+                        })
+                        .await
+                        .unwrap();
+                    let write = pioneer_crud::PluginOwnershipWrite {
+                        kind: pioneer_protocol::PackageKind::Plugin,
+                        plugin_id: parent.clone(),
+                        expected_revision: 1,
+                        member_key: "one".into(),
+                        member_path: None,
+                        package_fingerprint: "tree".into(),
+                        child_id: id.clone(),
+                    };
+                    let audit = pioneer_crud::McpAuditEventRecord {
+                        turn_id: None,
+                        server_installation_id: Some(id.clone()),
+                        server_name: row.name.clone(),
+                        raw_tool_name: None,
+                        callable_name: None,
+                        catalog_version: None,
+                        action: "install".into(),
+                        decision: "allowed".into(),
+                        reason_code: None,
+                        details_json: "{}".into(),
+                        created_at_unix: 1,
+                    };
+                    store
+                        .upsert_mcp_server_installation_with_audit_and_ownership(
+                            &row,
+                            &audit,
+                            Some(&write),
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                    store
+                        .settle_plugin_installation(&parent, 1, "installed", None)
+                        .await
+                        .unwrap();
+                    assert!(
+                        service
+                            .plugin_start_available(&store, &row, None)
+                            .await
+                            .unwrap()
+                    );
+                }
+                let installation = installation_from_record(&row).unwrap();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(tokio::sync::Notify::new());
+                struct Release(Arc<tokio::sync::Notify>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.notify_waiters();
+                        self.0.notify_one();
+                    }
+                }
+                let _release = Release(release.clone());
+                let connects = Arc::new(AtomicUsize::new(0));
+                service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+                    connects: connects.clone(),
+                    change: Arc::new(tokio::sync::Notify::new()),
+                    unrelated_degradation: unrelated,
+                    tool_barrier: Some((entered.clone(), release.clone())),
+                    tool_outcome: None,
+                    provider: Some(service.oauth().clone()),
+                }));
+                service
+                    .oauth()
+                    .sign_in(
+                        &id,
+                        &installation,
+                        client,
+                        "http://127.0.0.1:37643/oauth/mcp/callback",
+                    )
+                    .await
+                    .unwrap();
+                let browser = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
+                        else {
+                            continue;
+                        };
+                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                        if value["params"]["state"] == "awaiting_callback" {
+                            break value["params"].clone();
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
+                let state = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let effect_entered = Arc::new(tokio::sync::Notify::new());
+                let effect_release = Arc::new(tokio::sync::Notify::new());
+                let effect_completed = Arc::new(tokio::sync::Notify::new());
+                if failed_predecessor {
+                    *service.inner.oauth_effect_barrier.lock().unwrap() = Some((
+                        effect_entered.clone(),
+                        effect_release.clone(),
+                        effect_completed.clone(),
+                    ));
+                }
+                service
+                    .oauth()
+                    .callback(
+                        &id,
+                        client,
+                        pioneer_mcp_oauth::OAuthCallback {
+                            flow_id: browser["flow_id"].as_str().unwrap().into(),
+                            state,
+                            code: Some("single-code".into()),
+                            issuer: Some(issuer),
+                            error: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if failed_predecessor {
+                    // The real callback emitted current Authorized. Hold its existing
+                    // Gateway effect boundary, then install an actual failed actor join.
+                    tokio::time::timeout(Duration::from_secs(5), effect_entered.notified())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        service.oauth().state(&id).await,
+                        Some(pioneer_mcp_oauth::OAuthState::Authorized)
+                    );
+                    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                    let (call_tx, _call_rx) = mpsc::channel(1);
+                    let completed = Arc::new(CancellationToken::new());
+                    let completion = McpTaskCompletion(completed.clone());
+                    let join = McpTaskJoin::new(tokio::spawn(async move {
+                        let _completion = completion;
+                        shutdown_rx
+                            .await
+                            .expect("Authorized must request predecessor drain");
+                        anyhow::bail!("retained predecessor cleanup failed")
+                    }));
+                    service.inner.tasks.lock().await.insert(
+                        id.clone(),
+                        McpServerTaskHandle {
+                            name: row.name.clone(),
+                            scope_kind: row.scope_kind.clone(),
+                            scope_key: row.scope_key.clone(),
+                            fingerprint: row.fingerprint.clone(),
+                            effective_secret_fingerprint: "old".into(),
+                            call_tx,
+                            oauth_failure_revision: Arc::new(AtomicU64::new(0)),
+                            recovery: Arc::new(OAuthRecoveryMailbox::default()),
+                            shutdown_tx: Some(shutdown_tx),
+                            completed: completed.clone(),
+                            join,
+                            session: Arc::new(Mutex::new(None)),
+                        },
+                    );
+                    service
+                        .inner
+                        .runtime_generations
+                        .lock()
+                        .await
+                        .insert(id.clone(), 42);
+                    effect_release.notify_one();
+                    tokio::time::timeout(Duration::from_secs(5), effect_completed.notified())
+                        .await
+                        .unwrap();
+                    assert!(
+                        completed.is_cancelled(),
+                        "real actor must have finished its failed drain"
+                    );
+                    assert!(Arc::ptr_eq(
+                        &service.inner.tasks.lock().await[&id].completed,
+                        &completed
+                    ));
+                    assert_eq!(service.inner.runtime_generations.lock().await[&id], 42);
+                    assert_eq!(connects.load(Ordering::SeqCst), 0);
+                    assert!(
+                        service
+                            .stop_task_result(&id, DomainRuntimeState::Stopped)
+                            .await
+                            .is_err()
+                    );
+                    *service.inner.oauth_effect_barrier.lock().unwrap() = None;
+                    service.shutdown().await;
+                    return Ok(());
+                }
+                let expected = if unrelated {
+                    DomainRuntimeState::Degraded
+                } else {
+                    DomainRuntimeState::Ready
+                };
+                wait_for_runtime_state(&service, &workspace, &id, expected).await;
+                let generation =
+                    service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
+                let (tx, mailbox) = {
+                    let tasks = service.inner.tasks.lock().await;
+                    (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
+                };
+                let (response_tx, response) = oneshot::channel();
+                tx.send(McpServerCommand::Tool(McpServerCallCommand {
+                    request: pioneer_tools::McpToolCallRequest {
+                        workspace_id: workspace.clone(),
+                        turn_id: "test-turn".into(),
+                        call_id: "tool-A".into(),
+                        callable_name: "send".into(),
+                        server_id: id.clone(),
+                        server_name: "real-recovery".into(),
+                        raw_tool_name: "send".into(),
+                        catalog_version: "test".into(),
+                        arguments: json!({}),
+                        timeout_ms: 120000,
+                        max_arguments_bytes: 1024,
+                    },
+                    cancellation: CancellationToken::new(),
+                    response_tx,
+                }))
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(3), entered.notified())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if mailbox.pending.lock().unwrap().is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    service.inner.tasks.lock().await[&id]
+                        .oauth_failure_revision
+                        .load(Ordering::SeqCst),
+                    0,
+                    "error A has not reached actor yet"
+                );
+                release.notify_one();
+                assert_eq!(
+                    response.await.unwrap().unwrap_err().message,
+                    "notified OAuth failure A"
+                );
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let snapshot =
+                            service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                        if mailbox.pending.lock().unwrap().is_none() && snapshot.last_error.is_none() {
+                            assert_eq!(snapshot.state, expected);
+                            assert_eq!(snapshot.runtime_generation, generation);
+                            if unrelated {
+                                assert_eq!(
+                                    snapshot.status_reason.as_deref(),
+                                    Some("unrelated stream limitation")
+                                );
+                            }
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(connects.load(Ordering::SeqCst), 1);
+                service.shutdown().await;
+                Ok(())
+            }).await.unwrap();
         }
     }
     #[cfg(feature = "oauth-test-support")]
@@ -9034,242 +9320,245 @@ mod tests {
             routing::{get, post},
         };
         for deadline in [false, true] {
-            let (old, store, workspace, secrets) = test_mcp_service_with_secrets().await;
-            old.shutdown().await;
-            let sessions = Arc::new(SessionManager::new());
-            let (recipient_tx, mut recipient) =
-                crate::session::test_support::outbound_channel(1024);
-            let mut principal = (*authenticated_test_superuser()).clone();
-            principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
-            let client = sessions
-                .register_connection(recipient_tx, Arc::new(principal))
-                .await
-                .unwrap();
-            let hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
-            hooks.pause_after_winner.store(true, Ordering::SeqCst);
-            struct Release(Arc<pioneer_mcp_oauth::OAuthTestHooks>);
-            impl Drop for Release {
-                fn drop(&mut self) {
-                    self.0.publish_resolution.notify_one();
-                }
-            }
-            let _release = Release(hooks.clone());
-            struct Clock(std::sync::Mutex<std::time::SystemTime>);
-            impl pioneer_mcp_oauth::OAuthClock for Clock {
-                fn now(&self) -> std::time::SystemTime {
-                    *self.0.lock().unwrap()
-                }
-            }
-            let clock = Arc::new(Clock(std::sync::Mutex::new(std::time::SystemTime::now())));
-            let service = McpService::new_with_oauth_options(
-                store.clone(),
-                sessions.clone(),
-                secrets,
-                Arc::new(AtomicU64::new(1)),
-                Arc::new(AuthorizationInvalidationHub::default()),
-                Arc::new(ExecutionLeaseRegistry::default()),
-                pioneer_mcp_oauth::OAuthServiceOptions {
-                    test_hooks: Some(hooks.clone()),
-                    clock: clock.clone(),
-                    poll_interval: Duration::from_millis(5),
-                    ..Default::default()
-                },
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let issuer = format!("http://{}", listener.local_addr().unwrap());
-            let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
-            let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
-                .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
-                .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
-            let server = tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
-            });
-            struct Server(tokio::task::JoinHandle<()>);
-            impl Drop for Server {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let _server = Server(server);
-            let id = seed_mcp_installation(&store, &workspace, "real-recovery", false, false).await;
-            let mut row = store
-                .find_mcp_server_installation("workspace", &workspace, "real-recovery")
-                .await
-                .unwrap()
-                .unwrap();
-            row.transport_kind = "streamable_http".into();
-            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
-                url: format!("{issuer}/mcp"),
-                headers: BTreeMap::new(),
-                startup_timeout_ms: 5000,
-                tool_timeout_ms: 120000,
-            })
-            .unwrap();
-            store
-                .upsert_mcp_server_installation(&row, now_timestamp_secs())
-                .await
-                .unwrap();
-            let installation = installation_from_record(&row).unwrap();
-            service
-                .oauth()
-                .sign_in(
-                    &id,
-                    &installation,
-                    client,
-                    "http://127.0.0.1:37643/oauth/mcp/callback",
-                )
-                .await
-                .unwrap();
-            let browser = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
-                    else {
-                        continue;
-                    };
-                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                    if value["params"]["state"] == "awaiting_callback" {
-                        break value["params"].clone();
+            pioneer_postgres_test::with_database(async |db_fixture| {
+                let (old, store, workspace, secrets) = test_mcp_service_with_secrets(db_fixture).await;
+                old.shutdown().await;
+                let sessions = Arc::new(SessionManager::new());
+                let (recipient_tx, mut recipient) =
+                    crate::session::test_support::outbound_channel(1024);
+                let mut principal = (*authenticated_test_superuser()).clone();
+                principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+                let client = sessions
+                    .register_connection(recipient_tx, Arc::new(principal))
+                    .await
+                    .unwrap();
+                let hooks = Arc::new(pioneer_mcp_oauth::OAuthTestHooks::default());
+                hooks.pause_after_winner.store(true, Ordering::SeqCst);
+                struct Release(Arc<pioneer_mcp_oauth::OAuthTestHooks>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.publish_resolution.notify_one();
                     }
                 }
-            })
-            .await
-            .unwrap();
-            let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
-            let state = url
-                .query_pairs()
-                .find(|(key, _)| key == "state")
-                .unwrap()
-                .1
-                .into_owned();
-            service
-                .oauth()
-                .callback(
-                    &id,
-                    client,
-                    pioneer_mcp_oauth::OAuthCallback {
-                        flow_id: browser["flow_id"].as_str().unwrap().into(),
-                        state,
-                        code: Some("single-code".into()),
-                        issuer: Some(issuer),
-                        error: None,
-                    },
-                )
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(3), hooks.winner_reserved.notified())
-                .await
-                .unwrap();
-            assert_eq!(
-                service.oauth().state(&id).await,
-                Some(pioneer_mcp_oauth::OAuthState::Resolving)
-            );
-            if deadline {
-                *clock.0.lock().unwrap() += Duration::from_secs(1200);
-            } else {
-                sessions.unregister_connection(client).await;
-            }
-            tokio::time::timeout(Duration::from_secs(3), hooks.retirement_observed.notified())
-                .await
-                .unwrap();
-            hooks.publish_resolution.notify_one();
-            let flow = browser["flow_id"].as_str().unwrap();
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while !service
-                    .oauth()
-                    .resolution_finished_for_test(&id, flow)
-                    .await
-                {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                let _release = Release(hooks.clone());
+                struct Clock(std::sync::Mutex<std::time::SystemTime>);
+                impl pioneer_mcp_oauth::OAuthClock for Clock {
+                    fn now(&self) -> std::time::SystemTime {
+                        *self.0.lock().unwrap()
+                    }
                 }
-            })
-            .await
-            .unwrap();
-            if deadline {
-                async fn wire_state(
-                    recipient: &mut crate::session::test_support::OutboundTestReceiver,
-                    state: &str,
-                ) -> JsonValue {
-                    tokio::time::timeout(Duration::from_secs(3), async {
-                        loop {
-                            if let Some(axum::extract::ws::Message::Text(text)) =
-                                recipient.recv().await
-                            {
-                                let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                                assert_ne!(value["params"]["state"], "authorized");
-                                if value["params"]["state"] == state {
-                                    break value["params"].clone();
-                                }
-                            }
-                        }
-                    })
+                let clock = Arc::new(Clock(std::sync::Mutex::new(std::time::SystemTime::now())));
+                let service = McpService::new_with_oauth_options(
+                    store.clone(),
+                    sessions.clone(),
+                    secrets,
+                    Arc::new(AtomicU64::new(1)),
+                    Arc::new(AuthorizationInvalidationHub::default()),
+                    Arc::new(ExecutionLeaseRegistry::default()),
+                    pioneer_mcp_oauth::OAuthServiceOptions {
+                        test_hooks: Some(hooks.clone()),
+                        clock: clock.clone(),
+                        poll_interval: Duration::from_millis(5),
+                        ..Default::default()
+                    },
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let issuer = format!("http://{}", listener.local_addr().unwrap());
+                let metadata = json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/authorize"),"token_endpoint":format!("{issuer}/token"),"registration_endpoint":format!("{issuer}/register"),"response_types_supported":["code"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true});
+                let router=Router::new().route("/.well-known/oauth-authorization-server",get(move||{let metadata=metadata.clone();async move{Json(metadata)}}))
+                    .route("/register",post(|Json(body):Json<JsonValue>|async move{Json(json!({"client_id":"real-recovery-client","redirect_uris":body["redirect_uris"]}))}))
+                    .route("/token",post(||async{Json(json!({"access_token":"recovered-token","refresh_token":"rotated-token","token_type":"Bearer","expires_in":3600}))}));
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+                struct Server(tokio::task::JoinHandle<()>);
+                impl Drop for Server {
+                    fn drop(&mut self) {
+                        self.0.abort();
+                    }
+                }
+                let _server = Server(server);
+                let id = seed_mcp_installation(&store, &workspace, "real-recovery", false, false).await;
+                let mut row = store
+                    .find_mcp_server_installation("workspace", &workspace, "real-recovery")
                     .await
                     .unwrap()
-                }
-                let resolving = wire_state(&mut recipient, "resolving").await;
-                assert_eq!(resolving["flow_id"], browser["flow_id"]);
-                assert!(resolving["authorization_url"].is_null());
-                let (second_tx, mut second_rx) =
-                    crate::session::test_support::outbound_channel(1024);
-                let mut second_principal = (*authenticated_test_superuser()).clone();
-                second_principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
-                let second = sessions
-                    .register_connection(second_tx, Arc::new(second_principal))
-                    .await
                     .unwrap();
-                let mut replacement = row.clone();
-                let mut config = installation.clone();
-                config.auth.oauth = Some(pioneer_mcp::McpOAuthConfig {
-                    scopes: vec!["additional".into()],
-                    ..Default::default()
-                });
-                replacement.auth_json = serde_json::to_string(&config.auth).unwrap();
+                row.transport_kind = "streamable_http".into();
+                row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                    url: format!("{issuer}/mcp"),
+                    headers: BTreeMap::new(),
+                    startup_timeout_ms: 5000,
+                    tool_timeout_ms: 120000,
+                })
+                .unwrap();
                 store
-                    .upsert_mcp_server_installation(&replacement, now_timestamp_secs())
+                    .upsert_mcp_server_installation(&row, now_timestamp_secs())
                     .await
                     .unwrap();
+                let installation = installation_from_record(&row).unwrap();
                 service
                     .oauth()
-                    .sign_in_in_workspace(
+                    .sign_in(
                         &id,
-                        &config,
-                        second,
+                        &installation,
+                        client,
                         "http://127.0.0.1:37643/oauth/mcp/callback",
-                        &workspace,
                     )
                     .await
                     .unwrap();
-                let retired = wire_state(&mut recipient, "retired").await;
-                assert_eq!(retired["flow_id"], browser["flow_id"]);
-                assert!(retired["authorization_url"].is_null());
-                let next = wire_state(&mut second_rx, "awaiting_callback").await;
-                assert_ne!(next["flow_id"], browser["flow_id"]);
-                assert!(next["authorization_url"].is_string());
-                while let Ok(frame) = recipient.try_recv() {
-                    if let axum::extract::ws::Message::Text(text) = frame {
+                let browser = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let axum::extract::ws::Message::Text(text) = recipient.recv().await.unwrap()
+                        else {
+                            continue;
+                        };
                         let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                        assert!(
-                            value["params"]["authorization_url"].is_null(),
-                            "client A must never receive client B's consent URL"
-                        );
+                        if value["params"]["state"] == "awaiting_callback" {
+                            break value["params"].clone();
+                        }
                     }
-                }
-            } else {
+                })
+                .await
+                .unwrap();
+                let url = url::Url::parse(browser["authorization_url"].as_str().unwrap()).unwrap();
+                let state = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                service
+                    .oauth()
+                    .callback(
+                        &id,
+                        client,
+                        pioneer_mcp_oauth::OAuthCallback {
+                            flow_id: browser["flow_id"].as_str().unwrap().into(),
+                            state,
+                            code: Some("single-code".into()),
+                            issuer: Some(issuer),
+                            error: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(3), hooks.winner_reserved.notified())
+                    .await
+                    .unwrap();
                 assert_eq!(
                     service.oauth().state(&id).await,
                     Some(pioneer_mcp_oauth::OAuthState::Resolving)
                 );
-                while let Ok(frame) = recipient.try_recv() {
-                    if let axum::extract::ws::Message::Text(text) = frame {
-                        let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
-                        assert_ne!(
-                            value["params"]["state"], "resolving",
-                            "retirement notification cannot reach a disconnected initiator"
-                        );
-                        assert_ne!(value["params"]["state"], "authorized");
+                if deadline {
+                    *clock.0.lock().unwrap() += Duration::from_secs(1200);
+                } else {
+                    sessions.unregister_connection(client).await;
+                }
+                tokio::time::timeout(Duration::from_secs(3), hooks.retirement_observed.notified())
+                    .await
+                    .unwrap();
+                hooks.publish_resolution.notify_one();
+                let flow = browser["flow_id"].as_str().unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !service
+                        .oauth()
+                        .resolution_finished_for_test(&id, flow)
+                        .await
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                if deadline {
+                    async fn wire_state(
+                        recipient: &mut crate::session::test_support::OutboundTestReceiver,
+                        state: &str,
+                    ) -> JsonValue {
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            loop {
+                                if let Some(axum::extract::ws::Message::Text(text)) =
+                                    recipient.recv().await
+                                {
+                                    let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                                    assert_ne!(value["params"]["state"], "authorized");
+                                    if value["params"]["state"] == state {
+                                        break value["params"].clone();
+                                    }
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap()
+                    }
+                    let resolving = wire_state(&mut recipient, "resolving").await;
+                    assert_eq!(resolving["flow_id"], browser["flow_id"]);
+                    assert!(resolving["authorization_url"].is_null());
+                    let (second_tx, mut second_rx) =
+                        crate::session::test_support::outbound_channel(1024);
+                    let mut second_principal = (*authenticated_test_superuser()).clone();
+                    second_principal.access_expires_at_unix = now_timestamp_secs() as u64 + 3600;
+                    let second = sessions
+                        .register_connection(second_tx, Arc::new(second_principal))
+                        .await
+                        .unwrap();
+                    let mut replacement = row.clone();
+                    let mut config = installation.clone();
+                    config.auth.oauth = Some(pioneer_mcp::McpOAuthConfig {
+                        scopes: vec!["additional".into()],
+                        ..Default::default()
+                    });
+                    replacement.auth_json = serde_json::to_string(&config.auth).unwrap();
+                    store
+                        .upsert_mcp_server_installation(&replacement, now_timestamp_secs())
+                        .await
+                        .unwrap();
+                    service
+                        .oauth()
+                        .sign_in_in_workspace(
+                            &id,
+                            &config,
+                            second,
+                            "http://127.0.0.1:37643/oauth/mcp/callback",
+                            &workspace,
+                        )
+                        .await
+                        .unwrap();
+                    let retired = wire_state(&mut recipient, "retired").await;
+                    assert_eq!(retired["flow_id"], browser["flow_id"]);
+                    assert!(retired["authorization_url"].is_null());
+                    let next = wire_state(&mut second_rx, "awaiting_callback").await;
+                    assert_ne!(next["flow_id"], browser["flow_id"]);
+                    assert!(next["authorization_url"].is_string());
+                    while let Ok(frame) = recipient.try_recv() {
+                        if let axum::extract::ws::Message::Text(text) = frame {
+                            let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                            assert!(
+                                value["params"]["authorization_url"].is_null(),
+                                "client A must never receive client B's consent URL"
+                            );
+                        }
+                    }
+                } else {
+                    assert_eq!(
+                        service.oauth().state(&id).await,
+                        Some(pioneer_mcp_oauth::OAuthState::Resolving)
+                    );
+                    while let Ok(frame) = recipient.try_recv() {
+                        if let axum::extract::ws::Message::Text(text) = frame {
+                            let value: JsonValue = serde_json::from_str(text.as_str()).unwrap();
+                            assert_ne!(
+                                value["params"]["state"], "resolving",
+                                "retirement notification cannot reach a disconnected initiator"
+                            );
+                            assert_ne!(value["params"]["state"], "authorized");
+                        }
                     }
                 }
-            }
-            service.shutdown().await;
+                service.shutdown().await;
+                Ok(())
+            }).await.unwrap();
         }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9285,174 +9574,52 @@ mod tests {
         }
     }
     async fn delayed_recovery_mailbox(same_cause: bool, unrelated: bool, retire: u8) {
-        let (service, store, workspace) = test_mcp_service().await;
-        let change = Arc::new(tokio::sync::Notify::new());
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        struct Release(Arc<tokio::sync::Notify>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                self.0.notify_waiters();
-                self.0.notify_one();
-            }
-        }
-        let _release = Release(release.clone());
-        let cause = pioneer_mcp::OAuthFailureCause {
-            generation: "manager-A".into(),
-            revision: 7,
-        };
-        let mut error = McpRuntimeError::failed("delayed OAuth failure A");
-        error.kind = McpRuntimeErrorKind::TransientRefresh;
-        error.oauth_failure = Some(cause.clone());
-        let connects = Arc::new(AtomicUsize::new(0));
-        service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
-            connects: connects.clone(),
-            change: change.clone(),
-            unrelated_degradation: unrelated,
-            tool_barrier: Some((entered.clone(), release.clone())),
-            tool_outcome: Some(if same_cause { Err(error) } else { Ok(()) }),
-            provider: None,
-        }));
-        let id = seed_mcp_installation(&store, &workspace, "late-recovery", true, false).await;
-        service.reload_workspace(&workspace).await.unwrap();
-        let expected = if unrelated {
-            DomainRuntimeState::Degraded
-        } else {
-            DomainRuntimeState::Ready
-        };
-        wait_for_runtime_state(&service, &workspace, &id, expected).await;
-        let generation =
-            service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
-        change.notify_one();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if service.runtime_snapshot("workspace", &workspace).await[&id]
-                    .last_error
-                    .is_some()
-                {
-                    break;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, store, workspace) = test_mcp_service(db_fixture).await;
+            let change = Arc::new(tokio::sync::Notify::new());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            struct Release(Arc<tokio::sync::Notify>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                    self.0.notify_one();
                 }
-                tokio::time::sleep(Duration::from_millis(2)).await;
             }
-        })
-        .await
-        .unwrap();
-        let (tx, mailbox) = {
-            let tasks = service.inner.tasks.lock().await;
-            (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
-        };
-        let (response_tx, response) = oneshot::channel();
-        tx.send(McpServerCommand::Tool(McpServerCallCommand {
-            request: pioneer_tools::McpToolCallRequest {
-                workspace_id: workspace.clone(),
-                turn_id: "test-turn".into(),
-                call_id: "delayed-tool".into(),
-                callable_name: "send".into(),
-                server_id: id.clone(),
-                server_name: "late-recovery".into(),
-                raw_tool_name: "send".into(),
-                catalog_version: "test".into(),
-                arguments: json!({}),
-                timeout_ms: 120_000,
-                max_arguments_bytes: 1024,
-            },
-            cancellation: CancellationToken::new(),
-            response_tx,
-        }))
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), entered.notified())
-            .await
-            .unwrap();
-        if !same_cause {
-            *service.inner.oauth_recovery_ack_timeout.lock().unwrap() = Duration::from_millis(20);
-        }
-        let scoped = crate::mcp_oauth::maintenance_service(service.inner.clone());
-        let recovery_service = scoped.clone();
-        let recovery_id = id.clone();
-        let mut recovered = Some(tokio::spawn(async move {
-            recovery_service
-                .oauth_recovered_with_admission(
-                    &recovery_id,
-                    None,
-                    None,
-                    if same_cause { Some(cause) } else { None },
-                )
-                .await;
-        }));
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                if mailbox.pending.lock().unwrap().is_some() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        if !same_cause {
-            tokio::time::timeout(Duration::from_secs(1), recovered.take().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                mailbox.pending.lock().unwrap().is_some(),
-                "ack expiry must retain owned recovery"
-            );
-            let admission = tokio::time::timeout(
-                Duration::from_millis(100),
-                service.installation_lifecycle_guard("workspace", &workspace, "late-recovery"),
-            )
-            .await
-            .unwrap();
-            drop(admission);
-        } else {
-            assert!(!recovered.as_ref().unwrap().is_finished());
-        }
-        let stop = if retire != 0 {
-            let service = scoped.clone();
-            let id = id.clone();
-            Some(tokio::spawn(async move {
-                if retire == 2 {
-                    service.shutdown().await;
-                } else {
-                    service.stop_task(&id, DomainRuntimeState::Stopped).await;
-                }
-            }))
-        } else {
-            None
-        };
-        if retire != 0 {
+            let _release = Release(release.clone());
+            let cause = pioneer_mcp::OAuthFailureCause {
+                generation: "manager-A".into(),
+                revision: 7,
+            };
+            let mut error = McpRuntimeError::failed("delayed OAuth failure A");
+            error.kind = McpRuntimeErrorKind::TransientRefresh;
+            error.oauth_failure = Some(cause.clone());
+            let connects = Arc::new(AtomicUsize::new(0));
+            service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+                connects: connects.clone(),
+                change: change.clone(),
+                unrelated_degradation: unrelated,
+                tool_barrier: Some((entered.clone(), release.clone())),
+                tool_outcome: Some(if same_cause { Err(error) } else { Ok(()) }),
+                provider: None,
+            }));
+            let id = seed_mcp_installation(&store, &workspace, "late-recovery", true, false).await;
+            service.reload_workspace(&workspace).await.unwrap();
+            let expected = if unrelated {
+                DomainRuntimeState::Degraded
+            } else {
+                DomainRuntimeState::Ready
+            };
+            wait_for_runtime_state(&service, &workspace, &id, expected).await;
+            let generation =
+                service.runtime_snapshot("workspace", &workspace).await[&id].runtime_generation;
+            change.notify_one();
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    if mailbox.pending.lock().unwrap().is_none() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-        }
-        release.notify_one();
-        let result = response.await.unwrap();
-        assert_eq!(result.is_err(), same_cause);
-        if let Some(stop) = stop {
-            stop.await.unwrap();
-        } else {
-            tokio::time::timeout(Duration::from_secs(3), async {
-                loop {
-                    let snapshot =
-                        service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-                    if snapshot.last_error.is_none() {
-                        assert_eq!(snapshot.state, expected);
-                        assert_eq!(snapshot.runtime_generation, generation);
-                        if unrelated {
-                            assert_eq!(
-                                snapshot.status_reason.as_deref(),
-                                Some("unrelated stream limitation")
-                            );
-                        }
+                    if service.runtime_snapshot("workspace", &workspace).await[&id]
+                        .last_error
+                        .is_some()
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -9460,935 +9627,1170 @@ mod tests {
             })
             .await
             .unwrap();
-        }
-        if let Some(recovered) = recovered {
-            recovered.await.unwrap();
-        }
-        assert!(mailbox.pending.lock().unwrap().is_none());
-        assert_eq!(connects.load(Ordering::SeqCst), 1);
-        if retire == 1 {
-            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-                tools: vec!["send"],
-                fail_auth: false,
-            }));
-            service
-                .restart_server("workspace", &workspace, "late-recovery")
+            let (tx, mailbox) = {
+                let tasks = service.inner.tasks.lock().await;
+                (tasks[&id].call_tx.clone(), tasks[&id].recovery.clone())
+            };
+            let (response_tx, response) = oneshot::channel();
+            tx.send(McpServerCommand::Tool(McpServerCallCommand {
+                request: pioneer_tools::McpToolCallRequest {
+                    workspace_id: workspace.clone(),
+                    turn_id: "test-turn".into(),
+                    call_id: "delayed-tool".into(),
+                    callable_name: "send".into(),
+                    server_id: id.clone(),
+                    server_name: "late-recovery".into(),
+                    raw_tool_name: "send".into(),
+                    catalog_version: "test".into(),
+                    arguments: json!({}),
+                    timeout_ms: 120_000,
+                    max_arguments_bytes: 1024,
+                },
+                cancellation: CancellationToken::new(),
+                response_tx,
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), entered.notified())
                 .await
                 .unwrap();
-            wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
-            let replacement = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-            assert!(replacement.runtime_generation > generation);
-            assert!(replacement.last_error.is_none());
+            if !same_cause {
+                *service.inner.oauth_recovery_ack_timeout.lock().unwrap() =
+                    Duration::from_millis(20);
+            }
+            let scoped = crate::mcp_oauth::maintenance_service(service.inner.clone());
+            let recovery_service = scoped.clone();
+            let recovery_id = id.clone();
+            let mut recovered = Some(tokio::spawn(async move {
+                recovery_service
+                    .oauth_recovered_with_admission(
+                        &recovery_id,
+                        None,
+                        None,
+                        if same_cause { Some(cause) } else { None },
+                    )
+                    .await;
+            }));
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if mailbox.pending.lock().unwrap().is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if !same_cause {
+                tokio::time::timeout(Duration::from_secs(1), recovered.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    mailbox.pending.lock().unwrap().is_some(),
+                    "ack expiry must retain owned recovery"
+                );
+                let admission = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    service.installation_lifecycle_guard("workspace", &workspace, "late-recovery"),
+                )
+                .await
+                .unwrap();
+                drop(admission);
+            } else {
+                assert!(!recovered.as_ref().unwrap().is_finished());
+            }
+            let stop = if retire != 0 {
+                let service = scoped.clone();
+                let id = id.clone();
+                Some(tokio::spawn(async move {
+                    if retire == 2 {
+                        service.shutdown().await;
+                    } else {
+                        service.stop_task(&id, DomainRuntimeState::Stopped).await;
+                    }
+                }))
+            } else {
+                None
+            };
+            if retire != 0 {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if mailbox.pending.lock().unwrap().is_none() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            release.notify_one();
+            let result = response.await.unwrap();
+            assert_eq!(result.is_err(), same_cause);
+            if let Some(stop) = stop {
+                stop.await.unwrap();
+            } else {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let snapshot =
+                            service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                        if snapshot.last_error.is_none() {
+                            assert_eq!(snapshot.state, expected);
+                            assert_eq!(snapshot.runtime_generation, generation);
+                            if unrelated {
+                                assert_eq!(
+                                    snapshot.status_reason.as_deref(),
+                                    Some("unrelated stream limitation")
+                                );
+                            }
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            if let Some(recovered) = recovered {
+                recovered.await.unwrap();
+            }
             assert!(mailbox.pending.lock().unwrap().is_none());
-        } else if retire == 2 {
-            assert_eq!(
-                service.runtime_snapshot("workspace", &workspace).await[&id].state,
-                DomainRuntimeState::Stopped
-            );
-        }
-        service.shutdown().await;
+            assert_eq!(connects.load(Ordering::SeqCst), 1);
+            if retire == 1 {
+                service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                    tools: vec!["send"],
+                    fail_auth: false,
+                }));
+                service
+                    .restart_server("workspace", &workspace, "late-recovery")
+                    .await
+                    .unwrap();
+                wait_for_runtime_state(&service, &workspace, &id, DomainRuntimeState::Ready).await;
+                let replacement =
+                    service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                assert!(replacement.runtime_generation > generation);
+                assert!(replacement.last_error.is_none());
+                assert!(mailbox.pending.lock().unwrap().is_none());
+            } else if retire == 2 {
+                assert_eq!(
+                    service.runtime_snapshot("workspace", &workspace).await[&id].state,
+                    DomainRuntimeState::Stopped
+                );
+            }
+            service.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_recovery_keeps_session_generation_and_unrelated_degraded_reason() {
         for unrelated in [false, true] {
-            let (service, store, workspace) = test_mcp_service().await;
-            let connects = Arc::new(AtomicUsize::new(0));
-            let change = Arc::new(tokio::sync::Notify::new());
-            service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
-                connects: connects.clone(),
-                change: change.clone(),
-                unrelated_degradation: unrelated,
-                tool_barrier: None,
-                tool_outcome: None,
-                provider: None,
-            }));
-            let id = seed_mcp_installation(&store, &workspace, "oauth-recovery", true, false).await;
-            service.reload_workspace(&workspace).await.unwrap();
-            let original_state = if unrelated {
-                DomainRuntimeState::Degraded
-            } else {
-                DomainRuntimeState::Ready
-            };
-            wait_for_runtime_state(&service, &workspace, &id, original_state).await;
-            let before = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-            change.notify_one();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let snapshots = service.runtime_snapshot("workspace", &workspace).await;
-                    if snapshots[&id].last_error.as_deref()
-                        == Some("OAuth token refresh temporarily unavailable")
-                    {
-                        break;
+            pioneer_postgres_test::with_database(async |db_fixture| {
+                let (service, store, workspace) = test_mcp_service(db_fixture).await;
+                let connects = Arc::new(AtomicUsize::new(0));
+                let change = Arc::new(tokio::sync::Notify::new());
+                service.set_connector_for_tests(Arc::new(RefreshFailureConnector {
+                    connects: connects.clone(),
+                    change: change.clone(),
+                    unrelated_degradation: unrelated,
+                    tool_barrier: None,
+                    tool_outcome: None,
+                    provider: None,
+                }));
+                let id =
+                    seed_mcp_installation(&store, &workspace, "oauth-recovery", true, false).await;
+                service.reload_workspace(&workspace).await.unwrap();
+                let original_state = if unrelated {
+                    DomainRuntimeState::Degraded
+                } else {
+                    DomainRuntimeState::Ready
+                };
+                wait_for_runtime_state(&service, &workspace, &id, original_state).await;
+                let before = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                change.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let snapshots = service.runtime_snapshot("workspace", &workspace).await;
+                        if snapshots[&id].last_error.as_deref()
+                            == Some("OAuth token refresh temporarily unavailable")
+                        {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
                     }
-                    sleep(Duration::from_millis(10)).await;
+                })
+                .await
+                .unwrap();
+                service.oauth_recovered(&id).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let snapshots = service.runtime_snapshot("workspace", &workspace).await;
+                        let snapshot = &snapshots[&id];
+                        if snapshot.state == original_state && snapshot.last_error.is_none() {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
+                assert_eq!(before.runtime_generation, after.runtime_generation);
+                assert_eq!(connects.load(Ordering::SeqCst), 1);
+                if unrelated {
+                    assert_eq!(
+                        after.status_reason.as_deref(),
+                        Some("unrelated stream limitation")
+                    );
                 }
+                // Repeated/ordinary successful refresh is a no-op for this actor.
+                service.oauth_recovered(&id).await;
+                assert_eq!(connects.load(Ordering::SeqCst), 1);
+                service.shutdown().await;
+                Ok(())
             })
             .await
             .unwrap();
-            service.oauth_recovered(&id).await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let snapshots = service.runtime_snapshot("workspace", &workspace).await;
-                    let snapshot = &snapshots[&id];
-                    if snapshot.state == original_state && snapshot.last_error.is_none() {
-                        break;
-                    }
-                    sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            let after = service.runtime_snapshot("workspace", &workspace).await[&id].clone();
-            assert_eq!(before.runtime_generation, after.runtime_generation);
-            assert_eq!(connects.load(Ordering::SeqCst), 1);
-            if unrelated {
-                assert_eq!(
-                    after.status_reason.as_deref(),
-                    Some("unrelated stream limitation")
-                );
-            }
-            // Repeated/ordinary successful refresh is a no-op for this actor.
-            service.oauth_recovered(&id).await;
-            assert_eq!(connects.load(Ordering::SeqCst), 1);
-            service.shutdown().await;
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oauth_loss_event_stops_live_runtime_and_disconnect_preserves_installation() {
-        use pioneer_mcp::McpOAuthProvider;
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        let id = seed_mcp_installation(&crud_store, &workspace_id, "oauth-test", true, false).await;
-        let mut row = crud_store
-            .find_mcp_server_installation("workspace", &workspace_id, "oauth-test")
-            .await
-            .unwrap()
-            .unwrap();
-        row.transport_kind = "streamable_http".into();
-        row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
-            url: "http://127.0.0.1:1/mcp".into(),
-            headers: BTreeMap::new(),
-            startup_timeout_ms: 500,
-            tool_timeout_ms: 500,
-        })
-        .unwrap();
-        crud_store
-            .upsert_mcp_server_installation(&row, 1_700_000_001)
-            .await
-            .unwrap();
-        service.reload_workspace(&workspace_id).await.unwrap();
-        wait_for_runtime_state(&service, &workspace_id, &id, DomainRuntimeState::Ready).await;
-        assert!(service.task_exists(&id).await);
-        // The OAuth service emits through the production Gateway adapter. There
-        // is no browser intent at startup and the fake MCP connector uses no network.
-        service.oauth().authorization_lost(&id).await;
-        wait_for_runtime_state(
-            &service,
-            &workspace_id,
-            &id,
-            DomainRuntimeState::AuthRequired,
-        )
-        .await;
-        assert!(!service.task_exists(&id).await);
-        service.oauth().disconnect(&id).await.unwrap();
-        service.stop_oauth_connection(&row).await;
-        assert!(
-            crud_store
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            use pioneer_mcp::McpOAuthProvider;
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            let id =
+                seed_mcp_installation(&crud_store, &workspace_id, "oauth-test", true, false).await;
+            let mut row = crud_store
                 .find_mcp_server_installation("workspace", &workspace_id, "oauth-test")
                 .await
                 .unwrap()
-                .is_some()
-        );
-        assert!(!service.task_exists(&id).await);
-        service.shutdown().await;
+                .unwrap();
+            row.transport_kind = "streamable_http".into();
+            row.transport_json = serde_json::to_string(&McpTransportConfig::StreamableHttp {
+                url: "http://127.0.0.1:1/mcp".into(),
+                headers: BTreeMap::new(),
+                startup_timeout_ms: 500,
+                tool_timeout_ms: 500,
+            })
+            .unwrap();
+            crud_store
+                .upsert_mcp_server_installation(&row, 1_700_000_001)
+                .await
+                .unwrap();
+            service.reload_workspace(&workspace_id).await.unwrap();
+            wait_for_runtime_state(&service, &workspace_id, &id, DomainRuntimeState::Ready).await;
+            assert!(service.task_exists(&id).await);
+            // The OAuth service emits through the production Gateway adapter. There
+            // is no browser intent at startup and the fake MCP connector uses no network.
+            service.oauth().authorization_lost(&id).await;
+            wait_for_runtime_state(
+                &service,
+                &workspace_id,
+                &id,
+                DomainRuntimeState::AuthRequired,
+            )
+            .await;
+            assert!(!service.task_exists(&id).await);
+            service.oauth().disconnect(&id).await.unwrap();
+            service.stop_oauth_connection(&row).await;
+            assert!(
+                crud_store
+                    .find_mcp_server_installation("workspace", &workspace_id, "oauth-test")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!service.task_exists(&id).await);
+            service.shutdown().await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_secret_rotation_same_ref_restarts_runtime_and_advances_runtime_generation() {
-        let (service, crud_store, workspace_id, gateway_secrets) =
-            test_mcp_service_with_secrets().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
-        let secret_ref_id = "mcp-secret-same-ref";
-        configure_mcp_installation_secret(
-            &crud_store,
-            workspace_id.as_str(),
-            "resend",
-            secret_ref_id,
-        )
-        .await;
-        gateway_secrets
-            .put_mcp_secret(secret_ref_id, "secret-canary-before-rotation", None)
-            .expect("initial MCP secret should persist");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id, gateway_secrets) =
+                test_mcp_service_with_secrets(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false)
+                    .await;
+            let secret_ref_id = "mcp-secret-same-ref";
+            configure_mcp_installation_secret(
+                &crud_store,
+                workspace_id.as_str(),
+                "resend",
+                secret_ref_id,
+            )
+            .await;
+            gateway_secrets
+                .put_mcp_secret(secret_ref_id, "secret-canary-before-rotation", None)
+                .expect("initial MCP secret should persist");
 
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("initial secret-backed runtime should start");
-        wait_for_runtime_state(
-            &service,
-            workspace_id.as_str(),
-            installation_id.as_str(),
-            DomainRuntimeState::Ready,
-        )
-        .await;
-        let first_generation = service
-            .runtime_snapshot("workspace", workspace_id.as_str())
-            .await[installation_id.as_str()]
-        .runtime_generation;
-        let explicit_tool = tool_ref("mcp-tool:workspace:resend:send", "resend", "send");
-        let first_projection = service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id: workspace_id.clone(),
-                turn_id: "turn_before_secret_rotation".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![explicit_tool.clone()],
-            })
-            .await
-            .expect("first projection should resolve");
-        assert_eq!(
-            first_projection.tools[0].runtime_generation,
-            first_generation
-        );
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("initial secret-backed runtime should start");
+            wait_for_runtime_state(
+                &service,
+                workspace_id.as_str(),
+                installation_id.as_str(),
+                DomainRuntimeState::Ready,
+            )
+            .await;
+            let first_generation = service
+                .runtime_snapshot("workspace", workspace_id.as_str())
+                .await[installation_id.as_str()]
+            .runtime_generation;
+            let explicit_tool = tool_ref("mcp-tool:workspace:resend:send", "resend", "send");
+            let first_projection = service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id: workspace_id.clone(),
+                    turn_id: "turn_before_secret_rotation".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![explicit_tool.clone()],
+                })
+                .await
+                .expect("first projection should resolve");
+            assert_eq!(
+                first_projection.tools[0].runtime_generation,
+                first_generation
+            );
 
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("unchanged secret material should reuse runtime");
-        let unchanged_generation = service
-            .runtime_snapshot("workspace", workspace_id.as_str())
-            .await[installation_id.as_str()]
-        .runtime_generation;
-        assert_eq!(unchanged_generation, first_generation);
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("unchanged secret material should reuse runtime");
+            let unchanged_generation = service
+                .runtime_snapshot("workspace", workspace_id.as_str())
+                .await[installation_id.as_str()]
+            .runtime_generation;
+            assert_eq!(unchanged_generation, first_generation);
 
-        gateway_secrets
-            .put_mcp_secret(secret_ref_id, "secret-canary-after-rotation", None)
-            .expect("rotated MCP secret should persist under the same ref");
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("secret rotation should replace the upstream runtime");
-        wait_for_runtime_state(
-            &service,
-            workspace_id.as_str(),
-            installation_id.as_str(),
-            DomainRuntimeState::Ready,
-        )
-        .await;
-        let rotated_generation = service
-            .runtime_snapshot("workspace", workspace_id.as_str())
-            .await[installation_id.as_str()]
-        .runtime_generation;
-        assert!(rotated_generation > first_generation);
+            gateway_secrets
+                .put_mcp_secret(secret_ref_id, "secret-canary-after-rotation", None)
+                .expect("rotated MCP secret should persist under the same ref");
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("secret rotation should replace the upstream runtime");
+            wait_for_runtime_state(
+                &service,
+                workspace_id.as_str(),
+                installation_id.as_str(),
+                DomainRuntimeState::Ready,
+            )
+            .await;
+            let rotated_generation = service
+                .runtime_snapshot("workspace", workspace_id.as_str())
+                .await[installation_id.as_str()]
+            .runtime_generation;
+            assert!(rotated_generation > first_generation);
 
-        let rotated_projection = service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_after_secret_rotation".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![explicit_tool],
-            })
-            .await
-            .expect("projection after secret rotation should resolve");
-        assert_eq!(
-            rotated_projection.tools[0].runtime_generation,
-            rotated_generation
-        );
-        assert_ne!(
-            rotated_projection.manifest_hash,
-            first_projection.manifest_hash
-        );
-        let projection_debug = format!("{rotated_projection:?}");
-        assert!(!projection_debug.contains("secret-canary-before-rotation"));
-        assert!(!projection_debug.contains("secret-canary-after-rotation"));
+            let rotated_projection = service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_after_secret_rotation".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![explicit_tool],
+                })
+                .await
+                .expect("projection after secret rotation should resolve");
+            assert_eq!(
+                rotated_projection.tools[0].runtime_generation,
+                rotated_generation
+            );
+            assert_ne!(
+                rotated_projection.manifest_hash,
+                first_projection.manifest_hash
+            );
+            let projection_debug = format!("{rotated_projection:?}");
+            assert!(!projection_debug.contains("secret-canary-before-rotation"));
+            assert!(!projection_debug.contains("secret-canary-after-rotation"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_mcp_projection_preserves_wrong_scope_rejection_without_tools() {
-        let (service, _crud_store, workspace_id) = test_mcp_service().await;
-        let failure = service
-            .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_wrong_scope".to_owned(),
-                explicit_servers: vec![AgentMcpServerRef {
-                    capability_id: "mcp-server:user:resend".to_owned(),
-                    label: Some("resend".to_owned()),
-                    name: "resend".to_owned(),
-                    scope_kind: McpScopeKind::User,
-                }],
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect_err("wrong-scope capability should fail as a typed rejection");
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, _crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            let failure = service
+                .resolve_mcp_turn_projection(&AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_wrong_scope".to_owned(),
+                    explicit_servers: vec![AgentMcpServerRef {
+                        capability_id: "mcp-server:user:resend".to_owned(),
+                        label: Some("resend".to_owned()),
+                        name: "resend".to_owned(),
+                        scope_kind: McpScopeKind::User,
+                    }],
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect_err("wrong-scope capability should fail as a typed rejection");
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
-        );
-        assert!(failure.accepted_capabilities.is_empty());
-        assert_eq!(failure.rejected_capabilities.len(), 1);
-        assert_eq!(
-            failure.rejected_capabilities[0].reason,
-            TurnCapabilityRejectedReason::ProviderUnsupported
-        );
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
+            );
+            assert!(failure.accepted_capabilities.is_empty());
+            assert_eq!(failure.rejected_capabilities.len(), 1);
+            assert_eq!(
+                failure.rejected_capabilities[0].reason,
+                TurnCapabilityRejectedReason::ProviderUnsupported
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capability_resolution_accepts_live_mcp_server_selection() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_mcp_server_capability".to_owned(),
-                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect("MCP materialization should succeed");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_mcp_server_capability".to_owned(),
+                    explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect("MCP materialization should succeed");
 
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(materialization.accepted_capabilities.len(), 1);
-        assert_eq!(
-            materialization.accepted_capabilities[0].reason,
-            TurnCapabilityAcceptedReason::ExplicitComposerCapability
-        );
-        assert!(
-            materialization
-                .bundles
-                .iter()
-                .flat_map(|bundle| bundle.specs.iter())
-                .any(|configured| configured.spec.name == "mcp_resend_send")
-        );
-        assert_eq!(
-            materialization.available_mcp,
-            vec![
-                "resend".to_owned(),
-                "resend/domains".to_owned(),
-                "resend/send".to_owned(),
-            ]
-        );
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(materialization.accepted_capabilities.len(), 1);
+            assert_eq!(
+                materialization.accepted_capabilities[0].reason,
+                TurnCapabilityAcceptedReason::ExplicitComposerCapability
+            );
+            assert!(
+                materialization
+                    .bundles
+                    .iter()
+                    .flat_map(|bundle| bundle.specs.iter())
+                    .any(|configured| configured.spec.name == "mcp_resend_send")
+            );
+            assert_eq!(
+                materialization.available_mcp,
+                vec![
+                    "resend".to_owned(),
+                    "resend/domains".to_owned(),
+                    "resend/send".to_owned(),
+                ]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_capability_validation_accepts_live_tool_selection() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_mcp_tool_capability".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
-            })
-            .await
-            .expect("MCP materialization should succeed");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_mcp_tool_capability".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![tool_ref(
+                        "mcp-tool:workspace:resend:send",
+                        "resend",
+                        "send",
+                    )],
+                })
+                .await
+                .expect("MCP materialization should succeed");
 
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(materialization.accepted_capabilities.len(), 1);
-        assert_eq!(
-            materialization.accepted_capabilities[0].id,
-            "mcp-tool:workspace:resend:send"
-        );
-        assert!(
-            materialization
-                .bundles
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(materialization.accepted_capabilities.len(), 1);
+            assert_eq!(
+                materialization.accepted_capabilities[0].id,
+                "mcp-tool:workspace:resend:send"
+            );
+            assert!(
+                materialization
+                    .bundles
+                    .iter()
+                    .flat_map(|bundle| bundle.specs.iter())
+                    .any(|configured| configured.spec.name == "mcp_resend_send")
+            );
+            assert_eq!(
+                materialization.available_mcp,
+                vec![
+                    "resend".to_owned(),
+                    "resend/domains".to_owned(),
+                    "resend/send".to_owned(),
+                ]
+            );
+            let bindings = materialization.mcp_bindings.as_slice();
+            let persisted_bindings = crud_store
+                .list_turn_mcp_bindings("turn_mcp_tool_capability")
+                .await
+                .expect("turn MCP bindings should load");
+            assert!(
+                persisted_bindings.is_empty(),
+                "materialization is a side-effect-free combined preflight stage"
+            );
+            let send_binding = bindings
                 .iter()
-                .flat_map(|bundle| bundle.specs.iter())
-                .any(|configured| configured.spec.name == "mcp_resend_send")
-        );
-        assert_eq!(
-            materialization.available_mcp,
-            vec![
-                "resend".to_owned(),
-                "resend/domains".to_owned(),
-                "resend/send".to_owned(),
-            ]
-        );
-        let bindings = materialization.mcp_bindings.as_slice();
-        let persisted_bindings = crud_store
-            .list_turn_mcp_bindings("turn_mcp_tool_capability")
-            .await
-            .expect("turn MCP bindings should load");
-        assert!(
-            persisted_bindings.is_empty(),
-            "materialization is a side-effect-free combined preflight stage"
-        );
-        let send_binding = bindings
-            .iter()
-            .find(|binding| binding.raw_tool_name == "send")
-            .expect("selected tool should persist a binding");
-        assert_eq!(
-            send_binding.selection_reason,
-            MCP_SELECTION_EXPLICIT_CAPABILITY
-        );
-        assert_eq!(
-            send_binding.capability_id.as_deref(),
-            Some("mcp-tool:workspace:resend:send")
-        );
+                .find(|binding| binding.raw_tool_name == "send")
+                .expect("selected tool should persist a binding");
+            assert_eq!(
+                send_binding.selection_reason,
+                MCP_SELECTION_EXPLICIT_CAPABILITY
+            );
+            assert_eq!(
+                send_binding.capability_id.as_deref(),
+                Some("mcp-tool:workspace:resend:send")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explicit_capability_preflight_rejects_unavailable_mcp_server() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: true,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_runtime_state(
-            &service,
-            workspace_id.as_str(),
-            installation_id.as_str(),
-            DomainRuntimeState::AuthRequired,
-        )
-        .await;
-
-        let failure = expect_mcp_materialization_failure(
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: true,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true)
+                    .await;
             service
-                .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                    workspace_id,
-                    turn_id: "turn_mcp_unavailable_capability".to_owned(),
-                    explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
-                    explicit_tools: Vec::new(),
-                })
-                .await,
-            "explicit unavailable MCP server should fail preflight",
-        );
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_runtime_state(
+                &service,
+                workspace_id.as_str(),
+                installation_id.as_str(),
+                DomainRuntimeState::AuthRequired,
+            )
+            .await;
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
-        );
-        assert!(failure.accepted_capabilities.is_empty());
-        assert_eq!(failure.rejected_capabilities.len(), 1);
-        assert_eq!(
-            failure.rejected_capabilities[0].reason,
-            TurnCapabilityRejectedReason::Unavailable
-        );
-        assert!(
-            failure.rejected_capabilities[0]
-                .message
-                .contains("not live")
-        );
+            let failure = expect_mcp_materialization_failure(
+                service
+                    .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                        workspace_id,
+                        turn_id: "turn_mcp_unavailable_capability".to_owned(),
+                        explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                        explicit_tools: Vec::new(),
+                    })
+                    .await,
+                "explicit unavailable MCP server should fail preflight",
+            );
+
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
+            );
+            assert!(failure.accepted_capabilities.is_empty());
+            assert_eq!(failure.rejected_capabilities.len(), 1);
+            assert_eq!(
+                failure.rejected_capabilities[0].reason,
+                TurnCapabilityRejectedReason::Unavailable
+            );
+            assert!(
+                failure.rejected_capabilities[0]
+                    .message
+                    .contains("not live")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_capability_validation_rejects_missing_tool() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
-
-        let failure = expect_mcp_materialization_failure(
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true)
+                    .await;
             service
-                .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                    workspace_id,
-                    turn_id: "turn_mcp_missing_tool_capability".to_owned(),
-                    explicit_servers: Vec::new(),
-                    explicit_tools: vec![tool_ref(
-                        "mcp-tool:workspace:resend:missing",
-                        "resend",
-                        "missing",
-                    )],
-                })
-                .await,
-            "explicit missing MCP tool should fail preflight",
-        );
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
-        );
-        assert!(failure.accepted_capabilities.is_empty());
-        assert_eq!(failure.rejected_capabilities.len(), 1);
-        assert_eq!(
-            failure.rejected_capabilities[0].reason,
-            TurnCapabilityRejectedReason::ToolMissing
-        );
-        assert!(
-            failure.rejected_capabilities[0]
-                .message
-                .contains("does not expose tool")
-        );
+            let failure = expect_mcp_materialization_failure(
+                service
+                    .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                        workspace_id,
+                        turn_id: "turn_mcp_missing_tool_capability".to_owned(),
+                        explicit_servers: Vec::new(),
+                        explicit_tools: vec![tool_ref(
+                            "mcp-tool:workspace:resend:missing",
+                            "resend",
+                            "missing",
+                        )],
+                    })
+                    .await,
+                "explicit missing MCP tool should fail preflight",
+            );
+
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
+            );
+            assert!(failure.accepted_capabilities.is_empty());
+            assert_eq!(failure.rejected_capabilities.len(), 1);
+            assert_eq!(
+                failure.rejected_capabilities[0].reason,
+                TurnCapabilityRejectedReason::ToolMissing
+            );
+            assert!(
+                failure.rejected_capabilities[0]
+                    .message
+                    .contains("does not expose tool")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn workspace_mcp_tool_state_preserves_implicit_policy_without_explicit_refs() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, true)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_mcp_implicit_policy".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect("MCP materialization should succeed");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_mcp_implicit_policy".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect("MCP materialization should succeed");
 
-        assert!(materialization.accepted_capabilities.is_empty());
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(
-            materialized_tool_names(&materialization),
-            vec!["mcp_resend_domains", "mcp_resend_send"]
-        );
-        assert_eq!(
-            materialization.available_mcp,
-            vec![
-                "resend".to_owned(),
-                "resend/domains".to_owned(),
-                "resend/send".to_owned(),
-            ]
-        );
+            assert!(materialization.accepted_capabilities.is_empty());
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(
+                materialized_tool_names(&materialization),
+                vec!["mcp_resend_domains", "mcp_resend_send"]
+            );
+            assert_eq!(
+                materialization.available_mcp,
+                vec![
+                    "resend".to_owned(),
+                    "resend/domains".to_owned(),
+                    "resend/send".to_owned(),
+                ]
+            );
 
-        let bindings = materialization.mcp_bindings.as_slice();
-        let persisted_bindings = crud_store
-            .list_turn_mcp_bindings("turn_mcp_implicit_policy")
-            .await
-            .expect("turn MCP bindings should load");
-        assert!(persisted_bindings.is_empty());
-        assert_eq!(bindings.len(), 2);
-        for binding in bindings {
-            assert_eq!(binding.selection_reason, MCP_SELECTION_IMPLICIT_POLICY);
-            assert_eq!(binding.capability_id, None);
-        }
+            let bindings = materialization.mcp_bindings.as_slice();
+            let persisted_bindings = crud_store
+                .list_turn_mcp_bindings("turn_mcp_implicit_policy")
+                .await
+                .expect("turn MCP bindings should load");
+            assert!(persisted_bindings.is_empty());
+            assert_eq!(bindings.len(), 2);
+            for binding in bindings {
+                assert_eq!(binding.selection_reason, MCP_SELECTION_IMPLICIT_POLICY);
+                assert_eq!(binding.capability_id, None);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_selection_rules_explicit_tool_attaches_only_selected_tool_when_implicit_false() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_mcp_explicit_tool_only".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: vec![tool_ref("mcp-tool:workspace:resend:send", "resend", "send")],
-            })
-            .await
-            .expect("MCP materialization should succeed");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_mcp_explicit_tool_only".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: vec![tool_ref(
+                        "mcp-tool:workspace:resend:send",
+                        "resend",
+                        "send",
+                    )],
+                })
+                .await
+                .expect("MCP materialization should succeed");
 
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(materialization.accepted_capabilities.len(), 1);
-        assert_eq!(
-            materialized_tool_names(&materialization),
-            vec!["mcp_resend_send"]
-        );
-        assert_eq!(materialization.available_mcp, vec!["resend/send"]);
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(materialization.accepted_capabilities.len(), 1);
+            assert_eq!(
+                materialized_tool_names(&materialization),
+                vec!["mcp_resend_send"]
+            );
+            assert_eq!(materialization.available_mcp, vec!["resend/send"]);
 
-        let bindings = materialization.mcp_bindings.as_slice();
-        let persisted_bindings = crud_store
-            .list_turn_mcp_bindings("turn_mcp_explicit_tool_only")
-            .await
-            .expect("turn MCP bindings should load");
-        assert!(persisted_bindings.is_empty());
-        assert_eq!(bindings.len(), 1);
-        let binding = bindings
-            .first()
-            .expect("explicit tool should persist one MCP binding");
-        assert_eq!(binding.raw_tool_name, "send");
-        assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
-        assert_eq!(
-            binding.capability_id.as_deref(),
-            Some("mcp-tool:workspace:resend:send")
-        );
+            let bindings = materialization.mcp_bindings.as_slice();
+            let persisted_bindings = crud_store
+                .list_turn_mcp_bindings("turn_mcp_explicit_tool_only")
+                .await
+                .expect("turn MCP bindings should load");
+            assert!(persisted_bindings.is_empty());
+            assert_eq!(bindings.len(), 1);
+            let binding = bindings
+                .first()
+                .expect("explicit tool should persist one MCP binding");
+            assert_eq!(binding.raw_tool_name, "send");
+            assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
+            assert_eq!(
+                binding.capability_id.as_deref(),
+                Some("mcp-tool:workspace:resend:send")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_selection_rules_explicit_server_expands_all_tools_when_implicit_false() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send", "domains"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send", "domains"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false)
+                    .await;
+            service
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_mcp_explicit_server_all_tools".to_owned(),
-                explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect("MCP materialization should succeed");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_mcp_explicit_server_all_tools".to_owned(),
+                    explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect("MCP materialization should succeed");
 
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(materialization.accepted_capabilities.len(), 1);
-        assert_eq!(
-            materialized_tool_names(&materialization),
-            vec!["mcp_resend_domains", "mcp_resend_send"]
-        );
-        assert_eq!(
-            materialization.available_mcp,
-            vec![
-                "resend".to_owned(),
-                "resend/domains".to_owned(),
-                "resend/send".to_owned(),
-            ]
-        );
-
-        let bindings = materialization.mcp_bindings.as_slice();
-        let persisted_bindings = crud_store
-            .list_turn_mcp_bindings("turn_mcp_explicit_server_all_tools")
-            .await
-            .expect("turn MCP bindings should load");
-        assert!(persisted_bindings.is_empty());
-        assert_eq!(bindings.len(), 2);
-        for binding in bindings {
-            assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(materialization.accepted_capabilities.len(), 1);
             assert_eq!(
-                binding.capability_id.as_deref(),
-                Some("mcp-server:workspace:resend")
+                materialized_tool_names(&materialization),
+                vec!["mcp_resend_domains", "mcp_resend_send"]
             );
-        }
+            assert_eq!(
+                materialization.available_mcp,
+                vec![
+                    "resend".to_owned(),
+                    "resend/domains".to_owned(),
+                    "resend/send".to_owned(),
+                ]
+            );
+
+            let bindings = materialization.mcp_bindings.as_slice();
+            let persisted_bindings = crud_store
+                .list_turn_mcp_bindings("turn_mcp_explicit_server_all_tools")
+                .await
+                .expect("turn MCP bindings should load");
+            assert!(persisted_bindings.is_empty());
+            assert_eq!(bindings.len(), 2);
+            for binding in bindings {
+                assert_eq!(binding.selection_reason, MCP_SELECTION_EXPLICIT_CAPABILITY);
+                assert_eq!(
+                    binding.capability_id.as_deref(),
+                    Some("mcp-server:workspace:resend")
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_selection_rules_reject_disabled_server() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", false, false).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", false, false).await;
 
-        let failure = expect_mcp_materialization_failure(
-            service
-                .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                    workspace_id,
-                    turn_id: "turn_mcp_disabled_server".to_owned(),
-                    explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
-                    explicit_tools: Vec::new(),
-                })
-                .await,
-            "explicit disabled MCP server should fail preflight",
-        );
+            let failure = expect_mcp_materialization_failure(
+                service
+                    .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                        workspace_id,
+                        turn_id: "turn_mcp_disabled_server".to_owned(),
+                        explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                        explicit_tools: Vec::new(),
+                    })
+                    .await,
+                "explicit disabled MCP server should fail preflight",
+            );
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
-        );
-        assert!(failure.accepted_capabilities.is_empty());
-        assert_eq!(failure.rejected_capabilities.len(), 1);
-        assert_eq!(
-            failure.rejected_capabilities[0].reason,
-            TurnCapabilityRejectedReason::DisabledByPolicy
-        );
-        assert!(
-            failure.rejected_capabilities[0]
-                .message
-                .contains("disabled by workspace policy")
-        );
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
+            );
+            assert!(failure.accepted_capabilities.is_empty());
+            assert_eq!(failure.rejected_capabilities.len(), 1);
+            assert_eq!(
+                failure.rejected_capabilities[0].reason,
+                TurnCapabilityRejectedReason::DisabledByPolicy
+            );
+            assert!(
+                failure.rejected_capabilities[0]
+                    .message
+                    .contains("disabled by workspace policy")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_selection_rules_reject_missing_catalog() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
-            tools: vec!["send"],
-            fail_auth: false,
-        }));
-        let installation_id =
-            seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false).await;
-        service
-            .reload_workspace(workspace_id.as_str())
-            .await
-            .expect("MCP workspace should reload");
-        wait_for_catalog(&crud_store, installation_id.as_str()).await;
-        crud_store
-            .delete_mcp_server_catalog_snapshot(installation_id.as_str())
-            .await
-            .expect("test MCP catalog snapshot should delete");
-
-        let failure = expect_mcp_materialization_failure(
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            service.set_connector_for_tests(Arc::new(TestMcpRuntimeConnector {
+                tools: vec!["send"],
+                fail_auth: false,
+            }));
+            let installation_id =
+                seed_mcp_installation(&crud_store, workspace_id.as_str(), "resend", true, false)
+                    .await;
             service
-                .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                    workspace_id,
-                    turn_id: "turn_mcp_missing_catalog".to_owned(),
-                    explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
-                    explicit_tools: Vec::new(),
-                })
-                .await,
-            "explicit server without catalog should fail preflight",
-        );
+                .reload_workspace(workspace_id.as_str())
+                .await
+                .expect("MCP workspace should reload");
+            wait_for_live_catalog(&service, &crud_store, &workspace_id, &installation_id).await;
+            crud_store
+                .delete_mcp_server_catalog_snapshot(installation_id.as_str())
+                .await
+                .expect("test MCP catalog snapshot should delete");
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
-        );
-        assert!(failure.accepted_capabilities.is_empty());
-        assert_eq!(failure.rejected_capabilities.len(), 1);
-        assert_eq!(
-            failure.rejected_capabilities[0].reason,
-            TurnCapabilityRejectedReason::CatalogMissing
-        );
-        assert!(
-            failure.rejected_capabilities[0]
-                .message
-                .contains("no tool catalog snapshot")
-        );
+            let failure = expect_mcp_materialization_failure(
+                service
+                    .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                        workspace_id,
+                        turn_id: "turn_mcp_missing_catalog".to_owned(),
+                        explicit_servers: vec![server_ref("mcp-server:workspace:resend", "resend")],
+                        explicit_tools: Vec::new(),
+                    })
+                    .await,
+                "explicit server without catalog should fail preflight",
+            );
+
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected
+            );
+            assert!(failure.accepted_capabilities.is_empty());
+            assert_eq!(failure.rejected_capabilities.len(), 1);
+            assert_eq!(
+                failure.rejected_capabilities[0].reason,
+                TurnCapabilityRejectedReason::CatalogMissing
+            );
+            assert!(
+                failure.rejected_capabilities[0]
+                    .message
+                    .contains("no tool catalog snapshot")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_resolution_failure_required_unavailable_is_fatal_without_explicit_refs() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        seed_mcp_installation(&crud_store, workspace_id.as_str(), "required", false, false).await;
-        mark_mcp_installation_required(&crud_store, workspace_id.as_str(), "required").await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "required", false, false)
+                .await;
+            mark_mcp_installation_required(&crud_store, workspace_id.as_str(), "required").await;
 
-        let failure = expect_mcp_materialization_failure(
-            service
-                .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                    workspace_id,
-                    turn_id: "turn_required_unavailable".to_owned(),
-                    explicit_servers: Vec::new(),
-                    explicit_tools: Vec::new(),
-                })
-                .await,
-            "required unavailable MCP installation must fail preflight",
-        );
+            let failure = expect_mcp_materialization_failure(
+                service
+                    .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                        workspace_id,
+                        turn_id: "turn_required_unavailable".to_owned(),
+                        explicit_servers: Vec::new(),
+                        explicit_tools: Vec::new(),
+                    })
+                    .await,
+                "required unavailable MCP installation must fail preflight",
+            );
 
-        assert_eq!(
-            failure.reason,
-            AgentMcpMaterializationFailureReason::RequiredInstallationUnavailable
-        );
-        assert!(failure.rejected_capabilities.is_empty());
-        assert_eq!(failure.diagnostics.len(), 1);
-        assert_eq!(
-            failure.diagnostics[0].code,
-            "mcp.resolution.installation_unavailable"
-        );
+            assert_eq!(
+                failure.reason,
+                AgentMcpMaterializationFailureReason::RequiredInstallationUnavailable
+            );
+            assert!(failure.rejected_capabilities.is_empty());
+            assert_eq!(failure.diagnostics.len(), 1);
+            assert_eq!(
+                failure.diagnostics[0].code,
+                "mcp.resolution.installation_unavailable"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mcp_resolution_failure_implicit_non_required_degrades_to_empty_projection() {
-        let (service, crud_store, workspace_id) = test_mcp_service().await;
-        seed_mcp_installation(&crud_store, workspace_id.as_str(), "optional", false, true).await;
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, crud_store, workspace_id) = test_mcp_service(db_fixture).await;
+            seed_mcp_installation(&crud_store, workspace_id.as_str(), "optional", false, true)
+                .await;
 
-        let materialization = service
-            .materialize_mcp_tools(AgentMcpMaterializationRequest {
-                workspace_id,
-                turn_id: "turn_optional_unavailable".to_owned(),
-                explicit_servers: Vec::new(),
-                explicit_tools: Vec::new(),
-            })
-            .await
-            .expect("implicit non-required MCP outage should degrade");
+            let materialization = service
+                .materialize_mcp_tools(AgentMcpMaterializationRequest {
+                    workspace_id,
+                    turn_id: "turn_optional_unavailable".to_owned(),
+                    explicit_servers: Vec::new(),
+                    explicit_tools: Vec::new(),
+                })
+                .await
+                .expect("implicit non-required MCP outage should degrade");
 
-        assert!(materialization.bundles.is_empty());
-        assert!(materialization.accepted_capabilities.is_empty());
-        assert!(materialization.rejected_capabilities.is_empty());
-        assert_eq!(materialization.diagnostics.len(), 1);
-        assert_eq!(
-            materialization.diagnostics[0].code,
-            "mcp.resolution.installation_unavailable"
-        );
+            assert!(materialization.bundles.is_empty());
+            assert!(materialization.accepted_capabilities.is_empty());
+            assert!(materialization.rejected_capabilities.is_empty());
+            assert_eq!(materialization.diagnostics.len(), 1);
+            assert_eq!(
+                materialization.diagnostics[0].code,
+                "mcp.resolution.installation_unavailable"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
     // C1 regression source only: NOT_RUN / NOT_COMPILED.
     #[tokio::test]
     async fn direct_native_start_cannot_bypass_the_closed_parent_during_oauth_recovery() {
-        let (service, store, workspace) = test_mcp_service().await;
-        seed_mcp_installation(&store, &workspace, "template", false, false).await;
-        let mut row = store
-            .find_mcp_server_installation("workspace", &workspace, "template")
-            .await
-            .unwrap()
-            .unwrap();
-        let parent_id = "P".repeat(21);
-        let child_id = "S".repeat(21);
-        let now = chrono::Utc::now().fixed_offset();
-        store
-            .insert_plugin_installation(&pioneer_crud::PackageRecord {
-                kind: pioneer_crud::PackageKind::Plugin,
-                app_manifest_json: None,
-                app_localizations_json: None,
-                operation_error_json: None,
-                id: parent_id.clone(),
-                workspace_id: workspace.clone(),
-                name: "mixed".into(),
-                version: None,
-                source_upload_id: "source".into(),
-                package_path: "/unused/package".into(),
-                data_path: "/unused/data".into(),
-                package_fingerprint: "tree".into(),
-                enabled: true,
-                allow_implicit_invocation: false,
-                state: "installing".into(),
-                revision: 1,
-                display_name: None,
-                short_description: None,
-                description: None,
-                long_description: None,
-                developer_name: None,
-                author_name: None,
-                author_email: None,
-                author_url: None,
-                homepage: None,
-                repository: None,
-                documentation_url: None,
-                support_url: None,
-                privacy_policy_url: None,
-                terms_of_service_url: None,
-                license: None,
-                category: None,
-                brand_color: None,
-                logo_path: None,
-                logo_revision: None,
-                composer_icon_path: None,
-                composer_icon_revision: None,
-                pending_json: Some("{}".into()),
-                last_error: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .unwrap();
-        row.id = Some(child_id.clone());
-        row.name = "pplugin_closed_parent_fixture".into();
-        row.enabled = true;
-        let write = pioneer_crud::PluginOwnershipWrite {
-            kind: pioneer_protocol::PackageKind::Plugin,
-            plugin_id: parent_id.clone(),
-            expected_revision: 1,
-            member_key: "one".into(),
-            member_path: None,
-            package_fingerprint: "tree".into(),
-            child_id: child_id.clone(),
-        };
-        let audit = pioneer_crud::McpAuditEventRecord {
-            turn_id: None,
-            server_installation_id: Some(child_id.clone()),
-            server_name: row.name.clone(),
-            raw_tool_name: None,
-            callable_name: None,
-            catalog_version: None,
-            action: "install".into(),
-            decision: "allowed".into(),
-            reason_code: None,
-            details_json: "{}".into(),
-            created_at_unix: 1,
-        };
-        store
-            .upsert_mcp_server_installation_with_audit_and_ownership(&row, &audit, Some(&write), 1)
-            .await
-            .unwrap();
-        store
-            .settle_plugin_installation(&parent_id, 1, "installed", None)
-            .await
-            .unwrap();
-        store
-            .begin_plugin_mutation(
-                &workspace,
-                &parent_id,
-                1,
-                "updating",
-                true,
-                "{\"kind\":\"set_enabled\",\"enabled\":true}",
-            )
-            .await
-            .unwrap();
-        let _native = service
-            .installation_lifecycle_guard("workspace", &workspace, &row.name)
-            .await;
-        // OAuth Authorized and restart converge on this real native start seam.
-        // The connector must never be reached while the parent gate is closed.
-        service
-            .start_task(
-                row.clone(),
-                "fixture-fingerprint".into(),
-                service.runtime_store(),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(!service.inner.tasks.lock().await.contains_key(&child_id));
-        assert!(
-            !service
-                .inner
-                .runtime_generations
-                .lock()
+        pioneer_postgres_test::with_database(async |db_fixture| {
+            let (service, store, workspace) = test_mcp_service(db_fixture).await;
+            seed_mcp_installation(&store, &workspace, "template", false, false).await;
+            let mut row = store
+                .find_mcp_server_installation("workspace", &workspace, "template")
                 .await
-                .contains_key(&child_id)
-        );
-        assert!(
+                .unwrap()
+                .unwrap();
+            let parent_id = "P".repeat(21);
+            let child_id = "S".repeat(21);
+            let now = chrono::Utc::now().fixed_offset();
             store
-                .find_mcp_server_installation("workspace", &workspace, &row.name)
+                .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                    kind: pioneer_crud::PackageKind::Plugin,
+                    app_manifest_json: None,
+                    app_localizations_json: None,
+                    operation_error_json: None,
+                    id: parent_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: "mixed".into(),
+                    version: None,
+                    source_upload_id: "source".into(),
+                    package_path: "/unused/package".into(),
+                    data_path: "/unused/data".into(),
+                    package_fingerprint: "tree".into(),
+                    enabled: true,
+                    allow_implicit_invocation: false,
+                    state: "installing".into(),
+                    revision: 1,
+                    display_name: None,
+                    short_description: None,
+                    description: None,
+                    long_description: None,
+                    developer_name: None,
+                    author_name: None,
+                    author_email: None,
+                    author_url: None,
+                    homepage: None,
+                    repository: None,
+                    documentation_url: None,
+                    support_url: None,
+                    privacy_policy_url: None,
+                    terms_of_service_url: None,
+                    license: None,
+                    category: None,
+                    brand_color: None,
+                    logo_path: None,
+                    logo_revision: None,
+                    composer_icon_path: None,
+                    composer_icon_revision: None,
+                    pending_json: Some("{}".into()),
+                    last_error: None,
+                    created_at: now,
+                    updated_at: now,
+                })
                 .await
-                .unwrap()
-                .unwrap()
-                .enabled
-        );
+                .unwrap();
+            row.id = Some(child_id.clone());
+            row.name = "pplugin_closed_parent_fixture".into();
+            row.enabled = true;
+            let write = pioneer_crud::PluginOwnershipWrite {
+                kind: pioneer_protocol::PackageKind::Plugin,
+                plugin_id: parent_id.clone(),
+                expected_revision: 1,
+                member_key: "one".into(),
+                member_path: None,
+                package_fingerprint: "tree".into(),
+                child_id: child_id.clone(),
+            };
+            let audit = pioneer_crud::McpAuditEventRecord {
+                turn_id: None,
+                server_installation_id: Some(child_id.clone()),
+                server_name: row.name.clone(),
+                raw_tool_name: None,
+                callable_name: None,
+                catalog_version: None,
+                action: "install".into(),
+                decision: "allowed".into(),
+                reason_code: None,
+                details_json: "{}".into(),
+                created_at_unix: 1,
+            };
+            store
+                .upsert_mcp_server_installation_with_audit_and_ownership(
+                    &row,
+                    &audit,
+                    Some(&write),
+                    1,
+                )
+                .await
+                .unwrap();
+            store
+                .settle_plugin_installation(&parent_id, 1, "installed", None)
+                .await
+                .unwrap();
+            store
+                .begin_plugin_mutation(
+                    &workspace,
+                    &parent_id,
+                    1,
+                    "updating",
+                    true,
+                    "{\"kind\":\"set_enabled\",\"enabled\":true}",
+                )
+                .await
+                .unwrap();
+            let _native = service
+                .installation_lifecycle_guard("workspace", &workspace, &row.name)
+                .await;
+            // OAuth Authorized and restart converge on this real native start seam.
+            // The connector must never be reached while the parent gate is closed.
+            service
+                .start_task(
+                    row.clone(),
+                    "fixture-fingerprint".into(),
+                    service.runtime_store(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!service.inner.tasks.lock().await.contains_key(&child_id));
+            assert!(
+                !service
+                    .inner
+                    .runtime_generations
+                    .lock()
+                    .await
+                    .contains_key(&child_id)
+            );
+            assert!(
+                store
+                    .find_mcp_server_installation("workspace", &workspace, &row.name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

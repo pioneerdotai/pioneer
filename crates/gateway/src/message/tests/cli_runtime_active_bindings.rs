@@ -5,7 +5,7 @@ use crate::message::cli_runtime::CliRuntimeStaleTurnScan;
 use crate::message::turn_handlers::CliRuntimeLaunchSpecRestore;
 use pioneer_entity::{turn, turn_cli_runtime_binding as binding, turn_liveness};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait};
 
 // Real persisted Turns make the healthy prefix exercise the validator rather
 // than its missing-Turn shortcut. Equal timestamps exercise the turn_id tie.
@@ -63,7 +63,7 @@ async fn has_recovery(store: &CrudStore, id: &str) -> bool {
 // source still needs a second portion; its later clock must not erase the wake.
 // A busy action outbox must also permit fresh timeout/supervision rounds before
 // the outbox empties. The previous test with only a finite CLI tail missed this.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_keeps_deadline_that_matures_between_portions() {
     use pioneer_entity::{agent_action, agent_action_outbox as outbox, agent_identity};
     use sea_orm::Set;
@@ -96,8 +96,9 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
         .unwrap()
         .unwrap();
     let owner = "E00000000000000000008";
+    let tx = database.begin().await.unwrap();
     pioneer_crud::insert_agent_execution(
-        &database,
+        &tx,
         &pioneer_crud::AgentExecutionInput {
             id: owner.into(),
             workspace_id: workspace.clone(),
@@ -122,6 +123,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     // Persist invalid detached envelopes: dispatch rejects them locally,
     // with no provider or runtime needed. Twelve raw claim quanta keep the
     // real outbox runnable throughout the observations below.
@@ -254,7 +256,7 @@ async fn control_owner_keeps_deadline_that_matures_between_portions() {
 // Commit after the owner has discovered its deadlines but before it parks.
 // The retained source signal must restore the command and heartbeat it before
 // the already-expired attempt is handed to destructive timeout processing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_restores_command_committed_between_discovery_and_wait() {
     let (processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
     *session.turn_liveness_probe.lock().await =
@@ -330,7 +332,7 @@ async fn control_owner_restores_command_committed_between_discovery_and_wait() {
     outcome.expect("retained mutation must wake the owner and heartbeat before timeout");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_deadline_parks_terminal_history_and_tracks_active_liveness() {
     let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -389,7 +391,7 @@ async fn cli_deadline_parks_terminal_history_and_tracks_active_liveness() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() {
     let (processor, _, rx, workspace, store, _session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -424,10 +426,23 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
     }
     // A lookup error must not count as processed, become a destructive stale
     // decision, or hold the cursor on the prefix forever.
+    store
+        .database_connection()
+        .execute_unprepared("ALTER TABLE turn DROP CONSTRAINT turn_prompt_manifest_json_check")
+        .await
+        .unwrap();
     turn::Entity::update_many()
         .col_expr(turn::Column::PromptManifestJson, Expr::value("{"))
         .filter(turn::Column::Id.eq("starting_000"))
         .exec(&store.database_connection())
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared(
+            "ALTER TABLE turn ADD CONSTRAINT turn_prompt_manifest_json_check
+         CHECK (prompt_manifest_json IS JSON) NOT VALID",
+        )
         .await
         .unwrap();
     let processor = processor.scoped_for_background_reconciliation();
@@ -540,7 +555,7 @@ async fn cli_active_scan_reaches_stale_after_130_healthy_with_errors_and_wrap() 
     assert_eq!(restarted.processed, 127);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_cancellation_advances_selected_page_and_keeps_runtime_alive() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -613,32 +628,21 @@ async fn cli_active_scan_cancellation_advances_selected_page_and_keeps_runtime_a
     assert_eq!(command.status, TurnStatus::InProgress);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_writes() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
-    use sea_orm::ConnectOptions;
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("cli-scan.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -676,15 +680,15 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     let reads = observer.reads.lock().unwrap();
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(reads.iter().all(|event| !matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -692,14 +696,14 @@ async fn cli_active_scan_preserves_maintenance_reads_and_critical_correctness_wr
     let writes = observer.writes.lock().unwrap();
     assert!(writes.iter().any(|event| matches!(
         event,
-        SqliteWriteEvent::Acquired {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Acquired {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));
-    assert!(writes.iter().all(|event| !matches!(event, SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical)));
+    assert!(writes.iter().all(|event| !matches!(event, PostgresWriteEvent::Acquired { class, .. } if *class != PostgresWriteClass::Critical)));
     drop(writes);
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     assert!(has_recovery(&store, "route_stale").await);
 }
 
@@ -846,7 +850,7 @@ async fn pending_for_new_execution(store: &CrudStore, workspace: &str) {
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_and_scan_continues()
 {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
@@ -950,7 +954,7 @@ async fn cli_active_terminal_snapshot_resume_wins_without_new_execution_effects_
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_commit_serializes_new_admission_until_old_effects_finish() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1032,7 +1036,7 @@ async fn cli_active_terminal_commit_serializes_new_admission_until_old_effects_f
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_active_terminal_cancellation_leaves_no_queued_terminal_effect_for_resumed_turn() {
     let (processor, _, rx, _, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1118,7 +1122,7 @@ async fn cli_terminal_queued_event_keeps_transition_through_cancelled_waiter_and
     assert!(gate.try_lock().is_ok());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_active_scan_defers_busy_session_without_waiting_or_refetching_pages() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1237,9 +1241,9 @@ const BLOCKED_TURN: &str = "blocked-observation-turn";
 const BLOCKED_NATIVE_THREAD: &str = "01900000-0000-7000-8000-000000000071";
 
 // Uses the project's persisted admission and recording provider. Reopening
-// builds a new processor, store and session from the same isolated disk schema.
+// builds a new processor, store and session from independent pools on the same isolated database.
 async fn blocked_observation_fixture(
-    path: &std::path::Path,
+    fixture: &pioneer_postgres_test::TestDatabase,
     kind: &str,
     seed: bool,
 ) -> (
@@ -1248,11 +1252,11 @@ async fn blocked_observation_fixture(
     Arc<RecordingCliRuntimeSession>,
     String,
 ) {
-    blocked_observation_fixture_with_receipt(path, kind, seed, false).await
+    blocked_observation_fixture_with_receipt(fixture, kind, seed, false).await
 }
 
 async fn blocked_observation_fixture_with_receipt(
-    path: &std::path::Path,
+    fixture: &pioneer_postgres_test::TestDatabase,
     kind: &str,
     seed: bool,
     receipt: bool,
@@ -1262,11 +1266,22 @@ async fn blocked_observation_fixture_with_receipt(
     Arc<RecordingCliRuntimeSession>,
     String,
 ) {
-    let mut options = sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(path));
-    options.max_connections(1).sqlx_logging(false);
-    let connection = Database::connect(options).await.unwrap();
-    let (workspace_manager, store, workspace) =
-        setup_workspace_manager_with_connection(connection).await;
+    if seed {
+        setup_postgres_workspace_manager(fixture).await;
+    }
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let database = pioneer_postgres_pools::PostgresDatabase::new(reader, writer);
+    let workspace_manager = Arc::new(WorkspaceManager::new(database.clone()));
+    let store = Arc::new(CrudStore::new(database));
+    let workspace = workspace_manager
+        .list_workspaces()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|workspace| workspace.is_active && workspace.is_current)
+        .expect("fixture has a current workspace")
+        .id;
     let session = Arc::new(RecordingCliRuntimeSession::default());
     *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
         status: CLIAgentRuntimeObservedTurnStatus::Blocked,
@@ -1419,11 +1434,11 @@ async fn assert_blocked_observation_active(store: &CrudStore) {
     assert_eq!(blocked_event_count(store).await, 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_blocked_observation_rejects_old_segment_at_writer_and_fresh_snapshot_commits() {
-    let temp = tempfile::tempdir().unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (processor, store, session, workspace) =
-        blocked_observation_fixture(&temp.path().join("segments.sqlite"), "codex", true).await;
+        blocked_observation_fixture(&fixture, "codex", true).await;
     processor.arm_completed_history_preparation_barrier("__cli_blocked_before_enqueue__");
     let now = chrono::Utc::now().fixed_offset();
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
@@ -1579,13 +1594,12 @@ async fn cli_blocked_observation_rejects_old_segment_at_writer_and_fresh_snapsho
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_blocked_before_enqueue_cancellation_reopens_and_retries_codex_and_claude() {
     for kind in ["codex", "claude"] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("before-enqueue.sqlite");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let (processor, store, session, workspace) =
-            blocked_observation_fixture(&path, kind, true).await;
+            blocked_observation_fixture(&fixture, kind, true).await;
         processor.arm_completed_history_preparation_barrier("__cli_blocked_before_enqueue__");
         let now_ms = (chrono::Utc::now() + chrono::Duration::minutes(30)).timestamp_millis();
         let mut scan = CliRuntimeStaleTurnScan::default();
@@ -1607,10 +1621,10 @@ async fn cli_blocked_before_enqueue_cancellation_reopens_and_retries_codex_and_c
                 .is_ok()
         );
         assert!(session.interrupts.lock().await.is_empty());
-        // A fresh store/processor read the on-disk active binding, with no cursor,
+        // A fresh store and processor read the saved active binding, with no cursor,
         // mutex or queued obligation inherited from the cancelled publisher.
         let (reopened, reopened_store, _, _) =
-            blocked_observation_fixture(&path, kind, false).await;
+            blocked_observation_fixture(&fixture, kind, false).await;
         let result = reopened
             .fail_stale_cli_runtime_turns(now_ms, &mut CliRuntimeStaleTurnScan::default())
             .await;
@@ -1652,13 +1666,13 @@ async fn cli_blocked_before_enqueue_cancellation_reopens_and_retries_codex_and_c
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_blocked_projection_failure_rolls_back_attempt_segments_event_and_retries_after_reopen()
 {
     for kind in ["codex", "claude"] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("projection.sqlite");
-        let (processor, store, session, _) = blocked_observation_fixture(&path, kind, true).await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (processor, store, session, _) =
+            blocked_observation_fixture(&fixture, kind, true).await;
         let before_attempt = store
             .latest_cli_runtime_turn_attempt(BLOCKED_TURN)
             .await
@@ -1675,7 +1689,7 @@ async fn cli_blocked_projection_failure_rolls_back_attempt_segments_event_and_re
                 .await
                 .unwrap();
         assert!(before_projection.is_some());
-        store.database_connection().execute_unprepared("CREATE TRIGGER reject_blocked_projection BEFORE UPDATE OF status ON turn WHEN NEW.status='blocked' BEGIN SELECT RAISE(ABORT, 'blocked projection failure'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION reject_blocked_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'blocked projection failure'; END; $$; CREATE TRIGGER reject_blocked_projection BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.status='blocked') EXECUTE FUNCTION reject_blocked_projection();").await.unwrap();
         let now_ms = (chrono::Utc::now() + chrono::Duration::minutes(30)).timestamp_millis();
         let result = processor
             .fail_stale_cli_runtime_turns(now_ms, &mut CliRuntimeStaleTurnScan::default())
@@ -1709,11 +1723,11 @@ async fn cli_blocked_projection_failure_rolls_back_attempt_segments_event_and_re
         assert!(session.mcp_terminals.lock().await.is_empty());
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_blocked_projection")
+            .execute_unprepared("DROP TRIGGER reject_blocked_projection ON turn; DROP FUNCTION reject_blocked_projection()")
             .await
             .unwrap();
         let (reopened, reopened_store, _, _) =
-            blocked_observation_fixture(&path, kind, false).await;
+            blocked_observation_fixture(&fixture, kind, false).await;
         let result = reopened
             .fail_stale_cli_runtime_turns(now_ms, &mut CliRuntimeStaleTurnScan::default())
             .await;
@@ -1731,13 +1745,12 @@ async fn cli_blocked_projection_failure_rolls_back_attempt_segments_event_and_re
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_cancellation() {
     for kind in ["codex", "claude"] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("after-commit.sqlite");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let (processor, store, session, workspace) =
-            blocked_observation_fixture(&path, kind, true).await;
+            blocked_observation_fixture(&fixture, kind, true).await;
         processor.arm_completed_history_preparation_barrier("__cli_blocked_after_atomic_commit__");
         let now_ms = (chrono::Utc::now() + chrono::Duration::minutes(30)).timestamp_millis();
         let mut scan = CliRuntimeStaleTurnScan::default();
@@ -1787,7 +1800,7 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
         // No native running lookup or queued obligation is needed: the active
         // binding projects the already terminal canonical Turn without another event.
         let (reopened, reopened_store, reopened_session, _) =
-            blocked_observation_fixture(&path, kind, false).await;
+            blocked_observation_fixture(&fixture, kind, false).await;
         let repaired = reopened
             .fail_stale_cli_runtime_turns(now_ms, &mut CliRuntimeStaleTurnScan::default())
             .await;
@@ -1825,7 +1838,7 @@ async fn cli_blocked_atomic_commit_keeps_queued_consumer_owned_after_publisher_c
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout_evidence() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -1895,13 +1908,12 @@ async fn cli_timeout_and_command_heartbeat_defer_busy_transition_without_timeout
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_common_blocked_reconciliation_retains_consumer_ownership_after_cancel_until_ack() {
     for kind in ["codex", "claude"] {
-        let temp = tempfile::tempdir().unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let (processor, store, session, workspace) =
-            blocked_observation_fixture(&temp.path().join("common-blocked.sqlite"), kind, true)
-                .await;
+            blocked_observation_fixture(&fixture, kind, true).await;
         let binding = store
             .get_cli_runtime_turn_binding(BLOCKED_TURN)
             .await
@@ -1976,7 +1988,7 @@ async fn cli_common_blocked_reconciliation_retains_consumer_ownership_after_canc
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_competing_scan() {
     // Both the direct timeout race and timeout competing with a complete scan
     // use the actual supervisor entry, not the owned cleanup inner helper.
@@ -2129,7 +2141,7 @@ async fn cli_timeout_terminal_cleanup_rejects_resume_and_late_effects_after_comp
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_normal_terminal_consumer_rejects_busy_without_blocking_lane_and_fences_effects() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -2214,12 +2226,11 @@ fn ordinary_native_failure(native_thread: &str, native_turn: &str) -> RuntimeEve
     })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_native_terminal_waits_outside_lane_and_active_scan_replays_cancelled_producer() {
-    let temp = tempfile::tempdir().unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (processor, store, session, workspace) =
-        blocked_observation_fixture(&temp.path().join("native-delivery.sqlite"), "codex", true)
-            .await;
+        blocked_observation_fixture(&fixture, "codex", true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -2322,7 +2333,7 @@ async fn cli_native_terminal_waits_outside_lane_and_active_scan_replays_cancelle
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_snapshot() {
     for (kind, completed) in [
         ("codex", false),
@@ -2330,12 +2341,9 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
         ("codex", true),
         ("claude", true),
     ] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp
-            .path()
-            .join(format!("{kind}-{completed}-native-delivery.sqlite"));
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let (processor, store, session, workspace) =
-            blocked_observation_fixture_with_receipt(&path, kind, true, true).await;
+            blocked_observation_fixture_with_receipt(&fixture, kind, true, true).await;
         let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
         let handle = processor
             .cli_runtime_manager
@@ -2390,7 +2398,7 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
         drop(processor);
         // A different manager/session has no Claude in-memory turn outcome.
         let (reopened, store, session, _) =
-            blocked_observation_fixture_with_receipt(&path, kind, false, true).await;
+            blocked_observation_fixture_with_receipt(&fixture, kind, false, true).await;
         *session.turn_observation.lock().await = None;
         assert!(
             reopened
@@ -2580,7 +2588,7 @@ async fn cli_saved_native_outcome_reopens_for_codex_and_claude_without_provider_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_attempt() {
     let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -2691,16 +2699,11 @@ async fn cli_old_native_failed_producer_cannot_open_recovery_or_cleanup_resumed_
     assert!(session.mcp_terminals.lock().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_old_native_failed_producer_rejects_same_attempt_new_segment_with_equal_timestamp() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, session, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("native-source-segment.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, session, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -2793,12 +2796,11 @@ async fn activate_observation_request(
     (request, job, now)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_reconciliation_stale_and_storage_sources_defer_durably_without_recovery_budget() {
     for phase in ["before_handler", "after_source", "lookup_failure"] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(format!("recovery-{phase}.sqlite"));
-        let (processor, store, _, _) = blocked_observation_fixture(&path, "codex", true).await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (processor, store, _, _) = blocked_observation_fixture(&fixture, "codex", true).await;
         let (request, active, now) = activate_observation_request(&processor, &store).await;
         if phase == "before_handler" {
             binding::Entity::update_many()
@@ -2885,7 +2887,7 @@ async fn cli_reconciliation_stale_and_storage_sources_defer_durably_without_reco
         drop(store);
         drop(processor);
         let (reopened, store, session, _) =
-            blocked_observation_fixture(&path, "codex", false).await;
+            blocked_observation_fixture(&fixture, "codex", false).await;
         *session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
             status: CLIAgentRuntimeObservedTurnStatus::InProgress,
             message: None,
@@ -2928,12 +2930,10 @@ async fn cli_reconciliation_stale_and_storage_sources_defer_durably_without_reco
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_reconciliation_late_deferral_cannot_change_replacement_recovery_attempt() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, session, _) =
-        blocked_observation_fixture(&temp.path().join("recovery-replaced.sqlite"), "codex", true)
-            .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, session, _) = blocked_observation_fixture(&fixture, "codex", true).await;
     let (request, active, now) = activate_observation_request(&processor, &store).await;
     binding::Entity::update_many()
         .col_expr(binding::Column::Model, Expr::value("metadata refresh"))
@@ -2992,15 +2992,11 @@ async fn cli_reconciliation_late_deferral_cannot_change_replacement_recovery_att
     assert_blocked_observation_active(&store).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, _, workspace) = blocked_observation_fixture(
-        &temp.path().join("native-lane-cancel.sqlite"),
-        "codex",
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture(&fixture, "codex", true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -3035,7 +3031,7 @@ async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_
         "consumer retains ownership independently of its publisher"
     );
     // Read before suspending admission: its first poll can retain the fixture's
-    // only SQLite connection while the binding lookup is still in progress.
+    // only PostgreSQL connection while the binding lookup is still in progress.
     let before = pioneer_entity::turn_event::Entity::find()
         .filter(pioneer_entity::turn_event::Column::TurnId.eq(BLOCKED_TURN))
         .count(&store.database_connection())
@@ -3072,16 +3068,11 @@ async fn cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_old_native_failed_producer_rejects_owner_generation_aba_at_equal_timestamp() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, session, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("native-owner-aba.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, session, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let db = store.database_connection();
     use pioneer_entity::turn_execution as execution;
     let owner = store
@@ -3149,13 +3140,12 @@ async fn cli_old_native_failed_producer_rejects_owner_generation_aba_at_equal_ti
     assert!(session.interrupts.lock().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion() {
     for (cleared, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
-        let temp = tempfile::tempdir().unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
         let (processor, store, _, workspace) =
-            blocked_observation_fixture(&temp.path().join("native-goal-ack.sqlite"), "codex", true)
-                .await;
+            blocked_observation_fixture(&fixture, "codex", true).await;
         let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
         let handle = processor
             .cli_runtime_manager
@@ -3316,12 +3306,8 @@ async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion
             drop(handle);
             drop(store);
             drop(processor);
-            let (reopened, store, _, workspace) = blocked_observation_fixture(
-                &temp.path().join("native-goal-ack.sqlite"),
-                "codex",
-                false,
-            )
-            .await;
+            let (reopened, store, _, workspace) =
+                blocked_observation_fixture(&fixture, "codex", false).await;
             let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
             let handle = reopened
                 .cli_runtime_manager
@@ -3390,7 +3376,7 @@ async fn cli_native_goal_segment_ack_does_not_suppress_canonical_goal_completion
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_goal_waiting_for_admission_refreshes_same_execution_and_rejects_replacement() {
     for phase in [
         "activation",
@@ -3400,14 +3386,9 @@ async fn cli_goal_waiting_for_admission_refreshes_same_execution_and_rejects_rep
         "replacement_segment",
         "owner_aba",
     ] {
-        let temp = tempfile::tempdir().unwrap();
-        let (processor, store, session, workspace) = blocked_observation_fixture_with_receipt(
-            &temp.path().join("goal-admission.sqlite"),
-            "codex",
-            true,
-            true,
-        )
-        .await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (processor, store, session, workspace) =
+            blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
         let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
         let handle = processor
             .cli_runtime_manager
@@ -3654,16 +3635,11 @@ async fn cli_goal_waiting_for_admission_refreshes_same_execution_and_rejects_rep
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_unsaved_native_failure_cannot_follow_receipt_resume_into_attempt_b() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, session, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("receipt-resume.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, session, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -3977,15 +3953,14 @@ fn recovery_native_outcome(completed: bool) -> RuntimeEvent {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_and_reopen() {
     for kind in ["codex", "claude"] {
         for completed in [true, false] {
             for exhaust in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
-                let path = temp.path().join("unconfirmed-recovery.sqlite");
+                let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
                 let (processor, store, session, workspace) =
-                    blocked_observation_fixture_with_receipt(&path, kind, true, true).await;
+                    blocked_observation_fixture_with_receipt(&fixture, kind, true, true).await;
                 let job =
                     activate_unconfirmed_cli_recovery(&processor, &store, kind, exhaust).await;
                 let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
@@ -4031,7 +4006,7 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
                 drop(processor);
                 drop(store);
                 let (reopened, store, session, _) =
-                    blocked_observation_fixture_with_receipt(&path, kind, false, true).await;
+                    blocked_observation_fixture_with_receipt(&fixture, kind, false, true).await;
                 *session.turn_observation.lock().await = None;
                 let now = chrono::Utc::now().timestamp();
                 // Actual resilience order, including the expired Active job.
@@ -4221,20 +4196,14 @@ async fn cli_accepted_unconfirmed_recovery_outcome_survives_expiration_takeover_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_recovery_expiration_first_rejects_unsaved_producer_and_preserves_retry_budget() {
     for kind in ["codex", "claude"] {
         for completed in [true, false] {
             for exhaust in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
+                let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
                 let (processor, store, session, workspace) =
-                    blocked_observation_fixture_with_receipt(
-                        &temp.path().join("expiration-first.sqlite"),
-                        kind,
-                        true,
-                        true,
-                    )
-                    .await;
+                    blocked_observation_fixture_with_receipt(&fixture, kind, true, true).await;
                 let job =
                     activate_unconfirmed_cli_recovery(&processor, &store, kind, exhaust).await;
                 let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
@@ -4373,18 +4342,13 @@ async fn cli_recovery_expiration_first_rejects_unsaved_producer_and_preserves_re
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_common_observation_writer_loses_to_accepted_native_outcome() {
     for kind in ["codex", "claude"] {
         for completed in [true, false] {
-            let temp = tempfile::tempdir().unwrap();
-            let (processor, store, session, workspace) = blocked_observation_fixture_with_receipt(
-                &temp.path().join("observation-race.sqlite"),
-                kind,
-                true,
-                true,
-            )
-            .await;
+            let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+            let (processor, store, session, workspace) =
+                blocked_observation_fixture_with_receipt(&fixture, kind, true, true).await;
             let key = CLIAgentRuntimeSessionKey::new(&workspace, kind, BLOCKED_THREAD).unwrap();
             let handle = processor
                 .cli_runtime_manager
@@ -4493,16 +4457,11 @@ async fn cli_common_observation_writer_loses_to_accepted_native_outcome() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_together() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("ack-rollback.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let job = activate_unconfirmed_cli_recovery(&processor, &store, "codex", false).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
@@ -4532,7 +4491,7 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
     let record =
         crate::message::cli_runtime::cli_runtime_terminal_event_record(&source, String::new());
     store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_recovery_ack BEFORE INSERT ON cli_runtime_native_event WHEN NEW.native_method = 'gateway/terminal_recovery_ack' BEGIN SELECT RAISE(ABORT, 'injected ACK failure'); END"
+        "CREATE FUNCTION reject_recovery_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected ACK failure'; END; $$; CREATE TRIGGER reject_recovery_ack BEFORE INSERT ON cli_runtime_native_event FOR EACH ROW WHEN (NEW.native_method = 'gateway/terminal_recovery_ack') EXECUTE FUNCTION reject_recovery_ack();"
     ).await.unwrap();
     let result = processor
         .renew_active_cli_runtime_turn_deadlines(BLOCKED_TURN, chrono::Utc::now().timestamp())
@@ -4557,7 +4516,7 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
     assert_eq!(blocked_event_count(&store).await, 0);
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_recovery_ack")
+        .execute_unprepared("DROP TRIGGER reject_recovery_ack ON cli_runtime_native_event; DROP FUNCTION reject_recovery_ack()")
         .await
         .unwrap();
     assert_eq!(
@@ -4603,7 +4562,7 @@ async fn cli_accepted_recovery_failure_ack_and_authority_change_roll_back_togeth
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure() {
     for heartbeat in [false, true] {
         let (processor, _, rx, workspace, store, session) = cli_runtime_approval_processor().await;
@@ -4703,18 +4662,13 @@ async fn cli_timeout_poll_and_command_heartbeat_prioritize_saved_native_failure(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellation_fences() {
     use pioneer_entity::turn_execution as execution;
     for race in ["generation", "expired", "cancel"] {
-        let temp = tempfile::tempdir().unwrap();
-        let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
-            &temp.path().join("heartbeat-authority.sqlite"),
-            "codex",
-            true,
-            true,
-        )
-        .await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (processor, store, _, workspace) =
+            blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
         let active = store
             .get_turn(BLOCKED_THREAD, BLOCKED_TURN)
             .await
@@ -4863,17 +4817,16 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
 
 // Real wire reader/ordered queue -> native mapping -> existing receipt journal
 // -> durable projection -> DB readback. No native process/model is needed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_usage_receipts_survive_database_replay_without_range_attribution() {
     use pioneer_cli_agent_runtime::codex::CodexJsonlRpcClient;
     use pioneer_cli_agent_runtime::event::{
         RuntimeEventMappingOptions, map_codex_notification_event,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
-    let temp = tempfile::tempdir().unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let (processor, store, _, workspace) =
-        blocked_observation_fixture(&temp.path().join("usage-receipts.sqlite"), "codex", true)
-            .await;
+        blocked_observation_fixture(&fixture, "codex", true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -5031,18 +4984,14 @@ async fn codex_usage_receipts_survive_database_replay_without_range_attribution(
 // Exercise the real durable publisher ACK and ItemCompleted consumer, with a
 // storage fault that leaves recovery writes available. Code-only/API and
 // mismatched-binding controls must retain the canonical failure policy.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_statistics_materialization_failure_rejects_ack_without_opening_recovery() {
     use pioneer_cli_agent_runtime::event::{RuntimeNativeEvent, RuntimeTurnStarted};
     use pioneer_protocol::SystemEventLevel;
     for case in ["usage", "timing", "api_usage", "ordinary", "wrong_binding"] {
-        let temp = tempfile::tempdir().unwrap();
-        let (processor, store, _, workspace) = blocked_observation_fixture(
-            &temp.path().join("statistics-failure.sqlite"),
-            "codex",
-            true,
-        )
-        .await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let (processor, store, _, workspace) =
+            blocked_observation_fixture(&fixture, "codex", true).await;
         let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
         let handle = processor
             .cli_runtime_manager
@@ -5120,9 +5069,7 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
             _ => {}
         }
         store.database_connection().execute_unprepared(
-            "CREATE TRIGGER reject_cli_statistics BEFORE INSERT ON turn_event \
-             WHEN NEW.event_type='item/completed' AND json_extract(NEW.payload,'$.payload.item.id')='g1_fault' \
-             BEGIN SELECT RAISE(ABORT,'injected statistics storage failure'); END;"
+            "CREATE FUNCTION reject_cli_statistics() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected statistics storage failure'; END; $$; CREATE TRIGGER reject_cli_statistics BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.event_type='item/completed' AND NEW.turn_id='blocked-observation-turn') EXECUTE FUNCTION reject_cli_statistics();"
         ).await.unwrap();
         let result = processor
             .publish_cli_runtime_durable_and_wait(handle.instance(), event)
@@ -5149,7 +5096,7 @@ async fn cli_statistics_materialization_failure_rejects_ack_without_opening_reco
         assert_eq!(jobs.is_empty(), supplemental, "{case}");
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER reject_cli_statistics")
+            .execute_unprepared("DROP TRIGGER reject_cli_statistics ON turn_event; DROP FUNCTION reject_cli_statistics()")
             .await
             .unwrap();
         if supplemental {
@@ -5292,7 +5239,7 @@ fn control_readiness_preserves_independent_deadlines_and_isolates_failed_turns()
 // Cross the actual worker's error/backoff boundary: one failing watchdog in
 // the first page must not strand an expired watchdog on a later page. Healthy
 // rows emit no events, so partial-success masking cannot make this pass by luck.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_owner_reaches_later_supervision_page_after_persistent_row_failure() {
     use crate::resilience::ProviderFailureCandidate;
     use pioneer_entity::recovery_job;
@@ -5300,15 +5247,10 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
 
     let (processor, _, _rx, _, store, _session) = cli_runtime_approval_processor().await;
     let database = store.database_connection();
-    database
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     let processor = Arc::new(processor);
     let outcome = tokio::time::timeout(Duration::from_secs(30), async {
         let now = now_timestamp_secs();
         let coordinator = &processor.recovery_coordinator;
-        let mut jobs = Vec::new();
         for index in 0..65 {
             let job = coordinator.enqueue_provider_failure_job(
                 &ProviderFailureCandidate {
@@ -5341,9 +5283,15 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
                 &format!("attempt_{index}"),
                 now - 999,
             ).await.unwrap(), pioneer_crud::ClaimedRecoveryActivation::Activated));
-            jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        // Use the same SQL ordering as the watchdog. Native locale ordering
+        // can differ from Rust's bytewise comparison of mixed-case IDs.
+        let upper = store.active_recovery_job_upper_id().await.unwrap().unwrap();
+        let jobs = store
+            .list_active_recovery_job_page(None, &upper, 65)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 65);
         let poison = &jobs[0];
         let tail = &jobs[64];
         for job in &jobs[1..64] {
@@ -5356,7 +5304,7 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
             row.update(&database).await.unwrap();
         }
         database.execute_unprepared(&format!(
-            "CREATE TRIGGER reject_first_watchdog BEFORE UPDATE OF status ON recovery_job WHEN OLD.id='{}' AND NEW.status <> 'active' BEGIN SELECT RAISE(ABORT, 'persistent watchdog fixture'); END",
+            "CREATE FUNCTION reject_first_watchdog() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'persistent watchdog fixture'; END; $$; CREATE TRIGGER reject_first_watchdog BEFORE UPDATE OF status ON recovery_job FOR EACH ROW WHEN (OLD.id='{}' AND NEW.status <> 'active') EXECUTE FUNCTION reject_first_watchdog();",
             poison.id.replace('\'', "''"),
         )).await.unwrap();
 
@@ -5382,16 +5330,11 @@ async fn control_owner_reaches_later_supervision_page_after_persistent_row_failu
     outcome.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign_binding() {
     use crate::message::control_work::{ControlWork, Family};
     use pioneer_crud::GatewayControlWake as Wake;
     let (processor, _, _rx, workspace, store, session) = cli_runtime_approval_processor().await;
-    store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
     *session.turn_liveness_probe.lock().await =
         Some(CLIAgentRuntimeTurnLivenessProbe::ConfirmedActive);
     ensure_test_superuser_execution_turn(
@@ -5513,19 +5456,13 @@ async fn control_activity_is_addressed_for_cli_and_api_without_repairing_foreign
 
 // A failed content read must not leave an accepted native completion unACKed,
 // its attempt running, or its retained admission lease occupied.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrated() {
-    use pioneer_entity::portable_payload;
     use sea_orm::Set;
 
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("optional-mapping.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -5544,27 +5481,10 @@ async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrat
     // Deliberately damaged content, with valid control/attempt authority. The
     // invalid length/digest fail the real hydration path, not an unrelated
     // owner fence or a test replacement for the completion handler.
-    portable_payload::Entity::insert(portable_payload::ActiveModel {
-        id: Set("damaged-cli-mapping".into()),
-        family: Set("cli.mapping".into()),
-        original_bytes: Set(2),
-        original_chars: Set(2),
-        sha256: Set(vec![0; 32]),
-        raw: Set(1),
-        retired: Set(0),
-        dictionary_id: Set(None),
-    })
-    .exec(&store.database_connection())
-    .await
-    .unwrap();
     binding::Entity::update_many()
         .col_expr(
-            binding::Column::InputMappingJsonPayloadId,
-            Expr::value(Some("damaged-cli-mapping".to_owned())),
-        )
-        .col_expr(
-            binding::Column::InputMappingJson,
-            Expr::value(String::new()),
+            binding::Column::InputMappingSha256,
+            Expr::val(vec![0_u8; 32]),
         )
         .filter(binding::Column::TurnId.eq(BLOCKED_TURN))
         .exec(&store.database_connection())
@@ -5630,17 +5550,12 @@ async fn cli_completion_finishes_and_acks_when_optional_mapping_cannot_be_hydrat
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_cached_activity_waiting_for_database_does_not_block_other_session_cache_access() {
     use futures_util::FutureExt;
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("cache-reader-wait.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor
         .cli_runtime_manager
@@ -5699,16 +5614,11 @@ async fn cli_cached_activity_waiting_for_database_does_not_block_other_session_c
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_control_owner_retries_terminal_cleanup_on_gate_release_without_another_event() {
-    let temp = tempfile::tempdir().unwrap();
-    let (processor, store, _, workspace) = blocked_observation_fixture_with_receipt(
-        &temp.path().join("terminal-gate-release.sqlite"),
-        "codex",
-        true,
-        true,
-    )
-    .await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (processor, store, _, workspace) =
+        blocked_observation_fixture_with_receipt(&fixture, "codex", true, true).await;
     let processor = Arc::new(processor);
     let key = CLIAgentRuntimeSessionKey::new(&workspace, "codex", BLOCKED_THREAD).unwrap();
     let handle = processor

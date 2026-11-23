@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "invitation_workspace_grant")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub invitation_id: String,
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub workspace_id: String,
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
@@ -19,7 +19,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub invitation: HasOne<super::invitation::Entity>,
+    pub invitation: BelongsTo<super::invitation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

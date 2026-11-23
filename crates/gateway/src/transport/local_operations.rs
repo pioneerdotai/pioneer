@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 #[serde(tag = "operation", deny_unknown_fields)]
 pub(crate) enum Operation {
     DeviceCreate,
+    DevApp(pioneer_protocol::DevAppOperation),
     ArtifactGc {
         workspace_id: String,
         now_unix_ms: i64,
@@ -86,13 +87,12 @@ struct Services {
     auth: Arc<crate::auth::GatewayAuthService>,
     artifacts: Arc<pioneer_artifacts::ArtifactService>,
     admission: Arc<tokio::sync::Semaphore>,
+    processor: Option<Arc<crate::message::MessageProcessor>>,
+    identity: Option<Arc<crate::identity::IdentityBootstrapSnapshot>>,
 }
 
-fn endpoint_path(runtime_home: &Path, config: &pioneer_config::AppConfig) -> Result<PathBuf> {
-    let database = crate::database::gateway_database_path(runtime_home, config)?;
-    let mut path = pioneer_sqlite::WriterOwnership::database_identity(&database)?.into_os_string();
-    path.push(".operator.json");
-    Ok(PathBuf::from(path))
+pub(crate) fn endpoint_path(runtime_home: &Path) -> PathBuf {
+    runtime_home.join("database-operator.json")
 }
 
 pub(crate) struct LocalOperations {
@@ -104,9 +104,11 @@ pub(crate) struct LocalOperations {
 impl LocalOperations {
     pub(crate) async fn start(
         runtime_home: &Path,
-        config: &pioneer_config::AppConfig,
+        _config: &pioneer_config::AppConfig,
         auth: Arc<crate::auth::GatewayAuthService>,
         artifacts: Arc<pioneer_artifacts::ArtifactService>,
+        processor: Option<Arc<crate::message::MessageProcessor>>,
+        identity: Option<Arc<crate::identity::IdentityBootstrapSnapshot>>,
     ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
@@ -116,6 +118,8 @@ impl LocalOperations {
         let state = Arc::new(Services {
             token,
             auth,
+            processor,
+            identity,
             artifacts: Arc::new(artifacts.with_maintenance_access()),
             admission: Arc::new(tokio::sync::Semaphore::new(1)),
         });
@@ -123,7 +127,7 @@ impl LocalOperations {
             .route("/operation", post(execute))
             .layer(DefaultBodyLimit::max(8192))
             .with_state(state.clone());
-        let path = endpoint_path(runtime_home, config)?;
+        let path = endpoint_path(runtime_home);
         // Harden before writing a capability, including when reusing a stale
         // endpoint after a crash. The runtime directory is already private.
         let mut options = std::fs::OpenOptions::new();
@@ -189,6 +193,10 @@ async fn execute(
         .try_acquire_owned()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let result: Result<serde_json::Value> = match operation {
+        Operation::DevApp(operation) => match (&state.processor, &state.identity) {
+            (Some(processor), Some(identity)) => processor.local_dev_app(identity, operation).await,
+            _ => Err(anyhow::anyhow!("local dev App service unavailable")),
+        },
         Operation::DeviceCreate => state
             .auth
             .create_local_device()
@@ -228,10 +236,10 @@ async fn execute(
 
 pub(crate) async fn request<T: DeserializeOwned>(
     runtime_home: &Path,
-    config: &pioneer_config::AppConfig,
+    _config: &pioneer_config::AppConfig,
     operation: Operation,
 ) -> Result<T> {
-    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint_path(runtime_home, config)?)
+    let endpoint: Endpoint = serde_json::from_slice(&std::fs::read(endpoint_path(runtime_home))
         .context("database owner is starting, stopping, or is an offline operation; local operation unavailable")?)?;
     if endpoint.address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) || endpoint.token.len() != 64 {
         bail!("invalid local database-owner endpoint");
@@ -296,7 +304,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let key = "c".repeat(64);
         std::fs::write(
-            endpoint_path(home.path(), &config).unwrap(),
+            endpoint_path(home.path()),
             serde_json::to_vec(&Endpoint {
                 address,
                 token: key.clone(),

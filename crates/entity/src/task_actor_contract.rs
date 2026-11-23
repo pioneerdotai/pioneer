@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_actor_contract")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     #[sea_orm(column_type = "Text")]
     pub creator_json: String,
@@ -22,21 +23,30 @@ pub struct Model {
     pub launch_selection_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub requested_identity_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_identity_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_profile_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_config_fingerprint: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub derived_child_launch_grant_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub execution_destination_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub execution_route_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub execution_route_receipt_json: Option<String>,
     pub execution_route_expires_at_millis: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub creator_work_graph_root_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub work_graph_root_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub root_resource_scope_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub accounting_attribution_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub controller_principal_id: Option<String>,
     pub revision: i64,
     pub created_at: DateTimeWithTimeZone,

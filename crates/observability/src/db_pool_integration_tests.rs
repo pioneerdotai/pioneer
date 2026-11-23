@@ -1,16 +1,16 @@
 //! Actual SQLx event -> production adapter -> actual pool layer -> SDK output.
-//! SqliteDatabase routing itself remains owned by SQLite's existing tests.
+//! Gateway's routing tests cover the selection of the reader and writer.
 use crate::metrics::DatabasePoolAcquireMetricsLayer;
 use crate::pool_context::PoolContext;
-use crate::sqlite_query_scope::{PoolFutureExt, observe_control, open_stream};
+use crate::postgres_query_scope::{PoolFutureExt, observe_control, open_stream};
 use crate::telemetry::tests::{gateway_test_state, with_test_state};
 use futures_util::StreamExt;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+use pioneer_postgres_test::TestDatabase;
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
-    StreamTrait, TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DbBackend, Statement, StreamTrait, TransactionTrait,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -102,17 +102,24 @@ impl<S: Subscriber> Layer<S> for Acquisitions {
 }
 fn statement() -> Statement {
     Statement::from_string(
-        DbBackend::Sqlite,
+        DbBackend::Postgres,
         "SELECT 1 AS value UNION ALL SELECT 2".to_owned(),
     )
 }
-async fn connection(url: String) -> DatabaseConnection {
-    let mut options = ConnectOptions::new(url);
-    options.max_connections(1).min_connections(1);
-    // Same SQLx timing configuration as Gateway, with type inferred to avoid
-    // adding a direct log dependency just for LevelFilter.
-    options.map_sqlx_sqlite_pool_opts(|pool| pool.acquire_time_level("trace".parse().unwrap()));
-    Database::connect(options).await.unwrap()
+async fn connection(fixture: &TestDatabase, read_only: bool) -> anyhow::Result<DatabaseConnection> {
+    fixture
+        .connect_with_options(|options| {
+            options.max_connections(1).min_connections(1);
+            options.map_sqlx_postgres_pool_opts(|pool| {
+                pool.acquire_time_level("trace".parse().unwrap())
+            });
+            if read_only {
+                options.map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+            }
+        })
+        .await
 }
 fn expect_acquisition(
     provider: &SdkMeterProvider,
@@ -136,7 +143,7 @@ fn expect_acquisition(
         vec![Point {
             unit: "ms".into(),
             attributes: BTreeMap::from([
-                ("db.system.name".into(), "sqlite".into()),
+                ("db.system.name".into(), "postgresql".into()),
                 ("db.pool.role".into(), role.into()),
                 ("db.scheduling.class".into(), class.into()),
             ]),
@@ -198,100 +205,91 @@ fn sqlx_pool_adapter_exports_actual_acquisitions_for_scalar_stream_and_control()
         .unwrap();
     with_test_state(state, || {
         tracing::subscriber::with_default(subscriber, || {
-            runtime.block_on(async {
-                let directory = tempfile::tempdir().unwrap();
-                let path = directory.path().join("pool-observer.sqlite");
-                let writer = connection(format!("sqlite://{}?mode=rwc", path.display())).await;
-                writer
-                    .execute_unprepared("PRAGMA journal_mode=WAL")
-                    .await
-                    .unwrap();
-                let reader = connection(format!("sqlite://{}?mode=ro", path.display())).await;
-                reader
-                    .execute_unprepared("PRAGMA query_only=ON")
-                    .await
-                    .unwrap();
-                // Bootstrap is deliberately unscoped, so none of its actual events
-                // acquire a fabricated class. Remove only the independent event log.
-                events.0.lock().unwrap().clear();
-                provider.force_flush().unwrap();
-                assert!(output.0.lock().unwrap().is_empty());
+            runtime
+                .block_on(pioneer_postgres_test::with_database(async |fixture| {
+                    let writer = connection(fixture, false).await?;
+                    let reader = connection(fixture, true).await?;
+                    // Bootstrap is deliberately unscoped, so none of its actual events
+                    // acquire a fabricated class. Remove only the independent event log.
+                    events.0.lock().unwrap().clear();
+                    provider.force_flush().unwrap();
+                    assert!(output.0.lock().unwrap().is_empty());
 
-                use PoolContext::*;
-                for (context, pool, role, class) in [
-                    (ReaderInteractive, &reader, "reader", "interactive"),
-                    (ReaderMaintenance, &reader, "reader", "maintenance"),
-                    (WriterCritical, &writer, "writer", "critical"),
-                    (WriterInteractive, &writer, "writer", "interactive"),
-                    (WriterMaintenance, &writer, "writer", "maintenance"),
-                ] {
-                    // Repeat after Delta reset to exercise the warm bound handle.
-                    for _ in 0..2 {
-                        crate::query_cpu::observe(pool.query_all_raw(statement()))
-                            .in_pool(context)
-                            .await
-                            .unwrap();
-                        expect_acquisition(&provider, &output, &events, role, class);
-                        expect_no_acquisition(&provider, &output, &events);
-                    }
-                    observe_control(pool.ping(), "ping")
-                        .in_pool(context)
-                        .await
-                        .unwrap();
-                    expect_acquisition(&provider, &output, &events, role, class);
-                    for commit in [false, true] {
-                        let transaction = observe_control(pool.begin(), "begin")
-                            .in_pool(context)
-                            .await
-                            .unwrap();
-                        assert_eq!(events.0.lock().unwrap().len(), 1);
-                        crate::query_cpu::observe(transaction.query_all_raw(statement()))
-                            .in_pool(context)
-                            .await
-                            .unwrap();
-                        if commit {
-                            observe_control(transaction.commit(), "commit")
+                    use PoolContext::*;
+                    for (context, pool, role, class) in [
+                        (ReaderInteractive, &reader, "reader", "interactive"),
+                        (ReaderMaintenance, &reader, "reader", "maintenance"),
+                        (WriterCritical, &writer, "writer", "critical"),
+                        (WriterInteractive, &writer, "writer", "interactive"),
+                        (WriterMaintenance, &writer, "writer", "maintenance"),
+                    ] {
+                        // Repeat after Delta reset to exercise the warm bound handle.
+                        for _ in 0..2 {
+                            crate::query_cpu::observe(pool.query_all_raw(statement()))
                                 .in_pool(context)
                                 .await
                                 .unwrap();
-                        } else {
-                            observe_control(transaction.rollback(), "rollback")
-                                .in_pool(context)
-                                .await
-                                .unwrap();
+                            expect_acquisition(&provider, &output, &events, role, class);
+                            expect_no_acquisition(&provider, &output, &events);
                         }
-                        // Inspect/export only after releasing the held connection.
-                        // Statements and commit/rollback must add no acquisition.
-                        expect_acquisition(&provider, &output, &events, role, class);
-                        expect_no_acquisition(&provider, &output, &events);
-                    }
-
-                    for eof in [false, true] {
-                        let mut stream = open_stream(pool.stream_raw(statement()))
+                        observe_control(pool.ping(), "ping")
                             .in_pool(context)
                             .await
                             .unwrap();
-                        assert!(stream.next().await.unwrap().is_ok());
-                        if eof {
-                            while let Some(row) = stream.next().await {
-                                row.unwrap();
+                        expect_acquisition(&provider, &output, &events, role, class);
+                        for commit in [false, true] {
+                            let transaction = observe_control(pool.begin(), "begin")
+                                .in_pool(context)
+                                .await
+                                .unwrap();
+                            assert_eq!(events.0.lock().unwrap().len(), 1);
+                            crate::query_cpu::observe(transaction.query_all_raw(statement()))
+                                .in_pool(context)
+                                .await
+                                .unwrap();
+                            if commit {
+                                observe_control(transaction.commit(), "commit")
+                                    .in_pool(context)
+                                    .await
+                                    .unwrap();
+                            } else {
+                                observe_control(transaction.rollback(), "rollback")
+                                    .in_pool(context)
+                                    .await
+                                    .unwrap();
                             }
+                            // Inspect/export only after releasing the held connection.
+                            // Statements and commit/rollback must add no acquisition.
+                            expect_acquisition(&provider, &output, &events, role, class);
+                            expect_no_acquisition(&provider, &output, &events);
                         }
-                        drop(stream);
-                        expect_acquisition(&provider, &output, &events, role, class);
-                        expect_no_acquisition(&provider, &output, &events);
+
+                        for eof in [false, true] {
+                            let mut stream = open_stream(pool.stream_raw(statement()))
+                                .in_pool(context)
+                                .await
+                                .unwrap();
+                            assert!(stream.next().await.unwrap().is_ok());
+                            if eof {
+                                while let Some(row) = stream.next().await {
+                                    row.unwrap();
+                                }
+                            }
+                            drop(stream);
+                            expect_acquisition(&provider, &output, &events, role, class);
+                            expect_no_acquisition(&provider, &output, &events);
+                        }
                     }
-                }
-                assert!(crate::pool_context::current().is_none());
-                // Actual foreign/unscoped SQLx event after all scoped operations:
-                // it must not inherit the final writer-maintenance attribution.
-                reader.query_all_raw(statement()).await.unwrap();
-                assert_eq!(events.0.lock().unwrap().len(), 1);
-                events.0.lock().unwrap().clear();
-                expect_no_acquisition(&provider, &output, &events);
-                reader.close().await.unwrap();
-                writer.close().await.unwrap();
-            })
+                    assert!(crate::pool_context::current().is_none());
+                    // Actual foreign/unscoped SQLx event after all scoped operations:
+                    // it must not inherit the final writer-maintenance attribution.
+                    reader.query_all_raw(statement()).await.unwrap();
+                    assert_eq!(events.0.lock().unwrap().len(), 1);
+                    events.0.lock().unwrap().clear();
+                    expect_no_acquisition(&provider, &output, &events);
+                    Ok(())
+                }))
+                .unwrap();
         })
     });
     provider.shutdown().unwrap();

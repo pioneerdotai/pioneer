@@ -5,15 +5,14 @@ use pioneer_client::timeline::semantic::{
     apply_thread_timeline_page, apply_turn_work_items_changed, apply_turn_work_items_get_response,
 };
 
-async fn detached_parent(case: &str) -> (tempfile::TempDir, LiveSemanticTimelineHarness) {
+async fn detached_parent(
+    case: &str,
+) -> (
+    Arc<pioneer_postgres_test::TestDatabase>,
+    LiveSemanticTimelineHarness,
+) {
     let (directory, workspace_manager, crud_store, workspace_id) =
-        setup_pooled_file_workspace_manager().await;
-    // Match Gateway's serialized FK OFF writer and query-only reader pool.
-    crud_store
-        .database_connection()
-        .execute_unprepared("PRAGMA foreign_keys=OFF")
-        .await
-        .unwrap();
+        setup_pooled_workspace_manager().await;
     let mut harness = setup_live_semantic_timeline_harness_on_store(
         case,
         generate_test_request_id("detachedthread", case),
@@ -83,7 +82,7 @@ fn items_params(harness: &LiveSemanticTimelineHarness) -> JsonValue {
         "workItemIds":["stale-work", "stale-work", "missing-work"]})
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_parent_notifications_and_late_items_reads_preserve_authoritative_deletion() {
     let (_directory, mut harness) = detached_parent("owned_absence").await;
     let store = harness.processor.crud_store.clone();
@@ -383,7 +382,7 @@ async fn detached_parent_notifications_and_late_items_reads_preserve_authoritati
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_work_absence_does_not_mask_unprepared_unhealthy_or_database_failures() {
     use pioneer_entity::turn_event_projection_stream_state as stream;
     for fault in [
@@ -470,7 +469,7 @@ async fn detached_work_absence_does_not_mask_unprepared_unhealthy_or_database_fa
     assert!(result.get("error").is_some(), "{result}");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn detached_work_tombstones_require_current_authorization_and_authoritative_scope() {
     let (_directory, mut harness) = detached_parent("scope").await;
     let store = harness.processor.crud_store.clone();

@@ -1,11 +1,11 @@
 use super::*;
 use pioneer_client::{core::ClientCore, state::snapshot::ActiveThreadSnapshot};
 use pioneer_crud::{TurnExecutionStatus, TurnExecutorKind};
+use pioneer_postgres_pools::PostgresWriteClass;
 use pioneer_protocol::{
     GatewayNotification, NativeTerminalEffectPreparation, ThreadUpdatedNotification,
     TurnStartParams,
 };
-use pioneer_sqlite::SqliteWriteClass;
 use sea_orm::ActiveModelTrait;
 use std::sync::atomic::AtomicU64;
 
@@ -503,7 +503,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             Box::pin(async move {
                 weak.upgrade()
                     .unwrap()
-                    .with_database_class(SqliteWriteClass::Critical)
+                    .with_database_class(PostgresWriteClass::Critical)
                     .ensure_agent_listener_task(&thread)
                     .await
                     .map_err(|e| format!("{e:#}"))
@@ -1572,7 +1572,7 @@ enum InitialStopPhase {
 // Preparation is real admission, including the runtime snapshot and listener.
 // Retiring that actor before dispatch must produce a failure outcome even if
 // the dispatcher's existing recovery path successfully schedules recovery.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn prepared_native_dispatch_reports_retired_actor_instead_of_success() {
     exercise_initial_native_stop(InitialStopPhase::ActorRemovedBeforeDispatch).await;
 }
@@ -1580,72 +1580,72 @@ async fn prepared_native_dispatch_reports_retired_actor_instead_of_success() {
 // These phase tests use one executor thread: observing the control registry's
 // Applied process control observes its synchronous out-of-band cancellation.
 // Registration remains behind the barrier; no sleep or provider race is used.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_finishes_actor_admission_before_context_registration() {
     exercise_initial_native_stop(InitialStopPhase::ActorBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_switches_to_registered_context_when_early_writer_loses_phase() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationWinsEarlyCommit).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_follows_actor_appearing_before_registration() {
     exercise_initial_native_stop(InitialStopPhase::ActorAppearsBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_native_stop_retains_completion_after_the_process_ack_window() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationAfterControlAckWindow).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_a_real_terminal_storage_failure() {
     exercise_initial_native_stop(InitialStopPhase::CanonicalStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_registration_storage_failure() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_completion_across_registration_write_failure() {
     exercise_initial_native_stop(InitialStopPhase::RegistrationWriteStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_finishes_a_direct_threads_child_after_delayed_registration() {
     exercise_initial_native_stop(InitialStopPhase::DirectChildBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_task_cancel_ack_keeps_the_actor_owning_delayed_durable_publication() {
     exercise_initial_native_stop(InitialStopPhase::NativeTaskBeforeRegistration).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_rediscovers_unfinished_children_after_a_graph_fence() {
     exercise_initial_native_stop(InitialStopPhase::GraphFenceStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_waits_for_accepted_cancellation_projection() {
     exercise_initial_native_stop(InitialStopPhase::AcceptedProjectionPending).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_initial_stop_retains_actor_after_a_real_projection_failure() {
     exercise_initial_native_stop(InitialStopPhase::ProjectionStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_early_stop_and_repeat_wait_for_real_projection_without_an_actor() {
     exercise_initial_native_stop(InitialStopPhase::BeforeActorProjectionStorageUnavailable).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn public_root_stop_retries_a_direct_child_after_real_projection_failure() {
     exercise_initial_native_stop(InitialStopPhase::GraphFenceProjectionUnavailable).await;
 }
@@ -1797,7 +1797,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             ] {
                 owner.running.store(true, Ordering::SeqCst);
             }
-            db.execute_unprepared("CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+            db.execute_unprepared("CREATE FUNCTION reject_early_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture projection unavailable'; END; $$; CREATE TRIGGER reject_early_projection BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.status = 'interrupted') EXECUTE FUNCTION reject_early_projection();").await.unwrap();
             for suffix in ["first-pending", "repeat-pending"] {
                 let id = generate_test_request_id("initialstop", suffix);
                 let mut pending: JsonValue = serde_json::from_str(&request).unwrap();
@@ -1830,7 +1830,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 assert!(!processor.agent_manager.has_thread(thread).await);
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
             }
-            db.execute_unprepared("DROP TRIGGER reject_early_projection")
+            db.execute_unprepared("DROP TRIGGER reject_early_projection ON turn; DROP FUNCTION reject_early_projection()")
                 .await
                 .unwrap();
             let replay = store
@@ -2167,11 +2167,11 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 let trigger = if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable)
                 {
                     format!(
-                        "CREATE TRIGGER fail_graph_child BEFORE UPDATE OF status ON turn WHEN NEW.id='{first_turn}' AND NEW.status='interrupted' BEGIN SELECT RAISE(ABORT,'fixture projection unavailable'); END"
+                        "CREATE FUNCTION fail_graph_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture projection unavailable'; END; $$; CREATE TRIGGER fail_graph_child BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.id='{first_turn}' AND NEW.status='interrupted') EXECUTE FUNCTION fail_graph_child();"
                     )
                 } else {
                     format!(
-                        "CREATE TRIGGER fail_graph_child BEFORE INSERT ON turn_event WHEN NEW.turn_id='{first_turn}' BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END"
+                        "CREATE FUNCTION fail_graph_child() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture storage unavailable'; END; $$; CREATE TRIGGER fail_graph_child BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='{first_turn}') EXECUTE FUNCTION fail_graph_child();"
                     )
                 };
                 db.execute_unprepared(&trigger).await.unwrap();
@@ -2270,7 +2270,11 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                         .await;
                     recv_error_by_id(&mut rx, &id).await;
                 }
-                db.execute_unprepared("DROP TRIGGER fail_graph_child")
+                db.execute_unprepared(if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
+                    "DROP TRIGGER fail_graph_child ON turn; DROP FUNCTION fail_graph_child()"
+                } else {
+                    "DROP TRIGGER fail_graph_child ON turn_event; DROP FUNCTION fail_graph_child()"
+                })
                     .await
                     .unwrap();
                 if matches!(phase, InitialStopPhase::GraphFenceProjectionUnavailable) {
@@ -2581,7 +2585,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             if matches!(phase, InitialStopPhase::RegistrationWriteStorageUnavailable) {
                 // The guard can read storage; only the real immutable context
                 // INSERT fails after the Stop has been handed to the actor.
-                db.execute_unprepared(&format!("CREATE TRIGGER fail_initial_registration BEFORE INSERT ON native_cancellation_context WHEN NEW.turn_id='{turn}' BEGIN SELECT RAISE(ABORT,'fixture registration storage unavailable'); END"))
+                db.execute_unprepared(&format!("CREATE FUNCTION fail_initial_registration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture registration storage unavailable'; END; $$; CREATE TRIGGER fail_initial_registration BEFORE INSERT ON native_cancellation_context FOR EACH ROW WHEN (NEW.turn_id='{turn}') EXECUTE FUNCTION fail_initial_registration();"))
                     .await.unwrap();
                 processor.arm_completed_history_preparation_barrier(
                     "__initial_stop_registration_failed__",
@@ -2604,7 +2608,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 );
                 assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
-                db.execute_unprepared("DROP TRIGGER fail_initial_registration")
+                db.execute_unprepared("DROP TRIGGER fail_initial_registration ON native_cancellation_context; DROP FUNCTION fail_initial_registration()")
                     .await
                     .unwrap();
             }
@@ -2649,7 +2653,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
             if matches!(phase, InitialStopPhase::CanonicalStorageUnavailable) {
                 // Registration can commit, but the actual canonical append fails.
                 // The control receipt must retain its owner through that failure.
-                db.execute_unprepared(&format!("CREATE TRIGGER fail_initial_stop BEFORE INSERT ON turn_event WHEN NEW.turn_id='{turn}' BEGIN SELECT RAISE(ABORT,'fixture terminal storage unavailable'); END"))
+                db.execute_unprepared(&format!("CREATE FUNCTION fail_initial_stop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture terminal storage unavailable'; END; $$; CREATE TRIGGER fail_initial_stop BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.turn_id='{turn}') EXECUTE FUNCTION fail_initial_stop();"))
                     .await.unwrap();
                 processor.arm_completed_history_preparation_barrier(
                     "__initial_stop_terminal_commit_failed__",
@@ -2671,7 +2675,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                 assert!(!store.native_turn_has_accepted_terminal(turn).await.unwrap());
                 assert!(!stop.is_finished());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
-                db.execute_unprepared("DROP TRIGGER fail_initial_stop")
+                db.execute_unprepared("DROP TRIGGER fail_initial_stop ON turn_event; DROP FUNCTION fail_initial_stop()")
                     .await
                     .unwrap();
             }
@@ -2681,7 +2685,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                     | InitialStopPhase::ProjectionStorageUnavailable
             ) {
                 if matches!(phase, InitialStopPhase::ProjectionStorageUnavailable) {
-                    db.execute_unprepared("CREATE TRIGGER reject_owned_projection BEFORE UPDATE OF status ON turn WHEN NEW.status = 'interrupted' BEGIN SELECT RAISE(ABORT, 'fixture projection unavailable'); END").await.unwrap();
+                    db.execute_unprepared("CREATE FUNCTION reject_owned_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture projection unavailable'; END; $$; CREATE TRIGGER reject_owned_projection BEFORE UPDATE OF status ON turn FOR EACH ROW WHEN (NEW.status = 'interrupted') EXECUTE FUNCTION reject_owned_projection();").await.unwrap();
                 }
                 processor.arm_completed_history_preparation_barrier(
                     "__initial_stop_terminal_commit_failed__",
@@ -2732,7 +2736,7 @@ async fn exercise_initial_native_stop(phase: InitialStopPhase) {
                             .status,
                         TurnStatus::InProgress
                     );
-                    db.execute_unprepared("DROP TRIGGER reject_owned_projection")
+                    db.execute_unprepared("DROP TRIGGER reject_owned_projection ON turn; DROP FUNCTION reject_owned_projection()")
                         .await
                         .unwrap();
                 }

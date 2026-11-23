@@ -1,0 +1,2 @@
+DROP TRIGGER compaction_projection_epoch_lock_capture_order ON compaction_projection_epoch;
+DROP FUNCTION compaction_projection_epoch_lock_capture_order();

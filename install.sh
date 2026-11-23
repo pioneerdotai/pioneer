@@ -201,11 +201,10 @@ run_package_installer() {
   local executable="pioneer"
   local gateway_bundle=""
   if [[ "$os" == "macos" && "$COMPUTER_USE" -eq 1 ]]; then
-    executable="cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
-    gateway_bundle="${work_dir}/payload/cua/Pioneer Gateway.app"
+    executable="runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
   fi
   local installer_bin="${work_dir}/payload/${executable}"
-  PIONEER_ASSET_FILE="$asset_file" PIONEER_INSTALLER_BIN="$installer_bin" \
+  installer_bin="$(PIONEER_ASSET_FILE="$asset_file" PIONEER_INSTALLER_BIN="$installer_bin" \
     PIONEER_EXTRACT_DIR="${work_dir}/payload" PIONEER_TARGET_OS="$os" PIONEER_TARGET_ARCH="$arch" python3 <<'PY'
 import gzip
 import os
@@ -280,6 +279,8 @@ elif asset.suffix == ".gz":
             target.write(chunk)
 else:
     raise SystemExit("Gateway installation requires a .gz server archive or complete ZIP archive")
+if not installer.is_file() and installer == destination / "runtime/Pioneer Gateway.app/Contents/MacOS/pioneer":
+    installer = destination / "cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
 if not installer.is_file():
     raise SystemExit(f"{asset} does not contain {installer.relative_to(destination)}")
 # Check the selected native target before executing any extracted code.
@@ -295,8 +296,11 @@ else:
              and int.from_bytes(header[4:8], order) == (0x100000C if arm else 0x1000007))
 if not valid:
     raise SystemExit("Gateway executable does not match this OS and architecture")
+print(installer)
 PY
-  if [[ -n "$gateway_bundle" ]]; then
+)"
+  if [[ "$os" == "macos" && "$COMPUTER_USE" -eq 1 ]]; then
+    gateway_bundle="$(dirname "$(dirname "$(dirname "$installer_bin")")")"
     need_cmd codesign
     codesign --verify --deep --strict "$gateway_bundle"
   elif [[ "$asset_file" == *.gz ]]; then
@@ -349,12 +353,9 @@ main() {
     checksums_file="${WORK_DIR}/inputs/SHA256SUMS"
     tag="local-bundle"
   else
-    local asset_suffix="" asset_ext="gz"
+    local asset_suffix="" asset_ext="zip"
     if [[ "$COMPUTER_USE" -eq 1 ]]; then
       asset_suffix="-computer-use-package"
-      asset_ext="zip"
-    elif [[ "$os" == "macos" && "$arch" == "x86_64" ]]; then
-      asset_ext="zip"
     fi
     asset_name="pioneer-gateway-${os}-${arch}${asset_suffix}.${asset_ext}"
     tag="$(resolve_release_tag)"

@@ -10,17 +10,21 @@ pub struct Model {
     #[sea_orm(
         primary_key,
         auto_increment = false,
+        column_type = "Text",
         unique_key = "idx_turn_admission_scope"
     )]
     pub turn_id: String,
-    #[sea_orm(unique_key = "idx_turn_admission_scope")]
+    #[sea_orm(column_type = "Text", unique_key = "idx_turn_admission_scope")]
     pub thread_id: String,
-    #[sea_orm(unique_key = "idx_turn_admission_scope")]
+    #[sea_orm(column_type = "Text", unique_key = "idx_turn_admission_scope")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub request_digest: String,
     pub created_at: DateTimeWithTimeZone,
     pub policy_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub role_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub policy_fingerprint: Option<String>,
     #[sea_orm(
         belongs_to,
@@ -29,7 +33,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

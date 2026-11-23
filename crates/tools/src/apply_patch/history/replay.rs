@@ -1,13 +1,13 @@
 //! Bounded replay of durable Apply Patch record and status streams.
 //!
 //! The applied-record log and the intent terminal markers are independent
-//! SQLite streams.  A projection must merge them by commit ordinal without
+//! PostgreSQL streams.  A projection must merge them by commit ordinal without
 //! materializing a whole (potentially very large) turn in memory.  This
 //! module owns that merge so live publication, bootstrap repair, and crash
 //! recovery cannot drift into subtly different coverage semantics.
 
 use crate::apply_patch::history::{
-    CommitOrdinal, IntentStatus, SqliteAppliedPatchStore, SqliteCommitIntentStore,
+    CommitOrdinal, IntentStatus, PostgresAppliedPatchStore, PostgresCommitIntentStore,
     StoredPatchRecord, TurnAggregate, TurnRecordProjector,
 };
 use anyhow::{Result, anyhow, bail, ensure};
@@ -34,8 +34,8 @@ pub struct TurnProjectionReplay {
 /// bookkeeping repair commits. Other equal ordinals are a durable consistency
 /// error.
 pub async fn replay_turn_pages(
-    records: &SqliteAppliedPatchStore,
-    intents: &SqliteCommitIntentStore,
+    records: &PostgresAppliedPatchStore,
+    intents: &PostgresCommitIntentStore,
     thread_id: &str,
     turn_id: &str,
     page_size: usize,

@@ -6,9 +6,9 @@ invariants below.
 
 ## Diagnostics
 
-For debugging development or production databases, use direct SQL with `sqlite3`,
-another SQL client, or a short script. Raw SQL and direct connections are allowed
-for this work; the application architecture/ORM requirements below govern code
+For debugging the Gateway database, use direct SQL with `psql` or a short
+script. Use `sqlite3` for diagnostics of independent SQLite stores. Raw SQL
+and direct connections are allowed for this work; the application architecture/ORM requirements below govern code
 implementation. Do not add Rust files/crates or generate Entity/ORM scaffolding
 solely to inspect a database. Use read-only connections for inspection; data
 changes must stay within the task's authorized scope.
@@ -23,25 +23,32 @@ For any database behavior change, including callers in other crates, read
 
 - Schema: [migration](crates/migration/AGENTS.md).
 - Entity generation: [entity](crates/entity/AGENTS.md).
-- Data migration/backfill: [Gateway database](crates/gateway/src/database/AGENTS.md).
+- Database startup and maintenance: [Gateway database](crates/gateway/src/database/AGENTS.md).
 
 ## Runtime Model
 
-The Gateway SQLite runtime has two independent contours:
+The Gateway application database runs on PostgreSQL. The scoped handle and
+admission queues live in [`pioneer-postgres-pools`](crates/postgres-pools).
 
-- a read-only reader pool, protected with `PRAGMA query_only=ON`;
-- one serialized writer executor, because SQLite still has only one effective
-  writer.
+Microsandbox uses its own SQLite database for the local Dev Apps sandbox
+registry. The keystore and external CLI runtimes also own their storage
+independently of the Gateway application database.
 
-Application database access must go through `SqliteDatabase`, `CrudStore`, and the
-existing repositories. Do not open ad hoc SQLite connections, use the writer
-pool directly, acquire scheduling permits manually, or bypass the writer
-executor.
+The Gateway PostgreSQL runtime has two independent pools:
+
+- a reader pool with read-only sessions and transactions;
+- a writer pool that admits concurrent operations under the scoped scheduling
+  limits. Use PostgreSQL transaction boundaries and row locks for invariants
+  shared by concurrent writers.
+
+Application database access must go through the scoped database handle,
+`CrudStore`, and the domain repositories. Do not open ad hoc connections,
+use the writer pool directly, or acquire scheduling permits manually.
 
 Row-returning SQL is routed from the actual statement. Ordinary reads use the
-reader pool; writes, write transactions, and mutating `... RETURNING`
-statements use the writer. A `SELECT` that invokes a mutating SQLite extension
-must use the explicit writer query API.
+reader pool, and writes, locking reads, write transactions, and mutating
+`... RETURNING` statements use the writer. Pass an open transaction to every
+repository participating in one atomic operation.
 
 ## Scheduling Classes
 
@@ -166,7 +173,7 @@ request unless it is an explicitly owned background worker with durable,
 idempotent recovery.
 
 Keep queues and batches bounded. Surface overload honestly; do not hide it with
-longer timeouts, unbounded retries, priority promotion, or extra SQLite writer
+longer timeouts, unbounded retries, priority promotion, or extra database
 connections.
 
 ## Correctness Requirements
@@ -177,9 +184,9 @@ connections.
   state.
 - Make migrations and reconciliation idempotent across retry and restart.
   Migration completion markers must reflect the actual durable outcome.
-- Keep reader connections physically read-only. Do not weaken `query_only`,
-  silently route writes through readers, or use a read transaction as a write
-  boundary.
+- Keep PostgreSQL reader sessions read-only with
+  `default_transaction_read_only` and a restricted reader role for the bundled
+  server. Route writes through the writer pool and an explicit transaction.
 - Keep database observability low-cardinality and free of SQL text, payloads,
   identifiers, paths, credentials, and raw errors.
 
@@ -196,6 +203,24 @@ Database changes require focused regression coverage for:
 - cancellation without leaked queue entries or permits;
 - concurrent interactive and maintenance work;
 - retry/restart idempotency and poison-row progress for background jobs.
+
+For PostgreSQL tests and schema checks, reuse the installed local PostgreSQL
+service with pgvector. Use `PIONEER_TEST_POSTGRES_ADMIN_URL` (an explicit role
+and the maintenance database) to create and drop uniquely named test databases.
+Run migrations, codegen and tests only in those databases. Local Cargo config or
+the CI job supplies the URL.
+
+PostgreSQL integration tests run under
+`cargo run --locked -p pioneer-postgres-test -- <test command>`.
+The runner applies the Migrator once and closes the template pool before any
+test starts. Use `with_database` for a clone, `with_empty_database` to test
+migrations, and `TestDatabase::connect` for another pool on the same database.
+For a test that calls nested fixture builders, use
+`#[pioneer_postgres_test::postgres_test]` or wrap a custom runtime's test future
+in `with_test_databases`. Each call to `scoped_database` creates an independent
+fixture. Pass that fixture to concurrent workers so they share its database.
+The test scope closes fixture pools and drops each database, including on panic.
+The runner removes its template and any databases left by interrupted tests.
 
 Use `cargo-nextest` for Rust unit and integration tests:
 

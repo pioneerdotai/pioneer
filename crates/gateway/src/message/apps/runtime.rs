@@ -102,6 +102,7 @@ impl AppRuntime {
 }
 impl MessageProcessor {
     pub(in crate::message) async fn stop_app_runtime(&self, app: &str) -> Result<()> {
+        self.stop_dev_view(app).await;
         self.host_api.fence_app(app);
         let execution = self.app_runtime.executions.lock().await.get(app).map(|e| {
             (
@@ -153,7 +154,7 @@ impl MessageProcessor {
         }
         let cancel = CancellationToken::new();
         let child = cancel.clone();
-        let owner = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let owner = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         let task = tokio::spawn(async move {
             let recovery = async {
                 let backend = owner
@@ -307,6 +308,9 @@ impl MessageProcessor {
         parent: pioneer_crud::PackageRecord,
         shutdown: &CancellationToken,
     ) -> Result<()> {
+        if super::dev::is_dev(&parent) {
+            return Ok(());
+        }
         let mutation = self.plugin_mutation_lock(&parent.id).await;
         let _guard = tokio::select! { _ = shutdown.cancelled() => return Ok(()), guard = mutation.lock_owned() => guard };
         let parent = match self
@@ -635,7 +639,7 @@ impl MessageProcessor {
                 execution: execution_id.clone(),
             };
             let secret = credential.clone();
-            let host = serde_json::json!({"endpoint":format!("ws://host.microsandbox.internal:{port}/apps/host"),"credential":credential,"capabilities":["host.pty"]});
+            let host = serde_json::json!({"endpoint":format!("ws://host.microsandbox.internal:{port}/apps/host"),"credential":credential,"capabilities":["host.pty","host.render"]});
             let proxy_credential =
                 pioneer_protocol::AuthSecretString::new(hex::encode(rand::random::<[u8; 32]>()));
             let bootstrap = serde_json::json!({"execution_id":execution_id,"host_api":host,"ui_base_path":"/","ui_proxy":{"credential":proxy_credential}});
@@ -1095,7 +1099,7 @@ mod backend_execution_access_tests {
         updated_at: chrono::DateTime::from_timestamp(1, 0).unwrap().fixed_offset(),
     }
     }
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn current_app_execution_authenticates_without_consent_and_stop_retires_it() {
         let (processor, _, _, _, _, workspace) =
             crate::message::tests::setup_workspace_message_processor().await;

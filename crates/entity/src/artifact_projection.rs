@@ -7,15 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_projection")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub artifact_id: String,
+    #[sea_orm(column_type = "Text")]
     pub artifact_version_id: String,
+    #[sea_orm(column_type = "Text")]
     pub projection_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub text_content: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub blob_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub metadata_json: String,

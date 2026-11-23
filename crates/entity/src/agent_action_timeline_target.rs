@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action_timeline_target")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub target_key: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub action_id: String,
+    #[sea_orm(column_type = "Text")]
     pub turn_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", nullable, unique)]
     pub turn_item_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub target_kind: String,
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
@@ -23,7 +25,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub agent_action: HasOne<super::agent_action::Entity>,
+    pub agent_action: BelongsTo<super::agent_action::Entity>,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
@@ -31,7 +33,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
     #[sea_orm(
         belongs_to,
         from = "turn_item_id",
@@ -39,7 +41,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub turn_item: HasOne<super::turn_item::Entity>,
+    pub turn_item: BelongsTo<Option<super::turn_item::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

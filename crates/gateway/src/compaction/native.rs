@@ -26,15 +26,7 @@ fn history_check_metadata(
     })
 }
 
-pub(crate) fn native_owner(workspace: &str, thread: &str) -> String {
-    // Lengths disambiguate arbitrary scope identifiers without parsing them.
-    format!(
-        "native:{}:{workspace}:{}:{thread}",
-        workspace.len(),
-        thread.len()
-    )
-}
-
+pub(crate) use pioneer_crud::compaction::native_owner;
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(super) async fn prepare_native_projection(
@@ -530,7 +522,7 @@ async fn prepare_native_projection_with_prepared(
         // evaluating either the full request or any compaction candidate.
         let materialized = context.provider.prepare_input_budget(request).await?;
         let media = materialized.media;
-        let mut full = NativeRequestProjection::full(
+        let full = NativeRequestProjection::full(
             materialized.request,
             media.clone(),
             budget.clone(),
@@ -551,36 +543,18 @@ async fn prepare_native_projection_with_prepared(
             version,
             basis.clone(),
         )?;
-        let mut message_tokens = full.message_input_tokens.clone();
-        let mut input = receipt.calibrated_estimate(
+        let message_tokens = &full.message_input_tokens;
+        let input = receipt.calibrated_estimate(
             full.estimated_input_tokens,
-            &message_tokens,
+            message_tokens,
             measured.as_ref(),
         )?;
-        if !budget.fits_estimate(input, full.output_reserve, recovery) {
-            if let Some(reduced) = super::result_budget::shrink_results(
-                &store, workspace, &full, &media, &budget, recovery,
-            )
-            .await?
-            {
-                full = reduced;
-                message_tokens = full.message_input_tokens.clone();
-                receipt = NativeInputReceipt::for_request(
-                    &full.request,
-                    &context.provider_instance,
-                    &api_identity,
-                    version,
-                    basis.clone(),
-                )?;
-                // Representation changed: exact-prefix validation decides
-                // whether any earlier provider measurement is still usable.
-                input = receipt.calibrated_estimate(
-                    full.estimated_input_tokens,
-                    &message_tokens,
-                    measured.as_ref(),
-                )?;
-            }
-        }
+        let input_capacity = estimated_input_capacity(&budget, full.output_reserve, false);
+        receipt.remaining_input_tokens = Some(input_capacity.saturating_sub(input.total()));
+        // Canonical tool results have already been bounded at their owner (or
+        // rebuilt from the same durable source on restore). Preserve those
+        // representations under pressure and let whole-round compaction fit
+        // the history.
         let history_check = history_check_metadata(&full)?;
         if !recovery && budget.fits_estimate(input, full.output_reserve, false) {
             return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
@@ -650,7 +624,7 @@ async fn prepare_native_projection_with_prepared(
             workspace,
             thread,
             &full.request.messages,
-            &message_tokens,
+            message_tokens,
         )?;
         // Compaction changes the measured prefix; its replacement candidates
         // must use their local fixed framing, not reuse an old provider anchor.
@@ -766,7 +740,7 @@ async fn prepare_native_projection_with_prepared(
             full.request,
             receipt,
             history_check,
-            Some((snapshot, summarizer, projection, first)),
+            Some((snapshot, summarizer, projection, first, input_capacity)),
         ))
     };
     let (request, receipt, history_check, operation) = tokio::select! { biased;
@@ -780,7 +754,7 @@ async fn prepare_native_projection_with_prepared(
     if let Some(AcceptedProjection::Prepared(projection)) = &mut accepted_projection {
         drop(projection.frozen_hold.take());
     }
-    let Some((snapshot, summarizer, projection, summary_index)) = operation else {
+    let Some((snapshot, summarizer, projection, summary_index, input_capacity)) = operation else {
         return Ok(NativePreparedRequest {
             request,
             receipt,
@@ -846,13 +820,16 @@ async fn prepare_native_projection_with_prepared(
             protected_input: false,
             inherited: checkpoint_is_working_context,
         });
-        let receipt = NativeInputReceipt::for_request(
+        let mut receipt = NativeInputReceipt::for_request(
             &evaluated.request,
             &context.provider_instance,
             &receipt.identity.api_format,
             checkpoint.projection_version,
             Some(id),
         )?;
+        receipt.remaining_input_tokens =
+            Some(input_capacity.saturating_sub(evaluated.estimated_input_tokens));
+        let history_check = history_check_metadata(&evaluated)?;
         Ok(NativePreparedRequest {
             request: evaluated.request,
             receipt,

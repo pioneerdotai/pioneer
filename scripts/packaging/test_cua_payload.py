@@ -84,7 +84,7 @@ class CuaPayloadTests(unittest.TestCase):
                     self.assertEqual(first.read_bytes(), binary.read_bytes())
                     self.assertEqual(CUA["dev"](target, binary, runtime), first)
                     for name, content in upstream.items():
-                        self.assertEqual((first.parent / "cua" / name).read_bytes(), content)
+                        self.assertEqual((first.parent / "runtime/cua" / name).read_bytes(), content)
                     binary.write_bytes(native_header(target) + b"current debug changes")
                     refreshed = CUA["dev"](target, first, runtime)
                     self.assertNotEqual(refreshed, first)
@@ -134,7 +134,7 @@ class CuaPayloadTests(unittest.TestCase):
         for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                contents = root / "cua/Pioneer Gateway.app/Contents"
+                contents = root / "runtime/Pioneer Gateway.app/Contents"
                 gateway = contents / "MacOS/pioneer"
                 daemon = contents / "Helpers/cua-driver"
                 for path in (gateway, daemon):
@@ -145,8 +145,9 @@ class CuaPayloadTests(unittest.TestCase):
                 (contents / "Info.plist").write_bytes(plistlib.dumps(info))
                 if target == "x86_64-apple-darwin":
                     (gateway.parent / "libonnxruntime.dylib").write_bytes(native_header(target))
+                (root / "runtime/cua").mkdir()
                 for name in ("LICENSE.cua-driver.md", "THIRD_PARTY_NOTICES.md"):
-                    (root / "cua" / name).write_text("Package notices fixture\n")
+                    (root / "runtime/cua" / name).write_text("Package notices fixture\n")
                 selected = CUA["release"]()
                 manifest = dict(schema_version=1, repository=selected["repository"],
                     revision=selected["revision"], version=selected["version"], release_tag=selected["tag"],
@@ -155,8 +156,8 @@ class CuaPayloadTests(unittest.TestCase):
                     sha256=hashlib.sha256(daemon.read_bytes()).hexdigest())
 
                 def seal_inventory():
-                    manifest["files"] = CUA["file_inventory"](root, ("cua/manifest.json",))
-                    (root / "cua/manifest.json").write_text(json.dumps(manifest))
+                    manifest["files"] = CUA["file_inventory"](root, ("runtime/cua/manifest.json",))
+                    (root / "runtime/cua/manifest.json").write_text(json.dumps(manifest))
 
                 seal_inventory()
                 # Architecture/layout validation deliberately does not claim to
@@ -248,11 +249,11 @@ class CuaPayloadTests(unittest.TestCase):
                     members = {name: container.read(name) for name in container.namelist()}
                 self.assertEqual(members[binary.name], binary.read_bytes())
                 for name, data in upstream.items():
-                    self.assertEqual(members["cua/" + name], data)
+                    self.assertEqual(members["runtime/cua/" + name], data)
                 for defect in ("version", "target", "architecture", "checksum", "companion"):
                     with self.subTest(defect=defect):
                         changed = dict(members)
-                        manifest = json.loads(changed["cua/manifest.json"])
+                        manifest = json.loads(changed["runtime/cua/manifest.json"])
                         if defect == "version":
                             manifest["version"] = "0.37.0"
                             message = "identity mismatch"
@@ -261,21 +262,21 @@ class CuaPayloadTests(unittest.TestCase):
                             message = "identity mismatch"
                         elif defect == "architecture":
                             wrong_arch = "x86_64-pc-windows-msvc" if "windows" in target else "aarch64-unknown-linux-gnu"
-                            name = "cua/" + manifest["daemon"]
+                            name = "runtime/" + manifest["daemon"]
                             changed[name] = native_header(wrong_arch)
                             manifest["files"][name] = dict(sha256=hashlib.sha256(changed[name]).hexdigest(), bytes=len(changed[name]))
                             manifest["sha256"] = hashlib.sha256(changed[name]).hexdigest()
                             message = "architecture mismatch"
                         elif defect == "checksum":
-                            changed["cua/" + manifest["daemon"]] += b"corrupt"
+                            changed["runtime/" + manifest["daemon"]] += b"corrupt"
                             message = "checksum mismatch"
                         else:
-                            companion = ("cua/cua-driver-uia.exe" if "windows" in target else
-                                         "cua/wayland-helper/winrects@cua/extension.js")
+                            companion = ("runtime/cua/cua-driver-uia.exe" if "windows" in target else
+                                         "runtime/cua/wayland-helper/winrects@cua/extension.js")
                             del changed[companion]
                             del manifest["files"][companion]
                             message = "missing required files"
-                        changed["cua/manifest.json"] = json.dumps(manifest).encode()
+                        changed["runtime/cua/manifest.json"] = json.dumps(manifest).encode()
                         invalid = root / (defect + ".zip")
                         with zipfile.ZipFile(invalid, "w") as container:
                             for name, data in changed.items():

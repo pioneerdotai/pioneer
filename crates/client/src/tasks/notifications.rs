@@ -252,7 +252,7 @@ pub struct TaskNotificationStore {
     // These are never treated as server-negative or confirmed evidence.
     viewed_failed: std::collections::HashSet<(String, String, String)>,
 }
-// New servers provide the exact SQLite key; the fallback is exclusively for
+// New servers provide the exact server ordering key; the fallback is exclusively for
 // legacy servers whose entries predate the negotiated protocol.
 fn compare_inbox_entries(
     a: &TaskCompletionInboxEntry,

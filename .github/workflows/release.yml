@@ -74,40 +74,8 @@ jobs:
         run: python scripts/packaging/release-preflight.py --signing
 
   generate-model-catalog:
-    name: generate-model-catalog
     needs: preflight
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
-
-      - name: setup-rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.99.0"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-model-catalog-v1
-
-      - name: generate-and-validate-model-catalog
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release-model-catalog
-          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
-            release-model-catalog/catalog.json
-
-      - name: upload-model-catalog
-        uses: actions/upload-artifact@v6
-        with:
-          name: pioneer-release-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
-          path: release-model-catalog/catalog.json
-          if-no-files-found: error
+    uses: ./.github/workflows/release-model-catalog.yml
 
   platforms:
     name: release-${{ matrix.target }}
@@ -116,29 +84,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            asset: pioneer-gateway-linux-x86_64.gz
+            asset: pioneer-gateway-linux-x86_64.zip
             cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip
             asset_name: pioneer-linux-x86_64.AppImage
             update_asset_name: pioneer-linux-x86_64.AppImage
             appimagetool_arch: x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: pioneer-gateway-linux-aarch64.gz
+            asset: pioneer-gateway-linux-aarch64.zip
             cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip
             asset_name: pioneer-linux-aarch64.AppImage
             update_asset_name: pioneer-linux-aarch64.AppImage
             appimagetool_arch: aarch64
-          - os: macos-15-intel
+          - os: macos-26-intel
             target: x86_64-apple-darwin
             asset: pioneer-gateway-macos-x86_64.zip
             cu_asset: pioneer-gateway-macos-x86_64-computer-use-package.zip
             asset_name: Pioneer-x86_64.dmg
             update_asset_name: Pioneer-x86_64.app.zip
-          - os: macos-15
+          - os: macos-26
             target: aarch64-apple-darwin
-            asset: pioneer-gateway-macos-aarch64.gz
+            asset: pioneer-gateway-macos-aarch64.zip
             cu_asset: pioneer-gateway-macos-aarch64-computer-use-package.zip
             asset_name: Pioneer-aarch64.dmg
             update_asset_name: Pioneer-aarch64.app.zip
@@ -221,24 +189,28 @@ jobs:
           import json
           import os
           from pathlib import Path
+          import runpy
           import subprocess
           import tomllib
+          import zipfile
 
           dist = Path('dist')
           catalog_hash = hashlib.sha256(Path('release-model-catalog/catalog.json').read_bytes()).hexdigest()
           version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
           platforms = {
-              'x86_64-unknown-linux-gnu': ('linux-x86_64', 'gz', ['pioneer-linux-x86_64.AppImage']),
-              'aarch64-unknown-linux-gnu': ('linux-aarch64', 'gz', ['pioneer-linux-aarch64.AppImage']),
-              'x86_64-apple-darwin': ('macos-x86_64', 'zip', ['Pioneer-x86_64.dmg', 'Pioneer-x86_64.app.zip']),
-              'aarch64-apple-darwin': ('macos-aarch64', 'gz', ['Pioneer-aarch64.dmg', 'Pioneer-aarch64.app.zip']),
-              'x86_64-pc-windows-msvc': ('windows-x86_64', 'zip', ['Pioneer-x86_64.msi', 'Pioneer-x86_64.exe']),
-              'aarch64-pc-windows-msvc': ('windows-aarch64', 'zip', ['Pioneer-aarch64.msi', 'Pioneer-aarch64.exe']),
+              'x86_64-unknown-linux-gnu': ['pioneer-linux-x86_64.AppImage'],
+              'aarch64-unknown-linux-gnu': ['pioneer-linux-aarch64.AppImage'],
+              'x86_64-apple-darwin': ['Pioneer-x86_64.dmg', 'Pioneer-x86_64.app.zip'],
+              'aarch64-apple-darwin': ['Pioneer-aarch64.dmg', 'Pioneer-aarch64.app.zip'],
+              'x86_64-pc-windows-msvc': ['Pioneer-x86_64.msi', 'Pioneer-x86_64.exe'],
+              'aarch64-pc-windows-msvc': ['Pioneer-aarch64.msi', 'Pioneer-aarch64.exe'],
           }
+          asset_name = runpy.run_path('scripts/packaging/runtime-inputs.py')['asset_name']
+          postgres = runpy.run_path('scripts/packaging/postgres-runtime.py')
           expected = {}
-          for target, (platform, extension, desktop) in platforms.items():
-              expected[f'pioneer-gateway-{platform}.{extension}'] = (target, 'default')
-              expected[f'pioneer-gateway-{platform}-computer-use-package.zip'] = (target, 'computer-use')
+          for target, desktop in platforms.items():
+              for variant in ('default', 'computer-use'):
+                  expected[asset_name(target, variant)] = (target, variant)
               expected.update({name: (target, 'desktop') for name in desktop})
           expected_files = set(expected) | {name + '.provenance.json' for name in expected}
           if {path.name for path in dist.iterdir()} != expected_files:
@@ -257,7 +229,25 @@ jobs:
                   raise ValueError(f'Invalid producer attempt: {name}')
               if hashlib.sha256(path.read_bytes()).hexdigest() != receipt['sha256']:
                   raise ValueError(f'Asset checksum mismatch: {name}')
+              if variant == 'default' and 'apple-darwin' in target:
+                  notarization = receipt.get('notarization', {})
+                  if (notarization.get('status') != 'Accepted' or not notarization.get('id')
+                          or notarization.get('sha256') != receipt['sha256']):
+                      raise ValueError(f'Missing accepted notarization for exact Gateway archive: {name}')
               receipts[name] = receipt
+              if variant in ('default', 'computer-use'):
+                  prefix = 'runtime/postgres/'
+                  suffix = '.exe' if 'windows' in target else ''
+                  programs = {prefix + f'bin/{program}{suffix}' for program in postgres['PROGRAMS']}
+                  extension = {prefix + 'share/extension/vector.control',
+                               prefix + f"share/extension/vector--{postgres['VECTOR_VERSION']}.sql"}
+                  modules = ('vector.dll',) if suffix else (
+                      ('vector.so', 'vector.dylib') if 'apple-darwin' in target else ('vector.so',))
+                  with zipfile.ZipFile(path) as archive:
+                      members = set(archive.namelist())
+                      missing = (programs | extension) - members
+                      if missing or not any(prefix + 'lib/' + module in members for module in modules):
+                          raise ValueError(f'Incomplete PostgreSQL runtime in {name}: {sorted(missing)}')
               if variant == 'computer-use':
                   subprocess.run(['python3', 'scripts/packaging/cua-driver.py', 'validate', '--target', target,
                                   '--archive', str(path)], check=True)
@@ -279,15 +269,13 @@ jobs:
           cd dist
           rm -f SHA256SUMS
           shopt -s nullglob
-          files=(pioneer-gateway-*.gz pioneer-gateway-*.zip)
+          files=(pioneer-gateway-*.zip)
           if [[ ${#files[@]} -ne 12 ]]; then
             echo "expected all 12 Gateway assets before publication, found ${#files[@]}"
             exit 1
           fi
           for platform in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 windows-x86_64 windows-aarch64; do
-            extension=zip
-            case "$platform" in linux-*|macos-aarch64) extension=gz ;; esac
-            test -f "pioneer-gateway-${platform}.${extension}"
+            test -f "pioneer-gateway-${platform}.zip"
             test -f "pioneer-gateway-${platform}-computer-use-package.zip"
           done
           for file in "${files[@]}"; do
@@ -483,7 +471,6 @@ jobs:
             test -f "dist/Pioneer-${arch}.msi"
           done
           files=(
-            dist/pioneer-gateway-*.gz
             dist/pioneer-gateway-*.zip
             dist/SHA256SUMS
             dist/Pioneer-*.app.zip

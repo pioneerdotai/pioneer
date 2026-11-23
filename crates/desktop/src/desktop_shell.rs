@@ -772,7 +772,8 @@ impl DesktopShellView {
                 client,
             )),
             Arc::new(crate::thread_platform::DesktopThreadExternalNavigationPort),
-        );
+        )
+        .with_api_provider_title(pioneer_desktop_providers::api_provider_title);
         let thread = pioneer_desktop_thread::ThreadView::new(config, window, cx);
         self.thread_events = Some(cx.subscribe_in(
             &thread,
@@ -924,14 +925,10 @@ impl DesktopShellView {
                 },
             ),
         );
-        let height = self.layout.read(cx).app_height();
-        pioneer_desktop_thread::ThreadView::set_window_app_bottom(
-            window,
-            Some(view.clone().into()),
-            height,
-            cx,
-        );
         self.app_view = Some(view);
+        if let Some((_, thread)) = &self.thread {
+            thread.update(cx, |thread, cx| thread.set_visible(false, window, cx));
+        }
         cx.notify();
     }
     fn activate_navigation(&mut self, route: MainRoute, cx: &mut Context<Self>) {

@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub domain_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Binary(1)")]
+    #[sea_orm(
+        primary_key,
+        auto_increment = false,
+        column_type = "VarBinary(StringLen::None)"
+    )]
     pub content_hash: Vec<u8>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub byte_len: i64,
@@ -17,7 +21,7 @@ pub struct Model {
     pub encoding: String,
     #[sea_orm(column_type = "Text")]
     pub line_endings_json: String,
-    #[sea_orm(column_type = "Binary(1)")]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub compressed_bytes: Vec<u8>,
     pub raw_byte_len: i64,
     pub ref_count: i64,

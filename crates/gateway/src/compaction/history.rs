@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[derive(Default)]
 struct PayloadBatchStats {
     calls: std::sync::atomic::AtomicUsize,
+    line_history_loads: std::sync::atomic::AtomicUsize,
     max_rows: std::sync::atomic::AtomicUsize,
     max_returned_raw_bytes: std::sync::atomic::AtomicUsize,
     current_raw_bytes: std::sync::atomic::AtomicUsize,
@@ -30,6 +31,7 @@ struct PayloadBatchStats {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PayloadBatchStatsSnapshot {
     pub(crate) calls: usize,
+    pub(crate) line_history_loads: usize,
     pub(crate) max_rows: usize,
     pub(crate) max_returned_raw_bytes: usize,
     pub(crate) current_raw_bytes: usize,
@@ -68,6 +70,7 @@ pub(super) async fn with_payload_batch_stats<F: std::future::Future>(
     let output = PAYLOAD_BATCH_STATS.scope(stats.clone(), future).await;
     let snapshot = PayloadBatchStatsSnapshot {
         calls: stats.calls.load(Ordering::SeqCst),
+        line_history_loads: stats.line_history_loads.load(Ordering::SeqCst),
         max_rows: stats.max_rows.load(Ordering::SeqCst),
         max_returned_raw_bytes: stats.max_returned_raw_bytes.load(Ordering::SeqCst),
         current_raw_bytes: stats.current_raw_bytes.load(Ordering::SeqCst),
@@ -240,27 +243,17 @@ impl Iterator for SourcePayloadBatch {
     }
 }
 
-/// Preparation belongs to the requesting operation, never a detached startup
-/// scan. Each quantum releases SQLite capacity; cancellation leaves a durable
-/// cursor for the next request. Capture the history fence only after this returns.
+/// Revisions are maintained on writes. Pin the history fence after verifying
+/// that the thread belongs to the requested workspace.
 pub(crate) async fn prepare_history(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
 ) -> Result<()> {
-    scope_current_stage(Stage::HistoryMetadata, async {
-        loop {
-            let finished = store
-                .compaction_prepare_history_quantum(workspace, thread)
-                .await?;
-            record_work(Work::Quanta, 1);
-            if finished {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        Ok(())
-    })
+    scope_current_stage(
+        Stage::HistoryMetadata,
+        store.compaction_assert_history_scope(workspace, thread),
+    )
     .await
 }
 
@@ -347,17 +340,6 @@ pub(crate) async fn reference_payload(
         .compaction_reference_payload(workspace, thread, reference)
         .await?
         .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))
-}
-
-pub(crate) async fn prepare_references(
-    store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    references: &[SourceRef],
-) -> Result<()> {
-    store
-        .compaction_prepare_references(workspace, thread, references)
-        .await
 }
 
 /// Resolve retained exact event relationship metadata in bounded batches without
@@ -2276,6 +2258,12 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
+    #[cfg(test)]
+    let _ = PAYLOAD_BATCH_STATS.try_with(|stats| {
+        stats
+            .line_history_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
     scope_current_stage(Stage::HistoryLoad, async {
         let (
             selected,

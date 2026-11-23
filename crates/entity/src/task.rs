@@ -7,33 +7,40 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub owner_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub owner_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub root_task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub parent_task_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub executor_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub title: String,
     #[sea_orm(column_type = "Text")]
     pub goal: String,
     pub priority: i64,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub lifecycle_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub delivery_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub retry_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub timeout_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub concurrency_policy_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub metadata_json: Option<String>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub lifecycle_policy_json: Option<Json>,
+    pub delivery_policy_json: Option<Json>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub retry_policy_json: Option<Json>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub timeout_policy_json: Option<Json>,
+    pub concurrency_policy_json: Option<Json>,
+    pub metadata_json: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub result_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

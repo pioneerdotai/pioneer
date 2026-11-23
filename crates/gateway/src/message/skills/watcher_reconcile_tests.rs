@@ -205,7 +205,7 @@ fn directory_and_file_symlinks_are_not_traversed_during_discovery_or_copy() {
     assert!(outside.join("SKILL.md").exists());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn own_writes_and_failed_summary_retry_do_not_rewrite_successful_packages() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -264,7 +264,7 @@ async fn own_writes_and_failed_summary_retry_do_not_rewrite_successful_packages(
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
     assert!(
         harness
@@ -273,20 +273,20 @@ async fn own_writes_and_failed_summary_retry_do_not_rewrite_successful_packages(
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == SqliteWriteClass::Maintenance)
+            .all(|class| *class == PostgresWriteClass::Maintenance)
     );
     assert!(
         harness
             .processor
             .crud_store
             .database_connection()
-            .reader_query_only_enabled()
+            .reader_is_read_only()
             .await
             .unwrap()
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn events_during_snapshot_and_scan_leave_another_generation_pending() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -309,7 +309,7 @@ async fn events_during_snapshot_and_scan_leave_another_generation_pending() {
     assert!(dirty.generation > dirty.acknowledged);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn a_workspace_commit_during_preparation_fences_the_old_job() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -353,7 +353,7 @@ async fn a_workspace_commit_during_preparation_fences_the_old_job() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn root_quanta_are_fair_under_a_hot_slow_root() {
     let harness = harness().await;
     let slow = harness.directory.path().join("slow");
@@ -396,7 +396,7 @@ async fn root_quanta_are_fair_under_a_hot_slow_root() {
     assert!(fast_changed && slow_changed);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn scoped_pages_and_exact_guards_preserve_row_workspace_and_pack_facts() {
     let harness = harness().await;
     let store = &harness.processor.crud_store;
@@ -518,7 +518,7 @@ async fn scoped_pages_and_exact_guards_preserve_row_workspace_and_pack_facts() {
     .unwrap()
     .unwrap();
     let mut active: pioneer_entity::skill_installation::ActiveModel = model.clone().into();
-    active.updated_at = Set(model.updated_at + chrono::Duration::nanoseconds(1));
+    active.updated_at = Set(model.updated_at + chrono::Duration::microseconds(1));
     active.update(&store.database_connection()).await.unwrap();
     assert_eq!(
         store
@@ -575,7 +575,7 @@ async fn scoped_pages_and_exact_guards_preserve_row_workspace_and_pack_facts() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn scope_reader_pages_are_capped_and_resume_after_the_last_id() {
     let harness = harness().await;
     let store = &harness.processor.crud_store;
@@ -635,7 +635,7 @@ async fn scope_reader_pages_are_capped_and_resume_after_the_last_id() {
             .lock()
             .unwrap()
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
 }
 
@@ -665,7 +665,7 @@ fn explicit_root_aliases_do_not_import_owned_stages_or_hide_valid_dot_packages()
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn managed_leaf_normalization_replaces_destination_and_cleans_the_owned_backup() {
     let harness = harness().await;
     let mut config = harness.processor.managed_root_scan_config("ws").unwrap();
@@ -734,7 +734,7 @@ async fn managed_leaf_normalization_replaces_destination_and_cleans_the_owned_ba
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_policies() {
     let harness = harness().await;
     harness
@@ -869,7 +869,7 @@ async fn shared_source_bytes_and_preparation_are_read_once_for_matching_scope_po
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fresh_worker_recognizes_owned_staging_and_retains_uncertain_backup_and_dot_packages() {
     let harness = harness().await;
     let root = harness.directory.path().join("overlap");
@@ -915,7 +915,7 @@ async fn fresh_worker_recognizes_owned_staging_and_retains_uncertain_backup_and_
     assert_eq!(again.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn baseline_prunes_current_scope_after_success_and_removed_mapping_but_not_failed_round() {
     let harness = harness().await;
     let mut config = harness.processor.managed_root_scan_config("ws").unwrap();
@@ -1148,7 +1148,7 @@ impl Drop for PublicationFaultReset {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cancellation_before_first_db_poll_restores_files_and_lock_and_has_no_commit() {
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
@@ -1203,13 +1203,13 @@ async fn cancellation_before_first_db_poll_restores_files_and_lock_and_has_no_co
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_retains_backup() {
     use sea_orm::ConnectionTrait;
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
     let destination = candidate.destination.clone();
-    harness.processor.crud_store.database_connection().execute_unprepared("CREATE TRIGGER reject_watched_update BEFORE UPDATE ON skill_installation BEGIN SELECT RAISE(ABORT,'injected mutation rejection'); END").await.unwrap();
+    harness.processor.crud_store.database_connection().execute_unprepared("CREATE FUNCTION reject_watched_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected mutation rejection'; END; $$; CREATE TRIGGER reject_watched_update BEFORE UPDATE ON skill_installation FOR EACH ROW EXECUTE FUNCTION reject_watched_update();").await.unwrap();
     let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
@@ -1240,7 +1240,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
         .processor
         .crud_store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_watched_update")
+        .execute_unprepared("DROP TRIGGER reject_watched_update ON skill_installation; DROP FUNCTION reject_watched_update()")
         .await
         .unwrap();
     let _reset = PublicationFaultReset;
@@ -1284,7 +1284,7 @@ async fn confirmed_mutation_rollback_restores_publication_while_lost_commit_ack_
     assert!(wrapper.join("backup/SKILL.md").exists());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn preparation_rejection_and_failed_file_or_lock_restoration_keep_last_backup() {
     for fault in [None, Some("restore_files"), Some("restore_lock")] {
         let harness = harness().await;
@@ -1336,7 +1336,7 @@ async fn preparation_rejection_and_failed_file_or_lock_restoration_keep_last_bac
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn indexed_provenance_and_one_fallback_catalog_pass_preserve_ambiguity() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -1457,7 +1457,7 @@ async fn indexed_provenance_and_one_fallback_catalog_pass_preserve_ambiguity() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fresh_worker_forwards_unknown_commit_with_current_guards_then_reclaims_backup() {
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
@@ -1505,7 +1505,7 @@ async fn fresh_worker_forwards_unknown_commit_with_current_guards_then_reclaims_
     assert!(attempts.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_begin_after_successful_reader_preparation_proves_no_commit() {
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
@@ -1541,7 +1541,7 @@ async fn failed_begin_after_successful_reader_preparation_proves_no_commit() {
     assert!(!attempt_marker(&wrapper).unwrap().unwrap().publishing);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn missing_scoped_pack_parent_and_incompatible_parent_reject_before_begin() {
     for parent_scope in ["other", "ws"] {
         let harness = harness().await;
@@ -1648,7 +1648,7 @@ fn interrupted_garbage_quantum_keeps_restart_ownership_until_payload_is_gone() {
 
 // Preservation/concurrency coverage only: this deliberately does not claim
 // bounded TOML parsing/serialization (review criterion 7 remains open).
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn large_lock_preserves_foreign_entries_and_serializes_a_foreground_writer() {
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
@@ -1743,14 +1743,19 @@ async fn large_lock_preserves_foreign_entries_and_serializes_a_foreground_writer
     assert_eq!(previous, Some(old));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without_blind_rollback() {
     use sea_orm::ConnectionTrait;
     let harness = harness().await;
     let (candidate, snapshot, stage, wrapper) = publication_fixture(&harness).await;
     let destination = candidate.destination.clone();
     let source = harness.directory.path().join("source");
-    harness.processor.crud_store.database_connection().execute_unprepared("PRAGMA foreign_keys=ON; CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY); CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation BEGIN INSERT INTO watched_commit_child VALUES(123); END").await.unwrap();
+    harness.processor.crud_store.database_connection().execute_unprepared("CREATE TABLE watched_commit_parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE watched_commit_child(parent INTEGER REFERENCES watched_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE FUNCTION fail_watched_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO watched_commit_child VALUES(123); RETURN NEW; END; $$;
+         CREATE TRIGGER fail_watched_commit AFTER UPDATE ON skill_installation
+         FOR EACH ROW EXECUTE FUNCTION fail_watched_commit()").await.unwrap();
     let error = publish(
         &harness.processor.crud_store,
         &harness.processor.skills_write_lock,
@@ -1833,7 +1838,7 @@ async fn real_commit_failure_adopts_existing_bytes_and_new_edits_forward_without
         .processor
         .crud_store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_watched_commit")
+        .execute_unprepared("DROP TRIGGER fail_watched_commit ON skill_installation; DROP FUNCTION fail_watched_commit()")
         .await
         .unwrap();
     assert_eq!(
@@ -1875,7 +1880,7 @@ impl Drop for LocalFsFaults {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn local_marker_cleanup_and_nested_directory_failures_preserve_neighbors_and_baseline() {
     for point in ["marker", "cleanup", "read_dir"] {
         let harness = harness().await;
@@ -2004,7 +2009,7 @@ async fn unresolved_marker_does_not_stop_resolving_an_independent_committed_atte
     assert!(!good.exists());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn sidecar_change_appearance_and_removal_after_preparation_never_publish_stale_metadata() {
     for (before, after) in [
         (Some("old"), Some("new")),
@@ -2075,7 +2080,7 @@ async fn sidecar_change_appearance_and_removal_after_preparation_never_publish_s
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_change_between_scope_mappings_invalidates_cached_inputs_without_another_security_scan()
  {
     let harness = harness().await;
@@ -2153,7 +2158,7 @@ async fn source_change_between_scope_mappings_invalidates_cached_inputs_without_
     assert!(second[0].fingerprint.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publisher_rejects_changed_sidecar_in_a_stage_even_when_markdown_fingerprint_is_unchanged()
 {
     let harness = harness().await;
@@ -2192,7 +2197,7 @@ async fn publisher_rejects_changed_sidecar_in_a_stage_even_when_markdown_fingerp
     assert!(!attempt_marker(&wrapper).unwrap().unwrap().publishing);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_worker_retains_failed_root_generation_while_a_neighbor_is_published() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -2261,7 +2266,7 @@ async fn real_worker_retains_failed_root_generation_while_a_neighbor_is_publishe
     assert!(bad.exists());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn actual_managed_job_keeps_leaf_slug_with_sidecar_and_finishes_an_external_leaf_rename() {
     let harness = harness().await;
     let (candidate, snapshot, _, _) = publication_fixture(&harness).await;
@@ -2324,7 +2329,7 @@ async fn actual_managed_job_keeps_leaf_slug_with_sidecar_and_finishes_an_externa
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn actual_import_generates_identity_for_an_unregistered_container_but_ignores_extra_known_leaves()
  {
     let harness = harness().await;
@@ -2387,7 +2392,7 @@ fn large_metadata_inputs(path: &Path) -> usize {
     skill.len() + sidecar.len()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn publisher_final_validation_is_bounded_and_pre_db_cancellation_compensates() {
     for cancel in [false, true] {
         let harness = harness().await;
@@ -2495,7 +2500,7 @@ async fn publisher_final_validation_is_bounded_and_pre_db_cancellation_compensat
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn large_input_noop_and_unknown_recovery_use_the_same_bounded_verification_cursor() {
     let harness = harness().await;
     let root = harness.directory.path().join("source");
@@ -2561,7 +2566,7 @@ async fn large_input_noop_and_unknown_recovery_use_the_same_bounded_verification
     assert!(!wrapper.exists());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn a_pending_import_waits_without_blocking_a_publishers_owned_cursor() {
     let harness = harness().await;
     let (candidate, snapshot, stage, _) = publication_fixture(&harness).await;
@@ -2639,7 +2644,7 @@ fn padded_attempt(parent: &Path, owner: &Path, id: SkillId) -> PathBuf {
     wrapper
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn discovery_marker_backlog_yields_real_root_quanta_without_losing_artifacts() {
     let harness = harness().await;
     let root = harness.directory.path().join("marker-backlog");
@@ -2758,7 +2763,7 @@ async fn pending_and_resolved_marker_pages_count_both_real_reads_and_resume_ever
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn final_noop_metadata_read_and_recovery_markers_are_separate_outer_root_quanta() {
     let harness = harness().await;
     let root = harness.directory.path().join("source");
@@ -2840,7 +2845,7 @@ async fn final_noop_metadata_read_and_recovery_markers_are_separate_outer_root_q
     assert!(wrappers.iter().all(|path| !path.exists()));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn marker_backlog_quanta_leave_a_neighbor_progress_and_cancel_without_erasing_backups() {
     let harness = harness().await;
     let slow = harness.directory.path().join("slow-markers");
@@ -2902,7 +2907,7 @@ async fn marker_backlog_quanta_leave_a_neighbor_progress_and_cancel_without_eras
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn pre_staging_artifact_check_resumes_bounded_pages_before_publication() {
     let harness = harness().await;
     let root = harness.directory.path().join("source");

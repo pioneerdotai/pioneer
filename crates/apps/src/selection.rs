@@ -10,6 +10,16 @@ pub struct SelectionPlan {
 }
 impl SelectionPlan {
     pub fn from_manifest(manifest: &AppManifest) -> Result<Self, ManifestError> {
+        Self::plan(manifest, true)
+    }
+
+    /// Authoring inputs exclude the managed runtime and release payloads.
+    /// Paths also declared as component inputs remain selected.
+    pub fn for_source(manifest: &AppManifest) -> Result<Self, ManifestError> {
+        Self::plan(manifest, false)
+    }
+
+    fn plan(manifest: &AppManifest, release: bool) -> Result<Self, ManifestError> {
         let mut entries = BTreeMap::from([("app.json".into(), SelectionKind::File)]);
         let mut add = |value: &Value, field: &str, kind| -> Result<(), ManifestError> {
             let p = path(value.as_str().expect("validated path"), field)?;
@@ -65,7 +75,7 @@ impl SelectionPlan {
                 SelectionKind::File,
             )?;
         }
-        if let Some(runtime) = manifest.runtime() {
+        if let Some(runtime) = manifest.runtime().filter(|_| release) {
             add(
                 &Value::String(runtime.cwd.clone()),
                 "app.json/runtime/cwd",
@@ -197,6 +207,24 @@ impl SelectionPlan {
         limits: Limits,
         cancelled: impl Fn() -> bool,
     ) -> anyhow::Result<(AppManifest, Snapshot)> {
+        Self::capture_inputs(root, limits, cancelled, true)
+    }
+
+    /// Capture only declared authoring inputs; never read or verify release payloads.
+    pub fn capture_source(
+        root: &Path,
+        limits: Limits,
+        cancelled: impl Fn() -> bool,
+    ) -> anyhow::Result<(AppManifest, Snapshot)> {
+        Self::capture_inputs(root, limits, cancelled, false)
+    }
+
+    fn capture_inputs(
+        root: &Path,
+        limits: Limits,
+        cancelled: impl Fn() -> bool,
+        release: bool,
+    ) -> anyhow::Result<(AppManifest, Snapshot)> {
         let manifest_limits = Limits {
             entry_bytes: limits.entry_bytes.min(1024 * 1024),
             expanded_bytes: limits.expanded_bytes.min(1024 * 1024),
@@ -210,7 +238,7 @@ impl SelectionPlan {
         )?;
         let bytes = first.file("app.json").expect("selected manifest");
         let manifest = AppManifest::parse(bytes)?;
-        let plan = Self::from_manifest(&manifest)?;
+        let plan = Self::plan(&manifest, release)?;
         let snapshot = Snapshot::capture_selected(root, limits, &plan.entries, &cancelled)?;
         // The manifest used for planning must be byte-for-byte the captured manifest.
         if snapshot.file("app.json") != Some(bytes) {

@@ -9,10 +9,15 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub request_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub native_thread_id: Option<String>,
@@ -20,9 +25,10 @@ pub struct Model {
     pub native_turn_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub native_item_id: Option<String>,
-    pub request_kind: String,
     #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
+    pub request_kind: String,
+    pub payload_json: Json,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub response_json: Option<String>,
@@ -36,7 +42,9 @@ pub struct Model {
     pub initiating_session_generation: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
     pub authorization_context_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub responding_principal_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub responding_session_id: Option<String>,
     pub response_authorization_revision: Option<i64>,
     pub delivery_attempts: i64,

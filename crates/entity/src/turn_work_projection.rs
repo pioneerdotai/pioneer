@@ -7,23 +7,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_work_projection")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub presentation: String,
+    #[sea_orm(column_type = "Text")]
     pub state: String,
     pub work_count: i64,
     pub visible_work_count: i64,
     pub hidden_work_count: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub first_work_item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub last_work_item_id: Option<String>,
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     pub elapsed_ms: Option<i64>,
     pub source_high_watermark: i64,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
+    pub metadata_json: Json,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

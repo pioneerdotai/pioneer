@@ -357,6 +357,11 @@ description = "ローカル vLLM OpenAI 互換 API"
 title = "OSaurus"
 description = "ローカル OSaurus OpenAI 互換 API"
 
+[providers.catalog.custom]
+title = "カスタム"
+
+[providers.catalog.local]
+title = "ローカル"
 
 [buttons]
 ok = "OK"

@@ -8,13 +8,13 @@ use crate::service::{is_terminal_task, now_timestamp_secs, task_error};
 use crate::trigger::{TaskTriggerCalculator, TaskTriggerCatchUpPlan};
 use anyhow::Context;
 use pioneer_crud::CrudStore;
+use pioneer_postgres_pools::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
+    is_anyhow_database_transient_access, retry_with_backoff,
+};
 use pioneer_protocol::{
     TaskErrorClass, TaskEventPayload, TaskExecutorKind, TaskRescheduleReason, TaskRun,
     TaskRunStatus, TaskTrigger, TaskTriggerKind, TaskTriggerStatus, generate_id,
-};
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
-    is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1390,8 +1390,7 @@ fn report_dispatch_terminal_failure(error: &anyhow::Error) {
         } else {
             diagnostic.cause.label()
         },
-        sqlite_primary_code = diagnostic.sqlite_primary_code,
-        sqlite_extended_code = diagnostic.sqlite_extended_code,
+        postgres_sqlstate = diagnostic.postgres_sqlstate.as_deref(),
         original_start_stage = original.map(|value| value.stage.label()),
         original_start_cause = original.map(|value| value.cause.label()),
         correlation_id = original.and_then(|value| value.correlation_id.as_deref()),
@@ -1457,7 +1456,7 @@ fn same_scheduled_occurrence(left: &TaskTrigger, right: &TaskTrigger) -> bool {
 }
 
 fn is_transient_scheduler_storage_error(error: &anyhow::Error) -> bool {
-    is_anyhow_sqlite_transient_access(error)
+    is_anyhow_database_transient_access(error)
 }
 
 #[cfg(test)]
@@ -1467,10 +1466,10 @@ mod tests {
 
     #[test]
     fn scheduler_treats_pool_acquire_timeout_as_transient_storage_access() {
-        let error = anyhow!(
-            "failed to list active task triggers: Failed to acquire connection from pool: \
-             Connection pool timed out: Connection pool timed out"
-        );
+        let error = anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::ConnAcquireErr::Timeout,
+        ))
+        .context("failed to list active task triggers");
 
         assert!(is_transient_scheduler_storage_error(&error));
     }

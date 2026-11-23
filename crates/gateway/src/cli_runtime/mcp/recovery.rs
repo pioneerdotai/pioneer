@@ -385,7 +385,6 @@ mod tests {
     };
     use crate::turn_mcp::projection::{canonical_annotations_identity, canonical_schema_identity};
     use async_trait::async_trait;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         CliRuntimeTurnMcpMetadata, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
     };
@@ -393,7 +392,7 @@ mod tests {
         SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
         Turn, TurnStatus,
     };
-    use sea_orm::Database;
+    use sea_orm::ConnectionTrait;
     use serde_json::json;
 
     #[derive(Clone)]
@@ -419,13 +418,14 @@ mod tests {
         }
     }
 
-    async fn test_store() -> CrudStore {
-        let connection = Database::connect("sqlite::memory:")
+    async fn test_store(fixture: &pioneer_postgres_test::TestDatabase) -> CrudStore {
+        let connection = fixture.connection().clone();
+        connection
+            .execute_unprepared(
+                "INSERT INTO workspace (id, name) VALUES ('workspace_mcp_recovery', 'Runtime')",
+            )
             .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+            .expect("workspace fixture must insert");
         CrudStore::new(connection)
     }
 
@@ -532,325 +532,335 @@ mod tests {
         annotations: pioneer_tools::McpDynamicToolAnnotations,
         include_html: bool,
     ) {
-        let store = test_store().await;
-        let workspace_id = "workspace_mcp_recovery";
-        let thread_id = "thread_mcp_recovery";
-        let turn_id = "turn_mcp_recovery";
-        persist_test_turn(&store, workspace_id, thread_id, turn_id).await;
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = test_store(fixture).await;
+            let workspace_id = "workspace_mcp_recovery";
+            let thread_id = "thread_mcp_recovery";
+            let turn_id = "turn_mcp_recovery";
+            persist_test_turn(&store, workspace_id, thread_id, turn_id).await;
 
-        // Match initial resolution: effective defaults have no canonical annotations.
-        let canonical_annotations =
-            (annotations != Default::default()).then_some(annotations.clone());
-        let mut projection = ResolvedMcpTurnProjection::empty(workspace_id, turn_id);
-        projection.tools.push(ResolvedMcpTurnTool {
-            canonical_callable_name: String::new(),
-            workspace_id: workspace_id.to_owned(),
-            server_installation_id: "mcp-installation".to_owned(),
-            server_name: "analytics".to_owned(),
-            raw_tool_name: "query".to_owned(),
-            description: Some("Query analytics".to_owned()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"]
-            }),
-            annotations: canonical_annotations.clone(),
-            timeout_ms: 20_000,
-            catalog_version: "catalog-v1".to_owned(),
-            installation_fingerprint: "installation-fingerprint".to_owned(),
-            schema_fingerprint: String::new(),
-            runtime_generation: 7,
-            selection_reason: McpSelectionReason::ExplicitTool,
-            capability_id: Some("mcp-tool:query".to_owned()),
-        });
-        projection
-            .finalize_identity(McpProjectionLimits::default())
-            .expect("projection should finalize");
-        let limits = McpProjectionLimits {
-            max_tools: 1,
-            ..McpProjectionLimits::default()
-        };
-        let projection = if include_html {
-            let definitions = [
-                crate::turn_mcp::native_tools::NativeToolFamily::Html,
-                crate::turn_mcp::native_tools::NativeToolFamily::Tasks,
-            ]
-            .into_iter()
-            .flat_map(|family| {
-                family
-                    .definitions()
-                    .into_iter()
-                    .map(move |spec| (family, spec))
-            })
-            .collect();
-            projection.with_native_tools(definitions, limits).unwrap()
-        } else {
+            // Match initial resolution: effective defaults have no canonical annotations.
+            let canonical_annotations =
+                (annotations != Default::default()).then_some(annotations.clone());
+            let mut projection = ResolvedMcpTurnProjection::empty(workspace_id, turn_id);
+            projection.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: String::new(),
+                workspace_id: workspace_id.to_owned(),
+                server_installation_id: "mcp-installation".to_owned(),
+                server_name: "analytics".to_owned(),
+                raw_tool_name: "query".to_owned(),
+                description: Some("Query analytics".to_owned()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+                annotations: canonical_annotations.clone(),
+                timeout_ms: 20_000,
+                catalog_version: "catalog-v1".to_owned(),
+                installation_fingerprint: "installation-fingerprint".to_owned(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 7,
+                selection_reason: McpSelectionReason::ExplicitTool,
+                capability_id: Some("mcp-tool:query".to_owned()),
+            });
             projection
-        };
-        let provider_contract_fingerprint = "a".repeat(64);
-        let original_launch = build_codex_mcp_session_launch_projection(
-            projection.clone(),
-            provider_contract_fingerprint.clone(),
-        )
-        .expect("Codex MCP projection should build");
-        let facade_fingerprint = original_launch
-            .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
-            .expect("facade should build")
-            .fingerprint()
-            .as_str()
-            .to_owned();
-        let tool = projection
-            .tools
-            .iter()
-            .find(|tool| tool.server_installation_id == "mcp-installation")
-            .expect("external tool should exist");
-        let transformed = original_launch
-            .preflight
-            .tools
-            .iter()
-            .find(|transformed| transformed.canonical_callable_name == tool.canonical_callable_name)
-            .expect("transformed tool should exist");
-        let (annotations_json, annotations_digest) =
-            canonical_annotations_identity(&annotations).expect("annotations should canonicalize");
-        let durable_binding = TurnMcpBindingRecord {
-            server_installation_id: tool.server_installation_id.clone(),
-            server_name: tool.server_name.clone(),
-            raw_tool_name: tool.raw_tool_name.clone(),
-            callable_name: tool.canonical_callable_name.clone(),
-            canonical_callable_name: tool.canonical_callable_name.clone(),
-            provider_callable_name: format!("mcp__pioneer__{}", tool.canonical_callable_name),
-            catalog_version: tool.catalog_version.clone(),
-            fingerprint: tool.installation_fingerprint.clone(),
-            canonical_schema_fingerprint: tool.schema_fingerprint.clone(),
-            provider_schema_fingerprint: transformed.transformed_schema_fingerprint.clone(),
-            annotations_json: annotations_json.clone(),
-            annotations_digest: annotations_digest.clone(),
-            effective_timeout_ms: 20_000,
-            runtime_generation: 7,
-            projection_activation_generation: 1,
-            selection_reason: "explicit_composer_capability".to_owned(),
-            capability_id: tool.capability_id.clone(),
-        };
-        let mut durable_bindings = vec![durable_binding.clone()];
-        for html in projection
-            .tools
-            .iter()
-            .filter(|tool| crate::turn_mcp::native_tools::exact_definition(tool).is_some())
-        {
+                .finalize_identity(McpProjectionLimits::default())
+                .expect("projection should finalize");
+            let limits = McpProjectionLimits {
+                max_tools: 1,
+                ..McpProjectionLimits::default()
+            };
+            let projection = if include_html {
+                let definitions = [
+                    crate::turn_mcp::native_tools::NativeToolFamily::Html,
+                    crate::turn_mcp::native_tools::NativeToolFamily::Tasks,
+                ]
+                .into_iter()
+                .flat_map(|family| {
+                    family
+                        .definitions()
+                        .into_iter()
+                        .map(move |spec| (family, spec))
+                })
+                .collect();
+                projection.with_native_tools(definitions, limits).unwrap()
+            } else {
+                projection
+            };
+            let provider_contract_fingerprint = "a".repeat(64);
+            let original_launch = build_codex_mcp_session_launch_projection(
+                projection.clone(),
+                provider_contract_fingerprint.clone(),
+            )
+            .expect("Codex MCP projection should build");
+            let facade_fingerprint = original_launch
+                .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
+                .expect("facade should build")
+                .fingerprint()
+                .as_str()
+                .to_owned();
+            let tool = projection
+                .tools
+                .iter()
+                .find(|tool| tool.server_installation_id == "mcp-installation")
+                .expect("external tool should exist");
             let transformed = original_launch
                 .preflight
                 .tools
                 .iter()
                 .find(|transformed| {
-                    transformed.canonical_callable_name == html.canonical_callable_name
+                    transformed.canonical_callable_name == tool.canonical_callable_name
                 })
-                .unwrap();
-            let mut binding = durable_binding.clone();
-            binding.server_installation_id = html.server_installation_id.clone();
-            binding.server_name = html.server_name.clone();
-            binding.raw_tool_name = html.raw_tool_name.clone();
-            binding.callable_name = html.canonical_callable_name.clone();
-            binding.canonical_callable_name = html.canonical_callable_name.clone();
-            binding.provider_callable_name =
-                format!("mcp__pioneer__{}", html.canonical_callable_name);
-            binding.catalog_version = html.catalog_version.clone();
-            binding.fingerprint = html.installation_fingerprint.clone();
-            binding.canonical_schema_fingerprint = html.schema_fingerprint.clone();
-            binding.provider_schema_fingerprint =
-                transformed.transformed_schema_fingerprint.clone();
-            let (html_annotations_json, html_annotations_digest) =
-                canonical_annotations_identity(&html.annotations.clone().unwrap_or_default())
-                    .expect("HTML annotations should canonicalize");
-            binding.annotations_json = html_annotations_json;
-            binding.annotations_digest = html_annotations_digest;
-            binding.effective_timeout_ms = html.timeout_ms as i64;
-            binding.runtime_generation = 1;
-            binding.selection_reason = "implicit_policy".into();
-            binding.capability_id = None;
-            durable_bindings.push(binding);
-        }
-        store
-            .replace_turn_mcp_projection(&TurnMcpProjectionReplacement {
-                projection: TurnMcpProjectionRecord {
-                    turn_id: turn_id.to_owned(),
-                    workspace_id: workspace_id.to_owned(),
-                    projection_version: MCP_TURN_PROJECTION_VERSION as i32,
-                    manifest_hash: projection.manifest_hash.clone(),
-                    resolution_status: "resolved".to_owned(),
-                    tool_count: i32::try_from(projection.tools.len()).unwrap(),
-                    created_at_unix: chrono::Utc::now().timestamp(),
-                },
-                bindings: durable_bindings,
-            })
-            .await
-            .expect("projection should persist");
-        let metadata = CliRuntimeTurnMcpMetadata {
-            adapter_kind: CODEX_MCP_ADAPTER_KIND.to_owned(),
-            manifest_hash: projection.manifest_hash.clone(),
-            projection_fingerprint: facade_fingerprint,
-            provider_contract_fingerprint,
-            isolation_contract_fingerprint: original_launch
-                .semantic_restart_fingerprint()
-                .to_owned(),
-            session_generation: 1,
-            projection_activation_generation: 1,
-        };
-        let now = chrono::Utc::now().fixed_offset();
-        let turn_binding = CliRuntimeTurnBindingRecord {
-            input_mapping_payload_id: None,
-            input_mapping_read_hold: None,
-            input_mapping_revision: 0,
-            input_mapping_identity: String::new(),
-            turn_id: turn_id.to_owned(),
-            thread_id: thread_id.to_owned(),
-            continuation_thread_id: thread_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
-            runtime_id: "codex".to_owned(),
-            runtime_kind: "codex".to_owned(),
-            native_thread_id: "native-thread".to_owned(),
-            native_turn_id: Some("native-turn".to_owned()),
-            request_id: None,
-            status: "running".to_owned(),
-            model: Some("gpt-5".to_owned()),
-            cwd: Some("/tmp/project".to_owned()),
-            sandbox_json: None,
-            approval_policy: None,
-            input_mapping_json: "{}".to_owned(),
-            mcp: Some(metadata),
-            native_goal_status: None,
-            native_goal_turn_id: None,
-            native_goal_observed_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        let (canonical_schema, canonical_schema_fingerprint, _) =
-            canonical_schema_identity(&tool.input_schema).expect("schema should canonicalize");
-        let current = CurrentMcpToolIdentity {
-            server_installation_id: tool.server_installation_id.clone(),
-            server_name: tool.server_name.clone(),
-            raw_tool_name: tool.raw_tool_name.clone(),
-            description: tool.description.clone(),
-            catalog_version: tool.catalog_version.clone(),
-            installation_fingerprint: tool.installation_fingerprint.clone(),
-            canonical_schema_fingerprint,
-            canonical_schema,
-            annotations_json,
-            annotations_digest,
-            effective_timeout_ms: tool.timeout_ms,
-            runtime_generation: tool.runtime_generation,
-        };
-
-        let restored = restore_cli_mcp_session_launch(
-            &store,
-            &StaticRuntimeView {
-                current: current.clone(),
-            },
-            &turn_binding,
-            CLIAgentRuntimeKind::Codex,
-            limits,
-        )
-        .await
-        .expect("exact frozen projection should restore");
-        let CliMcpSessionLaunch::Codex(restored) = restored else {
-            panic!("Codex recovery expected")
-        };
-        assert_eq!(
-            restored.canonical_projection.native_tool_count(),
-            if include_html {
-                2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
-                    .definitions()
-                    .len()
-            } else {
-                0
+                .expect("transformed tool should exist");
+            let (annotations_json, annotations_digest) =
+                canonical_annotations_identity(&annotations)
+                    .expect("annotations should canonicalize");
+            let durable_binding = TurnMcpBindingRecord {
+                server_installation_id: tool.server_installation_id.clone(),
+                server_name: tool.server_name.clone(),
+                raw_tool_name: tool.raw_tool_name.clone(),
+                callable_name: tool.canonical_callable_name.clone(),
+                canonical_callable_name: tool.canonical_callable_name.clone(),
+                provider_callable_name: format!("mcp__pioneer__{}", tool.canonical_callable_name),
+                catalog_version: tool.catalog_version.clone(),
+                fingerprint: tool.installation_fingerprint.clone(),
+                canonical_schema_fingerprint: tool.schema_fingerprint.clone(),
+                provider_schema_fingerprint: transformed.transformed_schema_fingerprint.clone(),
+                annotations_json: annotations_json.clone(),
+                annotations_digest: annotations_digest.clone(),
+                effective_timeout_ms: 20_000,
+                runtime_generation: 7,
+                projection_activation_generation: 1,
+                selection_reason: "explicit_composer_capability".to_owned(),
+                capability_id: tool.capability_id.clone(),
+            };
+            let mut durable_bindings = vec![durable_binding.clone()];
+            for html in projection
+                .tools
+                .iter()
+                .filter(|tool| crate::turn_mcp::native_tools::exact_definition(tool).is_some())
+            {
+                let transformed = original_launch
+                    .preflight
+                    .tools
+                    .iter()
+                    .find(|transformed| {
+                        transformed.canonical_callable_name == html.canonical_callable_name
+                    })
+                    .unwrap();
+                let mut binding = durable_binding.clone();
+                binding.server_installation_id = html.server_installation_id.clone();
+                binding.server_name = html.server_name.clone();
+                binding.raw_tool_name = html.raw_tool_name.clone();
+                binding.callable_name = html.canonical_callable_name.clone();
+                binding.canonical_callable_name = html.canonical_callable_name.clone();
+                binding.provider_callable_name =
+                    format!("mcp__pioneer__{}", html.canonical_callable_name);
+                binding.catalog_version = html.catalog_version.clone();
+                binding.fingerprint = html.installation_fingerprint.clone();
+                binding.canonical_schema_fingerprint = html.schema_fingerprint.clone();
+                binding.provider_schema_fingerprint =
+                    transformed.transformed_schema_fingerprint.clone();
+                let (html_annotations_json, html_annotations_digest) =
+                    canonical_annotations_identity(&html.annotations.clone().unwrap_or_default())
+                        .expect("HTML annotations should canonicalize");
+                binding.annotations_json = html_annotations_json;
+                binding.annotations_digest = html_annotations_digest;
+                binding.effective_timeout_ms = html.timeout_ms as i64;
+                binding.runtime_generation = 1;
+                binding.selection_reason = "implicit_policy".into();
+                binding.capability_id = None;
+                durable_bindings.push(binding);
             }
-        );
-        let restored_tool = restored
-            .canonical_projection
-            .tools
-            .iter()
-            .find(|tool| tool.server_installation_id == "mcp-installation")
-            .expect("restored external tool should exist");
-        assert_eq!(restored_tool.annotations, canonical_annotations);
-        assert_eq!(restored.canonical_projection, projection);
-        assert_eq!(restored.preflight, original_launch.preflight);
-        assert_eq!(
-            restored
-                .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
-                .expect("restored facade should build")
-                .fingerprint(),
-            original_launch
-                .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
-                .expect("original facade should build")
-                .fingerprint()
-        );
-        assert_eq!(restored, original_launch);
+            store
+                .replace_turn_mcp_projection(&TurnMcpProjectionReplacement {
+                    projection: TurnMcpProjectionRecord {
+                        turn_id: turn_id.to_owned(),
+                        workspace_id: workspace_id.to_owned(),
+                        projection_version: MCP_TURN_PROJECTION_VERSION as i32,
+                        manifest_hash: projection.manifest_hash.clone(),
+                        resolution_status: "resolved".to_owned(),
+                        tool_count: i32::try_from(projection.tools.len()).unwrap(),
+                        created_at_unix: chrono::Utc::now().timestamp(),
+                    },
+                    bindings: durable_bindings,
+                })
+                .await
+                .expect("projection should persist");
+            let metadata = CliRuntimeTurnMcpMetadata {
+                adapter_kind: CODEX_MCP_ADAPTER_KIND.to_owned(),
+                manifest_hash: projection.manifest_hash.clone(),
+                projection_fingerprint: facade_fingerprint,
+                provider_contract_fingerprint,
+                isolation_contract_fingerprint: original_launch
+                    .semantic_restart_fingerprint()
+                    .to_owned(),
+                session_generation: 1,
+                projection_activation_generation: 1,
+            };
+            let now = chrono::Utc::now().fixed_offset();
+            let turn_binding = CliRuntimeTurnBindingRecord {
+                input_mapping_frame: None,
+                input_mapping_has_inline_history: false,
+                input_mapping_revision: 0,
+                input_mapping_identity: String::new(),
+                turn_id: turn_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                continuation_thread_id: thread_id.to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                native_thread_id: "native-thread".to_owned(),
+                native_turn_id: Some("native-turn".to_owned()),
+                request_id: None,
+                status: "running".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                cwd: Some("/tmp/project".to_owned()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: "{}".to_owned(),
+                mcp: Some(metadata),
+                native_goal_status: None,
+                native_goal_turn_id: None,
+                native_goal_observed_at: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let (canonical_schema, canonical_schema_fingerprint, _) =
+                canonical_schema_identity(&tool.input_schema).expect("schema should canonicalize");
+            let current = CurrentMcpToolIdentity {
+                server_installation_id: tool.server_installation_id.clone(),
+                server_name: tool.server_name.clone(),
+                raw_tool_name: tool.raw_tool_name.clone(),
+                description: tool.description.clone(),
+                catalog_version: tool.catalog_version.clone(),
+                installation_fingerprint: tool.installation_fingerprint.clone(),
+                canonical_schema_fingerprint,
+                canonical_schema,
+                annotations_json,
+                annotations_digest,
+                effective_timeout_ms: tool.timeout_ms,
+                runtime_generation: tool.runtime_generation,
+            };
 
-        let mut changed_annotations = annotations.clone();
-        changed_annotations.read_only_hint = Some(!annotations.read_only_hint.unwrap_or_default());
-        let (changed_annotations_json, changed_annotations_digest) =
-            canonical_annotations_identity(&changed_annotations)
-                .expect("changed annotations should canonicalize");
-        let (changed_schema, changed_schema_fingerprint, _) = canonical_schema_identity(&json!({
-            "type": "object",
-            "properties": {"query": {"type": "integer"}},
-            "required": ["query"]
-        }))
-        .expect("changed schema should canonicalize");
-        for drifted in [
-            CurrentMcpToolIdentity {
-                runtime_generation: current.runtime_generation + 1,
-                ..current.clone()
-            },
-            CurrentMcpToolIdentity {
-                installation_fingerprint: "changed-installation".to_owned(),
-                ..current.clone()
-            },
-            CurrentMcpToolIdentity {
-                annotations_json: changed_annotations_json,
-                annotations_digest: changed_annotations_digest,
-                ..current.clone()
-            },
-            CurrentMcpToolIdentity {
-                canonical_schema: changed_schema.clone(),
-                canonical_schema_fingerprint: changed_schema_fingerprint,
-                ..current.clone()
-            },
-        ] {
-            let error = restore_cli_mcp_session_launch(
+            let restored = restore_cli_mcp_session_launch(
                 &store,
-                &StaticRuntimeView { current: drifted },
+                &StaticRuntimeView {
+                    current: current.clone(),
+                },
                 &turn_binding,
                 CLIAgentRuntimeKind::Codex,
                 limits,
             )
             .await
-            .expect_err("runtime drift must fail closed");
-            assert!(matches!(error, CliMcpSessionLaunchRestoreError::Invalid(_)));
-            assert!(
-                error
-                    .to_string()
-                    .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
+            .expect("exact frozen projection should restore");
+            let CliMcpSessionLaunch::Codex(restored) = restored else {
+                panic!("Codex recovery expected")
+            };
+            assert_eq!(
+                restored.canonical_projection.native_tool_count(),
+                if include_html {
+                    2 + crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                        .definitions()
+                        .len()
+                } else {
+                    0
+                }
             );
-        }
+            let restored_tool = restored
+                .canonical_projection
+                .tools
+                .iter()
+                .find(|tool| tool.server_installation_id == "mcp-installation")
+                .expect("restored external tool should exist");
+            assert_eq!(restored_tool.annotations, canonical_annotations);
+            assert_eq!(restored.canonical_projection, projection);
+            assert_eq!(restored.preflight, original_launch.preflight);
+            assert_eq!(
+                restored
+                    .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
+                    .expect("restored facade should build")
+                    .fingerprint(),
+                original_launch
+                    .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
+                    .expect("original facade should build")
+                    .fingerprint()
+            );
+            assert_eq!(restored, original_launch);
 
-        // Even a stale matching fingerprint must not hide changed schema bytes.
-        let error = restore_cli_mcp_session_launch(
-            &store,
-            &StaticRuntimeView {
-                current: CurrentMcpToolIdentity {
-                    canonical_schema: changed_schema,
-                    ..current
+            let mut changed_annotations = annotations.clone();
+            changed_annotations.read_only_hint =
+                Some(!annotations.read_only_hint.unwrap_or_default());
+            let (changed_annotations_json, changed_annotations_digest) =
+                canonical_annotations_identity(&changed_annotations)
+                    .expect("changed annotations should canonicalize");
+            let (changed_schema, changed_schema_fingerprint, _) =
+                canonical_schema_identity(&json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "integer"}},
+                    "required": ["query"]
+                }))
+                .expect("changed schema should canonicalize");
+            for drifted in [
+                CurrentMcpToolIdentity {
+                    runtime_generation: current.runtime_generation + 1,
+                    ..current.clone()
                 },
-            },
-            &turn_binding,
-            CLIAgentRuntimeKind::Codex,
-            limits,
-        )
+                CurrentMcpToolIdentity {
+                    installation_fingerprint: "changed-installation".to_owned(),
+                    ..current.clone()
+                },
+                CurrentMcpToolIdentity {
+                    annotations_json: changed_annotations_json,
+                    annotations_digest: changed_annotations_digest,
+                    ..current.clone()
+                },
+                CurrentMcpToolIdentity {
+                    canonical_schema: changed_schema.clone(),
+                    canonical_schema_fingerprint: changed_schema_fingerprint,
+                    ..current.clone()
+                },
+            ] {
+                let error = restore_cli_mcp_session_launch(
+                    &store,
+                    &StaticRuntimeView { current: drifted },
+                    &turn_binding,
+                    CLIAgentRuntimeKind::Codex,
+                    limits,
+                )
+                .await
+                .expect_err("runtime drift must fail closed");
+                assert!(matches!(error, CliMcpSessionLaunchRestoreError::Invalid(_)));
+                assert!(
+                    error
+                        .to_string()
+                        .contains(TurnMcpInvocationErrorCode::ToolDrift.as_str())
+                );
+            }
+
+            // Even a stale matching fingerprint must not hide changed schema bytes.
+            let error = restore_cli_mcp_session_launch(
+                &store,
+                &StaticRuntimeView {
+                    current: CurrentMcpToolIdentity {
+                        canonical_schema: changed_schema,
+                        ..current
+                    },
+                },
+                &turn_binding,
+                CLIAgentRuntimeKind::Codex,
+                limits,
+            )
+            .await
+            .expect_err("manifest drift must fail closed");
+            assert!(matches!(error, CliMcpSessionLaunchRestoreError::Invalid(_)));
+            assert!(error.to_string().contains(
+                "reconstructed CLI recovery MCP manifest differs from the frozen projection"
+            ));
+            Ok(())
+        })
         .await
-        .expect_err("manifest drift must fail closed");
-        assert!(matches!(error, CliMcpSessionLaunchRestoreError::Invalid(_)));
-        assert!(error.to_string().contains(
-            "reconstructed CLI recovery MCP manifest differs from the frozen projection"
-        ));
+        .unwrap();
     }
 }

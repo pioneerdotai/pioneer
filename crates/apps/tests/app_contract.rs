@@ -441,3 +441,56 @@ fn portable_runtime_has_one_payload_and_cannot_assign_images_or_authority() {
         assert!(parse(&invalid).is_err(), "{key}");
     }
 }
+
+#[test]
+fn authoring_source_requires_components_but_not_release_payloads() {
+    use pioneer_apps::PreparedAppSource;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut document = runtime_manifest();
+    document["skills"] = json!("capabilities");
+    document["locales"] = json!({"en": "en.json"});
+    document["defaultLocale"] = json!("en");
+    fs::write(root.path().join("app.json"), document.to_string()).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    fs::write(root.path().join("icon.png"), png.into_inner()).unwrap();
+    fs::write(root.path().join("en.json"), br#"{"name":"Localized"}"#).unwrap();
+    fs::create_dir_all(root.path().join("capabilities/one")).unwrap();
+    fs::write(
+        root.path().join("capabilities/one/SKILL.md"),
+        "---\nname: One\ndescription: Read data.\n---\nOriginal instructions.\n",
+    )
+    .unwrap();
+    // None of src, payloads/amd64, or payloads/arm64 exists on the host.
+    // A normal release capture must still require those declared inputs.
+    assert!(SelectionPlan::capture(root.path(), limits(), || false).is_err());
+    let prepared = PreparedAppSource::capture(root.path(), limits(), || false).unwrap();
+    assert_eq!(prepared.package.components.len(), 1);
+    assert_eq!(
+        prepared
+            .package
+            .manifest
+            .presentation("en", &prepared.package.localizations)
+            .name,
+        "Localized"
+    );
+    assert_eq!(prepared.package.images.len(), 1);
+    assert!(SelectionPlan::validate_package(&prepared.snapshot).is_err());
+
+    // Invalid edits cannot become an accepted revision; the captured bytes of
+    // the prior revision remain usable by an already prepared agent turn.
+    fs::write(root.path().join("capabilities/one/SKILL.md"), "").unwrap();
+    let error = PreparedAppSource::capture(root.path(), limits(), || false).unwrap_err();
+    let error = error.downcast_ref::<pioneer_apps::ManifestError>().unwrap();
+    assert_eq!(error.code, "invalid_source_component");
+    assert_eq!(error.field, "capabilities/one/SKILL.md");
+    assert_eq!(
+        prepared.snapshot.file("capabilities/one/SKILL.md"),
+        Some(b"---\nname: One\ndescription: Read data.\n---\nOriginal instructions.\n".as_slice())
+    );
+    fs::remove_file(root.path().join("en.json")).unwrap();
+    assert!(PreparedAppSource::capture(root.path(), limits(), || false).is_err());
+}

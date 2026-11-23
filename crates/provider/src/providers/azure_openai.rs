@@ -1081,6 +1081,10 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
+    fn keeps_tools_when_disabled(&self, _model: &str) -> bool {
+        self.base_url.is_none()
+    }
+
     fn usage_api(&self) -> &'static str {
         "azure_deployment_chat_completions"
     }
@@ -1363,7 +1367,7 @@ mod tests {
                         wire.get("parallel_tool_calls")
                             .and_then(serde_json::Value::as_bool),
                         if matches!(choice, ToolChoice::None) {
-                            None
+                            parallel.filter(|enabled| *enabled)
                         } else {
                             parallel
                         }

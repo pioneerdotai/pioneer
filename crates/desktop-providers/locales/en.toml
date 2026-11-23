@@ -361,6 +361,11 @@ description = "Local vLLM OpenAI-compatible API"
 title = "OSaurus"
 description = "Local OSaurus OpenAI-compatible API"
 
+[providers.catalog.custom]
+title = "Custom"
+
+[providers.catalog.local]
+title = "Local"
 
 [buttons]
 ok = "OK"

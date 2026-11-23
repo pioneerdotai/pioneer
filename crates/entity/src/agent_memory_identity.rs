@@ -24,7 +24,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_memory: HasOne<super::agent_memory::Entity>,
+    pub agent_memory: BelongsTo<super::agent_memory::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

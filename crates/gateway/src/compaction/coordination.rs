@@ -25,7 +25,7 @@ struct Owner {
 #[derive(Default)]
 pub(crate) struct ContextCompactionCoordinator {
     owners: Arc<Mutex<HashMap<(String, String), Weak<Owner>>>>,
-    released: pioneer_sqlite::WorkSignal,
+    released: pioneer_postgres_pools::WorkSignal,
 }
 struct OwnerReference {
     owner: Arc<Owner>,
@@ -53,7 +53,7 @@ pub(crate) struct ContextCompactionLease {
     reference: OwnerReference,
     cancellation: CancellationToken,
     _guard: Option<OwnedMutexGuard<()>>,
-    released: pioneer_sqlite::WorkSignal,
+    released: pioneer_postgres_pools::WorkSignal,
 }
 impl ContextCompactionLease {
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -69,7 +69,7 @@ impl Drop for ContextCompactionLease {
     }
 }
 impl ContextCompactionCoordinator {
-    pub(crate) fn release_subscription(&self) -> pioneer_sqlite::WorkSubscription {
+    pub(crate) fn release_subscription(&self) -> pioneer_postgres_pools::WorkSubscription {
         self.released.subscribe()
     }
     pub(crate) async fn acquire(

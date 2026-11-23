@@ -7,35 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_checkpoint")]
 pub struct Model {
-    pub proof_version: i64,
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(column_type = "Text")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "compaction_checkpoint_operation_id_portion_key"
+    )]
     pub operation_id: String,
     #[sea_orm(column_type = "Text")]
     pub owner: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub previous: Option<String>,
+    #[sea_orm(unique_key = "compaction_checkpoint_operation_id_portion_key")]
     pub portion: i64,
     #[sea_orm(column_type = "Text")]
     pub summary: String,
     #[sea_orm(column_type = "Text")]
     pub identity_sha256: String,
-    #[sea_orm(column_type = "Text")]
-    pub selection: String,
+    pub selection: Json,
     pub projection_version: i64,
     pub format_version: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
-    #[serde(skip)]
+    pub proof_version: i64,
     #[sea_orm(has_many)]
-    pub replay_aliases: HasMany<super::compaction_checkpoint_replay_alias::Entity>,
-    #[serde(skip)]
+    pub compaction_checkpoint_event_inputs:
+        HasMany<super::compaction_checkpoint_event_input::Entity>,
     #[sea_orm(has_many)]
-    pub event_inputs: HasMany<super::compaction_checkpoint_event_input::Entity>,
-    #[serde(skip)]
+    pub compaction_checkpoint_imports: HasMany<super::compaction_checkpoint_import::Entity>,
     #[sea_orm(has_many)]
-    pub imports: HasMany<super::compaction_checkpoint_import::Entity>,
+    pub compaction_checkpoint_replay_aliases:
+        HasMany<super::compaction_checkpoint_replay_alias::Entity>,
     #[sea_orm(has_many)]
     pub compaction_coverages: HasMany<super::compaction_coverage::Entity>,
     #[sea_orm(
@@ -45,7 +47,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

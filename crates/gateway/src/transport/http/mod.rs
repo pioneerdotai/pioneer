@@ -1,3 +1,4 @@
+mod app_profiles;
 mod apps;
 mod auth;
 mod avatars;

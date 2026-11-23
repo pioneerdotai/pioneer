@@ -1,4 +1,4 @@
-use migration::{Migrator, MigratorTrait};
+mod support;
 use pioneer_crud::{
     AgentMemoryListFilter, CrudStore, NewAgentMemoryQualityDecision, NewAgentMemoryRepairJob,
     global_agent_memory_scope_key, workspace_agent_memory_scope_key,
@@ -10,6 +10,7 @@ use pioneer_memory::{
     MemoryReadPolicy, MemoryRestoreRequest, MemoryService, MemoryServiceConfig,
     MemorySourceAccessPolicy,
 };
+use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidateStatus,
     MemoryCandidatesApproveParams, MemoryCandidatesEditAndApproveParams, MemoryCategory,
@@ -22,7 +23,6 @@ use pioneer_protocol::{
     MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
     MemoryWriteEvidence, MemoryWriteRelation,
 };
-use sea_orm::Database;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -59,18 +59,17 @@ impl MemoryBackend for RecordingMemoryBackend {
     }
 }
 
-async fn setup_service() -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryService) {
-    setup_service_with_config(MemoryServiceConfig::default()).await
+async fn setup_service(
+    database: &TestDatabase,
+) -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryService) {
+    setup_service_with_config(database, MemoryServiceConfig::default()).await
 }
 
 async fn setup_service_with_config(
+    database: &TestDatabase,
     config: MemoryServiceConfig,
 ) -> (Arc<CrudStore>, Arc<InMemoryMemoryBackend>, MemoryService) {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("connect sqlite");
-    Migrator::up(&connection, None).await.expect("migrate");
-    let store = Arc::new(CrudStore::new(connection));
+    let store = support::postgres_store(database).await;
     let backend = Arc::new(InMemoryMemoryBackend::default());
     let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
     let service = MemoryService::new(store.clone(), backend_for_service, config);
@@ -431,635 +430,680 @@ async fn attach_quality_decision(
 
 #[tokio::test]
 async fn semantic_active_writes_persist_source_context_classes() {
-    let (store, _backend, service) = setup_service().await;
-    let mut semantic = relationship_semantic("direct-user-source-context");
-    semantic.intent = MemoryIntent::ExplicitStore;
-    semantic.explicitness = MemoryExplicitness::Explicit;
-    let mut params = semantic_write_params(
-        semantic,
-        "Direct user relationship fact.",
-        "direct-user-relationship-value",
-        MemorySemanticWriteDisposition::AcceptActive,
-        "turn_source_context_direct_user",
-    );
-    params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
-
-    let response = service
-        .write_semantic_memory(user_context(90), params)
-        .await
-        .expect("direct user semantic active write succeeds");
-    let record = response.record.expect("active record");
-    assert_eq!(
-        record.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
-    let stored = store
-        .get_agent_memory_record(record.id.as_str(), false)
-        .await
-        .expect("load stored memory")
-        .expect("stored memory exists");
-    assert_eq!(
-        stored.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
-
-    let blocked_cases = [
-        MemorySourceContextKind::AssistantResponse,
-        MemorySourceContextKind::ToolResult,
-        MemorySourceContextKind::TaskRuntime,
-        MemorySourceContextKind::SystemRuntime,
-        MemorySourceContextKind::Unknown,
-    ];
-
-    for (index, source_context_kind) in blocked_cases.into_iter().enumerate() {
-        let mut semantic = relationship_semantic(format!("person-{index}").as_str());
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut semantic = relationship_semantic("direct-user-source-context");
         semantic.intent = MemoryIntent::ExplicitStore;
         semantic.explicitness = MemoryExplicitness::Explicit;
-        let turn_id = format!("turn_source_context_blocked_{index}");
         let mut params = semantic_write_params(
             semantic,
-            format!("Relationship fact {index}.").as_str(),
-            format!("relationship-value-{index}").as_str(),
+            "Direct user relationship fact.",
+            "direct-user-relationship-value",
             MemorySemanticWriteDisposition::AcceptActive,
-            turn_id.as_str(),
+            "turn_source_context_direct_user",
         );
-        params.source_context_kind = Some(source_context_kind);
+        params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
 
         let response = service
-            .write_semantic_memory(user_context(91 + index as i64), params)
+            .write_semantic_memory(user_context(90), params)
             .await
-            .expect("semantic active write is quality-gated");
-        assert!(response.record.is_none());
-        assert!(response.candidate.is_none());
+            .expect("direct user semantic active write succeeds");
+        let record = response.record.expect("active record");
+        assert_eq!(
+            record.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
+        let stored = store
+            .get_agent_memory_record(record.id.as_str(), false)
+            .await
+            .expect("load stored memory")
+            .expect("stored memory exists");
+        assert_eq!(
+            stored.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
 
-        let decisions = store
-            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-            .await
-            .expect("quality decisions");
-        let decision = decisions
-            .iter()
-            .find(|decision| decision.turn_id.as_deref() == Some(turn_id.as_str()))
-            .expect("quality decision for blocked source context");
-        assert_ne!(decision.action, MemoryQualityAction::CandidatePolicy);
-        assert_eq!(decision.source_context_kind, source_context_kind);
-    }
+        let blocked_cases = [
+            MemorySourceContextKind::AssistantResponse,
+            MemorySourceContextKind::ToolResult,
+            MemorySourceContextKind::TaskRuntime,
+            MemorySourceContextKind::SystemRuntime,
+            MemorySourceContextKind::Unknown,
+        ];
+
+        for (index, source_context_kind) in blocked_cases.into_iter().enumerate() {
+            let mut semantic = relationship_semantic(format!("person-{index}").as_str());
+            semantic.intent = MemoryIntent::ExplicitStore;
+            semantic.explicitness = MemoryExplicitness::Explicit;
+            let turn_id = format!("turn_source_context_blocked_{index}");
+            let mut params = semantic_write_params(
+                semantic,
+                format!("Relationship fact {index}.").as_str(),
+                format!("relationship-value-{index}").as_str(),
+                MemorySemanticWriteDisposition::AcceptActive,
+                turn_id.as_str(),
+            );
+            params.source_context_kind = Some(source_context_kind);
+
+            let response = service
+                .write_semantic_memory(user_context(91 + index as i64), params)
+                .await
+                .expect("semantic active write is quality-gated");
+            assert!(response.record.is_none());
+            assert!(response.candidate.is_none());
+
+            let decisions = store
+                .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+                .await
+                .expect("quality decisions");
+            let decision = decisions
+                .iter()
+                .find(|decision| decision.turn_id.as_deref() == Some(turn_id.as_str()))
+                .expect("quality decision for blocked source context");
+            assert_ne!(decision.action, MemoryQualityAction::CandidatePolicy);
+            assert_eq!(decision.source_context_kind, source_context_kind);
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn candidate_approval_preserves_source_context() {
-    let (store, _backend, service) = setup_service().await;
-    let mut params = semantic_write_params(
-        relationship_semantic("candidate-source-context"),
-        "Candidate source context fact.",
-        "candidate-source-context-value",
-        MemorySemanticWriteDisposition::CreatePendingCandidate,
-        "turn_candidate_source_context",
-    );
-    params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut params = semantic_write_params(
+            relationship_semantic("candidate-source-context"),
+            "Candidate source context fact.",
+            "candidate-source-context-value",
+            MemorySemanticWriteDisposition::CreatePendingCandidate,
+            "turn_candidate_source_context",
+        );
+        params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
 
-    let candidate = service
-        .write_semantic_memory(user_context(96), params)
-        .await
-        .expect("candidate write")
-        .candidate
-        .expect("candidate");
-    assert_eq!(
-        candidate.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
+        let candidate = service
+            .write_semantic_memory(user_context(96), params)
+            .await
+            .expect("candidate write")
+            .candidate
+            .expect("candidate");
+        assert_eq!(
+            candidate.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
 
-    let approved = service
-        .approve_candidate(
-            user_context(97),
-            MemoryCandidatesApproveParams {
-                candidate_id: candidate.id.clone(),
-                reason: Some("approved in source context test".to_owned()),
-                actor: None,
-            },
-        )
-        .await
-        .expect("approve candidate");
+        let approved = service
+            .approve_candidate(
+                user_context(97),
+                MemoryCandidatesApproveParams {
+                    candidate_id: candidate.id.clone(),
+                    reason: Some("approved in source context test".to_owned()),
+                    actor: None,
+                },
+            )
+            .await
+            .expect("approve candidate");
 
-    assert_eq!(
-        approved.record.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
-    let stored = store
-        .get_agent_memory_record(approved.record.id.as_str(), false)
-        .await
-        .expect("load approved memory")
-        .expect("approved memory exists");
-    assert_eq!(
-        stored.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
+        assert_eq!(
+            approved.record.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
+        let stored = store
+            .get_agent_memory_record(approved.record.id.as_str(), false)
+            .await
+            .expect("load approved memory")
+            .expect("approved memory exists");
+        assert_eq!(
+            stored.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn remember_get_and_list_hydrate_content_from_backend() {
-    let (store, _backend, service) = setup_service().await;
-    let full_content = format!("User birthday is September 12. {}", "x".repeat(320));
-    let remembered = service
-        .remember(
-            user_context(100),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.birthday"),
-                full_content.as_str(),
-            ),
-        )
-        .await
-        .expect("remember");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let full_content = format!("User birthday is September 12. {}", "x".repeat(320));
+        let remembered = service
+            .remember(
+                user_context(100),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.birthday"),
+                    full_content.as_str(),
+                ),
+            )
+            .await
+            .expect("remember");
 
-    assert_eq!(remembered.record.content, full_content);
-    assert_eq!(
-        remembered.record.provenance.created_by.unwrap().kind,
-        MemoryActorKind::User
-    );
+        assert_eq!(remembered.record.content, full_content);
+        assert_eq!(
+            remembered.record.provenance.created_by.unwrap().kind,
+            MemoryActorKind::User
+        );
 
-    let loaded = service
-        .get(
-            user_context(101),
-            MemoryGetParams {
-                memory_id: remembered.record.id.clone(),
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("get")
-        .record
-        .expect("record");
-    assert_eq!(loaded.content, full_content);
+        let loaded = service
+            .get(
+                user_context(101),
+                MemoryGetParams {
+                    memory_id: remembered.record.id.clone(),
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("get")
+            .record
+            .expect("record");
+        assert_eq!(loaded.content, full_content);
 
-    let listed = service
-        .list(
-            user_context(102),
-            MemoryListParams {
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list");
-    assert_eq!(listed.records.len(), 1);
-    assert_eq!(listed.records[0].content, full_content);
+        let listed = service
+            .list(
+                user_context(102),
+                MemoryListParams {
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list");
+        assert_eq!(listed.records.len(), 1);
+        assert_eq!(listed.records[0].content, full_content);
 
-    let control = store
-        .get_agent_memory_record(remembered.record.id.as_str(), true)
-        .await
-        .expect("load control row")
-        .expect("control row");
-    let preview = control.content_preview.expect("preview");
-    assert!(preview.len() < full_content.len());
-    assert!(full_content.starts_with(preview.as_str()));
+        let control = store
+            .get_agent_memory_record(remembered.record.id.as_str(), true)
+            .await
+            .expect("load control row")
+            .expect("control row");
+        let preview = control.content_preview.expect("preview");
+        assert!(preview.len() < full_content.len());
+        assert!(full_content.starts_with(preview.as_str()));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn list_get_and_forget_use_control_plane_visibility() {
-    let (store, _backend, service) = setup_service().await;
-    let mut params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("legacy.weather"),
-        "User wants current Moscow weather sent to this chat every 15 minutes.",
-    );
-    params.category = MemoryCategory::Preference;
-    params.source_context_kind = Some(MemorySourceContextKind::AssistantResponse);
-    params.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_legacy".to_owned()),
-        source_turn_id: Some("turn_legacy".to_owned()),
-        source_item_id: None,
-        created_by: Some(MemoryActor {
-            kind: MemoryActorKind::Assistant,
-            id: None,
-        }),
-    });
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("legacy.weather"),
+            "User wants current Moscow weather sent to this chat every 15 minutes.",
+        );
+        params.category = MemoryCategory::Preference;
+        params.source_context_kind = Some(MemorySourceContextKind::AssistantResponse);
+        params.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_legacy".to_owned()),
+            source_turn_id: Some("turn_legacy".to_owned()),
+            source_item_id: None,
+            created_by: Some(MemoryActor {
+                kind: MemoryActorKind::Assistant,
+                id: None,
+            }),
+        });
 
-    let remembered = service
-        .remember(user_context(150), params)
-        .await
-        .expect("remember legacy memory");
-    attach_quality_decision(
-        &store,
-        remembered.record.id.as_str(),
-        MemoryQualityAction::ForceReject,
-        MemoryOwnershipClass::Reject,
-        MemorySourceContextKind::AssistantResponse,
-        MemoryFactClass::StableUserPreference,
-        MemoryLifetimeClass::LongLived,
-        MemoryOwnershipClass::DurableUserMemory,
-        MemoryEvidenceClass::AssistantInference,
-        MemoryWriteRelation::Novel,
-        vec![MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence],
-        151,
-    )
-    .await;
-
-    let search = service
-        .search(
-            user_context(152),
-            MemorySearchParams {
-                query: "Moscow weather".to_owned(),
-                ..Default::default()
-            },
+        let remembered = service
+            .remember(user_context(150), params)
+            .await
+            .expect("remember legacy memory");
+        attach_quality_decision(
+            &store,
+            remembered.record.id.as_str(),
+            MemoryQualityAction::ForceReject,
+            MemoryOwnershipClass::Reject,
+            MemorySourceContextKind::AssistantResponse,
+            MemoryFactClass::StableUserPreference,
+            MemoryLifetimeClass::LongLived,
+            MemoryOwnershipClass::DurableUserMemory,
+            MemoryEvidenceClass::AssistantInference,
+            MemoryWriteRelation::Novel,
+            vec![MemoryQualityReasonCode::AssistantInferenceNotDurableEvidence],
+            151,
         )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        .await;
 
-    let listed = service
-        .list(user_context(153), MemoryListParams::default())
-        .await
-        .expect("list");
-    assert_eq!(
-        listed
-            .records
-            .iter()
-            .map(|record| record.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![remembered.record.id.as_str()]
-    );
-
-    let loaded = service
-        .get(
-            user_context(154),
-            MemoryGetParams {
-                memory_id: remembered.record.id.clone(),
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("get")
-        .record
-        .expect("record");
-    assert_eq!(loaded.content, remembered.record.content);
-    let eligibility = loaded.recall_eligibility.as_ref().expect("assessed get");
-    assert!(!eligibility.eligible);
-    assert!(eligibility.reason.starts_with("suppress_"));
-    assert_eq!(
-        listed.records[0].recall_eligibility.as_ref(),
-        Some(eligibility)
-    );
-
-    let forgotten = service
-        .forget(
-            user_context(155),
-            MemoryForgetParams {
-                target: MemoryForgetTarget::Id {
-                    memory_id: remembered.record.id.clone(),
+        let search = service
+            .search(
+                user_context(152),
+                MemorySearchParams {
+                    query: "Moscow weather".to_owned(),
+                    ..Default::default()
                 },
-                reason: Some("cleanup".to_owned()),
-                actor: None,
-                dry_run: false,
-            },
-        )
-        .await
-        .expect("forget");
-    assert_eq!(forgotten.forgotten_memory_ids, vec![remembered.record.id]);
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
+
+        let listed = service
+            .list(user_context(153), MemoryListParams::default())
+            .await
+            .expect("list");
+        assert_eq!(
+            listed
+                .records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![remembered.record.id.as_str()]
+        );
+
+        let loaded = service
+            .get(
+                user_context(154),
+                MemoryGetParams {
+                    memory_id: remembered.record.id.clone(),
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("get")
+            .record
+            .expect("record");
+        assert_eq!(loaded.content, remembered.record.content);
+        let eligibility = loaded.recall_eligibility.as_ref().expect("assessed get");
+        assert!(!eligibility.eligible);
+        assert!(eligibility.reason.starts_with("suppress_"));
+        assert_eq!(
+            listed.records[0].recall_eligibility.as_ref(),
+            Some(eligibility)
+        );
+
+        let forgotten = service
+            .forget(
+                user_context(155),
+                MemoryForgetParams {
+                    target: MemoryForgetTarget::Id {
+                        memory_id: remembered.record.id.clone(),
+                    },
+                    reason: Some("cleanup".to_owned()),
+                    actor: None,
+                    dry_run: false,
+                },
+            )
+            .await
+            .expect("forget");
+        assert_eq!(forgotten.forgotten_memory_ids, vec![remembered.record.id]);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn inventory_cursor_visits_tied_records_once_even_when_updated_or_deleted() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut expected = std::collections::BTreeSet::new();
-    for i in 0..7 {
-        let response = service
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut expected = std::collections::BTreeSet::new();
+        for i in 0..7 {
+            let response = service
+                .remember(
+                    user_context(200),
+                    remember_params(
+                        scope(MemoryScopeKind::User, "default"),
+                        Some(&format!("page.{i}")),
+                        &format!("Fact {i}"),
+                    ),
+                )
+                .await
+                .unwrap();
+            expected.insert(response.record.id);
+        }
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            let response = service
+                .list(
+                    user_context(201),
+                    MemoryListParams {
+                        limit: Some(2),
+                        cursor,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            pages += 1;
+            for record in response.records {
+                assert!(seen.insert(record.id.clone()), "duplicate inventory row");
+                // An update must not move an already scanned row to a later page.
+                service
+                    .remember(
+                        user_context(202),
+                        remember_params(record.scope, record.key.as_deref(), "Updated fact"),
+                    )
+                    .await
+                    .unwrap();
+                service
+                    .forget(
+                        user_context(203),
+                        MemoryForgetParams {
+                            target: MemoryForgetTarget::Id {
+                                memory_id: record.id,
+                            },
+                            reason: None,
+                            actor: None,
+                            dry_run: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            cursor = response.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages < 10);
+        }
+        assert_eq!(pages, 4);
+        assert_eq!(seen, expected);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn inventory_empty_filtered_page_still_has_a_continuation() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let visible = service
             .remember(
-                user_context(200),
+                user_context(100),
                 remember_params(
                     scope(MemoryScopeKind::User, "default"),
-                    Some(&format!("page.{i}")),
-                    &format!("Fact {i}"),
+                    Some("visible"),
+                    "Visible fact",
                 ),
             )
             .await
             .unwrap();
-        expected.insert(response.record.id);
-    }
-    let mut cursor = None;
-    let mut seen = std::collections::BTreeSet::new();
-    let mut pages = 0;
-    loop {
-        let response = service
+        for i in 0..3 {
+            let mut params = remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some(&format!("hidden.{i}")),
+                "Restricted fact",
+            );
+            params.sensitivity = Some(MemorySensitivity::Regulated);
+            service
+                .remember(user_context(101 + i), params)
+                .await
+                .unwrap();
+        }
+        let first = service
             .list(
-                user_context(201),
+                user_context(110),
                 MemoryListParams {
                     limit: Some(2),
-                    cursor,
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        pages += 1;
-        for record in response.records {
-            assert!(seen.insert(record.id.clone()), "duplicate inventory row");
-            // An update must not move an already scanned row to a later page.
-            service
-                .remember(
-                    user_context(202),
-                    remember_params(record.scope, record.key.as_deref(), "Updated fact"),
-                )
-                .await
-                .unwrap();
-            service
-                .forget(
-                    user_context(203),
-                    MemoryForgetParams {
-                        target: MemoryForgetTarget::Id {
-                            memory_id: record.id,
-                        },
-                        reason: None,
-                        actor: None,
-                        dry_run: false,
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        cursor = response.next_cursor;
-        if cursor.is_none() {
-            break;
-        }
-        assert!(pages < 10);
-    }
-    assert_eq!(pages, 4);
-    assert_eq!(seen, expected);
-}
-
-#[tokio::test]
-async fn inventory_empty_filtered_page_still_has_a_continuation() {
-    let (_store, _backend, service) = setup_service().await;
-    let visible = service
-        .remember(
-            user_context(100),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("visible"),
-                "Visible fact",
-            ),
-        )
-        .await
-        .unwrap();
-    for i in 0..3 {
-        let mut params = remember_params(
-            scope(MemoryScopeKind::User, "default"),
-            Some(&format!("hidden.{i}")),
-            "Restricted fact",
-        );
-        params.sensitivity = Some(MemorySensitivity::Regulated);
-        service
-            .remember(user_context(101 + i), params)
-            .await
-            .unwrap();
-    }
-    let first = service
-        .list(
-            user_context(110),
-            MemoryListParams {
-                limit: Some(2),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert!(first.records.is_empty());
-    assert!(first.next_cursor.is_some());
-    let second = service
-        .list(
-            user_context(110),
-            MemoryListParams {
-                limit: Some(2),
-                cursor: first.next_cursor,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(second.records.len(), 1);
-    assert_eq!(second.records[0].id, visible.record.id);
-    assert!(second.next_cursor.is_none());
-    for invalid in [
-        "garbage",
-        "memory-list-v1:9223372036854775807:x",
-        "memory-list-v1:1:",
-    ] {
-        assert!(
-            service
-                .list(
-                    user_context(110),
-                    MemoryListParams {
-                        cursor: Some(invalid.to_owned()),
-                        ..Default::default()
-                    }
-                )
-                .await
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
-async fn forget_authority_is_independent_of_sensitivity_expiry_and_repair() {
-    let (store, _backend, service) = setup_service().await;
-    for (i, sensitivity) in [
-        MemorySensitivity::SecretLike,
-        MemorySensitivity::Regulated,
-        MemorySensitivity::Normal,
-        MemorySensitivity::Normal,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut params = remember_params(
-            scope(MemoryScopeKind::Workspace, "ws_owner"),
-            Some(&format!("forget.{i}")),
-            "Owned content",
-        );
-        params.sensitivity = Some(sensitivity);
-        let saved = service
-            .remember(workspace_context("ws_owner", 300), params)
-            .await
-            .unwrap();
-        if i == 2 {
-            store
-                .mark_agent_memory_expired(&saved.record.id, 301)
-                .await
-                .unwrap();
-        }
-        if i == 3 {
-            store
-                .mark_agent_memory_repair_status(&saved.record.id, "repair_needed", 301)
-                .await
-                .unwrap();
-        }
-        let params = MemoryForgetParams {
-            target: MemoryForgetTarget::Id {
-                memory_id: saved.record.id.clone(),
-            },
-            reason: None,
-            actor: None,
-            dry_run: false,
-        };
-        let foreign = service
-            .forget(workspace_context("ws_foreign", 302), params.clone())
-            .await
-            .unwrap();
-        assert!(foreign.forgotten_memory_ids.is_empty());
-        let preview = service
-            .forget(
-                workspace_context("ws_owner", 302),
-                MemoryForgetParams {
-                    dry_run: true,
-                    ..params.clone()
+        assert!(first.records.is_empty());
+        assert!(first.next_cursor.is_some());
+        let second = service
+            .list(
+                user_context(110),
+                MemoryListParams {
+                    limit: Some(2),
+                    cursor: first.next_cursor,
+                    ..Default::default()
                 },
             )
             .await
             .unwrap();
-        assert_eq!(preview.forgotten_memory_ids, vec![saved.record.id.clone()]);
-        let result = service
-            .forget(workspace_context("ws_owner", 303), params.clone())
-            .await
-            .unwrap();
-        assert_eq!(result.forgotten_memory_ids, vec![saved.record.id.clone()]);
-        assert_eq!(
-            store
-                .get_agent_memory_record(&saved.record.id, true)
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].id, visible.record.id);
+        assert!(second.next_cursor.is_none());
+        for invalid in [
+            "garbage",
+            "memory-list-v1:9223372036854775807:x",
+            "memory-list-v1:1:",
+        ] {
+            assert!(
+                service
+                    .list(
+                        user_context(110),
+                        MemoryListParams {
+                            cursor: Some(invalid.to_owned()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn forget_authority_is_independent_of_sensitivity_expiry_and_repair() {
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        for (i, sensitivity) in [
+            MemorySensitivity::SecretLike,
+            MemorySensitivity::Regulated,
+            MemorySensitivity::Normal,
+            MemorySensitivity::Normal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut params = remember_params(
+                scope(MemoryScopeKind::Workspace, "ws_owner"),
+                Some(&format!("forget.{i}")),
+                "Owned content",
+            );
+            params.sensitivity = Some(sensitivity);
+            let saved = service
+                .remember(workspace_context("ws_owner", 300), params)
                 .await
-                .unwrap()
-                .unwrap()
-                .status,
-            MemoryStatus::Deleted
-        );
-        assert!(
-            service
-                .forget(workspace_context("ws_owner", 304), params)
+                .unwrap();
+            if i == 2 {
+                store
+                    .mark_agent_memory_expired(&saved.record.id, 301)
+                    .await
+                    .unwrap();
+            }
+            if i == 3 {
+                store
+                    .mark_agent_memory_repair_status(&saved.record.id, "repair_needed", 301)
+                    .await
+                    .unwrap();
+            }
+            let params = MemoryForgetParams {
+                target: MemoryForgetTarget::Id {
+                    memory_id: saved.record.id.clone(),
+                },
+                reason: None,
+                actor: None,
+                dry_run: false,
+            };
+            let foreign = service
+                .forget(workspace_context("ws_foreign", 302), params.clone())
                 .await
-                .unwrap()
-                .forgotten_memory_ids
-                .is_empty()
-        );
-    }
+                .unwrap();
+            assert!(foreign.forgotten_memory_ids.is_empty());
+            let preview = service
+                .forget(
+                    workspace_context("ws_owner", 302),
+                    MemoryForgetParams {
+                        dry_run: true,
+                        ..params.clone()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(preview.forgotten_memory_ids, vec![saved.record.id.clone()]);
+            let result = service
+                .forget(workspace_context("ws_owner", 303), params.clone())
+                .await
+                .unwrap();
+            assert_eq!(result.forgotten_memory_ids, vec![saved.record.id.clone()]);
+            assert_eq!(
+                store
+                    .get_agent_memory_record(&saved.record.id, true)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MemoryStatus::Deleted
+            );
+            assert!(
+                service
+                    .forget(workspace_context("ws_owner", 304), params)
+                    .await
+                    .unwrap()
+                    .forgotten_memory_ids
+                    .is_empty()
+            );
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn keyed_remember_upserts_existing_active_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let first = service
-        .remember(
-            user_context(200),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.name"),
-                "The user's name is Alexander.",
-            ),
-        )
-        .await
-        .expect("first remember");
-    let second = service
-        .remember(
-            user_context(201),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.name"),
-                "The user's preferred name is Alexander.",
-            ),
-        )
-        .await
-        .expect("second remember");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let first = service
+            .remember(
+                user_context(200),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.name"),
+                    "The user's name is Alexander.",
+                ),
+            )
+            .await
+            .expect("first remember");
+        let second = service
+            .remember(
+                user_context(201),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.name"),
+                    "The user's preferred name is Alexander.",
+                ),
+            )
+            .await
+            .expect("second remember");
 
-    assert_eq!(first.record.id, second.record.id);
-    assert!(!second.created);
-    assert_eq!(
-        second.record.content,
-        "The user's preferred name is Alexander."
-    );
+        assert_eq!(first.record.id, second.record.id);
+        assert!(!second.created);
+        assert_eq!(
+            second.record.content,
+            "The user's preferred name is Alexander."
+        );
 
-    let events = store
-        .list_agent_memory_events(first.record.id.as_str(), 10)
-        .await
-        .expect("events");
-    assert!(events.iter().any(|event| event.event_kind == "created"));
-    assert!(events.iter().any(|event| event.event_kind == "updated"));
+        let events = store
+            .list_agent_memory_events(first.record.id.as_str(), 10)
+            .await
+            .expect("events");
+        assert!(events.iter().any(|event| event.event_kind == "created"));
+        assert!(events.iter().any(|event| event.event_kind == "updated"));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn remember_with_supersedes_marks_old_row_superseded() {
-    let (store, _backend, service) = setup_service().await;
-    let old = service
-        .remember(
-            user_context(300),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("project.style"),
-                "Use casual prose.",
-            ),
-        )
-        .await
-        .expect("old remember");
-    let mut replacement_params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("project.style"),
-        "Use direct engineering prose.",
-    );
-    replacement_params.supersedes = Some(old.record.id.clone());
-    let replacement = service
-        .remember(user_context(301), replacement_params)
-        .await
-        .expect("replacement remember");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let old = service
+            .remember(
+                user_context(300),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("project.style"),
+                    "Use casual prose.",
+                ),
+            )
+            .await
+            .expect("old remember");
+        let mut replacement_params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("project.style"),
+            "Use direct engineering prose.",
+        );
+        replacement_params.supersedes = Some(old.record.id.clone());
+        let replacement = service
+            .remember(user_context(301), replacement_params)
+            .await
+            .expect("replacement remember");
 
-    let old_row = store
-        .get_agent_memory_record(old.record.id.as_str(), true)
-        .await
-        .expect("old row")
-        .expect("old exists");
-    assert_eq!(old_row.status, MemoryStatus::Superseded);
-    assert_eq!(old_row.active_key, None);
+        let old_row = store
+            .get_agent_memory_record(old.record.id.as_str(), true)
+            .await
+            .expect("old row")
+            .expect("old exists");
+        assert_eq!(old_row.status, MemoryStatus::Superseded);
+        assert_eq!(old_row.active_key, None);
 
-    let listed = service
-        .list(user_context(302), MemoryListParams::default())
-        .await
-        .expect("list");
-    assert_eq!(listed.records.len(), 1);
-    assert_eq!(listed.records[0].id, replacement.record.id);
+        let listed = service
+            .list(user_context(302), MemoryListParams::default())
+            .await
+            .expect("list");
+        assert_eq!(listed.records.len(), 1);
+        assert_eq!(listed.records[0].id, replacement.record.id);
 
-    let search = service
-        .search(
-            user_context(303),
-            MemorySearchParams {
-                query: "engineering prose".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 1);
-    assert_eq!(search.hits[0].record.id, replacement.record.id);
+        let search = service
+            .search(
+                user_context(303),
+                MemorySearchParams {
+                    query: "engineering prose".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].record.id, replacement.record.id);
 
-    let historical = service
-        .list(
-            user_context(304),
-            MemoryListParams {
-                statuses: vec![MemoryStatus::Superseded],
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(historical.records.len(), 1);
-    assert_eq!(historical.records[0].id, old.record.id);
-    let eligibility = historical.records[0].recall_eligibility.as_ref().unwrap();
-    assert!(!eligibility.eligible);
-    assert_eq!(eligibility.reason, "suppress_superseded");
+        let historical = service
+            .list(
+                user_context(304),
+                MemoryListParams {
+                    statuses: vec![MemoryStatus::Superseded],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(historical.records.len(), 1);
+        assert_eq!(historical.records[0].id, old.record.id);
+        let eligibility = historical.records[0].recall_eligibility.as_ref().unwrap();
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.reason, "suppress_superseded");
 
-    let decisions = store
-        .list_agent_memory_policy_decisions_for_memory(replacement.record.id.as_str(), 10)
-        .await
-        .expect("policy decisions");
-    assert!(
-        decisions
-            .iter()
-            .any(|decision| { decision.action == "remember" && decision.decision == "allow" })
-    );
+        let decisions = store
+            .list_agent_memory_policy_decisions_for_memory(replacement.record.id.as_str(), 10)
+            .await
+            .expect("policy decisions");
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| { decision.action == "remember" && decision.decision == "allow" })
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1070,782 +1114,842 @@ async fn addressed_semantic_corrections_preserve_legacy_keys_and_follow_the_link
         Some("auto_identity_opaque_hash"),
         None,
     ] {
-        let (store, _backend, service) = setup_service().await;
-        let mut direct = remember_params(
-            scope(MemoryScopeKind::User, "default"),
-            key,
-            "Имя: Алексей.",
-        );
-        direct.namespace = Some("legacy".to_owned());
-        let old = service
-            .remember(user_context(100), direct.clone())
-            .await
-            .unwrap()
-            .record;
-        let mut correction = semantic_write_params(
-            identity_name_semantic(MemoryExplicitness::Explicit),
-            "Имя: Александр.",
-            "Александр",
-            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-            "correction",
-        );
-        correction.target_memory_id = Some(old.id.clone());
-        let new = service
-            .write_semantic_memory(user_context(101), correction.clone())
-            .await
-            .unwrap();
-        assert_eq!(new.relation, MemoryWriteRelation::CompatibleUpdate);
-        let new = new.record.unwrap();
-        assert_eq!(new.key.as_deref(), key);
-        assert_eq!(new.namespace.as_deref(), Some("legacy"));
-        assert_ne!(new.id, old.id);
-        assert_eq!(
-            store
-                .get_agent_memory_record(&old.id, true)
+        pioneer_postgres_test::with_database(async |database| {
+            let (store, _backend, service) = setup_service(database).await;
+            let mut direct = remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                key,
+                "Имя: Алексей.",
+            );
+            direct.namespace = Some("legacy".to_owned());
+            let old = service
+                .remember(user_context(100), direct.clone())
                 .await
                 .unwrap()
-                .unwrap()
-                .status,
-            MemoryStatus::Superseded
-        );
+                .record;
+            let mut correction = semantic_write_params(
+                identity_name_semantic(MemoryExplicitness::Explicit),
+                "Имя: Александр.",
+                "Александр",
+                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                "correction",
+            );
+            correction.target_memory_id = Some(old.id.clone());
+            let new = service
+                .write_semantic_memory(user_context(101), correction.clone())
+                .await
+                .unwrap();
+            assert_eq!(new.relation, MemoryWriteRelation::CompatibleUpdate);
+            let new = new.record.unwrap();
+            assert_eq!(new.key.as_deref(), key);
+            assert_eq!(new.namespace.as_deref(), Some("legacy"));
+            assert_ne!(new.id, old.id);
+            assert_eq!(
+                store
+                    .get_agent_memory_record(&old.id, true)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                MemoryStatus::Superseded
+            );
 
-        // Future semantic writes need no guessed legacy key or previous run ID.
-        correction.target_memory_id = None;
-        correction.disposition = Some(MemorySemanticWriteDisposition::AcceptActive);
-        correction.content = "Имя: Саша.".to_owned();
-        correction.value = Some("Саша".to_owned());
-        let linked = service
-            .write_semantic_memory(user_context(102), correction.clone())
-            .await
-            .unwrap()
-            .record
-            .unwrap();
-        assert_eq!(linked.key.as_deref(), key);
-        assert_eq!(linked.namespace.as_deref(), Some("legacy"));
-
-        // Reverse direction: direct addressed replacement keeps the identity
-        // link, then a semantic duplicate resolves to that same current record.
-        direct.content = "Саша".to_owned();
-        direct.supersedes = Some(linked.id.clone());
-        let direct_new = service
-            .remember(user_context(103), direct)
-            .await
-            .unwrap()
-            .record;
-        let duplicate = service
-            .write_semantic_memory(user_context(104), correction)
-            .await
-            .unwrap();
-        assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
-        assert_eq!(duplicate.record.unwrap().id, direct_new.id);
-        let all = service
-            .list(user_context(105), MemoryListParams::default())
-            .await
-            .unwrap();
-        assert_eq!(all.records.len(), 1);
-        let by_identity = service
-            .get_by_key(
-                user_context(105),
-                direct_new.scope.clone(),
-                None,
-                "user/global:identity:self:name".to_owned(),
-            )
-            .await
-            .unwrap()
-            .record
-            .unwrap();
-        assert_eq!(by_identity.id, direct_new.id);
-        let via_alias = service
-            .remember(
-                user_context(106),
-                remember_params(
-                    direct_new.scope.clone(),
-                    Some("user/global:identity:self:name"),
-                    "Новое имя",
-                ),
-            )
-            .await
-            .unwrap()
-            .record;
-        assert_eq!(via_alias.key.as_deref(), key);
-        assert_eq!(via_alias.namespace.as_deref(), Some("legacy"));
-        assert_eq!(
-            service
-                .list(user_context(107), MemoryListParams::default())
+            // Future semantic writes need no guessed legacy key or previous run ID.
+            correction.target_memory_id = None;
+            correction.disposition = Some(MemorySemanticWriteDisposition::AcceptActive);
+            correction.content = "Имя: Саша.".to_owned();
+            correction.value = Some("Саша".to_owned());
+            let linked = service
+                .write_semantic_memory(user_context(102), correction.clone())
                 .await
                 .unwrap()
-                .records
-                .len(),
-            1
-        );
-        if let Some(key) = key {
-            let read = service
+                .record
+                .unwrap();
+            assert_eq!(linked.key.as_deref(), key);
+            assert_eq!(linked.namespace.as_deref(), Some("legacy"));
+
+            // Reverse direction: direct addressed replacement keeps the identity
+            // link, then a semantic duplicate resolves to that same current record.
+            direct.content = "Саша".to_owned();
+            direct.supersedes = Some(linked.id.clone());
+            let direct_new = service
+                .remember(user_context(103), direct)
+                .await
+                .unwrap()
+                .record;
+            let duplicate = service
+                .write_semantic_memory(user_context(104), correction)
+                .await
+                .unwrap();
+            assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
+            assert_eq!(duplicate.record.unwrap().id, direct_new.id);
+            let all = service
+                .list(user_context(105), MemoryListParams::default())
+                .await
+                .unwrap();
+            assert_eq!(all.records.len(), 1);
+            let by_identity = service
                 .get_by_key(
                     user_context(105),
-                    old.scope,
-                    Some("legacy".to_owned()),
-                    key.to_owned(),
+                    direct_new.scope.clone(),
+                    None,
+                    "user/global:identity:self:name".to_owned(),
                 )
                 .await
                 .unwrap()
                 .record
                 .unwrap();
-            assert_eq!(read.id, via_alias.id);
-        }
+            assert_eq!(by_identity.id, direct_new.id);
+            let via_alias = service
+                .remember(
+                    user_context(106),
+                    remember_params(
+                        direct_new.scope.clone(),
+                        Some("user/global:identity:self:name"),
+                        "Новое имя",
+                    ),
+                )
+                .await
+                .unwrap()
+                .record;
+            assert_eq!(via_alias.key.as_deref(), key);
+            assert_eq!(via_alias.namespace.as_deref(), Some("legacy"));
+            assert_eq!(
+                service
+                    .list(user_context(107), MemoryListParams::default())
+                    .await
+                    .unwrap()
+                    .records
+                    .len(),
+                1
+            );
+            if let Some(key) = key {
+                let read = service
+                    .get_by_key(
+                        user_context(105),
+                        old.scope,
+                        Some("legacy".to_owned()),
+                        key.to_owned(),
+                    )
+                    .await
+                    .unwrap()
+                    .record
+                    .unwrap();
+                assert_eq!(read.id, via_alias.id);
+            }
+
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
 #[tokio::test]
 async fn semantic_target_cannot_cross_scope_or_rebind_another_active_identity() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut params = semantic_write_params(
-        identity_name_semantic(MemoryExplicitness::Explicit),
-        "Александр",
-        "Александр",
-        MemorySemanticWriteDisposition::AcceptActive,
-        "initial",
-    );
-    let canonical = service
-        .write_semantic_memory(user_context(100), params.clone())
-        .await
-        .unwrap()
-        .record
-        .unwrap();
-    let legacy = service
-        .remember(
-            user_context(101),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("legacy_name"),
-                "Алексей",
-            ),
-        )
-        .await
-        .unwrap()
-        .record;
-    params.target_memory_id = Some(legacy.id.clone());
-    params.value = Some("Саша".to_owned());
-    params.content = "Саша".to_owned();
-    assert!(
-        service
-            .write_semantic_memory(user_context(102), params.clone())
-            .await
-            .is_err()
-    );
-    params.target_memory_id = Some(canonical.id.clone());
-    params.scope = scope(MemoryScopeKind::Workspace, "ws_private");
-    assert!(
-        service
-            .write_semantic_memory(user_context(103), params.clone())
-            .await
-            .is_err()
-    );
-    params.scope = canonical.scope.clone();
-    let mut revoked = user_context(104);
-    revoked.source_access = MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new());
-    assert!(
-        service
-            .write_semantic_memory(revoked, params)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        service
-            .get(
-                user_context(105),
-                MemoryGetParams {
-                    memory_id: canonical.id,
-                    include_deleted: false
-                }
-            )
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut params = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Explicit),
+            "Александр",
+            "Александр",
+            MemorySemanticWriteDisposition::AcceptActive,
+            "initial",
+        );
+        let canonical = service
+            .write_semantic_memory(user_context(100), params.clone())
             .await
             .unwrap()
             .record
+            .unwrap();
+        let legacy = service
+            .remember(
+                user_context(101),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("legacy_name"),
+                    "Алексей",
+                ),
+            )
+            .await
             .unwrap()
-            .content,
-        "Александр"
-    );
+            .record;
+        params.target_memory_id = Some(legacy.id.clone());
+        params.value = Some("Саша".to_owned());
+        params.content = "Саша".to_owned();
+        assert!(
+            service
+                .write_semantic_memory(user_context(102), params.clone())
+                .await
+                .is_err()
+        );
+        params.target_memory_id = Some(canonical.id.clone());
+        params.scope = scope(MemoryScopeKind::Workspace, "ws_private");
+        assert!(
+            service
+                .write_semantic_memory(user_context(103), params.clone())
+                .await
+                .is_err()
+        );
+        params.scope = canonical.scope.clone();
+        let mut revoked = user_context(104);
+        revoked.source_access = MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new());
+        assert!(
+            service
+                .write_semantic_memory(revoked, params)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .get(
+                    user_context(105),
+                    MemoryGetParams {
+                        memory_id: canonical.id,
+                        include_deleted: false
+                    }
+                )
+                .await
+                .unwrap()
+                .record
+                .unwrap()
+                .content,
+            "Александр"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_identity_writes_share_canonical_key_and_merge_evidence() {
-    let (store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(310),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "Меня зовут Александр.",
-                "Александр",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_1",
-            ),
-        )
-        .await
-        .expect("first semantic write");
-    assert_eq!(first.relation, MemoryWriteRelation::Novel);
-    assert!(first.created);
-    assert_eq!(first.canonical_key.key, "user/global:identity:self:name");
-    let first_record = first.record.expect("first record");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(310),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "Меня зовут Александр.",
+                    "Александр",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_1",
+                ),
+            )
+            .await
+            .expect("first semantic write");
+        assert_eq!(first.relation, MemoryWriteRelation::Novel);
+        assert!(first.created);
+        assert_eq!(first.canonical_key.key, "user/global:identity:self:name");
+        let first_record = first.record.expect("first record");
 
-    let second = service
-        .write_semantic_memory(
-            user_context(311),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "My name is Alexander.",
-                "Александр",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_2",
-            ),
-        )
-        .await
-        .expect("duplicate semantic write");
-    assert_eq!(second.canonical_key.key, "user/global:identity:self:name");
-    assert_eq!(second.semantic_fingerprint, first.semantic_fingerprint);
-    assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
-    assert!(!second.created);
-    assert!(second.evidence_merged);
-    let second_record = second.record.expect("duplicate record");
-    assert_eq!(second_record.id, first_record.id);
-    assert_eq!(metadata_evidence_count(&second_record.metadata), 2);
-    let decisions = store
-        .list_agent_memory_policy_decisions_for_memory(second_record.id.as_str(), 20)
-        .await
-        .expect("semantic write policy decisions");
-    assert!(
-        decisions.iter().any(|decision| {
+        let second = service
+            .write_semantic_memory(
+                user_context(311),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "My name is Alexander.",
+                    "Александр",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_2",
+                ),
+            )
+            .await
+            .expect("duplicate semantic write");
+        assert_eq!(second.canonical_key.key, "user/global:identity:self:name");
+        assert_eq!(second.semantic_fingerprint, first.semantic_fingerprint);
+        assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
+        assert!(!second.created);
+        assert!(second.evidence_merged);
+        let second_record = second.record.expect("duplicate record");
+        assert_eq!(second_record.id, first_record.id);
+        assert_eq!(metadata_evidence_count(&second_record.metadata), 2);
+        let decisions = store
+            .list_agent_memory_policy_decisions_for_memory(second_record.id.as_str(), 20)
+            .await
+            .expect("semantic write policy decisions");
+        assert!(decisions.iter().any(|decision| {
             decision.action == "semantic_write" && decision.decision == "novel"
-        })
-    );
-    assert!(decisions.iter().any(|decision| {
-        decision.action == "semantic_write" && decision.decision == "duplicate"
-    }));
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.action == "semantic_write" && decision.decision == "duplicate"
+        }));
 
-    let listed = service
-        .list(
-            user_context(312),
-            MemoryListParams {
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                categories: vec![MemoryCategory::Identity],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list identity memories");
-    assert_eq!(listed.records.len(), 1);
+        let listed = service
+            .list(
+                user_context(312),
+                MemoryListParams {
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    categories: vec![MemoryCategory::Identity],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list identity memories");
+        assert_eq!(listed.records.len(), 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_concurrent_duplicate_writes_leave_one_active_memory() {
-    let (_store, _backend, service) = setup_service().await;
-    let service = Arc::new(service);
-    let first_service = service.clone();
-    let second_service = service.clone();
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let service = Arc::new(service);
+        let first_service = service.clone();
+        let second_service = service.clone();
 
-    let (first, second) = tokio::join!(
-        first_service.write_semantic_memory(
-            user_context(313),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "Меня зовут Александр.",
-                "Александр",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_race_1",
+        let (first, second) = tokio::join!(
+            first_service.write_semantic_memory(
+                user_context(313),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "Меня зовут Александр.",
+                    "Александр",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_race_1",
+                ),
             ),
-        ),
-        second_service.write_semantic_memory(
-            user_context(313),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "My name is Alexander.",
-                "Александр",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_race_2",
-            ),
-        )
-    );
-    first.expect("first concurrent semantic write");
-    second.expect("second concurrent semantic write");
+            second_service.write_semantic_memory(
+                user_context(313),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "My name is Alexander.",
+                    "Александр",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_race_2",
+                ),
+            )
+        );
+        first.expect("first concurrent semantic write");
+        second.expect("second concurrent semantic write");
 
-    let listed = service
-        .list(
-            user_context(314),
-            MemoryListParams {
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                categories: vec![MemoryCategory::Identity],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list identity memories");
-    assert_eq!(listed.records.len(), 1);
-    assert_eq!(
-        listed.records[0].key.as_deref(),
-        Some("user/global:identity:self:name")
-    );
+        let listed = service
+            .list(
+                user_context(314),
+                MemoryListParams {
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    categories: vec![MemoryCategory::Identity],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list identity memories");
+        assert_eq!(listed.records.len(), 1);
+        assert_eq!(
+            listed.records[0].key.as_deref(),
+            Some("user/global:identity:self:name")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_write_ignores_client_provided_free_form_key() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut params = semantic_write_params(
-        identity_name_semantic(MemoryExplicitness::Explicit),
-        "User: Alexander.",
-        "Alexander",
-        MemorySemanticWriteDisposition::AcceptActive,
-        "turn_semantic_key",
-    );
-    params.client_provided_key = Some("llm/freeform/user-name".to_owned());
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut params = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Explicit),
+            "User: Alexander.",
+            "Alexander",
+            MemorySemanticWriteDisposition::AcceptActive,
+            "turn_semantic_key",
+        );
+        params.client_provided_key = Some("llm/freeform/user-name".to_owned());
 
-    let response = service
-        .write_semantic_memory(user_context(320), params)
-        .await
-        .expect("semantic write");
-    let record = response.record.expect("record");
-    assert_eq!(
-        record.key.as_deref(),
-        Some("user/global:identity:self:name")
-    );
-    assert_ne!(record.key.as_deref(), Some("llm/freeform/user-name"));
-    assert_eq!(
-        record
-            .metadata
-            .get("client_provided_key")
-            .and_then(serde_json::Value::as_str),
-        Some("llm/freeform/user-name")
-    );
+        let response = service
+            .write_semantic_memory(user_context(320), params)
+            .await
+            .expect("semantic write");
+        let record = response.record.expect("record");
+        assert_eq!(
+            record.key.as_deref(),
+            Some("user/global:identity:self:name")
+        );
+        assert_ne!(record.key.as_deref(), Some("llm/freeform/user-name"));
+        assert_eq!(
+            record
+                .metadata
+                .get("client_provided_key")
+                .and_then(serde_json::Value::as_str),
+            Some("llm/freeform/user-name")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_write_requires_evidence() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut params = semantic_write_params(
-        identity_name_semantic(MemoryExplicitness::Explicit),
-        "User: Alexander.",
-        "Alexander",
-        MemorySemanticWriteDisposition::AcceptActive,
-        "turn_semantic_no_evidence",
-    );
-    params.evidence = None;
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut params = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Explicit),
+            "User: Alexander.",
+            "Alexander",
+            MemorySemanticWriteDisposition::AcceptActive,
+            "turn_semantic_no_evidence",
+        );
+        params.evidence = None;
 
-    let error = service
-        .write_semantic_memory(user_context(325), params)
-        .await
-        .expect_err("semantic writes without evidence must fail");
-    assert_eq!(
-        error.downcast_ref::<pioneer_memory::MemoryWriteFailure>(),
-        Some(&pioneer_memory::MemoryWriteFailure::InvalidInput),
-    );
+        let error = service
+            .write_semantic_memory(user_context(325), params)
+            .await
+            .expect_err("semantic writes without evidence must fail");
+        assert_eq!(
+            error.downcast_ref::<pioneer_memory::MemoryWriteFailure>(),
+            Some(&pioneer_memory::MemoryWriteFailure::InvalidInput),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_single_value_explicit_update_supersedes_same_key() {
-    let (store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(330),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_update_1",
-            ),
-        )
-        .await
-        .expect("first semantic write")
-        .record
-        .expect("first record");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(330),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_update_1",
+                ),
+            )
+            .await
+            .expect("first semantic write")
+            .record
+            .expect("first record");
 
-    let second = service
-        .write_semantic_memory(
-            user_context(331),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alex.",
-                "Alex",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_update_2",
-            ),
-        )
-        .await
-        .expect("semantic update");
+        let second = service
+            .write_semantic_memory(
+                user_context(331),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alex.",
+                    "Alex",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_update_2",
+                ),
+            )
+            .await
+            .expect("semantic update");
 
-    assert_eq!(second.relation, MemoryWriteRelation::CompatibleUpdate);
-    assert_eq!(
-        second.superseded_memory_id.as_deref(),
-        Some(first.id.as_str())
-    );
-    let second_record = second.record.expect("updated record");
-    assert_eq!(
-        second_record.key.as_deref(),
-        Some("user/global:identity:self:name")
-    );
+        assert_eq!(second.relation, MemoryWriteRelation::CompatibleUpdate);
+        assert_eq!(
+            second.superseded_memory_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        let second_record = second.record.expect("updated record");
+        assert_eq!(
+            second_record.key.as_deref(),
+            Some("user/global:identity:self:name")
+        );
 
-    let old_row = store
-        .get_agent_memory_record(first.id.as_str(), true)
-        .await
-        .expect("load old row")
-        .expect("old row");
-    assert_eq!(old_row.status, MemoryStatus::Superseded);
+        let old_row = store
+            .get_agent_memory_record(first.id.as_str(), true)
+            .await
+            .expect("load old row")
+            .expect("old row");
+        assert_eq!(old_row.status, MemoryStatus::Superseded);
 
-    let listed = service
-        .list(
-            user_context(332),
-            MemoryListParams {
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                categories: vec![MemoryCategory::Identity],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list active identity memories");
-    assert_eq!(listed.records.len(), 1);
-    assert_eq!(listed.records[0].id, second_record.id);
+        let listed = service
+            .list(
+                user_context(332),
+                MemoryListParams {
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    categories: vec![MemoryCategory::Identity],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list active identity memories");
+        assert_eq!(listed.records.len(), 1);
+        assert_eq!(listed.records[0].id, second_record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_implicit_contradiction_does_not_create_active_duplicate() {
-    let (_store, _backend, service) = setup_service().await;
-    service
-        .write_semantic_memory(
-            user_context(340),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_contradiction_1",
-            ),
-        )
-        .await
-        .expect("first semantic write");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        service
+            .write_semantic_memory(
+                user_context(340),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_contradiction_1",
+                ),
+            )
+            .await
+            .expect("first semantic write");
 
-    let contradiction = service
-        .write_semantic_memory(
-            user_context(341),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "Maybe the user's name is Alexey.",
-                "Alexey",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_contradiction_2",
-            ),
-        )
-        .await
-        .expect("implicit contradiction");
+        let contradiction = service
+            .write_semantic_memory(
+                user_context(341),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "Maybe the user's name is Alexey.",
+                    "Alexey",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_contradiction_2",
+                ),
+            )
+            .await
+            .expect("implicit contradiction");
 
-    assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
-    assert!(contradiction.record.is_none());
-    assert_eq!(
-        contradiction
-            .candidate
-            .as_ref()
-            .expect("suppressed candidate")
-            .status,
-        MemoryCandidateStatus::ReviewDisabledRejected
-    );
+        assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
+        assert!(contradiction.record.is_none());
+        assert_eq!(
+            contradiction
+                .candidate
+                .as_ref()
+                .expect("suppressed candidate")
+                .status,
+            MemoryCandidateStatus::ReviewDisabledRejected
+        );
 
-    let listed = service
-        .list(
-            user_context(342),
-            MemoryListParams {
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                categories: vec![MemoryCategory::Identity],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("list active identity memories");
-    assert_eq!(listed.records.len(), 1);
-    assert!(listed.records[0].content.contains("Alexander"));
+        let listed = service
+            .list(
+                user_context(342),
+                MemoryListParams {
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    categories: vec![MemoryCategory::Identity],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list active identity memories");
+        assert_eq!(listed.records.len(), 1);
+        assert!(listed.records[0].content.contains("Alexander"));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_pending_candidate_duplicates_merge_evidence() {
-    let (_store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(360),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name may be Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_semantic_pending_1",
-            ),
-        )
-        .await
-        .expect("first candidate");
-    assert_eq!(first.relation, MemoryWriteRelation::Novel);
-    let first_candidate = first.candidate.expect("first pending candidate");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(360),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "The user's name may be Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_semantic_pending_1",
+                ),
+            )
+            .await
+            .expect("first candidate");
+        assert_eq!(first.relation, MemoryWriteRelation::Novel);
+        let first_candidate = first.candidate.expect("first pending candidate");
 
-    let second = service
-        .write_semantic_memory(
-            user_context(361),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "User is called Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_semantic_pending_2",
-            ),
-        )
-        .await
-        .expect("duplicate candidate");
-    assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
-    assert!(second.evidence_merged);
-    let second_candidate = second.candidate.expect("merged pending candidate");
-    assert_eq!(second_candidate.id, first_candidate.id);
-    assert_eq!(metadata_evidence_count(&second_candidate.metadata), 2);
+        let second = service
+            .write_semantic_memory(
+                user_context(361),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "User is called Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_semantic_pending_2",
+                ),
+            )
+            .await
+            .expect("duplicate candidate");
+        assert_eq!(second.relation, MemoryWriteRelation::Duplicate);
+        assert!(second.evidence_merged);
+        let second_candidate = second.candidate.expect("merged pending candidate");
+        assert_eq!(second_candidate.id, first_candidate.id);
+        assert_eq!(metadata_evidence_count(&second_candidate.metadata), 2);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_to_candidate_policy_applies_default_review_disabled_policy() {
-    let (_store, _backend, service) = setup_service().await;
-    let response = service
-        .write_semantic_memory(
-            user_context(365),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name may be Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_boundary",
-            ),
-        )
-        .await
-        .expect("policy boundary write");
-    assert_eq!(response.relation, MemoryWriteRelation::Novel);
-    assert!(response.record.is_none());
-    let candidate = response.candidate.expect("review-disabled candidate");
-    assert_eq!(
-        candidate.status,
-        MemoryCandidateStatus::ReviewDisabledRejected
-    );
-    assert_eq!(
-        candidate
-            .metadata
-            .get("candidate_policy_reason_code")
-            .and_then(serde_json::Value::as_str),
-        Some("implicit_auto_approve_disabled")
-    );
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let response = service
+            .write_semantic_memory(
+                user_context(365),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "The user's name may be Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_boundary",
+                ),
+            )
+            .await
+            .expect("policy boundary write");
+        assert_eq!(response.relation, MemoryWriteRelation::Novel);
+        assert!(response.record.is_none());
+        let candidate = response.candidate.expect("review-disabled candidate");
+        assert_eq!(
+            candidate.status,
+            MemoryCandidateStatus::ReviewDisabledRejected
+        );
+        assert_eq!(
+            candidate
+                .metadata
+                .get("candidate_policy_reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("implicit_auto_approve_disabled")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_explicit_durable_fact_auto_approves() {
-    let (store, _backend, service) = setup_service().await;
-    let response = service
-        .write_semantic_memory(
-            user_context(366),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "Запомни, меня зовут Александр.",
-                "Александр",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_auto_approve",
-            ),
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let response = service
+            .write_semantic_memory(
+                user_context(366),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "Запомни, меня зовут Александр.",
+                    "Александр",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_auto_approve",
+                ),
+            )
+            .await
+            .expect("policy write");
+
+        assert_eq!(response.relation, MemoryWriteRelation::Novel);
+        assert!(response.candidate.is_none());
+        let response_route = response.route.as_ref().expect("durable route info");
+        assert_eq!(
+            response_route.route,
+            MemorySemanticWriteRoute::DurableControlPlane
+        );
+        assert_eq!(
+            response_route.quality_action,
+            MemoryQualityAction::CandidatePolicy
+        );
+        assert!(response_route.quality_decision_id.is_some());
+        let record = response.record.expect("auto-approved record");
+        assert_eq!(
+            record
+                .metadata
+                .get("candidate_score_bucket")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        let score = record
+            .metadata
+            .get("candidate_score")
+            .expect("candidate score metadata");
+        assert_eq!(
+            score
+                .get("score_version")
+                .and_then(serde_json::Value::as_str),
+            Some("quality_v1")
+        );
+        assert!(
+            score
+                .get("source_trust_score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                > 0.0
+        );
+        assert!(
+            score
+                .get("ownership_fit_score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                > 0.0
+        );
+        let policy = record
+            .metadata
+            .get("candidate_policy")
+            .expect("candidate policy metadata");
+        assert_eq!(
+            policy
+                .pointer("/input/quality_action")
+                .and_then(serde_json::Value::as_str),
+            Some("candidate_policy")
+        );
+        assert_eq!(
+            policy
+                .pointer("/input/fact_class")
+                .and_then(serde_json::Value::as_str),
+            Some("user_identity")
+        );
+        assert_eq!(
+            policy
+                .pointer("/input/evidence_class")
+                .and_then(serde_json::Value::as_str),
+            Some("direct_user_assertion")
+        );
+        assert_eq!(
+            record
+                .metadata
+                .get("candidate_policy_decision")
+                .and_then(serde_json::Value::as_str),
+            Some("auto_approve")
+        );
+
+        let decisions = store
+            .list_agent_memory_policy_decisions_for_memory(record.id.as_str(), 20)
+            .await
+            .expect("policy decisions");
+        let decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.action == "candidate_policy" && decision.decision == "auto_approve"
+            })
+            .expect("candidate policy decision");
+        let details: serde_json::Value = serde_json::from_str(
+            decision
+                .details_json
+                .as_deref()
+                .expect("policy decision details"),
         )
-        .await
-        .expect("policy write");
-
-    assert_eq!(response.relation, MemoryWriteRelation::Novel);
-    assert!(response.candidate.is_none());
-    let response_route = response.route.as_ref().expect("durable route info");
-    assert_eq!(
-        response_route.route,
-        MemorySemanticWriteRoute::DurableControlPlane
-    );
-    assert_eq!(
-        response_route.quality_action,
-        MemoryQualityAction::CandidatePolicy
-    );
-    assert!(response_route.quality_decision_id.is_some());
-    let record = response.record.expect("auto-approved record");
-    assert_eq!(
-        record
-            .metadata
-            .get("candidate_score_bucket")
-            .and_then(serde_json::Value::as_str),
-        Some("high")
-    );
-    let score = record
-        .metadata
-        .get("candidate_score")
-        .expect("candidate score metadata");
-    assert_eq!(
-        score
-            .get("score_version")
-            .and_then(serde_json::Value::as_str),
-        Some("quality_v1")
-    );
-    assert!(
-        score
-            .get("source_trust_score")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_default()
-            > 0.0
-    );
-    assert!(
-        score
-            .get("ownership_fit_score")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_default()
-            > 0.0
-    );
-    let policy = record
-        .metadata
-        .get("candidate_policy")
-        .expect("candidate policy metadata");
-    assert_eq!(
-        policy
-            .pointer("/input/quality_action")
-            .and_then(serde_json::Value::as_str),
-        Some("candidate_policy")
-    );
-    assert_eq!(
-        policy
-            .pointer("/input/fact_class")
-            .and_then(serde_json::Value::as_str),
-        Some("user_identity")
-    );
-    assert_eq!(
-        policy
-            .pointer("/input/evidence_class")
-            .and_then(serde_json::Value::as_str),
-        Some("direct_user_assertion")
-    );
-    assert_eq!(
-        record
-            .metadata
-            .get("candidate_policy_decision")
-            .and_then(serde_json::Value::as_str),
-        Some("auto_approve")
-    );
-
-    let decisions = store
-        .list_agent_memory_policy_decisions_for_memory(record.id.as_str(), 20)
-        .await
-        .expect("policy decisions");
-    let decision = decisions
-        .iter()
-        .find(|decision| {
-            decision.action == "candidate_policy" && decision.decision == "auto_approve"
-        })
-        .expect("candidate policy decision");
-    let details: serde_json::Value = serde_json::from_str(
-        decision
-            .details_json
-            .as_deref()
-            .expect("policy decision details"),
-    )
-    .expect("policy decision details json");
-    assert_eq!(
-        details
-            .pointer("/score/score_version")
-            .and_then(serde_json::Value::as_str),
-        Some("quality_v1")
-    );
-    assert_eq!(
-        details
-            .pointer("/input/quality_reason_codes/0")
-            .and_then(serde_json::Value::as_str),
-        Some("candidate_policy_allowed")
-    );
+        .expect("policy decision details json");
+        assert_eq!(
+            details
+                .pointer("/score/score_version")
+                .and_then(serde_json::Value::as_str),
+            Some("quality_v1")
+        );
+        assert_eq!(
+            details
+                .pointer("/input/quality_reason_codes/0")
+                .and_then(serde_json::Value::as_str),
+            Some("candidate_policy_allowed")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_write_responses_include_route_for_duplicate_and_candidate_paths() {
-    let (_store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(400),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_route_response_first",
-            ),
-        )
-        .await
-        .expect("first write");
-    assert_eq!(
-        first.route.as_ref().map(|route| route.route),
-        Some(MemorySemanticWriteRoute::DurableControlPlane)
-    );
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(400),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_route_response_first",
+                ),
+            )
+            .await
+            .expect("first write");
+        assert_eq!(
+            first.route.as_ref().map(|route| route.route),
+            Some(MemorySemanticWriteRoute::DurableControlPlane)
+        );
 
-    let duplicate = service
-        .write_semantic_memory(
-            user_context(401),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_route_response_duplicate",
-            ),
-        )
-        .await
-        .expect("duplicate write");
-    assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
-    assert!(duplicate.evidence_merged);
-    let duplicate_route = duplicate.route.expect("duplicate route");
-    assert_eq!(duplicate_route.route, MemorySemanticWriteRoute::Rejected);
-    assert_eq!(
-        duplicate_route.quality_action,
-        MemoryQualityAction::ForceReject
-    );
-    assert!(duplicate_route.quality_decision_id.is_some());
+        let duplicate = service
+            .write_semantic_memory(
+                user_context(401),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_route_response_duplicate",
+                ),
+            )
+            .await
+            .expect("duplicate write");
+        assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
+        assert!(duplicate.evidence_merged);
+        let duplicate_route = duplicate.route.expect("duplicate route");
+        assert_eq!(duplicate_route.route, MemorySemanticWriteRoute::Rejected);
+        assert_eq!(
+            duplicate_route.quality_action,
+            MemoryQualityAction::ForceReject
+        );
+        assert!(duplicate_route.quality_decision_id.is_some());
 
-    let pending = service
-        .write_semantic_memory(
-            user_context(402),
-            semantic_write_params(
-                user_preference_semantic(MemoryExplicitness::Unclear),
-                "Maybe the user prefers concise reviews.",
-                "concise reviews",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_route_response_pending",
-            ),
-        )
-        .await
-        .expect("pending write");
-    assert!(pending.candidate.is_some());
-    assert_eq!(
-        pending.route.as_ref().map(|route| route.route),
-        Some(MemorySemanticWriteRoute::DurableControlPlane)
-    );
+        let pending = service
+            .write_semantic_memory(
+                user_context(402),
+                semantic_write_params(
+                    user_preference_semantic(MemoryExplicitness::Unclear),
+                    "Maybe the user prefers concise reviews.",
+                    "concise reviews",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_route_response_pending",
+                ),
+            )
+            .await
+            .expect("pending write");
+        assert!(pending.candidate.is_some());
+        assert_eq!(
+            pending.route.as_ref().map(|route| route.route),
+            Some(MemorySemanticWriteRoute::DurableControlPlane)
+        );
 
-    let pending_duplicate = service
-        .write_semantic_memory(
-            user_context(403),
-            semantic_write_params(
-                user_preference_semantic(MemoryExplicitness::Unclear),
-                "Maybe the user prefers concise reviews.",
-                "concise reviews",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_route_response_pending_duplicate",
-            ),
-        )
-        .await
-        .expect("pending duplicate write");
-    assert_eq!(pending_duplicate.relation, MemoryWriteRelation::Duplicate);
-    let pending_duplicate_route = pending_duplicate.route.expect("pending duplicate route");
-    assert_eq!(
-        pending_duplicate_route.route,
-        MemorySemanticWriteRoute::Rejected
-    );
-    assert_eq!(
-        pending_duplicate_route.quality_action,
-        MemoryQualityAction::ForceReject
-    );
+        let pending_duplicate = service
+            .write_semantic_memory(
+                user_context(403),
+                semantic_write_params(
+                    user_preference_semantic(MemoryExplicitness::Unclear),
+                    "Maybe the user prefers concise reviews.",
+                    "concise reviews",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_route_response_pending_duplicate",
+                ),
+            )
+            .await
+            .expect("pending duplicate write");
+        assert_eq!(pending_duplicate.relation, MemoryWriteRelation::Duplicate);
+        let pending_duplicate_route = pending_duplicate.route.expect("pending duplicate route");
+        assert_eq!(
+            pending_duplicate_route.route,
+            MemorySemanticWriteRoute::Rejected
+        );
+        assert_eq!(
+            pending_duplicate_route.quality_action,
+            MemoryQualityAction::ForceReject
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_durable_workspace_fact_uses_control_plane_route() {
-    let (_store, _backend, service) = setup_service().await;
+    with_database(async |database| {
+    let (_store, _backend, service) = setup_service(database).await;
     let mut params = semantic_write_params(
         workspace_project_decision_semantic(MemoryExplicitness::Explicit),
         "Workspace migration policy is to keep database changes in the existing migration file.",
@@ -1881,1354 +1985,1475 @@ async fn semantic_route_durable_workspace_fact_uses_control_plane_route() {
             .is_some_and(|score| score > 0.0),
         true
     );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_durable_agent_fact_uses_control_plane_route() {
-    let (_store, _backend, service) = setup_service().await;
-    let agent_id = "agent_research";
-    let workspace_id = "ws_route_agent";
-    let agent_scope_key = workspace_agent_memory_scope_key(workspace_id, agent_id);
-    let mut params = semantic_write_params(
-        agent_self_description_semantic(MemoryExplicitness::Explicit),
-        "This agent is named Pioneer.",
-        "Pioneer",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_semantic_route_agent_durable",
-    );
-    params.scope = scope(MemoryScopeKind::Agent, agent_scope_key.as_str());
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let agent_id = "agent_research";
+        let workspace_id = "ws_route_agent";
+        let agent_scope_key = workspace_agent_memory_scope_key(workspace_id, agent_id);
+        let mut params = semantic_write_params(
+            agent_self_description_semantic(MemoryExplicitness::Explicit),
+            "This agent is named Pioneer.",
+            "Pioneer",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_semantic_route_agent_durable",
+        );
+        params.scope = scope(MemoryScopeKind::Agent, agent_scope_key.as_str());
 
-    let response = service
-        .write_semantic_memory(agent_workspace_context(workspace_id, agent_id, 382), params)
-        .await
-        .expect("agent durable write");
+        let response = service
+            .write_semantic_memory(agent_workspace_context(workspace_id, agent_id, 382), params)
+            .await
+            .expect("agent durable write");
 
-    assert_eq!(response.relation, MemoryWriteRelation::Novel);
-    assert!(response.candidate.is_none());
-    let record = response.record.expect("agent durable record");
-    assert_eq!(record.scope.kind, MemoryScopeKind::Agent);
-    assert_eq!(record.scope.key, agent_scope_key);
-    assert_eq!(
-        record
-            .metadata
-            .get("candidate_policy_decision")
-            .and_then(serde_json::Value::as_str),
-        Some("auto_approve")
-    );
-    assert_eq!(
-        record
-            .metadata
-            .get("candidate_policy")
-            .and_then(|policy| policy.pointer("/input/ownership_class"))
-            .and_then(serde_json::Value::as_str),
-        Some("durable_agent_memory")
-    );
+        assert_eq!(response.relation, MemoryWriteRelation::Novel);
+        assert!(response.candidate.is_none());
+        let record = response.record.expect("agent durable record");
+        assert_eq!(record.scope.kind, MemoryScopeKind::Agent);
+        assert_eq!(record.scope.key, agent_scope_key);
+        assert_eq!(
+            record
+                .metadata
+                .get("candidate_policy_decision")
+                .and_then(serde_json::Value::as_str),
+            Some("auto_approve")
+        );
+        assert_eq!(
+            record
+                .metadata
+                .get("candidate_policy")
+                .and_then(|policy| policy.pointer("/input/ownership_class"))
+                .and_then(serde_json::Value::as_str),
+            Some("durable_agent_memory")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_non_durable_fact_cannot_use_durable_control_plane() {
-    let (store, _backend, service) = setup_service().await;
-    let mut semantic = thread_local_todo_semantic();
-    semantic.explicitness = MemoryExplicitness::Explicit;
-    semantic.intent = MemoryIntent::ExplicitStore;
-    semantic.certainty = MemoryExtractorCertainty::High;
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut semantic = thread_local_todo_semantic();
+        semantic.explicitness = MemoryExplicitness::Explicit;
+        semantic.intent = MemoryIntent::ExplicitStore;
+        semantic.certainty = MemoryExtractorCertainty::High;
 
-    let response = service
-        .write_semantic_memory(
-            user_context(383),
-            semantic_write_params(
-                semantic,
-                "For this thread, follow up on the current debugging branch.",
-                "follow up on current debugging branch",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_route_thread_not_durable",
-            ),
-        )
-        .await
-        .expect("thread route write");
+        let response = service
+            .write_semantic_memory(
+                user_context(383),
+                semantic_write_params(
+                    semantic,
+                    "For this thread, follow up on the current debugging branch.",
+                    "follow up on current debugging branch",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_route_thread_not_durable",
+                ),
+            )
+            .await
+            .expect("thread route write");
 
-    assert_eq!(response.relation, MemoryWriteRelation::Novel);
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
+        assert_eq!(response.relation, MemoryWriteRelation::Novel);
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    let decision = decisions
-        .iter()
-        .find(|decision| {
-            decision.turn_id.as_deref() == Some("turn_semantic_route_thread_not_durable")
-        })
-        .expect("thread route quality decision");
-    assert_eq!(decision.action, MemoryQualityAction::RouteToThreadEpisodic);
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        let decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.turn_id.as_deref() == Some("turn_semantic_route_thread_not_durable")
+            })
+            .expect("thread route quality decision");
+        assert_eq!(decision.action, MemoryQualityAction::RouteToThreadEpisodic);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_write_extractor_ontology_proposal_is_advisory_only() {
-    let (store, _backend, service) = setup_service().await;
-    let turn_id = "turn_extractor_proposal_advisory";
-    let mut params = semantic_write_params(
-        tool_result_semantic(),
-        "Tool observed a transient project state.",
-        "transient project state",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        turn_id,
-    );
-    params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
-    params.metadata.insert(
-        "extractor_ontology_proposal".to_owned(),
-        serde_json::json!({
-            "fact_class": "user_identity",
-            "lifetime_class": "long_lived",
-            "evidence_class": "direct_user_assertion",
-            "proposed_ownership_class": "durable_user_memory"
-        }),
-    );
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let turn_id = "turn_extractor_proposal_advisory";
+        let mut params = semantic_write_params(
+            tool_result_semantic(),
+            "Tool observed a transient project state.",
+            "transient project state",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            turn_id,
+        );
+        params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+        params.metadata.insert(
+            "extractor_ontology_proposal".to_owned(),
+            serde_json::json!({
+                "fact_class": "user_identity",
+                "lifetime_class": "long_lived",
+                "evidence_class": "direct_user_assertion",
+                "proposed_ownership_class": "durable_user_memory"
+            }),
+        );
 
-    let response = service
-        .write_semantic_memory(workspace_context("ws_extractor_proposal", 384), params)
-        .await
-        .expect("semantic write succeeds");
+        let response = service
+            .write_semantic_memory(workspace_context("ws_extractor_proposal", 384), params)
+            .await
+            .expect("semantic write succeeds");
 
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    let route = response.route.expect("quality route");
-    assert_eq!(route.route, MemorySemanticWriteRoute::DomainStateDeferred);
-    assert_eq!(
-        route.target_ownership,
-        MemoryOwnershipClass::DomainRuntimeState
-    );
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        let route = response.route.expect("quality route");
+        assert_eq!(route.route, MemorySemanticWriteRoute::DomainStateDeferred);
+        assert_eq!(
+            route.target_ownership,
+            MemoryOwnershipClass::DomainRuntimeState
+        );
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    let decision = decisions
-        .iter()
-        .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
-        .expect("quality decision for advisory proposal");
-    assert_eq!(decision.fact_class, MemoryFactClass::ToolResultFact);
-    assert_eq!(
-        decision.lifetime_class,
-        MemoryLifetimeClass::NaturallyExpiring
-    );
-    assert_eq!(
-        decision.ownership_class,
-        MemoryOwnershipClass::DomainRuntimeState
-    );
-    let snapshot: serde_json::Value = serde_json::from_str(
-        decision
-            .input_snapshot_json
-            .as_deref()
-            .expect("quality input snapshot"),
-    )
-    .expect("quality input snapshot json");
-    assert_eq!(
-        snapshot.pointer("/extractor_ontology_proposal/fact_class"),
-        Some(&serde_json::json!("user_identity"))
-    );
-    assert_eq!(
-        snapshot.pointer("/extractor_ontology_proposal_comparison/all_match"),
-        Some(&serde_json::json!(false))
-    );
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
+            .expect("quality decision for advisory proposal");
+        assert_eq!(decision.fact_class, MemoryFactClass::ToolResultFact);
+        assert_eq!(
+            decision.lifetime_class,
+            MemoryLifetimeClass::NaturallyExpiring
+        );
+        assert_eq!(
+            decision.ownership_class,
+            MemoryOwnershipClass::DomainRuntimeState
+        );
+        let snapshot: serde_json::Value = serde_json::from_str(
+            decision
+                .input_snapshot_json
+                .as_deref()
+                .expect("quality input snapshot"),
+        )
+        .expect("quality input snapshot json");
+        assert_eq!(
+            snapshot.pointer("/extractor_ontology_proposal/fact_class"),
+            Some(&serde_json::json!("user_identity"))
+        );
+        assert_eq!(
+            snapshot.pointer("/extractor_ontology_proposal_comparison/all_match"),
+            Some(&serde_json::json!(false))
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_thread_episodic_route_response_carries_deferred_refs() {
-    let (store, _backend, service) = setup_service().await;
-    let turn_id = "turn_thread_episodic_route_info";
-    let response = service
-        .write_semantic_memory(
-            user_context(384),
-            semantic_write_params(
-                thread_local_todo_semantic(),
-                "This thread should remember to revisit the active debugging branch.",
-                "revisit active debugging branch",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                turn_id,
-            ),
-        )
-        .await
-        .expect("thread episodic route write");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let turn_id = "turn_thread_episodic_route_info";
+        let response = service
+            .write_semantic_memory(
+                user_context(384),
+                semantic_write_params(
+                    thread_local_todo_semantic(),
+                    "This thread should remember to revisit the active debugging branch.",
+                    "revisit active debugging branch",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    turn_id,
+                ),
+            )
+            .await
+            .expect("thread episodic route write");
 
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    assert!(!response.created);
-    let route = response.route.expect("thread route info");
-    assert_eq!(
-        route.route,
-        MemorySemanticWriteRoute::ThreadEpisodicDeferred
-    );
-    assert_eq!(
-        route.quality_action,
-        MemoryQualityAction::RouteToThreadEpisodic
-    );
-    assert_eq!(
-        route.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::ThreadEpisodicContext
-    );
-    assert!(route.quality_decision_id.is_some());
-    assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
-    assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
-    assert_eq!(
-        route.source_item_id.as_deref(),
-        Some("item_turn_thread_episodic_route_info")
-    );
-    assert_eq!(
-        route.canonical_key.as_deref(),
-        Some("user/default:todo:self:custom_4de127d381235b26")
-    );
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        assert!(!response.created);
+        let route = response.route.expect("thread route info");
+        assert_eq!(
+            route.route,
+            MemorySemanticWriteRoute::ThreadEpisodicDeferred
+        );
+        assert_eq!(
+            route.quality_action,
+            MemoryQualityAction::RouteToThreadEpisodic
+        );
+        assert_eq!(
+            route.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::ThreadEpisodicContext
+        );
+        assert!(route.quality_decision_id.is_some());
+        assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
+        assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
+        assert_eq!(
+            route.source_item_id.as_deref(),
+            Some("item_turn_thread_episodic_route_info")
+        );
+        assert_eq!(
+            route.canonical_key.as_deref(),
+            Some("user/default:todo:self:custom_4de127d381235b26")
+        );
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some(turn_id)
-            && decision.action == MemoryQualityAction::RouteToThreadEpisodic
-    }));
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some(turn_id)
+                && decision.action == MemoryQualityAction::RouteToThreadEpisodic
+        }));
 
-    let search = service
-        .search(
-            user_context(385),
-            MemorySearchParams {
-                query: "revisit active debugging branch".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("deferred fact is not searchable");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(385),
+                MemorySearchParams {
+                    query: "revisit active debugging branch".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deferred fact is not searchable");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_generated_summary_routes_to_thread_episodic_deferral() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut params = semantic_write_params(
-        generated_summary_semantic(),
-        "Summary: the current thread is debugging OpenRouter tool calls.",
-        "debugging OpenRouter tool calls",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_generated_summary_thread_route",
-    );
-    params.source_context_kind = Some(MemorySourceContextKind::GeneratedSummary);
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut params = semantic_write_params(
+            generated_summary_semantic(),
+            "Summary: the current thread is debugging OpenRouter tool calls.",
+            "debugging OpenRouter tool calls",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_generated_summary_thread_route",
+        );
+        params.source_context_kind = Some(MemorySourceContextKind::GeneratedSummary);
 
-    let response = service
-        .write_semantic_memory(user_context(385), params)
-        .await
-        .expect("generated summary route");
+        let response = service
+            .write_semantic_memory(user_context(385), params)
+            .await
+            .expect("generated summary route");
 
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    let route = response.route.expect("generated summary route info");
-    assert_eq!(
-        route.route,
-        MemorySemanticWriteRoute::ThreadEpisodicDeferred
-    );
-    assert_eq!(
-        route.quality_action,
-        MemoryQualityAction::RouteToThreadEpisodic
-    );
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        let route = response.route.expect("generated summary route info");
+        assert_eq!(
+            route.route,
+            MemorySemanticWriteRoute::ThreadEpisodicDeferred
+        );
+        assert_eq!(
+            route.quality_action,
+            MemoryQualityAction::RouteToThreadEpisodic
+        );
 
-    for query in [
-        "debugging OpenRouter tool calls",
-        "current thread is debugging OpenRouter",
-    ] {
+        for query in [
+            "debugging OpenRouter tool calls",
+            "current thread is debugging OpenRouter",
+        ] {
+            let search = service
+                .search(
+                    user_context(386),
+                    MemorySearchParams {
+                        query: query.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("search");
+            assert!(search.hits.is_empty(), "{query}");
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn semantic_task_state_route_response_is_deferred_and_not_memory() {
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let turn_id = "turn_task_state_route";
+        let mut params = semantic_write_params(
+            task_lifecycle_semantic(),
+            "Task runtime state: child task is waiting for provider output.",
+            "child task waiting for provider output",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            turn_id,
+        );
+        params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
+
+        let response = service
+            .write_semantic_memory(workspace_context("ws_route_task", 388), params)
+            .await
+            .expect("task state route");
+
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        let route = response.route.expect("task route info");
+        assert_eq!(route.route, MemorySemanticWriteRoute::TaskStateDeferred);
+        assert_eq!(route.quality_action, MemoryQualityAction::RouteToTaskState);
+        assert_eq!(
+            route.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
+        );
+        assert!(route.quality_decision_id.is_some());
+        assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
+        assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
+
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        let decision = decisions
+            .iter()
+            .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
+            .expect("task state decision");
+        assert_eq!(decision.action, MemoryQualityAction::RouteToTaskState);
+        assert_eq!(
+            decision.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
+        );
+
         let search = service
             .search(
-                user_context(386),
+                workspace_context("ws_route_task", 389),
                 MemorySearchParams {
-                    query: query.to_owned(),
+                    query: "child task waiting for provider output".to_owned(),
                     ..Default::default()
                 },
             )
             .await
             .expect("search");
-        assert!(search.hits.is_empty(), "{query}");
-    }
-}
-
-#[tokio::test]
-async fn semantic_task_state_route_response_is_deferred_and_not_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let turn_id = "turn_task_state_route";
-    let mut params = semantic_write_params(
-        task_lifecycle_semantic(),
-        "Task runtime state: child task is waiting for provider output.",
-        "child task waiting for provider output",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        turn_id,
-    );
-    params.source_context_kind = Some(MemorySourceContextKind::TaskRuntime);
-
-    let response = service
-        .write_semantic_memory(workspace_context("ws_route_task", 388), params)
-        .await
-        .expect("task state route");
-
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    let route = response.route.expect("task route info");
-    assert_eq!(route.route, MemorySemanticWriteRoute::TaskStateDeferred);
-    assert_eq!(route.quality_action, MemoryQualityAction::RouteToTaskState);
-    assert_eq!(
-        route.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
-    );
-    assert!(route.quality_decision_id.is_some());
-    assert_eq!(route.thread_id.as_deref(), Some("thread_semantic"));
-    assert_eq!(route.source_turn_id.as_deref(), Some(turn_id));
-
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    let decision = decisions
-        .iter()
-        .find(|decision| decision.turn_id.as_deref() == Some(turn_id))
-        .expect("task state decision");
-    assert_eq!(decision.action, MemoryQualityAction::RouteToTaskState);
-    assert_eq!(
-        decision.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::TaskRuntimeState
-    );
-
-    let search = service
-        .search(
-            workspace_context("ws_route_task", 389),
-            MemorySearchParams {
-                query: "child task waiting for provider output".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_domain_state_routes_are_deferred_and_not_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let mut tool_params = semantic_write_params(
-        tool_result_semantic(),
-        "Tool observation: the OpenRouter request took 118 seconds.",
-        "OpenRouter request took 118 seconds",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_domain_tool_route",
-    );
-    tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
-    tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut tool_params = semantic_write_params(
+            tool_result_semantic(),
+            "Tool observation: the OpenRouter request took 118 seconds.",
+            "OpenRouter request took 118 seconds",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_domain_tool_route",
+        );
+        tool_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
+        tool_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
 
-    let tool_response = service
-        .write_semantic_memory(workspace_context("ws_route_domain", 390), tool_params)
-        .await
-        .expect("tool domain route");
-    assert!(tool_response.record.is_none());
-    assert!(tool_response.candidate.is_none());
-    let tool_route = tool_response.route.expect("tool route info");
-    assert_eq!(
-        tool_route.route,
-        MemorySemanticWriteRoute::DomainStateDeferred
-    );
-    assert_eq!(
-        tool_route.quality_action,
-        MemoryQualityAction::RouteToDomainState
-    );
-    assert_eq!(
-        tool_route.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::DomainRuntimeState
-    );
+        let tool_response = service
+            .write_semantic_memory(workspace_context("ws_route_domain", 390), tool_params)
+            .await
+            .expect("tool domain route");
+        assert!(tool_response.record.is_none());
+        assert!(tool_response.candidate.is_none());
+        let tool_route = tool_response.route.expect("tool route info");
+        assert_eq!(
+            tool_route.route,
+            MemorySemanticWriteRoute::DomainStateDeferred
+        );
+        assert_eq!(
+            tool_route.quality_action,
+            MemoryQualityAction::RouteToDomainState
+        );
+        assert_eq!(
+            tool_route.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::DomainRuntimeState
+        );
 
-    let mut operational_semantic = operational_observation_semantic();
-    operational_semantic.explicitness = MemoryExplicitness::Explicit;
-    operational_semantic.intent = MemoryIntent::ExplicitStore;
-    let mut operational_params = semantic_write_params(
-        operational_semantic,
-        "Operational observation: provider latency is temporarily elevated.",
-        "provider latency temporarily elevated",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_domain_operational_route",
-    );
-    operational_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
-    operational_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
+        let mut operational_semantic = operational_observation_semantic();
+        operational_semantic.explicitness = MemoryExplicitness::Explicit;
+        operational_semantic.intent = MemoryIntent::ExplicitStore;
+        let mut operational_params = semantic_write_params(
+            operational_semantic,
+            "Operational observation: provider latency is temporarily elevated.",
+            "provider latency temporarily elevated",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_domain_operational_route",
+        );
+        operational_params.scope = scope(MemoryScopeKind::Workspace, "ws_route_domain");
+        operational_params.source_context_kind = Some(MemorySourceContextKind::ToolResult);
 
-    let operational_response = service
-        .write_semantic_memory(
-            workspace_context("ws_route_domain", 391),
-            operational_params,
-        )
-        .await
-        .expect("operational domain route");
-    assert!(operational_response.record.is_none());
-    assert!(operational_response.candidate.is_none());
-    let operational_route = operational_response.route.expect("operational route info");
-    assert_eq!(
-        operational_route.route,
-        MemorySemanticWriteRoute::DomainStateDeferred
-    );
-    assert_eq!(
-        operational_route.quality_action,
-        MemoryQualityAction::RouteToDomainState
-    );
-
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 30)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_domain_tool_route")
-            && decision.action == MemoryQualityAction::RouteToDomainState
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_domain_operational_route")
-            && decision.action == MemoryQualityAction::RouteToDomainState
-    }));
-
-    for query in [
-        "OpenRouter request took 118 seconds",
-        "provider latency temporarily elevated",
-    ] {
-        let search = service
-            .search(
-                workspace_context("ws_route_domain", 392),
-                MemorySearchParams {
-                    query: query.to_owned(),
-                    ..Default::default()
-                },
+        let operational_response = service
+            .write_semantic_memory(
+                workspace_context("ws_route_domain", 391),
+                operational_params,
             )
             .await
-            .expect("domain runtime state is not searchable");
-        assert!(search.hits.is_empty(), "{query}");
-    }
+            .expect("operational domain route");
+        assert!(operational_response.record.is_none());
+        assert!(operational_response.candidate.is_none());
+        let operational_route = operational_response.route.expect("operational route info");
+        assert_eq!(
+            operational_route.route,
+            MemorySemanticWriteRoute::DomainStateDeferred
+        );
+        assert_eq!(
+            operational_route.quality_action,
+            MemoryQualityAction::RouteToDomainState
+        );
+
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 30)
+            .await
+            .expect("quality decisions");
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some("turn_domain_tool_route")
+                && decision.action == MemoryQualityAction::RouteToDomainState
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some("turn_domain_operational_route")
+                && decision.action == MemoryQualityAction::RouteToDomainState
+        }));
+
+        for query in [
+            "OpenRouter request took 118 seconds",
+            "provider latency temporarily elevated",
+        ] {
+            let search = service
+                .search(
+                    workspace_context("ws_route_domain", 392),
+                    MemorySearchParams {
+                        query: query.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("domain runtime state is not searchable");
+            assert!(search.hits.is_empty(), "{query}");
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_implicit_durable_fact_auto_approves_when_enabled() {
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.allow_implicit_auto_approve = true;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.allow_implicit_auto_approve = true;
+        let (_store, _backend, service) = setup_service_with_config(database, config).await;
 
-    let response = service
-        .write_semantic_memory(
-            user_context(367),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_implicit_auto_approve",
-            ),
-        )
-        .await
-        .expect("policy write");
+        let response = service
+            .write_semantic_memory(
+                user_context(367),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_implicit_auto_approve",
+                ),
+            )
+            .await
+            .expect("policy write");
 
-    assert_eq!(response.relation, MemoryWriteRelation::Novel);
-    assert!(response.candidate.is_none());
-    assert!(response.record.is_some());
+        assert_eq!(response.relation, MemoryWriteRelation::Novel);
+        assert!(response.candidate.is_none());
+        assert!(response.record.is_some());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_extremely_low_and_secret_facts_auto_reject() {
-    let (store, _backend, service) = setup_service().await;
-    let mut transient_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
-    transient_semantic.durability = MemoryDurability::Transient;
-    let transient = service
-        .write_semantic_memory(
-            user_context(368),
-            semantic_write_params(
-                transient_semantic,
-                "Right now the user might be called Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_transient",
-            ),
-        )
-        .await
-        .expect("transient policy write");
-    assert!(transient.record.is_none());
-    assert!(transient.candidate.is_none());
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut transient_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+        transient_semantic.durability = MemoryDurability::Transient;
+        let transient = service
+            .write_semantic_memory(
+                user_context(368),
+                semantic_write_params(
+                    transient_semantic,
+                    "Right now the user might be called Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_transient",
+                ),
+            )
+            .await
+            .expect("transient policy write");
+        assert!(transient.record.is_none());
+        assert!(transient.candidate.is_none());
 
-    let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
-    secret_semantic.sensitivity = MemorySensitivityHint::Secret;
-    let secret = service
-        .write_semantic_memory(
-            user_context(369),
-            semantic_write_params(
-                secret_semantic,
-                "User token is abc123.",
-                "abc123",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_secret",
-            ),
-        )
-        .await
-        .expect("secret policy write");
-    assert!(secret.record.is_none());
-    assert!(secret.candidate.is_none());
+        let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+        secret_semantic.sensitivity = MemorySensitivityHint::Secret;
+        let secret = service
+            .write_semantic_memory(
+                user_context(369),
+                semantic_write_params(
+                    secret_semantic,
+                    "User token is abc123.",
+                    "abc123",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_secret",
+                ),
+            )
+            .await
+            .expect("secret policy write");
+        assert!(secret.record.is_none());
+        assert!(secret.candidate.is_none());
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    let transient_decision = decisions
-        .iter()
-        .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_transient"))
-        .expect("transient quality decision");
-    assert_eq!(transient_decision.action, MemoryQualityAction::ForceReject);
-    assert!(
-        transient_decision
-            .reason_codes
-            .contains(&MemoryQualityReasonCode::NonDurableLifetime)
-    );
-    let secret_decision = decisions
-        .iter()
-        .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_secret"))
-        .expect("secret quality decision");
-    assert_eq!(secret_decision.action, MemoryQualityAction::ForceReject);
-    assert!(
-        secret_decision
-            .reason_codes
-            .contains(&MemoryQualityReasonCode::SecretOrCredential)
-    );
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        let transient_decision = decisions
+            .iter()
+            .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_transient"))
+            .expect("transient quality decision");
+        assert_eq!(transient_decision.action, MemoryQualityAction::ForceReject);
+        assert!(
+            transient_decision
+                .reason_codes
+                .contains(&MemoryQualityReasonCode::NonDurableLifetime)
+        );
+        let secret_decision = decisions
+            .iter()
+            .find(|decision| decision.turn_id.as_deref() == Some("turn_semantic_policy_secret"))
+            .expect("secret quality decision");
+        assert_eq!(secret_decision.action, MemoryQualityAction::ForceReject);
+        assert!(
+            secret_decision
+                .reason_codes
+                .contains(&MemoryQualityReasonCode::SecretOrCredential)
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_force_reject_response_is_rejected_terminal_route() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
-    secret_semantic.sensitivity = MemorySensitivityHint::Secret;
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut secret_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+        secret_semantic.sensitivity = MemorySensitivityHint::Secret;
 
-    let response = service
-        .write_semantic_memory(
-            user_context(393),
-            semantic_write_params(
-                secret_semantic,
-                "User API token is abc123.",
-                "abc123",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_force_reject_route",
-            ),
-        )
-        .await
-        .expect("secret force reject");
+        let response = service
+            .write_semantic_memory(
+                user_context(393),
+                semantic_write_params(
+                    secret_semantic,
+                    "User API token is abc123.",
+                    "abc123",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_force_reject_route",
+                ),
+            )
+            .await
+            .expect("secret force reject");
 
-    assert!(!response.created);
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    let route = response.route.expect("reject route info");
-    assert_eq!(route.route, MemorySemanticWriteRoute::Rejected);
-    assert_eq!(route.quality_action, MemoryQualityAction::ForceReject);
-    assert_eq!(
-        route.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::Reject
-    );
-    assert!(route.quality_decision_id.is_some());
+        assert!(!response.created);
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        let route = response.route.expect("reject route info");
+        assert_eq!(route.route, MemorySemanticWriteRoute::Rejected);
+        assert_eq!(route.quality_action, MemoryQualityAction::ForceReject);
+        assert_eq!(
+            route.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::Reject
+        );
+        assert!(route.quality_decision_id.is_some());
 
-    let search = service
-        .search(
-            user_context(394),
-            MemorySearchParams {
-                query: "abc123".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(394),
+                MemorySearchParams {
+                    query: "abc123".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_quarantine_response_is_audit_only_terminal_route() {
-    let (store, _backend, service) = setup_service().await;
-    let response = service
-        .write_semantic_memory(
-            user_context(395),
-            semantic_write_params(
-                unknown_custom_semantic(),
-                "Unknown custom fact should stay audit-only.",
-                "unknown custom fact",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_quarantine_audit_only_route",
-            ),
-        )
-        .await
-        .expect("quarantine route");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let response = service
+            .write_semantic_memory(
+                user_context(395),
+                semantic_write_params(
+                    unknown_custom_semantic(),
+                    "Unknown custom fact should stay audit-only.",
+                    "unknown custom fact",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_quarantine_audit_only_route",
+                ),
+            )
+            .await
+            .expect("quarantine route");
 
-    assert!(!response.created);
-    assert!(response.record.is_none());
-    assert!(response.candidate.is_none());
-    let route = response.route.expect("audit-only route info");
-    assert_eq!(route.route, MemorySemanticWriteRoute::AuditOnly);
-    assert_eq!(route.quality_action, MemoryQualityAction::Quarantine);
-    assert_eq!(
-        route.target_ownership,
-        pioneer_protocol::MemoryOwnershipClass::AuditOnly
-    );
-    assert!(route.quality_decision_id.is_some());
+        assert!(!response.created);
+        assert!(response.record.is_none());
+        assert!(response.candidate.is_none());
+        let route = response.route.expect("audit-only route info");
+        assert_eq!(route.route, MemorySemanticWriteRoute::AuditOnly);
+        assert_eq!(route.quality_action, MemoryQualityAction::Quarantine);
+        assert_eq!(
+            route.target_ownership,
+            pioneer_protocol::MemoryOwnershipClass::AuditOnly
+        );
+        assert!(route.quality_decision_id.is_some());
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_quarantine_audit_only_route")
-            && decision.action == MemoryQualityAction::Quarantine
-            && decision
-                .reason_codes
-                .contains(&MemoryQualityReasonCode::UnknownFactClass)
-    }));
-    let search = service
-        .search(
-            user_context(396),
-            MemorySearchParams {
-                query: "unknown custom fact".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("audit-only fact is not searchable");
-    assert!(search.hits.is_empty());
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some("turn_quarantine_audit_only_route")
+                && decision.action == MemoryQualityAction::Quarantine
+                && decision
+                    .reason_codes
+                    .contains(&MemoryQualityReasonCode::UnknownFactClass)
+        }));
+        let search = service
+            .search(
+                user_context(396),
+                MemorySearchParams {
+                    query: "unknown custom fact".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("audit-only fact is not searchable");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_weak_evidence_and_unknown_lifetime_do_not_create_review_candidates() {
-    let (store, _backend, service) = setup_service().await;
-    let mut weak_params = semantic_write_params(
-        identity_name_semantic(MemoryExplicitness::Explicit),
-        "User name might be Alexander.",
-        "Alexander",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_weak_evidence_terminal",
-    );
-    weak_params.source_context_kind = Some(MemorySourceContextKind::Unknown);
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut weak_params = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Explicit),
+            "User name might be Alexander.",
+            "Alexander",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_weak_evidence_terminal",
+        );
+        weak_params.source_context_kind = Some(MemorySourceContextKind::Unknown);
 
-    let weak = service
-        .write_semantic_memory(user_context(397), weak_params)
-        .await
-        .expect("weak evidence write");
-    assert!(weak.record.is_none());
-    assert!(weak.candidate.is_none());
-    let weak_route = weak.route.expect("weak evidence route");
-    assert_eq!(weak_route.route, MemorySemanticWriteRoute::Rejected);
-    assert_eq!(weak_route.quality_action, MemoryQualityAction::ForceReject);
+        let weak = service
+            .write_semantic_memory(user_context(397), weak_params)
+            .await
+            .expect("weak evidence write");
+        assert!(weak.record.is_none());
+        assert!(weak.candidate.is_none());
+        let weak_route = weak.route.expect("weak evidence route");
+        assert_eq!(weak_route.route, MemorySemanticWriteRoute::Rejected);
+        assert_eq!(weak_route.quality_action, MemoryQualityAction::ForceReject);
 
-    let mut unknown_lifetime_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
-    unknown_lifetime_semantic.durability = MemoryDurability::Unknown;
-    let unknown_lifetime = service
-        .write_semantic_memory(
-            user_context(398),
-            semantic_write_params(
-                unknown_lifetime_semantic,
-                "User name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_unknown_lifetime_quarantine",
-            ),
-        )
-        .await
-        .expect("unknown lifetime write");
-    assert!(unknown_lifetime.record.is_none());
-    assert!(unknown_lifetime.candidate.is_none());
-    let unknown_lifetime_route = unknown_lifetime.route.expect("unknown lifetime route");
-    assert_eq!(
-        unknown_lifetime_route.route,
-        MemorySemanticWriteRoute::AuditOnly
-    );
-    assert_eq!(
-        unknown_lifetime_route.quality_action,
-        MemoryQualityAction::Quarantine
-    );
+        let mut unknown_lifetime_semantic = identity_name_semantic(MemoryExplicitness::Explicit);
+        unknown_lifetime_semantic.durability = MemoryDurability::Unknown;
+        let unknown_lifetime = service
+            .write_semantic_memory(
+                user_context(398),
+                semantic_write_params(
+                    unknown_lifetime_semantic,
+                    "User name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_unknown_lifetime_quarantine",
+                ),
+            )
+            .await
+            .expect("unknown lifetime write");
+        assert!(unknown_lifetime.record.is_none());
+        assert!(unknown_lifetime.candidate.is_none());
+        let unknown_lifetime_route = unknown_lifetime.route.expect("unknown lifetime route");
+        assert_eq!(
+            unknown_lifetime_route.route,
+            MemorySemanticWriteRoute::AuditOnly
+        );
+        assert_eq!(
+            unknown_lifetime_route.quality_action,
+            MemoryQualityAction::Quarantine
+        );
 
-    let listed = service
-        .list_candidates(
-            user_context(399),
-            pioneer_protocol::MemoryCandidatesListParams::default(),
-        )
-        .await
-        .expect("list candidates");
-    assert!(listed.candidates.is_empty());
+        let listed = service
+            .list_candidates(
+                user_context(399),
+                pioneer_protocol::MemoryCandidatesListParams::default(),
+            )
+            .await
+            .expect("list candidates");
+        assert!(listed.candidates.is_empty());
 
-    let decisions = store
-        .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
-        .await
-        .expect("quality decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_weak_evidence_terminal")
-            && decision.action == MemoryQualityAction::ForceReject
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.turn_id.as_deref() == Some("turn_unknown_lifetime_quarantine")
-            && decision.action == MemoryQualityAction::Quarantine
-    }));
+        let decisions = store
+            .list_agent_memory_quality_decisions_for_thread("thread_semantic", 20)
+            .await
+            .expect("quality decisions");
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some("turn_weak_evidence_terminal")
+                && decision.action == MemoryQualityAction::ForceReject
+        }));
+        assert!(decisions.iter().any(|decision| {
+            decision.turn_id.as_deref() == Some("turn_unknown_lifetime_quarantine")
+                && decision.action == MemoryQualityAction::Quarantine
+        }));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_middle_fact_rejects_by_default_and_routes_when_review_enabled() {
-    let (_store, _backend, service) = setup_service().await;
     let mut middle_semantic = user_preference_semantic(MemoryExplicitness::Unclear);
     middle_semantic.intent = MemoryIntent::ImplicitCandidate;
     middle_semantic.certainty = MemoryExtractorCertainty::Medium;
 
-    let default_response = service
-        .write_semantic_memory(
-            user_context(372),
-            semantic_write_params(
-                middle_semantic.clone(),
-                "Maybe the user prefers terse answers.",
-                "terse answers",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_middle",
-            ),
-        )
-        .await
-        .expect("middle policy write");
-    let default_candidate = default_response.candidate.expect("middle candidate");
-    assert_eq!(
-        default_candidate.status,
-        MemoryCandidateStatus::ReviewDisabledRejected
-    );
-    assert_eq!(
-        default_candidate
-            .metadata
-            .get("candidate_policy_reason_code")
-            .and_then(serde_json::Value::as_str),
-        Some("review_disabled_middle_confidence")
-    );
-    assert_eq!(
-        default_candidate
-            .metadata
-            .get("candidate_score")
-            .and_then(|score| score.get("score_version"))
-            .and_then(serde_json::Value::as_str),
-        Some("quality_v1")
-    );
-    assert!(
-        default_candidate
-            .metadata
-            .get("candidate_score")
-            .and_then(|score| score.get("penalty_score"))
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_default()
-            > 0.0
-    );
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let default_response = service
+            .write_semantic_memory(
+                user_context(372),
+                semantic_write_params(
+                    middle_semantic.clone(),
+                    "Maybe the user prefers terse answers.",
+                    "terse answers",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_middle",
+                ),
+            )
+            .await
+            .expect("middle policy write");
+        let default_candidate = default_response.candidate.expect("middle candidate");
+        assert_eq!(
+            default_candidate.status,
+            MemoryCandidateStatus::ReviewDisabledRejected
+        );
+        assert_eq!(
+            default_candidate
+                .metadata
+                .get("candidate_policy_reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("review_disabled_middle_confidence")
+        );
+        assert_eq!(
+            default_candidate
+                .metadata
+                .get("candidate_score")
+                .and_then(|score| score.get("score_version"))
+                .and_then(serde_json::Value::as_str),
+            Some("quality_v1")
+        );
+        assert!(
+            default_candidate
+                .metadata
+                .get("candidate_score")
+                .and_then(|score| score.get("penalty_score"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                > 0.0
+        );
 
-    let listed = service
-        .list_candidates(
-            user_context(373),
-            pioneer_protocol::MemoryCandidatesListParams::default(),
-        )
-        .await
-        .expect("default list candidates");
-    assert!(listed.candidates.iter().all(|candidate| !matches!(
-        candidate.status,
-        MemoryCandidateStatus::PendingSilent
-            | MemoryCandidateStatus::AskOnUse
-            | MemoryCandidateStatus::NeedsReview
-    )));
+        let listed = service
+            .list_candidates(
+                user_context(373),
+                pioneer_protocol::MemoryCandidatesListParams::default(),
+            )
+            .await
+            .expect("default list candidates");
+        assert!(listed.candidates.iter().all(|candidate| !matches!(
+            candidate.status,
+            MemoryCandidateStatus::PendingSilent
+                | MemoryCandidateStatus::AskOnUse
+                | MemoryCandidateStatus::NeedsReview
+        )));
 
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let (_store, _backend, review_service) = setup_service_with_config(config).await;
-    let review_response = review_service
-        .write_semantic_memory(
-            user_context(374),
-            semantic_write_params(
-                middle_semantic,
-                "Maybe the user prefers terse answers.",
-                "terse answers",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_middle_review",
-            ),
-        )
-        .await
-        .expect("review policy write");
-    let review_candidate = review_response.candidate.expect("review candidate");
-    assert_eq!(
-        review_candidate.status,
-        MemoryCandidateStatus::PendingSilent
-    );
-    assert_eq!(
-        review_candidate
-            .metadata
-            .get("candidate_score")
-            .and_then(|score| score.get("score_version"))
-            .and_then(serde_json::Value::as_str),
-        Some("quality_v1")
-    );
-    assert_eq!(
-        review_candidate
-            .metadata
-            .get("candidate_policy_decision")
-            .and_then(serde_json::Value::as_str),
-        Some("pending_silent")
-    );
+        Ok(())
+    })
+    .await
+    .unwrap();
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let (_store, _backend, review_service) = setup_service_with_config(database, config).await;
+        let review_response = review_service
+            .write_semantic_memory(
+                user_context(374),
+                semantic_write_params(
+                    middle_semantic,
+                    "Maybe the user prefers terse answers.",
+                    "terse answers",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_middle_review",
+                ),
+            )
+            .await
+            .expect("review policy write");
+        let review_candidate = review_response.candidate.expect("review candidate");
+        assert_eq!(
+            review_candidate.status,
+            MemoryCandidateStatus::PendingSilent
+        );
+        assert_eq!(
+            review_candidate
+                .metadata
+                .get("candidate_score")
+                .and_then(|score| score.get("score_version"))
+                .and_then(serde_json::Value::as_str),
+            Some("quality_v1")
+        );
+        assert_eq!(
+            review_candidate
+                .metadata
+                .get("candidate_policy_decision")
+                .and_then(serde_json::Value::as_str),
+            Some("pending_silent")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_route_contradiction_routes_to_dormant_review_only_when_enabled() {
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
-    service
-        .write_semantic_memory(
-            user_context(375),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_policy_contradiction_base",
-            ),
-        )
-        .await
-        .expect("base memory");
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let (_store, _backend, service) = setup_service_with_config(database, config).await;
+        service
+            .write_semantic_memory(
+                user_context(375),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_policy_contradiction_base",
+                ),
+            )
+            .await
+            .expect("base memory");
 
-    let contradiction = service
-        .write_semantic_memory(
-            user_context(376),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name may be Alexey.",
-                "Alexey",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_semantic_policy_contradiction",
-            ),
-        )
-        .await
-        .expect("contradiction");
-    assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
-    let contradiction_candidate = contradiction.candidate.expect("ask-on-use candidate");
-    assert_eq!(
-        contradiction_candidate.status,
-        MemoryCandidateStatus::AskOnUse
-    );
-    assert_eq!(
-        contradiction_candidate
-            .metadata
-            .get("candidate_policy_reason_code")
-            .and_then(serde_json::Value::as_str),
-        Some("review_enabled_contradiction")
-    );
-    assert_eq!(
-        contradiction_candidate
-            .metadata
-            .get("candidate_score")
-            .and_then(|score| score.get("score_version"))
-            .and_then(serde_json::Value::as_str),
-        Some("quality_v1")
-    );
-    assert!(contradiction.record.is_none());
+        let contradiction = service
+            .write_semantic_memory(
+                user_context(376),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "The user's name may be Alexey.",
+                    "Alexey",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_semantic_policy_contradiction",
+                ),
+            )
+            .await
+            .expect("contradiction");
+        assert_eq!(contradiction.relation, MemoryWriteRelation::Contradiction);
+        let contradiction_candidate = contradiction.candidate.expect("ask-on-use candidate");
+        assert_eq!(
+            contradiction_candidate.status,
+            MemoryCandidateStatus::AskOnUse
+        );
+        assert_eq!(
+            contradiction_candidate
+                .metadata
+                .get("candidate_policy_reason_code")
+                .and_then(serde_json::Value::as_str),
+            Some("review_enabled_contradiction")
+        );
+        assert_eq!(
+            contradiction_candidate
+                .metadata
+                .get("candidate_score")
+                .and_then(|score| score.get("score_version"))
+                .and_then(serde_json::Value::as_str),
+            Some("quality_v1")
+        );
+        assert!(contradiction.record.is_none());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_rejected_candidate_suppresses_repeat_suggestion() {
-    let (_store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(370),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "The user's name may be Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RejectSuppressed,
-                "turn_semantic_reject_1",
-            ),
-        )
-        .await
-        .expect("first suppressed candidate");
-    assert_eq!(first.relation, MemoryWriteRelation::Novel);
-    assert_eq!(
-        first.candidate.expect("rejected candidate").status,
-        MemoryCandidateStatus::Rejected
-    );
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(370),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "The user's name may be Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RejectSuppressed,
+                    "turn_semantic_reject_1",
+                ),
+            )
+            .await
+            .expect("first suppressed candidate");
+        assert_eq!(first.relation, MemoryWriteRelation::Novel);
+        assert_eq!(
+            first.candidate.expect("rejected candidate").status,
+            MemoryCandidateStatus::Rejected
+        );
 
-    let second = service
-        .write_semantic_memory(
-            user_context(371),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Implicit),
-                "User is called Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_semantic_reject_2",
-            ),
-        )
-        .await
-        .expect("repeat suppressed candidate");
-    assert_eq!(second.relation, MemoryWriteRelation::SuppressedByRejection);
-    assert!(second.candidate.is_none());
-    assert!(second.record.is_none());
+        let second = service
+            .write_semantic_memory(
+                user_context(371),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Implicit),
+                    "User is called Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_semantic_reject_2",
+                ),
+            )
+            .await
+            .expect("repeat suppressed candidate");
+        assert_eq!(second.relation, MemoryWriteRelation::SuppressedByRejection);
+        assert!(second.candidate.is_none());
+        assert!(second.record.is_none());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn candidate_approval_uses_semantic_canonical_pipeline() {
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
-    let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
-    middle_semantic.intent = MemoryIntent::ImplicitCandidate;
-    middle_semantic.certainty = MemoryExtractorCertainty::Medium;
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let (_store, _backend, service) = setup_service_with_config(database, config).await;
+        let mut middle_semantic = identity_name_semantic(MemoryExplicitness::Unclear);
+        middle_semantic.intent = MemoryIntent::ImplicitCandidate;
+        middle_semantic.certainty = MemoryExtractorCertainty::Medium;
 
-    let candidate = service
-        .write_semantic_memory(
-            user_context(390),
-            semantic_write_params(
-                middle_semantic,
-                "Maybe the user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-                "turn_candidate_approval",
-            ),
-        )
-        .await
-        .expect("candidate write")
-        .candidate
-        .expect("candidate");
-    assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
+        let candidate = service
+            .write_semantic_memory(
+                user_context(390),
+                semantic_write_params(
+                    middle_semantic,
+                    "Maybe the user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+                    "turn_candidate_approval",
+                ),
+            )
+            .await
+            .expect("candidate write")
+            .candidate
+            .expect("candidate");
+        assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
 
-    let approved = service
-        .approve_candidate(
-            user_context(391),
-            MemoryCandidatesApproveParams {
-                candidate_id: candidate.id.clone(),
-                reason: Some("approved in test".to_owned()),
-                actor: None,
-            },
-        )
-        .await
-        .expect("approve candidate");
+        let approved = service
+            .approve_candidate(
+                user_context(391),
+                MemoryCandidatesApproveParams {
+                    candidate_id: candidate.id.clone(),
+                    reason: Some("approved in test".to_owned()),
+                    actor: None,
+                },
+            )
+            .await
+            .expect("approve candidate");
 
-    assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
-    assert_eq!(
-        approved.record.key.as_deref(),
-        Some("user/global:identity:self:name")
-    );
-    assert_eq!(
-        approved
-            .record
-            .metadata
-            .get("approved_candidate_id")
-            .and_then(serde_json::Value::as_str),
-        Some(candidate.id.as_str())
-    );
+        assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
+        assert_eq!(
+            approved.record.key.as_deref(),
+            Some("user/global:identity:self:name")
+        );
+        assert_eq!(
+            approved
+                .record
+                .metadata
+                .get("approved_candidate_id")
+                .and_then(serde_json::Value::as_str),
+            Some(candidate.id.as_str())
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn candidate_edit_and_approve_supersedes_existing_active_memory() {
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let (store, _backend, service) = setup_service_with_config(config).await;
-    let first = service
-        .write_semantic_memory(
-            user_context(392),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "The user's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_candidate_edit_base",
-            ),
-        )
-        .await
-        .expect("base memory")
-        .record
-        .expect("record");
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let (store, _backend, service) = setup_service_with_config(database, config).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(392),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "The user's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_candidate_edit_base",
+                ),
+            )
+            .await
+            .expect("base memory")
+            .record
+            .expect("record");
 
-    let mut candidate_params = semantic_write_params(
-        identity_name_semantic(MemoryExplicitness::Implicit),
-        "The user's name may be Alexey.",
-        "Alexey",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_candidate_edit_candidate",
-    );
-    candidate_params.source_context_kind = Some(MemorySourceContextKind::DirectUserConversation);
+        let mut candidate_params = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Implicit),
+            "The user's name may be Alexey.",
+            "Alexey",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_candidate_edit_candidate",
+        );
+        candidate_params.source_context_kind =
+            Some(MemorySourceContextKind::DirectUserConversation);
 
-    let candidate = service
-        .write_semantic_memory(user_context(393), candidate_params)
-        .await
-        .expect("candidate")
-        .candidate
-        .expect("candidate");
-    assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
+        let candidate = service
+            .write_semantic_memory(user_context(393), candidate_params)
+            .await
+            .expect("candidate")
+            .candidate
+            .expect("candidate");
+        assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
 
-    let approved = service
-        .edit_and_approve_candidate(
-            user_context(394),
-            MemoryCandidatesEditAndApproveParams {
-                candidate_id: candidate.id,
-                edited_text: "The user's name is Alex.".to_owned(),
-                edited_value: Some("Alex".to_owned()),
-                reason: Some("corrected candidate".to_owned()),
-                actor: None,
-            },
-        )
-        .await
-        .expect("edit and approve");
-    assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
-    assert_eq!(approved.record.content, "The user's name is Alex.");
-    assert_eq!(
-        approved.record.source_context_kind,
-        Some(MemorySourceContextKind::DirectUserConversation)
-    );
+        let approved = service
+            .edit_and_approve_candidate(
+                user_context(394),
+                MemoryCandidatesEditAndApproveParams {
+                    candidate_id: candidate.id,
+                    edited_text: "The user's name is Alex.".to_owned(),
+                    edited_value: Some("Alex".to_owned()),
+                    reason: Some("corrected candidate".to_owned()),
+                    actor: None,
+                },
+            )
+            .await
+            .expect("edit and approve");
+        assert_eq!(approved.candidate.status, MemoryCandidateStatus::Approved);
+        assert_eq!(approved.record.content, "The user's name is Alex.");
+        assert_eq!(
+            approved.record.source_context_kind,
+            Some(MemorySourceContextKind::DirectUserConversation)
+        );
 
-    let old = store
-        .get_agent_memory_record(first.id.as_str(), true)
-        .await
-        .expect("load old")
-        .expect("old record");
-    assert_eq!(old.status, MemoryStatus::Superseded);
+        let old = store
+            .get_agent_memory_record(first.id.as_str(), true)
+            .await
+            .expect("load old")
+            .expect("old record");
+        assert_eq!(old.status, MemoryStatus::Superseded);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn candidate_api_preserves_workspace_isolation_and_score_audit() {
-    let mut config = MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let (store, _backend, service) = setup_service_with_config(config).await;
-    let mut middle_semantic = workspace_project_decision_semantic(MemoryExplicitness::Unclear);
-    middle_semantic.intent = MemoryIntent::ImplicitCandidate;
-    middle_semantic.certainty = MemoryExtractorCertainty::Medium;
-    let mut params = semantic_write_params(
-        middle_semantic,
-        "Maybe this workspace prefers migration changes in one file.",
-        "migration changes in one file",
-        MemorySemanticWriteDisposition::RouteToCandidatePolicy,
-        "turn_candidate_scope",
-    );
-    params.scope = scope(MemoryScopeKind::Workspace, "ws_memory_a");
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let (store, _backend, service) = setup_service_with_config(database, config).await;
+        let mut middle_semantic = workspace_project_decision_semantic(MemoryExplicitness::Unclear);
+        middle_semantic.intent = MemoryIntent::ImplicitCandidate;
+        middle_semantic.certainty = MemoryExtractorCertainty::Medium;
+        let mut params = semantic_write_params(
+            middle_semantic,
+            "Maybe this workspace prefers migration changes in one file.",
+            "migration changes in one file",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "turn_candidate_scope",
+        );
+        params.scope = scope(MemoryScopeKind::Workspace, "ws_memory_a");
 
-    let candidate = service
-        .write_semantic_memory(workspace_context("ws_memory_a", 395), params)
-        .await
-        .expect("workspace candidate")
-        .candidate
-        .expect("candidate");
-    assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
-    assert_eq!(
-        candidate
-            .metadata
-            .get("candidate_score_bucket")
-            .and_then(serde_json::Value::as_str),
-        Some("middle")
-    );
+        let candidate = service
+            .write_semantic_memory(workspace_context("ws_memory_a", 395), params)
+            .await
+            .expect("workspace candidate")
+            .candidate
+            .expect("candidate");
+        assert_eq!(candidate.status, MemoryCandidateStatus::PendingSilent);
+        assert_eq!(
+            candidate
+                .metadata
+                .get("candidate_score_bucket")
+                .and_then(serde_json::Value::as_str),
+            Some("middle")
+        );
 
-    let visible = service
-        .get_candidate(
-            workspace_context("ws_memory_a", 396),
-            pioneer_protocol::MemoryCandidatesGetParams {
-                candidate_id: candidate.id.clone(),
-            },
-        )
-        .await
-        .expect("get visible");
-    assert!(visible.candidate.is_some());
+        let visible = service
+            .get_candidate(
+                workspace_context("ws_memory_a", 396),
+                pioneer_protocol::MemoryCandidatesGetParams {
+                    candidate_id: candidate.id.clone(),
+                },
+            )
+            .await
+            .expect("get visible");
+        assert!(visible.candidate.is_some());
 
-    let hidden = service
-        .get_candidate(
-            workspace_context("ws_memory_b", 397),
-            pioneer_protocol::MemoryCandidatesGetParams {
-                candidate_id: candidate.id.clone(),
-            },
-        )
-        .await
-        .expect("get hidden");
-    assert!(hidden.candidate.is_none());
+        let hidden = service
+            .get_candidate(
+                workspace_context("ws_memory_b", 397),
+                pioneer_protocol::MemoryCandidatesGetParams {
+                    candidate_id: candidate.id.clone(),
+                },
+            )
+            .await
+            .expect("get hidden");
+        assert!(hidden.candidate.is_none());
 
-    let decisions = store
-        .list_agent_memory_policy_decisions_for_candidate(candidate.id.as_str(), 20)
-        .await
-        .expect("candidate policy decisions");
-    assert!(decisions.iter().any(|decision| {
-        decision.action == "candidate_policy"
-            && decision.reason_code.as_deref() == Some("review_enabled_middle_confidence")
-            && decision
-                .details_json
-                .as_deref()
-                .is_some_and(|details| details.contains("\"bucket\":\"middle\""))
-    }));
+        let decisions = store
+            .list_agent_memory_policy_decisions_for_candidate(candidate.id.as_str(), 20)
+            .await
+            .expect("candidate policy decisions");
+        assert!(decisions.iter().any(|decision| {
+            decision.action == "candidate_policy"
+                && decision.reason_code.as_deref() == Some("review_enabled_middle_confidence")
+                && decision
+                    .details_json
+                    .as_deref()
+                    .is_some_and(|details| details.contains("\"bucket\":\"middle\""))
+        }));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn semantic_multi_value_subjects_get_distinct_child_keys() {
-    let (_store, _backend, service) = setup_service().await;
-    let first = service
-        .write_semantic_memory(
-            user_context(380),
-            semantic_write_params(
-                relationship_semantic("alice"),
-                "Alice is a project contact.",
-                "Alice is a project contact.",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_multi_1",
-            ),
-        )
-        .await
-        .expect("first relationship")
-        .record
-        .expect("first relationship record");
-    let second = service
-        .write_semantic_memory(
-            user_context(381),
-            semantic_write_params(
-                relationship_semantic("bob"),
-                "Bob is a project contact.",
-                "Bob is a project contact.",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_semantic_multi_2",
-            ),
-        )
-        .await
-        .expect("second relationship")
-        .record
-        .expect("second relationship record");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let first = service
+            .write_semantic_memory(
+                user_context(380),
+                semantic_write_params(
+                    relationship_semantic("alice"),
+                    "Alice is a project contact.",
+                    "Alice is a project contact.",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_multi_1",
+                ),
+            )
+            .await
+            .expect("first relationship")
+            .record
+            .expect("first relationship record");
+        let second = service
+            .write_semantic_memory(
+                user_context(381),
+                semantic_write_params(
+                    relationship_semantic("bob"),
+                    "Bob is a project contact.",
+                    "Bob is a project contact.",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_semantic_multi_2",
+                ),
+            )
+            .await
+            .expect("second relationship")
+            .record
+            .expect("second relationship record");
 
-    assert_ne!(first.key, second.key);
-    assert_eq!(
-        first
-            .metadata
-            .get("semantic")
-            .and_then(|value| value.get("cardinality"))
-            .and_then(serde_json::Value::as_str),
-        Some("MultiValue")
-    );
+        assert_ne!(first.key, second.key);
+        assert_eq!(
+            first
+                .metadata
+                .get("semantic")
+                .and_then(|value| value.get("cardinality"))
+                .and_then(serde_json::Value::as_str),
+            Some("MultiValue")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn search_suppresses_superseded_backend_hits() {
-    let (_store, _backend, service) = setup_service().await;
-    let old = service
-        .remember(
-            user_context(350),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("project.style"),
-                "Superseded stale search token should not be visible.",
-            ),
-        )
-        .await
-        .expect("old remember");
-    let mut replacement_params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("project.style"),
-        "Replacement style memory is authoritative.",
-    );
-    replacement_params.supersedes = Some(old.record.id.clone());
-    service
-        .remember(user_context(351), replacement_params)
-        .await
-        .expect("replacement remember");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let old = service
+            .remember(
+                user_context(350),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("project.style"),
+                    "Superseded stale search token should not be visible.",
+                ),
+            )
+            .await
+            .expect("old remember");
+        let mut replacement_params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("project.style"),
+            "Replacement style memory is authoritative.",
+        );
+        replacement_params.supersedes = Some(old.record.id.clone());
+        service
+            .remember(user_context(351), replacement_params)
+            .await
+            .expect("replacement remember");
 
-    let search = service
-        .search(
-            user_context(352),
-            MemorySearchParams {
-                query: "Superseded stale search token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(352),
+                MemorySearchParams {
+                    query: "Superseded stale search token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn forget_tombstone_suppresses_stale_backend_search_hit() {
-    let (_store, backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(400),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.city"),
-                "The user lives in Tbilisi.",
-            ),
-        )
-        .await
-        .expect("remember");
-    backend.set_delete_noop(true).await;
-    service
-        .forget(
-            user_context(401),
-            MemoryForgetParams {
-                target: MemoryForgetTarget::Id {
-                    memory_id: remembered.record.id.clone(),
+    with_database(async |database| {
+        let (_store, backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(400),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.city"),
+                    "The user lives in Tbilisi.",
+                ),
+            )
+            .await
+            .expect("remember");
+        backend.set_delete_noop(true).await;
+        service
+            .forget(
+                user_context(401),
+                MemoryForgetParams {
+                    target: MemoryForgetTarget::Id {
+                        memory_id: remembered.record.id.clone(),
+                    },
+                    reason: Some("test".to_owned()),
+                    actor: None,
+                    dry_run: false,
                 },
-                reason: Some("test".to_owned()),
-                actor: None,
-                dry_run: false,
-            },
-        )
-        .await
-        .expect("forget");
+            )
+            .await
+            .expect("forget");
 
-    let raw = backend
-        .raw_search(BackendSearchRequest {
-            filter: pioneer_crud::AgentMemoryListFilter::default(),
-            allowed_sensitivities: vec![
-                MemorySensitivity::Normal,
-                MemorySensitivity::Personal,
-                MemorySensitivity::SecretLike,
-                MemorySensitivity::Regulated,
-            ],
-            now_unix: 300,
-            query: "Tbilisi".to_owned(),
-            scopes: vec![scope(MemoryScopeKind::User, "default")],
-            resolved_scopes: Vec::new(),
-            limit: 10,
-        })
-        .await
-        .expect("raw search");
-    assert_eq!(raw.len(), 1);
-
-    let service_search = service
-        .search(
-            user_context(402),
-            MemorySearchParams {
+        let raw = backend
+            .raw_search(BackendSearchRequest {
+                filter: pioneer_crud::AgentMemoryListFilter::default(),
+                allowed_sensitivities: vec![
+                    MemorySensitivity::Normal,
+                    MemorySensitivity::Personal,
+                    MemorySensitivity::SecretLike,
+                    MemorySensitivity::Regulated,
+                ],
+                now_unix: 300,
                 query: "Tbilisi".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("service search");
-    assert!(service_search.hits.is_empty());
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
+                resolved_scopes: Vec::new(),
+                limit: 10,
+            })
+            .await
+            .expect("raw search");
+        assert_eq!(raw.len(), 1);
 
-    let service_get = service
-        .get(
-            user_context(403),
-            MemoryGetParams {
-                memory_id: remembered.record.id,
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("service get");
-    assert!(service_get.record.is_none());
+        let service_search = service
+            .search(
+                user_context(402),
+                MemorySearchParams {
+                    query: "Tbilisi".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("service search");
+        assert!(service_search.hits.is_empty());
+
+        let service_get = service
+            .get(
+                user_context(403),
+                MemoryGetParams {
+                    memory_id: remembered.record.id,
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("service get");
+        assert!(service_get.record.is_none());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn member_memory_write_requires_accessible_normal_thread_provenance() {
-    let (_store, _backend, service) = setup_service().await;
-    let member_context = MemoryOperationContext {
-        workspace_id: Some("ws_member_memory".to_owned()),
-        thread_id: Some("thread_allowed".to_owned()),
-        actor: Some(MemoryActor {
-            kind: MemoryActorKind::User,
-            id: Some("member_a".to_owned()),
-        }),
-        now_unix: Some(410),
-        allow_global_user: false,
-        allow_global_agent: false,
-        read_policy: Some(MemoryReadPolicy {
-            allow_normal: true,
-            allow_personal: false,
-            allow_secret_like: false,
-            allow_regulated: false,
-        }),
-        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_allowed".to_owned()]),
-        ..MemoryOperationContext::default()
-    };
-    let mut allowed = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
-        Some("member.allowed"),
-        "Member memory has authoritative accessible provenance.",
-    );
-    allowed.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_allowed".to_owned()),
-        source_turn_id: Some("turn_allowed".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    service
-        .remember(member_context.clone(), allowed)
-        .await
-        .expect("accessible normal memory should be accepted");
-
-    let missing_provenance = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
-        Some("member.missing"),
-        "Missing provenance must be rejected.",
-    );
-    assert!(
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let member_context = MemoryOperationContext {
+            workspace_id: Some("ws_member_memory".to_owned()),
+            thread_id: Some("thread_allowed".to_owned()),
+            actor: Some(MemoryActor {
+                kind: MemoryActorKind::User,
+                id: Some("member_a".to_owned()),
+            }),
+            now_unix: Some(410),
+            allow_global_user: false,
+            allow_global_agent: false,
+            read_policy: Some(MemoryReadPolicy {
+                allow_normal: true,
+                allow_personal: false,
+                allow_secret_like: false,
+                allow_regulated: false,
+            }),
+            source_access: MemorySourceAccessPolicy::accessible_threads([
+                "thread_allowed".to_owned()
+            ]),
+            ..MemoryOperationContext::default()
+        };
+        let mut allowed = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+            Some("member.allowed"),
+            "Member memory has authoritative accessible provenance.",
+        );
+        allowed.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_allowed".to_owned()),
+            source_turn_id: Some("turn_allowed".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
         service
-            .remember(member_context.clone(), missing_provenance)
+            .remember(member_context.clone(), allowed)
             .await
-            .is_err()
-    );
+            .expect("accessible normal memory should be accepted");
 
-    let mut inaccessible = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
-        Some("member.inaccessible"),
-        "Inaccessible source provenance must be rejected.",
-    );
-    inaccessible.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_private".to_owned()),
-        source_turn_id: Some("turn_private".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    assert!(
-        service
-            .remember(member_context.clone(), inaccessible)
-            .await
-            .is_err()
-    );
+        let missing_provenance = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+            Some("member.missing"),
+            "Missing provenance must be rejected.",
+        );
+        assert!(
+            service
+                .remember(member_context.clone(), missing_provenance)
+                .await
+                .is_err()
+        );
 
-    let mut personal = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
-        Some("member.personal"),
-        "Personal content must be rejected.",
-    );
-    personal.sensitivity = Some(MemorySensitivity::Personal);
-    personal.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_allowed".to_owned()),
-        source_turn_id: Some("turn_allowed".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    assert!(
-        service
-            .remember(member_context.clone(), personal)
-            .await
-            .is_err()
-    );
+        let mut inaccessible = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+            Some("member.inaccessible"),
+            "Inaccessible source provenance must be rejected.",
+        );
+        inaccessible.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_private".to_owned()),
+            source_turn_id: Some("turn_private".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        assert!(
+            service
+                .remember(member_context.clone(), inaccessible)
+                .await
+                .is_err()
+        );
 
-    let mut foreign_workspace = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_private"),
-        Some("member.foreign"),
-        "Member writes must remain in the authorized workspace.",
-    );
-    foreign_workspace.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_allowed".to_owned()),
-        source_turn_id: Some("turn_allowed".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    assert!(
-        service
-            .remember(member_context.clone(), foreign_workspace)
-            .await
-            .is_err()
-    );
+        let mut personal = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+            Some("member.personal"),
+            "Personal content must be rejected.",
+        );
+        personal.sensitivity = Some(MemorySensitivity::Personal);
+        personal.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_allowed".to_owned()),
+            source_turn_id: Some("turn_allowed".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        assert!(
+            service
+                .remember(member_context.clone(), personal)
+                .await
+                .is_err()
+        );
 
-    let mut user_scope = remember_params(
-        scope(MemoryScopeKind::User, "member_a"),
-        Some("member.user_scope"),
-        "Member personal scope must be rejected.",
-    );
-    user_scope.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_allowed".to_owned()),
-        source_turn_id: Some("turn_allowed".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    assert!(service.remember(member_context, user_scope).await.is_err());
+        let mut foreign_workspace = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_private"),
+            Some("member.foreign"),
+            "Member writes must remain in the authorized workspace.",
+        );
+        foreign_workspace.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_allowed".to_owned()),
+            source_turn_id: Some("turn_allowed".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        assert!(
+            service
+                .remember(member_context.clone(), foreign_workspace)
+                .await
+                .is_err()
+        );
+
+        let mut user_scope = remember_params(
+            scope(MemoryScopeKind::User, "member_a"),
+            Some("member.user_scope"),
+            "Member personal scope must be rejected.",
+        );
+        user_scope.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_allowed".to_owned()),
+            source_turn_id: Some("turn_allowed".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        assert!(service.remember(member_context, user_scope).await.is_err());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn scoped_memory_survives_hidden_runs_without_granting_foreign_scopes() {
+    with_database(async |database| {
     use pioneer_memory::MemoryMutationBoundary;
     use sea_orm::ConnectionTrait;
-    let (store, _backend, service) = setup_service().await;
+    let (store, _backend, service) = setup_service(database).await;
     store.database_connection().execute_unprepared(
         "INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status) VALUES ('root_a','ws_a','','agent','test','test','active'),('root_b','ws_a','','agent','test','test','active');
          INSERT INTO task (id,workspace_id,owner_kind,executor_kind,status,title,goal) VALUES ('task_a','ws_a','user','agent','draft','A','A'),('task_b','ws_a','user','agent','draft','B','B');"
@@ -3386,1684 +3611,1825 @@ async fn scoped_memory_survives_hidden_runs_without_granting_foreign_scopes() {
             .unwrap();
         assert_eq!(forgotten.forgotten_memory_ids, vec![saved.record.id]);
     }
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn member_memory_cannot_supersede_an_inaccessible_record() {
-    let (store, _backend, service) = setup_service().await;
-    let mut private = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_private"),
-        Some("private.fact"),
-        "Private workspace memory.",
-    );
-    private.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_private".to_owned()),
-        source_turn_id: Some("turn_private".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    let private = service
-        .remember(workspace_context("ws_private", 411), private)
-        .await
-        .expect("seed private memory");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let mut private = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_private"),
+            Some("private.fact"),
+            "Private workspace memory.",
+        );
+        private.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_private".to_owned()),
+            source_turn_id: Some("turn_private".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        let private = service
+            .remember(workspace_context("ws_private", 411), private)
+            .await
+            .expect("seed private memory");
 
-    let member_context = MemoryOperationContext {
-        workspace_id: Some("ws_member_memory".to_owned()),
-        thread_id: Some("thread_allowed".to_owned()),
-        now_unix: Some(412),
-        read_policy: Some(MemoryReadPolicy {
-            allow_normal: true,
-            allow_personal: false,
-            allow_secret_like: false,
-            allow_regulated: false,
-        }),
-        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_allowed".to_owned()]),
-        ..MemoryOperationContext::default()
-    };
-    let mut replacement = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_member_memory"),
-        Some("member.replacement"),
-        "Authorized workspace replacement.",
-    );
-    replacement.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_allowed".to_owned()),
-        source_turn_id: Some("turn_allowed".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    replacement.supersedes = Some(private.record.id.clone());
+        let member_context = MemoryOperationContext {
+            workspace_id: Some("ws_member_memory".to_owned()),
+            thread_id: Some("thread_allowed".to_owned()),
+            now_unix: Some(412),
+            read_policy: Some(MemoryReadPolicy {
+                allow_normal: true,
+                allow_personal: false,
+                allow_secret_like: false,
+                allow_regulated: false,
+            }),
+            source_access: MemorySourceAccessPolicy::accessible_threads([
+                "thread_allowed".to_owned()
+            ]),
+            ..MemoryOperationContext::default()
+        };
+        let mut replacement = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_member_memory"),
+            Some("member.replacement"),
+            "Authorized workspace replacement.",
+        );
+        replacement.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_allowed".to_owned()),
+            source_turn_id: Some("turn_allowed".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        replacement.supersedes = Some(private.record.id.clone());
 
-    assert!(service.remember(member_context, replacement).await.is_err());
-    let private_row = store
-        .get_agent_memory_record(private.record.id.as_str(), true)
-        .await
-        .expect("load private memory")
-        .expect("private memory remains");
-    assert_eq!(private_row.status, MemoryStatus::Active);
+        assert!(service.remember(member_context, replacement).await.is_err());
+        let private_row = store
+            .get_agent_memory_record(private.record.id.as_str(), true)
+            .await
+            .expect("load private memory")
+            .expect("private memory remains");
+        assert_eq!(private_row.status, MemoryStatus::Active);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn member_memory_search_and_cached_get_recheck_current_source_acl() {
-    let (_store, _backend, service) = setup_service().await;
-    let workspace_scope = scope(MemoryScopeKind::Workspace, "ws_member_recall");
-    let mut accessible = remember_params(
-        workspace_scope.clone(),
-        Some("member.visible"),
-        "Shared source token from an accessible thread.",
-    );
-    accessible.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_visible".to_owned()),
-        source_turn_id: Some("turn_visible".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    let accessible = service
-        .remember(workspace_context("ws_member_recall", 420), accessible)
-        .await
-        .expect("seed accessible memory");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let workspace_scope = scope(MemoryScopeKind::Workspace, "ws_member_recall");
+        let mut accessible = remember_params(
+            workspace_scope.clone(),
+            Some("member.visible"),
+            "Shared source token from an accessible thread.",
+        );
+        accessible.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_visible".to_owned()),
+            source_turn_id: Some("turn_visible".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        let accessible = service
+            .remember(workspace_context("ws_member_recall", 420), accessible)
+            .await
+            .expect("seed accessible memory");
 
-    let mut private = remember_params(
-        workspace_scope.clone(),
-        Some("member.private"),
-        "Shared source token from a private thread.",
-    );
-    private.provenance = Some(MemoryProvenance {
-        source_thread_id: Some("thread_private".to_owned()),
-        source_turn_id: Some("turn_private".to_owned()),
-        source_item_id: None,
-        created_by: None,
-    });
-    service
-        .remember(workspace_context("ws_member_recall", 421), private)
-        .await
-        .expect("seed private memory");
+        let mut private = remember_params(
+            workspace_scope.clone(),
+            Some("member.private"),
+            "Shared source token from a private thread.",
+        );
+        private.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("thread_private".to_owned()),
+            source_turn_id: Some("turn_private".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        service
+            .remember(workspace_context("ws_member_recall", 421), private)
+            .await
+            .expect("seed private memory");
 
-    let mut missing = remember_params(
-        workspace_scope.clone(),
-        Some("member.missing"),
-        "Shared source token without provenance.",
-    );
-    missing.provenance = None;
-    service
-        .remember(workspace_context("ws_member_recall", 422), missing)
-        .await
-        .expect("seed legacy missing-provenance memory");
+        let mut missing = remember_params(
+            workspace_scope.clone(),
+            Some("member.missing"),
+            "Shared source token without provenance.",
+        );
+        missing.provenance = None;
+        service
+            .remember(workspace_context("ws_member_recall", 422), missing)
+            .await
+            .expect("seed legacy missing-provenance memory");
 
-    let member_context = MemoryOperationContext {
-        workspace_id: Some("ws_member_recall".to_owned()),
-        thread_id: Some("thread_visible".to_owned()),
-        now_unix: Some(423),
-        read_policy: Some(MemoryReadPolicy {
-            allow_normal: true,
-            allow_personal: false,
-            allow_secret_like: false,
-            allow_regulated: false,
-        }),
-        source_access: MemorySourceAccessPolicy::accessible_threads(["thread_visible".to_owned()]),
-        ..MemoryOperationContext::default()
-    };
-    let visible = service
-        .search(
-            member_context.clone(),
-            MemorySearchParams {
-                query: "Shared source token".to_owned(),
-                scopes: vec![workspace_scope.clone()],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("member search");
-    assert_eq!(visible.hits.len(), 1);
-    assert_eq!(visible.hits[0].record.id, accessible.record.id);
+        let member_context = MemoryOperationContext {
+            workspace_id: Some("ws_member_recall".to_owned()),
+            thread_id: Some("thread_visible".to_owned()),
+            now_unix: Some(423),
+            read_policy: Some(MemoryReadPolicy {
+                allow_normal: true,
+                allow_personal: false,
+                allow_secret_like: false,
+                allow_regulated: false,
+            }),
+            source_access: MemorySourceAccessPolicy::accessible_threads([
+                "thread_visible".to_owned()
+            ]),
+            ..MemoryOperationContext::default()
+        };
+        let visible = service
+            .search(
+                member_context.clone(),
+                MemorySearchParams {
+                    query: "Shared source token".to_owned(),
+                    scopes: vec![workspace_scope.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("member search");
+        assert_eq!(visible.hits.len(), 1);
+        assert_eq!(visible.hits[0].record.id, accessible.record.id);
 
-    let revoked_context = MemoryOperationContext {
-        source_access: MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new()),
-        ..member_context
-    };
-    let cached_search = service
-        .search(
-            revoked_context.clone(),
-            MemorySearchParams {
-                query: "Shared source token".to_owned(),
-                scopes: vec![workspace_scope],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("cached search after ACL revocation");
-    assert!(cached_search.hits.is_empty());
-    let cached_get = service
-        .get(
-            revoked_context,
-            MemoryGetParams {
-                memory_id: accessible.record.id,
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("cached get after ACL revocation");
-    assert!(cached_get.record.is_none());
+        let revoked_context = MemoryOperationContext {
+            source_access: MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new()),
+            ..member_context
+        };
+        let cached_search = service
+            .search(
+                revoked_context.clone(),
+                MemorySearchParams {
+                    query: "Shared source token".to_owned(),
+                    scopes: vec![workspace_scope],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("cached search after ACL revocation");
+        assert!(cached_search.hits.is_empty());
+        let cached_get = service
+            .get(
+                revoked_context,
+                MemoryGetParams {
+                    memory_id: accessible.record.id,
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("cached get after ACL revocation");
+        assert!(cached_get.record.is_none());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn recall_visibility_suppresses_polluted_search_and_prompt_records() {
-    let (store, _backend, service) = setup_service().await;
-    let clean = service
-        .remember(
-            user_context(430),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("phase13.clean"),
-                "phase13 clean durable user profile memory",
-            ),
-        )
-        .await
-        .expect("clean remember");
-    let deleted = service
-        .remember(
-            user_context(431),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("phase13.deleted"),
-                "phase13 deleted polluted memory",
-            ),
-        )
-        .await
-        .expect("deleted remember");
-    store
-        .mark_agent_memory_deleted(
-            deleted.record.id.as_str(),
-            None,
-            Some("fixture".to_owned()),
-            432,
-        )
-        .await
-        .expect("mark deleted");
-    let superseded = service
-        .remember(
-            user_context(433),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("phase13.superseded"),
-                "phase13 superseded polluted memory",
-            ),
-        )
-        .await
-        .expect("superseded remember");
-    store
-        .mark_agent_memory_superseded(superseded.record.id.as_str(), clean.record.id.as_str(), 434)
-        .await
-        .expect("mark superseded");
-    let expired = service
-        .remember(
-            user_context(435),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("phase13.expired"),
-                "phase13 expired polluted memory",
-            ),
-        )
-        .await
-        .expect("expired remember");
-    store
-        .mark_agent_memory_expired(expired.record.id.as_str(), 436)
-        .await
-        .expect("mark expired");
-    let mut secret_params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("phase13.secret"),
-        "phase13 secret polluted memory",
-    );
-    secret_params.sensitivity = Some(MemorySensitivity::SecretLike);
-    service
-        .remember(user_context(437), secret_params)
-        .await
-        .expect("secret remember");
-
-    for (
-        index,
-        (
-            key,
-            action,
-            target_ownership,
-            source_context_kind,
-            evidence_class,
-            relation,
-            reason_codes,
-        ),
-    ) in [
-        (
-            "phase13.low_source",
-            MemoryQualityAction::ForceReject,
-            MemoryOwnershipClass::Reject,
-            MemorySourceContextKind::Unknown,
-            MemoryEvidenceClass::MissingOrWeak,
-            MemoryWriteRelation::Novel,
-            vec![MemoryQualityReasonCode::WeakOrMissingEvidence],
-        ),
-        (
-            "phase13.rejected_related",
-            MemoryQualityAction::ForceReject,
-            MemoryOwnershipClass::AuditOnly,
-            MemorySourceContextKind::DirectUserConversation,
-            MemoryEvidenceClass::DirectUserAssertion,
-            MemoryWriteRelation::SuppressedByRejection,
-            vec![MemoryQualityReasonCode::DuplicateExistingMemory],
-        ),
-        (
-            "phase13.quarantine",
-            MemoryQualityAction::Quarantine,
-            MemoryOwnershipClass::AuditOnly,
-            MemorySourceContextKind::DirectUserConversation,
-            MemoryEvidenceClass::DirectUserAssertion,
-            MemoryWriteRelation::Novel,
-            vec![MemoryQualityReasonCode::NoQualityAllowRule],
-        ),
-        (
-            "phase13.ownership_mismatch",
-            MemoryQualityAction::ForceReject,
-            MemoryOwnershipClass::AuditOnly,
-            MemorySourceContextKind::DirectUserConversation,
-            MemoryEvidenceClass::DirectUserAssertion,
-            MemoryWriteRelation::Novel,
-            vec![MemoryQualityReasonCode::OwnershipMismatch],
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let remembered = service
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let clean = service
             .remember(
-                user_context(440 + index as i64),
+                user_context(430),
                 remember_params(
                     scope(MemoryScopeKind::User, "default"),
-                    Some(key),
-                    format!("{key} polluted memory phase13").as_str(),
+                    Some("phase13.clean"),
+                    "phase13 clean durable user profile memory",
                 ),
             )
             .await
-            .expect("polluted remember");
-        attach_quality_decision(
-            &store,
-            remembered.record.id.as_str(),
-            action,
-            target_ownership,
-            source_context_kind,
-            MemoryFactClass::UserIdentity,
-            MemoryLifetimeClass::LongLived,
-            MemoryOwnershipClass::DurableWorkspaceMemory,
-            evidence_class,
-            relation,
-            reason_codes,
-            450 + index as i64,
-        )
-        .await;
-    }
+            .expect("clean remember");
+        let deleted = service
+            .remember(
+                user_context(431),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("phase13.deleted"),
+                    "phase13 deleted polluted memory",
+                ),
+            )
+            .await
+            .expect("deleted remember");
+        store
+            .mark_agent_memory_deleted(
+                deleted.record.id.as_str(),
+                None,
+                Some("fixture".to_owned()),
+                432,
+            )
+            .await
+            .expect("mark deleted");
+        let superseded = service
+            .remember(
+                user_context(433),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("phase13.superseded"),
+                    "phase13 superseded polluted memory",
+                ),
+            )
+            .await
+            .expect("superseded remember");
+        store
+            .mark_agent_memory_superseded(
+                superseded.record.id.as_str(),
+                clean.record.id.as_str(),
+                434,
+            )
+            .await
+            .expect("mark superseded");
+        let expired = service
+            .remember(
+                user_context(435),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("phase13.expired"),
+                    "phase13 expired polluted memory",
+                ),
+            )
+            .await
+            .expect("expired remember");
+        store
+            .mark_agent_memory_expired(expired.record.id.as_str(), 436)
+            .await
+            .expect("mark expired");
+        let mut secret_params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("phase13.secret"),
+            "phase13 secret polluted memory",
+        );
+        secret_params.sensitivity = Some(MemorySensitivity::SecretLike);
+        service
+            .remember(user_context(437), secret_params)
+            .await
+            .expect("secret remember");
 
-    let search = service
-        .search(
-            user_context(460),
-            MemorySearchParams {
-                query: "phase13".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    let search_ids = search
-        .hits
-        .iter()
-        .map(|hit| hit.record.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(search_ids, vec![clean.record.id.as_str()]);
+        for (
+            index,
+            (
+                key,
+                action,
+                target_ownership,
+                source_context_kind,
+                evidence_class,
+                relation,
+                reason_codes,
+            ),
+        ) in [
+            (
+                "phase13.low_source",
+                MemoryQualityAction::ForceReject,
+                MemoryOwnershipClass::Reject,
+                MemorySourceContextKind::Unknown,
+                MemoryEvidenceClass::MissingOrWeak,
+                MemoryWriteRelation::Novel,
+                vec![MemoryQualityReasonCode::WeakOrMissingEvidence],
+            ),
+            (
+                "phase13.rejected_related",
+                MemoryQualityAction::ForceReject,
+                MemoryOwnershipClass::AuditOnly,
+                MemorySourceContextKind::DirectUserConversation,
+                MemoryEvidenceClass::DirectUserAssertion,
+                MemoryWriteRelation::SuppressedByRejection,
+                vec![MemoryQualityReasonCode::DuplicateExistingMemory],
+            ),
+            (
+                "phase13.quarantine",
+                MemoryQualityAction::Quarantine,
+                MemoryOwnershipClass::AuditOnly,
+                MemorySourceContextKind::DirectUserConversation,
+                MemoryEvidenceClass::DirectUserAssertion,
+                MemoryWriteRelation::Novel,
+                vec![MemoryQualityReasonCode::NoQualityAllowRule],
+            ),
+            (
+                "phase13.ownership_mismatch",
+                MemoryQualityAction::ForceReject,
+                MemoryOwnershipClass::AuditOnly,
+                MemorySourceContextKind::DirectUserConversation,
+                MemoryEvidenceClass::DirectUserAssertion,
+                MemoryWriteRelation::Novel,
+                vec![MemoryQualityReasonCode::OwnershipMismatch],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let remembered = service
+                .remember(
+                    user_context(440 + index as i64),
+                    remember_params(
+                        scope(MemoryScopeKind::User, "default"),
+                        Some(key),
+                        format!("{key} polluted memory phase13").as_str(),
+                    ),
+                )
+                .await
+                .expect("polluted remember");
+            attach_quality_decision(
+                &store,
+                remembered.record.id.as_str(),
+                action,
+                target_ownership,
+                source_context_kind,
+                MemoryFactClass::UserIdentity,
+                MemoryLifetimeClass::LongLived,
+                MemoryOwnershipClass::DurableWorkspaceMemory,
+                evidence_class,
+                relation,
+                reason_codes,
+                450 + index as i64,
+            )
+            .await;
+        }
+
+        let search = service
+            .search(
+                user_context(460),
+                MemorySearchParams {
+                    query: "phase13".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        let search_ids = search
+            .hits
+            .iter()
+            .map(|hit| hit.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(search_ids, vec![clean.record.id.as_str()]);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn recall_visibility_suppresses_workspace_mismatch_backend_hits() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut params = remember_params(
-        scope(MemoryScopeKind::Workspace, "ws_phase13_other"),
-        Some("phase13.workspace.other"),
-        "phase13 workspace mismatch memory",
-    );
-    params.category = MemoryCategory::ProjectDecision;
-    service
-        .remember(workspace_context("ws_phase13_other", 480), params)
-        .await
-        .expect("other workspace remember");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut params = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_phase13_other"),
+            Some("phase13.workspace.other"),
+            "phase13 workspace mismatch memory",
+        );
+        params.category = MemoryCategory::ProjectDecision;
+        service
+            .remember(workspace_context("ws_phase13_other", 480), params)
+            .await
+            .expect("other workspace remember");
 
-    let search = service
-        .search(
-            workspace_context("ws_phase13_target", 481),
-            MemorySearchParams {
-                query: "phase13 workspace mismatch".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::Workspace, "ws_phase13_other")],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("workspace guarded search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                workspace_context("ws_phase13_target", 481),
+                MemorySearchParams {
+                    query: "phase13 workspace mismatch".to_owned(),
+                    scopes: vec![scope(MemoryScopeKind::Workspace, "ws_phase13_other")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("workspace guarded search");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn dry_run_forget_resolves_ids_without_mutation() {
-    let (store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(500),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.food"),
-                "The user likes Georgian food.",
-            ),
-        )
-        .await
-        .expect("remember");
-
-    let dry_run = service
-        .forget(
-            user_context(501),
-            MemoryForgetParams {
-                target: MemoryForgetTarget::ScopedKey {
-                    scope: scope(MemoryScopeKind::User, "default"),
-                    namespace: None,
-                    key: "user.food".to_owned(),
-                },
-                reason: Some("dry run".to_owned()),
-                actor: None,
-                dry_run: true,
-            },
-        )
-        .await
-        .expect("dry run forget");
-    assert_eq!(
-        dry_run.forgotten_memory_ids,
-        vec![remembered.record.id.clone()]
-    );
-    assert!(dry_run.dry_run);
-
-    let still_loaded = service
-        .get(
-            user_context(502),
-            MemoryGetParams {
-                memory_id: remembered.record.id.clone(),
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("get")
-        .record;
-    assert!(still_loaded.is_some());
-
-    let events = store
-        .list_agent_memory_events(remembered.record.id.as_str(), 10)
-        .await
-        .expect("events");
-    assert!(!events.iter().any(|event| event.event_kind == "forgotten"));
-}
-
-#[tokio::test]
-async fn search_filters_sensitivity_by_default() {
-    let (_store, _backend, service) = setup_service().await;
-    for (key, sensitivity) in [
-        ("normal", MemorySensitivity::Normal),
-        ("personal", MemorySensitivity::Personal),
-        ("secret", MemorySensitivity::SecretLike),
-        ("regulated", MemorySensitivity::Regulated),
-    ] {
-        let mut params = remember_params(
-            scope(MemoryScopeKind::User, "default"),
-            Some(key),
-            format!("shared recall token {key}").as_str(),
-        );
-        params.sensitivity = Some(sensitivity);
-        service
-            .remember(user_context(600), params)
-            .await
-            .expect("remember sensitivity row");
-    }
-
-    let default_search = service
-        .search(
-            user_context(601),
-            MemorySearchParams {
-                query: "shared recall token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("default search");
-    let mut default_keys = default_search
-        .hits
-        .iter()
-        .filter_map(|hit| hit.record.key.as_deref())
-        .collect::<Vec<_>>();
-    default_keys.sort_unstable();
-    assert_eq!(default_keys, vec!["normal", "personal"]);
-
-    let allow_all_search = service
-        .search(
-            MemoryOperationContext {
-                read_policy: Some(MemoryReadPolicy::allow_all()),
-                ..user_context(602)
-            },
-            MemorySearchParams {
-                query: "shared recall token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("allow all search");
-    assert_eq!(allow_all_search.hits.len(), 4);
-}
-
-#[tokio::test]
-async fn search_exact_key_match_beats_body_only_match() {
-    let (_store, _backend, service) = setup_service().await;
-    let exact = service
-        .remember(
-            user_context(650),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.birthday"),
-                "The birthday memory says September 12.",
-            ),
-        )
-        .await
-        .expect("remember exact");
-    let body_only = service
-        .remember(
-            user_context(651),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.note"),
-                "The literal user.birthday token appears in this unrelated note.",
-            ),
-        )
-        .await
-        .expect("remember body-only");
-
-    let search = service
-        .search(
-            user_context(652),
-            MemorySearchParams {
-                query: "user.birthday".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 2);
-    assert_eq!(search.hits[0].record.id, exact.record.id);
-    assert_eq!(search.hits[1].record.id, body_only.record.id);
-    assert!(search.hits[0].score > search.hits[1].score);
-}
-
-#[tokio::test]
-async fn search_backend_score_contributes_to_final_ranking() {
-    let (_store, _backend, service) = setup_service().await;
-    let full_match = service
-        .remember(
-            user_context(653),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("backend.full"),
-                "Backend score alpha beta gamma appears as a full phrase.",
-            ),
-        )
-        .await
-        .expect("remember full match");
-    let partial_match = service
-        .remember(
-            user_context(654),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("backend.partial"),
-                "Backend score alpha appears without the other query terms.",
-            ),
-        )
-        .await
-        .expect("remember partial match");
-
-    let search = service
-        .search(
-            user_context(655),
-            MemorySearchParams {
-                query: "Backend score alpha beta gamma".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 2);
-    assert_eq!(search.hits[0].record.id, full_match.record.id);
-    assert_eq!(search.hits[1].record.id, partial_match.record.id);
-    assert!(search.hits[0].score > search.hits[1].score);
-}
-
-#[tokio::test]
-async fn search_category_match_boost_contributes_to_final_score() {
-    let mut config = MemoryServiceConfig::default();
-    config.ranking.backend_score_weight = 0.0;
-    config.ranking.exact_key_boost = 0.0;
-    config.ranking.primary_scope_boost = 0.0;
-    config.ranking.scope_rank_boost = 0.0;
-    config.ranking.recency_boost_max = 0.0;
-    config.ranking.importance_weight = 0.0;
-    config.ranking.confidence_weight = 0.0;
-    config.ranking.category_match_boost = 0.5;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
-    let remembered = service
-        .remember(
-            user_context(656),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("category.boost"),
-                "Category boost isolated token.",
-            ),
-        )
-        .await
-        .expect("remember");
-
-    let unboosted = service
-        .search(
-            user_context(657),
-            MemorySearchParams {
-                query: "Category boost isolated token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("unboosted search");
-    let boosted = service
-        .search(
-            user_context(658),
-            MemorySearchParams {
-                query: "Category boost isolated token".to_owned(),
-                categories: vec![MemoryCategory::Identity],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("boosted search");
-    assert_eq!(unboosted.hits[0].record.id, remembered.record.id);
-    assert_eq!(boosted.hits[0].record.id, remembered.record.id);
-    assert_eq!(unboosted.hits[0].score, Some(0.0));
-    assert_eq!(boosted.hits[0].score, Some(0.5));
-}
-
-#[tokio::test]
-async fn search_scope_boost_prefers_workspace_over_user_fallback() {
-    let (_store, _backend, service) = setup_service().await;
-    let user = service
-        .remember(
-            user_context(660),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("scope.user"),
-                "Scope boost shared token from user memory.",
-            ),
-        )
-        .await
-        .expect("remember user");
-    let workspace = service
-        .remember(
-            workspace_context("ws_scope_boost", 661),
-            remember_params(
-                scope(MemoryScopeKind::Workspace, "ws_scope_boost"),
-                Some("scope.workspace"),
-                "Scope boost shared token from workspace memory.",
-            ),
-        )
-        .await
-        .expect("remember workspace");
-
-    let search = service
-        .search(
-            MemoryOperationContext {
-                allow_global_user: true,
-                ..workspace_context("ws_scope_boost", 662)
-            },
-            MemorySearchParams {
-                query: "Scope boost shared token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 2);
-    assert_eq!(search.hits[0].record.id, workspace.record.id);
-    assert_eq!(search.hits[1].record.id, user.record.id);
-}
-
-#[tokio::test]
-async fn search_importance_and_recency_boosts_are_deterministic() {
-    let (_store, _backend, service) = setup_service().await;
-    let mut important_params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("rank.important"),
-        "Ranking importance shared token from important memory.",
-    );
-    important_params.importance = Some(1.0);
-    let important = service
-        .remember(user_context(665), important_params)
-        .await
-        .expect("remember important");
-
-    let mut less_important_params = remember_params(
-        scope(MemoryScopeKind::User, "default"),
-        Some("rank.less_important"),
-        "Ranking importance shared token from less important memory.",
-    );
-    less_important_params.importance = Some(0.0);
-    let less_important = service
-        .remember(user_context(666), less_important_params)
-        .await
-        .expect("remember less important");
-
-    let importance_search = service
-        .search(
-            user_context(667),
-            MemorySearchParams {
-                query: "Ranking importance shared token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("importance search");
-    assert_eq!(importance_search.hits.len(), 2);
-    assert_eq!(importance_search.hits[0].record.id, important.record.id);
-    assert_eq!(
-        importance_search.hits[1].record.id,
-        less_important.record.id
-    );
-
-    let older = service
-        .remember(
-            user_context(668),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("rank.older"),
-                "Ranking recency shared token from older memory.",
-            ),
-        )
-        .await
-        .expect("remember older");
-    let newer = service
-        .remember(
-            user_context(698),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("rank.newer"),
-                "Ranking recency shared token from newer memory.",
-            ),
-        )
-        .await
-        .expect("remember newer");
-
-    let recency_search = service
-        .search(
-            user_context(699),
-            MemorySearchParams {
-                query: "Ranking recency shared token".to_owned(),
-                limit: Some(2),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("recency search");
-    assert_eq!(recency_search.hits.len(), 2);
-    assert_eq!(recency_search.hits[0].record.id, newer.record.id);
-    assert_eq!(recency_search.hits[1].record.id, older.record.id);
-}
-
-#[tokio::test]
-async fn search_empty_scopes_use_user_scope_fallback_when_allowed() {
-    let (_store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(670),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("fallback.user"),
-                "User scope fallback token should be found.",
-            ),
-        )
-        .await
-        .expect("remember user fallback");
-
-    let search = service
-        .search(
-            MemoryOperationContext {
-                allow_global_user: true,
-                ..workspace_context("ws_user_fallback", 671)
-            },
-            MemorySearchParams {
-                query: "User scope fallback token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 1);
-    assert_eq!(search.hits[0].record.id, remembered.record.id);
-}
-
-#[tokio::test]
-async fn search_uses_tool_search_limit_when_limit_is_missing() {
-    let mut config = MemoryServiceConfig::default();
-    config.recall.tool_search_limit = 2;
-    let (_store, _backend, service) = setup_service_with_config(config).await;
-
-    for index in 0..3 {
-        service
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let remembered = service
             .remember(
-                user_context(680 + index),
+                user_context(500),
                 remember_params(
                     scope(MemoryScopeKind::User, "default"),
-                    Some(format!("tool.limit.{index}").as_str()),
-                    format!("Tool default limit shared token {index}.").as_str(),
+                    Some("user.food"),
+                    "The user likes Georgian food.",
                 ),
             )
             .await
             .expect("remember");
-    }
 
-    let search = service
-        .search(
-            user_context(690),
-            MemorySearchParams {
-                query: "Tool default limit shared token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert_eq!(search.hits.len(), 2);
+        let dry_run = service
+            .forget(
+                user_context(501),
+                MemoryForgetParams {
+                    target: MemoryForgetTarget::ScopedKey {
+                        scope: scope(MemoryScopeKind::User, "default"),
+                        namespace: None,
+                        key: "user.food".to_owned(),
+                    },
+                    reason: Some("dry run".to_owned()),
+                    actor: None,
+                    dry_run: true,
+                },
+            )
+            .await
+            .expect("dry run forget");
+        assert_eq!(
+            dry_run.forgotten_memory_ids,
+            vec![remembered.record.id.clone()]
+        );
+        assert!(dry_run.dry_run);
+
+        let still_loaded = service
+            .get(
+                user_context(502),
+                MemoryGetParams {
+                    memory_id: remembered.record.id.clone(),
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("get")
+            .record;
+        assert!(still_loaded.is_some());
+
+        let events = store
+            .list_agent_memory_events(remembered.record.id.as_str(), 10)
+            .await
+            .expect("events");
+        assert!(!events.iter().any(|event| event.event_kind == "forgotten"));
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_filters_sensitivity_by_default() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        for (key, sensitivity) in [
+            ("normal", MemorySensitivity::Normal),
+            ("personal", MemorySensitivity::Personal),
+            ("secret", MemorySensitivity::SecretLike),
+            ("regulated", MemorySensitivity::Regulated),
+        ] {
+            let mut params = remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some(key),
+                format!("shared recall token {key}").as_str(),
+            );
+            params.sensitivity = Some(sensitivity);
+            service
+                .remember(user_context(600), params)
+                .await
+                .expect("remember sensitivity row");
+        }
+
+        let default_search = service
+            .search(
+                user_context(601),
+                MemorySearchParams {
+                    query: "shared recall token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("default search");
+        let mut default_keys = default_search
+            .hits
+            .iter()
+            .filter_map(|hit| hit.record.key.as_deref())
+            .collect::<Vec<_>>();
+        default_keys.sort_unstable();
+        assert_eq!(default_keys, vec!["normal", "personal"]);
+
+        let allow_all_search = service
+            .search(
+                MemoryOperationContext {
+                    read_policy: Some(MemoryReadPolicy::allow_all()),
+                    ..user_context(602)
+                },
+                MemorySearchParams {
+                    query: "shared recall token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("allow all search");
+        assert_eq!(allow_all_search.hits.len(), 4);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_exact_key_match_beats_body_only_match() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let exact = service
+            .remember(
+                user_context(650),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.birthday"),
+                    "The birthday memory says September 12.",
+                ),
+            )
+            .await
+            .expect("remember exact");
+        let body_only = service
+            .remember(
+                user_context(651),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.note"),
+                    "The literal user.birthday token appears in this unrelated note.",
+                ),
+            )
+            .await
+            .expect("remember body-only");
+
+        let search = service
+            .search(
+                user_context(652),
+                MemorySearchParams {
+                    query: "user.birthday".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 2);
+        assert_eq!(search.hits[0].record.id, exact.record.id);
+        assert_eq!(search.hits[1].record.id, body_only.record.id);
+        assert!(search.hits[0].score > search.hits[1].score);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_backend_score_contributes_to_final_ranking() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let full_match = service
+            .remember(
+                user_context(653),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("backend.full"),
+                    "Backend score alpha beta gamma appears as a full phrase.",
+                ),
+            )
+            .await
+            .expect("remember full match");
+        let partial_match = service
+            .remember(
+                user_context(654),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("backend.partial"),
+                    "Backend score alpha appears without the other query terms.",
+                ),
+            )
+            .await
+            .expect("remember partial match");
+
+        let search = service
+            .search(
+                user_context(655),
+                MemorySearchParams {
+                    query: "Backend score alpha beta gamma".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 2);
+        assert_eq!(search.hits[0].record.id, full_match.record.id);
+        assert_eq!(search.hits[1].record.id, partial_match.record.id);
+        assert!(search.hits[0].score > search.hits[1].score);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_category_match_boost_contributes_to_final_score() {
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.ranking.backend_score_weight = 0.0;
+        config.ranking.exact_key_boost = 0.0;
+        config.ranking.primary_scope_boost = 0.0;
+        config.ranking.scope_rank_boost = 0.0;
+        config.ranking.recency_boost_max = 0.0;
+        config.ranking.importance_weight = 0.0;
+        config.ranking.confidence_weight = 0.0;
+        config.ranking.category_match_boost = 0.5;
+        let (_store, _backend, service) = setup_service_with_config(database, config).await;
+        let remembered = service
+            .remember(
+                user_context(656),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("category.boost"),
+                    "Category boost isolated token.",
+                ),
+            )
+            .await
+            .expect("remember");
+
+        let unboosted = service
+            .search(
+                user_context(657),
+                MemorySearchParams {
+                    query: "Category boost isolated token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unboosted search");
+        let boosted = service
+            .search(
+                user_context(658),
+                MemorySearchParams {
+                    query: "Category boost isolated token".to_owned(),
+                    categories: vec![MemoryCategory::Identity],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("boosted search");
+        assert_eq!(unboosted.hits[0].record.id, remembered.record.id);
+        assert_eq!(boosted.hits[0].record.id, remembered.record.id);
+        assert_eq!(unboosted.hits[0].score, Some(0.0));
+        assert_eq!(boosted.hits[0].score, Some(0.5));
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_scope_boost_prefers_workspace_over_user_fallback() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let user = service
+            .remember(
+                user_context(660),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("scope.user"),
+                    "Scope boost shared token from user memory.",
+                ),
+            )
+            .await
+            .expect("remember user");
+        let workspace = service
+            .remember(
+                workspace_context("ws_scope_boost", 661),
+                remember_params(
+                    scope(MemoryScopeKind::Workspace, "ws_scope_boost"),
+                    Some("scope.workspace"),
+                    "Scope boost shared token from workspace memory.",
+                ),
+            )
+            .await
+            .expect("remember workspace");
+
+        let search = service
+            .search(
+                MemoryOperationContext {
+                    allow_global_user: true,
+                    ..workspace_context("ws_scope_boost", 662)
+                },
+                MemorySearchParams {
+                    query: "Scope boost shared token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 2);
+        assert_eq!(search.hits[0].record.id, workspace.record.id);
+        assert_eq!(search.hits[1].record.id, user.record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_importance_and_recency_boosts_are_deterministic() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let mut important_params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("rank.important"),
+            "Ranking importance shared token from important memory.",
+        );
+        important_params.importance = Some(1.0);
+        let important = service
+            .remember(user_context(665), important_params)
+            .await
+            .expect("remember important");
+
+        let mut less_important_params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some("rank.less_important"),
+            "Ranking importance shared token from less important memory.",
+        );
+        less_important_params.importance = Some(0.0);
+        let less_important = service
+            .remember(user_context(666), less_important_params)
+            .await
+            .expect("remember less important");
+
+        let importance_search = service
+            .search(
+                user_context(667),
+                MemorySearchParams {
+                    query: "Ranking importance shared token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("importance search");
+        assert_eq!(importance_search.hits.len(), 2);
+        assert_eq!(importance_search.hits[0].record.id, important.record.id);
+        assert_eq!(
+            importance_search.hits[1].record.id,
+            less_important.record.id
+        );
+
+        let older = service
+            .remember(
+                user_context(668),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("rank.older"),
+                    "Ranking recency shared token from older memory.",
+                ),
+            )
+            .await
+            .expect("remember older");
+        let newer = service
+            .remember(
+                user_context(698),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("rank.newer"),
+                    "Ranking recency shared token from newer memory.",
+                ),
+            )
+            .await
+            .expect("remember newer");
+
+        let recency_search = service
+            .search(
+                user_context(699),
+                MemorySearchParams {
+                    query: "Ranking recency shared token".to_owned(),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recency search");
+        assert_eq!(recency_search.hits.len(), 2);
+        assert_eq!(recency_search.hits[0].record.id, newer.record.id);
+        assert_eq!(recency_search.hits[1].record.id, older.record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_empty_scopes_use_user_scope_fallback_when_allowed() {
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(670),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("fallback.user"),
+                    "User scope fallback token should be found.",
+                ),
+            )
+            .await
+            .expect("remember user fallback");
+
+        let search = service
+            .search(
+                MemoryOperationContext {
+                    allow_global_user: true,
+                    ..workspace_context("ws_user_fallback", 671)
+                },
+                MemorySearchParams {
+                    query: "User scope fallback token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].record.id, remembered.record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_uses_tool_search_limit_when_limit_is_missing() {
+    with_database(async |database| {
+        let mut config = MemoryServiceConfig::default();
+        config.recall.tool_search_limit = 2;
+        let (_store, _backend, service) = setup_service_with_config(database, config).await;
+
+        for index in 0..3 {
+            service
+                .remember(
+                    user_context(680 + index),
+                    remember_params(
+                        scope(MemoryScopeKind::User, "default"),
+                        Some(format!("tool.limit.{index}").as_str()),
+                        format!("Tool default limit shared token {index}.").as_str(),
+                    ),
+                )
+                .await
+                .expect("remember");
+        }
+
+        let search = service
+            .search(
+                user_context(690),
+                MemorySearchParams {
+                    query: "Tool default limit shared token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert_eq!(search.hits.len(), 2);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn search_backend_limit_overfetches_before_final_ranking_limit() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("connect sqlite");
-    Migrator::up(&connection, None).await.expect("migrate");
-    let store = Arc::new(CrudStore::new(connection));
-    let backend = Arc::new(RecordingMemoryBackend::default());
-    let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
-    let mut config = MemoryServiceConfig::default();
-    config.recall.tool_search_limit = 3;
-    config.ranking.backend_candidate_multiplier = 4;
-    config.ranking.max_backend_candidates = 100;
-    let service = MemoryService::new(store, backend_for_service, config);
+    with_database(async |database| {
+        let store = support::postgres_store(database).await;
+        let backend = Arc::new(RecordingMemoryBackend::default());
+        let backend_for_service: Arc<dyn MemoryBackend> = backend.clone();
+        let mut config = MemoryServiceConfig::default();
+        config.recall.tool_search_limit = 3;
+        config.ranking.backend_candidate_multiplier = 4;
+        config.ranking.max_backend_candidates = 100;
+        let service = MemoryService::new(store, backend_for_service, config);
 
-    let search = service
-        .search(
-            user_context(695),
-            MemorySearchParams {
-                query: "overfetch token".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
-    assert_eq!(backend.search_limits().await, vec![12]);
+        let search = service
+            .search(
+                user_context(695),
+                MemorySearchParams {
+                    query: "overfetch token".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
+        assert_eq!(backend.search_limits().await, vec![12]);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn expired_and_repair_needed_records_are_not_visible() {
-    let (store, _backend, service) = setup_service().await;
-    let expired = service
-        .remember(
-            user_context(700),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("memory.expired"),
-                "This memory should expire.",
-            ),
-        )
-        .await
-        .expect("remember expired");
-    let repair = service
-        .remember(
-            user_context(701),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("memory.repair"),
-                "This memory needs repair.",
-            ),
-        )
-        .await
-        .expect("remember repair");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let expired = service
+            .remember(
+                user_context(700),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("memory.expired"),
+                    "This memory should expire.",
+                ),
+            )
+            .await
+            .expect("remember expired");
+        let repair = service
+            .remember(
+                user_context(701),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("memory.repair"),
+                    "This memory needs repair.",
+                ),
+            )
+            .await
+            .expect("remember repair");
 
-    store
-        .mark_agent_memory_expired(expired.record.id.as_str(), 702)
-        .await
-        .expect("mark expired");
-    store
-        .mark_agent_memory_repair_status(repair.record.id.as_str(), "repair_needed", 703)
-        .await
-        .expect("mark repair");
+        store
+            .mark_agent_memory_expired(expired.record.id.as_str(), 702)
+            .await
+            .expect("mark expired");
+        store
+            .mark_agent_memory_repair_status(repair.record.id.as_str(), "repair_needed", 703)
+            .await
+            .expect("mark repair");
 
-    let listed = service
-        .list(user_context(704), MemoryListParams::default())
-        .await
-        .expect("list");
-    assert!(listed.records.is_empty());
+        let listed = service
+            .list(user_context(704), MemoryListParams::default())
+            .await
+            .expect("list");
+        assert!(listed.records.is_empty());
 
-    let searched = service
-        .search(
-            user_context(705),
-            MemorySearchParams {
-                query: "memory".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(searched.hits.is_empty());
+        let searched = service
+            .search(
+                user_context(705),
+                MemorySearchParams {
+                    query: "memory".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(searched.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn workspace_local_agent_memory_cannot_leak() {
-    let (_store, _backend, service) = setup_service().await;
-    let agent_id = "agent_research";
-    let workspace_a_agent = workspace_agent_memory_scope_key("ws_memory_a", agent_id);
-    let global_agent = global_agent_memory_scope_key(agent_id);
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let agent_id = "agent_research";
+        let workspace_a_agent = workspace_agent_memory_scope_key("ws_memory_a", agent_id);
+        let global_agent = global_agent_memory_scope_key(agent_id);
 
-    let workspace_memory = service
-        .remember(
-            workspace_context("ws_memory_a", 800),
-            remember_params(
-                scope(MemoryScopeKind::Agent, workspace_a_agent.as_str()),
-                Some("agent.note"),
-                "Workspace A agent memory.",
-            ),
-        )
-        .await
-        .expect("remember workspace agent");
-    let global_memory = service
-        .remember(
-            MemoryOperationContext {
-                allow_global_agent: true,
-                now_unix: Some(801),
-                ..Default::default()
-            },
-            remember_params(
-                scope(MemoryScopeKind::Agent, global_agent.as_str()),
-                Some("agent.global"),
-                "Global agent memory.",
-            ),
-        )
-        .await
-        .expect("remember global agent");
+        let workspace_memory = service
+            .remember(
+                workspace_context("ws_memory_a", 800),
+                remember_params(
+                    scope(MemoryScopeKind::Agent, workspace_a_agent.as_str()),
+                    Some("agent.note"),
+                    "Workspace A agent memory.",
+                ),
+            )
+            .await
+            .expect("remember workspace agent");
+        let global_memory = service
+            .remember(
+                MemoryOperationContext {
+                    allow_global_agent: true,
+                    now_unix: Some(801),
+                    ..Default::default()
+                },
+                remember_params(
+                    scope(MemoryScopeKind::Agent, global_agent.as_str()),
+                    Some("agent.global"),
+                    "Global agent memory.",
+                ),
+            )
+            .await
+            .expect("remember global agent");
 
-    let leaked_get = service
-        .get(
-            workspace_context("ws_memory_b", 802),
-            MemoryGetParams {
-                memory_id: workspace_memory.record.id,
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("get from wrong workspace");
-    assert!(leaked_get.record.is_none());
+        let leaked_get = service
+            .get(
+                workspace_context("ws_memory_b", 802),
+                MemoryGetParams {
+                    memory_id: workspace_memory.record.id,
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("get from wrong workspace");
+        assert!(leaked_get.record.is_none());
 
-    let global_without_allow = service
-        .search(
-            workspace_context("ws_memory_b", 803),
-            MemorySearchParams {
-                query: "Global agent memory".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search global without allow");
-    assert!(global_without_allow.hits.is_empty());
+        let global_without_allow = service
+            .search(
+                workspace_context("ws_memory_b", 803),
+                MemorySearchParams {
+                    query: "Global agent memory".to_owned(),
+                    scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search global without allow");
+        assert!(global_without_allow.hits.is_empty());
 
-    let global_with_allow = service
-        .search(
-            MemoryOperationContext {
-                allow_global_agent: true,
-                ..workspace_context("ws_memory_b", 804)
-            },
-            MemorySearchParams {
-                query: "Global agent memory".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search global with allow");
-    assert_eq!(global_with_allow.hits.len(), 1);
-    assert_eq!(global_with_allow.hits[0].record.id, global_memory.record.id);
+        let global_with_allow = service
+            .search(
+                MemoryOperationContext {
+                    allow_global_agent: true,
+                    ..workspace_context("ws_memory_b", 804)
+                },
+                MemorySearchParams {
+                    query: "Global agent memory".to_owned(),
+                    scopes: vec![scope(MemoryScopeKind::Agent, global_agent.as_str())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search global with allow");
+        assert_eq!(global_with_allow.hits.len(), 1);
+        assert_eq!(global_with_allow.hits[0].record.id, global_memory.record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn global_user_memory_requires_explicit_workspace_allowance() {
-    let (_store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(850),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("user.global"),
-                "Global user memory.",
-            ),
-        )
-        .await
-        .expect("remember global user");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(850),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("user.global"),
+                    "Global user memory.",
+                ),
+            )
+            .await
+            .expect("remember global user");
 
-    let blocked = service
-        .search(
-            workspace_context("ws_memory_a", 851),
-            MemorySearchParams {
-                query: "Global user memory".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("blocked search");
-    assert!(blocked.hits.is_empty());
+        let blocked = service
+            .search(
+                workspace_context("ws_memory_a", 851),
+                MemorySearchParams {
+                    query: "Global user memory".to_owned(),
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("blocked search");
+        assert!(blocked.hits.is_empty());
 
-    let allowed = service
-        .search(
-            MemoryOperationContext {
-                allow_global_user: true,
-                ..workspace_context("ws_memory_a", 852)
-            },
-            MemorySearchParams {
-                query: "Global user memory".to_owned(),
-                scopes: vec![scope(MemoryScopeKind::User, "default")],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("allowed search");
-    assert_eq!(allowed.hits.len(), 1);
-    assert_eq!(allowed.hits[0].record.id, remembered.record.id);
+        let allowed = service
+            .search(
+                MemoryOperationContext {
+                    allow_global_user: true,
+                    ..workspace_context("ws_memory_a", 852)
+                },
+                MemorySearchParams {
+                    query: "Global user memory".to_owned(),
+                    scopes: vec![scope(MemoryScopeKind::User, "default")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("allowed search");
+        assert_eq!(allowed.hits.len(), 1);
+        assert_eq!(allowed.hits[0].record.id, remembered.record.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn missing_backend_payload_creates_repair_diagnostic() {
-    let (store, backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(900),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("memory.missing"),
-                "This backend payload will be removed.",
-            ),
-        )
-        .await
-        .expect("remember");
-    backend.remove_payload(remembered.record.id.as_str()).await;
+    with_database(async |database| {
+        let (store, backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(900),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("memory.missing"),
+                    "This backend payload will be removed.",
+                ),
+            )
+            .await
+            .expect("remember");
+        backend.remove_payload(remembered.record.id.as_str()).await;
 
-    let missing = service
-        .get(
-            user_context(901),
-            MemoryGetParams {
-                memory_id: remembered.record.id.clone(),
-                include_deleted: false,
-            },
-        )
-        .await
-        .expect("get missing payload");
-    assert!(missing.record.is_none());
+        let missing = service
+            .get(
+                user_context(901),
+                MemoryGetParams {
+                    memory_id: remembered.record.id.clone(),
+                    include_deleted: false,
+                },
+            )
+            .await
+            .expect("get missing payload");
+        assert!(missing.record.is_none());
 
-    let control = store
-        .get_agent_memory_record(remembered.record.id.as_str(), true)
-        .await
-        .expect("control")
-        .expect("row");
-    assert_eq!(control.repair_status, "repair_needed");
+        let control = store
+            .get_agent_memory_record(remembered.record.id.as_str(), true)
+            .await
+            .expect("control")
+            .expect("row");
+        assert_eq!(control.repair_status, "repair_needed");
 
-    let claimed = service
-        .claim_due_repair_jobs(902, 60, "repair_worker", 10)
-        .await
-        .expect("claim repair jobs");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].job_kind, "backend_payload_missing");
-    assert!(
-        !claimed[0]
-            .payload_json
-            .as_deref()
-            .unwrap_or_default()
-            .contains("This backend payload will be removed.")
-    );
+        let claimed = service
+            .claim_due_repair_jobs(902, 60, "repair_worker", 10)
+            .await
+            .expect("claim repair jobs");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_kind, "backend_payload_missing");
+        assert!(
+            !claimed[0]
+                .payload_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("This backend payload will be removed.")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn stale_backend_payload_without_control_plane_row_creates_repair_diagnostic() {
-    let (_store, backend, service) = setup_service().await;
-    backend
-        .insert_stale_payload(BackendPutRequest {
-            memory_id: "mem_backend_only".to_owned(),
-            scope: scope(MemoryScopeKind::User, "default"),
-            namespace: None,
-            category: MemoryCategory::Identity,
-            key: Some("backend.only".to_owned()),
-            content: "Backend-only stale memory.".to_owned(),
-            sensitivity: MemorySensitivity::Normal,
-            metadata_json: None,
-            source_thread_id: None,
-            source_turn_id: None,
-            source_item_id: None,
-            created_by_kind: None,
-            created_by_id: None,
-            policy_version: "test".to_owned(),
-            status: MemoryStatus::Active,
-            idempotency_key: None,
-        })
-        .await;
+    with_database(async |database| {
+        let (_store, backend, service) = setup_service(database).await;
+        backend
+            .insert_stale_payload(BackendPutRequest {
+                memory_id: "mem_backend_only".to_owned(),
+                scope: scope(MemoryScopeKind::User, "default"),
+                namespace: None,
+                category: MemoryCategory::Identity,
+                key: Some("backend.only".to_owned()),
+                content: "Backend-only stale memory.".to_owned(),
+                sensitivity: MemorySensitivity::Normal,
+                metadata_json: None,
+                source_thread_id: None,
+                source_turn_id: None,
+                source_item_id: None,
+                created_by_kind: None,
+                created_by_id: None,
+                policy_version: "test".to_owned(),
+                status: MemoryStatus::Active,
+                idempotency_key: None,
+            })
+            .await;
 
-    let search = service
-        .search(
-            user_context(950),
-            MemorySearchParams {
-                query: "Backend-only".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("service search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(950),
+                MemorySearchParams {
+                    query: "Backend-only".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("service search");
+        assert!(search.hits.is_empty());
 
-    let claimed = service
-        .claim_due_repair_jobs(951, 60, "repair_worker", 10)
-        .await
-        .expect("claim repair jobs");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].job_kind, "backend_stale_payload");
-    assert!(
-        !claimed[0]
-            .payload_json
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Backend-only stale memory.")
-    );
+        let claimed = service
+            .claim_due_repair_jobs(951, 60, "repair_worker", 10)
+            .await
+            .expect("claim repair jobs");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_kind, "backend_stale_payload");
+        assert!(
+            !claimed[0]
+                .payload_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Backend-only stale memory.")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn repair_job_helpers_roundtrip() {
-    let (_store, _backend, service) = setup_service().await;
-    let completed = service
-        .enqueue_repair_job(
-            NewAgentMemoryRepairJob {
-                job_kind: "backend_payload_missing".to_owned(),
-                workspace_id: None,
-                scope_kind: Some(MemoryScopeKind::User),
-                scope_key_hash: Some("hash_one".to_owned()),
-                memory_id: Some("mem_repair_one".to_owned()),
-                priority: 10,
-                max_attempts: 3,
-                scheduled_at_unix: 1000,
-                payload_json: Some(serde_json::json!({"memory_id": "mem_repair_one"}).to_string()),
-            },
-            1000,
-        )
-        .await
-        .expect("enqueue completed job");
-    let claimed = service
-        .claim_due_repair_jobs(1001, 60, "worker_one", 10)
-        .await
-        .expect("claim");
-    assert_eq!(claimed[0].id, completed.id);
-    let completed = service
-        .complete_repair_job(claimed[0].id.as_str(), "worker_one", None, 1002)
-        .await
-        .expect("complete")
-        .expect("completed job");
-    assert_eq!(completed.status, "completed");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let completed = service
+            .enqueue_repair_job(
+                NewAgentMemoryRepairJob {
+                    job_kind: "backend_payload_missing".to_owned(),
+                    workspace_id: None,
+                    scope_kind: Some(MemoryScopeKind::User),
+                    scope_key_hash: Some("hash_one".to_owned()),
+                    memory_id: Some("mem_repair_one".to_owned()),
+                    priority: 10,
+                    max_attempts: 3,
+                    scheduled_at_unix: 1000,
+                    payload_json: Some(
+                        serde_json::json!({"memory_id": "mem_repair_one"}).to_string(),
+                    ),
+                },
+                1000,
+            )
+            .await
+            .expect("enqueue completed job");
+        let claimed = service
+            .claim_due_repair_jobs(1001, 60, "worker_one", 10)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].id, completed.id);
+        let completed = service
+            .complete_repair_job(claimed[0].id.as_str(), "worker_one", None, 1002)
+            .await
+            .expect("complete")
+            .expect("completed job");
+        assert_eq!(completed.status, "completed");
 
-    let retry = service
-        .enqueue_repair_job(
-            NewAgentMemoryRepairJob {
-                job_kind: "backend_delete_failed".to_owned(),
-                workspace_id: None,
-                scope_kind: Some(MemoryScopeKind::User),
-                scope_key_hash: Some("hash_two".to_owned()),
-                memory_id: Some("mem_repair_two".to_owned()),
-                priority: 10,
-                max_attempts: 2,
-                scheduled_at_unix: 1010,
-                payload_json: Some(serde_json::json!({"memory_id": "mem_repair_two"}).to_string()),
-            },
-            1010,
-        )
-        .await
-        .expect("enqueue retry job");
-    let claimed_retry = service
-        .claim_due_repair_jobs(1011, 60, "worker_two", 10)
-        .await
-        .expect("claim retry");
-    assert_eq!(claimed_retry[0].id, retry.id);
-    let pending = service
-        .fail_repair_job(
-            claimed_retry[0].id.as_str(),
-            "worker_two",
-            "temporary".to_owned(),
-            Some(1020),
-            1012,
-        )
-        .await
-        .expect("fail below max")
-        .expect("pending retry");
-    assert_eq!(pending.status, "pending");
+        let retry = service
+            .enqueue_repair_job(
+                NewAgentMemoryRepairJob {
+                    job_kind: "backend_delete_failed".to_owned(),
+                    workspace_id: None,
+                    scope_kind: Some(MemoryScopeKind::User),
+                    scope_key_hash: Some("hash_two".to_owned()),
+                    memory_id: Some("mem_repair_two".to_owned()),
+                    priority: 10,
+                    max_attempts: 2,
+                    scheduled_at_unix: 1010,
+                    payload_json: Some(
+                        serde_json::json!({"memory_id": "mem_repair_two"}).to_string(),
+                    ),
+                },
+                1010,
+            )
+            .await
+            .expect("enqueue retry job");
+        let claimed_retry = service
+            .claim_due_repair_jobs(1011, 60, "worker_two", 10)
+            .await
+            .expect("claim retry");
+        assert_eq!(claimed_retry[0].id, retry.id);
+        let pending = service
+            .fail_repair_job(
+                claimed_retry[0].id.as_str(),
+                "worker_two",
+                "temporary".to_owned(),
+                Some(1020),
+                1012,
+            )
+            .await
+            .expect("fail below max")
+            .expect("pending retry");
+        assert_eq!(pending.status, "pending");
 
-    let claimed_again = service
-        .claim_due_repair_jobs(1021, 60, "worker_two", 10)
-        .await
-        .expect("claim again");
-    let failed = service
-        .fail_repair_job(
-            claimed_again[0].id.as_str(),
-            "worker_two",
-            "permanent".to_owned(),
-            None,
-            1022,
-        )
-        .await
-        .expect("fail at max")
-        .expect("failed job");
-    assert_eq!(failed.status, "failed");
+        let claimed_again = service
+            .claim_due_repair_jobs(1021, 60, "worker_two", 10)
+            .await
+            .expect("claim again");
+        let failed = service
+            .fail_repair_job(
+                claimed_again[0].id.as_str(),
+                "worker_two",
+                "permanent".to_owned(),
+                None,
+                1022,
+            )
+            .await
+            .expect("fail at max")
+            .expect("failed job");
+        assert_eq!(failed.status, "failed");
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn noop_backend_fails_closed() {
-    let connection = Database::connect("sqlite::memory:")
-        .await
-        .expect("connect sqlite");
-    Migrator::up(&connection, None).await.expect("migrate");
-    let store = Arc::new(CrudStore::new(connection));
-    let service = MemoryService::with_noop_backend(store.clone());
+    with_database(async |database| {
+        let store = support::postgres_store(database).await;
+        let service = MemoryService::with_noop_backend(store.clone());
 
-    let remember = service
-        .remember(
-            user_context(1100),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("noop.test"),
-                "This should not be stored.",
-            ),
-        )
-        .await;
-    assert!(remember.is_err());
+        let remember = service
+            .remember(
+                user_context(1100),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("noop.test"),
+                    "This should not be stored.",
+                ),
+            )
+            .await;
+        assert!(remember.is_err());
 
-    let search = service
-        .search(
-            user_context(1101),
-            MemorySearchParams {
-                query: "anything".to_owned(),
+        let search = service
+            .search(
+                user_context(1101),
+                MemorySearchParams {
+                    query: "anything".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(search.is_err());
+
+        let rows = store
+            .list_agent_memory_records(AgentMemoryListFilter {
+                scopes: vec![scope(MemoryScopeKind::User, "default")],
                 ..Default::default()
-            },
-        )
-        .await;
-    assert!(search.is_err());
-
-    let rows = store
-        .list_agent_memory_records(AgentMemoryListFilter {
-            scopes: vec![scope(MemoryScopeKind::User, "default")],
-            ..Default::default()
-        })
-        .await
-        .expect("list control rows");
-    assert!(rows.is_empty());
+            })
+            .await
+            .expect("list control rows");
+        assert!(rows.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn backend_delete_failure_keeps_tombstone_and_enqueues_repair() {
-    let (store, backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(1200),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("delete.failure"),
-                "Delete failure should not restore visibility.",
-            ),
-        )
-        .await
-        .expect("remember");
-    backend
-        .set_delete_error(Some("delete failed".to_owned()))
-        .await;
+    with_database(async |database| {
+        let (store, backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(1200),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("delete.failure"),
+                    "Delete failure should not restore visibility.",
+                ),
+            )
+            .await
+            .expect("remember");
+        backend
+            .set_delete_error(Some("delete failed".to_owned()))
+            .await;
 
-    let forgotten = service
-        .forget(
-            user_context(1201),
-            MemoryForgetParams {
-                target: MemoryForgetTarget::Id {
-                    memory_id: remembered.record.id.clone(),
+        let forgotten = service
+            .forget(
+                user_context(1201),
+                MemoryForgetParams {
+                    target: MemoryForgetTarget::Id {
+                        memory_id: remembered.record.id.clone(),
+                    },
+                    reason: Some("test failure".to_owned()),
+                    actor: None,
+                    dry_run: false,
                 },
-                reason: Some("test failure".to_owned()),
-                actor: None,
-                dry_run: false,
-            },
-        )
-        .await
-        .expect("forget");
-    assert_eq!(
-        forgotten.forgotten_memory_ids,
-        vec![remembered.record.id.clone()]
-    );
+            )
+            .await
+            .expect("forget");
+        assert_eq!(
+            forgotten.forgotten_memory_ids,
+            vec![remembered.record.id.clone()]
+        );
 
-    let control = store
-        .get_agent_memory_record(remembered.record.id.as_str(), true)
-        .await
-        .expect("control")
-        .expect("row");
-    assert_eq!(control.status, MemoryStatus::Deleted);
+        let control = store
+            .get_agent_memory_record(remembered.record.id.as_str(), true)
+            .await
+            .expect("control")
+            .expect("row");
+        assert_eq!(control.status, MemoryStatus::Deleted);
 
-    let search = service
-        .search(
-            user_context(1202),
-            MemorySearchParams {
-                query: "restore visibility".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(1202),
+                MemorySearchParams {
+                    query: "restore visibility".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
 
-    let claimed = service
-        .claim_due_repair_jobs(1203, 60, "repair_worker", 10)
-        .await
-        .expect("claim");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].job_kind, "backend_delete_failed");
-    assert!(
-        !claimed[0]
-            .payload_json
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Delete failure should not restore visibility.")
-    );
+        let claimed = service
+            .claim_due_repair_jobs(1203, 60, "repair_worker", 10)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].job_kind, "backend_delete_failed");
+        assert!(
+            !claimed[0]
+                .payload_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Delete failure should not restore visibility.")
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn quarantine_hides_memory_from_product_recall_and_restore_reenables_it() {
-    let (store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(1300),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("quarantine.identity"),
-                "User name is Александр.",
-            ),
-        )
-        .await
-        .expect("remember");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(1300),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("quarantine.identity"),
+                    "User name is Александр.",
+                ),
+            )
+            .await
+            .expect("remember");
 
-    let quarantined = service
-        .quarantine_memory(
-            user_context(1301),
-            MemoryQuarantineRequest {
-                memory_id: remembered.record.id.clone(),
-                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-                actor: None,
-                details_json: None,
-                schedule_backend_cleanup: true,
-            },
-        )
-        .await
-        .expect("quarantine");
-    assert_eq!(quarantined.quarantine.memory_id, remembered.record.id);
-    assert_eq!(
-        quarantined
-            .repair_job
-            .as_ref()
-            .expect("cleanup repair job")
-            .job_kind,
-        "backend_quarantine_cleanup"
-    );
+        let quarantined = service
+            .quarantine_memory(
+                user_context(1301),
+                MemoryQuarantineRequest {
+                    memory_id: remembered.record.id.clone(),
+                    reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                    actor: None,
+                    details_json: None,
+                    schedule_backend_cleanup: true,
+                },
+            )
+            .await
+            .expect("quarantine");
+        assert_eq!(quarantined.quarantine.memory_id, remembered.record.id);
+        assert_eq!(
+            quarantined
+                .repair_job
+                .as_ref()
+                .expect("cleanup repair job")
+                .job_kind,
+            "backend_quarantine_cleanup"
+        );
 
-    let search = service
-        .search(
-            user_context(1302),
-            MemorySearchParams {
-                query: "Александр".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(1302),
+                MemorySearchParams {
+                    query: "Александр".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
 
-    let repeated = service
-        .quarantine_memory(
-            user_context(1305),
-            MemoryQuarantineRequest {
-                memory_id: remembered.record.id.clone(),
-                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-                actor: None,
-                details_json: None,
-                schedule_backend_cleanup: true,
-            },
-        )
-        .await
-        .expect("repeat quarantine");
-    assert_eq!(repeated.quarantine.id, quarantined.quarantine.id);
-    assert_eq!(
-        repeated.repair_job.as_ref().map(|job| job.id.clone()),
-        quarantined.repair_job.as_ref().map(|job| job.id.clone())
-    );
+        let repeated = service
+            .quarantine_memory(
+                user_context(1305),
+                MemoryQuarantineRequest {
+                    memory_id: remembered.record.id.clone(),
+                    reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                    actor: None,
+                    details_json: None,
+                    schedule_backend_cleanup: true,
+                },
+            )
+            .await
+            .expect("repeat quarantine");
+        assert_eq!(repeated.quarantine.id, quarantined.quarantine.id);
+        assert_eq!(
+            repeated.repair_job.as_ref().map(|job| job.id.clone()),
+            quarantined.repair_job.as_ref().map(|job| job.id.clone())
+        );
 
-    let restored = service
-        .restore_quarantined_memory(
-            user_context(1306),
-            MemoryRestoreRequest {
-                memory_id: remembered.record.id.clone(),
-                actor: None,
-                schedule_backend_reindex: true,
-            },
-        )
-        .await
-        .expect("restore");
-    assert!(restored.quarantine.is_some());
-    assert_eq!(
-        restored
-            .repair_job
-            .as_ref()
-            .expect("reindex repair job")
-            .job_kind,
-        "backend_restore_reindex"
-    );
+        let restored = service
+            .restore_quarantined_memory(
+                user_context(1306),
+                MemoryRestoreRequest {
+                    memory_id: remembered.record.id.clone(),
+                    actor: None,
+                    schedule_backend_reindex: true,
+                },
+            )
+            .await
+            .expect("restore");
+        assert!(restored.quarantine.is_some());
+        assert_eq!(
+            restored
+                .repair_job
+                .as_ref()
+                .expect("reindex repair job")
+                .job_kind,
+            "backend_restore_reindex"
+        );
 
-    let restored_search = service
-        .search(
-            user_context(1307),
-            MemorySearchParams {
-                query: "Александр".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search after restore");
-    assert_eq!(restored_search.hits.len(), 1);
+        let restored_search = service
+            .search(
+                user_context(1307),
+                MemorySearchParams {
+                    query: "Александр".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search after restore");
+        assert_eq!(restored_search.hits.len(), 1);
 
-    let history = store
-        .list_agent_memory_quarantine_history(remembered.record.id.as_str(), 10)
-        .await
-        .expect("quarantine history");
-    assert_eq!(history.len(), 1);
-    assert!(history[0].resolved_at_unix.is_some());
+        let history = store
+            .list_agent_memory_quarantine_history(remembered.record.id.as_str(), 10)
+            .await
+            .expect("quarantine history");
+        assert_eq!(history.len(), 1);
+        assert!(history[0].resolved_at_unix.is_some());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn restore_does_not_resurrect_deleted_quarantined_memory() {
-    let (store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(1400),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("quarantine.deleted"),
-                "Deleted quarantined memory should stay hidden.",
-            ),
-        )
-        .await
-        .expect("remember");
-    service
-        .quarantine_memory(
-            user_context(1401),
-            MemoryQuarantineRequest {
-                memory_id: remembered.record.id.clone(),
-                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-                actor: None,
-                details_json: None,
-                schedule_backend_cleanup: false,
-            },
-        )
-        .await
-        .expect("quarantine");
-    store
-        .mark_agent_memory_deleted(
-            remembered.record.id.as_str(),
-            None,
-            Some("deleted during quarantine".to_owned()),
-            1402,
-        )
-        .await
-        .expect("delete");
+    with_database(async |database| {
+        let (store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(1400),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("quarantine.deleted"),
+                    "Deleted quarantined memory should stay hidden.",
+                ),
+            )
+            .await
+            .expect("remember");
+        service
+            .quarantine_memory(
+                user_context(1401),
+                MemoryQuarantineRequest {
+                    memory_id: remembered.record.id.clone(),
+                    reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                    actor: None,
+                    details_json: None,
+                    schedule_backend_cleanup: false,
+                },
+            )
+            .await
+            .expect("quarantine");
+        store
+            .mark_agent_memory_deleted(
+                remembered.record.id.as_str(),
+                None,
+                Some("deleted during quarantine".to_owned()),
+                1402,
+            )
+            .await
+            .expect("delete");
 
-    let restored = service
-        .restore_quarantined_memory(
-            user_context(1403),
-            MemoryRestoreRequest {
-                memory_id: remembered.record.id.clone(),
-                actor: None,
-                schedule_backend_reindex: true,
-            },
-        )
-        .await
-        .expect("restore");
-    assert!(restored.quarantine.is_some());
-    assert!(restored.repair_job.is_none());
+        let restored = service
+            .restore_quarantined_memory(
+                user_context(1403),
+                MemoryRestoreRequest {
+                    memory_id: remembered.record.id.clone(),
+                    actor: None,
+                    schedule_backend_reindex: true,
+                },
+            )
+            .await
+            .expect("restore");
+        assert!(restored.quarantine.is_some());
+        assert!(restored.repair_job.is_none());
 
-    let search = service
-        .search(
-            user_context(1404),
-            MemorySearchParams {
-                query: "quarantined memory".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(search.hits.is_empty());
+        let search = service
+            .search(
+                user_context(1404),
+                MemorySearchParams {
+                    query: "quarantined memory".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(search.hits.is_empty());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn quarantine_workspace_guard_blocks_other_workspace() {
-    let (_store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            workspace_context("ws_quarantine_a", 1500),
-            remember_params(
-                scope(MemoryScopeKind::Workspace, "ws_quarantine_a"),
-                Some("workspace.secret"),
-                "Workspace A memory.",
-            ),
-        )
-        .await
-        .expect("remember");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                workspace_context("ws_quarantine_a", 1500),
+                remember_params(
+                    scope(MemoryScopeKind::Workspace, "ws_quarantine_a"),
+                    Some("workspace.secret"),
+                    "Workspace A memory.",
+                ),
+            )
+            .await
+            .expect("remember");
 
-    let result = service
-        .quarantine_memory(
-            workspace_context("ws_quarantine_b", 1501),
-            MemoryQuarantineRequest {
-                memory_id: remembered.record.id,
-                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-                actor: None,
-                details_json: None,
-                schedule_backend_cleanup: false,
-            },
-        )
-        .await;
-    assert!(result.is_err());
+        let result = service
+            .quarantine_memory(
+                workspace_context("ws_quarantine_b", 1501),
+                MemoryQuarantineRequest {
+                    memory_id: remembered.record.id,
+                    reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                    actor: None,
+                    details_json: None,
+                    schedule_backend_cleanup: false,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn repair_worker_processes_quarantine_cleanup_and_restore_reindex() {
-    let (_store, _backend, service) = setup_service().await;
-    let remembered = service
-        .remember(
-            user_context(1600),
-            remember_params(
-                scope(MemoryScopeKind::User, "default"),
-                Some("repair.quarantine"),
-                "Repair worker quarantine memory.",
-            ),
-        )
-        .await
-        .expect("remember");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let remembered = service
+            .remember(
+                user_context(1600),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some("repair.quarantine"),
+                    "Repair worker quarantine memory.",
+                ),
+            )
+            .await
+            .expect("remember");
 
-    service
-        .quarantine_memory(
-            user_context(1601),
-            MemoryQuarantineRequest {
-                memory_id: remembered.record.id.clone(),
-                reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
-                actor: None,
-                details_json: None,
-                schedule_backend_cleanup: true,
-            },
-        )
-        .await
-        .expect("quarantine");
-    let cleanup = service
-        .claim_due_repair_jobs(1602, 60, "repair_worker", 10)
-        .await
-        .expect("claim cleanup");
-    assert_eq!(cleanup.len(), 1);
-    let completed_cleanup = service
-        .process_repair_job(cleanup[0].id.as_str(), "repair_worker", 1603)
-        .await
-        .expect("process cleanup")
-        .expect("completed cleanup");
-    assert_eq!(completed_cleanup.status, "completed");
+        service
+            .quarantine_memory(
+                user_context(1601),
+                MemoryQuarantineRequest {
+                    memory_id: remembered.record.id.clone(),
+                    reason_code: MemoryLifecycleReasonCode::ManualDeveloperAdminQuarantine,
+                    actor: None,
+                    details_json: None,
+                    schedule_backend_cleanup: true,
+                },
+            )
+            .await
+            .expect("quarantine");
+        let cleanup = service
+            .claim_due_repair_jobs(1602, 60, "repair_worker", 10)
+            .await
+            .expect("claim cleanup");
+        assert_eq!(cleanup.len(), 1);
+        let completed_cleanup = service
+            .process_repair_job(cleanup[0].id.as_str(), "repair_worker", 1603)
+            .await
+            .expect("process cleanup")
+            .expect("completed cleanup");
+        assert_eq!(completed_cleanup.status, "completed");
 
-    service
-        .restore_quarantined_memory(
-            user_context(1604),
-            MemoryRestoreRequest {
-                memory_id: remembered.record.id.clone(),
-                actor: None,
-                schedule_backend_reindex: true,
-            },
-        )
-        .await
-        .expect("restore");
-    let reindex = service
-        .claim_due_repair_jobs(1605, 60, "repair_worker", 10)
-        .await
-        .expect("claim reindex");
-    assert_eq!(reindex.len(), 1);
-    assert_eq!(reindex[0].job_kind, "backend_restore_reindex");
-    let completed_reindex = service
-        .process_repair_job(reindex[0].id.as_str(), "repair_worker", 1606)
-        .await
-        .expect("process reindex")
-        .expect("completed reindex");
-    assert_eq!(completed_reindex.status, "pending");
-    assert!(
-        completed_reindex
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("full memory payload unavailable")
-    );
+        service
+            .restore_quarantined_memory(
+                user_context(1604),
+                MemoryRestoreRequest {
+                    memory_id: remembered.record.id.clone(),
+                    actor: None,
+                    schedule_backend_reindex: true,
+                },
+            )
+            .await
+            .expect("restore");
+        let reindex = service
+            .claim_due_repair_jobs(1605, 60, "repair_worker", 10)
+            .await
+            .expect("claim reindex");
+        assert_eq!(reindex.len(), 1);
+        assert_eq!(reindex[0].job_kind, "backend_restore_reindex");
+        let completed_reindex = service
+            .process_repair_job(reindex[0].id.as_str(), "repair_worker", 1606)
+            .await
+            .expect("process reindex")
+            .expect("completed reindex");
+        assert_eq!(completed_reindex.status, "pending");
+        assert!(
+            completed_reindex
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("full memory payload unavailable")
+        );
 
-    let search = service
-        .search(
-            user_context(1607),
-            MemorySearchParams {
-                query: "quarantine memory".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search");
-    assert!(
-        search.hits.is_empty(),
-        "cleanup removed the full payload; preview cannot recreate it"
-    );
+        let search = service
+            .search(
+                user_context(1607),
+                MemorySearchParams {
+                    query: "quarantine memory".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search");
+        assert!(
+            search.hits.is_empty(),
+            "cleanup removed the full payload; preview cannot recreate it"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn candidate_terminal_transitions_are_idempotent_and_do_not_hide_memory() {
-    let (_store, _backend, service) = setup_service().await;
-    let active = service
-        .write_semantic_memory(
-            user_context(1700),
-            semantic_write_params(
-                identity_name_semantic(MemoryExplicitness::Explicit),
-                "User's name is Alexander.",
-                "Alexander",
-                MemorySemanticWriteDisposition::AcceptActive,
-                "turn_candidate_terminal_active",
-            ),
-        )
-        .await
-        .expect("active write")
-        .record
-        .expect("active record");
-    let candidate = service
-        .write_semantic_memory(
-            user_context(1701),
-            semantic_write_params(
-                relationship_semantic("terminal-candidate"),
-                "Terminal candidate fact.",
-                "terminal-candidate-value",
-                MemorySemanticWriteDisposition::CreatePendingCandidate,
-                "turn_candidate_terminal_pending",
-            ),
-        )
-        .await
-        .expect("candidate write")
-        .candidate
-        .expect("candidate");
+    with_database(async |database| {
+        let (_store, _backend, service) = setup_service(database).await;
+        let active = service
+            .write_semantic_memory(
+                user_context(1700),
+                semantic_write_params(
+                    identity_name_semantic(MemoryExplicitness::Explicit),
+                    "User's name is Alexander.",
+                    "Alexander",
+                    MemorySemanticWriteDisposition::AcceptActive,
+                    "turn_candidate_terminal_active",
+                ),
+            )
+            .await
+            .expect("active write")
+            .record
+            .expect("active record");
+        let candidate = service
+            .write_semantic_memory(
+                user_context(1701),
+                semantic_write_params(
+                    relationship_semantic("terminal-candidate"),
+                    "Terminal candidate fact.",
+                    "terminal-candidate-value",
+                    MemorySemanticWriteDisposition::CreatePendingCandidate,
+                    "turn_candidate_terminal_pending",
+                ),
+            )
+            .await
+            .expect("candidate write")
+            .candidate
+            .expect("candidate");
 
-    let rejected = service
-        .reject_candidate(
-            user_context(1702),
-            pioneer_protocol::MemoryCandidatesRejectParams {
-                candidate_id: candidate.id.clone(),
-                reason: Some("not useful".to_owned()),
-                actor: None,
-            },
-        )
-        .await
-        .expect("reject");
-    assert_eq!(rejected.candidate.status, MemoryCandidateStatus::Rejected);
+        let rejected = service
+            .reject_candidate(
+                user_context(1702),
+                pioneer_protocol::MemoryCandidatesRejectParams {
+                    candidate_id: candidate.id.clone(),
+                    reason: Some("not useful".to_owned()),
+                    actor: None,
+                },
+            )
+            .await
+            .expect("reject");
+        assert_eq!(rejected.candidate.status, MemoryCandidateStatus::Rejected);
 
-    let rejected_again = service
-        .reject_candidate(
-            user_context(1703),
-            pioneer_protocol::MemoryCandidatesRejectParams {
-                candidate_id: candidate.id.clone(),
-                reason: Some("still not useful".to_owned()),
-                actor: None,
-            },
-        )
-        .await
-        .expect("reject again");
-    assert_eq!(
-        rejected_again.candidate.status,
-        MemoryCandidateStatus::Rejected
-    );
+        let rejected_again = service
+            .reject_candidate(
+                user_context(1703),
+                pioneer_protocol::MemoryCandidatesRejectParams {
+                    candidate_id: candidate.id.clone(),
+                    reason: Some("still not useful".to_owned()),
+                    actor: None,
+                },
+            )
+            .await
+            .expect("reject again");
+        assert_eq!(
+            rejected_again.candidate.status,
+            MemoryCandidateStatus::Rejected
+        );
 
-    let approve_rejected = service
-        .approve_candidate(
-            user_context(1704),
-            MemoryCandidatesApproveParams {
-                candidate_id: candidate.id,
-                reason: Some("should not approve terminal rejected".to_owned()),
-                actor: None,
-            },
-        )
-        .await;
-    assert!(approve_rejected.is_err());
+        let approve_rejected = service
+            .approve_candidate(
+                user_context(1704),
+                MemoryCandidatesApproveParams {
+                    candidate_id: candidate.id,
+                    reason: Some("should not approve terminal rejected".to_owned()),
+                    actor: None,
+                },
+            )
+            .await;
+        assert!(approve_rejected.is_err());
 
-    let search = service
-        .search(
-            user_context(1705),
-            MemorySearchParams {
-                query: "Alexander".to_owned(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("search active");
-    assert_eq!(search.hits.len(), 1);
-    assert_eq!(search.hits[0].record.id, active.id);
+        let search = service
+            .search(
+                user_context(1705),
+                MemorySearchParams {
+                    query: "Alexander".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("search active");
+        assert_eq!(search.hits.len(), 1);
+        assert_eq!(search.hits[0].record.id, active.id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

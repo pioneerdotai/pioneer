@@ -45,13 +45,11 @@ macro_rules! labels {
 labels!(Family {
     ToolText => "tool.text", ToolMetadata => "tool.metadata",
     CliMapping => "cli.mapping", TaskHistory => "task.history",
-    TaskEvent => "task.event", Mixed => "mixed",
+    TaskEvent => "task.event", TurnEvent => "turn.event", TurnItem => "turn.item", Mixed => "mixed",
 });
 labels!(Mode { Full => "full", Range => "range", Background => "background" });
 labels!(Stage {
     SourceRead => "source_read", BlockRead => "block_read",
-    DictionaryLoad => "dictionary_load", DictionaryTrain => "dictionary_train",
-    DictionaryPrepare => "dictionary_prepare", DictionaryLookup => "dictionary_lookup",
     Compress => "compress", Decompress => "decompress", VerifyAssemble => "verify_assemble",
     Publish => "publish", Cleanup => "cleanup", Idle => "idle", Backoff => "backoff",
 });
@@ -65,14 +63,10 @@ labels!(ByteKind {
     PublishedOriginal => "published_original", PublishedEncoded => "published_encoded",
 });
 labels!(BlockKind { Read => "read", Encoded => "encoded", Published => "published", Cleaned => "cleaned" });
-labels!(DictionaryEvent {
-    Hit => "hit", Miss => "miss", Train => "train", Prepare => "prepare",
-    TrainFallback => "train_fallback",
-});
 labels!(NativeOutcome { Ok => "ok", Missing => "missing", Error => "error", Cancelled => "cancelled" });
 
 /// `Mixed` means unknown or multiple families (discovery/cleanup); never infer
-/// a family from an owner ID, table text, dictionary identity or payload bytes.
+/// a family from an owner ID, table text or payload bytes.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LiveOperation {
     pub family: Family,
@@ -85,13 +79,12 @@ const FAMILIES: usize = Family::ALL.len();
 const STAGES: usize = Stage::ALL.len();
 const BYTE_KINDS: usize = ByteKind::ALL.len();
 const BLOCK_KINDS: usize = BlockKind::ALL.len();
-const DICTIONARY_EVENTS: usize = DictionaryEvent::ALL.len();
 const LIVE_INTERVAL_MS: u64 = 250;
 // Instrument label combinations per resource, without an outcome on phases,
-// bytes, blocks or dictionary events. Resource identity is the existing SDK's.
+// bytes or blocks. Resource identity is the existing SDK's.
 pub const MAX_METRIC_SERIES: usize = Family::ALL.len()
     * Mode::ALL.len()
-    * (2 * Outcome::ALL.len() + STAGES + BYTE_KINDS + BLOCK_KINDS + DICTIONARY_EVENTS)
+    * (2 * Outcome::ALL.len() + STAGES + BYTE_KINDS + BLOCK_KINDS)
     + Family::ALL.len() * (NativeOutcome::ALL.len() + 2 + 1 + 1);
 const _: () = assert!(MAX_METRIC_SERIES < 2_000);
 
@@ -101,7 +94,6 @@ pub(crate) struct Metrics {
     phase: Histogram<f64>,
     bytes: Counter<u64>,
     blocks: Counter<u64>,
-    dictionary: Counter<u64>,
     native_reads: Counter<u64>,
     native_duration: Histogram<f64>,
     native_bytes: Counter<u64>,
@@ -120,16 +112,13 @@ impl Metrics {
                 .with_description("Sum of phase elapsed wall durations per logical operation; inclusive nested phases must not be added together")
                 .with_unit("ms").build(),
             bytes: meter.u64_counter("pioneer.gateway.portable.bytes")
-                .with_description("Actual read/encoded/published bytes by kind; PPAY envelope included in encoded sizes, SQLite/dictionary/storage overhead excluded; published only after commit")
+                .with_description("Actual payload bytes read, encoded and published by kind, excluding PostgreSQL storage overhead; published only after commit")
                 .with_unit("By").build(),
             blocks: meter.u64_counter("pioneer.gateway.portable.blocks")
                 .with_description("Actual read/encoded/published/cleaned blocks by kind; staged blocks are not published")
                 .with_unit("{block}").build(),
-            dictionary: meter.u64_counter("pioneer.gateway.portable.dictionary.events")
-                .with_description("Prepared dictionary cache lookup hit/miss, attempted train/prepare and native training failure handled by normal dictionary fallback; aggregated per logical operation")
-                .with_unit("{event}").build(),
             native_reads: meter.u64_counter("pioneer.gateway.portable.native.reads")
-                .with_description("Native guard/blob read operations; outside ordinary SQL callback/query-count and named SQLite worker-thread CPU coverage")
+                .with_description("Native guard/blob read operations; outside ordinary SQL callback/query-count and SQLx query-scope CPU coverage")
                 .with_unit("{read}").build(),
             native_duration: meter.f64_histogram("pioneer.gateway.portable.native.operation.duration")
                 .with_description("Sum of native handle wait or guard/blob execution elapsed per logical operation/family (standalone read when unowned); not per-read latency or CPU; excludes pool/admission waits")
@@ -210,7 +199,6 @@ struct Aggregate {
     phase_calls: [[AtomicU64; STAGES]; FAMILIES],
     bytes: [[AtomicU64; BYTE_KINDS]; FAMILIES],
     blocks: [[AtomicU64; BLOCK_KINDS]; FAMILIES],
-    dictionary: [[AtomicU64; DICTIONARY_EVENTS]; FAMILIES],
     native: [NativeTotals; FAMILIES],
     parent: Context,
     started: Instant,
@@ -238,7 +226,6 @@ impl Aggregate {
             phase_calls: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             bytes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             blocks: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
-            dictionary: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             native: std::array::from_fn(|_| NativeTotals::default()),
             parent,
             started: Instant::now(),
@@ -282,14 +269,13 @@ impl Aggregate {
         let now = crate::identity::monotonic_ms();
         // First train/prepare entry is visible even after a fast DB phase.
         // Full/range reads also expose their first codec/verification entry.
-        // Short background block phases and cache lookups stay coalesced: a
+        // Short background block phases stay coalesced: a
         // one-block quantum must not journal every CPU transition. There is
         // at most one immediate entry per eligible phase per operation.
         let first_stage = stage.is_some_and(|stage| {
             let bit = 1_u64 << stage as usize;
             let first = self.live_stages_seen.fetch_or(bit, Ordering::Relaxed) & bit == 0;
             first
-                && !matches!(stage, Stage::DictionaryLookup)
                 && !(self.mode == Mode::Background
                     && matches!(
                         stage,
@@ -446,11 +432,6 @@ pub fn bytes(kind: ByteKind, count: u64) {
 pub fn blocks(kind: BlockKind, count: u64) {
     if let Some(s) = current() {
         add(&s.blocks[s.family() as usize][kind as usize], count);
-    }
-}
-pub fn dictionary_event(event: DictionaryEvent) {
-    if let Some(s) = current() {
-        add(&s.dictionary[s.family() as usize][event as usize], 1);
     }
 }
 pub fn phase(stage: Stage, elapsed: Duration) {
@@ -779,19 +760,6 @@ fn emit(s: &Aggregate, elapsed: Duration) {
                 );
             }
         }
-        for event in DictionaryEvent::ALL {
-            let count = s.dictionary[family_index][*event as usize].load(Ordering::Relaxed);
-            if count > 0 {
-                metrics.dictionary.add(
-                    count,
-                    &[
-                        dimensions[0].clone(),
-                        dimensions[1].clone(),
-                        KeyValue::new("event", event.as_str()),
-                    ],
-                );
-            }
-        }
     }
     // Reuse the existing 30-second workload anomaly limiter. All portable
     // summaries share its one slot; main metrics above are never sampled.
@@ -1098,15 +1066,8 @@ mod tests {
             phase(Stage::Compress, Duration::from_millis(3));
             bytes(ByteKind::Encoded, u64::MAX);
             bytes(ByteKind::Encoded, 1);
-            dictionary_event(DictionaryEvent::TrainFallback);
             let state = current().unwrap();
-            assert_eq!(state.outcome(), Outcome::Success); // normal fallback is not an error
-            assert_eq!(
-                state.dictionary[Family::TaskEvent as usize]
-                    [DictionaryEvent::TrainFallback as usize]
-                    .load(Ordering::Relaxed),
-                1
-            );
+            assert_eq!(state.outcome(), Outcome::Success);
             assert_eq!(
                 state.phases[Family::Mixed as usize][Stage::Cleanup as usize]
                     .load(Ordering::Relaxed),
@@ -1265,19 +1226,19 @@ mod tests {
     }
 
     #[test]
-    fn first_training_and_preparation_entry_remains_visible_during_coalescing() {
+    fn first_read_and_publication_stage_remains_visible_during_coalescing() {
         let _consent = Consent::enabled();
         let token = std::cell::Cell::new(None);
-        let mut future = Box::pin(scope_result(Family::TaskHistory, Mode::Background, async {
+        let mut future = Box::pin(scope_result(Family::TaskHistory, Mode::Full, async {
             let state = current().unwrap();
             token.set(state.work.map(|w| w.token));
             live_stage(Stage::SourceRead);
-            live_stage(Stage::DictionaryLoad);
+            live_stage(Stage::BlockRead);
             let before = live::snapshot().unwrap().journal.len();
             // Keep the ordinary elapsed gate closed deterministically: no sleeps,
             // benchmark or fake long CPU work. First-entry admission must win.
             state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
-            live_stage(Stage::DictionaryTrain);
+            live_stage(Stage::VerifyAssemble);
             let snapshot = live::snapshot().unwrap();
             let work = snapshot
                 .active
@@ -1286,14 +1247,14 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 work.portable_payload.unwrap().stage,
-                Some(Stage::DictionaryTrain)
+                Some(Stage::VerifyAssemble)
             );
             assert_eq!(snapshot.journal.len(), before + 1);
             for _ in 0..100 {
                 state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
-                live_stage(Stage::DictionaryPrepare);
+                live_stage(Stage::Publish);
                 state.last_live_ms.store(u64::MAX, Ordering::Relaxed);
-                live_stage(Stage::DictionaryTrain);
+                live_stage(Stage::VerifyAssemble);
             }
             assert_eq!(live::snapshot().unwrap().journal.len(), before + 2);
             std::future::pending::<Result<(), ()>>().await
@@ -1305,10 +1266,7 @@ mod tests {
             .iter()
             .find(|w| Some(w.context.token) == token.get())
             .unwrap();
-        assert_eq!(
-            work.portable_payload.unwrap().stage,
-            Some(Stage::DictionaryPrepare)
-        );
+        assert_eq!(work.portable_payload.unwrap().stage, Some(Stage::Publish));
         assert!(matches!(work.state, live::WorkState::Running));
         drop(future);
         assert!(live::snapshot().unwrap().active.is_empty());

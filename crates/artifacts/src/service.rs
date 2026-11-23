@@ -73,17 +73,14 @@ pub enum HtmlPreviewMaintenanceOutcome {
 pub struct HtmlPreviewMaintenanceProgress {
     previews: pioneer_crud::HtmlPreviewRetentionProgress,
     blobs: String,
-    copies: String,
-    finished: [bool; 3],
-    io_seeded: bool,
+    finished: [bool; 2],
     // Earliest GC cutoff observed in this bounded pass. A grace deadline can
     // expire behind the cursor before EOF; it must still trigger a fresh pass.
     gc_cutoff_ms: Option<i64>,
     blob_upper: Option<String>,
-    copies_upper: Option<String>,
     // Each family's error/cancellation survives successful suffix quanta until
     // that family's EOF; unrelated Deferred work must not postpone its rewind.
-    retry_debt: [bool; 3],
+    retry_debt: [bool; 2],
 }
 
 impl HtmlPreviewMaintenanceProgress {
@@ -91,7 +88,7 @@ impl HtmlPreviewMaintenanceProgress {
     /// still waiting for an activity/read hold. The caller retains invalidation
     /// for unfinished keysets until their captured pass finishes as well.
     pub fn invalidate_completed(&mut self) {
-        for family in 0..3 {
+        for family in 0..2 {
             if self.finished[family] {
                 self.invalidate_family(family);
             }
@@ -99,17 +96,12 @@ impl HtmlPreviewMaintenanceProgress {
     }
 
     fn invalidate_family(&mut self, family: usize) {
-        match family {
-            0 => self.previews = Default::default(),
-            1 => {
-                self.blobs.clear();
-                self.blob_upper = None;
-                self.gc_cutoff_ms = None;
-            }
-            _ => {
-                self.copies.clear();
-                self.copies_upper = None;
-            }
+        if family == 0 {
+            self.previews = Default::default();
+        } else {
+            self.blobs.clear();
+            self.blob_upper = None;
+            self.gc_cutoff_ms = None;
         }
         self.finished[family] = false;
         self.retry_debt[family] = false;
@@ -910,7 +902,7 @@ impl ArtifactService {
     ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
         let result = self.html_preview_maintenance_pass_quantum(progress).await;
         let mut retry = false;
-        for family in 0..3 {
+        for family in 0..2 {
             if progress.retry_debt[family] && progress.finished[family] {
                 // Rewind only the failed family's completed keyset. Another
                 // family's activity/read hold or IO backlog cannot postpone it.
@@ -932,13 +924,11 @@ impl ArtifactService {
     ) -> ArtifactResult<HtmlPreviewMaintenanceOutcome> {
         let store = self.store.with_maintenance_access();
         if progress.finished.iter().all(|done| *done) {
-            progress.finished = [false; 3];
+            progress.finished = [false; 2];
             progress.gc_cutoff_ms = None;
             progress.blob_upper = None;
-            progress.copies_upper = None;
         }
         let mut deferred = false;
-        let mut copies_deferred = false;
         let preview_debt = progress.retry_debt[0];
         progress.retry_debt[0] = !progress.finished[0] || preview_debt;
         let preview_result = if progress.finished[0] {
@@ -1018,65 +1008,54 @@ impl ArtifactService {
         if blob_result.is_ok() {
             progress.retry_debt[1] = blob_debt;
         }
-        let copies_debt = progress.retry_debt[2];
-        progress.retry_debt[2] = !progress.finished[2] || copies_debt;
-        let copies_result = async {
-            if !progress.io_seeded {
-                progress.io_seeded = store.html_preview_io_seed_complete().await?;
-            }
-            let (id, copy) = if progress.finished[2] || progress.io_seeded {
-                (String::new(), None)
-            } else {
-                if progress.copies_upper.is_none() {
-                    progress.copies_upper = Some(store.html_preview_artifact_frontier().await?);
-                }
-                store
-                    .html_preview_released_copies_page_through(
-                        &progress.copies,
-                        progress.copies_upper.as_deref().expect("captured frontier"),
-                    )
-                    .await?
-            };
-            progress.finished[2] = id.is_empty();
-            progress.copies = id.clone();
-            if let Some((workspace, previous)) = copy {
-                match self
-                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
-                    .await?
-                {
-                    Some(prepared) => {
-                        store
-                            .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
-                            .await?;
-                    }
-                    None => {
-                        copies_deferred = true;
-                        progress.copies.clear();
-                        progress.finished[2] = false;
-                    }
-                }
-            }
-            Ok::<(), ArtifactError>(())
-        }
-        .await;
-        if copies_result.is_ok() {
-            progress.retry_debt[2] = copies_debt;
-        }
         blob_result?;
         preview_result?;
-        copies_result?;
-        let runnable = (!progress.finished[0] && !deferred)
-            || !progress.finished[1]
-            || (!progress.finished[2] && !copies_deferred);
+        let runnable = (!progress.finished[0] && !deferred) || !progress.finished[1];
         Ok(if runnable {
             HtmlPreviewMaintenanceOutcome::More
-        } else if deferred || copies_deferred {
+        } else if deferred {
             HtmlPreviewMaintenanceOutcome::Deferred
-        } else if progress.finished.iter().all(|done| *done) {
-            HtmlPreviewMaintenanceOutcome::Idle
         } else {
-            HtmlPreviewMaintenanceOutcome::More
+            HtmlPreviewMaintenanceOutcome::Idle
         })
+    }
+
+    pub async fn cleanup_claimed_html_preview_copy(
+        &self,
+        claim: &pioneer_crud::HtmlPreviewIoClaim,
+    ) -> ArtifactResult<()> {
+        use pioneer_crud::{HtmlPreviewIoOutcome, HtmlPreviewIoSource};
+        let store = self.store.with_maintenance_access();
+        let outcome = match store.load_html_preview_io_copies(claim).await? {
+            HtmlPreviewIoSource::Ready((workspace, previous)) => {
+                match self
+                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
+                    .await
+                {
+                    Ok(Some(prepared)) => {
+                        if store
+                            .finish_html_preview_copy_cleanup_claimed(claim, &previous, &prepared)
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                        HtmlPreviewIoOutcome::Retry
+                    }
+                    Err(ArtifactError::ContentInvariant { .. }) => HtmlPreviewIoOutcome::Quarantine,
+                    Ok(None) | Err(_) => HtmlPreviewIoOutcome::Retry,
+                }
+            }
+            HtmlPreviewIoSource::Retry => HtmlPreviewIoOutcome::Retry,
+            HtmlPreviewIoSource::Obsolete => HtmlPreviewIoOutcome::Done,
+            HtmlPreviewIoSource::Quarantine => HtmlPreviewIoOutcome::Quarantine,
+        };
+        let changed = store
+            .defer_html_preview_io_work(claim, outcome, Utc::now().timestamp_millis())
+            .await?;
+        if !changed {
+            return Err(anyhow::anyhow!("HTML IO claim fence lost").into());
+        }
+        Ok(())
     }
 
     /// Physical preparation only: caller owns source proof and conditional
@@ -1668,16 +1647,16 @@ mod tests {
     use std::task::{Context, Poll};
 
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         ArtifactExternalRefKey, CrudStore, NewArtifactBlobRecord, UpsertArtifactExternalRefRequest,
     };
+    use pioneer_postgres_test::{TestDatabase, with_database};
     use pioneer_protocol::{
         ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
         ArtifactProjectionKind, ArtifactProjectionStatus,
     };
     use pioneer_provider::{AttachmentDataSource, InputContentType};
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     use super::*;
     use crate::blob_store::{ArtifactReadHandle, StoredArtifactBlob};
@@ -1689,30 +1668,36 @@ mod tests {
     use crate::source::{ArtifactSource, IngestArtifactSourceRequest};
     use sha2::{Digest, Sha256};
 
+    async fn scoped_store(database: &TestDatabase) -> Arc<CrudStore> {
+        Arc::new(CrudStore::new(
+            pioneer_postgres_pools::PostgresDatabase::new(
+                database.connect_read_only().await.unwrap(),
+                database.connection().clone(),
+            ),
+        ))
+    }
+
     struct TestHarness {
         service: ArtifactService,
         store: Arc<CrudStore>,
         _temp: tempfile::TempDir,
     }
 
-    async fn setup() -> TestHarness {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("migrations apply");
+    async fn setup(database: &TestDatabase) -> TestHarness {
+        let db = database.connection();
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', true, false)",
         )
         .await
         .expect("insert workspace A");
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_b', 'B', 1, 0)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_b', 'B', true, false)",
         )
         .await
         .expect("insert workspace B");
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(CrudStore::new(db.clone()));
+        let store = scoped_store(database).await;
         let blob_store = Arc::new(LocalArtifactBlobStore::new(temp.path()));
         let service = ArtifactService::new(store.clone(), blob_store);
 
@@ -1723,24 +1708,24 @@ mod tests {
         }
     }
 
-    async fn setup_with_quota(quota_policy: ArtifactQuotaPolicy) -> TestHarness {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("migrations apply");
+    async fn setup_with_quota(
+        database: &TestDatabase,
+        quota_policy: ArtifactQuotaPolicy,
+    ) -> TestHarness {
+        let db = database.connection();
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', true, false)",
         )
         .await
         .expect("insert workspace A");
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_b', 'B', 1, 0)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_b', 'B', true, false)",
         )
         .await
         .expect("insert workspace B");
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let store = Arc::new(CrudStore::new(db.clone()));
+        let store = scoped_store(database).await;
         let blob_store = Arc::new(LocalArtifactBlobStore::new(temp.path()));
         let service = ArtifactService::new_with_quota(store.clone(), blob_store, quota_policy);
 
@@ -1812,389 +1797,429 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_bytes_creates_blob_artifact_version_and_binding() {
-        let harness = setup().await;
+        with_database(async |database| {
+            let harness = setup(database).await;
 
-        let summary = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello",
-                "hello.txt",
-            ))
-            .await
-            .expect("ingest bytes");
+            let summary = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello",
+                    "hello.txt",
+                ))
+                .await
+                .expect("ingest bytes");
 
-        assert_eq!(summary.workspace_id, "ws_a");
-        assert_eq!(summary.primary_thread_id.as_deref(), Some("thr_a"));
-        assert_eq!(summary.artifact.display_name, "hello.txt");
-        assert_eq!(summary.artifact.size_bytes, Some(5));
-        assert_eq!(summary.bindings.len(), 1);
-        assert_eq!(summary.bindings[0].thread_id.as_deref(), Some("thr_a"));
+            assert_eq!(summary.workspace_id, "ws_a");
+            assert_eq!(summary.primary_thread_id.as_deref(), Some("thr_a"));
+            assert_eq!(summary.artifact.display_name, "hello.txt");
+            assert_eq!(summary.artifact.size_bytes, Some(5));
+            assert_eq!(summary.bindings.len(), 1);
+            assert_eq!(summary.bindings[0].thread_id.as_deref(), Some("thr_a"));
 
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn ingest_bytes_adds_mime_extension_to_extensionless_display_name() {
-        let harness = setup().await;
-        let image_bytes = test_png_bytes(16, 16);
-        let mut request = ingest_request(
-            "ws_a",
-            "thr_a",
-            "turn_a",
-            image_bytes.as_slice(),
-            "auto.ru_screenshot",
-        );
-        request.kind = ArtifactKind::Image;
-        request.mime_type = Some("image/png".to_owned());
-
-        let summary = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect("ingest image");
-        let snapshot = harness
-            .service
-            .exact_content_snapshot(
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let image_bytes = test_png_bytes(16, 16);
+            let mut request = ingest_request(
                 "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary
-                    .artifact
-                    .version_id
-                    .as_deref()
-                    .expect("exact version"),
-            )
-            .await
-            .expect("content snapshot");
+                "thr_a",
+                "turn_a",
+                image_bytes.as_slice(),
+                "auto.ru_screenshot",
+            );
+            request.kind = ArtifactKind::Image;
+            request.mime_type = Some("image/png".to_owned());
 
-        assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
-        assert_eq!(snapshot.safe_display_name(), "auto.ru_screenshot.png");
+            let summary = harness
+                .service
+                .ingest_bytes(request)
+                .await
+                .expect("ingest image");
+            let snapshot = harness
+                .service
+                .exact_content_snapshot(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary
+                        .artifact
+                        .version_id
+                        .as_deref()
+                        .expect("exact version"),
+                )
+                .await
+                .expect("content snapshot");
+
+            assert_eq!(summary.artifact.display_name, "auto.ru_screenshot.png");
+            assert_eq!(snapshot.safe_display_name(), "auto.ru_screenshot.png");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn projection_created_for_small_text_artifact() {
-        let harness = setup().await;
-        let summary = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello projection",
-                "projection.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-        assert!(summary.artifact.preview.is_some());
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let summary = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello projection",
+                    "projection.txt",
+                ))
+                .await
+                .expect("ingest bytes");
+            assert!(summary.artifact.preview.is_some());
 
-        let projections = harness
-            .service
-            .list_projections(
-                "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("list projections");
+            let projections = harness
+                .service
+                .list_projections(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("list projections");
 
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].status, ArtifactProjectionStatus::Ready);
-        assert_eq!(
-            projections[0].text_content.as_deref(),
-            Some("hello projection")
-        );
+            assert_eq!(projections.len(), 1);
+            assert_eq!(projections[0].status, ArtifactProjectionStatus::Ready);
+            assert_eq!(
+                projections[0].text_content.as_deref(),
+                Some("hello projection")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn projection_failure_does_not_fail_artifact_ingest() {
-        let harness = setup().await;
-        let summary = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                &[0xff],
-                "invalid.txt",
-            ))
-            .await
-            .expect("ingest should survive projection failure");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let summary = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    &[0xff],
+                    "invalid.txt",
+                ))
+                .await
+                .expect("ingest should survive projection failure");
 
-        let projections = harness
-            .service
-            .list_projections(
-                "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("list projections");
+            let projections = harness
+                .service
+                .list_projections(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("list projections");
 
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].status, ArtifactProjectionStatus::Failed);
-        assert_eq!(projections[0].text_content, None);
+            assert_eq!(projections.len(), 1);
+            assert_eq!(projections[0].status, ArtifactProjectionStatus::Failed);
+            assert_eq!(projections[0].text_content, None);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn projection_regeneration_replaces_existing_projection() {
-        let harness = setup().await;
-        let summary = harness
-            .service
-            .ingest_bytes(ingest_request(
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let summary = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"first",
+                    "projection.txt",
+                ))
+                .await
+                .expect("ingest bytes");
+            let artifact_id = summary.artifact.artifact_id.as_str();
+            let version_id = summary.artifact.version_id.as_deref().expect("version id");
+
+            crate::projection::create_inline_projections(
+                harness.store.as_ref(),
+                harness.service.blob_store.as_ref(),
                 "ws_a",
-                "thr_a",
-                "turn_a",
-                b"first",
-                "projection.txt",
-            ))
+                artifact_id,
+                version_id,
+                ArtifactKind::Text,
+                Some("text/plain"),
+                b"second",
+            )
             .await
-            .expect("ingest bytes");
-        let artifact_id = summary.artifact.artifact_id.as_str();
-        let version_id = summary.artifact.version_id.as_deref().expect("version id");
+            .expect("regenerate projection");
+            let projections = harness
+                .service
+                .list_projections("ws_a", artifact_id, Some(version_id))
+                .await
+                .expect("list projections");
 
-        crate::projection::create_inline_projections(
-            harness.store.as_ref(),
-            harness.service.blob_store.as_ref(),
-            "ws_a",
-            artifact_id,
-            version_id,
-            ArtifactKind::Text,
-            Some("text/plain"),
-            b"second",
-        )
+            assert_eq!(projections.len(), 1);
+            assert_eq!(projections[0].text_content.as_deref(), Some("second"));
+            Ok(())
+        })
         .await
-        .expect("regenerate projection");
-        let projections = harness
-            .service
-            .list_projections("ws_a", artifact_id, Some(version_id))
-            .await
-            .expect("list projections");
-
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].text_content.as_deref(), Some("second"));
+        .unwrap();
     }
 
     #[tokio::test]
     async fn thumbnail_projection_is_generated_for_image_artifact() {
-        let harness = setup().await;
-        let image_bytes = test_png_bytes(800, 600);
-        let mut request = ingest_request(
-            "ws_a",
-            "thr_a",
-            "turn_a",
-            image_bytes.as_slice(),
-            "image.png",
-        );
-        request.kind = ArtifactKind::Image;
-        request.mime_type = Some("image/png".to_owned());
-
-        let summary = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect("ingest image");
-        let projections = harness
-            .service
-            .list_projections(
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let image_bytes = test_png_bytes(800, 600);
+            let mut request = ingest_request(
                 "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("list projections");
+                "thr_a",
+                "turn_a",
+                image_bytes.as_slice(),
+                "image.png",
+            );
+            request.kind = ArtifactKind::Image;
+            request.mime_type = Some("image/png".to_owned());
 
-        assert_eq!(projections.len(), 1);
-        assert_eq!(
-            projections[0].projection_kind,
-            ArtifactProjectionKind::Thumbnail
-        );
-        assert_eq!(projections[0].status, ArtifactProjectionStatus::Ready);
-        assert!(projections[0].blob_id.is_some());
-        assert_eq!(projections[0].text_content, None);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
+            let summary = harness
+                .service
+                .ingest_bytes(request)
+                .await
+                .expect("ingest image");
+            let projections = harness
+                .service
+                .list_projections(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("list projections");
 
-        let projection_snapshot = harness
-            .service
-            .exact_projection_snapshot(
-                "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref().expect("version"),
-                ArtifactProjectionKind::Thumbnail,
-            )
-            .await
-            .expect("exact projection snapshot");
-        assert_eq!(projection_snapshot.effective_mime_type(), "image/png");
-        assert!(matches!(
-            projection_snapshot.content_kind(),
-            ArtifactContentKind::Projection {
-                projection_kind: ArtifactProjectionKind::Thumbnail,
-                ..
-            }
-        ));
-        let mut projection_reader = harness
-            .service
-            .open_content_range(&projection_snapshot, 0, projection_snapshot.size_bytes())
-            .await
-            .expect("open projection stream");
-        let mut projection_bytes = Vec::new();
-        projection_reader
-            .read_to_end(&mut projection_bytes)
-            .await
-            .expect("stream projection");
-        assert_eq!(
-            projection_bytes.len() as u64,
-            projection_snapshot.size_bytes()
-        );
+            assert_eq!(projections.len(), 1);
+            assert_eq!(
+                projections[0].projection_kind,
+                ArtifactProjectionKind::Thumbnail
+            );
+            assert_eq!(projections[0].status, ArtifactProjectionStatus::Ready);
+            assert!(projections[0].blob_id.is_some());
+            assert_eq!(projections[0].text_content, None);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
 
-        let preview = summary.artifact.preview.expect("thumbnail preview");
-        assert_eq!(preview.projection_kind, ArtifactProjectionKind::Thumbnail);
-        assert_eq!(preview.status, ArtifactProjectionStatus::Ready);
-        assert!(preview.blob_id.is_some());
-        assert_eq!(preview.mime_type.as_deref(), Some("image/png"));
-        assert!(preview.size_bytes.is_some_and(|size| size > 0));
-        assert!(preview.sha256.is_some());
+            let projection_snapshot = harness
+                .service
+                .exact_projection_snapshot(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref().expect("version"),
+                    ArtifactProjectionKind::Thumbnail,
+                )
+                .await
+                .expect("exact projection snapshot");
+            assert_eq!(projection_snapshot.effective_mime_type(), "image/png");
+            assert!(matches!(
+                projection_snapshot.content_kind(),
+                ArtifactContentKind::Projection {
+                    projection_kind: ArtifactProjectionKind::Thumbnail,
+                    ..
+                }
+            ));
+            let mut projection_reader = harness
+                .service
+                .open_content_range(&projection_snapshot, 0, projection_snapshot.size_bytes())
+                .await
+                .expect("open projection stream");
+            let mut projection_bytes = Vec::new();
+            projection_reader
+                .read_to_end(&mut projection_bytes)
+                .await
+                .expect("stream projection");
+            assert_eq!(
+                projection_bytes.len() as u64,
+                projection_snapshot.size_bytes()
+            );
 
-        let thumbnail_read = harness
-            .service
-            .read_bounded_artifact(
-                ArtifactBoundedReadRequest {
-                    workspace_id: "ws_a".to_owned(),
-                    artifact_id: summary.artifact.artifact_id.clone(),
-                    version_id: summary.artifact.version_id.clone(),
-                    projection_kind: Some(ArtifactProjectionKind::Thumbnail),
-                    offset: Some(0),
-                    max_bytes: Some(512 * 1024),
-                },
-                512 * 1024,
-            )
-            .await
-            .expect("read thumbnail projection");
-        assert_eq!(
-            thumbnail_read.total_size_bytes,
-            preview.size_bytes.expect("preview size")
-        );
-        assert_eq!(thumbnail_read.sha256, preview.sha256.expect("preview sha"));
-        assert!(!thumbnail_read.bytes.is_empty());
-        assert!(!thumbnail_read.truncated);
+            let preview = summary.artifact.preview.expect("thumbnail preview");
+            assert_eq!(preview.projection_kind, ArtifactProjectionKind::Thumbnail);
+            assert_eq!(preview.status, ArtifactProjectionStatus::Ready);
+            assert!(preview.blob_id.is_some());
+            assert_eq!(preview.mime_type.as_deref(), Some("image/png"));
+            assert!(preview.size_bytes.is_some_and(|size| size > 0));
+            assert!(preview.sha256.is_some());
 
-        let usage = harness
-            .service
-            .workspace_usage("ws_a")
-            .await
-            .expect("workspace usage");
-        assert_eq!(usage.files, 2);
+            let thumbnail_read = harness
+                .service
+                .read_bounded_artifact(
+                    ArtifactBoundedReadRequest {
+                        workspace_id: "ws_a".to_owned(),
+                        artifact_id: summary.artifact.artifact_id.clone(),
+                        version_id: summary.artifact.version_id.clone(),
+                        projection_kind: Some(ArtifactProjectionKind::Thumbnail),
+                        offset: Some(0),
+                        max_bytes: Some(512 * 1024),
+                    },
+                    512 * 1024,
+                )
+                .await
+                .expect("read thumbnail projection");
+            assert_eq!(
+                thumbnail_read.total_size_bytes,
+                preview.size_bytes.expect("preview size")
+            );
+            assert_eq!(thumbnail_read.sha256, preview.sha256.expect("preview sha"));
+            assert!(!thumbnail_read.bytes.is_empty());
+            assert!(!thumbnail_read.truncated);
 
-        let gc_plan = harness
-            .service
-            .gc_dry_run("ws_a", i64::MAX)
-            .await
-            .expect("gc dry run");
-        assert!(gc_plan.orphan_blobs.is_empty());
+            let usage = harness
+                .service
+                .workspace_usage("ws_a")
+                .await
+                .expect("workspace usage");
+            assert_eq!(usage.files, 2);
+
+            let gc_plan = harness
+                .service
+                .gc_dry_run("ws_a", i64::MAX)
+                .await
+                .expect("gc dry run");
+            assert!(gc_plan.orphan_blobs.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn failed_and_pending_thumbnail_projections_are_not_exposed_as_preview() {
-        let harness = setup().await;
-        let mut request = ingest_request(
-            "ws_a",
-            "thr_a",
-            "turn_a",
-            b"\xff\x00not-a-real-png",
-            "image.png",
-        );
-        request.kind = ArtifactKind::Image;
-        request.mime_type = Some("image/png".to_owned());
-
-        let summary = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect("ingest image");
-        let projections = harness
-            .service
-            .list_projections(
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let mut request = ingest_request(
                 "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("list projections");
+                "thr_a",
+                "turn_a",
+                b"\xff\x00not-a-real-png",
+                "image.png",
+            );
+            request.kind = ArtifactKind::Image;
+            request.mime_type = Some("image/png".to_owned());
 
-        assert_eq!(projections.len(), 1);
-        assert_eq!(projections[0].status, ArtifactProjectionStatus::Failed);
-        assert!(summary.artifact.preview.is_none());
+            let summary = harness
+                .service
+                .ingest_bytes(request)
+                .await
+                .expect("ingest image");
+            let projections = harness
+                .service
+                .list_projections(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("list projections");
 
-        harness
-            .store
-            .replace_artifact_projection(
-                "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref().expect("version id"),
-                ArtifactProjectionKind::Thumbnail,
-                ArtifactProjectionStatus::Pending,
-                None,
-                std::collections::BTreeMap::new(),
-            )
-            .await
-            .expect("insert pending projection");
+            assert_eq!(projections.len(), 1);
+            assert_eq!(projections[0].status, ArtifactProjectionStatus::Failed);
+            assert!(summary.artifact.preview.is_none());
 
-        let refreshed = harness
-            .service
-            .get_artifact(
-                "ws_a",
-                summary.artifact.artifact_id.as_str(),
-                summary.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("get refreshed artifact");
-        assert!(refreshed.artifact.preview.is_none());
+            harness
+                .store
+                .replace_artifact_projection(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref().expect("version id"),
+                    ArtifactProjectionKind::Thumbnail,
+                    ArtifactProjectionStatus::Pending,
+                    None,
+                    std::collections::BTreeMap::new(),
+                )
+                .await
+                .expect("insert pending projection");
+
+            let refreshed = harness
+                .service
+                .get_artifact(
+                    "ws_a",
+                    summary.artifact.artifact_id.as_str(),
+                    summary.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("get refreshed artifact");
+            assert!(refreshed.artifact.preview.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn mime_detection_overrides_declared_mime_and_records_metadata() {
-        let harness = setup().await;
-        let image_bytes = test_png_bytes(16, 16);
-        let mut request = ingest_request(
-            "ws_a",
-            "thr_a",
-            "turn_a",
-            image_bytes.as_slice(),
-            "mismatch.txt",
-        );
-        request.kind = ArtifactKind::Image;
-        request.mime_type = Some("text/plain; charset=utf-8".to_owned());
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let image_bytes = test_png_bytes(16, 16);
+            let mut request = ingest_request(
+                "ws_a",
+                "thr_a",
+                "turn_a",
+                image_bytes.as_slice(),
+                "mismatch.txt",
+            );
+            request.kind = ArtifactKind::Image;
+            request.mime_type = Some("text/plain; charset=utf-8".to_owned());
 
-        let summary = harness
-            .service
-            .ingest_bytes(request)
-            .await
-            .expect("ingest bytes");
+            let summary = harness
+                .service
+                .ingest_bytes(request)
+                .await
+                .expect("ingest bytes");
 
-        assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(
-            metadata_str(&summary, "declared_mime_type"),
-            Some("text/plain")
-        );
-        assert_eq!(
-            metadata_str(&summary, "detected_mime_type"),
-            Some("image/png")
-        );
-        assert_eq!(
-            metadata_str(&summary, "effective_mime_type"),
-            Some("image/png")
-        );
-        assert_eq!(
-            summary
-                .metadata
-                .get("declared_detected_mime_mismatch")
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
+            assert_eq!(summary.artifact.mime_type.as_deref(), Some("image/png"));
+            assert_eq!(
+                metadata_str(&summary, "declared_mime_type"),
+                Some("text/plain")
+            );
+            assert_eq!(
+                metadata_str(&summary, "detected_mime_type"),
+                Some("image/png")
+            );
+            assert_eq!(
+                metadata_str(&summary, "effective_mime_type"),
+                Some("image/png")
+            );
+            assert_eq!(
+                summary
+                    .metadata
+                    .get("declared_detected_mime_mismatch")
+                    .and_then(|value| value.as_bool()),
+                Some(true)
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -2210,134 +2235,156 @@ mod tests {
 
     #[tokio::test]
     async fn quota_rejects_workspace_over_limit_per_workspace() {
-        let harness = setup_with_quota(ArtifactQuotaPolicy {
-            max_workspace_bytes: 8,
-            max_file_bytes: 8,
-            max_files_per_workspace: 10,
-            warn_at_percent: 80,
+        with_database(async |database| {
+            let harness = setup_with_quota(
+                database,
+                ArtifactQuotaPolicy {
+                    max_workspace_bytes: 8,
+                    max_file_bytes: 8,
+                    max_files_per_workspace: 10,
+                    warn_at_percent: 80,
+                },
+            )
+            .await;
+            harness
+                .service
+                .ingest_bytes(ingest_request("ws_a", "thr_a", "turn_a", b"12345", "a.txt"))
+                .await
+                .expect("first ingest");
+
+            let error = harness
+                .service
+                .ingest_bytes(ingest_request("ws_a", "thr_a", "turn_b", b"1234", "b.txt"))
+                .await
+                .expect_err("workspace quota should reject");
+
+            assert!(matches!(
+                error,
+                ArtifactError::QuotaExceeded {
+                    kind: ArtifactQuotaRejectionKind::WorkspaceBytesExceeded,
+                    ..
+                }
+            ));
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
+            harness
+                .service
+                .ingest_bytes(ingest_request("ws_b", "thr_b", "turn_b", b"1234", "b.txt"))
+                .await
+                .expect("other workspace has separate quota");
+            Ok(())
         })
-        .await;
-        harness
-            .service
-            .ingest_bytes(ingest_request("ws_a", "thr_a", "turn_a", b"12345", "a.txt"))
-            .await
-            .expect("first ingest");
-
-        let error = harness
-            .service
-            .ingest_bytes(ingest_request("ws_a", "thr_a", "turn_b", b"1234", "b.txt"))
-            .await
-            .expect_err("workspace quota should reject");
-
-        assert!(matches!(
-            error,
-            ArtifactError::QuotaExceeded {
-                kind: ArtifactQuotaRejectionKind::WorkspaceBytesExceeded,
-                ..
-            }
-        ));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 1);
-        harness
-            .service
-            .ingest_bytes(ingest_request("ws_b", "thr_b", "turn_b", b"1234", "b.txt"))
-            .await
-            .expect("other workspace has separate quota");
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn quota_rejects_file_over_limit_before_blob_write() {
-        let harness = setup_with_quota(ArtifactQuotaPolicy {
-            max_workspace_bytes: 64,
-            max_file_bytes: 3,
-            max_files_per_workspace: 10,
-            warn_at_percent: 80,
+        with_database(async |database| {
+            let harness = setup_with_quota(
+                database,
+                ArtifactQuotaPolicy {
+                    max_workspace_bytes: 64,
+                    max_file_bytes: 3,
+                    max_files_per_workspace: 10,
+                    warn_at_percent: 80,
+                },
+            )
+            .await;
+
+            let error = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"1234",
+                    "too-large.txt",
+                ))
+                .await
+                .expect_err("file quota should reject");
+
+            assert!(matches!(
+                error,
+                ArtifactError::QuotaExceeded {
+                    kind: ArtifactQuotaRejectionKind::FileTooLarge,
+                    ..
+                }
+            ));
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+            Ok(())
         })
-        .await;
-
-        let error = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"1234",
-                "too-large.txt",
-            ))
-            .await
-            .expect_err("file quota should reject");
-
-        assert!(matches!(
-            error,
-            ArtifactError::QuotaExceeded {
-                kind: ArtifactQuotaRejectionKind::FileTooLarge,
-                ..
-            }
-        ));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn quota_rejects_temp_file_over_limit() {
-        let harness = setup_with_quota(ArtifactQuotaPolicy {
-            max_workspace_bytes: 64,
-            max_file_bytes: 3,
-            max_files_per_workspace: 10,
-            warn_at_percent: 80,
+        with_database(async |database| {
+            let harness = setup_with_quota(
+                database,
+                ArtifactQuotaPolicy {
+                    max_workspace_bytes: 64,
+                    max_file_bytes: 3,
+                    max_files_per_workspace: 10,
+                    warn_at_percent: 80,
+                },
+            )
+            .await;
+            let path = harness._temp.path().join("too-large.txt");
+            tokio::fs::write(&path, b"1234")
+                .await
+                .expect("write temp input");
+
+            let error = harness
+                .service
+                .ingest_temp_file(IngestArtifactTempFileRequest {
+                    workspace_id: "ws_a".to_owned(),
+                    primary_thread_id: Some("thr_a".to_owned()),
+                    temp_path: path,
+                    display_name: "too-large.txt".to_owned(),
+                    kind: ArtifactKind::Text,
+                    mime_type: Some("text/plain".to_owned()),
+                    created_by_kind: ArtifactCreatedByKind::User,
+                    created_by_actor_id: Some("user_a".to_owned()),
+                    binding: Some(target("thr_a", "turn_a")),
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect_err("temp file quota should reject");
+
+            assert!(matches!(
+                error,
+                ArtifactError::QuotaExceeded {
+                    kind: ArtifactQuotaRejectionKind::FileTooLarge,
+                    ..
+                }
+            ));
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+            Ok(())
         })
-        .await;
-        let path = harness._temp.path().join("too-large.txt");
-        tokio::fs::write(&path, b"1234")
-            .await
-            .expect("write temp input");
-
-        let error = harness
-            .service
-            .ingest_temp_file(IngestArtifactTempFileRequest {
-                workspace_id: "ws_a".to_owned(),
-                primary_thread_id: Some("thr_a".to_owned()),
-                temp_path: path,
-                display_name: "too-large.txt".to_owned(),
-                kind: ArtifactKind::Text,
-                mime_type: Some("text/plain".to_owned()),
-                created_by_kind: ArtifactCreatedByKind::User,
-                created_by_actor_id: Some("user_a".to_owned()),
-                binding: Some(target("thr_a", "turn_a")),
-                metadata: BTreeMap::new(),
-            })
-            .await
-            .expect_err("temp file quota should reject");
-
-        assert!(matches!(
-            error,
-            ArtifactError::QuotaExceeded {
-                kind: ArtifactQuotaRejectionKind::FileTooLarge,
-                ..
-            }
-        ));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn registration_blob_write_failure_leaves_no_db_rows() {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("migrations apply");
+        with_database(async |database| {
+        let db = database.connection();
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', true, false)",
         )
         .await
         .expect("insert workspace A");
-        let store = Arc::new(CrudStore::new(db));
+        let store = scoped_store(database).await;
         let service = ArtifactService::new(store.clone(), Arc::new(FailingPutBlobStore));
 
         let error = service
@@ -2352,25 +2399,25 @@ mod tests {
         assert_eq!(count_artifacts(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_versions(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_bindings(store.as_ref(), "ws_a").await, 0);
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn registration_cleanup_failure_reports_failure_without_visible_rows() {
-        let db = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite memory");
-        Migrator::up(&db, None).await.expect("migrations apply");
+        with_database(async |database| {
+        let db = database.connection();
         db.execute_unprepared(
-            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', 1, 1)",
+            "INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_a', 'A', true, false)",
         )
         .await
         .expect("insert workspace A");
         db.execute_unprepared(
-            "CREATE TRIGGER fail_artifact_blob_insert BEFORE INSERT ON artifact_blob BEGIN SELECT RAISE(FAIL, 'forced blob metadata failure'); END;",
+            "CREATE FUNCTION fail_artifact_blob_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced blob metadata failure'; END; $$; CREATE TRIGGER fail_artifact_blob_insert BEFORE INSERT ON artifact_blob FOR EACH ROW EXECUTE FUNCTION fail_artifact_blob_insert()",
         )
         .await
         .expect("create failure trigger");
-        let store = Arc::new(CrudStore::new(db));
+        let store = scoped_store(database).await;
         let service = ArtifactService::new(
             store.clone(),
             Arc::new(CleanupFailingBlobStore {
@@ -2394,773 +2441,880 @@ mod tests {
         assert_eq!(count_artifacts(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_versions(store.as_ref(), "ws_a").await, 0);
         assert_eq!(count_bindings(store.as_ref(), "ws_a").await, 0);
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn gc_dry_run_reports_orphan_and_execute_deletes_only_orphan() {
-        let harness = setup().await;
-        let referenced = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"referenced",
-                "referenced.txt",
-            ))
-            .await
-            .expect("referenced ingest");
-        harness
-            .store
-            .upsert_artifact_external_ref(UpsertArtifactExternalRefRequest {
-                key: ArtifactExternalRefKey {
-                    workspace_id: "ws_a".to_owned(),
-                    artifact_id: referenced.artifact.artifact_id.clone(),
-                    artifact_version_id: referenced.artifact.version_id.clone(),
-                    provider: "openai".to_owned(),
-                    model_family: Some("gpt-test".to_owned()),
-                    transport_kind: "upload".to_owned(),
-                },
-                external_id: "file-expired".to_owned(),
-                external_uri: None,
-                expires_at_unix_ms: Some(500),
-                metadata: BTreeMap::new(),
-            })
-            .await
-            .expect("insert expired external ref");
-        let orphan_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        harness
-            .store
-            .insert_test_artifact_blob(
-                NewArtifactBlobRecord {
-                    workspace_id: "ws_a".to_owned(),
-                    sha256: orphan_sha.to_owned(),
-                    size_bytes: 7,
-                    mime_type: Some("text/plain".to_owned()),
-                    storage_backend: "local".to_owned(),
-                    storage_key: format!("sha256/01/23/{orphan_sha}"),
-                    metadata: BTreeMap::new(),
-                },
-                0,
-                "orphan_blob".to_owned(),
-            )
-            .await
-            .expect("insert orphan blob");
-
-        let plan = harness
-            .service
-            .gc_dry_run("ws_a", 200_000_000)
-            .await
-            .expect("gc dry run");
-
-        assert_eq!(plan.orphan_blobs.len(), 1);
-        assert_eq!(plan.expired_external_refs, 1);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
-
-        let report = harness
-            .service
-            .gc_execute("ws_a", 200_000_000)
-            .await
-            .expect("gc execute");
-
-        assert_eq!(report.deleted_blobs, 1);
-        assert_eq!(report.pruned_external_refs, 1);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-    }
-
-    #[tokio::test]
-    async fn gc_dry_run_keeps_orphan_inside_grace_period() {
-        let harness = setup().await;
-        let orphan_sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        harness
-            .store
-            .insert_test_artifact_blob(
-                NewArtifactBlobRecord {
-                    workspace_id: "ws_a".to_owned(),
-                    sha256: orphan_sha.to_owned(),
-                    size_bytes: 7,
-                    mime_type: Some("text/plain".to_owned()),
-                    storage_backend: "local".to_owned(),
-                    storage_key: format!("sha256/ab/cd/{orphan_sha}"),
-                    metadata: BTreeMap::new(),
-                },
-                0,
-                "young_orphan_blob".to_owned(),
-            )
-            .await
-            .expect("insert orphan blob");
-
-        let plan = harness
-            .service
-            .gc_dry_run("ws_a", 1_000)
-            .await
-            .expect("gc dry run");
-
-        assert!(plan.orphan_blobs.is_empty());
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-    }
-
-    #[tokio::test]
-    async fn list_by_thread_returns_artifact_summary() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello",
-                "hello.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-
-        let page = harness
-            .service
-            .list_thread_artifacts("ws_a", "thr_a", ArtifactListFilter::default())
-            .await
-            .expect("list artifacts");
-
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(
-            page.items[0].artifact.artifact_id,
-            created.artifact.artifact_id
-        );
-        assert_eq!(page.next_cursor, None);
-    }
-
-    #[tokio::test]
-    async fn list_thread_artifacts_paginates_with_cursor() {
-        let harness = setup().await;
-        for index in 0..3 {
-            harness
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let referenced = harness
                 .service
                 .ingest_bytes(ingest_request(
                     "ws_a",
                     "thr_a",
-                    format!("turn_{index}").as_str(),
-                    format!("artifact {index}").as_bytes(),
-                    format!("artifact-{index}.txt").as_str(),
+                    "turn_a",
+                    b"referenced",
+                    "referenced.txt",
+                ))
+                .await
+                .expect("referenced ingest");
+            harness
+                .store
+                .upsert_artifact_external_ref(UpsertArtifactExternalRefRequest {
+                    key: ArtifactExternalRefKey {
+                        workspace_id: "ws_a".to_owned(),
+                        artifact_id: referenced.artifact.artifact_id.clone(),
+                        artifact_version_id: referenced.artifact.version_id.clone(),
+                        provider: "openai".to_owned(),
+                        model_family: Some("gpt-test".to_owned()),
+                        transport_kind: "upload".to_owned(),
+                    },
+                    external_id: "file-expired".to_owned(),
+                    external_uri: None,
+                    expires_at_unix_ms: Some(500),
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect("insert expired external ref");
+            let orphan_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            harness
+                .store
+                .insert_test_artifact_blob(
+                    NewArtifactBlobRecord {
+                        workspace_id: "ws_a".to_owned(),
+                        sha256: orphan_sha.to_owned(),
+                        size_bytes: 7,
+                        mime_type: Some("text/plain".to_owned()),
+                        storage_backend: "local".to_owned(),
+                        storage_key: format!("sha256/01/23/{orphan_sha}"),
+                        metadata: BTreeMap::new(),
+                    },
+                    0,
+                    "orphan_blob".to_owned(),
+                )
+                .await
+                .expect("insert orphan blob");
+
+            let plan = harness
+                .service
+                .gc_dry_run("ws_a", 200_000_000)
+                .await
+                .expect("gc dry run");
+
+            assert_eq!(plan.orphan_blobs.len(), 1);
+            assert_eq!(plan.expired_external_refs, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 2);
+
+            let report = harness
+                .service
+                .gc_execute("ws_a", 200_000_000)
+                .await
+                .expect("gc execute");
+
+            assert_eq!(report.deleted_blobs, 1);
+            assert_eq!(report.pruned_external_refs, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_keeps_orphan_inside_grace_period() {
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let orphan_sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+            harness
+                .store
+                .insert_test_artifact_blob(
+                    NewArtifactBlobRecord {
+                        workspace_id: "ws_a".to_owned(),
+                        sha256: orphan_sha.to_owned(),
+                        size_bytes: 7,
+                        mime_type: Some("text/plain".to_owned()),
+                        storage_backend: "local".to_owned(),
+                        storage_key: format!("sha256/ab/cd/{orphan_sha}"),
+                        metadata: BTreeMap::new(),
+                    },
+                    0,
+                    "young_orphan_blob".to_owned(),
+                )
+                .await
+                .expect("insert orphan blob");
+
+            let plan = harness
+                .service
+                .gc_dry_run("ws_a", 1_000)
+                .await
+                .expect("gc dry run");
+
+            assert!(plan.orphan_blobs.is_empty());
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_by_thread_returns_artifact_summary() {
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello",
+                    "hello.txt",
                 ))
                 .await
                 .expect("ingest bytes");
-        }
 
-        let first_page = harness
-            .service
-            .list_thread_artifacts(
-                "ws_a",
-                "thr_a",
-                ArtifactListFilter {
-                    limit: Some(2),
-                    ..ArtifactListFilter::default()
-                },
-            )
-            .await
-            .expect("list first page");
-        let cursor = first_page.next_cursor.clone().expect("next cursor");
-        let second_page = harness
-            .service
-            .list_thread_artifacts(
-                "ws_a",
-                "thr_a",
-                ArtifactListFilter {
-                    limit: Some(2),
-                    cursor: Some(cursor),
-                    ..ArtifactListFilter::default()
-                },
-            )
-            .await
-            .expect("list second page");
+            let page = harness
+                .service
+                .list_thread_artifacts("ws_a", "thr_a", ArtifactListFilter::default())
+                .await
+                .expect("list artifacts");
 
-        assert_eq!(first_page.items.len(), 2);
-        assert_eq!(second_page.items.len(), 1);
-        assert_eq!(second_page.next_cursor, None);
-        let first_ids = first_page
-            .items
-            .iter()
-            .map(|summary| summary.artifact.artifact_id.as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            !first_ids.contains(&second_page.items[0].artifact.artifact_id.as_str()),
-            "second page repeated an artifact from the first page"
-        );
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(
+                page.items[0].artifact.artifact_id,
+                created.artifact.artifact_id
+            );
+            assert_eq!(page.next_cursor, None);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_thread_artifacts_paginates_with_cursor() {
+        with_database(async |database| {
+            let harness = setup(database).await;
+            for index in 0..3 {
+                harness
+                    .service
+                    .ingest_bytes(ingest_request(
+                        "ws_a",
+                        "thr_a",
+                        format!("turn_{index}").as_str(),
+                        format!("artifact {index}").as_bytes(),
+                        format!("artifact-{index}.txt").as_str(),
+                    ))
+                    .await
+                    .expect("ingest bytes");
+            }
+
+            let first_page = harness
+                .service
+                .list_thread_artifacts(
+                    "ws_a",
+                    "thr_a",
+                    ArtifactListFilter {
+                        limit: Some(2),
+                        ..ArtifactListFilter::default()
+                    },
+                )
+                .await
+                .expect("list first page");
+            let cursor = first_page.next_cursor.clone().expect("next cursor");
+            let second_page = harness
+                .service
+                .list_thread_artifacts(
+                    "ws_a",
+                    "thr_a",
+                    ArtifactListFilter {
+                        limit: Some(2),
+                        cursor: Some(cursor),
+                        ..ArtifactListFilter::default()
+                    },
+                )
+                .await
+                .expect("list second page");
+
+            assert_eq!(first_page.items.len(), 2);
+            assert_eq!(second_page.items.len(), 1);
+            assert_eq!(second_page.next_cursor, None);
+            let first_ids = first_page
+                .items
+                .iter()
+                .map(|summary| summary.artifact.artifact_id.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                !first_ids.contains(&second_page.items[0].artifact.artifact_id.as_str()),
+                "second page repeated an artifact from the first page"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn same_bytes_same_workspace_reuse_artifact_blob() {
-        let harness = setup().await;
+        with_database(async |database| {
+            let harness = setup(database).await;
 
-        harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a", "thr_a", "turn_a", b"same", "one.txt",
-            ))
-            .await
-            .expect("first ingest");
-        harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a", "thr_b", "turn_b", b"same", "two.txt",
-            ))
-            .await
-            .expect("second ingest");
+            harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a", "thr_a", "turn_a", b"same", "one.txt",
+                ))
+                .await
+                .expect("first ingest");
+            harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a", "thr_b", "turn_b", b"same", "two.txt",
+                ))
+                .await
+                .expect("second ingest");
 
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 2);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn same_bytes_different_workspace_create_separate_blobs() {
-        let harness = setup().await;
+        with_database(async |database| {
+            let harness = setup(database).await;
 
-        harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a", "thr_a", "turn_a", b"same", "one.txt",
-            ))
-            .await
-            .expect("first ingest");
-        harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_b", "thr_b", "turn_b", b"same", "two.txt",
-            ))
-            .await
-            .expect("second ingest");
+            harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a", "thr_a", "turn_a", b"same", "one.txt",
+                ))
+                .await
+                .expect("first ingest");
+            harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_b", "thr_b", "turn_b", b"same", "two.txt",
+                ))
+                .await
+                .expect("second ingest");
 
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_b").await, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_b").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn get_artifact_with_wrong_workspace_is_not_found() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello",
-                "hello.txt",
-            ))
-            .await
-            .expect("ingest bytes");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello",
+                    "hello.txt",
+                ))
+                .await
+                .expect("ingest bytes");
 
-        let error = harness
-            .service
-            .get_artifact("ws_b", &created.artifact.artifact_id, None)
-            .await
-            .expect_err("wrong workspace should not resolve artifact");
+            let error = harness
+                .service
+                .get_artifact("ws_b", &created.artifact.artifact_id, None)
+                .await
+                .expect_err("wrong workspace should not resolve artifact");
 
-        assert!(matches!(error, ArtifactError::NotFound { .. }));
+            assert!(matches!(error, ArtifactError::NotFound { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn exact_content_snapshot_streams_a_bounded_range() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello download",
-                "download.txt",
-            ))
-            .await
-            .expect("ingest bytes");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello download",
+                    "download.txt",
+                ))
+                .await
+                .expect("ingest bytes");
 
-        let content = harness
-            .service
-            .exact_content_snapshot(
-                "ws_a",
-                created.artifact.artifact_id.as_str(),
-                created
-                    .artifact
-                    .version_id
-                    .as_deref()
-                    .expect("exact version"),
-            )
-            .await
-            .expect("exact content snapshot");
-        let mut reader = harness
-            .service
-            .open_content_range(&content, 6, "download".len() as u64)
-            .await
-            .expect("open bounded content range");
-        let mut streamed = Vec::new();
-        reader
-            .read_to_end(&mut streamed)
-            .await
-            .expect("stream bounded range");
-        assert_eq!(streamed, b"download");
-        assert_eq!(reader.remaining(), 0);
+            let content = harness
+                .service
+                .exact_content_snapshot(
+                    "ws_a",
+                    created.artifact.artifact_id.as_str(),
+                    created
+                        .artifact
+                        .version_id
+                        .as_deref()
+                        .expect("exact version"),
+                )
+                .await
+                .expect("exact content snapshot");
+            let mut reader = harness
+                .service
+                .open_content_range(&content, 6, "download".len() as u64)
+                .await
+                .expect("open bounded content range");
+            let mut streamed = Vec::new();
+            reader
+                .read_to_end(&mut streamed)
+                .await
+                .expect("stream bounded range");
+            assert_eq!(streamed, b"download");
+            assert_eq!(reader.remaining(), 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn content_open_fails_closed_for_missing_mismatch_and_short_read() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"immutable bytes",
-                "immutable.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-        let snapshot = harness
-            .service
-            .exact_content_snapshot(
-                "ws_a",
-                created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref().expect("version"),
-            )
-            .await
-            .expect("snapshot");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"immutable bytes",
+                    "immutable.txt",
+                ))
+                .await
+                .expect("ingest bytes");
+            let snapshot = harness
+                .service
+                .exact_content_snapshot(
+                    "ws_a",
+                    created.artifact.artifact_id.as_str(),
+                    created.artifact.version_id.as_deref().expect("version"),
+                )
+                .await
+                .expect("snapshot");
 
-        let missing = ArtifactService::new(
-            harness.store.clone(),
-            Arc::new(FakeReadBlobStore {
-                storage_key: snapshot.storage_key.clone(),
-                mode: FakeReadMode::Missing,
-            }),
-        );
-        assert!(matches!(
-            missing.open_content(&snapshot).await,
-            Err(ArtifactError::ReadMissingBlob { .. })
-        ));
+            let missing = ArtifactService::new(
+                harness.store.clone(),
+                Arc::new(FakeReadBlobStore {
+                    storage_key: snapshot.storage_key.clone(),
+                    mode: FakeReadMode::Missing,
+                }),
+            );
+            assert!(matches!(
+                missing.open_content(&snapshot).await,
+                Err(ArtifactError::ReadMissingBlob { .. })
+            ));
 
-        let mismatched = ArtifactService::new(
-            harness.store.clone(),
-            Arc::new(FakeReadBlobStore {
-                storage_key: snapshot.storage_key.clone(),
-                mode: FakeReadMode::Bytes {
-                    bytes: b"immutable bytes".to_vec(),
-                    advertised_size: snapshot.size_bytes(),
-                    storage_key_override: Some("opaque-mismatched-key".to_owned()),
-                },
-            }),
-        );
-        assert!(matches!(
-            mismatched.open_content(&snapshot).await,
-            Err(ArtifactError::ContentInvariant { .. })
-        ));
+            let mismatched = ArtifactService::new(
+                harness.store.clone(),
+                Arc::new(FakeReadBlobStore {
+                    storage_key: snapshot.storage_key.clone(),
+                    mode: FakeReadMode::Bytes {
+                        bytes: b"immutable bytes".to_vec(),
+                        advertised_size: snapshot.size_bytes(),
+                        storage_key_override: Some("opaque-mismatched-key".to_owned()),
+                    },
+                }),
+            );
+            assert!(matches!(
+                mismatched.open_content(&snapshot).await,
+                Err(ArtifactError::ContentInvariant { .. })
+            ));
 
-        let short = ArtifactService::new(
-            harness.store.clone(),
-            Arc::new(FakeReadBlobStore {
-                storage_key: snapshot.storage_key.clone(),
-                mode: FakeReadMode::Bytes {
-                    bytes: b"short".to_vec(),
-                    advertised_size: snapshot.size_bytes(),
-                    storage_key_override: None,
-                },
-            }),
-        );
-        let mut reader = short
-            .open_content_range(&snapshot, 0, snapshot.size_bytes())
-            .await
-            .expect("metadata permits open");
-        let mut bytes = Vec::new();
-        let error = reader
-            .read_to_end(&mut bytes)
-            .await
-            .expect_err("short immutable content must fail");
-        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+            let short = ArtifactService::new(
+                harness.store.clone(),
+                Arc::new(FakeReadBlobStore {
+                    storage_key: snapshot.storage_key.clone(),
+                    mode: FakeReadMode::Bytes {
+                        bytes: b"short".to_vec(),
+                        advertised_size: snapshot.size_bytes(),
+                        storage_key_override: None,
+                    },
+                }),
+            );
+            let mut reader = short
+                .open_content_range(&snapshot, 0, snapshot.size_bytes())
+                .await
+                .expect("metadata permits open");
+            let mut bytes = Vec::new();
+            let error = reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect_err("short immutable content must fail");
+            assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn dropping_bounded_reader_cancels_backend_without_materializing_content() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"x",
-                "pending.txt",
-            ))
-            .await
-            .expect("ingest bytes");
-        let snapshot = harness
-            .service
-            .exact_content_snapshot(
-                "ws_a",
-                created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref().expect("version"),
-            )
-            .await
-            .expect("snapshot");
-        let dropped = Arc::new(AtomicBool::new(false));
-        let service = ArtifactService::new(
-            harness.store.clone(),
-            Arc::new(FakeReadBlobStore {
-                storage_key: snapshot.storage_key.clone(),
-                mode: FakeReadMode::Pending {
-                    dropped: dropped.clone(),
-                },
-            }),
-        );
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"x",
+                    "pending.txt",
+                ))
+                .await
+                .expect("ingest bytes");
+            let snapshot = harness
+                .service
+                .exact_content_snapshot(
+                    "ws_a",
+                    created.artifact.artifact_id.as_str(),
+                    created.artifact.version_id.as_deref().expect("version"),
+                )
+                .await
+                .expect("snapshot");
+            let dropped = Arc::new(AtomicBool::new(false));
+            let service = ArtifactService::new(
+                harness.store.clone(),
+                Arc::new(FakeReadBlobStore {
+                    storage_key: snapshot.storage_key.clone(),
+                    mode: FakeReadMode::Pending {
+                        dropped: dropped.clone(),
+                    },
+                }),
+            );
 
-        let reader = service
-            .open_content_range(&snapshot, 0, 1)
-            .await
-            .expect("open pending reader");
-        assert!(!dropped.load(Ordering::SeqCst));
-        drop(reader);
-        assert!(dropped.load(Ordering::SeqCst));
+            let reader = service
+                .open_content_range(&snapshot, 0, 1)
+                .await
+                .expect("open pending reader");
+            assert!(!dropped.load(Ordering::SeqCst));
+            drop(reader);
+            assert!(dropped.load(Ordering::SeqCst));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn large_logical_content_range_has_constant_allocation() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"seed",
-                "large.bin",
-            ))
-            .await
-            .expect("ingest seed");
-        let mut snapshot = harness
-            .service
-            .exact_content_snapshot(
-                "ws_a",
-                created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref().expect("version"),
-            )
-            .await
-            .expect("snapshot");
-        let logical_size = 8_u64 * 1024 * 1024 * 1024 * 1024;
-        snapshot.size_bytes = logical_size;
-        snapshot.artifact.size_bytes = Some(logical_size);
-        let service = ArtifactService::new(
-            harness.store.clone(),
-            Arc::new(FakeReadBlobStore {
-                storage_key: snapshot.storage_key.clone(),
-                mode: FakeReadMode::LogicalZeros {
-                    size_bytes: logical_size,
-                },
-            }),
-        );
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"seed",
+                    "large.bin",
+                ))
+                .await
+                .expect("ingest seed");
+            let mut snapshot = harness
+                .service
+                .exact_content_snapshot(
+                    "ws_a",
+                    created.artifact.artifact_id.as_str(),
+                    created.artifact.version_id.as_deref().expect("version"),
+                )
+                .await
+                .expect("snapshot");
+            let logical_size = 8_u64 * 1024 * 1024 * 1024 * 1024;
+            snapshot.size_bytes = logical_size;
+            snapshot.artifact.size_bytes = Some(logical_size);
+            let service = ArtifactService::new(
+                harness.store.clone(),
+                Arc::new(FakeReadBlobStore {
+                    storage_key: snapshot.storage_key.clone(),
+                    mode: FakeReadMode::LogicalZeros {
+                        size_bytes: logical_size,
+                    },
+                }),
+            );
 
-        let mut reader = service
-            .open_content_range(&snapshot, logical_size - 32, 32)
-            .await
-            .expect("open tail range");
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .await
-            .expect("read logical tail");
-        assert_eq!(bytes, vec![0; 32]);
-        assert_eq!(reader.length(), 32);
+            let mut reader = service
+                .open_content_range(&snapshot, logical_size - 32, 32)
+                .await
+                .expect("open tail range");
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read logical tail");
+            assert_eq!(bytes, vec![0; 32]);
+            assert_eq!(reader.length(), 32);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn resolve_provider_attachment_materializes_blob_path_with_metadata() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello provider",
-                "provider.txt",
-            ))
-            .await
-            .expect("ingest bytes");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello provider",
+                    "provider.txt",
+                ))
+                .await
+                .expect("ingest bytes");
 
-        let resolved = harness
-            .service
-            .resolve_provider_attachment(
-                "ws_a",
-                created.artifact.artifact_id.as_str(),
-                created.artifact.version_id.as_deref(),
-            )
-            .await
-            .expect("resolve provider attachment");
+            let resolved = harness
+                .service
+                .resolve_provider_attachment(
+                    "ws_a",
+                    created.artifact.artifact_id.as_str(),
+                    created.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("resolve provider attachment");
 
-        assert_eq!(resolved.content_type, InputContentType::File);
-        assert_eq!(resolved.attachment.name.as_deref(), Some("provider.txt"));
-        assert_eq!(resolved.attachment.mime_type, "text/plain");
-        assert_eq!(resolved.attachment.size_bytes, Some(14));
-        assert_eq!(resolved.attachment.sha256, created.artifact.sha256);
-        let artifact_context = resolved
-            .attachment
-            .artifact
-            .as_ref()
-            .expect("artifact context should be attached");
-        assert_eq!(artifact_context.workspace_id, "ws_a");
-        assert_eq!(artifact_context.artifact_id, created.artifact.artifact_id);
-        assert_eq!(
-            artifact_context.artifact_version_id,
-            created.artifact.version_id
-        );
-        let AttachmentDataSource::Path { path } = &resolved.attachment.source else {
-            panic!("expected materialized path attachment");
-        };
-        assert_ne!(path, "provider.txt");
-        assert_eq!(
-            tokio::fs::read(path).await.expect("read materialized file"),
-            b"hello provider"
-        );
+            assert_eq!(resolved.content_type, InputContentType::File);
+            assert_eq!(resolved.attachment.name.as_deref(), Some("provider.txt"));
+            assert_eq!(resolved.attachment.mime_type, "text/plain");
+            assert_eq!(resolved.attachment.size_bytes, Some(14));
+            assert_eq!(resolved.attachment.sha256, created.artifact.sha256);
+            let artifact_context = resolved
+                .attachment
+                .artifact
+                .as_ref()
+                .expect("artifact context should be attached");
+            assert_eq!(artifact_context.workspace_id, "ws_a");
+            assert_eq!(artifact_context.artifact_id, created.artifact.artifact_id);
+            assert_eq!(
+                artifact_context.artifact_version_id,
+                created.artifact.version_id
+            );
+            let AttachmentDataSource::Path { path } = &resolved.attachment.source else {
+                panic!("expected materialized path attachment");
+            };
+            assert_ne!(path, "provider.txt");
+            assert_eq!(
+                tokio::fs::read(path).await.expect("read materialized file"),
+                b"hello provider"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn resolve_provider_attachment_missing_artifact_is_not_found() {
-        let harness = setup().await;
+        with_database(async |database| {
+            let harness = setup(database).await;
 
-        let error = harness
-            .service
-            .resolve_provider_attachment("ws_a", "artifact_missing", None)
-            .await
-            .expect_err("missing artifact should not resolve");
+            let error = harness
+                .service
+                .resolve_provider_attachment("ws_a", "artifact_missing", None)
+                .await
+                .expect_err("missing artifact should not resolve");
 
-        assert!(matches!(error, ArtifactError::NotFound { .. }));
+            assert!(matches!(error, ArtifactError::NotFound { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn bind_existing_artifact_adds_binding_without_duplicating_blob() {
-        let harness = setup().await;
-        let created = harness
-            .service
-            .ingest_bytes(ingest_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                b"hello",
-                "hello.txt",
-            ))
-            .await
-            .expect("ingest bytes");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let created = harness
+                .service
+                .ingest_bytes(ingest_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    b"hello",
+                    "hello.txt",
+                ))
+                .await
+                .expect("ingest bytes");
 
-        let binding = harness
-            .service
-            .bind_artifact(BindArtifactRequest {
-                workspace_id: "ws_a".to_owned(),
-                artifact_id: created.artifact.artifact_id.clone(),
-                version_id: None,
-                target: target("thr_a", "turn_b"),
-                metadata: BTreeMap::new(),
-            })
-            .await
-            .expect("bind artifact");
+            let binding = harness
+                .service
+                .bind_artifact(BindArtifactRequest {
+                    workspace_id: "ws_a".to_owned(),
+                    artifact_id: created.artifact.artifact_id.clone(),
+                    version_id: None,
+                    target: target("thr_a", "turn_b"),
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .expect("bind artifact");
 
-        assert_eq!(binding.turn_id.as_deref(), Some("turn_b"));
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 2);
+            assert_eq!(binding.turn_id.as_deref(), Some("turn_b"));
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 2);
 
-        let summary = harness
-            .service
-            .get_artifact("ws_a", &created.artifact.artifact_id, None)
-            .await
-            .expect("get artifact");
-        assert_eq!(summary.bindings.len(), 2);
+            let summary = harness
+                .service
+                .get_artifact("ws_a", &created.artifact.artifact_id, None)
+                .await
+                .expect("get artifact");
+            assert_eq!(summary.bindings.len(), 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_inside_allowed_root_ingests_successfully() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let file = root.join("report.txt");
-        tokio::fs::write(&file, b"local text")
-            .await
-            .expect("write local file");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let file = root.join("report.txt");
+            tokio::fs::write(&file, b"local text")
+                .await
+                .expect("write local file");
 
-        let summary = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                file,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect("ingest local path");
+            let summary = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    file,
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect("ingest local path");
 
-        assert_eq!(summary.artifact.display_name, "report.txt");
-        assert_eq!(summary.artifact.kind, ArtifactKind::Text);
-        assert_eq!(summary.artifact.mime_type.as_deref(), Some("text/plain"));
-        assert_eq!(summary.bindings.len(), 1);
-        assert_eq!(summary.bindings[0].turn_id.as_deref(), Some("turn_a"));
+            assert_eq!(summary.artifact.display_name, "report.txt");
+            assert_eq!(summary.artifact.kind, ArtifactKind::Text);
+            assert_eq!(summary.artifact.mime_type.as_deref(), Some("text/plain"));
+            assert_eq!(summary.bindings.len(), 1);
+            assert_eq!(summary.bindings[0].turn_id.as_deref(), Some("turn_a"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_outside_allowed_root_is_rejected() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let outside = harness._temp.path().join("outside.txt");
-        tokio::fs::write(&outside, b"outside")
-            .await
-            .expect("write outside file");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let outside = harness._temp.path().join("outside.txt");
+            tokio::fs::write(&outside, b"outside")
+                .await
+                .expect("write outside file");
 
-        let error = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                outside,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect_err("outside path should be rejected");
+            let error = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    outside,
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect_err("outside path should be rejected");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_traversal_is_rejected() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let outside = harness._temp.path().join("outside.txt");
-        tokio::fs::write(&outside, b"outside")
-            .await
-            .expect("write outside file");
-        let traversal = root.join("../outside.txt");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let outside = harness._temp.path().join("outside.txt");
+            tokio::fs::write(&outside, b"outside")
+                .await
+                .expect("write outside file");
+            let traversal = root.join("../outside.txt");
 
-        let error = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                traversal,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect_err("traversal path should be rejected");
+            let error = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    traversal,
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect_err("traversal path should be rejected");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn local_path_symlink_inside_root_pointing_outside_is_rejected() {
-        use std::os::unix::fs::symlink;
+        with_database(async |database| {
+            use std::os::unix::fs::symlink;
 
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let outside = harness._temp.path().join("outside.txt");
-        tokio::fs::write(&outside, b"outside")
-            .await
-            .expect("write outside file");
-        let link = root.join("linked.txt");
-        symlink(&outside, &link).expect("create symlink");
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let outside = harness._temp.path().join("outside.txt");
+            tokio::fs::write(&outside, b"outside")
+                .await
+                .expect("write outside file");
+            let link = root.join("linked.txt");
+            symlink(&outside, &link).expect("create symlink");
 
-        let error = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                link,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect_err("symlink should be rejected");
+            let error = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    link,
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect_err("symlink should be rejected");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_directory_is_rejected() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
 
-        let error = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                root.clone(),
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect_err("directory should be rejected");
+            let error = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    root.clone(),
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect_err("directory should be rejected");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_oversized_file_is_rejected_before_commit() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let file = root.join("big.bin");
-        tokio::fs::write(&file, b"12345")
-            .await
-            .expect("write local file");
-        let mut policy = ArtifactLocalPathPolicy::new(vec![root]);
-        policy.max_file_bytes = 4;
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let file = root.join("big.bin");
+            tokio::fs::write(&file, b"12345")
+                .await
+                .expect("write local file");
+            let mut policy = ArtifactLocalPathPolicy::new(vec![root]);
+            policy.max_file_bytes = 4;
 
-        let error = harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a", "thr_a", "turn_a", file, policy,
-            ))
-            .await
-            .expect_err("oversized path should be rejected");
+            let error = harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a", "thr_a", "turn_a", file, policy,
+                ))
+                .await
+                .expect_err("oversized path should be rejected");
 
-        assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
-        assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+            assert!(matches!(error, ArtifactError::LocalPathRejected { .. }));
+            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn local_path_same_file_in_two_workspaces_stays_workspace_scoped() {
-        let harness = setup().await;
-        let root = harness._temp.path().join("allowed");
-        tokio::fs::create_dir_all(&root).await.expect("create root");
-        let file = root.join("shared.txt");
-        tokio::fs::write(&file, b"shared")
-            .await
-            .expect("write local file");
+        with_database(async |database| {
+            let harness = setup(database).await;
+            let root = harness._temp.path().join("allowed");
+            tokio::fs::create_dir_all(&root).await.expect("create root");
+            let file = root.join("shared.txt");
+            tokio::fs::write(&file, b"shared")
+                .await
+                .expect("write local file");
 
-        harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_a",
-                "thr_a",
-                "turn_a",
-                file.clone(),
-                ArtifactLocalPathPolicy::new(vec![root.clone()]),
-            ))
-            .await
-            .expect("ingest workspace A");
-        harness
-            .service
-            .ingest_source(local_source_request(
-                "ws_b",
-                "thr_b",
-                "turn_b",
-                file,
-                ArtifactLocalPathPolicy::new(vec![root]),
-            ))
-            .await
-            .expect("ingest workspace B");
+            harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_a",
+                    "thr_a",
+                    "turn_a",
+                    file.clone(),
+                    ArtifactLocalPathPolicy::new(vec![root.clone()]),
+                ))
+                .await
+                .expect("ingest workspace A");
+            harness
+                .service
+                .ingest_source(local_source_request(
+                    "ws_b",
+                    "thr_b",
+                    "turn_b",
+                    file,
+                    ArtifactLocalPathPolicy::new(vec![root]),
+                ))
+                .await
+                .expect("ingest workspace B");
 
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
-        assert_eq!(count_blobs(harness.store.as_ref(), "ws_b").await, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 1);
+            assert_eq!(count_blobs(harness.store.as_ref(), "ws_b").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     async fn count_blobs(store: &CrudStore, workspace_id: &str) -> u64 {
@@ -3562,35 +3716,44 @@ mod tests {
             ("deleted", "deleted artifact should be rejected"),
             ("quarantined", "quarantined artifact should be rejected"),
         ] {
-            let harness = setup().await;
-            let created = harness
-                .service
-                .ingest_bytes(ingest_request(
-                    "ws_a",
-                    "thr_a",
-                    "turn_a",
-                    b"hello provider",
-                    "provider.txt",
-                ))
-                .await
-                .expect("ingest bytes");
-            update_artifact_status(
-                harness.store.as_ref(),
-                &created.artifact.artifact_id,
-                status,
-            )
-            .await;
+            with_database(async |database| {
+                let harness = setup(database).await;
+                let created = harness
+                    .service
+                    .ingest_bytes(ingest_request(
+                        "ws_a",
+                        "thr_a",
+                        "turn_a",
+                        b"hello provider",
+                        "provider.txt",
+                    ))
+                    .await
+                    .expect("ingest bytes");
+                update_artifact_status(
+                    harness.store.as_ref(),
+                    &created.artifact.artifact_id,
+                    status,
+                )
+                .await;
 
-            let error = harness
-                .service
-                .resolve_provider_attachment("ws_a", created.artifact.artifact_id.as_str(), None)
-                .await
-                .expect_err(rejection_message);
+                let error = harness
+                    .service
+                    .resolve_provider_attachment(
+                        "ws_a",
+                        created.artifact.artifact_id.as_str(),
+                        None,
+                    )
+                    .await
+                    .expect_err(rejection_message);
 
-            assert!(
-                matches!(error, ArtifactError::InvalidRequest { .. }),
-                "{status}: {error:?}"
-            );
+                assert!(
+                    matches!(error, ArtifactError::InvalidRequest { .. }),
+                    "{status}: {error:?}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -3598,45 +3761,50 @@ mod tests {
     async fn registration_database_faults_roll_back_graph_and_clean_blob() {
         for (trigger, bytes, display_name, registration_failure, cleanup_failure) in [
             (
-                "CREATE TRIGGER fail_artifact_insert BEFORE INSERT ON artifact BEGIN SELECT RAISE(FAIL, 'forced artifact failure'); END;",
+                "CREATE FUNCTION fail_artifact_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced artifact failure'; END; $$; CREATE TRIGGER fail_artifact_insert BEFORE INSERT ON artifact FOR EACH ROW EXECUTE FUNCTION fail_artifact_insert()",
                 b"blob already written".as_slice(),
                 "cleanup.txt",
                 "DB failure should fail registration",
                 "blob should be cleaned up after DB failure",
             ),
             (
-                "CREATE TRIGGER fail_artifact_binding_insert BEFORE INSERT ON artifact_binding BEGIN SELECT RAISE(FAIL, 'forced binding failure'); END;",
+                "CREATE FUNCTION fail_artifact_binding_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced binding failure'; END; $$; CREATE TRIGGER fail_artifact_binding_insert BEFORE INSERT ON artifact_binding FOR EACH ROW EXECUTE FUNCTION fail_artifact_binding_insert()",
                 b"binding failure".as_slice(),
                 "binding.txt",
                 "binding failure should fail registration",
                 "blob should be cleaned up after binding rollback",
             ),
         ] {
-            let harness = setup().await;
-            harness
-                .store
-                .database_connection()
-                .execute_unprepared(trigger)
-                .await
-                .expect("create failure trigger");
-            let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, display_name);
-            let storage_key = storage_key_for(bytes);
-            let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
-                .blob_path("ws_a", storage_key.as_str())
-                .expect("blob path");
+            with_database(async |database| {
+                let harness = setup(database).await;
+                harness
+                    .store
+                    .database_connection()
+                    .execute_unprepared(trigger)
+                    .await
+                    .expect("create failure trigger");
+                let request = ingest_request("ws_a", "thr_a", "turn_a", bytes, display_name);
+                let storage_key = storage_key_for(bytes);
+                let blob_path = LocalArtifactBlobStore::new(harness._temp.path())
+                    .blob_path("ws_a", storage_key.as_str())
+                    .expect("blob path");
 
-            let error = harness
-                .service
-                .ingest_bytes(request)
-                .await
-                .expect_err(registration_failure);
+                let error = harness
+                    .service
+                    .ingest_bytes(request)
+                    .await
+                    .expect_err(registration_failure);
 
-            assert!(matches!(error, ArtifactError::Database { .. }));
-            assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
-            assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
-            assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
-            assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
-            assert!(!blob_path.exists(), "{cleanup_failure}");
+                assert!(matches!(error, ArtifactError::Database { .. }));
+                assert_eq!(count_blobs(harness.store.as_ref(), "ws_a").await, 0);
+                assert_eq!(count_artifacts(harness.store.as_ref(), "ws_a").await, 0);
+                assert_eq!(count_versions(harness.store.as_ref(), "ws_a").await, 0);
+                assert_eq!(count_bindings(harness.store.as_ref(), "ws_a").await, 0);
+                assert!(!blob_path.exists(), "{cleanup_failure}");
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 }

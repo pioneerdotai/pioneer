@@ -7,25 +7,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "invitation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub gateway_id: String,
+    #[sea_orm(column_type = "Text")]
     pub created_by_principal_id: String,
+    #[sea_orm(column_type = "Text")]
     pub created_by_session_id: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
-    #[sea_orm(column_type = "Binary(1)", nullable, unique)]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)", nullable, unique)]
     pub token_hash: Option<Vec<u8>>,
     pub token_format_version: i64,
     pub expires_at: DateTimeWithTimeZone,
     pub accepted_at: Option<DateTimeWithTimeZone>,
     pub revoked_at: Option<DateTimeWithTimeZone>,
     pub expired_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub accepted_principal_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub accepted_device_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub accepted_session_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub revoke_reason: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text")]
     pub target_role_key: String,
     #[sea_orm(
         belongs_to,
@@ -35,7 +44,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub auth_session_2: HasOne<super::auth_session::Entity>,
+    pub auth_session_2: BelongsTo<Option<super::auth_session::Entity>>,
     #[sea_orm(
         belongs_to,
         relation_enum = "AuthSession1",
@@ -44,7 +53,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub auth_session_1: HasOne<super::auth_session::Entity>,
+    pub auth_session_1: BelongsTo<super::auth_session::Entity>,
     #[sea_orm(
         belongs_to,
         from = "accepted_device_id",
@@ -52,7 +61,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub device: HasOne<super::device::Entity>,
+    pub device: BelongsTo<Option<super::device::Entity>>,
     #[sea_orm(
         belongs_to,
         from = "gateway_id",
@@ -60,7 +69,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    pub gateway_identity: BelongsTo<super::gateway_identity::Entity>,
     #[sea_orm(
         belongs_to,
         relation_enum = "GatewayPrincipal2",
@@ -69,7 +78,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal_2: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal_2: BelongsTo<Option<super::gateway_principal::Entity>>,
     #[sea_orm(
         belongs_to,
         relation_enum = "GatewayPrincipal1",
@@ -78,7 +87,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_principal_1: HasOne<super::gateway_principal::Entity>,
+    pub gateway_principal_1: BelongsTo<super::gateway_principal::Entity>,
     #[sea_orm(has_many)]
     pub invitation_workspace_grants: HasMany<super::invitation_workspace_grant::Entity>,
 }

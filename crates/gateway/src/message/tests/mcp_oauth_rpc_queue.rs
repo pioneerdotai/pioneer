@@ -10,17 +10,17 @@ use futures_util::SinkExt;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn callback_acceptance_frees_same_websocket_for_cancel_during_exchange() {
     oauth_queue_cancellation(false, None, None, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn preparing_is_delivered_and_details_does_not_block_cancel_on_same_websocket() {
     oauth_queue_cancellation(true, None, None, None).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_notification_await()
 {
     for state in [
@@ -35,7 +35,7 @@ async fn authorized_event_cannot_restart_reinstalled_or_replaced_identity_after_
 }
 
 // One async worker verifies that the post-put async barrier yields to Cancel.
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 1)]
 async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_timeout_and_success() {
     use pioneer_mcp_oauth::OAuthState;
     for decision in [
@@ -47,7 +47,7 @@ async fn same_websocket_terminal_decision_after_durable_put_preserves_cancel_tim
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn other_installation_blocking_read_cannot_delay_same_websocket_details_and_cancel() {
     oauth_queue_cancellation_impl(false, None, None, None, true, None).await;
 }
@@ -1114,7 +1114,7 @@ async fn oauth_queue_cancellation_impl(
     oauth_server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn oauth_scoped_restart_keeps_catalog_and_audit_on_maintenance_writer() {
     for phase in ["live", "startup", "backoff", "auth_required", "recovery"] {
         oauth_scope_phase(phase).await;
@@ -1123,33 +1123,13 @@ async fn oauth_scoped_restart_keeps_catalog_and_audit_on_maintenance_writer() {
 
 async fn oauth_scope_phase(phase: &'static str) {
     let observer = Arc::new(NativeSchedulingObserver::default());
-    use sea_orm::ConnectOptions;
-    let directory = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("oauth-scope.sqlite").display()
-    );
-    let mut options = ConnectOptions::new(url.clone());
-    options.max_connections(1).sqlx_logging(false);
-    let bootstrap_connection = Database::connect(options).await.unwrap();
-    let (_, _, workspace_id) =
-        setup_workspace_manager_with_connection(bootstrap_connection.clone()).await;
-    bootstrap_connection
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut writer_options = ConnectOptions::new(url.clone());
-    writer_options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(writer_options).await.unwrap();
-    let mut reader_options = ConnectOptions::new(url);
-    reader_options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(reader_options).await.unwrap();
-    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace_id) = setup_postgres_workspace_manager(&fixture).await;
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture.connect_read_only().await.unwrap();
+    let database = pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
         reader,
-        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let workspaces = Arc::new(WorkspaceManager::new(database.clone()));
@@ -1247,11 +1227,11 @@ async fn oauth_scope_phase(phase: &'static str) {
     let service = crate::mcp_oauth::maintenance_service(processor.mcp_service.inner.clone());
     assert_eq!(
         scoped_store.database_connection().read_class(),
-        pioneer_sqlite::SqliteReadClass::Maintenance
+        pioneer_postgres_pools::PostgresReadClass::Maintenance
     );
     assert_eq!(
         scoped_store.database_connection().write_class(),
-        pioneer_sqlite::SqliteWriteClass::Maintenance
+        pioneer_postgres_pools::PostgresWriteClass::Maintenance
     );
     if phase == "recovery" {
         let change = Arc::new(tokio::sync::Notify::new());
@@ -1432,7 +1412,7 @@ async fn oauth_scope_phase(phase: &'static str) {
     })
     .await
     .unwrap();
-    // The physical reader pool is query_only. Catalog/audit persistence must
+    // The physical reader pool is read-only. Catalog/audit persistence must
     // succeed through the writer, with the Maintenance class retained by the
     // cloned service handle inside the background actor.
     assert!(
@@ -1446,7 +1426,7 @@ async fn oauth_scope_phase(phase: &'static str) {
     let acquired = writes
         .iter()
         .filter_map(|event| match event {
-            pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } => Some(*class),
+            pioneer_postgres_pools::PostgresWriteEvent::Acquired { class, .. } => Some(*class),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1454,7 +1434,9 @@ async fn oauth_scope_phase(phase: &'static str) {
     let read_classes = reads
         .iter()
         .filter_map(|event| match event {
-            pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } => Some(*class),
+            pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } => {
+                Some(*class)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1462,13 +1444,13 @@ async fn oauth_scope_phase(phase: &'static str) {
     assert!(
         read_classes
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteReadClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresReadClass::Maintenance)
     );
     assert!(!acquired.is_empty());
     assert!(
         acquired
             .iter()
-            .all(|class| *class == pioneer_sqlite::SqliteWriteClass::Maintenance)
+            .all(|class| *class == pioneer_postgres_pools::PostgresWriteClass::Maintenance)
     );
     // The foreground source handle was not reclassified by background cloning.
     observer.reads.lock().unwrap().clear();
@@ -1481,8 +1463,8 @@ async fn oauth_scope_phase(phase: &'static str) {
     );
     assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
         event,
-        pioneer_sqlite::SqliteReadEvent::OperationFinished {
-            class: pioneer_sqlite::SqliteReadClass::Interactive,
+        pioneer_postgres_pools::PostgresReadEvent::OperationFinished {
+            class: pioneer_postgres_pools::PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -1662,7 +1644,7 @@ impl Drop for QueueFixtureRelease {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_connections_stale_oauth_rpc_cannot_rebind_or_clear_replacement() {
     for action in ["sign_in", "callback", "cancel", "disconnect"] {
         for new_uuid in [false, true] {
@@ -1872,7 +1854,7 @@ async fn stale_rpc_replacement(
     current_socket.close(None).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn disabled_consent_commits_account_without_starting_runtime() {
     oauth_queue_cancellation(
         false,
@@ -1985,14 +1967,14 @@ impl pioneer_keystore::SecretStore for OtherInstallationRead {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolving_clear_failure_preserves_details_and_retry_on_same_websocket() {
     for mode in [1, 2, 3] {
         oauth_queue_cancellation_impl(false, None, None, None, false, Some(mode)).await;
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_management_clients_denied_then_other_consent_clear_delivers_current_cleanup() {
     oauth_queue_cancellation_impl(false, None, None, None, false, Some(4)).await;
 }

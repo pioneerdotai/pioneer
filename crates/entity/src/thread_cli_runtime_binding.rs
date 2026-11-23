@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_cli_runtime_binding")]
 pub struct Model {
-    #[sea_orm(column_type = "Text", nullable)]
-    pub frozen_manifest_id: Option<String>,
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_kind: String,
     #[sea_orm(column_type = "Text")]
     pub native_thread_id: String,
@@ -26,6 +27,7 @@ pub struct Model {
     pub native_model: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub resume_cursor_json: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -45,6 +47,8 @@ pub struct Model {
     pub provider_session_lifecycle_state: Option<String>,
     pub mcp_session_generation: Option<i64>,
     pub provider_session_last_verified_process_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

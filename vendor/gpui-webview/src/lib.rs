@@ -422,6 +422,7 @@ impl WebViewElement {
     }
 }
 
+#[cfg(not(feature = "gpui-fast"))]
 impl IntoElement for WebViewElement {
     type Element = WebViewElement;
 

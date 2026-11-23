@@ -11,25 +11,25 @@ import plistlib
 import zipfile
 
 
-def fixture(binary, archive, target):
+def fixture(binary, archive, target, postgres):
     windows = "windows" in target
     macos = "apple-darwin" in target
     executable = "pioneer.exe" if windows else "pioneer"
     daemon = ("Pioneer Gateway.app/Contents/Helpers/cua-driver" if macos else
-              "cua-driver.exe" if windows else "cua-driver")
+              "cua/cua-driver.exe" if windows else "cua/cua-driver")
     # Invalid executable on Windows; explicit non-ready executable on Unix.
     driver = b"CUA unavailable in installer fixture\n" if windows else b"#!/bin/sh\nexit 1\n"
     members = {
-        "cua/" + daemon: (driver, 0o755),
-        "cua/LICENSE.cua-driver.md": (b"Synthetic installer fixture; no upstream binary.\n", 0o644),
-        "cua/THIRD_PARTY_NOTICES.md": (b"Synthetic installer fixture.\n", 0o644),
+        "runtime/" + daemon: (driver, 0o755),
+        "runtime/cua/LICENSE.cua-driver.md": (b"Synthetic installer fixture; no upstream binary.\n", 0o644),
+        "runtime/cua/THIRD_PARTY_NOTICES.md": (b"Synthetic installer fixture.\n", 0o644),
     }
     if windows:
-        members["cua/cua-driver-uia.exe"] = (driver, 0o755)
+        members["runtime/cua/cua-driver-uia.exe"] = (driver, 0o755)
     if not macos:
         members[executable] = (binary.read_bytes(), 0o755)
     if macos:
-        app = "cua/Pioneer Gateway.app/Contents/"
+        app = "runtime/Pioneer Gateway.app/Contents/"
         members[app + "MacOS/pioneer"] = (binary.read_bytes(), 0o755)
         members[app + "Info.plist"] = (plistlib.dumps(dict(
             CFBundleIdentifier="ai.pioneer.gateway", CFBundleExecutable="pioneer",
@@ -38,7 +38,7 @@ def fixture(binary, archive, target):
                     revision="installer-fixture",
                     version="fixture", target=target, permission_owner="gateway",
                     daemon=daemon, sha256=hashlib.sha256(driver).hexdigest())
-    members["cua/manifest.json"] = ((json.dumps(manifest) + "\n").encode(), 0o644)
+    members["runtime/cua/manifest.json"] = ((json.dumps(manifest) + "\n").encode(), 0o644)
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
         for name, (data, mode) in members.items():
             info = zipfile.ZipInfo(name)
@@ -46,6 +46,9 @@ def fixture(binary, archive, target):
             info.external_attr = (0o100000 | mode) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             output.writestr(info, data)
+        for path in sorted(postgres.rglob("*")):
+            if path.is_file():
+                output.write(path, (Path("runtime/postgres") / path.relative_to(postgres)).as_posix())
 
 
 if __name__ == "__main__":
@@ -53,5 +56,6 @@ if __name__ == "__main__":
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--postgres", type=Path, required=True)
     args = parser.parse_args()
-    fixture(args.binary, args.archive, args.target)
+    fixture(args.binary, args.archive, args.target, args.postgres)

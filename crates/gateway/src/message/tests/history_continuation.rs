@@ -98,7 +98,7 @@ async fn prepare_history_for_provider(
         .messages
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_final_response_aliases_survive_checkpoint_cleanup_and_frozen_restart() {
     for (provider, model, native, reasoning, ui_final, content) in [
         (
@@ -847,7 +847,7 @@ async fn durable_final_case(
     assert_eq!(restarted.messages, cold.messages);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unrelated_technical_completion_and_foreign_identity_do_not_discharge_final_boundary() {
     let thread = "g05-negative-thread";
     let turn = "g05-negative-turn";
@@ -1028,7 +1028,7 @@ async fn unrelated_technical_completion_and_foreign_identity_do_not_discharge_fi
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_ui_only_final_keeps_existing_cold_history_eligibility() {
     let thread = "g05-ordinary-thread";
     let turn = "g05-ordinary-turn";
@@ -1079,7 +1079,7 @@ async fn ordinary_ui_only_final_keeps_existing_cold_history_eligibility() {
     assert!(layout.units.iter().all(|u| u.complete));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn responses_commentary_exact_copies_survive_hot_cold_recovery_frozen_checkpoint() {
     // Synthetic native replay; portable generic aliases remain independent of wire schema.
     durable_final_case("openai","gpt-6.1-sol",json!({"schema_version":1,"wire_api":"responses","authority_scope":"synthetic","output":[
@@ -1089,7 +1089,7 @@ async fn responses_commentary_exact_copies_survive_hot_cold_recovery_frozen_chec
     ]}),"canonical reasoning","canonical final answer","[Assistant commentary]\nworking\n\ncanonical final answer",true).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn explicit_copies_require_named_completed_semantics_and_empty_does_not_wait_for_final() {
     let thread = "p71-copy-thread";
     let turn = "p71-copy-turn";
@@ -1258,7 +1258,7 @@ async fn explicit_copies_require_named_completed_semantics_and_empty_does_not_wa
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn tool_round_commentary_copies_are_exact_without_a_final_ui_item() {
     let thread = "p71-tool-thread";
     let turn = "p71-tool-turn";

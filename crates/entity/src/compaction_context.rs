@@ -25,7 +25,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub thread: HasOne<super::thread::Entity>,
+    pub thread: BelongsTo<super::thread::Entity>,
     #[sea_orm(has_many, via = "compaction_execution_stop")]
     pub turns: HasMany<super::turn::Entity>,
 }

@@ -51,7 +51,7 @@ async fn wire_server() -> (
     (root, rx, server)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_responses_wire() {
     use pioneer_protocol::{PersistedActorRef, SandboxMode, ToolRetryResolution, UserInput};
     use pioneer_provider::providers::{AuthStyle, ResponsesApiCompatibleProvider};
@@ -134,8 +134,8 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
                 })
                 .collect(),
         };
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('call-source','turn','patch-round',7,'assistant_round',?,'{}','2026-10-30T05:36:14.874340Z')",
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('call-source','turn','patch-round',7,'assistant_round',$1,'{}','2026-10-30T05:36:14.874340Z')",
             [serde_json::to_string(&round).unwrap().into()])).await.unwrap();
         // Completion order differs from call ordinal for parallel tools.
         let mut live_results = Vec::new();
@@ -154,8 +154,8 @@ async fn retry_resolution_between_call_and_result_survives_cold_accepted_and_res
                 value: serde_json::to_value(&result).unwrap(),
                 truncated: false,
             };
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?,'turn',?,?,'tool_result_v2',?,'{}',?)",
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
+                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES($1,'turn',$2,$3,'tool_result_v2',$4,'{}',$5::text::timestamptz)",
                 [format!("result-{i}").into(), item.into(), (8_i64 + live_results.len() as i64).into(), serde_json::to_string(&payload).unwrap().into(),
                     if i==0 { "2026-10-30T05:36:15.302774Z" } else { "2026-10-30T05:36:15.100000Z" }.into()])).await.unwrap();
             live_results.push(result);
@@ -448,7 +448,7 @@ fn retry_non_retryable_resolution_remains_model_visible() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn aihubmix_signed_tool_round_survives_cold_and_accepted_history_storage() {
     use pioneer_crud::NewTurnLlmContextEntry;
     use std::collections::BTreeSet;

@@ -7,17 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_write_lock")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub task_id: String,
+    #[sea_orm(column_type = "Text")]
     pub run_id: String,
+    #[sea_orm(column_type = "Text")]
     pub scope_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub scope_path: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub acquired_at: DateTimeWithTimeZone,
     pub expires_at: Option<DateTimeWithTimeZone>,
     pub released_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
     pub conflict_policy: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub reason: Option<String>,

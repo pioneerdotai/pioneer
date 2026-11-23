@@ -18,7 +18,7 @@ const MAX_PERSISTED_SIDE_EFFECT_STRING_BYTES: usize = 4096;
 const MAX_PERSISTED_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PERSISTED_TOTAL_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PERSISTED_GAP_REASON_BYTES: usize = 4096;
-/// Serialized records are decoded from SQLite before their typed bounds can
+/// Serialized records are decoded from PostgreSQL before their typed bounds can
 /// be checked. Keep that decode itself bounded so a corrupt row cannot cause
 /// an attacker-controlled allocation during replay/startup.
 pub(crate) const MAX_PERSISTED_RECORD_JSON_BYTES: usize = 8 * 1024 * 1024;

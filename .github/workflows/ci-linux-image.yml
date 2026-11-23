@@ -1,0 +1,56 @@
+name: CI Linux image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, ci/linux-runner-image]
+    paths:
+      - packaging/ci-linux/Dockerfile
+      - .github/workflows/ci-linux-image.yml
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'pioneerdotai/pioneer' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/linux-runner-image')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/pioneerdotai/pioneer-ci-linux
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, check and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:sha-$GITHUB_SHA-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$tag" packaging/ci-linux
+          docker run --rm --volume "$RUNNER_TEMP:/probe" "$tag" bash -euc '
+            test "$(id -u)" -eq 1001
+            test -w /probe
+            git --version
+            clang --version
+            python3 --version
+            pkg-config --exists alsa egl gbm libpipewire-0.3 openssl wayland-client webkit2gtk-4.1 xkbcommon-x11
+          '
+          docker push "$tag"
+          digest_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$tag")"
+          [[ "$digest_ref" =~ ^ghcr\.io/pioneerdotai/pioneer-ci-linux@sha256:[0-9a-f]{64}$ ]]
+          printf 'Image for Linux CI: `%s`\n' "$digest_ref" >> "$GITHUB_STEP_SUMMARY"

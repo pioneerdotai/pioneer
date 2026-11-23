@@ -2080,8 +2080,10 @@ mod tests {
         }
     }
 
-    async fn resolver_fixture() -> (IsolatedEpic4Harness, AuthorizationResolver) {
-        let harness = IsolatedEpic4Harness::new()
+    async fn resolver_fixture(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> (IsolatedEpic4Harness, AuthorizationResolver) {
+        let harness = IsolatedEpic4Harness::new(test_database)
             .await
             .expect("isolated Epic 4 harness");
         harness
@@ -2197,1366 +2199,1495 @@ mod tests {
 
     #[tokio::test]
     async fn member_mcp_capability_resolves_ui_id_and_execution_name_to_the_same_server() {
-        let (harness, resolver) = resolver_fixture().await;
-        harness
-            .database
-            .execute_unprepared(
-                "INSERT INTO mcp_server_installation(\
-                    id,scope_kind,scope_key,name,source_kind,source_ref,transport_kind,\
-                    transport_json,auth_json,secret_refs_json,enabled,\
-                    allow_implicit_invocation,required,fingerprint\
-                 ) VALUES(\
-                    'mcp-installation-member','workspace','W00000000000000000001',\
-                    'member-tools','config','{}','stdio','{}','{}','[]',1,0,0,\
-                    'mcp-member-fingerprint'\
-                 )",
-            )
-            .await
-            .expect("materialize enabled Member MCP capability");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                harness
+                    .database
+                    .execute_unprepared(
+                        "INSERT INTO mcp_server_installation(\
+                            id,scope_kind,scope_key,name,source_kind,source_ref,transport_kind,\
+                            transport_json,auth_json,secret_refs_json,enabled,\
+                            allow_implicit_invocation,required,fingerprint\
+                         ) VALUES(\
+                            'mcp-installation-member','workspace','W00000000000000000001',\
+                            'member-tools','config','{}','stdio','{}','{}','[]',TRUE,FALSE,FALSE,\
+                            'mcp-member-fingerprint'\
+                         )",
+                    )
+                    .await
+                    .expect("materialize enabled Member MCP capability");
 
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::McpUse,
-        );
-
-        for capability_id in ["mcp-installation-member", "member-tools"] {
-            let authorized = resolver
-                .authorize_persisted_capability(
-                    &member,
-                    &gate,
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
                     ResourceAction::McpUse,
-                    WORKSPACE_ID,
-                    CapabilityKind::McpServer,
-                    capability_id,
-                )
-                .await
-                .expect("resolve Member MCP capability")
-                .into_authorized();
-            assert!(
-                authorized.is_some(),
-                "Member MCP capability should resolve through `{capability_id}`"
-            );
-        }
+                );
 
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE mcp_server_installation SET enabled=0 \
-                 WHERE id='mcp-installation-member'",
-            )
-            .await
-            .expect("disable Member MCP capability");
-        assert!(
-            resolver
-                .authorize_persisted_capability(
-                    &member,
-                    &gate,
-                    ResourceAction::McpUse,
-                    WORKSPACE_ID,
-                    CapabilityKind::McpServer,
-                    "mcp-installation-member",
-                )
-                .await
-                .expect("resolve disabled Member MCP capability")
-                .into_authorized()
-                .is_none(),
-            "disabled MCP capabilities must remain unusable"
-        );
+                for capability_id in ["mcp-installation-member", "member-tools"] {
+                    let authorized = resolver
+                        .authorize_persisted_capability(
+                            &member,
+                            &gate,
+                            ResourceAction::McpUse,
+                            WORKSPACE_ID,
+                            CapabilityKind::McpServer,
+                            capability_id,
+                        )
+                        .await
+                        .expect("resolve Member MCP capability")
+                        .into_authorized();
+                    assert!(
+                        authorized.is_some(),
+                        "Member MCP capability should resolve through `{capability_id}`"
+                    );
+                }
+
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE mcp_server_installation SET enabled=FALSE \
+                         WHERE id='mcp-installation-member'",
+                    )
+                    .await
+                    .expect("disable Member MCP capability");
+                assert!(
+                    resolver
+                        .authorize_persisted_capability(
+                            &member,
+                            &gate,
+                            ResourceAction::McpUse,
+                            WORKSPACE_ID,
+                            CapabilityKind::McpServer,
+                            "mcp-installation-member",
+                        )
+                        .await
+                        .expect("resolve disabled Member MCP capability")
+                        .into_authorized()
+                        .is_none(),
+                    "disabled MCP capabilities must remain unusable"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn invitation_grants_reauthorize_the_actor_inside_the_transaction() {
-        let (harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::InvitationCreate,
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
+                    ResourceAction::InvitationCreate,
+                );
 
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE gateway_principal SET status='suspended' \
-                 WHERE id='P0000000000000000000A'",
-            )
-            .await
-            .expect("suspend invitation actor");
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE gateway_principal SET status='suspended' \
+                         WHERE id='P0000000000000000000A'",
+                    )
+                    .await
+                    .expect("suspend invitation actor");
 
-        assert_eq!(
-            resolver
-                .authorize_invitation_grants(
-                    &harness.database,
-                    &member,
-                    &gate,
-                    &[WorkspaceId::new(WORKSPACE_ID).expect("workspace")],
-                )
-                .await
-                .expect("resolve invitation grants")
-                .denial(),
-            Some(&AuthorizationDecision::Deny {
-                reason: DenyReason::InactivePrincipal,
-                disclosure: DisclosurePolicy::AuthenticationTerminal,
-            }),
-            "the request principal snapshot must not authorize an actor that became inactive"
-        );
+                assert_eq!(
+                    resolver
+                        .authorize_invitation_grants(
+                            &harness.database,
+                            &member,
+                            &gate,
+                            &[WorkspaceId::new(WORKSPACE_ID).expect("workspace")],
+                        )
+                        .await
+                        .expect("resolve invitation grants")
+                        .denial(),
+                    Some(&AuthorizationDecision::Deny {
+                        reason: DenyReason::InactivePrincipal,
+                        disclosure: DisclosurePolicy::AuthenticationTerminal,
+                    }),
+                    "the request principal snapshot must not authorize an actor that became inactive"
+                );
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn persisted_two_member_three_workspace_thread_matrix_is_exact_and_fail_closed() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
 
-        for (principal, allowed, denied) in [
-            (
-                &member_a,
-                [WORKSPACE_RED_ID, WORKSPACE_BLUE_ID],
-                WORKSPACE_GREEN_ID,
-            ),
-            (
-                &member_b,
-                [WORKSPACE_RED_ID, WORKSPACE_GREEN_ID],
-                WORKSPACE_BLUE_ID,
-            ),
-        ] {
-            let gate = service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::WorkspaceRead,
-            );
-            for workspace_id in allowed {
-                let proof = resolver
-                    .authorize_workspace(
-                        principal,
-                        &gate,
+                for (principal, allowed, denied) in [
+                    (
+                        &member_a,
+                        [WORKSPACE_RED_ID, WORKSPACE_BLUE_ID],
+                        WORKSPACE_GREEN_ID,
+                    ),
+                    (
+                        &member_b,
+                        [WORKSPACE_RED_ID, WORKSPACE_GREEN_ID],
+                        WORKSPACE_BLUE_ID,
+                    ),
+                ] {
+                    let gate = service.authorize_action(
+                        principal.kind,
+                        principal.role_key.as_ref(),
                         ResourceAction::WorkspaceRead,
-                        workspace_id,
-                    )
-                    .await
-                    .expect("resolve granted workspace")
-                    .into_authorized()
-                    .expect("persisted workspace membership");
-                assert_eq!(proof.workspace_id(), workspace_id);
-            }
-            assert_eq!(
-                resolver
-                    .authorize_workspace(principal, &gate, ResourceAction::WorkspaceRead, denied,)
-                    .await
-                    .expect("resolve forbidden workspace")
-                    .denial(),
-                Some(&AuthorizationDecision::Deny {
-                    reason: DenyReason::MissingAuthoritativeResource,
-                    disclosure: DisclosurePolicy::NotFound,
-                })
-            );
-        }
+                    );
+                    for workspace_id in allowed {
+                        let proof = resolver
+                            .authorize_workspace(
+                                principal,
+                                &gate,
+                                ResourceAction::WorkspaceRead,
+                                workspace_id,
+                            )
+                            .await
+                            .expect("resolve granted workspace")
+                            .into_authorized()
+                            .expect("persisted workspace membership");
+                        assert_eq!(proof.workspace_id(), workspace_id);
+                    }
+                    assert_eq!(
+                        resolver
+                            .authorize_workspace(
+                                principal,
+                                &gate,
+                                ResourceAction::WorkspaceRead,
+                                denied,
+                            )
+                            .await
+                            .expect("resolve forbidden workspace")
+                            .denial(),
+                        Some(&AuthorizationDecision::Deny {
+                            reason: DenyReason::MissingAuthoritativeResource,
+                            disclosure: DisclosurePolicy::NotFound,
+                        })
+                    );
+                }
 
-        let superuser_workspace_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::WorkspaceRead,
-        );
-        assert!(
-            resolver
-                .authorize_workspace(
-                    &superuser,
-                    &superuser_workspace_gate,
+                let superuser_workspace_gate = service.authorize_action(
+                    superuser.kind,
+                    superuser.role_key.as_ref(),
                     ResourceAction::WorkspaceRead,
-                    WORKSPACE_GREEN_ID,
-                )
-                .await
-                .expect("resolve Superuser workspace")
-                .into_authorized()
-                .is_some(),
-            "Superuser must not require membership rows"
-        );
-
-        let member_cases = [
-            (
-                &member_a,
-                [
-                    (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID, true),
-                    (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID, false),
-                    (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID, true),
-                    (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID, false),
-                    (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID, true),
-                    (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID, false),
-                ],
-            ),
-            (
-                &member_b,
-                [
-                    (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID, false),
-                    (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID, true),
-                    (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID, true),
-                    (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID, false),
-                    (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID, false),
-                    (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID, true),
-                ],
-            ),
-        ];
-        for (principal, cases) in member_cases {
-            let gate = service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::ThreadRead,
-            );
-            for (thread_id, workspace_id, allowed) in cases {
-                let resolution = resolver
-                    .authorize_thread(
-                        principal,
-                        &gate,
-                        ResourceAction::ThreadRead,
-                        thread_id,
-                        Some(workspace_id),
-                    )
-                    .await
-                    .expect("resolve persisted thread matrix case");
-                assert_eq!(
-                    resolution.into_authorized().is_some(),
-                    allowed,
-                    "unexpected access for principal {} to thread {thread_id}",
-                    principal.principal_id
                 );
-            }
-        }
+                assert!(
+                    resolver
+                        .authorize_workspace(
+                            &superuser,
+                            &superuser_workspace_gate,
+                            ResourceAction::WorkspaceRead,
+                            WORKSPACE_GREEN_ID,
+                        )
+                        .await
+                        .expect("resolve Superuser workspace")
+                        .into_authorized()
+                        .is_some(),
+                    "Superuser must not require membership rows"
+                );
 
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        for (thread_id, workspace_id) in [
-            (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID),
-            (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID),
-            (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID),
-            (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID),
-            (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID),
-            (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID),
-        ] {
-            assert!(
-                resolver
-                    .authorize_thread(
-                        &superuser,
-                        &superuser_gate,
+                let member_cases = [
+                    (
+                        &member_a,
+                        [
+                            (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID, true),
+                            (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID, false),
+                            (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID, true),
+                            (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID, false),
+                            (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID, true),
+                            (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID, false),
+                        ],
+                    ),
+                    (
+                        &member_b,
+                        [
+                            (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID, false),
+                            (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID, true),
+                            (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID, true),
+                            (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID, false),
+                            (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID, false),
+                            (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID, true),
+                        ],
+                    ),
+                ];
+                for (principal, cases) in member_cases {
+                    let gate = service.authorize_action(
+                        principal.kind,
+                        principal.role_key.as_ref(),
                         ResourceAction::ThreadRead,
-                        thread_id,
-                        Some(workspace_id),
-                    )
-                    .await
-                    .expect("resolve absolute Superuser thread access")
-                    .into_authorized()
-                    .is_some(),
-                "Superuser must not need workspace or thread membership for {thread_id}"
-            );
-        }
+                    );
+                    for (thread_id, workspace_id, allowed) in cases {
+                        let resolution = resolver
+                            .authorize_thread(
+                                principal,
+                                &gate,
+                                ResourceAction::ThreadRead,
+                                thread_id,
+                                Some(workspace_id),
+                            )
+                            .await
+                            .expect("resolve persisted thread matrix case");
+                        assert_eq!(
+                            resolution.into_authorized().is_some(),
+                            allowed,
+                            "unexpected access for principal {} to thread {thread_id}",
+                            principal.principal_id
+                        );
+                    }
+                }
 
-        for principal in [&member_a, &superuser] {
-            let gate = service.authorize_action(
-                principal.kind,
-                principal.role_key.as_ref(),
-                ResourceAction::ThreadRead,
-            );
-            assert!(
-                resolver
+                let superuser_gate = service.authorize_action(
+                    superuser.kind,
+                    superuser.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                for (thread_id, workspace_id) in [
+                    (THREAD_RED_PRIVATE_A_ID, WORKSPACE_RED_ID),
+                    (THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID),
+                    (THREAD_RED_WORKSPACE_ID, WORKSPACE_RED_ID),
+                    (THREAD_RED_INTERNAL_ID, WORKSPACE_RED_ID),
+                    (THREAD_BLUE_PRIVATE_A_ID, WORKSPACE_BLUE_ID),
+                    (THREAD_GREEN_PRIVATE_B_ID, WORKSPACE_GREEN_ID),
+                ] {
+                    assert!(
+                        resolver
+                            .authorize_thread(
+                                &superuser,
+                                &superuser_gate,
+                                ResourceAction::ThreadRead,
+                                thread_id,
+                                Some(workspace_id),
+                            )
+                            .await
+                            .expect("resolve absolute Superuser thread access")
+                            .into_authorized()
+                            .is_some(),
+                        "Superuser must not need workspace or thread membership for {thread_id}"
+                    );
+                }
+
+                for principal in [&member_a, &superuser] {
+                    let gate = service.authorize_action(
+                        principal.kind,
+                        principal.role_key.as_ref(),
+                        ResourceAction::ThreadRead,
+                    );
+                    assert!(
+                        resolver
+                            .authorize_thread(
+                                principal,
+                                &gate,
+                                ResourceAction::ThreadRead,
+                                PRIVATE_THREAD_ID,
+                                Some(WORKSPACE_ID),
+                            )
+                            .await
+                            .expect("resolve exact persisted parent before mismatch")
+                            .into_authorized()
+                            .is_some()
+                    );
+                    for (thread_id, workspace_id) in [
+                        (PRIVATE_THREAD_ID, "W00000000000000000002"),
+                        (THREAD_RED_PRIVATE_A_ID, WORKSPACE_GREEN_ID),
+                        ("T00000000000000000099", WORKSPACE_RED_ID),
+                    ] {
+                        assert_eq!(
+                            resolver
+                                .authorize_thread(
+                                    principal,
+                                    &gate,
+                                    ResourceAction::ThreadRead,
+                                    thread_id,
+                                    Some(workspace_id),
+                                )
+                                .await
+                                .expect("resolve missing or malformed parent-child pair")
+                                .denial(),
+                            Some(&AuthorizationDecision::Deny {
+                                reason: DenyReason::MissingAuthoritativeResource,
+                                disclosure: DisclosurePolicy::NotFound,
+                            })
+                        );
+                    }
+                }
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_thread_proof_is_exact_and_peer_access_is_not_found() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let gate_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                let gate_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+
+                let authorized = resolver
                     .authorize_thread(
-                        principal,
-                        &gate,
+                        &member_a,
+                        &gate_a,
                         ResourceAction::ThreadRead,
                         PRIVATE_THREAD_ID,
                         Some(WORKSPACE_ID),
                     )
                     .await
-                    .expect("resolve exact persisted parent before mismatch")
+                    .expect("resolve private thread")
                     .into_authorized()
-                    .is_some()
-            );
-            for (thread_id, workspace_id) in [
-                (PRIVATE_THREAD_ID, "W00000000000000000002"),
-                (THREAD_RED_PRIVATE_A_ID, WORKSPACE_GREEN_ID),
-                ("T00000000000000000099", WORKSPACE_RED_ID),
-            ] {
+                    .expect("member A proof");
+                assert_eq!(authorized.principal_id(), &member_a.principal_id);
+                assert_eq!(authorized.action(), ResourceAction::ThreadRead);
+                assert!(matches!(
+                    authorized.resource(),
+                    AuthorizationResource::Thread {
+                        workspace_id,
+                        thread_id,
+                    } if workspace_id.as_str() == WORKSPACE_ID
+                        && thread_id.as_str() == PRIVATE_THREAD_ID
+                ));
+
+                let denied = resolver
+                    .authorize_thread(
+                        &member_b,
+                        &gate_b,
+                        ResourceAction::ThreadRead,
+                        PRIVATE_THREAD_ID,
+                        Some(WORKSPACE_ID),
+                    )
+                    .await
+                    .expect("resolve peer private thread");
                 assert_eq!(
+                    denied.denial(),
+                    Some(&AuthorizationDecision::Deny {
+                        reason: DenyReason::NoPrivateThreadMembership,
+                        disclosure: DisclosurePolicy::NotFound,
+                    })
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_member_creator_participant_and_superuser_matrix_is_exact() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
+
+                let read_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                let read_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                let read_superuser = service.authorize_action(
+                    superuser.kind,
+                    superuser.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+
+                assert!(
                     resolver
                         .authorize_thread(
-                            principal,
-                            &gate,
+                            &member_a,
+                            &read_a,
                             ResourceAction::ThreadRead,
-                            thread_id,
-                            Some(workspace_id),
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
                         )
                         .await
-                        .expect("resolve missing or malformed parent-child pair")
+                        .expect("resolve creator private access")
+                        .into_authorized()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &member_b,
+                            &read_b,
+                            ResourceAction::ThreadRead,
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve peer private access")
+                        .into_authorized()
+                        .is_none()
+                );
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &member_b,
+                            &read_b,
+                            ResourceAction::ThreadRead,
+                            WORKSPACE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve overlapping workspace access")
+                        .into_authorized()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &superuser,
+                            &read_superuser,
+                            ResourceAction::ThreadRead,
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve absolute Superuser access")
+                        .into_authorized()
+                        .is_some(),
+                    "Superuser must not require a thread membership"
+                );
+
+                harness
+                    .database
+                    .execute_unprepared(
+                        "INSERT INTO thread_membership(\
+                            thread_id,principal_id,added_by_actor_kind,added_by_actor_id,\
+                            created_at,updated_at\
+                         ) VALUES(\
+                            'T0000000000000000000A','P0000000000000000000B','principal',\
+                            'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
+                         )",
+                    )
+                    .await
+                    .expect("add explicit participant");
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &member_b,
+                            &read_b,
+                            ResourceAction::ThreadRead,
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve explicit participant")
+                        .into_authorized()
+                        .is_some()
+                );
+
+                let manage_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::ThreadManage,
+                );
+                let manage_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::ThreadManage,
+                );
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &member_a,
+                            &manage_a,
+                            ResourceAction::ThreadManage,
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve creator management")
+                        .into_authorized()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .authorize_thread(
+                            &member_b,
+                            &manage_b,
+                            ResourceAction::ThreadManage,
+                            PRIVATE_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve participant management")
+                        .into_authorized()
+                        .is_none(),
+                    "participant access must not transfer creator management"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_thread_is_denied_directly_and_requires_authorized_root_lineage() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+
+                let direct = resolver
+                    .authorize_thread(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        INTERNAL_THREAD_ID,
+                        Some(WORKSPACE_ID),
+                    )
+                    .await
+                    .expect("resolve direct internal thread");
+                assert_eq!(
+                    direct.denial(),
+                    Some(&AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        disclosure: DisclosurePolicy::NotFound,
+                    })
+                );
+
+                let inherited = resolver
+                    .authorize_internal_thread_via_root(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        INTERNAL_THREAD_ID,
+                        None,
+                    )
+                    .await
+                    .expect("resolve internal thread through root")
+                    .into_authorized()
+                    .expect("authorized root permits indirect internal projection");
+                assert_eq!(inherited.thread_id(), INTERNAL_THREAD_ID);
+                // Page authorization preserves the same ACL with mixed scopes and
+                // duplicate children, including a page beyond the metadata quantum.
+                let mut requested = (0..65)
+                    .map(|i| (WORKSPACE_ID.to_owned(), format!("missing-child-{i}")))
+                    .collect::<Vec<_>>();
+                requested.extend([
+                    (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+                    (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
+                    (WORKSPACE_ID.to_owned(), PRIVATE_THREAD_ID.to_owned()),
+                    ("wrong-workspace".to_owned(), INTERNAL_THREAD_ID.to_owned()),
+                ]);
+                let batch = resolver
+                    .authorize_internal_thread_page(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        &requested,
+                    )
+                    .await
+                    .expect("authorize bounded mixed page");
+                assert_eq!(batch.len(), 1);
+                assert!(batch.contains(&(WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned())));
+
+                let peer = principal(MEMBER_B_ID, PrincipalKind::User);
+                let peer_gate = service.authorize_action(
+                    peer.kind,
+                    peer.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                assert!(
+                    resolver
+                        .authorize_internal_thread_via_root(
+                            &peer,
+                            &peer_gate,
+                            ResourceAction::ThreadRead,
+                            INTERNAL_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("resolve peer internal projection")
+                        .into_authorized()
+                        .is_none(),
+                    "guessed child id must not bypass inaccessible root ACL"
+                );
+
+                assert!(
+                    resolver
+                        .authorize_internal_thread_page(
+                            &peer,
+                            &peer_gate,
+                            ResourceAction::ThreadRead,
+                            &requested
+                        )
+                        .await
+                        .expect("peer must retain the root ACL denial")
+                        .is_empty()
+                );
+
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE \"turn\" SET execution_authorization_context_json=NULL \
+                         WHERE id='U0000000000000000000A'",
+                    )
+                    .await
+                    .expect("parent authority should be removable for fail-closed test");
+                assert!(
+                    resolver
+                        .authorize_internal_thread_via_root(
+                            &member,
+                            &gate,
+                            ResourceAction::ThreadRead,
+                            INTERNAL_THREAD_ID,
+                            Some(WORKSPACE_ID),
+                        )
+                        .await
+                        .expect("missing parent authority should resolve as deny")
+                        .into_authorized()
+                        .is_none(),
+                    "missing parent authority must never become unrestricted child access"
+                );
+                // No request-local result may survive across requests after revocation.
+                assert!(
+                    resolver
+                        .authorize_internal_thread_page(
+                            &member,
+                            &gate,
+                            ResourceAction::ThreadRead,
+                            &requested
+                        )
+                        .await
+                        .expect("removed authority must deny a fresh page")
+                        .is_empty()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_turn_requires_and_inherits_authorized_root_lineage() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+
+                assert_eq!(
+                    resolver
+                        .authorize_turn(
+                            &member,
+                            &gate,
+                            ResourceAction::ThreadRead,
+                            INTERNAL_TURN_ID,
+                            Some(WORKSPACE_ID),
+                            Some(INTERNAL_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve direct internal turn")
                         .denial(),
                     Some(&AuthorizationDecision::Deny {
                         reason: DenyReason::MissingAuthoritativeResource,
                         disclosure: DisclosurePolicy::NotFound,
                     })
                 );
+
+                let inherited = resolver
+                    .authorize_internal_turn_via_root(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        INTERNAL_TURN_ID,
+                        None,
+                        Some(INTERNAL_THREAD_ID),
+                    )
+                    .await
+                    .expect("resolve internal turn through root")
+                    .into_authorized()
+                    .expect("authorized root permits internal turn projection");
+                assert!(matches!(
+                    inherited.resource(),
+                    AuthorizationResource::Turn {
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                    } if workspace_id.as_str() == WORKSPACE_ID
+                        && thread_id.as_str() == INTERNAL_THREAD_ID
+                        && turn_id.as_str() == INTERNAL_TURN_ID
+                ));
+
+                let peer = principal(MEMBER_B_ID, PrincipalKind::User);
+                let peer_gate = service.authorize_action(
+                    peer.kind,
+                    peer.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
+                assert!(
+                    resolver
+                        .authorize_internal_turn_via_root(
+                            &peer,
+                            &peer_gate,
+                            ResourceAction::ThreadRead,
+                            INTERNAL_TURN_ID,
+                            Some(WORKSPACE_ID),
+                            Some(INTERNAL_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve peer internal turn")
+                        .into_authorized()
+                        .is_none(),
+                    "guessed internal turn must not bypass inaccessible root ACL"
+                );
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn private_thread_proof_is_exact_and_peer_access_is_not_found() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let gate_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        let gate_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        let authorized = resolver
-            .authorize_thread(
-                &member_a,
-                &gate_a,
-                ResourceAction::ThreadRead,
-                PRIVATE_THREAD_ID,
-                Some(WORKSPACE_ID),
-            )
-            .await
-            .expect("resolve private thread")
-            .into_authorized()
-            .expect("member A proof");
-        assert_eq!(authorized.principal_id(), &member_a.principal_id);
-        assert_eq!(authorized.action(), ResourceAction::ThreadRead);
-        assert!(matches!(
-            authorized.resource(),
-            AuthorizationResource::Thread {
-                workspace_id,
-                thread_id,
-            } if workspace_id.as_str() == WORKSPACE_ID
-                && thread_id.as_str() == PRIVATE_THREAD_ID
-        ));
-
-        let denied = resolver
-            .authorize_thread(
-                &member_b,
-                &gate_b,
-                ResourceAction::ThreadRead,
-                PRIVATE_THREAD_ID,
-                Some(WORKSPACE_ID),
-            )
-            .await
-            .expect("resolve peer private thread");
-        assert_eq!(
-            denied.denial(),
-            Some(&AuthorizationDecision::Deny {
-                reason: DenyReason::NoPrivateThreadMembership,
-                disclosure: DisclosurePolicy::NotFound,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn overlapping_member_creator_participant_and_superuser_matrix_is_exact() {
-        let (harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-
-        let read_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        let read_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        let read_superuser = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_a,
-                    &read_a,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve creator private access")
-                .into_authorized()
-                .is_some()
-        );
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_b,
-                    &read_b,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve peer private access")
-                .into_authorized()
-                .is_none()
-        );
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_b,
-                    &read_b,
-                    ResourceAction::ThreadRead,
-                    WORKSPACE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve overlapping workspace access")
-                .into_authorized()
-                .is_some()
-        );
-        assert!(
-            resolver
-                .authorize_thread(
-                    &superuser,
-                    &read_superuser,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve absolute Superuser access")
-                .into_authorized()
-                .is_some(),
-            "Superuser must not require a thread membership"
-        );
-
-        harness
-            .database
-            .execute_unprepared(
-                "INSERT INTO thread_membership(\
-                    thread_id,principal_id,added_by_actor_kind,added_by_actor_id,\
-                    created_at,updated_at\
-                 ) VALUES(\
-                    'T0000000000000000000A','P0000000000000000000B','principal',\
-                    'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-                 )",
-            )
-            .await
-            .expect("add explicit participant");
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_b,
-                    &read_b,
-                    ResourceAction::ThreadRead,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve explicit participant")
-                .into_authorized()
-                .is_some()
-        );
-
-        let manage_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::ThreadManage,
-        );
-        let manage_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::ThreadManage,
-        );
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_a,
-                    &manage_a,
-                    ResourceAction::ThreadManage,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve creator management")
-                .into_authorized()
-                .is_some()
-        );
-        assert!(
-            resolver
-                .authorize_thread(
-                    &member_b,
-                    &manage_b,
-                    ResourceAction::ThreadManage,
-                    PRIVATE_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve participant management")
-                .into_authorized()
-                .is_none(),
-            "participant access must not transfer creator management"
-        );
-    }
-
-    #[tokio::test]
-    async fn internal_thread_is_denied_directly_and_requires_authorized_root_lineage() {
-        let (harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        let direct = resolver
-            .authorize_thread(
-                &member,
-                &gate,
-                ResourceAction::ThreadRead,
-                INTERNAL_THREAD_ID,
-                Some(WORKSPACE_ID),
-            )
-            .await
-            .expect("resolve direct internal thread");
-        assert_eq!(
-            direct.denial(),
-            Some(&AuthorizationDecision::Deny {
-                reason: DenyReason::MissingAuthoritativeResource,
-                disclosure: DisclosurePolicy::NotFound,
-            })
-        );
-
-        let inherited = resolver
-            .authorize_internal_thread_via_root(
-                &member,
-                &gate,
-                ResourceAction::ThreadRead,
-                INTERNAL_THREAD_ID,
-                None,
-            )
-            .await
-            .expect("resolve internal thread through root")
-            .into_authorized()
-            .expect("authorized root permits indirect internal projection");
-        assert_eq!(inherited.thread_id(), INTERNAL_THREAD_ID);
-        // Page authorization preserves the same ACL with mixed scopes and
-        // duplicate children, including a page beyond the metadata quantum.
-        let mut requested = (0..65)
-            .map(|i| (WORKSPACE_ID.to_owned(), format!("missing-child-{i}")))
-            .collect::<Vec<_>>();
-        requested.extend([
-            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
-            (WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()),
-            (WORKSPACE_ID.to_owned(), PRIVATE_THREAD_ID.to_owned()),
-            ("wrong-workspace".to_owned(), INTERNAL_THREAD_ID.to_owned()),
-        ]);
-        let batch = resolver
-            .authorize_internal_thread_page(&member, &gate, ResourceAction::ThreadRead, &requested)
-            .await
-            .expect("authorize bounded mixed page");
-        assert_eq!(batch.len(), 1);
-        assert!(batch.contains(&(WORKSPACE_ID.to_owned(), INTERNAL_THREAD_ID.to_owned())));
-
-        let peer = principal(MEMBER_B_ID, PrincipalKind::User);
-        let peer_gate = service.authorize_action(
-            peer.kind,
-            peer.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        assert!(
-            resolver
-                .authorize_internal_thread_via_root(
-                    &peer,
-                    &peer_gate,
-                    ResourceAction::ThreadRead,
-                    INTERNAL_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("resolve peer internal projection")
-                .into_authorized()
-                .is_none(),
-            "guessed child id must not bypass inaccessible root ACL"
-        );
-
-        assert!(
-            resolver
-                .authorize_internal_thread_page(
-                    &peer,
-                    &peer_gate,
-                    ResourceAction::ThreadRead,
-                    &requested
-                )
-                .await
-                .expect("peer must retain the root ACL denial")
-                .is_empty()
-        );
-
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE \"turn\" SET execution_authorization_context_json=NULL \
-                 WHERE id='U0000000000000000000A'",
-            )
-            .await
-            .expect("parent authority should be removable for fail-closed test");
-        assert!(
-            resolver
-                .authorize_internal_thread_via_root(
-                    &member,
-                    &gate,
-                    ResourceAction::ThreadRead,
-                    INTERNAL_THREAD_ID,
-                    Some(WORKSPACE_ID),
-                )
-                .await
-                .expect("missing parent authority should resolve as deny")
-                .into_authorized()
-                .is_none(),
-            "missing parent authority must never become unrestricted child access"
-        );
-        // No request-local result may survive across requests after revocation.
-        assert!(
-            resolver
-                .authorize_internal_thread_page(
-                    &member,
-                    &gate,
-                    ResourceAction::ThreadRead,
-                    &requested
-                )
-                .await
-                .expect("removed authority must deny a fresh page")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn internal_turn_requires_and_inherits_authorized_root_lineage() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-
-        assert_eq!(
-            resolver
-                .authorize_turn(
-                    &member,
-                    &gate,
-                    ResourceAction::ThreadRead,
-                    INTERNAL_TURN_ID,
-                    Some(WORKSPACE_ID),
-                    Some(INTERNAL_THREAD_ID),
-                )
-                .await
-                .expect("resolve direct internal turn")
-                .denial(),
-            Some(&AuthorizationDecision::Deny {
-                reason: DenyReason::MissingAuthoritativeResource,
-                disclosure: DisclosurePolicy::NotFound,
-            })
-        );
-
-        let inherited = resolver
-            .authorize_internal_turn_via_root(
-                &member,
-                &gate,
-                ResourceAction::ThreadRead,
-                INTERNAL_TURN_ID,
-                None,
-                Some(INTERNAL_THREAD_ID),
-            )
-            .await
-            .expect("resolve internal turn through root")
-            .into_authorized()
-            .expect("authorized root permits internal turn projection");
-        assert!(matches!(
-            inherited.resource(),
-            AuthorizationResource::Turn {
-                workspace_id,
-                thread_id,
-                turn_id,
-            } if workspace_id.as_str() == WORKSPACE_ID
-                && thread_id.as_str() == INTERNAL_THREAD_ID
-                && turn_id.as_str() == INTERNAL_TURN_ID
-        ));
-
-        let peer = principal(MEMBER_B_ID, PrincipalKind::User);
-        let peer_gate = service.authorize_action(
-            peer.kind,
-            peer.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
-        assert!(
-            resolver
-                .authorize_internal_turn_via_root(
-                    &peer,
-                    &peer_gate,
-                    ResourceAction::ThreadRead,
-                    INTERNAL_TURN_ID,
-                    Some(WORKSPACE_ID),
-                    Some(INTERNAL_THREAD_ID),
-                )
-                .await
-                .expect("resolve peer internal turn")
-                .into_authorized()
-                .is_none(),
-            "guessed internal turn must not bypass inaccessible root ACL"
-        );
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn turn_proof_uses_persisted_thread_parent_and_rejects_forged_pair() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ThreadRead,
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
+                    ResourceAction::ThreadRead,
+                );
 
-        let authorized = resolver
-            .authorize_turn(
-                &member,
-                &gate,
-                ResourceAction::ThreadRead,
-                TURN_ID,
-                Some(WORKSPACE_ID),
-                Some(PRIVATE_THREAD_ID),
-            )
-            .await
-            .expect("resolve turn")
-            .into_authorized()
-            .expect("turn proof");
-        assert!(matches!(
-            authorized.resource(),
-            AuthorizationResource::Turn {
-                workspace_id,
-                thread_id,
-                turn_id,
-            } if workspace_id.as_str() == WORKSPACE_ID
-                && thread_id.as_str() == PRIVATE_THREAD_ID
-                && turn_id.as_str() == TURN_ID
-        ));
-
-        let denied = resolver
-            .authorize_turn(
-                &member,
-                &gate,
-                ResourceAction::ThreadRead,
-                TURN_ID,
-                Some(WORKSPACE_ID),
-                Some(WORKSPACE_THREAD_ID),
-            )
-            .await
-            .expect("resolve forged turn parent");
-        assert!(denied.into_authorized().is_none());
-    }
-
-    #[tokio::test]
-    async fn ambiguous_artifact_parent_fails_closed_even_for_superuser() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ArtifactRead,
-        );
-
-        let denied = resolver
-            .authorize_artifact(
-                &superuser,
-                &gate,
-                ResourceAction::ArtifactRead,
-                AMBIGUOUS_ARTIFACT_ID,
-                Some(WORKSPACE_ID),
-                None,
-            )
-            .await
-            .expect("resolve ambiguous artifact");
-        assert_eq!(
-            denied.denial(),
-            Some(&AuthorizationDecision::Deny {
-                reason: DenyReason::MissingAuthoritativeResource,
-                disclosure: DisclosurePolicy::NotFound,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn artifact_collection_uses_the_exact_parent_resolver_before_pagination() {
-        let (harness, _resolver) = resolver_fixture().await;
-        harness
-            .database
-            .execute_unprepared(
-                "INSERT INTO artifact(\
-                    id,workspace_id,primary_thread_id,display_name,kind,status,\
-                    created_by_kind,created_by_actor_id,created_at,updated_at,metadata_json\
-                 ) VALUES(\
-                    'artifact-primary-only','W00000000000000000001',\
-                    'T0000000000000000000A','Primary only','file','ready','principal',\
-                    'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}'),(\
-                    'artifact-rootless-task','W00000000000000000001',\
-                    'T0000000000000000000A','Rootless task','file','ready','principal',\
-                    'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}'\
-                 );\
-                 INSERT INTO task(\
-                    id,workspace_id,owner_kind,owner_id,root_task_id,parent_task_id,\
-                    executor_kind,status,title,goal\
-                 ) VALUES(\
-                    'K0000000000000000000R','W00000000000000000001','user',\
-                    'P0000000000000000000A',NULL,NULL,'agent','waiting',\
-                    'Rootless task','Rootless task'\
-                 );\
-                 INSERT INTO artifact_binding(\
-                    id,artifact_id,workspace_id,task_id,binding_kind,direction,\
-                    created_at,metadata_json\
-                 ) VALUES(\
-                    'binding-rootless-task','artifact-rootless-task',\
-                    'W00000000000000000001','K0000000000000000000R',\
-                    'task_result','output',CURRENT_TIMESTAMP,'{}'\
-                 );",
-            )
-            .await
-            .expect("materialize exact artifact collection cases");
-
-        let store = CrudStore::new(harness.database.clone());
-        let artifact_ids = store
-            .list_artifact_ids_for_authorized_thread_roots(
-                WORKSPACE_ID,
-                &[
-                    vec![PRIVATE_THREAD_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()],
-                    vec![WORKSPACE_THREAD_ID.to_owned()],
-                ],
-            )
-            .await
-            .expect("resolve authorized artifact collection");
-        assert_eq!(
-            artifact_ids,
-            vec![
-                INTERNAL_ARTIFACT_ID.to_owned(),
-                "artifact-primary-only".to_owned()
-            ],
-            "primary-thread-only artifacts remain visible, while ambiguous and rootless-task \
-             bindings fail closed even when every individual visible root is authorized"
-        );
-    }
-
-    #[tokio::test]
-    async fn artifact_acl_inherits_internal_lineage_and_tracks_root_visibility() {
-        let (harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let gate_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::ArtifactRead,
-        );
-        let gate_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::ArtifactRead,
-        );
-
-        let proof = resolver
-            .authorize_artifact(
-                &member_a,
-                &gate_a,
-                ResourceAction::ArtifactRead,
-                INTERNAL_ARTIFACT_ID,
-                Some(WORKSPACE_ID),
-                None,
-            )
-            .await
-            .expect("resolve internal artifact through root")
-            .into_authorized()
-            .expect("private root participant inherits artifact access");
-        assert_eq!(proof.thread_id(), Some(PRIVATE_THREAD_ID));
-        assert!(
-            resolver
-                .authorize_artifact(
-                    &member_b,
-                    &gate_b,
-                    ResourceAction::ArtifactRead,
-                    INTERNAL_ARTIFACT_ID,
-                    Some(WORKSPACE_ID),
-                    None,
-                )
-                .await
-                .expect("resolve peer internal artifact")
-                .into_authorized()
-                .is_none()
-        );
-
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE thread SET access_class='workspace' \
-                 WHERE id='T0000000000000000000A'",
-            )
-            .await
-            .expect("make root workspace-visible");
-        assert!(
-            resolver
-                .authorize_artifact(
-                    &member_b,
-                    &gate_b,
-                    ResourceAction::ArtifactRead,
-                    INTERNAL_ARTIFACT_ID,
-                    Some(WORKSPACE_ID),
-                    None,
-                )
-                .await
-                .expect("resolve artifact after visibility change")
-                .into_authorized()
-                .is_some(),
-            "future artifact authorization must reflect current root visibility"
-        );
-    }
-
-    #[tokio::test]
-    async fn tree_task_activity_uses_runs_lineage_and_current_task_authorization() {
-        use sea_orm::{Statement, Value};
-        let (harness, resolver) = resolver_fixture().await;
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let peer = principal(MEMBER_B_ID, PrincipalKind::User);
-        // The parent waits and remains Idle. The grandchild executes in an
-        // internal thread; a foreground conversation is neither necessary nor sufficient.
-        harness
-            .database
-            .execute_unprepared("UPDATE thread SET status='idle';")
-            .await
-            .unwrap();
-        for (run, task, executor) in [
-            ("run-parent", PRIVATE_ROOT_TASK_ID, "agent"),
-            ("run-a", PRIVATE_CHILD_TASK_ID, "agent"),
-            ("run-b", PRIVATE_GRANDCHILD_TASK_ID, "agent"),
-            ("run-public", WORKSPACE_ROOT_TASK_ID, "agent"),
-        ] {
-            harness.database.execute_raw(Statement::from_sql_and_values(
-                harness.database.get_database_backend(),
-                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
-                 VALUES(?,?,?,1,1,'queued',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-                vec![Value::from(run), Value::from(task), Value::from(run), Value::from(executor)],
-            )).await.unwrap();
-        }
-        harness.database.execute_unprepared("UPDATE task_run SET status='waiting' WHERE id='run-parent';
-            INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
-            VALUES('service-only','W00000000000000000001','system','system','running','Service','fixture');
-            INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
-            VALUES('service-run','service-only','service-run',1,1,'running','system')").await.unwrap();
-        let ids = vec![PRIVATE_THREAD_ID.to_owned(), WORKSPACE_THREAD_ID.to_owned()];
-        let query = |principal: AuthenticatedSessionPrincipal| {
-            let resolver = resolver.clone();
-            let ids = ids.clone();
-            async move {
-                resolver
-                    .running_task_thread_ids(&principal, WORKSPACE_ID, &ids)
-                    .await
-                    .unwrap()
-            }
-        };
-        for status in [
-            "starting",
-            "running",
-            "queued",
-            "waiting",
-            "waiting_review",
-            "succeeded",
-            "failed",
-            "blocked",
-            "cancelled",
-            "timed_out",
-        ] {
-            harness
-                .database
-                .execute_raw(Statement::from_sql_and_values(
-                    harness.database.get_database_backend(),
-                    "UPDATE task_run SET status=? WHERE id='run-a'",
-                    [Value::from(status)],
-                ))
-                .await
-                .unwrap();
-            let active = query(member.clone()).await;
-            assert_eq!(
-                active.contains(&PRIVATE_THREAD_ID.to_owned()),
-                matches!(status, "starting" | "running"),
-                "{status}"
-            );
-            assert!(query(peer.clone()).await.is_empty());
-        }
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE task_run SET status='running' WHERE id IN ('run-a','run-b')",
-            )
-            .await
-            .unwrap();
-        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
-        harness
-            .database
-            .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-a'")
-            .await
-            .unwrap();
-        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
-        // Exact provenance through an internal causal thread has the same root
-        // as ordinary task reads, even with no visible run-thread binding.
-        harness.database.execute_unprepared("UPDATE task SET created_by_thread_id='T0000000000000000000I', created_by_turn_id='U0000000000000000000I' WHERE id='K0000000000000000000A'").await.unwrap();
-        let scopes = pioneer_crud::list_running_task_scopes(
-            &resolver.store.database_connection(),
-            WORKSPACE_ID,
-            &ids,
-            &member.principal_id,
-            "",
-        )
-        .await
-        .unwrap();
-        for (batch, _, _) in scopes.scopes {
-            let single = pioneer_crud::resolve_task_authorization_scope(
-                &resolver.store.database_connection(),
-                &batch.task_id,
-                Some(WORKSPACE_ID),
-                None,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(batch, single);
-        }
-        assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
-        for attachment in [
-            pioneer_protocol::TaskAttachmentMode::Attached,
-            pioneer_protocol::TaskAttachmentMode::Detached,
-        ] {
-            let policy = pioneer_protocol::TaskLifecyclePolicy {
-                attachment,
-                on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
-                completion: pioneer_protocol::TaskCompletionBehavior::KeepActiveForRecurring,
-            };
-            harness
-                .database
-                .execute_raw(Statement::from_sql_and_values(
-                    harness.database.get_database_backend(),
-                    "UPDATE task SET lifecycle_policy_json=? WHERE id='K0000000000000000000A'",
-                    [Value::from(serde_json::to_string(&policy).unwrap())],
-                ))
-                .await
-                .unwrap();
-            assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
-        }
-        for executor in ["agent", "tool", "workflow", "webhook", "system"] {
-            harness
-                .database
-                .execute_raw(Statement::from_sql_and_values(
-                    harness.database.get_database_backend(),
-                    "UPDATE task_run SET executor_kind=? WHERE id='run-b'",
-                    [Value::from(executor)],
-                ))
-                .await
-                .unwrap();
-            harness.database.execute_unprepared("UPDATE task SET executor_kind=(SELECT executor_kind FROM task_run WHERE id='run-b') WHERE id='K0000000000000000000C'").await.unwrap();
-            assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
-        }
-        harness
-            .database
-            .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-b'")
-            .await
-            .unwrap();
-        assert!(
-            query(member.clone()).await.is_empty(),
-            "last execution completed"
-        );
-        harness
-            .database
-            .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-b'")
-            .await
-            .unwrap();
-        assert!(
-            resolver
-                .running_task_thread_ids(&member, WORKSPACE_BLUE_ID, &ids)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            resolver
-                .running_task_thread_ids(&member, WORKSPACE_ID, &[WORKSPACE_THREAD_ID.into()])
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        harness
-            .database
-            .execute_unprepared(
-                "DELETE FROM thread_membership WHERE thread_id='T0000000000000000000A'",
-            )
-            .await
-            .unwrap();
-        assert!(query(member.clone()).await.is_empty());
-        harness
-            .database
-            .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-public'")
-            .await
-            .unwrap();
-        assert_eq!(query(peer.clone()).await, vec![WORKSPACE_THREAD_ID]);
-        harness
-            .database
-            .execute_unprepared(
-                "DELETE FROM workspace_membership WHERE workspace_id='W00000000000000000001'",
-            )
-            .await
-            .unwrap();
-        assert!(query(peer).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn task_child_and_grandchild_ids_inherit_exact_root_acl() {
-        let (harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let read_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::TaskRead,
-        );
-        let read_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::TaskRead,
-        );
-
-        for task_id in [
-            PRIVATE_ROOT_TASK_ID,
-            PRIVATE_CHILD_TASK_ID,
-            PRIVATE_GRANDCHILD_TASK_ID,
-        ] {
-            let proof = resolver
-                .authorize_task(
-                    &member_a,
-                    &read_a,
-                    ResourceAction::TaskRead,
-                    task_id,
-                    Some(WORKSPACE_ID),
-                    Some(PRIVATE_THREAD_ID),
-                )
-                .await
-                .expect("resolve private-root task")
-                .into_authorized()
-                .expect("root participant inherits descendant task access");
-            assert_eq!(proof.task_id(), task_id);
-            assert_eq!(proof.root_thread_id(), Some(PRIVATE_THREAD_ID));
-
-            assert!(
-                resolver
-                    .authorize_task(
-                        &member_b,
-                        &read_b,
-                        ResourceAction::TaskRead,
-                        task_id,
+                let authorized = resolver
+                    .authorize_turn(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        TURN_ID,
                         Some(WORKSPACE_ID),
                         Some(PRIVATE_THREAD_ID),
                     )
                     .await
-                    .expect("resolve guessed descendant task")
+                    .expect("resolve turn")
                     .into_authorized()
-                    .is_none(),
-                "guessed descendant id must not bypass private root ACL"
-            );
-        }
+                    .expect("turn proof");
+                assert!(matches!(
+                    authorized.resource(),
+                    AuthorizationResource::Turn {
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                    } if workspace_id.as_str() == WORKSPACE_ID
+                        && thread_id.as_str() == PRIVATE_THREAD_ID
+                        && turn_id.as_str() == TURN_ID
+                ));
 
-        harness
-            .database
-            .execute_unprepared(
-                "DELETE FROM thread_membership \
-                 WHERE thread_id='T0000000000000000000A' \
-                   AND principal_id='P0000000000000000000A'",
-            )
-            .await
-            .expect("revoke private root access");
-        assert!(
-            resolver
-                .authorize_task(
-                    &member_a,
-                    &read_a,
-                    ResourceAction::TaskRead,
-                    PRIVATE_GRANDCHILD_TASK_ID,
-                    Some(WORKSPACE_ID),
-                    Some(PRIVATE_THREAD_ID),
+                let denied = resolver
+                    .authorize_turn(
+                        &member,
+                        &gate,
+                        ResourceAction::ThreadRead,
+                        TURN_ID,
+                        Some(WORKSPACE_ID),
+                        Some(WORKSPACE_THREAD_ID),
+                    )
+                    .await
+                    .expect("resolve forged turn parent");
+                assert!(denied.into_authorized().is_none());
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_artifact_parent_fails_closed_even_for_superuser() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
+                let gate = service.authorize_action(
+                    superuser.kind,
+                    superuser.role_key.as_ref(),
+                    ResourceAction::ArtifactRead,
+                );
+
+                let denied = resolver
+                    .authorize_artifact(
+                        &superuser,
+                        &gate,
+                        ResourceAction::ArtifactRead,
+                        AMBIGUOUS_ARTIFACT_ID,
+                        Some(WORKSPACE_ID),
+                        None,
+                    )
+                    .await
+                    .expect("resolve ambiguous artifact");
+                assert_eq!(
+                    denied.denial(),
+                    Some(&AuthorizationDecision::Deny {
+                        reason: DenyReason::MissingAuthoritativeResource,
+                        disclosure: DisclosurePolicy::NotFound,
+                    })
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_collection_uses_the_exact_parent_resolver_before_pagination() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, _resolver) = resolver_fixture(test_database).await;
+                harness
+                    .database
+                    .execute_unprepared(
+                        "INSERT INTO artifact(\
+                            id,workspace_id,primary_thread_id,display_name,kind,status,\
+                            created_by_kind,created_by_actor_id,created_at,updated_at,metadata_json\
+                         ) VALUES(\
+                            'artifact-primary-only','W00000000000000000001',\
+                            'T0000000000000000000A','Primary only','file','ready','principal',\
+                            'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}'),(\
+                            'artifact-rootless-task','W00000000000000000001',\
+                            'T0000000000000000000A','Rootless task','file','ready','principal',\
+                            'P0000000000000000000A',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'{}'\
+                         );\
+                         INSERT INTO task(\
+                            id,workspace_id,owner_kind,owner_id,root_task_id,parent_task_id,\
+                            executor_kind,status,title,goal\
+                         ) VALUES(\
+                            'K0000000000000000000R','W00000000000000000001','user',\
+                            'P0000000000000000000A',NULL,NULL,'agent','waiting',\
+                            'Rootless task','Rootless task'\
+                         );\
+                         INSERT INTO artifact_binding(\
+                            id,artifact_id,workspace_id,task_id,binding_kind,direction,\
+                            created_at,metadata_json\
+                         ) VALUES(\
+                            'binding-rootless-task','artifact-rootless-task',\
+                            'W00000000000000000001','K0000000000000000000R',\
+                            'task_result','output',CURRENT_TIMESTAMP,'{}'\
+                         );",
+                    )
+                    .await
+                    .expect("materialize exact artifact collection cases");
+
+                let store = CrudStore::new(harness.database.clone());
+                let artifact_ids = store
+                    .list_artifact_ids_for_authorized_thread_roots(
+                        WORKSPACE_ID,
+                        &[
+                            vec![PRIVATE_THREAD_ID.to_owned(), INTERNAL_THREAD_ID.to_owned()],
+                            vec![WORKSPACE_THREAD_ID.to_owned()],
+                        ],
+                    )
+                    .await
+                    .expect("resolve authorized artifact collection");
+                assert_eq!(
+                    artifact_ids,
+                    vec![
+                        INTERNAL_ARTIFACT_ID.to_owned(),
+                        "artifact-primary-only".to_owned()
+                    ],
+                    "primary-thread-only artifacts remain visible, while ambiguous and rootless-task \
+                     bindings fail closed even when every individual visible root is authorized"
+                );
+            }.await;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_acl_inherits_internal_lineage_and_tracks_root_visibility() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let gate_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::ArtifactRead,
+                );
+                let gate_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::ArtifactRead,
+                );
+
+                let proof = resolver
+                    .authorize_artifact(
+                        &member_a,
+                        &gate_a,
+                        ResourceAction::ArtifactRead,
+                        INTERNAL_ARTIFACT_ID,
+                        Some(WORKSPACE_ID),
+                        None,
+                    )
+                    .await
+                    .expect("resolve internal artifact through root")
+                    .into_authorized()
+                    .expect("private root participant inherits artifact access");
+                assert_eq!(proof.thread_id(), Some(PRIVATE_THREAD_ID));
+                assert!(
+                    resolver
+                        .authorize_artifact(
+                            &member_b,
+                            &gate_b,
+                            ResourceAction::ArtifactRead,
+                            INTERNAL_ARTIFACT_ID,
+                            Some(WORKSPACE_ID),
+                            None,
+                        )
+                        .await
+                        .expect("resolve peer internal artifact")
+                        .into_authorized()
+                        .is_none()
+                );
+
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE thread SET access_class='workspace' \
+                         WHERE id='T0000000000000000000A'",
+                    )
+                    .await
+                    .expect("make root workspace-visible");
+                assert!(
+                    resolver
+                        .authorize_artifact(
+                            &member_b,
+                            &gate_b,
+                            ResourceAction::ArtifactRead,
+                            INTERNAL_ARTIFACT_ID,
+                            Some(WORKSPACE_ID),
+                            None,
+                        )
+                        .await
+                        .expect("resolve artifact after visibility change")
+                        .into_authorized()
+                        .is_some(),
+                    "future artifact authorization must reflect current root visibility"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tree_task_activity_uses_runs_lineage_and_current_task_authorization() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                use sea_orm::{Statement, Value};
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let peer = principal(MEMBER_B_ID, PrincipalKind::User);
+                // The parent waits and remains Idle. The grandchild executes in an
+                // internal thread; a foreground conversation is neither necessary nor sufficient.
+                harness
+                    .database
+                    .execute_unprepared("UPDATE thread SET status='idle';")
+                    .await
+                    .unwrap();
+                for (run, task, executor) in [
+                    ("run-parent", PRIVATE_ROOT_TASK_ID, "agent"),
+                    ("run-a", PRIVATE_CHILD_TASK_ID, "agent"),
+                    ("run-b", PRIVATE_GRANDCHILD_TASK_ID, "agent"),
+                    ("run-public", WORKSPACE_ROOT_TASK_ID, "agent"),
+                ] {
+                    harness.database.execute_raw(Statement::from_sql_and_values(
+                        harness.database.get_database_backend(),
+                        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,created_at,updated_at)
+                         VALUES($1,$2,$3,1,1,'queued',$4,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                        vec![Value::from(run), Value::from(task), Value::from(run), Value::from(executor)],
+                    )).await.unwrap();
+                }
+                harness.database.execute_unprepared("UPDATE task_run SET status='waiting' WHERE id='run-parent';
+                    INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+                    VALUES('service-only','W00000000000000000001','system','system','running','Service','fixture');
+                    INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+                    VALUES('service-run','service-only','service-run',1,1,'running','system')").await.unwrap();
+                let ids = vec![PRIVATE_THREAD_ID.to_owned(), WORKSPACE_THREAD_ID.to_owned()];
+                let query = |principal: AuthenticatedSessionPrincipal| {
+                    let resolver = resolver.clone();
+                    let ids = ids.clone();
+                    async move {
+                        resolver
+                            .running_task_thread_ids(&principal, WORKSPACE_ID, &ids)
+                            .await
+                            .unwrap()
+                    }
+                };
+                for status in [
+                    "starting",
+                    "running",
+                    "queued",
+                    "waiting",
+                    "waiting_review",
+                    "succeeded",
+                    "failed",
+                    "blocked",
+                    "cancelled",
+                    "timed_out",
+                ] {
+                    harness
+                        .database
+                        .execute_raw(Statement::from_sql_and_values(
+                            harness.database.get_database_backend(),
+                            "UPDATE task_run SET status=$1 WHERE id='run-a'",
+                            [Value::from(status)],
+                        ))
+                        .await
+                        .unwrap();
+                    let active = query(member.clone()).await;
+                    assert_eq!(
+                        active.contains(&PRIVATE_THREAD_ID.to_owned()),
+                        matches!(status, "starting" | "running"),
+                        "{status}"
+                    );
+                    assert!(query(peer.clone()).await.is_empty());
+                }
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE task_run SET status='running' WHERE id IN ('run-a','run-b')",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+                harness
+                    .database
+                    .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-a'")
+                    .await
+                    .unwrap();
+                assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+                // Exact provenance through an internal causal thread has the same root
+                // as ordinary task reads, even with no visible run-thread binding.
+                harness.database.execute_unprepared("UPDATE task SET created_by_thread_id='T0000000000000000000I', created_by_turn_id='U0000000000000000000I' WHERE id='K0000000000000000000A'").await.unwrap();
+                let scopes = pioneer_crud::list_running_task_scopes(
+                    &resolver.store.database_connection(),
+                    WORKSPACE_ID,
+                    &ids,
+                    &member.principal_id,
+                    "",
                 )
                 .await
-                .expect("resolve descendant after access loss")
-                .into_authorized()
-                .is_none(),
-            "future task reads and mutations must re-evaluate current root ACL"
-        );
+                .unwrap();
+                for (batch, _, _) in scopes.scopes {
+                    let single = pioneer_crud::resolve_task_authorization_scope(
+                        &resolver.store.database_connection(),
+                        &batch.task_id,
+                        Some(WORKSPACE_ID),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(batch, single);
+                }
+                assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+                for attachment in [
+                    pioneer_protocol::TaskAttachmentMode::Attached,
+                    pioneer_protocol::TaskAttachmentMode::Detached,
+                ] {
+                    let policy = pioneer_protocol::TaskLifecyclePolicy {
+                        attachment,
+                        on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                        on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
+                        completion: pioneer_protocol::TaskCompletionBehavior::KeepActiveForRecurring,
+                    };
+                    harness
+                        .database
+                        .execute_raw(Statement::from_sql_and_values(
+                            harness.database.get_database_backend(),
+                            "UPDATE task SET lifecycle_policy_json=$1::text::json WHERE id='K0000000000000000000A'",
+                            [Value::from(serde_json::to_string(&policy).unwrap())],
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+                }
+                for executor in ["agent", "tool", "workflow", "webhook", "system"] {
+                    harness
+                        .database
+                        .execute_raw(Statement::from_sql_and_values(
+                            harness.database.get_database_backend(),
+                            "UPDATE task_run SET executor_kind=$1 WHERE id='run-b'",
+                            [Value::from(executor)],
+                        ))
+                        .await
+                        .unwrap();
+                    harness.database.execute_unprepared("UPDATE task SET executor_kind=(SELECT executor_kind FROM task_run WHERE id='run-b') WHERE id='K0000000000000000000C'").await.unwrap();
+                    assert_eq!(query(member.clone()).await, vec![PRIVATE_THREAD_ID]);
+                }
+                harness
+                    .database
+                    .execute_unprepared("UPDATE task_run SET status='succeeded' WHERE id='run-b'")
+                    .await
+                    .unwrap();
+                assert!(
+                    query(member.clone()).await.is_empty(),
+                    "last execution completed"
+                );
+                harness
+                    .database
+                    .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-b'")
+                    .await
+                    .unwrap();
+                assert!(
+                    resolver
+                        .running_task_thread_ids(&member, WORKSPACE_BLUE_ID, &ids)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    resolver
+                        .running_task_thread_ids(&member, WORKSPACE_ID, &[WORKSPACE_THREAD_ID.into()])
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                harness
+                    .database
+                    .execute_unprepared(
+                        "DELETE FROM thread_membership WHERE thread_id='T0000000000000000000A'",
+                    )
+                    .await
+                    .unwrap();
+                assert!(query(member.clone()).await.is_empty());
+                harness
+                    .database
+                    .execute_unprepared("UPDATE task_run SET status='running' WHERE id='run-public'")
+                    .await
+                    .unwrap();
+                assert_eq!(query(peer.clone()).await, vec![WORKSPACE_THREAD_ID]);
+                harness
+                    .database
+                    .execute_unprepared(
+                        "DELETE FROM workspace_membership WHERE workspace_id='W00000000000000000001'",
+                    )
+                    .await
+                    .unwrap();
+                assert!(query(peer).await.is_empty());
+            }.await;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_child_and_grandchild_ids_inherit_exact_root_acl() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let read_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::TaskRead,
+                );
+                let read_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::TaskRead,
+                );
+
+                for task_id in [
+                    PRIVATE_ROOT_TASK_ID,
+                    PRIVATE_CHILD_TASK_ID,
+                    PRIVATE_GRANDCHILD_TASK_ID,
+                ] {
+                    let proof = resolver
+                        .authorize_task(
+                            &member_a,
+                            &read_a,
+                            ResourceAction::TaskRead,
+                            task_id,
+                            Some(WORKSPACE_ID),
+                            Some(PRIVATE_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve private-root task")
+                        .into_authorized()
+                        .expect("root participant inherits descendant task access");
+                    assert_eq!(proof.task_id(), task_id);
+                    assert_eq!(proof.root_thread_id(), Some(PRIVATE_THREAD_ID));
+
+                    assert!(
+                        resolver
+                            .authorize_task(
+                                &member_b,
+                                &read_b,
+                                ResourceAction::TaskRead,
+                                task_id,
+                                Some(WORKSPACE_ID),
+                                Some(PRIVATE_THREAD_ID),
+                            )
+                            .await
+                            .expect("resolve guessed descendant task")
+                            .into_authorized()
+                            .is_none(),
+                        "guessed descendant id must not bypass private root ACL"
+                    );
+                }
+
+                harness
+                    .database
+                    .execute_unprepared(
+                        "DELETE FROM thread_membership \
+                         WHERE thread_id='T0000000000000000000A' \
+                           AND principal_id='P0000000000000000000A'",
+                    )
+                    .await
+                    .expect("revoke private root access");
+                assert!(
+                    resolver
+                        .authorize_task(
+                            &member_a,
+                            &read_a,
+                            ResourceAction::TaskRead,
+                            PRIVATE_GRANDCHILD_TASK_ID,
+                            Some(WORKSPACE_ID),
+                            Some(PRIVATE_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve descendant after access loss")
+                        .into_authorized()
+                        .is_none(),
+                    "future task reads and mutations must re-evaluate current root ACL"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn task_management_is_shared_by_authorized_root_collaborators() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
-        let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
-        let manage_a = service.authorize_action(
-            member_a.kind,
-            member_a.role_key.as_ref(),
-            ResourceAction::TaskReview,
-        );
-        let manage_b = service.authorize_action(
-            member_b.kind,
-            member_b.role_key.as_ref(),
-            ResourceAction::TaskReview,
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member_a = principal(MEMBER_A_ID, PrincipalKind::User);
+                let member_b = principal(MEMBER_B_ID, PrincipalKind::User);
+                let manage_a = service.authorize_action(
+                    member_a.kind,
+                    member_a.role_key.as_ref(),
+                    ResourceAction::TaskReview,
+                );
+                let manage_b = service.authorize_action(
+                    member_b.kind,
+                    member_b.role_key.as_ref(),
+                    ResourceAction::TaskReview,
+                );
 
-        assert!(
-            resolver
-                .authorize_task(
-                    &member_a,
-                    &manage_a,
-                    ResourceAction::TaskReview,
-                    WORKSPACE_ROOT_TASK_ID,
-                    Some(WORKSPACE_ID),
-                    Some(WORKSPACE_THREAD_ID),
-                )
-                .await
-                .expect("resolve initiator management")
-                .into_authorized()
-                .is_some()
-        );
-        assert!(
-            resolver
-                .authorize_task(
-                    &member_b,
-                    &manage_b,
-                    ResourceAction::TaskReview,
-                    WORKSPACE_ROOT_TASK_ID,
-                    Some(WORKSPACE_ID),
-                    Some(WORKSPACE_THREAD_ID),
-                )
-                .await
-                .expect("resolve peer management")
-                .into_authorized()
-                .is_some(),
-            "root-thread collaboration authority must allow peer task management"
-        );
+                assert!(
+                    resolver
+                        .authorize_task(
+                            &member_a,
+                            &manage_a,
+                            ResourceAction::TaskReview,
+                            WORKSPACE_ROOT_TASK_ID,
+                            Some(WORKSPACE_ID),
+                            Some(WORKSPACE_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve initiator management")
+                        .into_authorized()
+                        .is_some()
+                );
+                assert!(
+                    resolver
+                        .authorize_task(
+                            &member_b,
+                            &manage_b,
+                            ResourceAction::TaskReview,
+                            WORKSPACE_ROOT_TASK_ID,
+                            Some(WORKSPACE_ID),
+                            Some(WORKSPACE_THREAD_ID),
+                        )
+                        .await
+                        .expect("resolve peer management")
+                        .into_authorized()
+                        .is_some(),
+                    "root-thread collaboration authority must allow peer task management"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn task_collection_applies_root_acl_before_limit() {
-        let (harness, _resolver) = resolver_fixture().await;
-        harness
-            .database
-            .execute_unprepared(
-                "UPDATE task SET updated_at='2030-01-01T00:00:00Z' \
-                 WHERE id IN (\
-                    'K0000000000000000000A',\
-                    'K0000000000000000000B',\
-                    'K0000000000000000000C'\
-                 );\
-                 UPDATE task SET updated_at='2020-01-01T00:00:00Z' \
-                 WHERE id='K0000000000000000000W';",
-            )
-            .await
-            .expect("order inaccessible tasks before accessible task");
-        let store = CrudStore::new(harness.database.clone());
-        let tasks = store
-            .list_tasks_scoped(
-                pioneer_protocol::TaskListParams {
-                    workspace_id: WORKSPACE_ID.to_owned(),
-                    owner_kind: None,
-                    owner_id: None,
-                    parent_task_id: None,
-                    root_task_id: None,
-                    status: None,
-                    cursor: None,
-                    limit: Some(1),
-                },
-                Some(&pioneer_crud::TaskRootAccessFilter {
-                    allowed_root_thread_ids: vec![WORKSPACE_THREAD_ID.to_owned()],
-                }),
-            )
-            .await
-            .expect("list root-authorized tasks");
-        assert_eq!(
-            tasks
-                .iter()
-                .map(|task| task.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![WORKSPACE_ROOT_TASK_ID],
-            "inaccessible rows must be excluded before pagination"
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (harness, _resolver) = resolver_fixture(test_database).await;
+                harness
+                    .database
+                    .execute_unprepared(
+                        "UPDATE task SET updated_at='2030-01-01T00:00:00Z' \
+                         WHERE id IN (\
+                            'K0000000000000000000A',\
+                            'K0000000000000000000B',\
+                            'K0000000000000000000C'\
+                         );\
+                         UPDATE task SET updated_at='2020-01-01T00:00:00Z' \
+                         WHERE id='K0000000000000000000W';",
+                    )
+                    .await
+                    .expect("order inaccessible tasks before accessible task");
+                let store = CrudStore::new(harness.database.clone());
+                let tasks = store
+                    .list_tasks_scoped(
+                        pioneer_protocol::TaskListParams {
+                            workspace_id: WORKSPACE_ID.to_owned(),
+                            owner_kind: None,
+                            owner_id: None,
+                            parent_task_id: None,
+                            root_task_id: None,
+                            status: None,
+                            cursor: None,
+                            limit: Some(1),
+                        },
+                        Some(&pioneer_crud::TaskRootAccessFilter {
+                            allowed_root_thread_ids: vec![WORKSPACE_THREAD_ID.to_owned()],
+                        }),
+                    )
+                    .await
+                    .expect("list root-authorized tasks");
+                assert_eq!(
+                    tasks
+                        .iter()
+                        .map(|task| task.id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec![WORKSPACE_ROOT_TASK_ID],
+                    "inaccessible rows must be excluded before pagination"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn unbound_artifact_is_member_hidden_but_superuser_visible() {
-        let (_harness, resolver) = resolver_fixture().await;
-        let service = AuthorizationService::new();
-        let member = principal(MEMBER_A_ID, PrincipalKind::User);
-        let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
-        let member_gate = service.authorize_action(
-            member.kind,
-            member.role_key.as_ref(),
-            ResourceAction::ArtifactRead,
-        );
-        let superuser_gate = service.authorize_action(
-            superuser.kind,
-            superuser.role_key.as_ref(),
-            ResourceAction::ArtifactRead,
-        );
-        assert!(
-            resolver
-                .authorize_artifact(
-                    &member,
-                    &member_gate,
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let (_harness, resolver) = resolver_fixture(test_database).await;
+                let service = AuthorizationService::new();
+                let member = principal(MEMBER_A_ID, PrincipalKind::User);
+                let superuser = principal("P00000000000000000001", PrincipalKind::Superuser);
+                let member_gate = service.authorize_action(
+                    member.kind,
+                    member.role_key.as_ref(),
                     ResourceAction::ArtifactRead,
-                    UNBOUND_ARTIFACT_ID,
-                    Some(WORKSPACE_ID),
-                    None,
-                )
-                .await
-                .expect("resolve Member unbound artifact")
-                .into_authorized()
-                .is_none()
-        );
-        assert!(
-            resolver
-                .authorize_artifact(
-                    &superuser,
-                    &superuser_gate,
+                );
+                let superuser_gate = service.authorize_action(
+                    superuser.kind,
+                    superuser.role_key.as_ref(),
                     ResourceAction::ArtifactRead,
-                    UNBOUND_ARTIFACT_ID,
-                    Some(WORKSPACE_ID),
-                    None,
-                )
-                .await
-                .expect("resolve Superuser unbound artifact")
-                .into_authorized()
-                .is_some()
-        );
+                );
+                assert!(
+                    resolver
+                        .authorize_artifact(
+                            &member,
+                            &member_gate,
+                            ResourceAction::ArtifactRead,
+                            UNBOUND_ARTIFACT_ID,
+                            Some(WORKSPACE_ID),
+                            None,
+                        )
+                        .await
+                        .expect("resolve Member unbound artifact")
+                        .into_authorized()
+                        .is_none()
+                );
+                assert!(
+                    resolver
+                        .authorize_artifact(
+                            &superuser,
+                            &superuser_gate,
+                            ResourceAction::ArtifactRead,
+                            UNBOUND_ARTIFACT_ID,
+                            Some(WORKSPACE_ID),
+                            None,
+                        )
+                        .await
+                        .expect("resolve Superuser unbound artifact")
+                        .into_authorized()
+                        .is_some()
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

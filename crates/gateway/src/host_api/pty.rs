@@ -1,5 +1,5 @@
 //! Interactive PTYs under the Gateway OS account. No UI or user impersonation.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, PtySize};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,25 +49,17 @@ struct Create {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    session_id: String,
     sequence: u64,
     bytes: Vec<u8>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Resize {
-    session_id: String,
     dimensions: Dimensions,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Session {
-    session_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadOutput {
-    session_id: String,
     after: u64,
 }
 struct Output {
@@ -349,6 +341,7 @@ impl PtyOwner {
                         touched: Instant::now(),
                     }),
                 };
+                #[cfg(windows)]
                 let pty = startup.pty.as_mut().expect("owned startup");
                 let write_status = output.clone();
                 let write_signal = self.output_signal.clone();
@@ -648,13 +641,14 @@ impl PtyOwner {
                 return Ok(json!({"session_id":id,"input_sequence":0,"retention_seconds":300}));
             }
         }
-        let id = params
-            .get("session_id")
-            .and_then(Value::as_str)
-            .context("host.invalid_params")?
-            .to_owned();
+        let Value::Object(mut fields) = params else {
+            bail!("host.invalid_params");
+        };
+        let Some(Value::String(id)) = fields.remove("session_id") else {
+            bail!("host.invalid_params");
+        };
         if method == "host.pty.close" {
-            let _: Session = serde_json::from_value(params).context("host.invalid_params")?;
+            ensure!(fields.is_empty(), "host.invalid_params");
             // Idempotent within this execution. IDs never address another owner.
             self.sessions.remove(&id);
             return Ok(json!({"closed":true}));
@@ -666,7 +660,8 @@ impl PtyOwner {
         pty.touched = Instant::now();
         match method {
             "host.pty.input" => {
-                let input: Input = serde_json::from_value(params).context("host.invalid_params")?;
+                let input: Input =
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
                 if input.bytes.len() > 16384 || input.bytes.is_empty() {
                     bail!("host.input_limit");
                 }
@@ -714,7 +709,8 @@ impl PtyOwner {
                 Ok(json!({"accepted_sequence":pty.input_sequence}))
             }
             "host.pty.resize" => {
-                let p: Resize = serde_json::from_value(params).context("host.invalid_params")?;
+                let p: Resize =
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
                 pty.master
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -725,11 +721,11 @@ impl PtyOwner {
             }
             "host.pty.read" => {
                 let p: ReadOutput =
-                    serde_json::from_value(params).context("host.invalid_params")?;
-                self.read_output(&p.session_id, p.after, 16384)
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
+                self.read_output(&id, p.after, 16384)
             }
             "host.pty.keepalive" => {
-                let _: Session = serde_json::from_value(params).context("host.invalid_params")?;
+                ensure!(fields.is_empty(), "host.invalid_params");
                 Ok(json!({"alive":true}))
             }
             _ => bail!("host.method_not_allowed"),
@@ -924,10 +920,10 @@ mod tests {
         let id = created["session_id"].as_str().unwrap();
         let mut input = "Приветя".as_bytes().to_vec();
         input.extend_from_slice(&[127, b'\n']);
-        let mut input_sent = false;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut cursor = 0;
         let mut bytes = Vec::new();
+        let mut sent_input = false;
         loop {
             let frame = owner
                 .call("host.pty.read", json!({"session_id":id,"after":cursor}))
@@ -940,21 +936,17 @@ mod tests {
                     .iter()
                     .map(|v| v.as_u64().unwrap() as u8),
             );
-            // Wait for the complete locale line before typing: terminal echo
-            // can otherwise interleave input between ENCODING: and charmap.
-            if !input_sent && bytes.contains(&b'\n') {
-                let output = String::from_utf8_lossy(&bytes);
-                assert!(
-                    output.contains("ENCODING:UTF-8"),
-                    "non-UTF-8 child locale: {output:?}"
-                );
+            // Wait for the complete locale line before input can be echoed
+            // between printf's prefix and locale's output on the same PTY.
+            let ready = b"ENCODING:UTF-8\r\n";
+            if !sent_input && bytes.windows(ready.len()).any(|window| window == ready) {
                 owner
                     .call(
                         "host.pty.input",
-                        json!({"session_id":id,"sequence":1,"bytes":&input}),
+                        json!({"session_id":id,"sequence":1,"bytes":input}),
                     )
                     .unwrap();
-                input_sent = true;
+                sent_input = true;
             }
             if !frame["exit_status"].is_null() {
                 break;
@@ -963,6 +955,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let output = String::from_utf8(bytes).expect("PTY output must remain valid UTF-8");
+        assert!(
+            output.contains("ENCODING:UTF-8"),
+            "non-UTF-8 child locale: {output:?}"
+        );
         assert!(
             output.contains("RESULT:Привет\r\n"),
             "multibyte erase corrupted the input: {output:?}"

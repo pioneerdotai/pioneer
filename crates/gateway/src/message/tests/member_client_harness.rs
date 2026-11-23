@@ -146,22 +146,24 @@ async fn start_member_thread(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_logout() {
-    let session_lifecycle = connect_member_session();
-    let (workspace_manager, crud_store, affected_workspace_id) = setup_workspace_manager().await;
-    let unrelated_workspace_id = "W0000000000000000000B";
-    let inaccessible_workspace_id = "W0000000000000000000C";
-    workspace_manager
-        .create_workspace(unrelated_workspace_id, Some("Unrelated Member workspace"))
-        .await
-        .expect("create unrelated Member workspace");
-    workspace_manager
-        .create_workspace(inaccessible_workspace_id, Some("Inaccessible workspace"))
-        .await
-        .expect("create inaccessible workspace");
-    crud_store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "INSERT INTO gateway_principal(\
+    pioneer_postgres_test::with_database(async |fixture| {
+        let session_lifecycle = connect_member_session();
+        let (workspace_manager, crud_store, affected_workspace_id) =
+            crate::message::tests::setup_postgres_workspace_manager(fixture).await;
+        let unrelated_workspace_id = "W0000000000000000000B";
+        let inaccessible_workspace_id = "W0000000000000000000C";
+        workspace_manager
+            .create_workspace(unrelated_workspace_id, Some("Unrelated Member workspace"))
+            .await
+            .expect("create unrelated Member workspace");
+        workspace_manager
+            .create_workspace(inaccessible_workspace_id, Some("Inaccessible workspace"))
+            .await
+            .expect("create inaccessible workspace");
+        crud_store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
              ) VALUES(\
@@ -193,166 +195,168 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
                 revoke_reason\
              ) VALUES(\
                 '{MEMBER_SESSION_ID}','{}','{MEMBER_A_ID}','{MEMBER_DEVICE_ID}',\
-                'F0000000000000000000A',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,\
+                'F0000000000000000000A',NULL,decode(repeat('9a',32),'hex'),decode(repeat('9a',32),'hex'),0,\
+                (CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',1,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
              );\
              INSERT INTO auth_refresh_credential(\
                 id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
              ) VALUES(\
                 'R0000000000000000000A','{MEMBER_SESSION_ID}',\
-                'F0000000000000000000A',1,randomblob(32),CURRENT_TIMESTAMP,\
-                datetime('now','+90 days')\
+                'F0000000000000000000A',1,decode(repeat('9a',32),'hex'),CURRENT_TIMESTAMP,\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days')\
              );",
-            crate::session::test_support::TEST_GATEWAY_ID,
-            crate::session::test_support::TEST_GATEWAY_ID,
-            crate::session::test_support::TEST_GATEWAY_ID,
-        ))
-        .await
-        .expect("materialize internal Member client grants");
+                crate::session::test_support::TEST_GATEWAY_ID,
+                crate::session::test_support::TEST_GATEWAY_ID,
+                crate::session::test_support::TEST_GATEWAY_ID,
+            ))
+            .await
+            .expect("materialize internal Member client grants");
 
-    let session_manager = Arc::new(SessionManager::new());
-    let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
-    let member_principal = register_member_principal();
-    let connection_id = session_manager
-        .register_connection(member_tx, member_principal.clone())
-        .await
-        .expect("connect internal Member client");
-    let processor = MessageProcessor::new(
-        Arc::new(ThreadManager::new("o4-mini", "openai")),
-        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
-            "openai",
-            Arc::new(DelayedProvider {
-                delay: Duration::from_secs(2),
-                text: "member harness delayed response".to_owned(),
-            }),
-        )),
-        session_manager.clone(),
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    );
-
-    let list_id = generate_test_request_id("memberclient", "allowed");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": list_id,
-                "method": "workspace/list",
-                "params": {}
-            })
-            .to_string(),
-        )
-        .await;
-    let list_response = recv_response_by_id(&mut member_rx, list_id.as_str()).await;
-    let list_result = decode_shared_client_response(&list_response)
-        .expect("shared client should accept allowed workspace/list");
-    let list: WorkspaceListResponse =
-        serde_json::from_value(list_result).expect("typed workspace/list response");
-    let listed_ids = list
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.id.as_str())
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        listed_ids,
-        HashSet::from([affected_workspace_id.as_str(), unrelated_workspace_id])
-    );
-    assert!(!listed_ids.contains(inaccessible_workspace_id));
-
-    let mut affected_thread = start_member_thread(
-        &processor,
-        connection_id,
-        &mut member_rx,
-        affected_workspace_id.as_str(),
-        AFFECTED_THREAD_ID,
-        ThreadVisibility::Private,
-    )
-    .await;
-    affected_thread.name = Some("classified affected client payload".to_owned());
-    let unrelated_thread = start_member_thread(
-        &processor,
-        connection_id,
-        &mut member_rx,
-        unrelated_workspace_id,
-        UNRELATED_THREAD_ID,
-        ThreadVisibility::Workspace,
-    )
-    .await;
-
-    let workspace_turn_id = generate_test_request_id("memberclient", "workspace-turn");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": workspace_turn_id,
-                "method": "turn/start",
-                "params": {
-                    "thread_id": UNRELATED_THREAD_ID,
-                    "turn_id": "T0000000000000000000D",
-                    "mode": "Agent",
-                    "model_provider": "openai",
-                    "model": "o4-mini",
-                    "permission_profile": { "mode": "supervised" },
-                    "input": [{ "type": "text", "text": "run the Member agent" }]
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let workspace_turn = recv_response_by_id(&mut member_rx, workspace_turn_id.as_str()).await;
-    let workspace_turn: TurnStartResponse = serde_json::from_value(
-        decode_shared_client_response(&workspace_turn)
-            .expect("Member may materialize a workspace-visible draft and start an agent"),
-    )
-    .expect("typed Member workspace turn/start response");
-    assert_eq!(workspace_turn.turn.id, "T0000000000000000000D");
-    assert_eq!(
-        workspace_turn.turn.permission_profile.mode,
-        pioneer_protocol::TurnPermissionMode::Supervised
-    );
-    for (suffix, requested_resolution) in [("allow", "allow_once"), ("deny", "deny")] {
-        let permission_request_id = format!("member-permission-{suffix}");
-        let response_request_id = generate_test_request_id("memberpermission", suffix);
-        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
-        processor
-            .open_native_permission_request(crate::permissions::GatewayPermissionApprovalRequest {
-                request_id: permission_request_id.clone(),
-                workspace_id: Some(unrelated_workspace_id.to_owned()),
-                thread_id: Some(UNRELATED_THREAD_ID.to_owned()),
-                turn_id: Some(workspace_turn.turn.id.clone()),
-                tool_name: "exec_command".to_owned(),
-                key: pioneer_tools::PermissionRequestKey {
-                    profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
-                    tool_name: "exec_command".to_owned(),
-                    action: pioneer_tools::PermissionActionKind::ShellCommand,
-                    normalized_scope_hash: format!("member-permission-scope-{suffix}"),
-                    turn_id: workspace_turn.turn.id.clone(),
-                },
-                reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
-                summary: Some("run a Member-approved command".to_owned()),
-                details: Vec::new(),
-                respond_to: respond_tx,
-            })
-            .await;
-
-        let opened =
-            recv_notification_by_method(&mut member_rx, events::TURN_PERMISSION_REQUEST_OPENED)
-                .await;
-        assert_eq!(
-            opened.params.as_ref().and_then(|params| params
-                .get("request")
-                .and_then(|request| request.get("request_id"))),
-            Some(&serde_json::json!(permission_request_id))
+        let session_manager = Arc::new(SessionManager::new());
+        let (member_tx, mut member_rx) = crate::session::test_support::outbound_channel(32);
+        let member_principal = register_member_principal();
+        let connection_id = session_manager
+            .register_connection(member_tx, member_principal.clone())
+            .await
+            .expect("connect internal Member client");
+        let processor = MessageProcessor::new(
+            Arc::new(ThreadManager::new("o4-mini", "openai")),
+            Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                "openai",
+                Arc::new(DelayedProvider {
+                    delay: Duration::from_secs(2),
+                    text: "member harness delayed response".to_owned(),
+                }),
+            )),
+            session_manager.clone(),
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
         );
 
+        let list_id = generate_test_request_id("memberclient", "allowed");
         processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": list_id,
+                    "method": "workspace/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .await;
+        let list_response = recv_response_by_id(&mut member_rx, list_id.as_str()).await;
+        let list_result = decode_shared_client_response(&list_response)
+            .expect("shared client should accept allowed workspace/list");
+        let list: WorkspaceListResponse =
+            serde_json::from_value(list_result).expect("typed workspace/list response");
+        let listed_ids = list
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            listed_ids,
+            HashSet::from([affected_workspace_id.as_str(), unrelated_workspace_id])
+        );
+        assert!(!listed_ids.contains(inaccessible_workspace_id));
+
+        let mut affected_thread = start_member_thread(
+            &processor,
+            connection_id,
+            &mut member_rx,
+            affected_workspace_id.as_str(),
+            AFFECTED_THREAD_ID,
+            ThreadVisibility::Private,
+        )
+        .await;
+        affected_thread.name = Some("classified affected client payload".to_owned());
+        let unrelated_thread = start_member_thread(
+            &processor,
+            connection_id,
+            &mut member_rx,
+            unrelated_workspace_id,
+            UNRELATED_THREAD_ID,
+            ThreadVisibility::Workspace,
+        )
+        .await;
+
+        let workspace_turn_id = generate_test_request_id("memberclient", "workspace-turn");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": workspace_turn_id,
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": UNRELATED_THREAD_ID,
+                        "turn_id": "T0000000000000000000D",
+                        "mode": "Agent",
+                        "model_provider": "openai",
+                        "model": "o4-mini",
+                        "permission_profile": { "mode": "supervised" },
+                        "input": [{ "type": "text", "text": "run the Member agent" }]
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let workspace_turn = recv_response_by_id(&mut member_rx, workspace_turn_id.as_str()).await;
+        let workspace_turn: TurnStartResponse = serde_json::from_value(
+            decode_shared_client_response(&workspace_turn)
+                .expect("Member may materialize a workspace-visible draft and start an agent"),
+        )
+        .expect("typed Member workspace turn/start response");
+        assert_eq!(workspace_turn.turn.id, "T0000000000000000000D");
+        assert_eq!(
+            workspace_turn.turn.permission_profile.mode,
+            pioneer_protocol::TurnPermissionMode::Supervised
+        );
+        for (suffix, requested_resolution) in [("allow", "allow_once"), ("deny", "deny")] {
+            let permission_request_id = format!("member-permission-{suffix}");
+            let response_request_id = generate_test_request_id("memberpermission", suffix);
+            let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+            processor
+                .open_native_permission_request(
+                    crate::permissions::GatewayPermissionApprovalRequest {
+                        request_id: permission_request_id.clone(),
+                        workspace_id: Some(unrelated_workspace_id.to_owned()),
+                        thread_id: Some(UNRELATED_THREAD_ID.to_owned()),
+                        turn_id: Some(workspace_turn.turn.id.clone()),
+                        tool_name: "exec_command".to_owned(),
+                        key: pioneer_tools::PermissionRequestKey {
+                            profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+                            tool_name: "exec_command".to_owned(),
+                            action: pioneer_tools::PermissionActionKind::ShellCommand,
+                            normalized_scope_hash: format!("member-permission-scope-{suffix}"),
+                            turn_id: workspace_turn.turn.id.clone(),
+                        },
+                        reason: pioneer_tools::PermissionDecisionReason::PolicyRequiresApproval,
+                        summary: Some("run a Member-approved command".to_owned()),
+                        details: Vec::new(),
+                        respond_to: respond_tx,
+                    },
+                )
+                .await;
+
+            let opened =
+                recv_notification_by_method(&mut member_rx, events::TURN_PERMISSION_REQUEST_OPENED)
+                    .await;
+            assert_eq!(
+                opened.params.as_ref().and_then(|params| params
+                    .get("request")
+                    .and_then(|request| request.get("request_id"))),
+                Some(&serde_json::json!(permission_request_id))
+            );
+
+            processor
             .process_request_for_connection(
                 connection_id,
                 &json!({
@@ -367,40 +371,40 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
                 .to_string(),
             )
             .await;
-        let (response, _) = recv_response_and_notification_by_id_method(
-            &mut member_rx,
-            response_request_id.as_str(),
-            events::TURN_PERMISSION_REQUEST_RESOLVED,
-        )
-        .await;
-        assert_eq!(response.result["resolution"], requested_resolution);
-        let broker_resolution = respond_rx
-            .await
-            .expect("Member permission decision must reach the running agent");
-        match requested_resolution {
-            "allow_once" => assert_eq!(
-                broker_resolution,
-                pioneer_tools::PermissionApprovalResolution::AllowOnce
-            ),
-            "deny" => assert!(matches!(
-                broker_resolution,
-                pioneer_tools::PermissionApprovalResolution::Deny { .. }
-            )),
-            _ => unreachable!(),
+            let (response, _) = recv_response_and_notification_by_id_method(
+                &mut member_rx,
+                response_request_id.as_str(),
+                events::TURN_PERMISSION_REQUEST_RESOLVED,
+            )
+            .await;
+            assert_eq!(response.result["resolution"], requested_resolution);
+            let broker_resolution = respond_rx
+                .await
+                .expect("Member permission decision must reach the running agent");
+            match requested_resolution {
+                "allow_once" => assert_eq!(
+                    broker_resolution,
+                    pioneer_tools::PermissionApprovalResolution::AllowOnce
+                ),
+                "deny" => assert!(matches!(
+                    broker_resolution,
+                    pioneer_tools::PermissionApprovalResolution::Deny { .. }
+                )),
+                _ => unreachable!(),
+            }
         }
-    }
-    let terminal = recv_turn_terminal_notification(&mut member_rx).await;
-    assert_eq!(
-        terminal.method,
-        events::TURN_COMPLETED,
-        "Member agent turn must complete successfully, got params={:?}",
-        terminal.params
-    );
+        let terminal = recv_turn_terminal_notification(&mut member_rx).await;
+        assert_eq!(
+            terminal.method,
+            events::TURN_COMPLETED,
+            "Member agent turn must complete successfully, got params={:?}",
+            terminal.params
+        );
 
-    crud_store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "INSERT INTO thread(\
+        crud_store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO thread(\
                 id,workspace_id,name,preview,mode,model,model_provider,status,\
                 origin_kind,sidebar_visibility,access_class,created_at,updated_at,\
                 created_by_actor_kind,created_by_actor_id\
@@ -428,324 +432,331 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
                 '{INTERNAL_ROOT_THREAD_ID}',1,CURRENT_TIMESTAMP,'task_run',\
                 '{INTERNAL_ROOT_THREAD_ID}',NULL\
              );"
-        ))
-        .await
-        .expect("materialize Member-visible internal child lineage");
-    let child_parent_turn_id = "U0000000000000000000R";
-    let child_root = crud_store
-        .get_thread_model(INTERNAL_ROOT_THREAD_ID)
-        .await
-        .expect("child root lookup should succeed")
-        .expect("child root should exist");
-    crud_store
-        .materialize_turn_start(
-            &child_root,
-            SandboxMode::FullAccess,
-            &Turn {
-                work_owner: Default::default(),
-                id: child_parent_turn_id.to_owned(),
-                status: TurnStatus::InProgress,
-                turn_kind: TurnKind::Conversation,
-                origin: TurnOrigin::User,
-                mode: Default::default(),
-                author: None,
-                reply_to_turn_id: None,
-                mentions: Vec::new(),
-                message_revision: 0,
-                message_deleted: false,
-                error: None,
-                prompt_manifest: None,
-                permission_profile: default_test_permission_profile(),
-            },
-            &[],
-            PersistedActorRef::Principal(member_principal.principal_id.clone()),
-        )
-        .await
-        .expect("child root parent turn should persist");
-    let child_parent_authority = crate::authorization::ExecutionAuthorizationContext::for_test(
-        member_principal.as_ref(),
-        affected_workspace_id.as_str(),
-        INTERNAL_ROOT_THREAD_ID,
-        &default_test_permission_profile(),
-        None,
-    )
-    .to_persisted_json()
-    .expect("child root parent authority should serialize");
-    assert!(
+            ))
+            .await
+            .expect("materialize Member-visible internal child lineage");
+        let child_parent_turn_id = "U0000000000000000000R";
+        let child_root = crud_store
+            .get_thread_model(INTERNAL_ROOT_THREAD_ID)
+            .await
+            .expect("child root lookup should succeed")
+            .expect("child root should exist");
         crud_store
-            .set_turn_execution_authorization_context(
-                child_parent_turn_id,
-                child_parent_authority.as_str(),
+            .materialize_turn_start(
+                &child_root,
+                SandboxMode::FullAccess,
+                &Turn {
+                    work_owner: Default::default(),
+                    id: child_parent_turn_id.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: TurnKind::Conversation,
+                    origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: default_test_permission_profile(),
+                },
+                &[],
+                PersistedActorRef::Principal(member_principal.principal_id.clone()),
             )
             .await
-            .expect("child root parent authority should persist")
-    );
-    crud_store
-        .database_connection()
-        .execute_unprepared(
-            format!(
-                "UPDATE thread_lineage SET created_by_turn_id='{child_parent_turn_id}' \
+            .expect("child root parent turn should persist");
+        let child_parent_authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+            member_principal.as_ref(),
+            affected_workspace_id.as_str(),
+            INTERNAL_ROOT_THREAD_ID,
+            &default_test_permission_profile(),
+            None,
+        )
+        .to_persisted_json()
+        .expect("child root parent authority should serialize");
+        assert!(
+            crud_store
+                .set_turn_execution_authorization_context(
+                    child_parent_turn_id,
+                    child_parent_authority.as_str(),
+                )
+                .await
+                .expect("child root parent authority should persist")
+        );
+        crud_store
+            .database_connection()
+            .execute_unprepared(
+                format!(
+                    "UPDATE thread_lineage SET created_by_turn_id='{child_parent_turn_id}' \
                  WHERE child_thread_id='{INTERNAL_CHILD_THREAD_ID}'"
+                )
+                .as_str(),
             )
-            .as_str(),
+            .await
+            .expect("child lineage should reference its typed parent execution");
+
+        let child_get_id = generate_test_request_id("memberclient", "childget");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": child_get_id,
+                    "method": "thread/get",
+                    "params": { "thread_id": INTERNAL_CHILD_THREAD_ID }
+                })
+                .to_string(),
+            )
+            .await;
+        let child_get = recv_response_by_id(&mut member_rx, child_get_id.as_str()).await;
+        let child_get: ThreadGetResponse = serde_json::from_value(
+            decode_shared_client_response(&child_get)
+                .expect("Member may resolve an authorized child"),
         )
-        .await
-        .expect("child lineage should reference its typed parent execution");
+        .expect("typed internal child thread/get response");
+        assert_eq!(child_get.thread.id, INTERNAL_CHILD_THREAD_ID);
 
-    let child_get_id = generate_test_request_id("memberclient", "childget");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": child_get_id,
-                "method": "thread/get",
-                "params": { "thread_id": INTERNAL_CHILD_THREAD_ID }
-            })
-            .to_string(),
+        let child_start_id = generate_test_request_id("memberclient", "childstart");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": child_start_id,
+                    "method": "thread/start",
+                    "params": {
+                        "thread_id": INTERNAL_CHILD_THREAD_ID,
+                        "workspace_id": affected_workspace_id
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let child_start = recv_response_by_id(&mut member_rx, child_start_id.as_str()).await;
+        let child_start: ThreadStartResponse = serde_json::from_value(
+            decode_shared_client_response(&child_start)
+                .expect("Member may subscribe to an authorized child"),
         )
-        .await;
-    let child_get = recv_response_by_id(&mut member_rx, child_get_id.as_str()).await;
-    let child_get: ThreadGetResponse = serde_json::from_value(
-        decode_shared_client_response(&child_get).expect("Member may resolve an authorized child"),
-    )
-    .expect("typed internal child thread/get response");
-    assert_eq!(child_get.thread.id, INTERNAL_CHILD_THREAD_ID);
+        .expect("typed internal child thread/start response");
+        assert_eq!(child_start.thread.id, INTERNAL_CHILD_THREAD_ID);
 
-    let child_start_id = generate_test_request_id("memberclient", "childstart");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": child_start_id,
-                "method": "thread/start",
-                "params": {
-                    "thread_id": INTERNAL_CHILD_THREAD_ID,
-                    "workspace_id": affected_workspace_id
-                }
-            })
-            .to_string(),
+        let child_timeline_id = generate_test_request_id("memberclient", "childtimeline");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": child_timeline_id,
+                    "method": "thread/timeline/page",
+                    "params": {
+                        "threadId": INTERNAL_CHILD_THREAD_ID,
+                        "anchor": { "kind": "newest" },
+                        "limit": 12
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let child_timeline = recv_response_by_id(&mut member_rx, child_timeline_id.as_str()).await;
+        let child_timeline: ThreadTimelinePageResponse = serde_json::from_value(
+            decode_shared_client_response(&child_timeline)
+                .expect("Member may read an authorized child timeline"),
         )
-        .await;
-    let child_start = recv_response_by_id(&mut member_rx, child_start_id.as_str()).await;
-    let child_start: ThreadStartResponse = serde_json::from_value(
-        decode_shared_client_response(&child_start)
-            .expect("Member may subscribe to an authorized child"),
-    )
-    .expect("typed internal child thread/start response");
-    assert_eq!(child_start.thread.id, INTERNAL_CHILD_THREAD_ID);
+        .expect("typed internal child timeline response");
+        assert_eq!(child_timeline.thread_id, INTERNAL_CHILD_THREAD_ID);
 
-    let child_timeline_id = generate_test_request_id("memberclient", "childtimeline");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": child_timeline_id,
-                "method": "thread/timeline/page",
-                "params": {
-                    "threadId": INTERNAL_CHILD_THREAD_ID,
-                    "anchor": { "kind": "newest" },
-                    "limit": 12
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let child_timeline = recv_response_by_id(&mut member_rx, child_timeline_id.as_str()).await;
-    let child_timeline: ThreadTimelinePageResponse = serde_json::from_value(
-        decode_shared_client_response(&child_timeline)
-            .expect("Member may read an authorized child timeline"),
-    )
-    .expect("typed internal child timeline response");
-    assert_eq!(child_timeline.thread_id, INTERNAL_CHILD_THREAD_ID);
+        let forbidden_id = generate_test_request_id("memberclient", "forbidden");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": forbidden_id,
+                    "method": "workspace/create",
+                    "params": {
+                        "workspace_id": "W0000000000000000000D",
+                        "name": "must not be created"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let forbidden = recv_error_by_id(&mut member_rx, forbidden_id.as_str()).await;
+        let forbidden = decode_shared_client_response(&forbidden)
+            .expect_err("shared client should retain forbidden response");
+        assert_eq!(
+            forbidden.authorization_failure(),
+            Some(JsonRpcAuthorizationFailure::Forbidden)
+        );
+        assert!(matches!(
+            session_lifecycle.state(),
+            SessionLifecycleState::Active { .. }
+        ));
 
-    let forbidden_id = generate_test_request_id("memberclient", "forbidden");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": forbidden_id,
-                "method": "workspace/create",
-                "params": {
-                    "workspace_id": "W0000000000000000000D",
-                    "name": "must not be created"
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let forbidden = recv_error_by_id(&mut member_rx, forbidden_id.as_str()).await;
-    let forbidden = decode_shared_client_response(&forbidden)
-        .expect_err("shared client should retain forbidden response");
-    assert_eq!(
-        forbidden.authorization_failure(),
-        Some(JsonRpcAuthorizationFailure::Forbidden)
-    );
-    assert!(matches!(
-        session_lifecycle.state(),
-        SessionLifecycleState::Active { .. }
-    ));
+        let inaccessible_id = generate_test_request_id("memberclient", "inaccessible");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": inaccessible_id,
+                    "method": "workspace/select",
+                    "params": {
+                        "workspace_id": inaccessible_workspace_id,
+                        "make_current": false
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let inaccessible = recv_error_by_id(&mut member_rx, inaccessible_id.as_str()).await;
+        let inaccessible = decode_shared_client_response(&inaccessible)
+            .expect_err("shared client should retain inaccessible response");
+        assert_eq!(
+            inaccessible.authorization_failure(),
+            Some(JsonRpcAuthorizationFailure::InaccessibleResource)
+        );
+        assert!(matches!(
+            session_lifecycle.state(),
+            SessionLifecycleState::Active { .. }
+        ));
 
-    let inaccessible_id = generate_test_request_id("memberclient", "inaccessible");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": inaccessible_id,
-                "method": "workspace/select",
-                "params": {
-                    "workspace_id": inaccessible_workspace_id,
-                    "make_current": false
-                }
-            })
-            .to_string(),
-        )
-        .await;
-    let inaccessible = recv_error_by_id(&mut member_rx, inaccessible_id.as_str()).await;
-    let inaccessible = decode_shared_client_response(&inaccessible)
-        .expect_err("shared client should retain inaccessible response");
-    assert_eq!(
-        inaccessible.authorization_failure(),
-        Some(JsonRpcAuthorizationFailure::InaccessibleResource)
-    );
-    assert!(matches!(
-        session_lifecycle.state(),
-        SessionLifecycleState::Active { .. }
-    ));
+        let mut client_state = ClientState::default();
+        client_state.workspaces.workspaces = list.workspaces;
+        client_state.workspaces.preferred_workspace_id = Some(affected_workspace_id.clone());
+        client_state.threads.active_thread_id = Some(AFFECTED_THREAD_ID.to_owned());
+        client_state.threads.coordinators.insert(
+            AFFECTED_THREAD_ID.to_owned(),
+            ThreadCoordinator::new(affected_thread),
+        );
+        client_state.threads.coordinators.insert(
+            UNRELATED_THREAD_ID.to_owned(),
+            ThreadCoordinator::new(unrelated_thread),
+        );
+        client_state.gateway.ws_connection_id = Some(41);
+        client_state.gateway.bootstrap_complete = true;
 
-    let mut client_state = ClientState::default();
-    client_state.workspaces.workspaces = list.workspaces;
-    client_state.workspaces.preferred_workspace_id = Some(affected_workspace_id.clone());
-    client_state.threads.active_thread_id = Some(AFFECTED_THREAD_ID.to_owned());
-    client_state.threads.coordinators.insert(
-        AFFECTED_THREAD_ID.to_owned(),
-        ThreadCoordinator::new(affected_thread),
-    );
-    client_state.threads.coordinators.insert(
-        UNRELATED_THREAD_ID.to_owned(),
-        ThreadCoordinator::new(unrelated_thread),
-    );
-    client_state.gateway.ws_connection_id = Some(41);
-    client_state.gateway.bootstrap_complete = true;
-
-    crud_store
-        .database_connection()
-        .execute_unprepared(&format!(
-            "DELETE FROM workspace_membership \
+        crud_store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "DELETE FROM workspace_membership \
              WHERE principal_id='{MEMBER_A_ID}' \
                AND workspace_id='{affected_workspace_id}'"
-        ))
-        .await
-        .expect("commit affected Member workspace revoke");
-    let signal = processor
-        .publish_committed_workspace_membership_invalidation(
-            member_principal.principal_id.clone(),
-            affected_workspace_id.clone(),
-        )
-        .await;
-    let notification = recv_notification_by_method(&mut member_rx, events::ACCESS_CHANGED).await;
-    let access_changed: AccessChangedNotification = serde_json::from_value(
-        notification
-            .params
-            .expect("access/changed should carry safe params"),
-    )
-    .expect("shared protocol should decode access/changed");
-    assert_eq!(
-        access_changed.authorization_revision,
-        signal.authorization_revision
-    );
-    assert_eq!(
-        access_changed.outcome,
-        pioneer_protocol::AccessChangeOutcome::Revoked
-    );
-
-    let plan = apply_access_changed_to_client_state(&mut client_state, &access_changed);
-    assert!(plan.apply);
-    assert_eq!(plan.invalidate_thread_ids, vec![AFFECTED_THREAD_ID]);
-    assert_eq!(client_state.gateway.ws_connection_id, Some(41));
-    assert!(client_state.gateway.bootstrap_complete);
-    assert!(client_state.threads.active_thread_id.is_none());
-    assert!(
-        !client_state
-            .threads
-            .coordinators
-            .contains_key(AFFECTED_THREAD_ID)
-    );
-    assert!(
-        client_state
-            .threads
-            .coordinators
-            .contains_key(UNRELATED_THREAD_ID)
-    );
-    assert!(
-        client_state
-            .workspaces
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.id != affected_workspace_id)
-    );
-    assert!(
-        client_state
-            .workspaces
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.id == unrelated_workspace_id)
-    );
-    assert!(
-        client_state
-            .threads
-            .coordinators
-            .values()
-            .filter_map(ThreadCoordinator::thread)
-            .all(|thread| {
-                thread.id != AFFECTED_THREAD_ID
-                    && thread.workspace_id != affected_workspace_id
-                    && !thread
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.contains("classified affected client payload"))
-            }),
-        "no inaccessible protected thread payload may remain cached"
-    );
-    assert!(matches!(
-        session_lifecycle.state(),
-        SessionLifecycleState::Active { .. }
-    ));
-    assert!(
-        session_manager
-            .connection_principal(connection_id)
+            ))
             .await
-            .is_ok(),
-        "workspace revoke must not log out an otherwise valid Member session"
-    );
-
-    let refreshed_list_id = generate_test_request_id("memberclient", "refresh");
-    processor
-        .process_request_for_connection(
-            connection_id,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": refreshed_list_id,
-                "method": "workspace/list",
-                "params": {}
-            })
-            .to_string(),
+            .expect("commit affected Member workspace revoke");
+        let signal = processor
+            .publish_committed_workspace_membership_invalidation(
+                member_principal.principal_id.clone(),
+                affected_workspace_id.clone(),
+            )
+            .await;
+        let notification =
+            recv_notification_by_method(&mut member_rx, events::ACCESS_CHANGED).await;
+        let access_changed: AccessChangedNotification = serde_json::from_value(
+            notification
+                .params
+                .expect("access/changed should carry safe params"),
         )
-        .await;
-    let refreshed_response = recv_response_by_id(&mut member_rx, refreshed_list_id.as_str()).await;
-    let refreshed_result = decode_shared_client_response(&refreshed_response)
-        .expect("shared client should refresh server-filtered workspace list");
-    let refreshed: WorkspaceListResponse =
-        serde_json::from_value(refreshed_result).expect("typed refreshed workspace/list");
-    assert_eq!(refreshed.workspaces.len(), 1);
-    assert_eq!(refreshed.workspaces[0].id, unrelated_workspace_id);
+        .expect("shared protocol should decode access/changed");
+        assert_eq!(
+            access_changed.authorization_revision,
+            signal.authorization_revision
+        );
+        assert_eq!(
+            access_changed.outcome,
+            pioneer_protocol::AccessChangeOutcome::Revoked
+        );
+
+        let plan = apply_access_changed_to_client_state(&mut client_state, &access_changed);
+        assert!(plan.apply);
+        assert_eq!(plan.invalidate_thread_ids, vec![AFFECTED_THREAD_ID]);
+        assert_eq!(client_state.gateway.ws_connection_id, Some(41));
+        assert!(client_state.gateway.bootstrap_complete);
+        assert!(client_state.threads.active_thread_id.is_none());
+        assert!(
+            !client_state
+                .threads
+                .coordinators
+                .contains_key(AFFECTED_THREAD_ID)
+        );
+        assert!(
+            client_state
+                .threads
+                .coordinators
+                .contains_key(UNRELATED_THREAD_ID)
+        );
+        assert!(
+            client_state
+                .workspaces
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != affected_workspace_id)
+        );
+        assert!(
+            client_state
+                .workspaces
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == unrelated_workspace_id)
+        );
+        assert!(
+            client_state
+                .threads
+                .coordinators
+                .values()
+                .filter_map(ThreadCoordinator::thread)
+                .all(|thread| {
+                    thread.id != AFFECTED_THREAD_ID
+                        && thread.workspace_id != affected_workspace_id
+                        && !thread
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.contains("classified affected client payload"))
+                }),
+            "no inaccessible protected thread payload may remain cached"
+        );
+        assert!(matches!(
+            session_lifecycle.state(),
+            SessionLifecycleState::Active { .. }
+        ));
+        assert!(
+            session_manager
+                .connection_principal(connection_id)
+                .await
+                .is_ok(),
+            "workspace revoke must not log out an otherwise valid Member session"
+        );
+
+        let refreshed_list_id = generate_test_request_id("memberclient", "refresh");
+        processor
+            .process_request_for_connection(
+                connection_id,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": refreshed_list_id,
+                    "method": "workspace/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .await;
+        let refreshed_response =
+            recv_response_by_id(&mut member_rx, refreshed_list_id.as_str()).await;
+        let refreshed_result = decode_shared_client_response(&refreshed_response)
+            .expect("shared client should refresh server-filtered workspace list");
+        let refreshed: WorkspaceListResponse =
+            serde_json::from_value(refreshed_result).expect("typed refreshed workspace/list");
+        assert_eq!(refreshed.workspaces.len(), 1);
+        assert_eq!(refreshed.workspaces[0].id, unrelated_workspace_id);
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation() {
     let member_principal = register_member_principal();
     let mut harness = setup_cli_runtime_security_harness_for_principal(
@@ -787,10 +798,10 @@ async fn member_full_access_cli_request_is_capped_before_codex_permissions_adapt
                 revoke_reason\
              ) VALUES(\
                 '{MEMBER_SESSION_ID}','{}','{MEMBER_A_ID}','{MEMBER_DEVICE_ID}',\
-                'F0000000000000000000A',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',1,\
+                'F0000000000000000000A',NULL,decode(repeat('9a',32),'hex'),decode(repeat('9a',32),'hex'),0,\
+                (CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',1,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
+                (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL\
              );",
             crate::session::test_support::TEST_GATEWAY_ID,
             harness.workspace_id,

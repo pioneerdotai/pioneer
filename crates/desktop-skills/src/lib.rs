@@ -8,6 +8,7 @@ mod catalog;
 mod details;
 mod dialogs;
 mod list;
+mod policy_settings;
 mod sidebar;
 mod table;
 pub use catalog::{SkillsCatalogConfig, SkillsCatalogView};

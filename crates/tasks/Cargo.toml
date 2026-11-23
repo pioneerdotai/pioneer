@@ -13,10 +13,10 @@ chrono.workspace = true
 chrono-tz.workspace = true
 pioneer-crud.workspace = true
 pioneer-protocol.workspace = true
-pioneer-sqlite.workspace = true
+pioneer-postgres-pools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 sha2.workspace = true
 hex.workspace = true
 tokio.workspace = true
@@ -25,7 +25,8 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 pioneer-crud = { workspace = true, features = ["test-support"] }
-pioneer-migration.workspace = true
+pioneer-crud-payloads.workspace = true
+pioneer-postgres-test.workspace = true
 pioneer-entity.workspace = true
-sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 tempfile.workspace = true

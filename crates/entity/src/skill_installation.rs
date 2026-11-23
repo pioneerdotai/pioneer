@@ -7,28 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_installation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub owner: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub slug: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub version: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub source_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub scope_key: String,
     #[sea_orm(column_type = "Text")]
     pub source_ref: String,
     #[sea_orm(column_type = "Text")]
     pub install_path: String,
+    #[sea_orm(column_type = "Text")]
     pub trust_level: String,
+    #[sea_orm(column_type = "Text")]
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(unique_key = "uq_skill_installation_pack_member_key")]
+    #[sea_orm(column_type = "Text", nullable)]
     pub pack_id: Option<String>,
-    #[sea_orm(
-        column_type = "Text",
-        nullable,
-        unique_key = "uq_skill_installation_pack_member_key"
-    )]
+    #[sea_orm(column_type = "Text", nullable)]
     pub pack_member_key: Option<String>,
     #[sea_orm(has_one)]
     pub package_component: HasOne<super::package_component::Entity>,
@@ -39,7 +42,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub skill_pack_installation: HasOne<super::skill_pack_installation::Entity>,
+    pub skill_pack_installation: BelongsTo<Option<super::skill_pack_installation::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -164,3 +164,8 @@ recovering = "连接暂时不可用。Pioneer 将重试。"
 clear_sign_in = "重置登录"
 prepare_failed = "无法准备登录。请关闭占用回调端口的应用，然后重新登录。"
 client_auth_unsupported = "此 OAuth 客户端的认证方式不受支持。请检查注册设置。"
+
+[mcp.settings]
+title = "设置"
+enabled_description = "使此MCP服务器的工具和资源可在当前工作区中使用。"
+implicit_description = "允许智能体自动使用此MCP服务器，即使请求中未明确提及它。"

@@ -2,6 +2,10 @@ use crate::{AppLanguagePreference, FileOpenerId, WindowThemePreference};
 use gpui_kit::{App, Window};
 /// Desktop preferences and existing native integrations. Domain saves use Client intents.
 pub trait SettingsPlatform {
+    fn api_provider_title(&self) -> Option<pioneer_desktop_foundation::ApiProviderTitle> {
+        None
+    }
+
     fn telemetry(&self, enabled: bool);
     fn language(&self, cx: &App) -> AppLanguagePreference;
     fn theme(&self, cx: &App) -> WindowThemePreference;

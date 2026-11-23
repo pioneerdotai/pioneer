@@ -2,10 +2,12 @@
 #[macro_use]
 extern crate rust_i18n;
 rust_i18n::i18n!("locales", fallback = "en");
+mod assets;
 mod catalog;
 mod details;
 mod list;
 mod management;
+mod policy_settings;
 mod sidebar;
 mod upload;
 use gpui_kit::component::{button::*, scroll::ScrollableElement, theme::ActiveTheme, *};

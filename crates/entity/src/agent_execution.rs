@@ -7,26 +7,39 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_execution")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub agent_identity_id: String,
     pub identity_source_revision: i64,
+    #[sea_orm(column_type = "Text")]
     pub identity_source_fingerprint: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub parent_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub parent_task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub parent_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub home_root_thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub work_graph_root_execution_id: String,
     #[sea_orm(column_type = "Text")]
     pub requested_identity_selection_json: String,
     #[sea_orm(column_type = "Text")]
     pub requested_profile_selection_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_profile_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resolved_profile_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub presentation_snapshot_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub authorization_context_fingerprint: String,
     pub execution_generation: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -48,7 +61,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub agent_identity: HasOne<super::agent_identity::Entity>,
+    pub agent_identity: BelongsTo<super::agent_identity::Entity>,
     #[sea_orm(
         belongs_to,
         from = "presentation_snapshot_id",
@@ -56,7 +69,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub agent_presentation_snapshot: HasOne<super::agent_presentation_snapshot::Entity>,
+    pub agent_presentation_snapshot: BelongsTo<Option<super::agent_presentation_snapshot::Entity>>,
     #[sea_orm(has_many)]
     pub agent_turn_response_executions: HasMany<super::agent_turn_response_execution::Entity>,
     #[sea_orm(has_one)]
@@ -68,7 +81,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

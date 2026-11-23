@@ -918,7 +918,7 @@ mod tests {
     fn repeated_saved_error_projections_are_silent_for_every_failure_class() {
         use super::*;
         use crate::public_error::test_support::capture_events;
-        let canary = "bearer-token /Users/operator/private.sqlite";
+        let canary = "bearer-token /Users/operator/private-db-data";
         let mut response =
             collaborator_fixture("private/path", "secret/webhook", canary, "input", "filter");
         let (_, events) = capture_events(|| {
@@ -1109,7 +1109,7 @@ mod tests {
     fn collaborator_projection_drops_host_paths_webhooks_and_raw_diagnostics() {
         let canary_path = "/Users/operator/private/task-result.txt";
         let canary_webhook = "https://hooks.example.test/deliver?token=secret";
-        let canary_error = "database failed at /var/lib/pioneer/private.sqlite";
+        let canary_error = "database failed at /var/lib/pioneer/private-db-data";
         let canary_input = "private task input that must not be disclosed";
         let canary_external_filter = "payload.secret == 'private'";
         let latest_projected_instruction =

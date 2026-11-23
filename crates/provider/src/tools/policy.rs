@@ -270,7 +270,11 @@ fn prepare_request_for_api(
             "provider `bedrock`: named tool choice requires a verified Claude 3 or Nova model identity"
         );
     }
-    if !disabled && (responses || provider != "anthropic") {
+    if (responses || provider != "anthropic")
+        && (!disabled
+            || matches!(provider, "openai" | "azure-openai")
+                && request.parallel_tool_calls == Some(true))
+    {
         let metadata_control = catalog
             .and_then(|c| c.model(provider, &request.model))
             .and_then(|m| m.metadata.get("compat").cloned())

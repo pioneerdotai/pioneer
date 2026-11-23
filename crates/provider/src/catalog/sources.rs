@@ -836,7 +836,9 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 &json!({}),
                 (4096, 4096),
             );
-            c.model["name"] = m["name"].clone();
+            if let Some(name) = m["name"].as_str().filter(|name| !name.trim().is_empty()) {
+                c.model["name"] = json!(name);
+            }
             // This source's candidates were filtered by supported_parameters.
             c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
             c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
@@ -848,7 +850,10 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                     .map(|(input, _)| input.split('+').map(|v| json!(v)).collect()));
             c.model["input"] = json!(input.clone().unwrap_or_default());
             c.model["inputOrigin"] = json!({"kind":if input.is_some(){"source"}else{"fallback"},"expression":"openrouter.architecture.input_modalities or modality"});
-            c.model["sourceMetadata"] = json!({"architecture":m["architecture"]});
+            c.model["sourceMetadata"] = json!({
+                "architecture":m["architecture"],
+                "description":m["description"].as_str(),
+            });
             c.model["output"] = m["architecture"]["output_modalities"].clone();
             let context = if number(&m["top_provider"]["context_length"]) != 0. {
                 &m["top_provider"]["context_length"]

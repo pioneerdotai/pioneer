@@ -79,6 +79,7 @@ impl ProviderModelPickerPort for DesktopProviderModelPicker {
             )
             .selection(request.selection().clone())
             .fixed_provider()
+            .with_api_provider_title(Some(pioneer_desktop_providers::api_provider_title))
             .on_refresh(request.on_refresh()),
             window,
             cx,

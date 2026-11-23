@@ -3,8 +3,12 @@ use pioneer_crud::{TaskDeliveryCommitTestKind, TaskDeliveryTransitionOutcome};
 
 const RACE_TIME: i64 = 4_300_000_000;
 
-async fn race_processor() -> (tempfile::TempDir, Arc<MessageProcessor>, String) {
-    let (directory, workspaces, store, workspace_id) = setup_pooled_file_workspace_manager().await;
+async fn race_processor() -> (
+    Arc<pioneer_postgres_test::TestDatabase>,
+    Arc<MessageProcessor>,
+    String,
+) {
+    let (directory, workspaces, store, workspace_id) = setup_pooled_workspace_manager().await;
     let sessions = Arc::new(SessionManager::new());
     let (sender, _receiver) = crate::session::test_support::outbound_channel(32);
     let connection_id = register_authenticated_test_connection(sessions.as_ref(), sender).await;
@@ -254,8 +258,8 @@ async fn cancellation_worker_case(
             .crud_store
             .database_connection()
             .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
-                "SELECT COUNT(*) AS count FROM turn_item WHERE item_id=?",
+                sea_orm::DbBackend::Postgres,
+                "SELECT COUNT(*) AS count FROM turn_item WHERE item_id=$1",
                 [pioneer_protocol::task_delivery_result_item_id(&first.id).into()],
             ))
             .await
@@ -306,27 +310,27 @@ async fn cancellation_worker_case(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_delivery_cancellation_lost_start_skips_execution_and_continues_worker() {
     cancellation_worker_case(TaskDeliveryCommitTestKind::Start, false, false).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_delivery_cancellation_late_success_continues_worker_without_refinalization() {
     cancellation_worker_case(TaskDeliveryCommitTestKind::Finish, false, false).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_delivery_cancellation_outer_execution_failure_continues_worker() {
     cancellation_worker_case(TaskDeliveryCommitTestKind::Finish, true, false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_delivery_cancellation_execution_timeout_continues_worker_without_refinalization() {
     cancellation_worker_case(TaskDeliveryCommitTestKind::Finish, false, true).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn recovery_partial_failure_does_not_hide_independent_pending_delivery() {
     let (_directory, processor, workspace) = race_processor().await;
     let poison =
@@ -345,14 +349,14 @@ async fn recovery_partial_failure_does_not_hide_independent_pending_delivery() {
     let database = processor.crud_store.database_connection();
     database
         .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "DELETE FROM task_delivery_attempt WHERE id=?",
+            sea_orm::DbBackend::Postgres,
+            "DELETE FROM task_delivery_attempt WHERE id=$1",
             [attempt.id.into()],
         ))
         .await
         .unwrap();
     // Failure is local to the row whose verified exact attempt is absent.
-    database.execute_unprepared("CREATE TRIGGER reject_missing_recovery_retry BEFORE INSERT ON task_delivery_recovery_retry WHEN NEW.expected_attempt_id IS NULL BEGIN SELECT RAISE(ABORT,'test row-local failure'); END").await.unwrap();
+    database.execute_unprepared("CREATE FUNCTION reject_missing_recovery_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test row-local failure'; END; $$; CREATE TRIGGER reject_missing_recovery_retry BEFORE INSERT ON task_delivery_recovery_retry FOR EACH ROW WHEN (NEW.expected_attempt_id IS NULL) EXECUTE FUNCTION reject_missing_recovery_retry();").await.unwrap();
     processor
         .process_due_task_deliveries(RACE_TIME + 301, 64)
         .await

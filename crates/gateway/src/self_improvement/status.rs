@@ -222,10 +222,9 @@ fn failure_reason(error: &str) -> Reason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_config::GatewaySelfImprovementModelSelectionConfig;
     use pioneer_crud::NewSelfImprovementRun;
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
     fn run() -> SelfImprovementRunRecord {
         SelfImprovementRunRecord {
@@ -380,160 +379,163 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_snapshot_distinguishes_empty_disabled_and_workspace_scoped_runs() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        db.execute_unprepared("INSERT INTO workspace (id,name,is_active,is_current) VALUES ('a','A',1,1),('b','B',1,0)").await.unwrap();
-        let store = CrudStore::new(db.clone());
-        let model = GatewaySelfImprovementModelSelectionConfig {
-            provider: "api".into(),
-            model: "model".into(),
-            reasoning_effort: None,
-        };
-        let mut settings = AuthoritativeSelfImprovementSettings {
-            desired_enabled: true,
-            effective_enabled: true,
-            default_model: Some(model.clone()),
-            reviewer_model_override: None,
-            reviewer_model: Some(model),
-        };
-        let a = store
-            .activate_self_improvement_workspace("a", 10)
-            .await
-            .unwrap();
-        let b = store
-            .activate_self_improvement_workspace("b", 10)
-            .await
-            .unwrap();
-        let empty = snapshot(&store, "a", &settings, true, 50).await.unwrap();
-        assert_eq!(empty.reason, Reason::NoNewSources);
-        assert_eq!(empty.next_scheduled_at_unix, Some(86400));
-        assert!(
+        pioneer_postgres_test::with_database(async |fixture| {
+            let db = fixture.connection();
+            db.execute_unprepared("DELETE FROM workspace").await.unwrap();
+            db.execute_unprepared("INSERT INTO workspace (id,name,is_active,is_current) VALUES ('a','A',TRUE,TRUE),('b','B',TRUE,FALSE)").await.unwrap();
+            let store = CrudStore::new(db.clone());
+            let model = GatewaySelfImprovementModelSelectionConfig {
+                provider: "api".into(),
+                model: "model".into(),
+                reasoning_effort: None,
+            };
+            let mut settings = AuthoritativeSelfImprovementSettings {
+                desired_enabled: true,
+                effective_enabled: true,
+                default_model: Some(model.clone()),
+                reviewer_model_override: None,
+                reviewer_model: Some(model),
+            };
+            let a = store
+                .activate_self_improvement_workspace("a", 10)
+                .await
+                .unwrap();
+            let b = store
+                .activate_self_improvement_workspace("b", 10)
+                .await
+                .unwrap();
+            let empty = snapshot(&store, "a", &settings, true, 50).await.unwrap();
+            assert_eq!(empty.reason, Reason::NoNewSources);
+            assert_eq!(empty.next_scheduled_at_unix, Some(86400));
+            assert!(
+                store
+                    .get_latest_self_improvement_run("a", a.activation_epoch)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let at = chrono::DateTime::from_timestamp(15, 0)
+                .unwrap()
+                .fixed_offset();
+            for (sql, values) in [
+                ("INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at)
+                  VALUES ('thread_a','a','','agent','model','api','active','user','private',$1,$2)", vec![at.into(), at.into()]),
+                ("INSERT INTO turn (id,thread_id,status,turn_kind,origin,created_at,updated_at)
+                  VALUES ('turn_a','thread_a','completed','conversation','user',$1,$2)", vec![at.into(), at.into()]),
+                ("INSERT INTO turn_event (id,thread_id,turn_id,sequence,event_type,payload,created_at)
+                  VALUES ('event_a','thread_a','turn_a',1,'turn/completed','{}',$1)", vec![at.into()]),
+                ("INSERT INTO self_improvement_source_turn (workspace_id,thread_id,turn_id,terminal_event_id,terminal_at,created_at)
+                  VALUES ('a','thread_a','turn_a','event_a',$1,$2)", vec![at.into(), at.into()]),
+            ] {
+                db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)).await.unwrap();
+            }
+            assert_eq!(
+                snapshot(&store, "a", &settings, true, 50)
+                    .await
+                    .unwrap()
+                    .reason,
+                Reason::AwaitingSchedule
+            );
             store
-                .get_latest_self_improvement_run("a", a.activation_epoch)
+                .create_or_get_self_improvement_run(
+                    NewSelfImprovementRun {
+                        workspace_id: "a".into(),
+                        activation_epoch: a.activation_epoch,
+                        scheduled_date_utc: "1970-01-01".into(),
+                        source_lower_exclusive: 0,
+                        source_upper_inclusive: 1,
+                        learner_provider: "api".into(),
+                        learner_model: "model".into(),
+                        learner_reasoning_effort: None,
+                        reviewer_provider: "api".into(),
+                        reviewer_model: "model".into(),
+                        reviewer_reasoning_effort: None,
+                        pipeline_contract_version: "v3".into(),
+                    },
+                    20,
+                )
                 .await
-                .unwrap()
-                .is_none()
-        );
-        let at = chrono::DateTime::from_timestamp(15, 0)
-            .unwrap()
-            .fixed_offset();
-        for (sql, values) in [
-            ("INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at)
-              VALUES ('thread_a','a','','agent','model','api','active','user','private',?,?)", vec![at.into(), at.into()]),
-            ("INSERT INTO turn (id,thread_id,status,turn_kind,origin,created_at,updated_at)
-              VALUES ('turn_a','thread_a','completed','conversation','user',?,?)", vec![at.into(), at.into()]),
-            ("INSERT INTO turn_event (id,thread_id,turn_id,sequence,event_type,payload,created_at)
-              VALUES ('event_a','thread_a','turn_a',1,'turn/completed','{}',?)", vec![at.into()]),
-            ("INSERT INTO self_improvement_source_turn (workspace_id,thread_id,turn_id,terminal_event_id,terminal_at,created_at)
-              VALUES ('a','thread_a','turn_a','event_a',?,?)", vec![at.into(), at.into()]),
-        ] {
-            db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite, sql, values)).await.unwrap();
-        }
-        assert_eq!(
-            snapshot(&store, "a", &settings, true, 50)
-                .await
-                .unwrap()
-                .reason,
-            Reason::AwaitingSchedule
-        );
-        store
-            .create_or_get_self_improvement_run(
-                NewSelfImprovementRun {
-                    workspace_id: "a".into(),
-                    activation_epoch: a.activation_epoch,
-                    scheduled_date_utc: "1970-01-01".into(),
-                    source_lower_exclusive: 0,
-                    source_upper_inclusive: 1,
-                    learner_provider: "api".into(),
-                    learner_model: "model".into(),
-                    learner_reasoning_effort: None,
-                    reviewer_provider: "api".into(),
-                    reviewer_model: "model".into(),
-                    reviewer_reasoning_effort: None,
-                    pipeline_contract_version: "v3".into(),
-                },
-                20,
+                .unwrap();
+            assert_eq!(
+                snapshot(&store, "a", &settings, true, 50)
+                    .await
+                    .unwrap()
+                    .reason,
+                Reason::Pending
+            );
+            assert_eq!(
+                snapshot(&store, "b", &settings, true, 50)
+                    .await
+                    .unwrap()
+                    .reason,
+                Reason::NoNewSources
+            );
+            assert!(
+                store
+                    .get_latest_self_improvement_run("b", b.activation_epoch)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_latest_self_improvement_run("a", a.activation_epoch + 1)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state("a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cursor_source_id,
+                0
+            );
+            // Yesterday's outcome remains visible without pretending learning ran today.
+            db.execute_unprepared(
+                "UPDATE self_improvement_run SET status = 'completed', outcome = 'no_change',
+                 result_summary = '{\"reason\":\"no_candidate\"}' WHERE workspace_id = 'a';
+                 UPDATE self_improvement_workspace_state SET cursor_source_id = 1 WHERE workspace_id = 'a'",
             )
             .await
             .unwrap();
-        assert_eq!(
-            snapshot(&store, "a", &settings, true, 50)
-                .await
-                .unwrap()
-                .reason,
-            Reason::Pending
-        );
-        assert_eq!(
-            snapshot(&store, "b", &settings, true, 50)
-                .await
-                .unwrap()
-                .reason,
-            Reason::NoNewSources
-        );
-        assert!(
-            store
-                .get_latest_self_improvement_run("b", b.activation_epoch)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get_latest_self_improvement_run("a", a.activation_epoch + 1)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .get_self_improvement_workspace_state("a")
-                .await
-                .unwrap()
-                .unwrap()
-                .cursor_source_id,
-            0
-        );
-        // Yesterday's outcome remains visible without pretending learning ran today.
-        db.execute_unprepared(
-            "UPDATE self_improvement_run SET status = 'completed', outcome = 'no_change',
-             result_summary = '{\"reason\":\"no_candidate\"}' WHERE workspace_id = 'a';
-             UPDATE self_improvement_workspace_state SET cursor_source_id = 1 WHERE workspace_id = 'a'",
-        )
-        .await
-        .unwrap();
-        let completed = snapshot(&store, "a", &settings, true, 50).await.unwrap();
-        assert_eq!(completed.phase, Phase::NoChange);
-        assert_eq!(completed.last_run_at_unix, Some(20));
-        let tomorrow = snapshot(&store, "a", &settings, true, 86450).await.unwrap();
-        assert_eq!(tomorrow.phase, Phase::Waiting);
-        assert_eq!(tomorrow.reason, Reason::NoNewSources);
-        assert_eq!(tomorrow.last_result, Some(Reason::NoCandidate));
-        assert_eq!(tomorrow.next_scheduled_at_unix, Some(172800));
-        assert_eq!(tomorrow.progress, None);
+            let completed = snapshot(&store, "a", &settings, true, 50).await.unwrap();
+            assert_eq!(completed.phase, Phase::NoChange);
+            assert_eq!(completed.last_run_at_unix, Some(20));
+            let tomorrow = snapshot(&store, "a", &settings, true, 86450).await.unwrap();
+            assert_eq!(tomorrow.phase, Phase::Waiting);
+            assert_eq!(tomorrow.reason, Reason::NoNewSources);
+            assert_eq!(tomorrow.last_result, Some(Reason::NoCandidate));
+            assert_eq!(tomorrow.next_scheduled_at_unix, Some(172800));
+            assert_eq!(tomorrow.progress, None);
 
-        settings.desired_enabled = false;
-        assert_eq!(
-            snapshot(&store, "a", &settings, true, 50)
-                .await
-                .unwrap()
-                .phase,
-            Phase::Disabled
-        );
-        settings.desired_enabled = true;
-        assert_eq!(
-            snapshot(&store, "a", &settings, false, 50)
-                .await
-                .unwrap()
-                .reason,
-            Reason::WorkerUnavailable
-        );
-        settings.effective_enabled = false;
-        assert_eq!(
-            snapshot(&store, "a", &settings, true, 50)
-                .await
-                .unwrap()
-                .reason,
-            Reason::ModelUnavailable
-        );
+            settings.desired_enabled = false;
+            assert_eq!(
+                snapshot(&store, "a", &settings, true, 50)
+                    .await
+                    .unwrap()
+                    .phase,
+                Phase::Disabled
+            );
+            settings.desired_enabled = true;
+            assert_eq!(
+                snapshot(&store, "a", &settings, false, 50)
+                    .await
+                    .unwrap()
+                    .reason,
+                Reason::WorkerUnavailable
+            );
+            settings.effective_enabled = false;
+            assert_eq!(
+                snapshot(&store, "a", &settings, true, 50)
+                    .await
+                    .unwrap()
+                    .reason,
+                Reason::ModelUnavailable
+            );
+            Ok(())
+        }).await.unwrap();
     }
 }

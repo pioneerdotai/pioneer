@@ -15,11 +15,12 @@ use pioneer_crud::{
     load_device, load_gateway_singleton, load_pending_local_session,
     load_pending_session_by_activation_locator_hash, load_pending_session_for_creator,
     load_principal_avatar, load_principal_by_id, load_principal_profile, load_session,
-    load_session_by_activation_hash, load_session_lease, load_session_leases, mark_device_revoked,
-    mark_session_revoked, principal_kind_from_db, principal_status_from_db,
-    record_failed_device_activation, replace_current_refresh,
+    load_session_by_activation_hash, load_session_lease, load_session_leases,
+    lock_session_for_refresh, mark_device_revoked, mark_session_revoked, principal_kind_from_db,
+    principal_status_from_db, record_failed_device_activation, replace_current_refresh,
     revoke_session_family_for_refresh_reuse, touch_active_auth_session, touch_active_device,
 };
+use pioneer_postgres_pools::PostgresDatabase;
 use pioneer_protocol::{
     AUTH_DOMAIN_ID_LEN, AuthDeviceActivateParams, AuthDeviceCreateResponse, AuthDeviceSnapshot,
     AuthGatewaySnapshot, AuthLogoutResponse, AuthMeResponse, AuthPrincipalSnapshot,
@@ -31,8 +32,7 @@ use pioneer_protocol::{
     DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
     RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
-use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
+use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
@@ -60,7 +60,7 @@ const MAX_DIAGNOSTIC_TEXT: usize = 255;
 const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// The startup owner joins this worker before closing SQLite. Dropping startup
+/// The startup owner joins this worker before closing PostgreSQL. Dropping startup
 /// on an error also cancels it; an indefinitely parked Weak worker cannot leak.
 pub(crate) struct AuthMaintenanceGuard {
     cancellation: tokio_util::sync::CancellationToken,
@@ -86,7 +86,7 @@ impl Drop for AuthMaintenanceGuard {
 }
 
 pub(crate) struct GatewayAuthService {
-    database: SqliteDatabase,
+    database: PostgresDatabase,
     config: GatewayAuthConfig,
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
@@ -198,7 +198,7 @@ fn typed_id<T, E>(
 
 impl GatewayAuthService {
     pub(crate) fn new(
-        database: impl Into<SqliteDatabase>,
+        database: impl Into<PostgresDatabase>,
         config: GatewayAuthConfig,
         identity: Arc<IdentityBootstrapSnapshot>,
         access_key: &AuthKeyMaterial,
@@ -274,12 +274,6 @@ impl GatewayAuthService {
         let presented_hash = self
             .opaque_credentials
             .fingerprint_refresh_raw(admission.credential().expose_for_authentication());
-        let now_unix =
-            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let now = datetime(now_unix)?;
-        let access_expires_at_unix = now_unix
-            .checked_add(self.config.access_token_ttl_seconds)
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let access_jti = generate_id(AUTH_DOMAIN_ID_LEN);
 
         let transaction_acquire_stage = trace.stage(
@@ -288,14 +282,11 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(refresh_transaction_acquire_error)?;
         transaction_acquire_stage.succeed();
-        let session = match load_session(&transaction, &presented.session_id)
+        let session = match lock_session_for_refresh(&transaction, &presented.session_id)
             .await
             .map_err(storage_error)?
         {
@@ -305,6 +296,12 @@ impl GatewayAuthService {
                 return Err(AuthError::new(AuthErrorCode::InvalidCredential));
             }
         };
+        let now_unix =
+            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let now = datetime(now_unix)?;
+        let access_expires_at_unix = now_unix
+            .checked_add(self.config.access_token_ttl_seconds)
+            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         if session.token_family_id != presented.token_family_id.as_str() {
             let _ = transaction.rollback().await;
             return Err(AuthError::new(AuthErrorCode::InvalidCredential));
@@ -717,10 +714,7 @@ impl GatewayAuthService {
         let now = chrono::Utc::now().fixed_offset();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -844,7 +838,7 @@ impl GatewayAuthService {
     pub(crate) async fn validate_session_lease_with_database(
         &self,
         principal: &AuthenticatedSessionPrincipal,
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<SessionLeaseFacts, AuthError> {
         self.validate_session_lease_in_scope(principal, None, database)
             .await
@@ -853,7 +847,7 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
         trace: Option<&pioneer_observability::GatewayOperationTrace>,
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<SessionLeaseFacts, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
@@ -873,7 +867,7 @@ impl GatewayAuthService {
     pub(crate) async fn load_notification_session_leases(
         &self,
         session_ids: &[AuthSessionId],
-        database: &SqliteDatabase,
+        database: &PostgresDatabase,
     ) -> Result<std::collections::HashMap<String, AuthSessionLeaseRow>, AuthError> {
         let rows = load_session_leases(database, session_ids)
             .await
@@ -1042,10 +1036,7 @@ impl GatewayAuthService {
         let now = datetime(now_unix)?;
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|error| storage_error(error.into()))?;
 
@@ -1177,10 +1168,7 @@ impl GatewayAuthService {
     ) -> Result<u64, AuthError> {
         let database = self.database.maintenance();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expired = match expire_stale_pending_sessions(
@@ -1212,10 +1200,7 @@ impl GatewayAuthService {
     ) -> Result<u64, AuthError> {
         let database = self.database.maintenance();
         let transaction = database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let expired =
@@ -1392,10 +1377,7 @@ impl GatewayAuthService {
         self.validate_session_lease(current).await?;
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -1584,10 +1566,7 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let result = async {
@@ -2068,10 +2047,7 @@ impl GatewayAuthService {
         let expiry_change = self.database.work_signal("auth.expiry").changing();
         let transaction = self
             .database
-            .begin_with_options(TransactionOptions {
-                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-                ..Default::default()
-            })
+            .begin()
             .await
             .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let exact_session =
@@ -2836,9 +2812,7 @@ fn storage_error(_error: anyhow::Error) -> AuthError {
 
 fn refresh_transaction_acquire_error(error: sea_orm::DbErr) -> AuthError {
     let error = anyhow::Error::new(error);
-    if pioneer_sqlite::is_anyhow_sqlite_lock(&error)
-        || pioneer_sqlite::is_anyhow_sqlite_pool_timeout(&error)
-    {
+    if pioneer_postgres_pools::is_anyhow_database_transient_access(&error) {
         AuthError::new(AuthErrorCode::TemporarilyUnavailable)
     } else {
         AuthError::new(AuthErrorCode::InvalidCredential)
@@ -2964,14 +2938,10 @@ mod tests {
         );
     }
 
-    async fn fixture() -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
-        fixture_with_connection(Database::connect("sqlite::memory:").await.unwrap()).await
-    }
-
-    async fn fixture_with_connection(
-        database: sea_orm::DatabaseConnection,
+    async fn fixture(
+        test_database: &pioneer_postgres_test::TestDatabase,
     ) -> (GatewayAuthService, Arc<IdentityBootstrapSnapshot>) {
-        Migrator::up(&database, None).await.unwrap();
+        let database = test_database.connection().clone();
         bootstrap_workspace(&database).await.unwrap();
         let identity = Arc::new(bootstrap_identity(&database).await.unwrap().snapshot);
         database
@@ -2999,77 +2969,82 @@ mod tests {
     // idle discovery, while the worker's own expiry ACK does not feed itself.
     #[tokio::test]
     async fn auth_expiry_tracks_session_lifecycle_without_ack_wake() {
-        use futures_util::FutureExt;
-        let (service, _) = fixture().await;
-        let database = service.database.maintenance();
-        let mut wake = database.work_signal("auth.expiry").subscribe();
-        wake.begin_pass(&database).await.unwrap();
-        assert!(
-            pioneer_crud::next_auth_session_expiry(&database)
+        pioneer_postgres_test::with_database(async |test_database| {
+            use futures_util::FutureExt;
+            let (service, _) = fixture(test_database).await;
+            let database = service.database.maintenance();
+            let mut wake = database.work_signal("auth.expiry").subscribe();
+            wake.begin_pass(&database).await.unwrap();
+            assert!(
+                pioneer_crud::next_auth_session_expiry(&database)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let pending = service.create_local_device().await.unwrap();
+            assert!(wake.wait(None).now_or_never().is_some());
+            assert_eq!(
+                pioneer_crud::next_auth_session_expiry(&database)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .timestamp(),
+                i64::try_from(pending.expires_at_unix).unwrap()
+            );
+            wake.begin_pass(&database).await.unwrap();
+            let grant = service
+                .activate_device(
+                    device_activation_admission(&service, pending.activation_code.expose_secret()),
+                    params("expiry-scheduling", ClientKind::Desktop),
+                )
+                .await
+                .unwrap();
+            assert!(wake.wait(None).now_or_never().is_some());
+            assert_eq!(
+                pioneer_crud::next_auth_session_expiry(&database)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .timestamp(),
+                i64::try_from(grant.session.refresh_expires_at_unix).unwrap()
+            );
+            wake.begin_pass(&database).await.unwrap();
+            let rotated = service
+                .exchange_refresh(
+                    refresh_admission(grant.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
+                .await
+                .unwrap();
+            assert!(wake.wait(None).now_or_never().is_some());
+            wake.begin_pass(&database).await.unwrap();
+            assert_eq!(
+                service
+                    .expire_stale_sessions(rotated.refresh_expires_at_unix, 256)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(
+                pioneer_crud::next_auth_session_expiry(&database)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(wake.wait(None).now_or_never().is_none());
+            let persisted = load_session(&database, &grant.session.id)
                 .await
                 .unwrap()
-                .is_none()
-        );
-        let pending = service.create_local_device().await.unwrap();
-        assert!(wake.wait(None).now_or_never().is_some());
-        assert_eq!(
-            pioneer_crud::next_auth_session_expiry(&database)
+                .unwrap();
+            assert_eq!(persisted.status, "expired");
+            let worker = Arc::new(service).spawn_auth_maintenance();
+            tokio::time::timeout(std::time::Duration::from_secs(5), worker.shutdown())
                 .await
-                .unwrap()
-                .unwrap()
-                .timestamp(),
-            i64::try_from(pending.expires_at_unix).unwrap()
-        );
-        wake.begin_pass(&database).await.unwrap();
-        let grant = service
-            .activate_device(
-                device_activation_admission(&service, pending.activation_code.expose_secret()),
-                params("expiry-scheduling", ClientKind::Desktop),
-            )
-            .await
-            .unwrap();
-        assert!(wake.wait(None).now_or_never().is_some());
-        assert_eq!(
-            pioneer_crud::next_auth_session_expiry(&database)
-                .await
-                .unwrap()
-                .unwrap()
-                .timestamp(),
-            i64::try_from(grant.session.refresh_expires_at_unix).unwrap()
-        );
-        wake.begin_pass(&database).await.unwrap();
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        assert!(wake.wait(None).now_or_never().is_some());
-        wake.begin_pass(&database).await.unwrap();
-        assert_eq!(
-            service
-                .expire_stale_sessions(rotated.refresh_expires_at_unix, 256)
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(
-            pioneer_crud::next_auth_session_expiry(&database)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(wake.wait(None).now_or_never().is_none());
-        let persisted = load_session(&database, &grant.session.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.status, "expired");
-        let worker = Arc::new(service).spawn_auth_maintenance();
-        tokio::time::timeout(std::time::Duration::from_secs(5), worker.shutdown())
-            .await
-            .unwrap();
+                .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     async fn member_access_credential(
@@ -3186,1174 +3161,1244 @@ mod tests {
 
     #[tokio::test]
     async fn member_access_uses_persisted_role_and_remains_default_denied_for_dispatch() {
-        use crate::request_context::{CanonicalMethod, ConnectionContext, RequestContext};
+        pioneer_postgres_test::with_database(async |test_database| {
+            use crate::request_context::{CanonicalMethod, ConnectionContext, RequestContext};
 
-        let (service, _identity) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("member-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let (member_id, credential) = member_access_credential(&service, &grant).await;
-
-        let principal = service
-            .authenticate_access(credential.clone())
-            .await
-            .expect("active supported Member authenticates");
-        assert_eq!(principal.principal_id, member_id);
-        assert_eq!(principal.kind, PrincipalKind::User);
-        assert_eq!(principal.role_key, Some(RoleKey::member()));
-        let connection = ConnectionContext::new(47, principal);
-        let context =
-            RequestContext::new(&connection, None, CanonicalMethod::rpc("workspace/list"));
-        assert_eq!(context.role_key().map(RoleKey::as_str), Some("member"));
-        assert_eq!(
-            crate::authorization::AuthorizationService::new().authorize_action(
-                context.principal().kind,
-                context.role_key(),
-                crate::authorization::ResourceAction::WorkspaceList,
-            ),
-            crate::authorization::ActionGateDecision::RequireResource {
-                role: RoleKey::member(),
-            }
-        );
-
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE gateway_principal SET status='suspended'\
-                 WHERE id='P0000000000000000000A'",
-            )
-            .await
-            .expect("suspend test Member");
-        assert_eq!(
-            service
-                .authenticate_access(credential)
+            let (service, _identity) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("member-installation", ClientKind::Desktop),
+                    ids(1),
+                )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked,
-        );
+                .unwrap();
+            let (member_id, credential) = member_access_credential(&service, &grant).await;
+
+            let principal = service
+                .authenticate_access(credential.clone())
+                .await
+                .expect("active supported Member authenticates");
+            assert_eq!(principal.principal_id, member_id);
+            assert_eq!(principal.kind, PrincipalKind::User);
+            assert_eq!(principal.role_key, Some(RoleKey::member()));
+            let connection = ConnectionContext::new(47, principal);
+            let context =
+                RequestContext::new(&connection, None, CanonicalMethod::rpc("workspace/list"));
+            assert_eq!(context.role_key().map(RoleKey::as_str), Some("member"));
+            assert_eq!(
+                crate::authorization::AuthorizationService::new().authorize_action(
+                    context.principal().kind,
+                    context.role_key(),
+                    crate::authorization::ResourceAction::WorkspaceList,
+                ),
+                crate::authorization::ActionGateDecision::RequireResource {
+                    role: RoleKey::member(),
+                }
+            );
+
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE gateway_principal SET status='suspended'\
+                     WHERE id='P0000000000000000000A'",
+                )
+                .await
+                .expect("suspend test Member");
+            assert_eq!(
+                service
+                    .authenticate_access(credential)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked,
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn member_refresh_rotates_and_revalidates_current_principal_status() {
-        let (service, _identity) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("member-refresh-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let _ = member_access_credential(&service, &initial).await;
-
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(initial.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .expect("active Member refresh rotates");
-        assert_eq!(rotated.principal.id.as_str(), "P0000000000000000000A");
-        assert_eq!(rotated.principal.kind, PrincipalKind::User);
-        assert_eq!(rotated.refresh_generation, 1);
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
-
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE gateway_principal SET status='suspended'\
-                 WHERE id='P0000000000000000000A'",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .exchange_refresh(
-                    refresh_admission(rotated.refresh_token.expose_secret()),
-                    refresh_params(2),
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("member-refresh-installation", ClientKind::Desktop),
+                    ids(1),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked,
-        );
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                "SELECT refresh_generation AS value FROM auth_session \
-                 WHERE id='S00000000000000000001'"
-            )
-            .await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_waits_for_one_maintenance_transaction_without_becoming_unavailable() {
-        let (service, _identity) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("bounded-background-refresh", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .expect("initial session should be created");
-        let database = service.database.maintenance();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let background = tokio::spawn({
-            let entered = entered.clone();
-            async move {
-                let transaction = database.begin().await?;
-                entered.notify_one();
-                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
-                transaction.commit().await?;
-                Ok::<_, sea_orm::DbErr>(())
-            }
-        });
-
-        entered.notified().await;
-        let started = std::time::Instant::now();
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(initial.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .expect("refresh should enter after the bounded background quantum");
-        assert_eq!(rotated.refresh_generation, 1);
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(500),
-            "test must cross the removed 500 ms database acquisition deadline"
-        );
-        assert!(
-            started.elapsed()
-                < std::time::Duration::from_secs(service.config.auth_exchange_timeout_seconds),
-            "refresh must remain within the single end-to-end auth deadline"
-        );
-        background
-            .await
-            .expect("background task should join")
-            .expect("background transaction should succeed");
-    }
-
-    #[tokio::test]
-    async fn concurrent_member_refresh_and_suspension_leave_no_usable_rotated_session() {
-        let (service, _identity) = fixture().await;
-        let initial_member = service
-            .create_initial_session_with_ids(
-                params("member-race-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let superuser_grant = service
-            .create_initial_session_with_ids(
-                params("superuser-race-installation", ClientKind::Desktop),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        let (member_id, _) = member_access_credential(&service, &initial_member).await;
-        let actor = authenticate_grant(&service, &superuser_grant).await;
-        let store = CrudStore::new(service.database.clone());
-        let gate = AuthorizationService::new().authorize_action(
-            actor.kind,
-            actor.role_key.as_ref(),
-            ResourceAction::MemberSuspend,
-        );
-        let proof = match AuthorizationResolver::new(store.clone())
-            .authorize_member_principal(
-                &store.database_connection(),
-                actor.as_ref(),
-                &gate,
-                ResourceAction::MemberSuspend,
-                &member_id,
-            )
-            .await
-            .unwrap()
-        {
-            ProofResolution::Authorized(proof) => proof,
-            ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
-        };
-        let member_service = MemberService::new(
-            store,
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-        );
-
-        let refresh = service.exchange_refresh(
-            refresh_admission(initial_member.refresh_token.expose_secret()),
-            refresh_params(1),
-        );
-        let suspend = member_service.suspend(
-            actor.as_ref(),
-            &proof,
-            MemberSuspendParams {
-                principal_id: member_id.clone(),
-                expected_status: Some(PrincipalStatus::Active),
-            },
-        );
-        let (refresh, suspended) = tokio::join!(refresh, suspend);
-        assert!(suspended.unwrap().response.changed);
-        if let Ok(rotated) = refresh {
-            let credential = service
-                .access_issuer
-                .validate(
-                    rotated.access_token.expose_secret(),
-                    unix_timestamp_secs().unwrap(),
-                )
                 .unwrap();
-            assert_eq!(
-                service
-                    .authenticate_access(credential)
-                    .await
-                    .unwrap_err()
-                    .code(),
-                AuthErrorCode::SessionRevoked
-            );
-        }
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM gateway_principal \
-                 WHERE id='P0000000000000000000A'"
-            )
-            .await,
-            "suspended"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session \
-                 WHERE id='S00000000000000000001'"
-            )
-            .await,
-            "revoked"
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "session_id='S00000000000000000001'",
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "audit_event",
-                "action='member_suspended'",
-            )
-            .await,
-            1
-        );
-    }
+            let _ = member_access_credential(&service, &initial).await;
 
-    #[tokio::test]
-    async fn concurrent_member_refresh_and_removal_leave_no_usable_rotated_session() {
-        let (service, _identity) = fixture().await;
-        let initial_member = service
-            .create_initial_session_with_ids(
-                params("member-remove-race-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let superuser_grant = service
-            .create_initial_session_with_ids(
-                params("superuser-remove-race-installation", ClientKind::Desktop),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        let (member_id, _) = member_access_credential(&service, &initial_member).await;
-        let actor = authenticate_grant(&service, &superuser_grant).await;
-        let store = CrudStore::new(service.database.clone());
-        let gate = AuthorizationService::new().authorize_action(
-            actor.kind,
-            actor.role_key.as_ref(),
-            ResourceAction::MemberRemove,
-        );
-        let proof = match AuthorizationResolver::new(store.clone())
-            .authorize_member_principal(
-                &store.database_connection(),
-                actor.as_ref(),
-                &gate,
-                ResourceAction::MemberRemove,
-                &member_id,
-            )
-            .await
-            .unwrap()
-        {
-            ProofResolution::Authorized(proof) => proof,
-            ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
-        };
-        let member_service = MemberService::new(
-            store,
-            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
-        );
-
-        let refresh = service.exchange_refresh(
-            refresh_admission(initial_member.refresh_token.expose_secret()),
-            refresh_params(1),
-        );
-        let remove = member_service.remove(
-            actor.as_ref(),
-            &proof,
-            MemberRemoveParams {
-                principal_id: member_id.clone(),
-                expected_status: Some(PrincipalStatus::Active),
-            },
-        );
-        let (refresh, removed) = tokio::join!(refresh, remove);
-        assert!(removed.unwrap().response.changed);
-        if let Ok(rotated) = refresh {
-            let credential = service
-                .access_issuer
-                .validate(
-                    rotated.access_token.expose_secret(),
-                    unix_timestamp_secs().unwrap(),
-                )
-                .unwrap();
-            assert_eq!(
-                service
-                    .authenticate_access(credential)
-                    .await
-                    .unwrap_err()
-                    .code(),
-                AuthErrorCode::SessionRevoked
-            );
-        }
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM gateway_principal \
-                 WHERE id='P0000000000000000000A'"
-            )
-            .await,
-            "removed"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session \
-                 WHERE id='S00000000000000000001'"
-            )
-            .await,
-            "revoked"
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "session_id='S00000000000000000001'",
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count_where(&service.database, "audit_event", "action='member_removed'").await,
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_rejects_cross_principal_session_device_substitution() {
-        let (service, _identity) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("member-substitution-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let _ = member_access_credential(&service, &initial).await;
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(\
-                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                    created_at,updated_at,removed_at\
-                 ) VALUES(\
-                    'P0000000000000000000B','{}','user','member','active',\
-                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                 );\
-                 UPDATE device SET principal_id='P0000000000000000000B'\
-                    WHERE id='D00000000000000000001';",
-                    service.identity.gateway.id
-                )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            service
+            let rotated = service
                 .exchange_refresh(
                     refresh_admission(initial.refresh_token.expose_secret()),
                     refresh_params(1),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked,
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session \
-                 WHERE id='S00000000000000000001'"
-            )
-            .await,
-            "active"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+                .expect("active Member refresh rotates");
+            assert_eq!(rotated.principal.id.as_str(), "P0000000000000000000A");
+            assert_eq!(rotated.principal.kind, PrincipalKind::User);
+            assert_eq!(rotated.refresh_generation, 1);
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE gateway_principal SET status='suspended'\
+                     WHERE id='P0000000000000000000A'",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .exchange_refresh(
+                        refresh_admission(rotated.refresh_token.expose_secret()),
+                        refresh_params(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked,
+            );
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    "SELECT refresh_generation AS value FROM auth_session \
+                     WHERE id='S00000000000000000001'"
+                )
+                .await,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_waits_for_one_maintenance_transaction_without_becoming_unavailable() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("bounded-background-refresh", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .expect("initial session should be created");
+            let database = service.database.maintenance();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let background = tokio::spawn({
+                let entered = entered.clone();
+                async move {
+                    let transaction = database.begin().await?;
+                    transaction
+                        .execute_unprepared("SELECT id FROM auth_session FOR UPDATE")
+                        .await?;
+                    entered.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                    transaction.commit().await?;
+                    Ok::<_, sea_orm::DbErr>(())
+                }
+            });
+
+            entered.notified().await;
+            let started = std::time::Instant::now();
+            let rotated = service
+                .exchange_refresh(
+                    refresh_admission(initial.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
+                .await
+                .expect("refresh should enter after the bounded background quantum");
+            assert_eq!(rotated.refresh_generation, 1);
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(500),
+                "test must cross the removed 500 ms database acquisition deadline"
+            );
+            assert!(
+                started.elapsed()
+                    < std::time::Duration::from_secs(service.config.auth_exchange_timeout_seconds),
+                "refresh must remain within the single end-to-end auth deadline"
+            );
+            background
+                .await
+                .expect("background task should join")
+                .expect("background transaction should succeed");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_member_refresh_and_suspension_leave_no_usable_rotated_session() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial_member = service
+                .create_initial_session_with_ids(
+                    params("member-race-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let superuser_grant = service
+                .create_initial_session_with_ids(
+                    params("superuser-race-installation", ClientKind::Desktop),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            let (member_id, _) = member_access_credential(&service, &initial_member).await;
+            let actor = authenticate_grant(&service, &superuser_grant).await;
+            let store = CrudStore::new(service.database.clone());
+            let gate = AuthorizationService::new().authorize_action(
+                actor.kind,
+                actor.role_key.as_ref(),
+                ResourceAction::MemberSuspend,
+            );
+            let proof = match AuthorizationResolver::new(store.clone())
+                .authorize_member_principal(
+                    &store.database_connection(),
+                    actor.as_ref(),
+                    &gate,
+                    ResourceAction::MemberSuspend,
+                    &member_id,
+                )
+                .await
+                .unwrap()
+            {
+                ProofResolution::Authorized(proof) => proof,
+                ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
+            };
+            let member_service = MemberService::new(
+                store,
+                Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+            );
+
+            let refresh = service.exchange_refresh(
+                refresh_admission(initial_member.refresh_token.expose_secret()),
+                refresh_params(1),
+            );
+            let suspend = member_service.suspend(
+                actor.as_ref(),
+                &proof,
+                MemberSuspendParams {
+                    principal_id: member_id.clone(),
+                    expected_status: Some(PrincipalStatus::Active),
+                },
+            );
+            let (refresh, suspended) = tokio::join!(refresh, suspend);
+            assert!(suspended.unwrap().response.changed);
+            if let Ok(rotated) = refresh {
+                let credential = service
+                    .access_issuer
+                    .validate(
+                        rotated.access_token.expose_secret(),
+                        unix_timestamp_secs().unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    service
+                        .authenticate_access(credential)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    AuthErrorCode::SessionRevoked
+                );
+            }
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM gateway_principal \
+                     WHERE id='P0000000000000000000A'"
+                )
+                .await,
+                "suspended"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session \
+                     WHERE id='S00000000000000000001'"
+                )
+                .await,
+                "revoked"
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "auth_refresh_credential",
+                    "session_id='S00000000000000000001'",
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "audit_event",
+                    "action='member_suspended'",
+                )
+                .await,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_member_refresh_and_removal_leave_no_usable_rotated_session() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial_member = service
+                .create_initial_session_with_ids(
+                    params("member-remove-race-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let superuser_grant = service
+                .create_initial_session_with_ids(
+                    params("superuser-remove-race-installation", ClientKind::Desktop),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            let (member_id, _) = member_access_credential(&service, &initial_member).await;
+            let actor = authenticate_grant(&service, &superuser_grant).await;
+            let store = CrudStore::new(service.database.clone());
+            let gate = AuthorizationService::new().authorize_action(
+                actor.kind,
+                actor.role_key.as_ref(),
+                ResourceAction::MemberRemove,
+            );
+            let proof = match AuthorizationResolver::new(store.clone())
+                .authorize_member_principal(
+                    &store.database_connection(),
+                    actor.as_ref(),
+                    &gate,
+                    ResourceAction::MemberRemove,
+                    &member_id,
+                )
+                .await
+                .unwrap()
+            {
+                ProofResolution::Authorized(proof) => proof,
+                ProofResolution::Denied(decision) => panic!("unexpected denial: {decision:?}"),
+            };
+            let member_service = MemberService::new(
+                store,
+                Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+            );
+
+            let refresh = service.exchange_refresh(
+                refresh_admission(initial_member.refresh_token.expose_secret()),
+                refresh_params(1),
+            );
+            let remove = member_service.remove(
+                actor.as_ref(),
+                &proof,
+                MemberRemoveParams {
+                    principal_id: member_id.clone(),
+                    expected_status: Some(PrincipalStatus::Active),
+                },
+            );
+            let (refresh, removed) = tokio::join!(refresh, remove);
+            assert!(removed.unwrap().response.changed);
+            if let Ok(rotated) = refresh {
+                let credential = service
+                    .access_issuer
+                    .validate(
+                        rotated.access_token.expose_secret(),
+                        unix_timestamp_secs().unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    service
+                        .authenticate_access(credential)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    AuthErrorCode::SessionRevoked
+                );
+            }
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM gateway_principal \
+                     WHERE id='P0000000000000000000A'"
+                )
+                .await,
+                "removed"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session \
+                     WHERE id='S00000000000000000001'"
+                )
+                .await,
+                "revoked"
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "auth_refresh_credential",
+                    "session_id='S00000000000000000001'",
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                count_where(&service.database, "audit_event", "action='member_removed'").await,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_cross_principal_session_device_substitution() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("member-substitution-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let _ = member_access_credential(&service, &initial).await;
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(\
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                        created_at,updated_at,removed_at\
+                     ) VALUES(\
+                        'P0000000000000000000B','{}','user','member','active',\
+                        'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     );\
+                     UPDATE device SET principal_id='P0000000000000000000B'\
+                        WHERE id='D00000000000000000001';",
+                        service.identity.gateway.id
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                service
+                    .exchange_refresh(
+                        refresh_admission(initial.refresh_token.expose_secret()),
+                        refresh_params(1),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked,
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session \
+                     WHERE id='S00000000000000000001'"
+                )
+                .await,
+                "active"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn member_refresh_reuse_revokes_only_the_exact_session_family() {
-        let (service, _identity) = fixture().await;
-        let member_a = service
-            .create_initial_session_with_ids(
-                params("member-a-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let member_b = service
-            .create_initial_session_with_ids(
-                params("member-b-installation", ClientKind::Desktop),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        let _ = member_access_credential(&service, &member_a).await;
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(\
-                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                    created_at,updated_at,removed_at\
-                 ) VALUES(\
-                    'P0000000000000000000B','{}','user','member','active',\
-                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                 );\
-                 UPDATE device SET principal_id='P0000000000000000000B'\
-                    WHERE id='D00000000000000000002';\
-                 UPDATE auth_session SET principal_id='P0000000000000000000B'\
-                    WHERE id='S00000000000000000002';",
-                    service.identity.gateway.id
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let member_a = service
+                .create_initial_session_with_ids(
+                    params("member-a-installation", ClientKind::Desktop),
+                    ids(1),
                 )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-
-        let member_a_old = member_a.refresh_token.expose_secret().to_owned();
-        let member_a_current = service
-            .exchange_refresh(refresh_admission(&member_a_old), refresh_params(1))
-            .await
-            .unwrap();
-        let member_b_current = service
-            .exchange_refresh(
-                refresh_admission(member_b.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .exchange_refresh(refresh_admission(&member_a_old), refresh_params(3))
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionCompromised,
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session \
-                 WHERE id='S00000000000000000001'"
-            )
-            .await,
-            "revoked"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session \
-                 WHERE id='S00000000000000000002'"
-            )
-            .await,
-            "active"
-        );
-        let member_b_next = service
-            .exchange_refresh(
-                refresh_admission(member_b_current.refresh_token.expose_secret()),
-                refresh_params(4),
-            )
-            .await
-            .expect("independent Member family remains refreshable");
-        assert_eq!(member_b_next.refresh_generation, 2);
-        assert!(!member_a_current.refresh_token.expose_secret().is_empty());
+                .unwrap();
+            let member_b = service
+                .create_initial_session_with_ids(
+                    params("member-b-installation", ClientKind::Desktop),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            let _ = member_access_credential(&service, &member_a).await;
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(\
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                        created_at,updated_at,removed_at\
+                     ) VALUES(\
+                        'P0000000000000000000B','{}','user','member','active',\
+                        'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     );\
+                     UPDATE device SET principal_id='P0000000000000000000B'\
+                        WHERE id='D00000000000000000002';\
+                     UPDATE auth_session SET principal_id='P0000000000000000000B'\
+                        WHERE id='S00000000000000000002';",
+                        service.identity.gateway.id
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+
+            let member_a_old = member_a.refresh_token.expose_secret().to_owned();
+            let member_a_current = service
+                .exchange_refresh(refresh_admission(&member_a_old), refresh_params(1))
+                .await
+                .unwrap();
+            let member_b_current = service
+                .exchange_refresh(
+                    refresh_admission(member_b.refresh_token.expose_secret()),
+                    refresh_params(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .exchange_refresh(refresh_admission(&member_a_old), refresh_params(3))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionCompromised,
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session \
+                     WHERE id='S00000000000000000001'"
+                )
+                .await,
+                "revoked"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session \
+                     WHERE id='S00000000000000000002'"
+                )
+                .await,
+                "active"
+            );
+            let member_b_next = service
+                .exchange_refresh(
+                    refresh_admission(member_b_current.refresh_token.expose_secret()),
+                    refresh_params(4),
+                )
+                .await
+                .expect("independent Member family remains refreshable");
+            assert_eq!(member_b_next.refresh_generation, 2);
+            assert!(!member_a_current.refresh_token.expose_secret().is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn refresh_retry_with_the_same_request_id_recovers_the_committed_successor() {
-        let (service, _) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let predecessor = initial.refresh_token.expose_secret().to_owned();
-        let first = service
-            .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
-            .await
-            .unwrap();
-        let recovered = service
-            .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
-            .await
-            .expect("same refresh request must recover after a lost response");
-
-        assert_eq!(recovered.refresh_generation, 1);
-        assert_eq!(
-            recovered.refresh_token.expose_secret(),
-            first.refresh_token.expose_secret()
-        );
-        assert_ne!(
-            recovered.access_token.expose_secret(),
-            first.access_token.expose_secret(),
-            "recovery may issue fresh short-lived access while preserving refresh"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "active"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
-
-        let next = service
-            .exchange_refresh(
-                refresh_admission(recovered.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .expect("recovered successor remains the current credential");
-        assert_eq!(next.refresh_generation, 2);
-    }
-
-    #[tokio::test]
-    async fn refresh_request_id_must_use_the_persisted_alphanumeric_contract() {
-        let (service, _) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let mut malformed = refresh_params(1);
-        malformed.refresh_request_id = "!!!!!!!!!!!!!!!!!!!!!".to_owned();
-
-        let error = service
-            .exchange_refresh(
-                refresh_admission(initial.refresh_token.expose_secret()),
-                malformed,
-            )
-            .await
-            .expect_err("non-alphanumeric refresh request id must fail before rotation");
-
-        assert_eq!(error.code(), AuthErrorCode::MalformedCredential);
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                "SELECT refresh_generation AS value FROM auth_session"
-            )
-            .await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_retry_recovery_survives_gateway_restart() {
-        let (service, identity) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let predecessor = initial.refresh_token.expose_secret().to_owned();
-        let first = service
-            .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
-            .await
-            .unwrap();
-        let database = service.database.clone();
-        drop(service);
-        let restarted = GatewayAuthService::new(
-            database,
-            GatewayAuthConfig::default(),
-            identity,
-            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
-        .unwrap();
-
-        let recovered = restarted
-            .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
-            .await
-            .expect("durable exchange recovery must survive Gateway restart");
-
-        assert_eq!(recovered.refresh_generation, 1);
-        assert_eq!(
-            recovered.refresh_token.expose_secret(),
-            first.refresh_token.expose_secret()
-        );
-        assert_eq!(
-            scalar_text(
-                &restarted.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "active"
-        );
-    }
-
-    #[tokio::test]
-    async fn private_operator_transport_requires_local_capability_without_session_bootstrap() {
-        let (service, _) = fixture().await;
-        let service = Arc::new(service);
-        let home = tempfile::tempdir().unwrap();
-        let config = pioneer_config::AppConfig::load().unwrap();
-        let artifacts = Arc::new(pioneer_artifacts::ArtifactService::new(
-            Arc::new(CrudStore::new(service.database.clone())),
-            Arc::new(pioneer_artifacts::LocalArtifactBlobStore::new(
-                home.path().to_path_buf(),
-            )),
-        ));
-        let server = crate::transport::local_operations::LocalOperations::start(
-            home.path(),
-            &config,
-            service.clone(),
-            artifacts,
-        )
-        .await
-        .unwrap();
-        let mut endpoint_path = pioneer_sqlite::WriterOwnership::database_identity(
-            &crate::database::gateway_database_path(home.path(), &config).unwrap(),
-        )
-        .unwrap()
-        .into_os_string();
-        endpoint_path.push(".operator.json");
-        let endpoint: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(std::path::PathBuf::from(endpoint_path)).unwrap(),
-        )
-        .unwrap();
-        let before = count(&service.database, "auth_session").await;
-        let rejected = reqwest::Client::new()
-            .post(format!("http://{}/operation", endpoint["address"].as_str().unwrap()))
-            .json(&serde_json::json!({
-                "nonce": "0".repeat(64),
-                "payload": serde_json::to_string(&crate::transport::local_operations::Operation::DeviceCreate).unwrap(),
-                "mac": "0".repeat(64),
-            }))
-            .send().await.unwrap();
-        assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
-        assert_eq!(count(&service.database, "auth_session").await, before);
-        let created: pioneer_protocol::AuthDeviceCreateResponse =
-            crate::transport::local_operations::request(
-                home.path(),
-                &config,
-                crate::transport::local_operations::Operation::DeviceCreate,
-            )
-            .await
-            .unwrap();
-        assert!(!created.activation_code.expose_secret().is_empty());
-        assert_eq!(count(&service.database, "auth_session").await, before + 1);
-        server.shutdown().await.unwrap();
-        assert!(crate::transport::local_operations::request::<pioneer_protocol::AuthDeviceCreateResponse>(
-            home.path(), &config, crate::transport::local_operations::Operation::DeviceCreate,
-        ).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn local_device_creation_is_one_use_and_preserves_the_superuser() {
-        let (service, identity) = fixture().await;
-        let created = service.create_local_device().await.unwrap();
-        let raw = created.activation_code.expose_secret().to_owned();
-        let grant = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, &raw),
-                params("desktop-installation", ClientKind::Desktop),
-                issued_ids(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(grant.principal.id, identity.superuser.id);
-        assert_eq!(grant.device.installation_id, "desktop-installation");
-        assert_eq!(grant.refresh_generation, 0);
-        assert!(
-            grant
-                .refresh_token
-                .expose_secret()
-                .starts_with(pioneer_protocol::REFRESH_CREDENTIAL_PREFIX)
-        );
-        assert!(!format!("{grant:?}").contains(grant.refresh_token.expose_secret()));
-
-        let replay = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, &raw),
-                params("different-installation", ClientKind::Mobile),
-                issued_ids(2),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(replay.code(), AuthErrorCode::DeviceActivationConsumed);
-
-        assert_eq!(count(&service.database, "gateway_principal").await, 1);
-        assert_eq!(count(&service.database, "device").await, 1);
-        assert_eq!(count(&service.database, "auth_session").await, 1);
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
-        let raw_refresh = grant.refresh_token.expose_secret();
-        let raw_access = grant.access_token.expose_secret();
-        let dump = database_text(&service.database).await;
-        assert!(!dump.contains(raw_refresh));
-        assert!(!dump.contains(raw_access));
-    }
-
-    #[tokio::test]
-    async fn injected_activation_failure_preserves_only_the_pending_device_session() {
-        for step in 1..=4 {
-            let (service, _identity) = fixture().await;
-            service.set_activation_failpoint(step);
-            let error = service
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let initial = service
                 .create_initial_session_with_ids(
                     params("desktop-installation", ClientKind::Desktop),
                     ids(1),
                 )
                 .await
+                .unwrap();
+            let predecessor = initial.refresh_token.expose_secret().to_owned();
+            let first = service
+                .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
+                .await
+                .unwrap();
+            let recovered = service
+                .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
+                .await
+                .expect("same refresh request must recover after a lost response");
+
+            assert_eq!(recovered.refresh_generation, 1);
+            assert_eq!(
+                recovered.refresh_token.expose_secret(),
+                first.refresh_token.expose_secret()
+            );
+            assert_ne!(
+                recovered.access_token.expose_secret(),
+                first.access_token.expose_secret(),
+                "recovery may issue fresh short-lived access while preserving refresh"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "active"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+
+            let next = service
+                .exchange_refresh(
+                    refresh_admission(recovered.refresh_token.expose_secret()),
+                    refresh_params(2),
+                )
+                .await
+                .expect("recovered successor remains the current credential");
+            assert_eq!(next.refresh_generation, 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_request_id_must_use_the_persisted_alphanumeric_contract() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let mut malformed = refresh_params(1);
+            malformed.refresh_request_id = "!!!!!!!!!!!!!!!!!!!!!".to_owned();
+
+            let error = service
+                .exchange_refresh(
+                    refresh_admission(initial.refresh_token.expose_secret()),
+                    malformed,
+                )
+                .await
+                .expect_err("non-alphanumeric refresh request id must fail before rotation");
+
+            assert_eq!(error.code(), AuthErrorCode::MalformedCredential);
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    "SELECT refresh_generation AS value FROM auth_session"
+                )
+                .await,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_retry_recovery_survives_gateway_restart() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let predecessor = initial.refresh_token.expose_secret().to_owned();
+            let first = service
+                .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
+                .await
+                .unwrap();
+            let database = service.database.clone();
+            drop(service);
+            let restarted = GatewayAuthService::new(
+                database,
+                GatewayAuthConfig::default(),
+                identity,
+                &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
+                &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
+            )
+            .unwrap();
+
+            let recovered = restarted
+                .exchange_refresh(refresh_admission(&predecessor), refresh_params(1))
+                .await
+                .expect("durable exchange recovery must survive Gateway restart");
+
+            assert_eq!(recovered.refresh_generation, 1);
+            assert_eq!(
+                recovered.refresh_token.expose_secret(),
+                first.refresh_token.expose_secret()
+            );
+            assert_eq!(
+                scalar_text(
+                    &restarted.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "active"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_operator_transport_requires_local_capability_without_session_bootstrap() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let service = Arc::new(service);
+            let home = tempfile::tempdir().unwrap();
+            let config = pioneer_config::AppConfig::load().unwrap();
+            let artifacts = Arc::new(pioneer_artifacts::ArtifactService::new(
+                Arc::new(CrudStore::new(service.database.clone())),
+                Arc::new(pioneer_artifacts::LocalArtifactBlobStore::new(
+                    home.path().to_path_buf(),
+                )),
+            ));
+            let server = crate::transport::local_operations::LocalOperations::start(
+                home.path(),
+                &config,
+                service.clone(),
+                artifacts,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let endpoint_path = crate::transport::local_operations::endpoint_path(home.path());
+            let endpoint: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(endpoint_path).unwrap()).unwrap();
+            let before = count(&service.database, "auth_session").await;
+            let rejected = reqwest::Client::new()
+                .post(format!("http://{}/operation", endpoint["address"].as_str().unwrap()))
+                .json(&serde_json::json!({
+                    "nonce": "0".repeat(64),
+                    "payload": serde_json::to_string(&crate::transport::local_operations::Operation::DeviceCreate).unwrap(),
+                    "mac": "0".repeat(64),
+                }))
+                .send().await.unwrap();
+            assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert_eq!(count(&service.database, "auth_session").await, before);
+            let created: pioneer_protocol::AuthDeviceCreateResponse =
+                crate::transport::local_operations::request(
+                    home.path(),
+                    &config,
+                    crate::transport::local_operations::Operation::DeviceCreate,
+                )
+                .await
+                .unwrap();
+            assert!(!created.activation_code.expose_secret().is_empty());
+            assert_eq!(count(&service.database, "auth_session").await, before + 1);
+            server.shutdown().await.unwrap();
+            assert!(crate::transport::local_operations::request::<pioneer_protocol::AuthDeviceCreateResponse>(
+                home.path(), &config, crate::transport::local_operations::Operation::DeviceCreate,
+            ).await.is_err());
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_device_creation_is_one_use_and_preserves_the_superuser() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let created = service.create_local_device().await.unwrap();
+            let raw = created.activation_code.expose_secret().to_owned();
+            let grant = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, &raw),
+                    params("desktop-installation", ClientKind::Desktop),
+                    issued_ids(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(grant.principal.id, identity.superuser.id);
+            assert_eq!(grant.device.installation_id, "desktop-installation");
+            assert_eq!(grant.refresh_generation, 0);
+            assert!(
+                grant
+                    .refresh_token
+                    .expose_secret()
+                    .starts_with(pioneer_protocol::REFRESH_CREDENTIAL_PREFIX)
+            );
+            assert!(!format!("{grant:?}").contains(grant.refresh_token.expose_secret()));
+
+            let replay = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, &raw),
+                    params("different-installation", ClientKind::Mobile),
+                    issued_ids(2),
+                )
+                .await
                 .unwrap_err();
-            assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
-            assert_eq!(count(&service.database, "device").await, 1, "step={step}");
-            assert_eq!(
-                count_where(&service.database, "device", "status = 'pending'").await,
-                1,
-                "step={step}"
-            );
-            assert_eq!(
-                count(&service.database, "auth_session").await,
-                1,
-                "step={step}"
-            );
-            assert_eq!(
-                count_where(&service.database, "auth_session", "status = 'pending'").await,
-                1,
-                "step={step}"
-            );
-            assert_eq!(
-                count(&service.database, "auth_refresh_credential").await,
-                0,
-                "step={step}"
-            );
+            assert_eq!(replay.code(), AuthErrorCode::DeviceActivationConsumed);
+
+            assert_eq!(count(&service.database, "gateway_principal").await, 1);
+            assert_eq!(count(&service.database, "device").await, 1);
+            assert_eq!(count(&service.database, "auth_session").await, 1);
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+            let raw_refresh = grant.refresh_token.expose_secret();
+            let raw_access = grant.access_token.expose_secret();
+            let dump = database_text(&service.database).await;
+            assert!(!dump.contains(raw_refresh));
+            assert!(!dump.contains(raw_access));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_activation_failure_preserves_only_the_pending_device_session() {
+        for step in 1..=4 {
+            pioneer_postgres_test::with_database(async |test_database| {
+                let (service, _identity) = fixture(test_database).await;
+                service.set_activation_failpoint(step);
+                let error = service
+                    .create_initial_session_with_ids(
+                        params("desktop-installation", ClientKind::Desktop),
+                        ids(1),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+                assert_eq!(count(&service.database, "device").await, 1, "step={step}");
+                assert_eq!(
+                    count_where(&service.database, "device", "status = 'pending'").await,
+                    1,
+                    "step={step}"
+                );
+                assert_eq!(
+                    count(&service.database, "auth_session").await,
+                    1,
+                    "step={step}"
+                );
+                assert_eq!(
+                    count_where(&service.database, "auth_session", "status = 'pending'").await,
+                    1,
+                    "step={step}"
+                );
+                assert_eq!(
+                    count(&service.database, "auth_refresh_credential").await,
+                    0,
+                    "step={step}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn renewal_is_admitted_while_read_group_is_blocked() {
-        use axum::extract::ws::Message;
-        use futures_util::StreamExt;
-        let (service, _) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("read-renewal-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let now = unix_timestamp_secs().unwrap();
-        let credential = service
-            .access_issuer
-            .validate(grant.access_token.expose_secret(), now)
-            .unwrap();
-        let old_token = service
-            .access_issuer
-            .issue(&credential.subject, now - 120, None)
-            .unwrap();
-        let old = authenticate_access_token(&service, &old_token).await;
-        let sessions = crate::session::SessionManager::new();
-        let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
-        let id = sessions
-            .register_connection(outbound.clone(), old.clone())
-            .await
-            .unwrap();
-        let mut context = sessions.connection_context(id).await.unwrap();
-        let (renewal, receipt) =
-            tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
-                (*old).clone(),
-                std::time::Duration::from_secs(old.access_expires_at_unix - now),
-            ));
-        let request = pioneer_protocol::JsonRpcRequest {
-            jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
-            id: RequestId::new("R00000000000000000001").unwrap(),
-            method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
-            params: Some(
-                serde_json::to_value(pioneer_protocol::AuthAccessRenewParams {
-                    access_token: grant.access_token.clone(),
-                    refresh_generation: grant.refresh_generation,
-                })
-                .unwrap(),
-            ),
-        };
-        let mut incoming = Box::pin(
-            futures_util::stream::once(async {
-                Ok::<_, axum::Error>(Message::Text(
-                    serde_json::to_string(&request).unwrap().into(),
-                ))
-            })
-            .chain(futures_util::stream::pending()),
-        );
-        let mut deferred = std::collections::VecDeque::from([Message::Text(serde_json::json!({
-            "jsonrpc":"2.0", "id":"R00000000000000000002", "method":"thread/get", "params":{"thread_id":"blocked"}
-        }).to_string().into())]);
-        let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let read_release = release.clone();
-        // Only the read body is a gate. Transport renewal uses the real service,
-        // durable admission, principal CAS, response enqueue and lease publisher.
-        let dispatch = move |_, _| {
-            let release = read_release.clone();
-            async move {
-                release.notified().await;
-            }
-        };
-
-        let mut handlers = crate::transport::ConnectionHandlers::default();
-        let pump = crate::transport::process_with_access_renewals(
-            std::future::pending(),
-            crate::transport::IngressMode::ReadGroup,
-            &mut incoming,
-            &mut deferred,
-            &service,
-            &sessions,
-            &mut context,
-            &renewal,
-            &outbound,
-            &mut handlers,
-            &dispatch,
-        );
-        let driver = async {
-            let Message::Text(text) = responses.recv().await.unwrap() else {
-                panic!()
+        pioneer_postgres_test::with_database(async |test_database| {
+            use axum::extract::ws::Message;
+            use futures_util::StreamExt;
+            let (service, _) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("read-renewal-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let now = unix_timestamp_secs().unwrap();
+            let credential = service
+                .access_issuer
+                .validate(grant.access_token.expose_secret(), now)
+                .unwrap();
+            let old_token = service
+                .access_issuer
+                .issue(&credential.subject, now - 120, None)
+                .unwrap();
+            let old = authenticate_access_token(&service, &old_token).await;
+            let sessions = crate::session::SessionManager::new();
+            let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
+            let id = sessions
+                .register_connection(outbound.clone(), old.clone())
+                .await
+                .unwrap();
+            let mut context = sessions.connection_context(id).await.unwrap();
+            let (renewal, receipt) =
+                tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
+                    (*old).clone(),
+                    std::time::Duration::from_secs(old.access_expires_at_unix - now),
+                ));
+            let request = pioneer_protocol::JsonRpcRequest {
+                jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+                id: RequestId::new("R00000000000000000001").unwrap(),
+                method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
+                params: Some(
+                    serde_json::to_value(pioneer_protocol::AuthAccessRenewParams {
+                        access_token: grant.access_token.clone(),
+                        refresh_generation: grant.refresh_generation,
+                    })
+                    .unwrap(),
+                ),
             };
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(value.get("error").is_none(), "{value}");
+            let mut incoming = Box::pin(
+                futures_util::stream::once(async {
+                    Ok::<_, axum::Error>(Message::Text(
+                        serde_json::to_string(&request).unwrap().into(),
+                    ))
+                })
+                .chain(futures_util::stream::pending()),
+            );
+            let mut deferred = std::collections::VecDeque::from([Message::Text(serde_json::json!({
+                "jsonrpc":"2.0", "id":"R00000000000000000002", "method":"thread/get", "params":{"thread_id":"blocked"}
+            }).to_string().into())]);
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            let read_release = release.clone();
+            // Only the read body is a gate. Transport renewal uses the real service,
+            // durable admission, principal CAS, response enqueue and lease publisher.
+            let dispatch = move |_, _| {
+                let release = read_release.clone();
+                async move {
+                    release.notified().await;
+                }
+            };
+
+            let mut handlers = crate::transport::ConnectionHandlers::default();
+            let pump = crate::transport::process_with_access_renewals(
+                std::future::pending(),
+                crate::transport::IngressMode::ReadGroup,
+                &mut incoming,
+                &mut deferred,
+                &service,
+                &sessions,
+                &mut context,
+                &renewal,
+                &outbound,
+                &mut handlers,
+                &dispatch,
+            );
+            let driver = async {
+                let Message::Text(text) = responses.recv().await.unwrap() else {
+                    panic!()
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(value.get("error").is_none(), "{value}");
+                assert_eq!(
+                    value["result"]["access_expires_at_unix"],
+                    grant.access_expires_at_unix
+                );
+                release.notify_one();
+            };
+            let (alive, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(pump, driver)
+            })
+            .await
+            .expect("read barrier must continue renewal admission");
+            assert!(alive);
+            assert_eq!(receipt.borrow().principal, *context.principal());
             assert_eq!(
-                value["result"]["access_expires_at_unix"],
+                context.principal().access_expires_at_unix,
                 grant.access_expires_at_unix
             );
-            release.notify_one();
-        };
-        let (alive, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(pump, driver)
-        })
-        .await
-        .expect("read barrier must continue renewal admission");
-        assert!(alive);
-        assert_eq!(receipt.borrow().principal, *context.principal());
-        assert_eq!(
-            context.principal().access_expires_at_unix,
-            grant.access_expires_at_unix
-        );
-        handlers.shutdown().await;
+            handlers.shutdown().await;
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn renewal_during_writer_rpc_keeps_connection_and_checks_durable_admission() {
-        use axum::extract::ws::Message;
-        use futures_util::StreamExt;
-        let (service, _) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("renewal-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let now = unix_timestamp_secs().unwrap();
-        let credential = service
-            .access_issuer
-            .validate(grant.access_token.expose_secret(), now)
-            .unwrap();
-        let old_token = service
-            .access_issuer
-            .issue(&credential.subject, now - 120, None)
-            .unwrap();
-        let old = authenticate_access_token(&service, &old_token).await;
-        let sessions = crate::session::SessionManager::new();
-        let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
-        let id = sessions
-            .register_connection(outbound.clone(), old.clone())
-            .await
-            .unwrap();
-        let mut context = sessions.connection_context(id).await.unwrap();
-        let (renewal, receipt) =
-            tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
-                (*old).clone(),
-                std::time::Duration::from_secs(old.access_expires_at_unix - now),
-            ));
-        let params = pioneer_protocol::AuthAccessRenewParams {
-            access_token: grant.access_token.clone(),
-            refresh_generation: grant.refresh_generation,
-        };
-        let request = pioneer_protocol::JsonRpcRequest {
-            jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
-            id: RequestId::new("R00000000000000000001").unwrap(),
-            method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
-            params: Some(serde_json::to_value(&params).unwrap()),
-        };
-        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
-        let frame = Message::Text(serde_json::to_string(&request).unwrap().into());
-        let mut incoming = Box::pin(
-            futures_util::stream::once(async {
-                admitted_tx.send(()).unwrap();
-                Ok::<_, axum::Error>(frame)
-            })
-            .chain(futures_util::stream::pending()),
-        );
-        // A real transaction owns the serialized writer at frame admission.
-        // The signal controls this synthetic RPC's next poll/commit boundary;
-        // no database capacity survives into the outbound acknowledgement.
-        let transaction = service.database.begin().await.unwrap();
-        let mut deferred = std::collections::VecDeque::new();
-
-        let mut handlers = crate::transport::ConnectionHandlers::default();
-        let dispatch = |_, _| async { panic!("renewal fixture contains no domain RPC") };
-        let processing = crate::transport::process_with_access_renewals(
-            async {
-                admitted_rx.await.unwrap();
-                transaction.commit().await.unwrap();
-            },
-            crate::transport::IngressMode::Serial,
-            &mut incoming,
-            &mut deferred,
-            &service,
-            &sessions,
-            &mut context,
-            &renewal,
-            &outbound,
-            &mut handlers,
-            &dispatch,
-        );
-        let acknowledge = async {
-            let Message::Text(text) = responses.recv().await.unwrap() else {
-                panic!()
+        pioneer_postgres_test::with_database(async |test_database| {
+            use axum::extract::ws::Message;
+            use futures_util::StreamExt;
+            let (service, _) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("renewal-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let now = unix_timestamp_secs().unwrap();
+            let credential = service
+                .access_issuer
+                .validate(grant.access_token.expose_secret(), now)
+                .unwrap();
+            let old_token = service
+                .access_issuer
+                .issue(&credential.subject, now - 120, None)
+                .unwrap();
+            let old = authenticate_access_token(&service, &old_token).await;
+            let sessions = crate::session::SessionManager::new();
+            let (outbound, mut responses) = crate::session::test_support::outbound_channel(4);
+            let id = sessions
+                .register_connection(outbound.clone(), old.clone())
+                .await
+                .unwrap();
+            let mut context = sessions.connection_context(id).await.unwrap();
+            let (renewal, receipt) =
+                tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
+                    (*old).clone(),
+                    std::time::Duration::from_secs(old.access_expires_at_unix - now),
+                ));
+            let params = pioneer_protocol::AuthAccessRenewParams {
+                access_token: grant.access_token.clone(),
+                refresh_generation: grant.refresh_generation,
             };
-            let response: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(response.get("error").is_none());
+            let request = pioneer_protocol::JsonRpcRequest {
+                jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+                id: RequestId::new("R00000000000000000001").unwrap(),
+                method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
+                params: Some(serde_json::to_value(&params).unwrap()),
+            };
+            let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+            let frame = Message::Text(serde_json::to_string(&request).unwrap().into());
+            let mut incoming = Box::pin(
+                futures_util::stream::once(async {
+                    admitted_tx.send(()).unwrap();
+                    Ok::<_, axum::Error>(frame)
+                })
+                .chain(futures_util::stream::pending()),
+            );
+            // A real write transaction is open at frame admission.
+            // The signal controls this synthetic RPC's next poll/commit boundary;
+            // no database capacity survives into the outbound acknowledgement.
+            let transaction = service.database.begin().await.unwrap();
+            let mut deferred = std::collections::VecDeque::new();
+
+            let mut handlers = crate::transport::ConnectionHandlers::default();
+            let dispatch = |_, _| async { panic!("renewal fixture contains no domain RPC") };
+            let processing = crate::transport::process_with_access_renewals(
+                async {
+                    admitted_rx.await.unwrap();
+                    transaction.commit().await.unwrap();
+                },
+                crate::transport::IngressMode::Serial,
+                &mut incoming,
+                &mut deferred,
+                &service,
+                &sessions,
+                &mut context,
+                &renewal,
+                &outbound,
+                &mut handlers,
+                &dispatch,
+            );
+            let acknowledge = async {
+                let Message::Text(text) = responses.recv().await.unwrap() else {
+                    panic!()
+                };
+                let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert!(response.get("error").is_none());
+                assert_eq!(
+                    response["result"]["access_expires_at_unix"],
+                    grant.access_expires_at_unix
+                );
+            };
+            let (completed, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(processing, acknowledge)
+            })
+            .await
+            .expect("the RPC must release its writer while renewal is pending");
+            assert!(completed);
+            assert_eq!(context.connection_id(), id);
+            assert_eq!(sessions.connection_ids().await, vec![id]);
             assert_eq!(
-                response["result"]["access_expires_at_unix"],
+                context.principal().access_expires_at_unix,
                 grant.access_expires_at_unix
             );
-        };
-        let (completed, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(processing, acknowledge)
-        })
-        .await
-        .expect("the RPC must release its writer while renewal is pending");
-        assert!(completed);
-        assert_eq!(context.connection_id(), id);
-        assert_eq!(sessions.connection_ids().await, vec![id]);
-        assert_eq!(
-            context.principal().access_expires_at_unix,
-            grant.access_expires_at_unix
-        );
-        assert_eq!(receipt.borrow().principal, *context.principal());
-        assert_eq!(
-            sessions.connection_principal(id).await.unwrap().as_ref(),
-            context.principal()
-        );
-        assert_ne!(old.access_jti, context.principal().access_jti);
-        assert!(
-            responses.try_recv().is_err(),
-            "no close or lost request on renewal"
-        );
-        let wrong_generation = pioneer_protocol::AuthAccessRenewParams {
-            refresh_generation: params.refresh_generation + 1,
-            ..params.clone()
-        };
-        assert_eq!(
+            assert_eq!(receipt.borrow().principal, *context.principal());
+            assert_eq!(
+                sessions.connection_principal(id).await.unwrap().as_ref(),
+                context.principal()
+            );
+            assert_ne!(old.access_jti, context.principal().access_jti);
+            assert!(
+                responses.try_recv().is_err(),
+                "no close or lost request on renewal"
+            );
+            let wrong_generation = pioneer_protocol::AuthAccessRenewParams {
+                refresh_generation: params.refresh_generation + 1,
+                ..params.clone()
+            };
+            assert_eq!(
+                service
+                    .renew_connection_access(context.principal(), &wrong_generation)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::TemporarilyUnavailable
+            );
+            // Replay and a forged token cannot roll back or extend admission.
+            let stale = pioneer_protocol::AuthAccessRenewParams {
+                access_token: AuthSecretString::new(old_token),
+                ..params.clone()
+            };
+            assert_eq!(
+                service
+                    .renew_connection_access(context.principal(), &stale)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::TemporarilyUnavailable,
+            );
+            let invalid = pioneer_protocol::AuthAccessRenewParams {
+                access_token: AuthSecretString::new("invalid"),
+                ..params.clone()
+            };
+            assert!(
+                service
+                    .renew_connection_access(context.principal(), &invalid)
+                    .await
+                    .is_err()
+            );
+            let mut expired = context.principal().clone();
+            expired.access_expires_at_unix = now;
+            assert_eq!(
+                service
+                    .renew_connection_access(&expired, &params)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::CredentialExpired
+            );
             service
-                .renew_connection_access(context.principal(), &wrong_generation)
+                .database
+                .execute_unprepared("UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'")
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::TemporarilyUnavailable
-        );
-        // Replay and a forged token cannot roll back or extend admission.
-        let stale = pioneer_protocol::AuthAccessRenewParams {
-            access_token: AuthSecretString::new(old_token),
-            ..params.clone()
-        };
-        assert_eq!(
-            service
-                .renew_connection_access(context.principal(), &stale)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::TemporarilyUnavailable,
-        );
-        let invalid = pioneer_protocol::AuthAccessRenewParams {
-            access_token: AuthSecretString::new("invalid"),
-            ..params.clone()
-        };
-        assert!(
-            service
-                .renew_connection_access(context.principal(), &invalid)
-                .await
-                .is_err()
-        );
-        let mut expired = context.principal().clone();
-        expired.access_expires_at_unix = now;
-        assert_eq!(
-            service
-                .renew_connection_access(&expired, &params)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::CredentialExpired
-        );
-        service
-            .database
-            .execute_unprepared("UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'")
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .renew_connection_access(context.principal(), &params)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
+                .unwrap();
+            assert_eq!(
+                service
+                    .renew_connection_access(context.principal(), &params)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn access_requires_exact_active_persisted_ownership_and_builds_session_identity() {
-        let (service, identity) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let now = unix_timestamp_secs().unwrap();
-        let credential = service
-            .access_issuer
-            .validate(grant.access_token.expose_secret(), now)
-            .unwrap();
-        let principal = service
-            .authenticate_access(credential.clone())
-            .await
-            .unwrap();
-        assert_eq!(principal.gateway_id, identity.gateway.id);
-        assert_eq!(principal.principal_id, identity.superuser.id);
-        assert_eq!(principal.device_id, grant.device.id);
-        assert_eq!(principal.session_id, grant.session.id);
-        assert_eq!(principal.kind, PrincipalKind::Superuser);
-        let me = service.auth_me(principal.as_ref()).await.unwrap();
-        assert_eq!(me.gateway.id, identity.gateway.id);
-        assert_eq!(me.principal.id, identity.superuser.id);
-        assert_eq!(me.device.id, grant.device.id);
-        assert_eq!(me.session.id, grant.session.id);
-        assert_eq!(me.session.refresh_generation, 0);
-
-        let forged_subjects = [
-            AccessJwtSubject {
-                principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000099").unwrap(),
-                ..credential.subject.clone()
-            },
-            AccessJwtSubject {
-                device_id: DeviceId::new("D00000000000000000099").unwrap(),
-                ..credential.subject.clone()
-            },
-            AccessJwtSubject {
-                session_id: AuthSessionId::new("S00000000000000000099").unwrap(),
-                ..credential.subject.clone()
-            },
-            AccessJwtSubject {
-                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
-                ..credential.subject.clone()
-            },
-        ];
-        for subject in forged_subjects {
-            let forged = AccessCredential {
-                subject,
-                jti: credential.jti.clone(),
-                issued_at_unix: credential.issued_at_unix,
-                expires_at_unix: credential.expires_at_unix,
-            };
-            assert!(
-                service.authenticate_access(forged).await.is_err(),
-                "persisted session ownership must reject forged access identity"
-            );
-        }
-
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'; \
-                 DELETE FROM auth_refresh_credential",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .validate_session_lease(principal.as_ref())
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-        assert_eq!(
-            service
-                .exchange_refresh(
-                    refresh_admission(grant.refresh_token.expose_secret()),
-                    refresh_params(1),
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT revoke_reason AS value FROM auth_session"
-            )
-            .await,
-            "self_revoke"
-        );
-        assert_eq!(
-            scalar_text(&service.database, "SELECT status AS value FROM device").await,
-            "active"
-        );
+                .unwrap();
+            let now = unix_timestamp_secs().unwrap();
+            let credential = service
+                .access_issuer
+                .validate(grant.access_token.expose_secret(), now)
+                .unwrap();
+            let principal = service
+                .authenticate_access(credential.clone())
+                .await
+                .unwrap();
+            assert_eq!(principal.gateway_id, identity.gateway.id);
+            assert_eq!(principal.principal_id, identity.superuser.id);
+            assert_eq!(principal.device_id, grant.device.id);
+            assert_eq!(principal.session_id, grant.session.id);
+            assert_eq!(principal.kind, PrincipalKind::Superuser);
+            let me = service.auth_me(principal.as_ref()).await.unwrap();
+            assert_eq!(me.gateway.id, identity.gateway.id);
+            assert_eq!(me.principal.id, identity.superuser.id);
+            assert_eq!(me.device.id, grant.device.id);
+            assert_eq!(me.session.id, grant.session.id);
+            assert_eq!(me.session.refresh_generation, 0);
+
+            let forged_subjects = [
+                AccessJwtSubject {
+                    principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000099").unwrap(),
+                    ..credential.subject.clone()
+                },
+                AccessJwtSubject {
+                    device_id: DeviceId::new("D00000000000000000099").unwrap(),
+                    ..credential.subject.clone()
+                },
+                AccessJwtSubject {
+                    session_id: AuthSessionId::new("S00000000000000000099").unwrap(),
+                    ..credential.subject.clone()
+                },
+                AccessJwtSubject {
+                    gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
+                    ..credential.subject.clone()
+                },
+            ];
+            for subject in forged_subjects {
+                let forged = AccessCredential {
+                    subject,
+                    jti: credential.jti.clone(),
+                    issued_at_unix: credential.issued_at_unix,
+                    expires_at_unix: credential.expires_at_unix,
+                };
+                assert!(
+                    service.authenticate_access(forged).await.is_err(),
+                    "persisted session ownership must reject forged access identity"
+                );
+            }
+
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'; \
+                     DELETE FROM auth_refresh_credential",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            assert_eq!(
+                service
+                    .exchange_refresh(
+                        refresh_admission(grant.refresh_token.expose_secret()),
+                        refresh_params(1),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT revoke_reason AS value FROM auth_session"
+                )
+                .await,
+                "self_revoke"
+            );
+            assert_eq!(
+                scalar_text(&service.database, "SELECT status AS value FROM device").await,
+                "active"
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
-    async fn lease_rejects_missing_cross_linked_and_invalid_active_rows_with_fk_off() {
+    async fn lease_rejects_missing_cross_linked_and_invalid_active_rows() {
         use AuthErrorCode::{InvalidCredential, SessionExpired, SessionRevoked};
         let cases = [
             ("DELETE FROM auth_session", InvalidCredential),
@@ -4442,728 +4487,713 @@ mod tests {
             ),
         ];
         for (mutation, expected) in cases {
-            let (service, _) = fixture().await;
+            pioneer_postgres_test::with_database(async |test_database| {
+                let (service, _) = fixture(test_database).await;
+                let grant = service
+                    .create_initial_session_with_ids(
+                        params("lease-matrix", ClientKind::Desktop),
+                        ids(1),
+                    )
+                    .await
+                    .unwrap();
+                let principal = authenticate_grant(&service, &grant).await;
+                relax_fixture_constraints(
+                    &service.database,
+                    "auth_session,device,gateway_principal,auth_refresh_credential",
+                )
+                .await;
+                service.database.execute_unprepared(mutation).await.unwrap();
+                assert_eq!(
+                    service
+                        .validate_session_lease(&principal)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    expected,
+                    "{mutation}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        pioneer_postgres_test::with_database(async |test_database| {
+            // Existing, valid related rows must not substitute for the expected
+            // authenticated device/principal. This differs from a dangling FK.
+            let (service, _) = fixture(test_database).await;
+            let first = service
+                .create_initial_session_with_ids(params("lease-first", ClientKind::Desktop), ids(1))
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &first).await;
+            let second = service
+                .create_initial_session_with_ids(params("lease-second", ClientKind::Mobile), ids(2))
+                .await
+                .unwrap();
+            let (member_id, member_credential) = member_access_credential(&service, &second).await;
+            service.validate_session_lease(&principal).await.unwrap();
+            let captured_superuser = AuthenticatedSessionPrincipal {
+                principal_id: member_id.clone(),
+                device_id: second.device.id.clone(),
+                session_id: second.session.id.clone(),
+                ..principal.as_ref().clone()
+            };
+            let current = service
+                .validate_session_lease(&captured_superuser)
+                .await
+                .unwrap();
+            assert_eq!(current.kind, PrincipalKind::User);
+            assert_eq!(
+                current.role_key.as_ref().map(RoleKey::as_str),
+                Some("member")
+            );
+            let transaction = service.database.begin().await.unwrap();
+            let guarded = service
+                .validate_active_actor_in_transaction(
+                    &transaction,
+                    &captured_superuser,
+                    datetime(unix_timestamp_secs().unwrap()).unwrap(),
+                )
+                .await;
+            transaction.rollback().await.unwrap();
+            assert_eq!(guarded.unwrap_err().code(), SessionRevoked);
+
+            let substituted = AuthenticatedSessionPrincipal {
+                session_id: second.session.id,
+                ..principal.as_ref().clone()
+            };
+            assert_eq!(
+                service
+                    .validate_session_lease(&substituted)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                InvalidCredential
+            );
+            let substituted = AuthenticatedSessionPrincipal {
+                device_id: member_credential.subject.device_id,
+                ..principal.as_ref().clone()
+            };
+            assert_eq!(
+                service
+                    .validate_session_lease(&substituted)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                InvalidCredential
+            );
+            let substituted = AuthenticatedSessionPrincipal {
+                principal_id: member_id,
+                ..principal.as_ref().clone()
+            };
+            assert_eq!(
+                service
+                    .validate_session_lease(&substituted)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                InvalidCredential
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_refresh_expiry_boundary_uses_current_projection_and_generation() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
             let grant = service
                 .create_initial_session_with_ids(
-                    params("lease-matrix", ClientKind::Desktop),
+                    params("lease-boundary", ClientKind::Desktop),
                     ids(1),
                 )
                 .await
                 .unwrap();
             let principal = authenticate_grant(&service, &grant).await;
-            service
-                .database
-                .execute_unprepared("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
+            let rotated = service
+                .exchange_refresh(
+                    refresh_admission(grant.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
                 .await
                 .unwrap();
-            assert_eq!(
-                scalar_i64(
-                    &service.database,
-                    "SELECT foreign_keys AS value FROM pragma_foreign_keys"
-                )
-                .await,
-                0
-            );
-            service.database.execute_unprepared(mutation).await.unwrap();
-            assert_eq!(
-                service
-                    .validate_session_lease(&principal)
-                    .await
-                    .unwrap_err()
-                    .code(),
-                expected,
-                "{mutation}"
-            );
-        }
-
-        // Existing, valid related rows must not substitute for the expected
-        // authenticated device/principal. This differs from a dangling FK.
-        let (service, _) = fixture().await;
-        service
-            .database
-            .execute_unprepared("PRAGMA foreign_keys=OFF")
-            .await
-            .unwrap();
-        let first = service
-            .create_initial_session_with_ids(params("lease-first", ClientKind::Desktop), ids(1))
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &first).await;
-        let second = service
-            .create_initial_session_with_ids(params("lease-second", ClientKind::Mobile), ids(2))
-            .await
-            .unwrap();
-        let (member_id, member_credential) = member_access_credential(&service, &second).await;
-        service.validate_session_lease(&principal).await.unwrap();
-        let captured_superuser = AuthenticatedSessionPrincipal {
-            principal_id: member_id.clone(),
-            device_id: second.device.id.clone(),
-            session_id: second.session.id.clone(),
-            ..principal.as_ref().clone()
-        };
-        let current = service
-            .validate_session_lease(&captured_superuser)
-            .await
-            .unwrap();
-        assert_eq!(current.kind, PrincipalKind::User);
-        assert_eq!(
-            current.role_key.as_ref().map(RoleKey::as_str),
-            Some("member")
-        );
-        let transaction = service.database.begin().await.unwrap();
-        let guarded = service
-            .validate_active_actor_in_transaction(
-                &transaction,
-                &captured_superuser,
-                datetime(unix_timestamp_secs().unwrap()).unwrap(),
-            )
-            .await;
-        transaction.rollback().await.unwrap();
-        assert_eq!(guarded.unwrap_err().code(), SessionRevoked);
-
-        let substituted = AuthenticatedSessionPrincipal {
-            session_id: second.session.id,
-            ..principal.as_ref().clone()
-        };
-        assert_eq!(
-            service
-                .validate_session_lease(&substituted)
-                .await
-                .unwrap_err()
-                .code(),
-            InvalidCredential
-        );
-        let substituted = AuthenticatedSessionPrincipal {
-            device_id: member_credential.subject.device_id,
-            ..principal.as_ref().clone()
-        };
-        assert_eq!(
-            service
-                .validate_session_lease(&substituted)
-                .await
-                .unwrap_err()
-                .code(),
-            InvalidCredential
-        );
-        let substituted = AuthenticatedSessionPrincipal {
-            principal_id: member_id,
-            ..principal.as_ref().clone()
-        };
-        assert_eq!(
-            service
-                .validate_session_lease(&substituted)
-                .await
-                .unwrap_err()
-                .code(),
-            InvalidCredential
-        );
-    }
-
-    #[tokio::test]
-    async fn lease_refresh_expiry_boundary_uses_current_projection_and_generation() {
-        let (service, _) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(params("lease-boundary", ClientKind::Desktop), ids(1))
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &grant).await;
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        let row = load_session_lease(&service.database, &principal.session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let expiry = timestamp(row.refresh_expires_at.unwrap()).unwrap();
-        let facts = validate_session_lease_facts(row, &principal, expiry - 1).unwrap();
-        assert_eq!(facts.session.refresh_generation, 1);
-        assert_eq!(facts.session.refresh_generation, rotated.refresh_generation);
-        for now in [expiry, expiry + 1] {
             let row = load_session_lease(&service.database, &principal.session_id)
                 .await
                 .unwrap()
                 .unwrap();
+            let expiry = timestamp(row.refresh_expires_at.unwrap()).unwrap();
+            let facts = validate_session_lease_facts(row, &principal, expiry - 1).unwrap();
+            assert_eq!(facts.session.refresh_generation, 1);
+            assert_eq!(facts.session.refresh_generation, rotated.refresh_generation);
+            for now in [expiry, expiry + 1] {
+                let row = load_session_lease(&service.database, &principal.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    validate_session_lease_facts(row, &principal, now)
+                        .unwrap_err()
+                        .code(),
+                    AuthErrorCode::SessionExpired
+                );
+            }
+            let wrong_gateway = AuthenticatedSessionPrincipal {
+                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
+                ..principal.as_ref().clone()
+            };
             assert_eq!(
-                validate_session_lease_facts(row, &principal, now)
+                service
+                    .validate_session_lease(&wrong_gateway)
+                    .await
                     .unwrap_err()
                     .code(),
-                AuthErrorCode::SessionExpired
+                AuthErrorCode::GatewayIdentityMismatch
             );
-        }
-        let wrong_gateway = AuthenticatedSessionPrincipal {
-            gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
-            ..principal.as_ref().clone()
-        };
-        assert_eq!(
-            service
-                .validate_session_lease(&wrong_gateway)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::GatewayIdentityMismatch
-        );
-        let expired = AuthenticatedSessionPrincipal {
-            access_expires_at_unix: unix_timestamp_secs().unwrap(),
-            ..wrong_gateway
-        };
-        assert_eq!(
-            service
-                .validate_session_lease(&expired)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::CredentialExpired
-        );
+            let expired = AuthenticatedSessionPrincipal {
+                access_expires_at_unix: unix_timestamp_secs().unwrap(),
+                ..wrong_gateway
+            };
+            assert_eq!(
+                service
+                    .validate_session_lease(&expired)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::CredentialExpired
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[derive(Default)]
-    struct LeaseReadObserver(Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>);
+    struct LeaseReadObserver(Mutex<Vec<pioneer_postgres_pools::PostgresReadEvent>>);
 
-    impl pioneer_sqlite::SqliteReadObserver for LeaseReadObserver {
-        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+    impl pioneer_postgres_pools::PostgresReadObserver for LeaseReadObserver {
+        fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
             self.0.lock().unwrap().push(event);
         }
     }
 
     #[tokio::test]
-    async fn lease_reads_one_statement_on_the_callers_scoped_query_only_reader() {
-        use pioneer_sqlite::{
-            SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
-        };
-        use sea_orm::ConnectOptions;
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("lease.sqlite");
-        let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-        options
-            .max_connections(1)
-            .map_sqlx_sqlite_opts(|options| options.pragma("foreign_keys", "OFF"));
-        let writer = Database::connect(options).await.unwrap();
-        pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
-        let (mut service, _) = fixture_with_connection(writer.clone()).await;
-        let grant = service
-            .create_initial_session_with_ids(params("lease-routing", ClientKind::Desktop), ids(1))
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &grant).await;
-        let mut options =
-            ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-        options.max_connections(1).map_sqlx_sqlite_opts(|options| {
+    async fn lease_reads_one_statement_on_the_callers_scoped_read_only_reader() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            use pioneer_postgres_pools::{
+                PostgresReadClass, PostgresReadEvent, PostgresReadOutcome, PostgresWriteExecutor,
+            };
+            use sea_orm::ConnectOptions;
+            let writer = test_database.connection().clone();
+            let (mut service, _) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("lease-routing", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &grant).await;
+            let mut options = ConnectOptions::new(test_database.url().to_string());
             options
-                .read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-                .pragma("foreign_keys", "OFF")
-        });
-        let reader = Database::connect(options).await.unwrap();
-        let observer = Arc::new(LeaseReadObserver::default());
-        service.database = SqliteDatabase::from_executor_with_read_observer(
-            reader,
-            SqliteWriteExecutor::new(writer),
-            observer.clone(),
-        )
-        .with_critical_writes();
-        service.database.validate_reader().await.unwrap();
-        for scope in [
-            service.database.clone(),
-            CrudStore::new(service.database.clone())
-                .with_maintenance_access()
-                .database_connection(),
-        ] {
-            let writer_transaction = service.database.begin().await.unwrap();
-            observer.0.lock().unwrap().clear();
-            let facts = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                service.validate_session_lease_with_database(&principal, &scope),
+                .max_connections(1)
+                .sqlx_logging(false)
+                .map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+            let reader = Database::connect(options).await.unwrap();
+            let observer = Arc::new(LeaseReadObserver::default());
+            service.database = PostgresDatabase::from_executor_with_read_observer(
+                reader,
+                PostgresWriteExecutor::new(writer),
+                observer.clone(),
             )
-            .await
-            .expect("lease must not wait on the held writer")
-            .unwrap();
-            assert_eq!(facts.session.id, grant.session.id);
-            let events = observer.0.lock().unwrap().clone();
-            let operations: Vec<_> = events
-                .iter()
-                .filter_map(|event| match event {
-                    SqliteReadEvent::OperationFinished { class, outcome, .. } => {
-                        Some((*class, *outcome))
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                operations,
-                vec![(scope.read_class(), SqliteReadOutcome::Ok)]
-            );
-            if scope.read_class() == SqliteReadClass::Maintenance {
-                assert!(events.iter().any(|event| matches!(
-                    event,
-                    SqliteReadEvent::AdmissionReleased {
-                        class: SqliteReadClass::Maintenance,
-                        active: 0,
-                        ..
-                    }
-                )));
+            .with_critical_writes();
+            service.database.validate_reader().await.unwrap();
+            for scope in [
+                service.database.clone(),
+                CrudStore::new(service.database.clone())
+                    .with_maintenance_access()
+                    .database_connection(),
+            ] {
+                let writer_transaction = service.database.begin().await.unwrap();
+                writer_transaction
+                    .execute_unprepared("SELECT id FROM auth_session FOR UPDATE")
+                    .await
+                    .unwrap();
+                observer.0.lock().unwrap().clear();
+                let facts = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    service.validate_session_lease_with_database(&principal, &scope),
+                )
+                .await
+                .expect("lease must not wait on the held writer")
+                .unwrap();
+                assert_eq!(facts.session.id, grant.session.id);
+                let events = observer.0.lock().unwrap().clone();
+                let operations: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        PostgresReadEvent::OperationFinished { class, outcome, .. } => {
+                            Some((*class, *outcome))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    operations,
+                    vec![(scope.read_class(), PostgresReadOutcome::Ok)]
+                );
+                if scope.read_class() == PostgresReadClass::Maintenance {
+                    assert!(events.iter().any(|event| matches!(
+                        event,
+                        PostgresReadEvent::AdmissionReleased {
+                            class: PostgresReadClass::Maintenance,
+                            active: 0,
+                            ..
+                        }
+                    )));
+                }
+                writer_transaction.rollback().await.unwrap();
             }
-            writer_transaction.rollback().await.unwrap();
-        }
-        observer.0.lock().unwrap().clear();
-        assert_eq!(
-            service.auth_me(&principal).await.unwrap().device.id,
-            grant.device.id
-        );
-        assert_eq!(
-            observer
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|event| matches!(event, SqliteReadEvent::OperationFinished { .. }))
-                .count(),
-            2
-        );
+            observer.0.lock().unwrap().clear();
+            assert_eq!(
+                service.auth_me(&principal).await.unwrap().device.id,
+                grant.device.id
+            );
+            assert_eq!(
+                observer
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(event, PostgresReadEvent::OperationFinished { .. }))
+                    .count(),
+                2
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn authenticated_principal_can_atomically_update_and_remove_own_profile() {
-        let (service, identity) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("profile-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &grant).await;
-
-        let mut encoded = Cursor::new(Vec::new());
-        DynamicImage::new_rgba8(2, 2)
-            .write_to(&mut encoded, ImageFormat::Png)
-            .unwrap();
-        let avatar = ProfileAvatarInput::new(
-            ProfileAvatarMediaType::Png,
-            BASE64_STANDARD.encode(encoded.into_inner()),
-        )
-        .unwrap();
-        let updated = service
-            .update_profile(
-                principal.as_ref(),
-                AuthProfileUpdateParams::new(
-                    "Alice Smith",
-                    "Alice.Smith",
-                    AuthProfileAvatarUpdate::Set { avatar },
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("profile-installation", ClientKind::Desktop),
+                    ids(1),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(updated.changed);
-        assert_eq!(updated.principal.display_name, "Alice Smith");
-        assert_eq!(updated.principal.nickname, "Alice.Smith");
-        assert_eq!(
-            updated.principal.avatar_revision.as_deref().map(str::len),
-            Some(64)
-        );
-        assert_eq!(count(&service.database, "principal_avatar").await, 1);
-
-        let me = service.auth_me(principal.as_ref()).await.unwrap();
-        assert_eq!(me.principal, updated.principal);
-        let unchanged = service
-            .update_profile(
-                principal.as_ref(),
-                AuthProfileUpdateParams::new(
-                    "Alice Smith",
-                    "Alice.Smith",
-                    AuthProfileAvatarUpdate::Unchanged,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(!unchanged.changed);
-
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(\
-                     id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                     created_at,updated_at,removed_at\
-                     ) VALUES(\
-                     'P0000000000000000000B','{}','user','member','active',\
-                     'Taken','taken','taken',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                     )",
-                    identity.gateway.id
-                )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-        let conflict = service
-            .update_profile(
-                principal.as_ref(),
-                AuthProfileUpdateParams::new(
-                    "Changed Again",
-                    "taken",
-                    AuthProfileAvatarUpdate::Remove,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(conflict.code(), AuthErrorCode::ProfileNicknameUnavailable);
-        assert_eq!(
-            service.auth_me(principal.as_ref()).await.unwrap().principal,
-            updated.principal
-        );
-        assert_eq!(count(&service.database, "principal_avatar").await, 1);
-
-        let removed = service
-            .update_profile(
-                principal.as_ref(),
-                AuthProfileUpdateParams::new(
-                    "Alice Smith",
-                    "Alice.Smith",
-                    AuthProfileAvatarUpdate::Remove,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(removed.changed);
-        assert_eq!(removed.principal.avatar_revision, None);
-        assert_eq!(count(&service.database, "principal_avatar").await, 0);
-        assert_eq!(
-            service
-                .auth_me(&principal)
                 .await
-                .unwrap()
-                .principal
-                .avatar_revision,
-            None
-        );
-        // Immutable revisions survive removal. A foreign current pointer must
-        // fail auth/me, while the same valid lease remains independent of it.
-        service
-            .database
-            .execute_unprepared("PRAGMA foreign_keys=OFF")
-            .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &grant).await;
+
+            let mut encoded = Cursor::new(Vec::new());
+            DynamicImage::new_rgba8(2, 2)
+                .write_to(&mut encoded, ImageFormat::Png)
+                .unwrap();
+            let avatar = ProfileAvatarInput::new(
+                ProfileAvatarMediaType::Png,
+                BASE64_STANDARD.encode(encoded.into_inner()),
+            )
             .unwrap();
-        // Bypass the revision ID CHECK only while seeding the corrupt owner.
-        service.database.execute_unprepared(
-            "PRAGMA ignore_check_constraints=ON;
-             UPDATE principal_avatar_revision SET principal_id='P0000000000000000000B';
-             INSERT INTO principal_avatar(principal_id,revision_id,updated_at)
-             SELECT (SELECT principal_id FROM auth_session LIMIT 1),id,CURRENT_TIMESTAMP FROM principal_avatar_revision LIMIT 1;
-             PRAGMA ignore_check_constraints=OFF",
-        ).await.unwrap();
-        service.validate_session_lease(&principal).await.unwrap();
-        assert_eq!(
-            service.auth_me(&principal).await.unwrap_err().code(),
-            AuthErrorCode::InvalidCredential
-        );
-        service
-            .database
-            .execute_unprepared("DELETE FROM principal_avatar_revision")
-            .await
-            .unwrap();
-        service.validate_session_lease(&principal).await.unwrap();
-        assert_eq!(
-            service.auth_me(&principal).await.unwrap_err().code(),
-            AuthErrorCode::InvalidCredential
-        );
+            let updated = service
+                .update_profile(
+                    principal.as_ref(),
+                    AuthProfileUpdateParams::new(
+                        "Alice Smith",
+                        "Alice.Smith",
+                        AuthProfileAvatarUpdate::Set { avatar },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(updated.changed);
+            assert_eq!(updated.principal.display_name, "Alice Smith");
+            assert_eq!(updated.principal.nickname, "Alice.Smith");
+            assert_eq!(
+                updated.principal.avatar_revision.as_deref().map(str::len),
+                Some(64)
+            );
+            assert_eq!(count(&service.database, "principal_avatar").await, 1);
+
+            let me = service.auth_me(principal.as_ref()).await.unwrap();
+            assert_eq!(me.principal, updated.principal);
+            let unchanged = service
+                .update_profile(
+                    principal.as_ref(),
+                    AuthProfileUpdateParams::new(
+                        "Alice Smith",
+                        "Alice.Smith",
+                        AuthProfileAvatarUpdate::Unchanged,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!unchanged.changed);
+
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(\
+                         id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                         created_at,updated_at,removed_at\
+                         ) VALUES(\
+                         'P0000000000000000000B','{}','user','member','active',\
+                         'Taken','taken','taken',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                         )",
+                        identity.gateway.id
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+            let conflict = service
+                .update_profile(
+                    principal.as_ref(),
+                    AuthProfileUpdateParams::new(
+                        "Changed Again",
+                        "taken",
+                        AuthProfileAvatarUpdate::Remove,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(conflict.code(), AuthErrorCode::ProfileNicknameUnavailable);
+            assert_eq!(
+                service.auth_me(principal.as_ref()).await.unwrap().principal,
+                updated.principal
+            );
+            assert_eq!(count(&service.database, "principal_avatar").await, 1);
+
+            let removed = service
+                .update_profile(
+                    principal.as_ref(),
+                    AuthProfileUpdateParams::new(
+                        "Alice Smith",
+                        "Alice.Smith",
+                        AuthProfileAvatarUpdate::Remove,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(removed.changed);
+            assert_eq!(removed.principal.avatar_revision, None);
+            assert_eq!(count(&service.database, "principal_avatar").await, 0);
+            assert_eq!(
+                service
+                    .auth_me(&principal)
+                    .await
+                    .unwrap()
+                    .principal
+                    .avatar_revision,
+                None
+            );
+            // Immutable revisions survive removal. A foreign current pointer must
+            // fail auth/me, while the same valid lease remains independent of it.
+            relax_fixture_constraints(&service.database, "principal_avatar,principal_avatar_revision").await;
+            service.database.execute_unprepared(
+                "UPDATE principal_avatar_revision SET principal_id='P0000000000000000000B';
+                 INSERT INTO principal_avatar(principal_id,revision_id,updated_at)
+                 SELECT (SELECT principal_id FROM auth_session LIMIT 1),id,CURRENT_TIMESTAMP FROM principal_avatar_revision LIMIT 1"
+            ).await.unwrap();
+            service.validate_session_lease(&principal).await.unwrap();
+            assert_eq!(
+                service.auth_me(&principal).await.unwrap_err().code(),
+                AuthErrorCode::InvalidCredential
+            );
+            service
+                .database
+                .execute_unprepared("DELETE FROM principal_avatar_revision")
+                .await
+                .unwrap();
+            service.validate_session_lease(&principal).await.unwrap();
+            assert_eq!(
+                service.auth_me(&principal).await.unwrap_err().code(),
+                AuthErrorCode::InvalidCredential
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn cryptographically_shaped_access_without_matching_rows_is_rejected() {
-        let (service, identity) = fixture().await;
-        let now = unix_timestamp_secs().unwrap();
-        let credential = AccessCredential {
-            subject: AccessJwtSubject {
-                gateway_id: identity.gateway.id.clone(),
-                principal_id: identity.superuser.id.clone(),
-                device_id: DeviceId::new("D00000000000000000099").unwrap(),
-                session_id: AuthSessionId::new("S00000000000000000099").unwrap(),
-            },
-            jti: "J00000000000000000099".to_owned(),
-            issued_at_unix: now,
-            expires_at_unix: now + 60,
-        };
-        assert_eq!(
-            service
-                .authenticate_access(credential)
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::InvalidCredential
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let now = unix_timestamp_secs().unwrap();
+            let credential = AccessCredential {
+                subject: AccessJwtSubject {
+                    gateway_id: identity.gateway.id.clone(),
+                    principal_id: identity.superuser.id.clone(),
+                    device_id: DeviceId::new("D00000000000000000099").unwrap(),
+                    session_id: AuthSessionId::new("S00000000000000000099").unwrap(),
+                },
+                jti: "J00000000000000000099".to_owned(),
+                issued_at_unix: now,
+                expires_at_unix: now + 60,
+            };
+            assert_eq!(
+                service
+                    .authenticate_access(credential)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::InvalidCredential
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn persisted_access_survives_auth_service_restart_with_same_key_domains() {
-        let (service, identity) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let token = grant.access_token.expose_secret().to_owned();
+            let database = service.database.clone();
+            drop(service);
+            let restarted = GatewayAuthService::new(
+                database,
+                GatewayAuthConfig::default(),
+                identity.clone(),
+                &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
+                &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
             )
-            .await
             .unwrap();
-        let token = grant.access_token.expose_secret().to_owned();
-        let database = service.database.clone();
-        drop(service);
-        let restarted = GatewayAuthService::new(
-            database,
-            GatewayAuthConfig::default(),
-            identity.clone(),
-            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
+            let credential = restarted
+                .access_issuer
+                .validate(token.as_str(), unix_timestamp_secs().unwrap())
+                .unwrap();
+            let principal = restarted.authenticate_access(credential).await.unwrap();
+            assert_eq!(principal.principal_id, identity.superuser.id);
+            assert_eq!(principal.session_id, grant.session.id);
+            Ok(())
+        })
+        .await
         .unwrap();
-        let credential = restarted
-            .access_issuer
-            .validate(token.as_str(), unix_timestamp_secs().unwrap())
-            .unwrap();
-        let principal = restarted.authenticate_access(credential).await.unwrap();
-        assert_eq!(principal.principal_id, identity.superuser.id);
-        assert_eq!(principal.session_id, grant.session.id);
     }
 
     #[tokio::test]
     async fn access_key_rotation_requires_refresh_without_losing_the_session() {
-        let (service, identity) = fixture().await;
-        let grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let old_access = grant.access_token.expose_secret().to_owned();
-        let refresh = grant.refresh_token.expose_secret().to_owned();
-        let session_id = grant.session.id.clone();
-        let device_id = grant.device.id.clone();
-        let database = service.database.clone();
-        drop(service);
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let old_access = grant.access_token.expose_secret().to_owned();
+            let refresh = grant.refresh_token.expose_secret().to_owned();
+            let session_id = grant.session.id.clone();
+            let device_id = grant.device.id.clone();
+            let database = service.database.clone();
+            drop(service);
 
-        let rotated = GatewayAuthService::new(
-            database,
-            GatewayAuthConfig::default(),
-            identity.clone(),
-            &AuthKeyMaterial::from_test_bytes(vec![7; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
-        .unwrap();
-        assert_eq!(
-            rotated
+            let rotated = GatewayAuthService::new(
+                database,
+                GatewayAuthConfig::default(),
+                identity.clone(),
+                &AuthKeyMaterial::from_test_bytes(vec![7; 64]),
+                &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
+            )
+            .unwrap();
+            assert_eq!(
+                rotated
+                    .access_issuer
+                    .validate(old_access.as_str(), unix_timestamp_secs().unwrap())
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::InvalidCredential
+            );
+
+            let refreshed = rotated
+                .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
+                .await
+                .unwrap();
+            assert_eq!(refreshed.session.id, session_id);
+            assert_eq!(refreshed.device.id, device_id);
+            let credential = rotated
                 .access_issuer
-                .validate(old_access.as_str(), unix_timestamp_secs().unwrap())
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::InvalidCredential
-        );
-
-        let refreshed = rotated
-            .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
-            .await
-            .unwrap();
-        assert_eq!(refreshed.session.id, session_id);
-        assert_eq!(refreshed.device.id, device_id);
-        let credential = rotated
-            .access_issuer
-            .validate(
-                refreshed.access_token.expose_secret(),
-                unix_timestamp_secs().unwrap(),
-            )
-            .unwrap();
-        let principal = rotated.authenticate_access(credential).await.unwrap();
-        assert_eq!(principal.principal_id, identity.superuser.id);
-        assert_eq!(principal.session_id, session_id);
+                .validate(
+                    refreshed.access_token.expose_secret(),
+                    unix_timestamp_secs().unwrap(),
+                )
+                .unwrap();
+            let principal = rotated.authenticate_access(credential).await.unwrap();
+            assert_eq!(principal.principal_id, identity.superuser.id);
+            assert_eq!(principal.session_id, session_id);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn populated_epic2_two_client_rollout_survives_restart_and_independent_revoke() {
-        let populated = crate::auth::test_support::populated_epic2_database().await;
-        Migrator::up(&populated.database, None).await.unwrap();
-        crate::auth::ensure_auth_readiness(&populated.database, &populated.identity)
-            .await
-            .unwrap();
-        let identity = Arc::new(populated.identity);
-        let service = GatewayAuthService::new(
-            populated.database,
-            GatewayAuthConfig::default(),
-            identity.clone(),
-            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
-        .unwrap();
-        let desktop = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let mobile = service
-            .create_initial_session_with_ids(
-                params("mobile-installation", ClientKind::Mobile),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(count(&service.database, "gateway_principal").await, 1);
-        assert_eq!(count(&service.database, "device").await, 2);
-        assert_eq!(count(&service.database, "auth_session").await, 2);
-
-        let desktop = service
-            .exchange_refresh(
-                refresh_admission(desktop.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        let mobile = service
-            .exchange_refresh(
-                refresh_admission(mobile.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap();
-        let database = service.database.clone();
-        drop(service);
-
-        let restarted = GatewayAuthService::new(
-            database,
-            GatewayAuthConfig::default(),
-            identity.clone(),
-            &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
-            &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
-        )
-        .unwrap();
-        let desktop_principal = restarted
-            .authenticate_access(
-                restarted
-                    .access_issuer
-                    .validate(
-                        desktop.access_token.expose_secret(),
-                        unix_timestamp_secs().unwrap(),
-                    )
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let mobile_principal = restarted
-            .authenticate_access(
-                restarted
-                    .access_issuer
-                    .validate(
-                        mobile.access_token.expose_secret(),
-                        unix_timestamp_secs().unwrap(),
-                    )
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let device_activation = restarted
-            .create_device(desktop_principal.as_ref())
-            .await
-            .unwrap();
-        let paired = restarted
-            .activate_device_with_ids(
-                device_activation_admission(
-                    &restarted,
-                    device_activation.activation_code.expose_secret(),
-                ),
-                device_activation_params("paired-mobile-installation"),
-                issued_ids(3),
-            )
-            .await
-            .unwrap();
-        assert_eq!(paired.principal.id, identity.superuser.id);
-        assert_ne!(paired.device.id, desktop.device.id);
-        assert_ne!(paired.session.id, desktop.session.id);
-
-        let revoked = restarted
-            .revoke_owned_session(
-                desktop_principal.as_ref(),
-                &mobile.session.id,
-                None,
-                AuthSessionRevokeReason::DeviceRevoke,
-            )
-            .await
-            .unwrap();
-        assert!(revoked.revoked);
-        assert_eq!(
-            restarted
-                .validate_session_lease(mobile_principal.as_ref())
+    async fn populated_identity_survives_auth_start_restart_and_independent_revoke()
+    -> anyhow::Result<()> {
+        pioneer_postgres_test::with_empty_database(async |fixture| {
+            let populated = crate::auth::test_support::populated_identity_database(fixture).await;
+            Migrator::up(&populated.database, None).await.unwrap();
+            crate::auth::ensure_auth_readiness(&populated.database, &populated.identity)
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-        restarted
-            .validate_session_lease(desktop_principal.as_ref())
-            .await
+                .unwrap();
+            let identity = Arc::new(populated.identity);
+            let service = GatewayAuthService::new(
+                populated.database,
+                GatewayAuthConfig::default(),
+                identity.clone(),
+                &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
+                &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
+            )
             .unwrap();
-        let paired_principal = authenticate_grant(&restarted, &paired).await;
-        restarted
-            .validate_session_lease(paired_principal.as_ref())
-            .await
+            let desktop = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let mobile = service
+                .create_initial_session_with_ids(
+                    params("mobile-installation", ClientKind::Mobile),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(count(&service.database, "gateway_principal").await, 1);
+            assert_eq!(count(&service.database, "device").await, 2);
+            assert_eq!(count(&service.database, "auth_session").await, 2);
+
+            let desktop = service
+                .exchange_refresh(
+                    refresh_admission(desktop.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
+                .await
+                .unwrap();
+            let mobile = service
+                .exchange_refresh(
+                    refresh_admission(mobile.refresh_token.expose_secret()),
+                    refresh_params(2),
+                )
+                .await
+                .unwrap();
+            let database = service.database.clone();
+            drop(service);
+
+            let restarted = GatewayAuthService::new(
+                database,
+                GatewayAuthConfig::default(),
+                identity.clone(),
+                &AuthKeyMaterial::from_test_bytes(vec![8; 64]),
+                &AuthKeyMaterial::from_test_bytes(vec![9; 64]),
+            )
             .unwrap();
-        assert_eq!(count(&restarted.database, "gateway_principal").await, 1);
-        assert_eq!(count(&restarted.database, "device").await, 3);
-        assert_eq!(
-            count_where(&restarted.database, "auth_session", "status = 'active'").await,
-            2
-        );
+            let desktop_principal = restarted
+                .authenticate_access(
+                    restarted
+                        .access_issuer
+                        .validate(
+                            desktop.access_token.expose_secret(),
+                            unix_timestamp_secs().unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mobile_principal = restarted
+                .authenticate_access(
+                    restarted
+                        .access_issuer
+                        .validate(
+                            mobile.access_token.expose_secret(),
+                            unix_timestamp_secs().unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let device_activation = restarted
+                .create_device(desktop_principal.as_ref())
+                .await
+                .unwrap();
+            let paired = restarted
+                .activate_device_with_ids(
+                    device_activation_admission(
+                        &restarted,
+                        device_activation.activation_code.expose_secret(),
+                    ),
+                    device_activation_params("paired-mobile-installation"),
+                    issued_ids(3),
+                )
+                .await
+                .unwrap();
+            assert_eq!(paired.principal.id, identity.superuser.id);
+            assert_ne!(paired.device.id, desktop.device.id);
+            assert_ne!(paired.session.id, desktop.session.id);
+
+            let revoked = restarted
+                .revoke_owned_session(
+                    desktop_principal.as_ref(),
+                    &mobile.session.id,
+                    None,
+                    AuthSessionRevokeReason::DeviceRevoke,
+                )
+                .await
+                .unwrap();
+            assert!(revoked.revoked);
+            assert_eq!(
+                restarted
+                    .validate_session_lease(mobile_principal.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            restarted
+                .validate_session_lease(desktop_principal.as_ref())
+                .await
+                .unwrap();
+            let paired_principal = authenticate_grant(&restarted, &paired).await;
+            restarted
+                .validate_session_lease(paired_principal.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(count(&restarted.database, "gateway_principal").await, 1);
+            assert_eq!(count(&restarted.database, "device").await, 3);
+            assert_eq!(
+                count_where(&restarted.database, "auth_session", "status = 'active'").await,
+                2
+            );
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
     async fn refresh_rotates_sequentially_with_exactly_one_current_generation() {
-        let (service, _) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let mut raw = initial_grant.refresh_token.expose_secret().to_owned();
-        let mut last_expiry = initial_grant.refresh_expires_at_unix;
-        for generation in 1..=100 {
-            let rotated = service
-                .exchange_refresh(refresh_admission(raw.as_str()), refresh_params(generation))
-                .await
-                .unwrap();
-            assert_eq!(rotated.refresh_generation, generation);
-            assert!(rotated.refresh_expires_at_unix >= last_expiry);
-            raw = rotated.refresh_token.expose_secret().to_owned();
-            last_expiry = rotated.refresh_expires_at_unix;
-        }
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                "SELECT generation AS value FROM auth_refresh_credential"
-            )
-            .await,
-            100
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
-                .await
-                .unwrap()
-                .is_valid()
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_write_failures_restore_previous_current_generation() {
-        for step in 1..=3 {
-            let (service, _) = fixture().await;
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
             let initial_grant = service
                 .create_initial_session_with_ids(
                     params("desktop-installation", ClientKind::Desktop),
@@ -5171,15 +5201,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            service.set_refresh_failpoint(step);
-            let error = service
-                .exchange_refresh(
-                    refresh_admission(initial_grant.refresh_token.expose_secret()),
-                    refresh_params(1),
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+            let mut raw = initial_grant.refresh_token.expose_secret().to_owned();
+            let mut last_expiry = initial_grant.refresh_expires_at_unix;
+            for generation in 1..=100 {
+                let rotated = service
+                    .exchange_refresh(refresh_admission(raw.as_str()), refresh_params(generation))
+                    .await
+                    .unwrap();
+                assert_eq!(rotated.refresh_generation, generation);
+                assert!(rotated.refresh_expires_at_unix >= last_expiry);
+                raw = rotated.refresh_token.expose_secret().to_owned();
+                last_expiry = rotated.refresh_expires_at_unix;
+            }
             assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
             assert_eq!(
                 scalar_i64(
@@ -5187,16 +5220,62 @@ mod tests {
                     "SELECT generation AS value FROM auth_refresh_credential"
                 )
                 .await,
-                0
+                100
             );
-            assert_eq!(
-                scalar_i64(
-                    &service.database,
-                    "SELECT refresh_generation AS value FROM auth_session"
-                )
-                .await,
-                0
+            assert!(
+                pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                    .await
+                    .unwrap()
+                    .is_valid()
             );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_write_failures_restore_previous_current_generation() {
+        for step in 1..=3 {
+            pioneer_postgres_test::with_database(async |test_database| {
+                let (service, _) = fixture(test_database).await;
+                let initial_grant = service
+                    .create_initial_session_with_ids(
+                        params("desktop-installation", ClientKind::Desktop),
+                        ids(1),
+                    )
+                    .await
+                    .unwrap();
+                service.set_refresh_failpoint(step);
+                let error = service
+                    .exchange_refresh(
+                        refresh_admission(initial_grant.refresh_token.expose_secret()),
+                        refresh_params(1),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+                assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+                assert_eq!(
+                    scalar_i64(
+                        &service.database,
+                        "SELECT generation AS value FROM auth_refresh_credential"
+                    )
+                    .await,
+                    0
+                );
+                assert_eq!(
+                    scalar_i64(
+                        &service.database,
+                        "SELECT refresh_generation AS value FROM auth_session"
+                    )
+                    .await,
+                    0
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
         }
     }
 
@@ -5219,923 +5298,480 @@ mod tests {
 
     #[tokio::test]
     async fn expired_refresh_expires_session_and_deletes_current_credential() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &initial_grant).await;
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session SET created_at = datetime('now', '-2 days'), refresh_expires_at = datetime('now', '-1 day'); \
-                 UPDATE auth_refresh_credential SET issued_at = datetime('now', '-2 days'), expires_at = datetime('now', '-1 day')",
-            )
-            .await
-            .unwrap();
-
-        let error = service
-            .exchange_refresh(
-                refresh_admission(initial_grant.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), AuthErrorCode::SessionExpired);
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "expired"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
-        assert_eq!(
-            hook.0.lock().unwrap().as_slice(),
-            &[(
-                initial_grant.session.id.to_string(),
-                AuthSessionTerminationReason::SessionExpired,
-            )]
-        );
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &initial_grant).await;
             service
-                .validate_session_lease(principal.as_ref())
+                .database
+                .execute_unprepared(
+                    "UPDATE auth_session SET created_at = (CURRENT_TIMESTAMP - INTERVAL '2 days'), refresh_expires_at = (CURRENT_TIMESTAMP - INTERVAL '1 day'); \
+                     UPDATE auth_refresh_credential SET issued_at = (CURRENT_TIMESTAMP - INTERVAL '2 days'), expires_at = (CURRENT_TIMESTAMP - INTERVAL '1 day')",
+                )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionExpired
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                .unwrap();
+
+            let error = service
+                .exchange_refresh(
+                    refresh_admission(initial_grant.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
                 .await
-                .unwrap()
-                .is_valid()
-        );
+                .unwrap_err();
+            assert_eq!(error.code(), AuthErrorCode::SessionExpired);
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "expired"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
+            assert_eq!(
+                hook.0.lock().unwrap().as_slice(),
+                &[(
+                    initial_grant.session.id.to_string(),
+                    AuthSessionTerminationReason::SessionExpired,
+                )]
+            );
+            assert_eq!(
+                service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionExpired
+            );
+            assert!(
+                pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn maintenance_expires_stale_session_atomically_before_disconnect() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session SET created_at = datetime('now', '-2 days'), refresh_expires_at = datetime('now', '-1 day'); \
-                 UPDATE auth_refresh_credential SET issued_at = datetime('now', '-2 days'), expires_at = datetime('now', '-1 day')",
-            )
-            .await
-            .unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE auth_session SET created_at = (CURRENT_TIMESTAMP - INTERVAL '2 days'), refresh_expires_at = (CURRENT_TIMESTAMP - INTERVAL '1 day'); \
+                     UPDATE auth_refresh_credential SET issued_at = (CURRENT_TIMESTAMP - INTERVAL '2 days'), expires_at = (CURRENT_TIMESTAMP - INTERVAL '1 day')",
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(
-            service
-                .expire_stale_sessions(unix_timestamp_secs().unwrap(), 1)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "expired"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
-        assert_eq!(
-            scalar_text(&service.database, "SELECT status AS value FROM device").await,
-            "revoked"
-        );
-        assert_eq!(
-            hook.0.lock().unwrap().as_slice(),
-            &[(
-                initial_grant.session.id.to_string(),
-                AuthSessionTerminationReason::SessionExpired,
-            )]
-        );
-        assert_eq!(
-            service
-                .expire_stale_sessions(unix_timestamp_secs().unwrap(), 1)
-                .await
-                .unwrap(),
-            0
-        );
+            assert_eq!(
+                service
+                    .expire_stale_sessions(unix_timestamp_secs().unwrap(), 1)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "expired"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
+            assert_eq!(
+                scalar_text(&service.database, "SELECT status AS value FROM device").await,
+                "revoked"
+            );
+            assert_eq!(
+                hook.0.lock().unwrap().as_slice(),
+                &[(
+                    initial_grant.session.id.to_string(),
+                    AuthSessionTerminationReason::SessionExpired,
+                )]
+            );
+            assert_eq!(
+                service
+                    .expire_stale_sessions(unix_timestamp_secs().unwrap(), 1)
+                    .await
+                    .unwrap(),
+                0
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn signed_older_generation_reuse_revokes_family_but_unknown_token_does_not() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let old = initial_grant.refresh_token.expose_secret().to_owned();
-        let generation_one = service
-            .exchange_refresh(refresh_admission(old.as_str()), refresh_params(1))
-            .await
-            .unwrap();
-        service
-            .exchange_refresh(
-                refresh_admission(generation_one.refresh_token.expose_secret()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap();
-        let reuse = service
-            .exchange_refresh(refresh_admission(old.as_str()), refresh_params(3))
-            .await
-            .unwrap_err();
-        assert_eq!(reuse.code(), AuthErrorCode::SessionCompromised);
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "revoked"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT revoke_reason AS value FROM auth_session"
-            )
-            .await,
-            "refresh_reuse"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
-        assert_eq!(hook.0.lock().unwrap().len(), 1);
-
-        let (other, _) = fixture().await;
-        let active = other
-            .create_initial_session_with_ids(
-                params("other-installation", ClientKind::Desktop),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        assert!(
-            other
-                .exchange_refresh(
-                    refresh_admission(
-                        format!(
-                            "{}{}",
-                            pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
-                            "u".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
-                        )
-                        .as_str(),
-                    ),
-                    refresh_params(1),
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
                 .await
-                .is_err()
-        );
-        assert_eq!(
-            scalar_text(&other.database, "SELECT status AS value FROM auth_session").await,
-            "active"
-        );
-        assert!(!active.refresh_token.expose_secret().is_empty());
+                .unwrap();
+            let old = initial_grant.refresh_token.expose_secret().to_owned();
+            let generation_one = service
+                .exchange_refresh(refresh_admission(old.as_str()), refresh_params(1))
+                .await
+                .unwrap();
+            service
+                .exchange_refresh(
+                    refresh_admission(generation_one.refresh_token.expose_secret()),
+                    refresh_params(2),
+                )
+                .await
+                .unwrap();
+            let reuse = service
+                .exchange_refresh(refresh_admission(old.as_str()), refresh_params(3))
+                .await
+                .unwrap_err();
+            assert_eq!(reuse.code(), AuthErrorCode::SessionCompromised);
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "revoked"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT revoke_reason AS value FROM auth_session"
+                )
+                .await,
+                "refresh_reuse"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
+            assert_eq!(hook.0.lock().unwrap().len(), 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (other, _) = fixture(test_database).await;
+            let active = other
+                .create_initial_session_with_ids(
+                    params("other-installation", ClientKind::Desktop),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            assert!(
+                other
+                    .exchange_refresh(
+                        refresh_admission(
+                            format!(
+                                "{}{}",
+                                pioneer_protocol::REFRESH_CREDENTIAL_PREFIX,
+                                "u".repeat(pioneer_protocol::REFRESH_CREDENTIAL_BODY_LEN)
+                            )
+                            .as_str(),
+                        ),
+                        refresh_params(1),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                scalar_text(&other.database, "SELECT status AS value FROM auth_session").await,
+                "active"
+            );
+            assert!(!active.refresh_token.expose_secret().is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn expired_prior_generation_cannot_revoke_an_active_session() {
-        let (service, _) = fixture().await;
-        let initial = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let rotated = service
-            .exchange_refresh(
-                refresh_admission(initial.refresh_token.expose_secret()),
-                refresh_params(1),
-            )
-            .await
-            .unwrap();
-        let expired_prior = service.opaque_credentials.refresh_from_nonce(
-            &initial.session.id,
-            &initial.session.token_family_id,
-            0,
-            unix_timestamp_secs().unwrap() - 1,
-            &[9; 32],
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let initial = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let rotated = service
+                .exchange_refresh(
+                    refresh_admission(initial.refresh_token.expose_secret()),
+                    refresh_params(1),
+                )
+                .await
+                .unwrap();
+            let expired_prior = service.opaque_credentials.refresh_from_nonce(
+                &initial.session.id,
+                &initial.session.token_family_id,
+                0,
+                unix_timestamp_secs().unwrap() - 1,
+                &[9; 32],
+            );
 
-        let error = service
-            .exchange_refresh(
-                refresh_admission(expired_prior.expose_for_exchange()),
-                refresh_params(2),
-            )
-            .await
-            .unwrap_err();
+            let error = service
+                .exchange_refresh(
+                    refresh_admission(expired_prior.expose_for_exchange()),
+                    refresh_params(2),
+                )
+                .await
+                .unwrap_err();
 
-        assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "active"
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
-        assert!(!rotated.refresh_token.expose_secret().is_empty());
+            assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "active"
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 1);
+            assert!(!rotated.refresh_token.expose_secret().is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_same_refresh_has_one_rotation_then_compromise_revoke() {
-        let (service, _) = fixture().await;
-        let service = Arc::new(service);
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let raw = initial_grant.refresh_token.expose_secret().to_owned();
-        let left = {
-            let service = service.clone();
-            let raw = raw.clone();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&raw), refresh_params(1))
-                    .await
-            })
-        };
-        let right = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&raw), refresh_params(2))
-                    .await
-            })
-        };
-        let outcomes = [left.await.unwrap(), right.await.unwrap()];
-        assert_eq!(outcomes.iter().filter(|value| value.is_ok()).count(), 1);
-        assert_eq!(outcomes.iter().filter(|value| value.is_err()).count(), 1);
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "revoked"
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let service = Arc::new(service);
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let raw = initial_grant.refresh_token.expose_secret().to_owned();
+            let left = {
+                let service = service.clone();
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&raw), refresh_params(1))
+                        .await
+                })
+            };
+            let right = {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&raw), refresh_params(2))
+                        .await
+                })
+            };
+            let outcomes = [left.await.unwrap(), right.await.unwrap()];
+            assert_eq!(outcomes.iter().filter(|value| value.is_ok()).count(), 1);
+            assert_eq!(outcomes.iter().filter(|value| value.is_err()).count(), 1);
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "revoked"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_same_refresh_request_is_idempotent() {
-        let (service, _) = fixture().await;
-        let service = Arc::new(service);
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let raw = initial_grant.refresh_token.expose_secret().to_owned();
-        let left = {
-            let service = service.clone();
-            let raw = raw.clone();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&raw), refresh_params(1))
-                    .await
-            })
-        };
-        let right = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&raw), refresh_params(1))
-                    .await
-            })
-        };
-        let left = left.await.unwrap().unwrap();
-        let right = right.await.unwrap().unwrap();
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let service = Arc::new(service);
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let raw = initial_grant.refresh_token.expose_secret().to_owned();
+            let left = {
+                let service = service.clone();
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&raw), refresh_params(1))
+                        .await
+                })
+            };
+            let right = {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&raw), refresh_params(1))
+                        .await
+                })
+            };
+            let left = left.await.unwrap().unwrap();
+            let right = right.await.unwrap().unwrap();
 
-        assert_eq!(left.refresh_generation, 1);
-        assert_eq!(right.refresh_generation, 1);
-        assert_eq!(
-            left.refresh_token.expose_secret(),
-            right.refresh_token.expose_secret()
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "active"
-        );
+            assert_eq!(left.refresh_generation, 1);
+            assert_eq!(right.refresh_generation, 1);
+            assert_eq!(
+                left.refresh_token.expose_secret(),
+                right.refresh_token.expose_secret()
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "active"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_refreshes_for_different_sessions_remain_independent() {
-        let (service, _) = fixture().await;
-        let service = Arc::new(service);
-        let desktop = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let mobile = service
-            .create_initial_session_with_ids(
-                params("mobile-installation", ClientKind::Mobile),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        let desktop_session_id = desktop.session.id.clone();
-        let mobile_session_id = mobile.session.id.clone();
-        let left = {
-            let service = service.clone();
-            let refresh = desktop.refresh_token.expose_secret().to_owned();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
-                    .await
-            })
-        };
-        let right = {
-            let service = service.clone();
-            let refresh = mobile.refresh_token.expose_secret().to_owned();
-            tokio::spawn(async move {
-                service
-                    .exchange_refresh(refresh_admission(&refresh), refresh_params(2))
-                    .await
-            })
-        };
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let service = Arc::new(service);
+            let desktop = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let mobile = service
+                .create_initial_session_with_ids(
+                    params("mobile-installation", ClientKind::Mobile),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            let desktop_session_id = desktop.session.id.clone();
+            let mobile_session_id = mobile.session.id.clone();
+            let left = {
+                let service = service.clone();
+                let refresh = desktop.refresh_token.expose_secret().to_owned();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
+                        .await
+                })
+            };
+            let right = {
+                let service = service.clone();
+                let refresh = mobile.refresh_token.expose_secret().to_owned();
+                tokio::spawn(async move {
+                    service
+                        .exchange_refresh(refresh_admission(&refresh), refresh_params(2))
+                        .await
+                })
+            };
 
-        let desktop_rotated = left.await.unwrap().unwrap();
-        let mobile_rotated = right.await.unwrap().unwrap();
-        assert_eq!(desktop_rotated.session.id, desktop_session_id);
-        assert_eq!(mobile_rotated.session.id, mobile_session_id);
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'active'").await,
-            2
-        );
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 2);
+            let desktop_rotated = left.await.unwrap().unwrap();
+            let mobile_rotated = right.await.unwrap().unwrap();
+            assert_eq!(desktop_rotated.session.id, desktop_session_id);
+            assert_eq!(mobile_rotated.session.id, mobile_session_id);
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'active'").await,
+                2
+            );
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn pending_device_expiry_is_bounded_and_preserves_terminal_audit_rows() {
-        let (service, _identity) = fixture().await;
-        let initial_grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &initial_grant).await;
-        let pending = service.create_device(principal.as_ref()).await.unwrap();
-
-        assert_eq!(
-            service
-                .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 1)
-                .await
-                .unwrap(),
-            0
-        );
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session \
-                 SET activation_expires_at = created_at \
-                 WHERE status = 'pending'",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 0)
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'pending'").await,
-            1
-        );
-        assert_eq!(
-            service
-                .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 1)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(count(&service.database, "auth_session").await, 2);
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'expired'").await,
-            1
-        );
-        assert_eq!(
-            count_where(&service.database, "device", "status = 'revoked'").await,
-            1
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT status AS value FROM auth_session WHERE id = '{}'",
-                    pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            "expired"
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
-                .await
-                .unwrap()
-                .is_valid()
-        );
-    }
-
-    #[tokio::test]
-    async fn session_management_lists_and_revokes_only_owned_session() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let desktop = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let mobile = service
-            .create_initial_session_with_ids(
-                params("mobile-installation", ClientKind::Mobile),
-                ids(2),
-            )
-            .await
-            .unwrap();
-        let desktop_principal = authenticate_grant(&service, &desktop).await;
-        let mobile_principal = authenticate_grant(&service, &mobile).await;
-
-        let listed = service
-            .list_sessions(desktop_principal.as_ref())
-            .await
-            .unwrap();
-        assert_eq!(listed.sessions.len(), 2);
-        assert_eq!(
-            listed.sessions.iter().filter(|item| item.current).count(),
-            1
-        );
-        assert!(listed.sessions.iter().all(|item| {
-            item.device.id == desktop.device.id || item.device.id == mobile.device.id
-        }));
-
-        let revoked = service
-            .revoke_owned_session(
-                desktop_principal.as_ref(),
-                &mobile.session.id,
-                Some(AuthSessionStatus::Active),
-                AuthSessionRevokeReason::SelfRevoke,
-            )
-            .await
-            .unwrap();
-        assert!(revoked.revoked);
-        assert!(hook.0.lock().unwrap().is_empty());
-        service
-            .disconnect_committed_session(
-                &mobile.session.id,
-                AuthSessionTerminationReason::SessionRevoked,
-            )
-            .await;
-        assert_eq!(
-            hook.0.lock().unwrap().as_slice(),
-            &[(
-                mobile.session.id.to_string(),
-                AuthSessionTerminationReason::SessionRevoked,
-            )]
-        );
-        service
-            .validate_session_lease(desktop_principal.as_ref())
-            .await
-            .unwrap();
-        assert_eq!(
-            service
-                .validate_session_lease(mobile_principal.as_ref())
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_refresh_credential",
-                "session_id = 'S00000000000000000002'"
-            )
-            .await,
-            0
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
-                .await
-                .unwrap()
-                .is_valid()
-        );
-    }
-
-    #[tokio::test]
-    async fn logout_commits_before_disconnect_and_denies_subsequent_lease() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let grant = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &grant).await;
-        let refresh = grant.refresh_token.expose_secret().to_owned();
-
-        let response = service.logout(principal.as_ref()).await.unwrap();
-        assert!(response.revoked);
-        assert!(hook.0.lock().unwrap().is_empty());
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT status AS value FROM auth_session"
-            )
-            .await,
-            "revoked"
-        );
-        service
-            .disconnect_committed_session(
-                &response.session_id,
-                AuthSessionTerminationReason::SessionRevoked,
-            )
-            .await;
-        assert_eq!(hook.0.lock().unwrap().len(), 1);
-        assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
-        assert_eq!(
-            service
-                .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                "SELECT revoke_reason AS value FROM auth_session"
-            )
-            .await,
-            "logout"
-        );
-        assert_eq!(
-            service
-                .validate_session_lease(principal.as_ref())
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::SessionRevoked
-        );
-    }
-
-    #[tokio::test]
-    async fn device_activation_is_one_use_and_creates_same_principal_distinct_session() {
-        let (service, _) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let device_activation = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let raw = device_activation.activation_code.expose_secret().to_owned();
-        assert_eq!(raw.len(), 9);
-        assert_eq!(raw.as_bytes()[4], b'-');
-        assert!(pioneer_protocol::normalize_device_activation_code(&raw).is_ok());
-        assert!(!format!("{device_activation:?}").contains(&raw));
-        assert!(!database_text(&service.database).await.contains(&raw));
-
-        let accepted = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, &raw),
-                device_activation_params("mobile-installation"),
-                issued_ids(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(accepted.principal.id, creator.principal.id);
-        assert_ne!(accepted.device.id, creator.device.id);
-        assert_ne!(accepted.session.id, creator.session.id);
-        assert_eq!(accepted.refresh_generation, 0);
-        let replay = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, &raw),
-                device_activation_params("other-installation"),
-                issued_ids(3),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(replay.code(), AuthErrorCode::DeviceActivationConsumed);
-    }
-
-    #[tokio::test]
-    async fn member_device_and_session_lifecycle_is_owner_scoped_while_local_cli_stays_superuser() {
-        let (service, identity) = fixture().await;
-        let member_initial = service
-            .create_initial_session_with_ids(
-                params("member-primary-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let (_, member_access) = member_access_credential(&service, &member_initial).await;
-        let member = service.authenticate_access(member_access).await.unwrap();
-
-        let member_pending = service.create_device(member.as_ref()).await.unwrap();
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
-                    member_pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            member.principal_id.as_str()
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT created_by_session_id AS value FROM auth_session WHERE id='{}'",
-                    member_pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            member.session_id.as_str()
-        );
-        let member_paired = service
-            .activate_device_with_ids(
-                device_activation_admission(
-                    &service,
-                    member_pending.activation_code.expose_secret(),
-                ),
-                device_activation_params("member-paired-installation"),
-                issued_ids(2),
-            )
-            .await
-            .unwrap();
-        assert_eq!(member_paired.principal.id, member.principal_id);
-        assert_eq!(member_paired.principal.kind, PrincipalKind::User);
-        let member_paired_principal = authenticate_grant(&service, &member_paired).await;
-        assert_eq!(
-            member_paired_principal
-                .role_key
-                .as_ref()
-                .map(RoleKey::as_str),
-            Some("member")
-        );
-
-        let superuser = service
-            .create_initial_session_with_ids(
-                params("superuser-installation", ClientKind::Desktop),
-                ids(3),
-            )
-            .await
-            .unwrap();
-        let superuser_principal = authenticate_grant(&service, &superuser).await;
-        let member_sessions = service.list_sessions(member.as_ref()).await.unwrap();
-        assert_eq!(member_sessions.sessions.len(), 2);
-        assert!(member_sessions.sessions.iter().all(|item| {
-            item.session.id == member_initial.session.id
-                || item.session.id == member_paired.session.id
-        }));
-        assert_eq!(
-            service
-                .revoke_owned_session(
-                    member.as_ref(),
-                    &superuser.session.id,
-                    None,
-                    AuthSessionRevokeReason::SelfRevoke,
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let initial_grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::InvalidCredential,
-        );
-        service
-            .validate_session_lease(superuser_principal.as_ref())
-            .await
-            .expect("cross-principal revoke cannot affect peer session");
+                .unwrap();
+            let principal = authenticate_grant(&service, &initial_grant).await;
+            let pending = service.create_device(principal.as_ref()).await.unwrap();
 
-        let own_revoke = service
-            .revoke_owned_session(
-                member.as_ref(),
-                &member_paired.session.id,
-                None,
-                AuthSessionRevokeReason::SelfRevoke,
-            )
-            .await
-            .unwrap();
-        assert!(own_revoke.revoked);
-        service
-            .validate_session_lease(member.as_ref())
-            .await
-            .expect("revoking a peer device preserves current Member session");
-
-        let local_pending = service.create_local_device().await.unwrap();
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
-                    local_pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            identity.superuser.id.as_str()
-        );
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                format!(
-                    "SELECT COUNT(*) AS value FROM auth_session \
-                     WHERE id='{}' AND created_by_session_id IS NULL",
-                    local_pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            service
-                .revoke_owned_session(
-                    member.as_ref(),
-                    &local_pending.session_id,
-                    None,
-                    AuthSessionRevokeReason::SelfRevoke,
-                )
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::InvalidCredential,
-        );
-    }
-
-    #[tokio::test]
-    async fn activation_rejects_pending_device_owner_substitution() {
-        let (service, _identity) = fixture().await;
-        let member_initial = service
-            .create_initial_session_with_ids(
-                params("member-owner-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let (_, member_access) = member_access_credential(&service, &member_initial).await;
-        let member = service.authenticate_access(member_access).await.unwrap();
-        let pending = service.create_device(member.as_ref()).await.unwrap();
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(\
-                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                    created_at,updated_at,removed_at\
-                 ) VALUES(\
-                    'P0000000000000000000B','{}','user','member','active',\
-                    'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                 );",
-                    service.identity.gateway.id
-                )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "UPDATE device SET principal_id='P0000000000000000000B' WHERE id='{}'",
-                    pending.device_id
-                )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            service
-                .activate_device_with_ids(
-                    device_activation_admission(&service, pending.activation_code.expose_secret(),),
-                    device_activation_params("substituted-owner-installation"),
-                    issued_ids(2),
-                )
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::DeviceActivationConsumed,
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT status AS value FROM auth_session WHERE id='{}'",
-                    pending.session_id
-                )
-                .as_str(),
-            )
-            .await,
-            "pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn five_wrong_codes_for_one_locator_revoke_the_pending_request() {
-        let (service, _) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let pending = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let correct = pioneer_protocol::normalize_device_activation_code(
-            pending.activation_code.expose_secret(),
-        )
-        .unwrap();
-        let wrong_suffixes = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
-            .iter()
-            .copied()
-            .map(char::from)
-            .filter(|candidate| Some(*candidate) != correct.chars().last())
-            .take(5)
-            .collect::<Vec<_>>();
-
-        for (index, suffix) in wrong_suffixes.into_iter().enumerate() {
-            let mut wrong = correct.clone();
-            wrong.replace_range(7..8, suffix.to_string().as_str());
-            let error = service
-                .activate_device_with_ids(
-                    device_activation_admission(&service, wrong.as_str()),
-                    device_activation_params("attacker-installation"),
-                    issued_ids(u8::try_from(index + 20).unwrap()),
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
             assert_eq!(
-                scalar_i64(
-                    &service.database,
-                    format!(
-                        "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
-                        pending.session_id
-                    )
-                    .as_str(),
+                service
+                    .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 1)
+                    .await
+                    .unwrap(),
+                0
+            );
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE auth_session \
+                     SET activation_expires_at = created_at \
+                     WHERE status = 'pending'",
                 )
-                .await,
-                i64::try_from(index + 1).unwrap()
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 0)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'pending'").await,
+                1
+            );
+            assert_eq!(
+                service
+                    .expire_pending_device_sessions(unix_timestamp_secs().unwrap(), 1)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(count(&service.database, "auth_session").await, 2);
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'expired'").await,
+                1
+            );
+            assert_eq!(
+                count_where(&service.database, "device", "status = 'revoked'").await,
+                1
             );
             assert_eq!(
                 scalar_text(
@@ -6147,441 +5783,681 @@ mod tests {
                     .as_str(),
                 )
                 .await,
-                if index == 4 { "revoked" } else { "pending" }
+                "expired"
             );
-        }
+            assert!(
+                pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT revoke_reason AS value FROM auth_session WHERE id = '{}'",
-                    pending.session_id
+    #[tokio::test]
+    async fn session_management_lists_and_revokes_only_owned_session() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let desktop = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
-                .as_str(),
-            )
-            .await,
-            "activation_attempts_exceeded"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT status AS value FROM device WHERE id = '{}'",
-                    pending.device_id
-                )
-                .as_str(),
-            )
-            .await,
-            "revoked"
-        );
-        let correct_after_lockout = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, pending.activation_code.expose_secret()),
-                device_activation_params("mobile-installation"),
-                issued_ids(30),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            correct_after_lockout.code(),
-            AuthErrorCode::DeviceActivationConsumed
-        );
-        assert!(
-            pioneer_crud::scan_auth_persistence_invariants(&service.database)
                 .await
-                .unwrap()
-                .is_valid()
-        );
+                .unwrap();
+            let mobile = service
+                .create_initial_session_with_ids(
+                    params("mobile-installation", ClientKind::Mobile),
+                    ids(2),
+                )
+                .await
+                .unwrap();
+            let desktop_principal = authenticate_grant(&service, &desktop).await;
+            let mobile_principal = authenticate_grant(&service, &mobile).await;
+
+            let listed = service
+                .list_sessions(desktop_principal.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(listed.sessions.len(), 2);
+            assert_eq!(
+                listed.sessions.iter().filter(|item| item.current).count(),
+                1
+            );
+            assert!(listed.sessions.iter().all(|item| {
+                item.device.id == desktop.device.id || item.device.id == mobile.device.id
+            }));
+
+            let revoked = service
+                .revoke_owned_session(
+                    desktop_principal.as_ref(),
+                    &mobile.session.id,
+                    Some(AuthSessionStatus::Active),
+                    AuthSessionRevokeReason::SelfRevoke,
+                )
+                .await
+                .unwrap();
+            assert!(revoked.revoked);
+            assert!(hook.0.lock().unwrap().is_empty());
+            service
+                .disconnect_committed_session(
+                    &mobile.session.id,
+                    AuthSessionTerminationReason::SessionRevoked,
+                )
+                .await;
+            assert_eq!(
+                hook.0.lock().unwrap().as_slice(),
+                &[(
+                    mobile.session.id.to_string(),
+                    AuthSessionTerminationReason::SessionRevoked,
+                )]
+            );
+            service
+                .validate_session_lease(desktop_principal.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .validate_session_lease(mobile_principal.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "auth_refresh_credential",
+                    "session_id = 'S00000000000000000002'"
+                )
+                .await,
+                0
+            );
+            assert!(
+                pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_commits_before_disconnect_and_denies_subsequent_lease() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let grant = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &grant).await;
+            let refresh = grant.refresh_token.expose_secret().to_owned();
+
+            let response = service.logout(principal.as_ref()).await.unwrap();
+            assert!(response.revoked);
+            assert!(hook.0.lock().unwrap().is_empty());
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT status AS value FROM auth_session"
+                )
+                .await,
+                "revoked"
+            );
+            service
+                .disconnect_committed_session(
+                    &response.session_id,
+                    AuthSessionTerminationReason::SessionRevoked,
+                )
+                .await;
+            assert_eq!(hook.0.lock().unwrap().len(), 1);
+            assert_eq!(count(&service.database, "auth_refresh_credential").await, 0);
+            assert_eq!(
+                service
+                    .exchange_refresh(refresh_admission(&refresh), refresh_params(1))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    "SELECT revoke_reason AS value FROM auth_session"
+                )
+                .await,
+                "logout"
+            );
+            assert_eq!(
+                service
+                    .validate_session_lease(principal.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::SessionRevoked
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_activation_is_one_use_and_creates_same_principal_distinct_session() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let device_activation = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let raw = device_activation.activation_code.expose_secret().to_owned();
+            assert_eq!(raw.len(), 9);
+            assert_eq!(raw.as_bytes()[4], b'-');
+            assert!(pioneer_protocol::normalize_device_activation_code(&raw).is_ok());
+            assert!(!format!("{device_activation:?}").contains(&raw));
+            assert!(!database_text(&service.database).await.contains(&raw));
+
+            let accepted = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, &raw),
+                    device_activation_params("mobile-installation"),
+                    issued_ids(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(accepted.principal.id, creator.principal.id);
+            assert_ne!(accepted.device.id, creator.device.id);
+            assert_ne!(accepted.session.id, creator.session.id);
+            assert_eq!(accepted.refresh_generation, 0);
+            let replay = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, &raw),
+                    device_activation_params("other-installation"),
+                    issued_ids(3),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(replay.code(), AuthErrorCode::DeviceActivationConsumed);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn member_device_and_session_lifecycle_is_owner_scoped_while_local_cli_stays_superuser() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let member_initial = service
+                .create_initial_session_with_ids(
+                    params("member-primary-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let (_, member_access) = member_access_credential(&service, &member_initial).await;
+            let member = service.authenticate_access(member_access).await.unwrap();
+
+            let member_pending = service.create_device(member.as_ref()).await.unwrap();
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
+                        member_pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                member.principal_id.as_str()
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT created_by_session_id AS value FROM auth_session WHERE id='{}'",
+                        member_pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                member.session_id.as_str()
+            );
+            let member_paired = service
+                .activate_device_with_ids(
+                    device_activation_admission(
+                        &service,
+                        member_pending.activation_code.expose_secret(),
+                    ),
+                    device_activation_params("member-paired-installation"),
+                    issued_ids(2),
+                )
+                .await
+                .unwrap();
+            assert_eq!(member_paired.principal.id, member.principal_id);
+            assert_eq!(member_paired.principal.kind, PrincipalKind::User);
+            let member_paired_principal = authenticate_grant(&service, &member_paired).await;
+            assert_eq!(
+                member_paired_principal
+                    .role_key
+                    .as_ref()
+                    .map(RoleKey::as_str),
+                Some("member")
+            );
+
+            let superuser = service
+                .create_initial_session_with_ids(
+                    params("superuser-installation", ClientKind::Desktop),
+                    ids(3),
+                )
+                .await
+                .unwrap();
+            let superuser_principal = authenticate_grant(&service, &superuser).await;
+            let member_sessions = service.list_sessions(member.as_ref()).await.unwrap();
+            assert_eq!(member_sessions.sessions.len(), 2);
+            assert!(member_sessions.sessions.iter().all(|item| {
+                item.session.id == member_initial.session.id
+                    || item.session.id == member_paired.session.id
+            }));
+            assert_eq!(
+                service
+                    .revoke_owned_session(
+                        member.as_ref(),
+                        &superuser.session.id,
+                        None,
+                        AuthSessionRevokeReason::SelfRevoke,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::InvalidCredential,
+            );
+            service
+                .validate_session_lease(superuser_principal.as_ref())
+                .await
+                .expect("cross-principal revoke cannot affect peer session");
+
+            let own_revoke = service
+                .revoke_owned_session(
+                    member.as_ref(),
+                    &member_paired.session.id,
+                    None,
+                    AuthSessionRevokeReason::SelfRevoke,
+                )
+                .await
+                .unwrap();
+            assert!(own_revoke.revoked);
+            service
+                .validate_session_lease(member.as_ref())
+                .await
+                .expect("revoking a peer device preserves current Member session");
+
+            let local_pending = service.create_local_device().await.unwrap();
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT principal_id AS value FROM auth_session WHERE id='{}'",
+                        local_pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                identity.superuser.id.as_str()
+            );
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    format!(
+                        "SELECT COUNT(*) AS value FROM auth_session \
+                         WHERE id='{}' AND created_by_session_id IS NULL",
+                        local_pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                service
+                    .revoke_owned_session(
+                        member.as_ref(),
+                        &local_pending.session_id,
+                        None,
+                        AuthSessionRevokeReason::SelfRevoke,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::InvalidCredential,
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_pending_device_owner_substitution() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let member_initial = service
+                .create_initial_session_with_ids(
+                    params("member-owner-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let (_, member_access) = member_access_credential(&service, &member_initial).await;
+            let member = service.authenticate_access(member_access).await.unwrap();
+            let pending = service.create_device(member.as_ref()).await.unwrap();
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(\
+                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                        created_at,updated_at,removed_at\
+                     ) VALUES(\
+                        'P0000000000000000000B','{}','user','member','active',\
+                        'Member B','member-b','member-b',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                     );",
+                        service.identity.gateway.id
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "UPDATE device SET principal_id='P0000000000000000000B' WHERE id='{}'",
+                        pending.device_id
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                service
+                    .activate_device_with_ids(
+                        device_activation_admission(
+                            &service,
+                            pending.activation_code.expose_secret(),
+                        ),
+                        device_activation_params("substituted-owner-installation"),
+                        issued_ids(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::DeviceActivationConsumed,
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT status AS value FROM auth_session WHERE id='{}'",
+                        pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                "pending"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn five_wrong_codes_for_one_locator_revoke_the_pending_request() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let pending = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let correct = pioneer_protocol::normalize_device_activation_code(
+                pending.activation_code.expose_secret(),
+            )
+            .unwrap();
+            let wrong_suffixes = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
+                .iter()
+                .copied()
+                .map(char::from)
+                .filter(|candidate| Some(*candidate) != correct.chars().last())
+                .take(5)
+                .collect::<Vec<_>>();
+
+            for (index, suffix) in wrong_suffixes.into_iter().enumerate() {
+                let mut wrong = correct.clone();
+                wrong.replace_range(7..8, suffix.to_string().as_str());
+                let error = service
+                    .activate_device_with_ids(
+                        device_activation_admission(&service, wrong.as_str()),
+                        device_activation_params("attacker-installation"),
+                        issued_ids(u8::try_from(index + 20).unwrap()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+                assert_eq!(
+                    scalar_i64(
+                        &service.database,
+                        format!(
+                            "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
+                            pending.session_id
+                        )
+                        .as_str(),
+                    )
+                    .await,
+                    i64::try_from(index + 1).unwrap()
+                );
+                assert_eq!(
+                    scalar_text(
+                        &service.database,
+                        format!(
+                            "SELECT status AS value FROM auth_session WHERE id = '{}'",
+                            pending.session_id
+                        )
+                        .as_str(),
+                    )
+                    .await,
+                    if index == 4 { "revoked" } else { "pending" }
+                );
+            }
+
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT revoke_reason AS value FROM auth_session WHERE id = '{}'",
+                        pending.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                "activation_attempts_exceeded"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT status AS value FROM device WHERE id = '{}'",
+                        pending.device_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                "revoked"
+            );
+            let correct_after_lockout = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, pending.activation_code.expose_secret()),
+                    device_activation_params("mobile-installation"),
+                    issued_ids(30),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                correct_after_lockout.code(),
+                AuthErrorCode::DeviceActivationConsumed
+            );
+            assert!(
+                pioneer_crud::scan_auth_persistence_invariants(&service.database)
+                    .await
+                    .unwrap()
+                    .is_valid()
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn historical_exact_code_does_not_bypass_current_request_attempt_counter() {
-        let (service, _) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let historical = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let current = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let mut wrong = pioneer_protocol::normalize_device_activation_code(
-            current.activation_code.expose_secret(),
-        )
-        .unwrap();
-        let replacement = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
-            .iter()
-            .copied()
-            .map(char::from)
-            .find(|candidate| Some(*candidate) != wrong.chars().last())
-            .unwrap();
-        wrong.replace_range(7..8, replacement.to_string().as_str());
-        let historical_hash = service
-            .opaque_credentials
-            .fingerprint_device_activation_raw(wrong.as_str());
-        let current_locator = pioneer_protocol::device_activation_locator(wrong.as_str()).unwrap();
-        let historical_locator = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
-            .iter()
-            .copied()
-            .map(char::from)
-            .find(|candidate| Some(*candidate) != current_locator.chars().next())
-            .unwrap()
-            .to_string();
-        let historical_locator_hash = service
-            .opaque_credentials
-            .fingerprint_device_activation_locator_symbol(historical_locator.as_str())
-            .unwrap();
-        service
-            .database
-            .execute_raw(Statement::from_sql_and_values(
-                service.database.get_database_backend(),
-                "UPDATE auth_session SET activation_token_hash = ?, activation_locator_hash = ? WHERE id = ?",
-                [
-                    historical_hash.to_vec().into(),
-                    historical_locator_hash.to_vec().into(),
-                    historical.session_id.to_string().into(),
-                ],
-            ))
-            .await
-            .unwrap();
-
-        let error = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, wrong.as_str()),
-                device_activation_params("attacker-installation"),
-                issued_ids(30),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                format!(
-                    "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
-                    current.session_id
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
-                .as_str(),
+                .await
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let historical = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let current = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let mut wrong = pioneer_protocol::normalize_device_activation_code(
+                current.activation_code.expose_secret(),
             )
-            .await,
-            1
-        );
+            .unwrap();
+            let replacement = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
+                .iter()
+                .copied()
+                .map(char::from)
+                .find(|candidate| Some(*candidate) != wrong.chars().last())
+                .unwrap();
+            wrong.replace_range(7..8, replacement.to_string().as_str());
+            let historical_hash = service
+                .opaque_credentials
+                .fingerprint_device_activation_raw(wrong.as_str());
+            let current_locator = pioneer_protocol::device_activation_locator(wrong.as_str()).unwrap();
+            let historical_locator = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
+                .iter()
+                .copied()
+                .map(char::from)
+                .find(|candidate| Some(*candidate) != current_locator.chars().next())
+                .unwrap()
+                .to_string();
+            let historical_locator_hash = service
+                .opaque_credentials
+                .fingerprint_device_activation_locator_symbol(historical_locator.as_str())
+                .unwrap();
+            service
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    service.database.get_database_backend(),
+                    "UPDATE auth_session SET activation_token_hash = $1, activation_locator_hash = $2 WHERE id = $3",
+                    [
+                        historical_hash.to_vec().into(),
+                        historical_locator_hash.to_vec().into(),
+                        historical.session_id.to_string().into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+
+            let error = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, wrong.as_str()),
+                    device_activation_params("attacker-installation"),
+                    issued_ids(30),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), AuthErrorCode::InvalidCredential);
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    format!(
+                        "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
+                        current.session_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                1
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn revoked_creator_session_cannot_authorize_device_activation_redemption() {
-        let (service, _identity) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let device_activation = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        service
-            .revoke_owned_session(
-                creator_principal.as_ref(),
-                &creator.session.id,
-                None,
-                AuthSessionRevokeReason::SelfRevoke,
-            )
-            .await
-            .unwrap();
-
-        let error = service
-            .activate_device_with_ids(
-                device_activation_admission(
-                    &service,
-                    device_activation.activation_code.expose_secret(),
-                ),
-                device_activation_params("mobile-installation"),
-                issued_ids(2),
-            )
-            .await
-            .unwrap_err();
-
-        assert_eq!(error.code(), AuthErrorCode::SessionRevoked);
-        assert_eq!(
-            count_where(&service.database, "device", "status = 'active'").await,
-            0
-        );
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'active'").await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn device_activation_atomically_replaces_an_existing_installation() {
-        let (service, _) = fixture().await;
-        let hook = Arc::new(RecordingDisconnectHook::default());
-        service.set_disconnect_hook(hook.clone());
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let first_device_activation = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let first_mobile = service
-            .activate_device_with_ids(
-                device_activation_admission(
-                    &service,
-                    first_device_activation.activation_code.expose_secret(),
-                ),
-                device_activation_params("mobile-installation"),
-                issued_ids(2),
-            )
-            .await
-            .unwrap();
-
-        let replacement_device_activation = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let replacement = service
-            .activate_device_with_ids(
-                device_activation_admission(
-                    &service,
-                    replacement_device_activation
-                        .activation_code
-                        .expose_secret(),
-                ),
-                device_activation_params("mobile-installation"),
-                issued_ids(3),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(replacement.device.id, first_mobile.device.id);
-        assert_ne!(replacement.session.id, first_mobile.session.id);
-        let old_device_status_query = format!(
-            "SELECT status AS value FROM device WHERE id = '{}'",
-            first_mobile.device.id
-        );
-        assert_eq!(
-            scalar_text(&service.database, &old_device_status_query).await,
-            "revoked"
-        );
-        let old_session_status_query = format!(
-            "SELECT status AS value FROM auth_session WHERE id = '{}'",
-            first_mobile.session.id
-        );
-        assert_eq!(
-            scalar_text(&service.database, &old_session_status_query).await,
-            "revoked"
-        );
-        assert_eq!(
-            hook.0.lock().unwrap().as_slice(),
-            &[(
-                first_mobile.session.id.to_string(),
-                AuthSessionTerminationReason::SessionRevoked,
-            )]
-        );
-        assert_eq!(
-            count_where(&service.database, "device", "status = 'active'").await,
-            2
-        );
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'active'").await,
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn second_device_activation_create_replaces_previous_and_explicit_revoke_is_terminal() {
-        let (service, _identity) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &creator).await;
-        let first = service.create_device(principal.as_ref()).await.unwrap();
-        let first_raw = first.activation_code.expose_secret().to_owned();
-        let second = service.create_device(principal.as_ref()).await.unwrap();
-        assert_eq!(
-            service
-                .list_sessions(principal.as_ref())
-                .await
-                .unwrap()
-                .sessions
-                .len(),
-            1,
-            "pending device sessions are not installed devices"
-        );
-        assert_eq!(
-            service
-                .activate_device_with_ids(
-                    device_activation_admission(&service, &first_raw),
-                    device_activation_params("mobile-installation"),
-                    issued_ids(2),
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::DeviceActivationConsumed
-        );
-        assert_eq!(
-            scalar_i64(
-                &service.database,
-                &format!(
-                    "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
-                    second.session_id
-                ),
-            )
-            .await,
-            0,
-            "an exact consumed credential must not count against a newer request sharing its locator"
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                &format!(
-                    "SELECT status AS value FROM auth_session WHERE id = '{}'",
-                    second.session_id
-                ),
-            )
-            .await,
-            "pending"
-        );
-        let revoked = service
-            .revoke_owned_session(
-                principal.as_ref(),
-                &second.session_id,
-                Some(AuthSessionStatus::Pending),
-                AuthSessionRevokeReason::DeviceRevoke,
-            )
-            .await
-            .unwrap();
-        assert!(revoked.revoked);
-        assert_eq!(
-            service
-                .list_sessions(principal.as_ref())
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let device_activation = service
+                .create_device(creator_principal.as_ref())
                 .await
-                .unwrap()
-                .sessions
-                .len(),
-            1,
-            "revoked unactivated rows must not break or pollute device listing"
-        );
-        assert_eq!(
+                .unwrap();
             service
-                .activate_device_with_ids(
-                    device_activation_admission(&service, second.activation_code.expose_secret(),),
-                    device_activation_params("mobile-installation"),
-                    issued_ids(2),
+                .revoke_owned_session(
+                    creator_principal.as_ref(),
+                    &creator.session.id,
+                    None,
+                    AuthSessionRevokeReason::SelfRevoke,
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::DeviceActivationConsumed
-        );
-    }
+                .unwrap();
 
-    #[tokio::test]
-    async fn late_pending_cancel_does_not_revoke_an_already_activated_session() {
-        let (service, _identity) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let creator_principal = authenticate_grant(&service, &creator).await;
-        let created = service
-            .create_device(creator_principal.as_ref())
-            .await
-            .unwrap();
-        let activated = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, created.activation_code.expose_secret()),
-                device_activation_params("mobile-installation"),
-                issued_ids(2),
-            )
-            .await
-            .unwrap();
-
-        let cancelled = service
-            .revoke_owned_session(
-                creator_principal.as_ref(),
-                &activated.session.id,
-                Some(AuthSessionStatus::Pending),
-                AuthSessionRevokeReason::DeviceRevoke,
-            )
-            .await
-            .unwrap();
-        assert!(!cancelled.revoked);
-
-        let activated_principal = authenticate_grant(&service, &activated).await;
-        service
-            .validate_session_lease(activated_principal.as_ref())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn expired_and_gateway_mismatched_device_activation_fail_closed() {
-        let (service, _) = fixture().await;
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &creator).await;
-        let device_activation = service.create_device(principal.as_ref()).await.unwrap();
-        let mismatched_admission = RestrictedAdmission::new(
-            PresentedCredential::classify(device_activation.activation_code.expose_secret())
-                .unwrap(),
-            RestrictedAuthContext::DeviceActivation(super::super::DeviceActivationContext {
-                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
-            }),
-        );
-        assert_eq!(
-            service
-                .activate_device_with_ids(
-                    mismatched_admission,
-                    device_activation_params("mobile-installation"),
-                    issued_ids(2),
-                )
-                .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::GatewayIdentityMismatch
-        );
-        service
-            .database
-            .execute_unprepared(
-                "UPDATE auth_session SET activation_expires_at = created_at WHERE status = 'pending'",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            service
+            let error = service
                 .activate_device_with_ids(
                     device_activation_admission(
                         &service,
@@ -6591,149 +6467,458 @@ mod tests {
                     issued_ids(2),
                 )
                 .await
-                .unwrap_err()
-                .code(),
-            AuthErrorCode::DeviceActivationExpired
-        );
-        assert_eq!(
-            count_where(&service.database, "auth_session", "status = 'expired'").await,
-            1
-        );
+                .unwrap_err();
+
+            assert_eq!(error.code(), AuthErrorCode::SessionRevoked);
+            assert_eq!(
+                count_where(&service.database, "device", "status = 'active'").await,
+                0
+            );
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'active'").await,
+                0
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_activation_atomically_replaces_an_existing_installation() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let hook = Arc::new(RecordingDisconnectHook::default());
+            service.set_disconnect_hook(hook.clone());
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let first_device_activation = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let first_mobile = service
+                .activate_device_with_ids(
+                    device_activation_admission(
+                        &service,
+                        first_device_activation.activation_code.expose_secret(),
+                    ),
+                    device_activation_params("mobile-installation"),
+                    issued_ids(2),
+                )
+                .await
+                .unwrap();
+
+            let replacement_device_activation = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let replacement = service
+                .activate_device_with_ids(
+                    device_activation_admission(
+                        &service,
+                        replacement_device_activation
+                            .activation_code
+                            .expose_secret(),
+                    ),
+                    device_activation_params("mobile-installation"),
+                    issued_ids(3),
+                )
+                .await
+                .unwrap();
+
+            assert_ne!(replacement.device.id, first_mobile.device.id);
+            assert_ne!(replacement.session.id, first_mobile.session.id);
+            let old_device_status_query = format!(
+                "SELECT status AS value FROM device WHERE id = '{}'",
+                first_mobile.device.id
+            );
+            assert_eq!(
+                scalar_text(&service.database, &old_device_status_query).await,
+                "revoked"
+            );
+            let old_session_status_query = format!(
+                "SELECT status AS value FROM auth_session WHERE id = '{}'",
+                first_mobile.session.id
+            );
+            assert_eq!(
+                scalar_text(&service.database, &old_session_status_query).await,
+                "revoked"
+            );
+            assert_eq!(
+                hook.0.lock().unwrap().as_slice(),
+                &[(
+                    first_mobile.session.id.to_string(),
+                    AuthSessionTerminationReason::SessionRevoked,
+                )]
+            );
+            assert_eq!(
+                count_where(&service.database, "device", "status = 'active'").await,
+                2
+            );
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'active'").await,
+                2
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_device_activation_create_replaces_previous_and_explicit_revoke_is_terminal() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &creator).await;
+            let first = service.create_device(principal.as_ref()).await.unwrap();
+            let first_raw = first.activation_code.expose_secret().to_owned();
+            let second = service.create_device(principal.as_ref()).await.unwrap();
+            assert_eq!(
+                service
+                    .list_sessions(principal.as_ref())
+                    .await
+                    .unwrap()
+                    .sessions
+                    .len(),
+                1,
+                "pending device sessions are not installed devices"
+            );
+            assert_eq!(
+                service
+                    .activate_device_with_ids(
+                        device_activation_admission(&service, &first_raw),
+                        device_activation_params("mobile-installation"),
+                        issued_ids(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::DeviceActivationConsumed
+            );
+            assert_eq!(
+                scalar_i64(
+                    &service.database,
+                    &format!(
+                        "SELECT activation_failed_attempts AS value FROM auth_session WHERE id = '{}'",
+                        second.session_id
+                    ),
+                )
+                .await,
+                0,
+                "an exact consumed credential must not count against a newer request sharing its locator"
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    &format!(
+                        "SELECT status AS value FROM auth_session WHERE id = '{}'",
+                        second.session_id
+                    ),
+                )
+                .await,
+                "pending"
+            );
+            let revoked = service
+                .revoke_owned_session(
+                    principal.as_ref(),
+                    &second.session_id,
+                    Some(AuthSessionStatus::Pending),
+                    AuthSessionRevokeReason::DeviceRevoke,
+                )
+                .await
+                .unwrap();
+            assert!(revoked.revoked);
+            assert_eq!(
+                service
+                    .list_sessions(principal.as_ref())
+                    .await
+                    .unwrap()
+                    .sessions
+                    .len(),
+                1,
+                "revoked unactivated rows must not break or pollute device listing"
+            );
+            assert_eq!(
+                service
+                    .activate_device_with_ids(
+                        device_activation_admission(&service, second.activation_code.expose_secret(),),
+                        device_activation_params("mobile-installation"),
+                        issued_ids(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::DeviceActivationConsumed
+            );
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_pending_cancel_does_not_revoke_an_already_activated_session() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _identity) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let creator_principal = authenticate_grant(&service, &creator).await;
+            let created = service
+                .create_device(creator_principal.as_ref())
+                .await
+                .unwrap();
+            let activated = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, created.activation_code.expose_secret()),
+                    device_activation_params("mobile-installation"),
+                    issued_ids(2),
+                )
+                .await
+                .unwrap();
+
+            let cancelled = service
+                .revoke_owned_session(
+                    creator_principal.as_ref(),
+                    &activated.session.id,
+                    Some(AuthSessionStatus::Pending),
+                    AuthSessionRevokeReason::DeviceRevoke,
+                )
+                .await
+                .unwrap();
+            assert!(!cancelled.revoked);
+
+            let activated_principal = authenticate_grant(&service, &activated).await;
+            service
+                .validate_session_lease(activated_principal.as_ref())
+                .await
+                .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_and_gateway_mismatched_device_activation_fail_closed() {
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &creator).await;
+            let device_activation = service.create_device(principal.as_ref()).await.unwrap();
+            let mismatched_admission = RestrictedAdmission::new(
+                PresentedCredential::classify(device_activation.activation_code.expose_secret())
+                    .unwrap(),
+                RestrictedAuthContext::DeviceActivation(super::super::DeviceActivationContext {
+                    gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000099").unwrap(),
+                }),
+            );
+            assert_eq!(
+                service
+                    .activate_device_with_ids(
+                        mismatched_admission,
+                        device_activation_params("mobile-installation"),
+                        issued_ids(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::GatewayIdentityMismatch
+            );
+            service
+                .database
+                .execute_unprepared(
+                    "UPDATE auth_session SET activation_expires_at = created_at WHERE status = 'pending'",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                service
+                    .activate_device_with_ids(
+                        device_activation_admission(
+                            &service,
+                            device_activation.activation_code.expose_secret(),
+                        ),
+                        device_activation_params("mobile-installation"),
+                        issued_ids(2),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                AuthErrorCode::DeviceActivationExpired
+            );
+            assert_eq!(
+                count_where(&service.database, "auth_session", "status = 'expired'").await,
+                1
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_device_activation_accept_has_exactly_one_winner() {
-        let (service, _) = fixture().await;
-        let service = Arc::new(service);
-        let creator = service
-            .create_initial_session_with_ids(
-                params("desktop-installation", ClientKind::Desktop),
-                ids(1),
-            )
-            .await
-            .unwrap();
-        let principal = authenticate_grant(&service, &creator).await;
-        let device_activation = service.create_device(principal.as_ref()).await.unwrap();
-        let raw = device_activation.activation_code.expose_secret().to_owned();
-        let left = {
-            let service = service.clone();
-            let raw = raw.clone();
-            tokio::spawn(async move {
-                service
-                    .activate_device_with_ids(
-                        device_activation_admission(&service, &raw),
-                        device_activation_params("mobile-left"),
-                        issued_ids(2),
-                    )
-                    .await
-            })
-        };
-        let right = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                service
-                    .activate_device_with_ids(
-                        device_activation_admission(&service, &raw),
-                        device_activation_params("mobile-right"),
-                        issued_ids(3),
-                    )
-                    .await
-            })
-        };
-        let outcomes = [left.await.unwrap(), right.await.unwrap()];
-        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
-        assert_eq!(count(&service.database, "device").await, 2);
-        assert_eq!(count(&service.database, "auth_session").await, 2);
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, _) = fixture(test_database).await;
+            let service = Arc::new(service);
+            let creator = service
+                .create_initial_session_with_ids(
+                    params("desktop-installation", ClientKind::Desktop),
+                    ids(1),
+                )
+                .await
+                .unwrap();
+            let principal = authenticate_grant(&service, &creator).await;
+            let device_activation = service.create_device(principal.as_ref()).await.unwrap();
+            let raw = device_activation.activation_code.expose_secret().to_owned();
+            let left = {
+                let service = service.clone();
+                let raw = raw.clone();
+                tokio::spawn(async move {
+                    service
+                        .activate_device_with_ids(
+                            device_activation_admission(&service, &raw),
+                            device_activation_params("mobile-left"),
+                            issued_ids(2),
+                        )
+                        .await
+                })
+            };
+            let right = {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .activate_device_with_ids(
+                            device_activation_admission(&service, &raw),
+                            device_activation_params("mobile-right"),
+                            issued_ids(3),
+                        )
+                        .await
+                })
+            };
+            let outcomes = [left.await.unwrap(), right.await.unwrap()];
+            assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+            assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+            assert_eq!(count(&service.database, "device").await, 2);
+            assert_eq!(count(&service.database, "auth_session").await, 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn first_member_session_provisioning_is_generation_zero_and_caller_transaction_owned() {
-        let (service, identity) = fixture().await;
-        let member_id = pioneer_protocol::PrincipalId::new("P0000000000000000000A").unwrap();
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(\
-                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                        created_at,updated_at,removed_at\
-                     ) VALUES(\
-                        '{}','{}','user','member','active','Invitee','invitee','invitee',\
-                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                     )",
-                    member_id, identity.gateway.id
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let member_id = pioneer_protocol::PrincipalId::new("P0000000000000000000A").unwrap();
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(\
+                            id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
+                            created_at,updated_at,removed_at\
+                         ) VALUES(\
+                            '{}','{}','user','member','active','Invitee','invitee','invitee',\
+                            CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
+                         )",
+                        member_id, identity.gateway.id
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-        let ids = FirstMemberSessionIds {
-            device_id: DeviceId::new("D0000000000000000000A").unwrap(),
-            session_id: AuthSessionId::new("S0000000000000000000A").unwrap(),
-            token_family_id: TokenFamilyId::new("F0000000000000000000A").unwrap(),
-            refresh_id: RefreshCredentialId::new("R0000000000000000000A").unwrap(),
-            access_jti: "J0000000000000000000A".to_owned(),
-        };
-        let transaction = service.database.begin().await.unwrap();
-        let grant = service
-            .provision_first_member_session_in_transaction(
-                &transaction,
-                &member_id,
-                ClientInstallationDescriptor {
-                    installation_id: "  invitee-mobile  ".to_owned(),
-                    display_name: "  Invitee Phone  ".to_owned(),
-                    client_kind: ClientKind::Mobile,
-                    platform: Some("  ios  ".to_owned()),
-                    client_version: Some("  1.0  ".to_owned()),
-                },
-                &ids,
-                unix_timestamp_secs().unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .unwrap();
+            let ids = FirstMemberSessionIds {
+                device_id: DeviceId::new("D0000000000000000000A").unwrap(),
+                session_id: AuthSessionId::new("S0000000000000000000A").unwrap(),
+                token_family_id: TokenFamilyId::new("F0000000000000000000A").unwrap(),
+                refresh_id: RefreshCredentialId::new("R0000000000000000000A").unwrap(),
+                access_jti: "J0000000000000000000A".to_owned(),
+            };
+            let transaction = service.database.begin().await.unwrap();
+            let grant = service
+                .provision_first_member_session_in_transaction(
+                    &transaction,
+                    &member_id,
+                    ClientInstallationDescriptor {
+                        installation_id: "  invitee-mobile  ".to_owned(),
+                        display_name: "  Invitee Phone  ".to_owned(),
+                        client_kind: ClientKind::Mobile,
+                        platform: Some("  ios  ".to_owned()),
+                        client_version: Some("  1.0  ".to_owned()),
+                    },
+                    &ids,
+                    unix_timestamp_secs().unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(grant.principal.id, member_id);
-        assert_eq!(grant.session.refresh_generation, 0);
-        assert_eq!(grant.refresh_generation, 0);
-        assert_eq!(
-            grant.credential_storage_order,
-            CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
-        );
-        assert_eq!(grant.device.installation_id, "invitee-mobile");
-        let persisted_session = load_session(&transaction, &ids.session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted_session.status, "active");
-        assert_eq!(persisted_session.refresh_generation, 0);
-        assert!(persisted_session.created_by_session_id.is_none());
-        assert!(
-            load_current_refresh(&transaction, &ids.session_id)
+            assert_eq!(grant.principal.id, member_id);
+            assert_eq!(grant.session.refresh_generation, 0);
+            assert_eq!(grant.refresh_generation, 0);
+            assert_eq!(
+                grant.credential_storage_order,
+                CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
+            );
+            assert_eq!(grant.device.installation_id, "invitee-mobile");
+            let persisted_session = load_session(&transaction, &ids.session_id)
                 .await
                 .unwrap()
-                .is_some()
-        );
+                .unwrap();
+            assert_eq!(persisted_session.status, "active");
+            assert_eq!(persisted_session.refresh_generation, 0);
+            assert!(persisted_session.created_by_session_id.is_none());
+            assert!(
+                load_current_refresh(&transaction, &ids.session_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
 
-        transaction.rollback().await.unwrap();
-        assert!(
-            load_device(&service.database, &ids.device_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_session(&service.database, &ids.session_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            load_current_refresh(&service.database, &ids.session_id)
-                .await
-                .unwrap()
-                .is_none()
-        );
+            transaction.rollback().await.unwrap();
+            assert!(
+                load_device(&service.database, &ids.device_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                load_session(&service.database, &ids.session_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                load_current_refresh(&service.database, &ids.session_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     fn params(installation_id: &str, client_kind: ClientKind) -> AuthDeviceActivateParams {
@@ -6820,172 +7005,175 @@ mod tests {
 
     #[tokio::test]
     async fn administrative_recovery_keeps_one_target_owned_pending_activation_and_audits() {
-        let (service, identity) = fixture().await;
-        let target_id = PrincipalId::new("P0000000000000000000E").unwrap();
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "INSERT INTO gateway_principal(
-                        id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
-                        created_at,updated_at,removed_at
-                     ) VALUES(
-                        '{}','{}','user','member','active','Recovery Member','recovery-member',
-                        'recovery-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
-                     );
-                     INSERT INTO device(
-                        id,gateway_id,principal_id,installation_id,display_name,client_kind,
-                        platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at
-                     ) VALUES(
-                        'D00000000000000000090','{}','{}','recovery-admin-fixture',
-                        'Admin Desktop','desktop','test','1','active',CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
-                     );
-                     INSERT INTO auth_session(
-                        id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,
-                        activation_token_hash,activation_locator_hash,activation_failed_attempts,
-                        activation_expires_at,activated_at,status,refresh_generation,created_at,
-                        updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,
-                        revoke_reason
-                     ) VALUES(
-                        'S00000000000000000090','{}','{}','D00000000000000000090',
-                        'F00000000000000000090',NULL,
-                        X'0000000000000000000000000000000000000000000000000000000000000090',
-                        X'1000000000000000000000000000000000000000000000000000000000000090',
-                        0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,
-                        CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,
-                        datetime('now','+90 days'),NULL,NULL
-                     )",
-                    target_id,
-                    identity.gateway.id,
-                    identity.gateway.id,
-                    identity.superuser.id,
-                    identity.gateway.id,
-                    identity.superuser.id,
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (service, identity) = fixture(test_database).await;
+            let target_id = PrincipalId::new("P0000000000000000000E").unwrap();
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "INSERT INTO gateway_principal(
+                            id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,
+                            created_at,updated_at,removed_at
+                         ) VALUES(
+                            '{}','{}','user','member','active','Recovery Member','recovery-member',
+                            'recovery-member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+                         );
+                         INSERT INTO device(
+                            id,gateway_id,principal_id,installation_id,display_name,client_kind,
+                            platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at
+                         ) VALUES(
+                            'D00000000000000000090','{}','{}','recovery-admin-fixture',
+                            'Admin Desktop','desktop','test','1','active',CURRENT_TIMESTAMP,
+                            CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL
+                         );
+                         INSERT INTO auth_session(
+                            id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,
+                            activation_token_hash,activation_locator_hash,activation_failed_attempts,
+                            activation_expires_at,activated_at,status,refresh_generation,created_at,
+                            updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,
+                            revoke_reason
+                         ) VALUES(
+                            'S00000000000000000090','{}','{}','D00000000000000000090',
+                            'F00000000000000000090',NULL,
+                            decode('0000000000000000000000000000000000000000000000000000000000000090','hex'),
+                            decode('1000000000000000000000000000000000000000000000000000000000000090','hex'),
+                            0,(CURRENT_TIMESTAMP + INTERVAL '10 minutes'),CURRENT_TIMESTAMP,'active',0,
+                            CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,
+                            (CURRENT_TIMESTAMP + INTERVAL '90 days'),NULL,NULL
+                         )",
+                        target_id,
+                        identity.gateway.id,
+                        identity.gateway.id,
+                        identity.superuser.id,
+                        identity.gateway.id,
+                        identity.superuser.id,
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-        let actor = AuthenticatedSessionPrincipal {
-            gateway_id: identity.gateway.id.clone(),
-            principal_id: identity.superuser.id.clone(),
-            kind: PrincipalKind::Superuser,
-            role_key: None,
-            device_id: DeviceId::new("D00000000000000000090").unwrap(),
-            session_id: AuthSessionId::new("S00000000000000000090").unwrap(),
-            access_jti: generate_id(AUTH_DOMAIN_ID_LEN),
-            access_expires_at_unix: u64::MAX,
-        };
-        let first = service
-            .create_recovery_device(&actor, &target_id)
-            .await
-            .unwrap();
-        let second = service
-            .create_recovery_device(&actor, &target_id)
-            .await
-            .unwrap();
-        assert_ne!(first.session_id, second.session_id);
-        assert!(format!("{second:?}").contains("[redacted]"));
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_session",
-                format!(
-                    "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
-                    target_id
+                .await
+                .unwrap();
+            let actor = AuthenticatedSessionPrincipal {
+                gateway_id: identity.gateway.id.clone(),
+                principal_id: identity.superuser.id.clone(),
+                kind: PrincipalKind::Superuser,
+                role_key: None,
+                device_id: DeviceId::new("D00000000000000000090").unwrap(),
+                session_id: AuthSessionId::new("S00000000000000000090").unwrap(),
+                access_jti: generate_id(AUTH_DOMAIN_ID_LEN),
+                access_expires_at_unix: u64::MAX,
+            };
+            let first = service
+                .create_recovery_device(&actor, &target_id)
+                .await
+                .unwrap();
+            let second = service
+                .create_recovery_device(&actor, &target_id)
+                .await
+                .unwrap();
+            assert_ne!(first.session_id, second.session_id);
+            assert!(format!("{second:?}").contains("[redacted]"));
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "auth_session",
+                    format!(
+                        "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
+                        target_id
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .await,
-            1
-        );
-        assert_eq!(
-            scalar_text(
-                &service.database,
-                format!(
-                    "SELECT revoke_reason AS value FROM auth_session WHERE id = '{}'",
-                    first.session_id
+                .await,
+                1
+            );
+            assert_eq!(
+                scalar_text(
+                    &service.database,
+                    format!(
+                        "SELECT revoke_reason AS value FROM auth_session WHERE id = '{}'",
+                        first.session_id
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .await,
-            "superseded"
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "audit_event",
-                "action = 'member_recovery_device_created'",
-            )
-            .await,
-            2
-        );
+                .await,
+                "superseded"
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "audit_event",
+                    "action = 'member_recovery_device_created'",
+                )
+                .await,
+                2
+            );
 
-        let recovered = service
-            .activate_device_with_ids(
-                device_activation_admission(&service, second.activation_code.expose_secret()),
-                device_activation_params("recovery-member-installation"),
-                issued_ids(91),
-            )
-            .await
-            .unwrap();
-        assert_eq!(recovered.principal.id, target_id);
-        assert_eq!(recovered.session.id, second.session_id);
-        assert_eq!(recovered.device.id, second.device_id);
-        let authenticated_target = authenticate_grant(&service, &recovered).await;
-        assert_eq!(authenticated_target.principal_id, target_id);
-        assert_eq!(authenticated_target.session_id, recovered.session.id);
-        assert_eq!(authenticated_target.device_id, recovered.device.id);
-        assert_eq!(
-            count_where(
-                &service.database,
-                "auth_session",
-                format!(
-                    "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
-                    target_id
+            let recovered = service
+                .activate_device_with_ids(
+                    device_activation_admission(&service, second.activation_code.expose_secret()),
+                    device_activation_params("recovery-member-installation"),
+                    issued_ids(91),
                 )
-                .as_str(),
-            )
-            .await,
-            0
-        );
-        assert_eq!(
-            count_where(
-                &service.database,
-                "audit_event",
-                "action = 'member_recovery_device_created'",
-            )
-            .await,
-            2,
-            "ordinary redemption must not duplicate the administrative creation audit"
-        );
+                .await
+                .unwrap();
+            assert_eq!(recovered.principal.id, target_id);
+            assert_eq!(recovered.session.id, second.session_id);
+            assert_eq!(recovered.device.id, second.device_id);
+            let authenticated_target = authenticate_grant(&service, &recovered).await;
+            assert_eq!(authenticated_target.principal_id, target_id);
+            assert_eq!(authenticated_target.session_id, recovered.session.id);
+            assert_eq!(authenticated_target.device_id, recovered.device.id);
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "auth_session",
+                    format!(
+                        "principal_id = '{}' AND status = 'pending' AND created_by_session_id IS NULL",
+                        target_id
+                    )
+                    .as_str(),
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "audit_event",
+                    "action = 'member_recovery_device_created'",
+                )
+                .await,
+                2,
+                "ordinary redemption must not duplicate the administrative creation audit"
+            );
 
-        service
-            .database
-            .execute_unprepared(
-                format!(
-                    "UPDATE gateway_principal SET status = 'suspended' WHERE id = '{}'",
-                    target_id
+            service
+                .database
+                .execute_unprepared(
+                    format!(
+                        "UPDATE gateway_principal SET status = 'suspended' WHERE id = '{}'",
+                        target_id
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .await
-            .unwrap();
-        let invalid_target = service
-            .create_recovery_device(&actor, &target_id)
-            .await
-            .unwrap_err();
-        assert_eq!(invalid_target.code(), AuthErrorCode::RecoveryInvalidTarget);
-        assert_eq!(
-            count_where(
-                &service.database,
-                "audit_event",
-                "action = 'member_recovery_device_created'",
-            )
-            .await,
-            2
-        );
+                .await
+                .unwrap();
+            let invalid_target = service
+                .create_recovery_device(&actor, &target_id)
+                .await
+                .unwrap_err();
+            assert_eq!(invalid_target.code(), AuthErrorCode::RecoveryInvalidTarget);
+            assert_eq!(
+                count_where(
+                    &service.database,
+                    "audit_event",
+                    "action = 'member_recovery_device_created'",
+                )
+                .await,
+                2
+            );
+            Ok(())
+        }).await.unwrap();
     }
 
     fn ids(seed: u8) -> SessionGrantIds {
@@ -7052,11 +7240,45 @@ mod tests {
             .unwrap()
     }
 
+    // Only the private clone in a corruption scenario can admit these rows.
+    async fn relax_fixture_constraints(database: &impl ConnectionTrait, tables: &str) {
+        let constraints = database
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT t.relname::text AS table_name, c.conname::text AS constraint_name
+             FROM pg_constraint c
+             JOIN pg_class t ON t.oid = c.conrelid
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE n.nspname = 'public' AND c.contype IN ('c', 'f')
+               AND t.relname::text = ANY(string_to_array($1, ','))",
+                [tables.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(!constraints.is_empty());
+        for constraint in constraints {
+            let table = constraint
+                .try_get::<String>("", "table_name")
+                .unwrap()
+                .replace('"', "\"\"");
+            let name = constraint
+                .try_get::<String>("", "constraint_name")
+                .unwrap()
+                .replace('"', "\"\"");
+            database
+                .execute_unprepared(&format!(
+                    r#"ALTER TABLE public."{table}" DROP CONSTRAINT "{name}""#
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn database_text(database: &impl ConnectionTrait) -> String {
         let rows = database
             .query_all_raw(Statement::from_string(
                 database.get_database_backend(),
-                "SELECT id || ':' || COALESCE(installation_id, '') || ':' || COALESCE(display_name, '') AS value FROM device UNION ALL SELECT id || ':' || status || ':' || token_family_id FROM auth_session UNION ALL SELECT id || ':' || hex(token_hash) || ':' || generation FROM auth_refresh_credential".to_owned(),
+                "SELECT id || ':' || COALESCE(installation_id, '') || ':' || COALESCE(display_name, '') AS value FROM device UNION ALL SELECT id || ':' || status || ':' || token_family_id FROM auth_session UNION ALL SELECT id || ':' || encode(token_hash, 'hex') || ':' || generation FROM auth_refresh_credential".to_owned(),
             ))
             .await
             .unwrap();

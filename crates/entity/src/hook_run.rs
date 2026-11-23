@@ -7,23 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "hook_run")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub idempotency_key: String,
+    #[sea_orm(column_type = "Text")]
     pub subscription_id: String,
+    #[sea_orm(column_type = "Text")]
     pub hook_id: String,
+    #[sea_orm(column_type = "Text")]
     pub phase: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub scope_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub scope_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub task_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub agent_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub actor_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub actor_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub context_mode: Option<String>,
     pub attempt_count: i64,
     pub contribution_count: i64,
@@ -32,6 +46,7 @@ pub struct Model {
     pub contribution_hashes_json: String,
     #[sea_orm(column_type = "Text")]
     pub diagnostic_previews_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub error_code: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message_preview: Option<String>,

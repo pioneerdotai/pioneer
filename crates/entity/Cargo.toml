@@ -9,5 +9,5 @@ authors.workspace = true
 path = "lib.rs"
 
 [dependencies]
-sea-orm = { workspace = true, features = ["macros"] }
+sea-orm = { workspace = true, features = ["macros", "postgres-vector"] }
 serde.workspace = true

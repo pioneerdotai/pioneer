@@ -1,0 +1,25 @@
+[package]
+name = "pioneer-crud-self-improvement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-crud-conversations.workspace = true
+pioneer-crud-packages.workspace = true
+pioneer-crud-tasks.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-postgres-pools.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+pioneer-crud-execution.workspace = true
+pioneer-migration.workspace = true
+pioneer-postgres-test.workspace = true
+tokio.workspace = true

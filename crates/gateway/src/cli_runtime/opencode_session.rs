@@ -939,7 +939,7 @@ impl std::fmt::Display for OpenCodeStartupFailure {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "exit status unavailable".into());
         let busy = if self.sqlite_busy {
-            "; SQLite database contention"
+            "; OpenCode's SQLite database contention"
         } else {
             ""
         };
@@ -973,8 +973,9 @@ fn opencode_sqlite_startup_conflict(
     natural_status: Option<ExitStatus>,
     stderr: &[String],
 ) -> bool {
-    // Require an unsuccessful natural exit, before any usable endpoint. A
-    // timeout/health/boundary failure must never become retryable from stderr.
+    // The OpenCode child owns this database. Only retry an unsuccessful
+    // natural exit before a usable endpoint. Stderr cannot make a timeout,
+    // health check failure, or endpoint validation failure retryable.
     stage == OpenCodeStartupStage::AddressEof
         && natural_status.is_some_and(|status| !status.success() && status.code().is_some())
         && stderr

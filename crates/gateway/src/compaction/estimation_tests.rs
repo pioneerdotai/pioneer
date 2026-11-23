@@ -2,7 +2,7 @@ use super::*;
 
 // The real native request envelope is the independent oracle for JSON escaping
 // and rounding. No production character-size formula is copied into the test.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn estimated_portions_preserve_escaped_unicode_and_source_cursor() {
     let source = format!("BEGIN{}END", "🌍漢e\u{301}\"\\\n\u{0}".repeat(200));
     let f = fixture(&source, vec![], true, false).await;
@@ -58,7 +58,7 @@ async fn estimated_portions_preserve_escaped_unicode_and_source_cursor() {
     assert!(f.provider.calls.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn confirmed_summary_overflow_decreases_requests_without_publishing_coverage() {
     // Leave capacity for fixed instructions even after all four reductions;
     // the ordinary small-window fixture can exhaust capacity before call five.

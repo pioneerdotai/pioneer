@@ -81,7 +81,9 @@ Les agents récupèrent le contexte pertinent en respectant les droits d'accès 
 
 ## Fonctionnement technique
 
-Pioneer est un workspace Rust avec une application de bureau native GPUI et une passerelle utilisant SQLite. Les clients se connectent via une API JSON-RPC sur WebSocket.
+Pioneer est un workspace Rust avec une application de bureau native GPUI et une passerelle utilisant PostgreSQL. Les clients se connectent via une API JSON-RPC sur WebSocket.
+
+Les paquets de la passerelle incluent PostgreSQL 19 et pgvector. La passerelle crée son répertoire de données au premier démarrage et le réutilise après les redémarrages et les mises à jour au sein d’une même version majeure de PostgreSQL. Desktop installe le même environnement de base de données pour sa passerelle locale.
 
 ```mermaid
 flowchart TB

@@ -275,40 +275,30 @@ def check_prepared(target, prepared):
     return metadata
 
 
-def daemon_name(target):
+def daemon_name(target, legacy=False):
     if "apple-darwin" in target:
         return "Pioneer Gateway.app/Contents/Helpers/cua-driver"
-    return "cua-driver.exe" if "windows" in target else "cua-driver"
+    name = "cua-driver.exe" if "windows" in target else "cua-driver"
+    return name if legacy else "cua/" + name
 
 
 def verify_macos(root):
-    app = root / "cua/Pioneer Gateway.app"
-    teams = set()
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            with path.open("rb") as source:
-                magic = source.read(4)
-            if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
-                subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
-                details = subprocess.run(["codesign", "--display", "--verbose=4", str(path)],
-                                         check=True, capture_output=True, text=True)
-                lines = (details.stdout + details.stderr).splitlines()
-                team = next((line.removeprefix("TeamIdentifier=") for line in lines
-                             if line.startswith("TeamIdentifier=")), "")
-                if not team or team == "not set" or not any(line.startswith("Authority=Developer ID Application:") for line in lines):
-                    raise ValueError(f"Gateway payload requires Developer ID signatures: {path}")
-                teams.add(team)
-    if len(teams) != 1:
-        raise ValueError("Gateway executable composition has inconsistent signing teams")
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+    notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
+    notary["verify_code_signatures"](root)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                    str(root / "runtime/Pioneer Gateway.app")], check=True)
 
 
-def validate_tree(target, root, verify_signatures=False, development=False):
+def validate_tree(target, root, verify_signatures=False, development=False, legacy=False):
     if target not in TARGETS:
         raise ValueError(f"Unsupported CUA target: {target}")
     selected = release()
-    manifest = json.loads((root / "cua/manifest.json").read_text())
-    expected_daemon = daemon_name(target)
+    companion_dir = "cua" if legacy else "runtime"
+    driver_dir = "cua" if legacy else "runtime/cua"
+    manifest_name = driver_dir + "/manifest.json"
+    manifest = json.loads((root / manifest_name).read_text())
+    expected_daemon = daemon_name(target, legacy)
+    daemon_path = root / companion_dir / expected_daemon
     if (manifest.get("schema_version") != 1 or manifest.get("repository") != selected["repository"]
             or manifest.get("revision") != selected["revision"] or manifest.get("version") != selected["version"]
             or manifest.get("release_tag") != selected["tag"] or manifest.get("target") != target
@@ -317,28 +307,27 @@ def validate_tree(target, root, verify_signatures=False, development=False):
         raise ValueError("Gateway CUA package identity mismatch")
     if development and manifest.get("gateway_bundle_identifier") != DEV_BUNDLE_ID:
         raise ValueError("Dev Gateway CUA identity mismatch")
-    actual = file_inventory(root, ("cua/manifest.json",))
-    if manifest.get("files") != actual or manifest.get("sha256") != digest(root / "cua" / expected_daemon):
+    actual = file_inventory(root, (manifest_name,))
+    if manifest.get("files") != actual or manifest.get("sha256") != digest(daemon_path):
         raise ValueError("Gateway CUA payload inventory or checksum mismatch")
     suffix = ".exe" if "windows" in target else ""
-    gateway_name = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+    gateway_name = (companion_dir + "/Pioneer Gateway.app/Contents/MacOS/pioneer"
                     if "apple-darwin" in target else "pioneer" + suffix)
-    if any(not name.startswith("cua/") and name != gateway_name for name in actual):
+    if any(not name.startswith(companion_dir + "/") and name != gateway_name for name in actual):
         raise ValueError("Gateway CUA package contains files outside the selected runtime layout")
-    required = {gateway_name, "cua/" + expected_daemon,
-                "cua/LICENSE.cua-driver.md", "cua/THIRD_PARTY_NOTICES.md"}
+    required = {gateway_name, companion_dir + "/" + expected_daemon}
     for name in required_runtime(target) - {"cua-driver" + suffix}:
-        required.add("cua/" + name)
+        required.add(driver_dir + "/" + name)
     if "apple-darwin" in target:
-        required.add("cua/Pioneer Gateway.app/Contents/Info.plist")
+        required.add(companion_dir + "/Pioneer Gateway.app/Contents/Info.plist")
     if not required.issubset(actual):
         raise ValueError(f"Gateway CUA payload is missing required files: {sorted(required - set(actual))}")
     architecture(root / gateway_name, target)
-    architecture(root / "cua" / expected_daemon, target)
+    architecture(daemon_path, target)
     if "windows" in target:
-        architecture(root / "cua/cua-driver-uia.exe", target)
+        architecture(root / driver_dir / "cua-driver-uia.exe", target)
     if "apple-darwin" in target:
-        gateway = root / "cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+        gateway = root / gateway_name
         with (gateway.parent.parent / "Info.plist").open("rb") as source:
             info = plistlib.load(source)
         bundle_id = DEV_BUNDLE_ID if development else BUNDLE_ID
@@ -355,11 +344,11 @@ def validate_tree(target, root, verify_signatures=False, development=False):
         if verify_signatures:
             if development:
                 subprocess.run(["codesign", "--verify", "--deep", "--strict",
-                                str(root / "cua/Pioneer Gateway.app")], check=True)
+                                str(root / companion_dir / "Pioneer Gateway.app")], check=True)
             else:
                 verify_macos(root)
                 notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
-                notary["validate_ticket"](root / "cua/Pioneer Gateway.app")
+                notary["validate_ticket"](root / "runtime/Pioneer Gateway.app")
     elif verify_signatures:
         raise ValueError("Signature verification mode requires a macOS target")
     return manifest
@@ -379,7 +368,7 @@ def zip_tree(root, archive):
                 output.write(path, path.relative_to(root).as_posix())
 
 
-def package(target, binary, prepared, archive, notary_log_dir=None):
+def package(target, binary, prepared, archive, notary_log_dir=None, postgres=None):
     if target not in TARGETS:
         raise ValueError(f"Unsupported CUA target: {target}")
     selected = release()
@@ -391,6 +380,8 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
         raise ValueError("macOS packaging requires persistent --notary-log-dir")
     macos = "apple-darwin" in target
     inputs = dict(target=target, gateway_sha256=digest(binary), prepared=metadata)
+    if postgres is not None:
+        inputs["postgres"] = file_inventory(postgres)
     identity = os.environ.get("MACOS_DESKTOP_SIGN_IDENTITY", "") if macos else ""
     if macos:
         if not identity:
@@ -421,7 +412,7 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
             shutil.rmtree(root)
             notary_archive.unlink(missing_ok=True)
         if root.exists():
-            exclusions = ("cua/manifest.json", "cua/Pioneer Gateway.app/Contents/CodeResources")
+            exclusions = ("runtime/cua/manifest.json", "runtime/Pioneer Gateway.app/Contents/CodeResources")
             if (state.get("inputs") != inputs or not notary_archive.is_file()
                     or state.get("signed_files") != file_inventory(root, exclusions)):
                 raise ValueError("Retained Gateway staging is incomplete or belongs to different inputs")
@@ -434,8 +425,19 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
         if macos:
             state_file.write_text(json.dumps(dict(inputs=inputs), indent=2) + "\n")
         root.mkdir()
-        payload = root / "cua"
-        shutil.copytree(prepared / "runtime", payload)
+        payload = root / "runtime"
+        shutil.copytree(prepared / "runtime", payload / "cua")
+        postgres_executables = []
+        if postgres is not None:
+            staged_postgres = payload / "postgres"
+            shutil.copytree(postgres, staged_postgres)
+            for program in (staged_postgres / "bin").iterdir():
+                program.chmod(0o755)
+                postgres_executables.append(program)
+            postgres_executables.extend(
+                library for library in (staged_postgres / "lib").iterdir()
+                if library.suffix in (".so", ".dylib", ".dll")
+            )
         suffix = ".exe" if "windows" in target else ""
         daemon = payload / daemon_name(target)
         if macos:
@@ -445,7 +447,7 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
             gateway = contents / "MacOS/pioneer"
             shutil.copy2(binary, gateway)
             gateway.chmod(0o755)
-            (payload / "cua-driver").rename(daemon)
+            (payload / "cua/cua-driver").rename(daemon)
             daemon.chmod(0o755)
             with (contents / "Info.plist").open("wb") as output:
                 plistlib.dump(dict(CFBundleIdentifier=BUNDLE_ID, CFBundleName="Pioneer Gateway",
@@ -466,6 +468,9 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
                 options = ["--entitlements", str(entitlements)] if executable.suffix != ".dylib" else []
                 subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                                 *options, "--sign", identity, str(executable)], check=True)
+            for executable in postgres_executables:
+                subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
+                                "--sign", identity, str(executable)], check=True)
             subprocess.run(["codesign", "--force", "--timestamp", "--options", "runtime",
                             "--entitlements", str(entitlements), "--sign", identity,
                             str(contents.parent)], check=True)
@@ -480,22 +485,22 @@ def package(target, binary, prepared, archive, notary_log_dir=None):
             # the known runtime executables rather than making all files executable.
             daemon.chmod(0o755)
             if "linux" in target:
-                (payload / "wayland-helper/install.sh").chmod(0o755)
+                (payload / "cua/wayland-helper/install.sh").chmod(0o755)
         _finish_package(target, root, selected, metadata, archive)
 
 
 def _finish_macos(root, notary_archive, log_dir):
     notary = runpy.run_path(str(Path(__file__).with_name("macos-notary.py")))
-    notary["notarize"](notary_archive, [root / "cua/Pioneer Gateway.app"], log_dir)
+    notary["notarize"](notary_archive, [root / "runtime/Pioneer Gateway.app"], log_dir)
 
 
 def _finish_package(target, root, selected, metadata, archive):
-    daemon = root / "cua" / daemon_name(target)
+    daemon = root / "runtime" / daemon_name(target)
     manifest = dict(schema_version=1, repository=selected["repository"], revision=selected["revision"],
         version=selected["version"], release_tag=selected["tag"], target=target, permission_owner="gateway",
         upstream_asset=metadata["upstream_asset"], daemon=daemon_name(target),
-        sha256=digest(daemon), files=file_inventory(root, ("cua/manifest.json",)))
-    (root / "cua/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        sha256=digest(daemon), files=file_inventory(root, ("runtime/cua/manifest.json",)))
+    (root / "runtime/cua/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     validate_tree(target, root, "apple-darwin" in target)
     archive.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="." + archive.name + ".", dir=archive.parent) as temporary:
@@ -514,7 +519,9 @@ def dev_source(binary, root, target):
         if (generation.is_symlink() or receipt_path.is_symlink() or not receipt_path.is_file()
                 or receipt_path.stat().st_size > 1024 * 1024):
             raise ValueError("Invalid dev runtime generation or source receipt")
-        validate_tree(target, generation / "payload", "apple-darwin" in target, development=True)
+        payload = generation / "payload"
+        validate_tree(target, payload, "apple-darwin" in target, development=True,
+                      legacy=(payload / "cua/manifest.json").is_file())
         receipt = json.loads(receipt_path.read_text())
         source = Path(receipt["source"])
         if not source.is_absolute() or source.is_relative_to(root):
@@ -563,7 +570,7 @@ def dev(target, binary, root):
     key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
     generation = root / key
     macos = "apple-darwin" in target
-    executable = ("cua/Pioneer Gateway.app/Contents/MacOS/pioneer" if macos
+    executable = ("runtime/Pioneer Gateway.app/Contents/MacOS/pioneer" if macos
                   else "pioneer.exe" if "windows" in target else "pioneer")
     if generation.exists():
         receipt_path = generation / "dev-inputs.json"
@@ -576,18 +583,18 @@ def dev(target, binary, root):
     with tempfile.TemporaryDirectory(prefix=".dev-compose-", dir=root) as temporary:
         staging = Path(temporary) / "generation"
         payload = staging / "payload"
-        shutil.copytree(prepared / "runtime", payload / "cua")
+        shutil.copytree(prepared / "runtime", payload / "runtime/cua")
         gateway = payload / executable
         gateway.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(binary, gateway)
         if digest(gateway) != inputs["gateway_sha256"]:
             raise ValueError("Cargo executable changed during dev runtime preparation; retry start")
         gateway.chmod(0o755)
-        daemon = payload / "cua" / daemon_name(target)
+        daemon = payload / "runtime" / daemon_name(target)
         if macos:
             contents = gateway.parent.parent
             daemon.parent.mkdir()
-            (payload / "cua/cua-driver").rename(daemon)
+            (payload / "runtime/cua/cua-driver").rename(daemon)
             with (contents / "Info.plist").open("wb") as output:
                 plistlib.dump(dict(CFBundleIdentifier=DEV_BUNDLE_ID, CFBundleName="Pioneer Gateway Dev",
                     CFBundleExecutable="pioneer", CFBundlePackageType="APPL", CFBundleVersion=selected["version"],
@@ -607,12 +614,12 @@ def dev(target, binary, root):
         else:
             daemon.chmod(0o755)
             if "linux" in target:
-                (payload / "cua/wayland-helper/install.sh").chmod(0o755)
+                (payload / "runtime/cua/wayland-helper/install.sh").chmod(0o755)
         manifest = dict(schema_version=1, repository=selected["repository"], revision=selected["revision"],
             version=selected["version"], release_tag=selected["tag"], target=target, permission_owner="gateway",
             upstream_asset=metadata["upstream_asset"], daemon=daemon_name(target), gateway_bundle_identifier=DEV_BUNDLE_ID,
-            sha256=digest(daemon), files=file_inventory(payload, ("cua/manifest.json",)))
-        (payload / "cua/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            sha256=digest(daemon), files=file_inventory(payload, ("runtime/cua/manifest.json",)))
+        (payload / "runtime/cua/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         (staging / "dev-inputs.json").write_text(json.dumps(inputs, indent=2) + "\n")
         validate_tree(target, payload, macos, development=True)
         staging.rename(generation)

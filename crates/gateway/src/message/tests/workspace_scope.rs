@@ -17,7 +17,7 @@ async fn rpc(
     serde_json::from_str(&recv_jsonrpc_payload_by_id(&mut harness.rx, &id).await).unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn explicit_resource_reads_preserve_selection_including_empty_tombstone_and_errors() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let workspace_a = harness
@@ -191,7 +191,7 @@ async fn assert_preserved(
 
 // Exercise the same typed workflows used by desktop and the thin FFI boundary
 // against the real dispatcher, without giving the test transport selection logic.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_workspace_transitions_establish_connection_scope_without_global_current() {
     struct Requests(
         tokio::sync::mpsc::Sender<(String, pioneer_client::rpc::JsonRpcResponseSender)>,
@@ -275,7 +275,7 @@ async fn shared_workspace_transitions_establish_connection_scope_without_global_
     assert_preserved(&harness, &workspace_b, &catalog_before).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn id_only_open_selects_authoritative_workspace_and_never_creates_missing_thread() {
     let mut harness = setup_semantic_timeline_query_harness().await;
     let thread_id = harness.sandbox_thread_id.clone();

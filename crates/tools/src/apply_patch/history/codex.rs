@@ -397,7 +397,7 @@ pub(crate) fn validate_state(state: &CodexAggregateState) -> Result<(), CodexAgg
     }
     if state.revision > i64::MAX as u64 {
         return Err(CodexAggregateError::InvalidPayload(
-            "aggregate revision exceeds SQLite integer range".to_owned(),
+            "aggregate revision exceeds PostgreSQL integer range".to_owned(),
         ));
     }
     for (label, value) in [

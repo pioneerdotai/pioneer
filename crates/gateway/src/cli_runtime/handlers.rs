@@ -58,7 +58,7 @@ use pioneer_observability::{
     GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
 };
 use pioneer_tools::apply_patch::history::{
-    CODEX_TURN_DIFF_PROTOCOL_REVISION, CodexAggregateEventContext, SqliteCodexAggregateStore,
+    CODEX_TURN_DIFF_PROTOCOL_REVISION, CodexAggregateEventContext, PostgresCodexAggregateStore,
     normalize_codex_diff_updated,
 };
 use serde_json::json;
@@ -8585,7 +8585,7 @@ impl MessageProcessor {
                         return false;
                     }
                 };
-                let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+                let store = PostgresCodexAggregateStore::new(self.crud_store.database_connection());
                 match store.ingest_event(&normalized).await {
                     Ok(_) => true,
                     Err(error) => {
@@ -8614,7 +8614,7 @@ impl MessageProcessor {
         if binding.runtime_kind != "codex" {
             return true;
         }
-        let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+        let store = PostgresCodexAggregateStore::new(self.crud_store.database_connection());
         match store
             .finalize(binding.thread_id.as_str(), binding.turn_id.as_str())
             .await

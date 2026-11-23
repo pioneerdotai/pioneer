@@ -40,10 +40,8 @@ pub enum DatabaseOperation {
     Insert,
     Update,
     Delete,
-    Replace,
     Transaction,
     Schema,
-    Pragma,
     Other,
 }
 
@@ -60,7 +58,7 @@ pub struct DatabaseOperationMetric {
 }
 
 impl DatabaseOperation {
-    pub const CARDINALITY: usize = 9;
+    pub const CARDINALITY: usize = 7;
 
     const fn as_str(self) -> &'static str {
         match self {
@@ -68,23 +66,18 @@ impl DatabaseOperation {
             Self::Insert => "insert",
             Self::Update => "update",
             Self::Delete => "delete",
-            Self::Replace => "replace",
             Self::Transaction => "transaction",
             Self::Schema => "schema",
-            Self::Pragma => "pragma",
             Self::Other => "other",
         }
     }
 
     const fn kind(self) -> &'static str {
         match self {
-            Self::Select | Self::Pragma => "read",
-            Self::Insert
-            | Self::Update
-            | Self::Delete
-            | Self::Replace
-            | Self::Transaction
-            | Self::Schema => "write",
+            Self::Select => "read",
+            Self::Insert | Self::Update | Self::Delete | Self::Transaction | Self::Schema => {
+                "write"
+            }
             Self::Other => "other",
         }
     }
@@ -96,7 +89,7 @@ pub struct DatabasePoolSnapshot {
     pub idle: u64,
 }
 
-/// One low-cardinality observation emitted by the Gateway's SQLite writer
+/// One low-cardinality observation emitted by the Gateway's PostgreSQL writer
 /// executor. Values are selected from finite runtime enums; no
 /// SQL, IDs, paths, or error text are accepted here.
 #[derive(Clone, Copy, Debug)]
@@ -113,7 +106,7 @@ pub struct DatabaseAdmissionMetric {
 
 /// End-to-end reader observation, including maintenance admission and SQLx
 /// pool acquisition. The class and outcome are selected from fixed enums in
-/// pioneer-sqlite; no query or request data is accepted here.
+/// pioneer-postgres-pools; no query or request data is accepted here.
 #[derive(Clone, Copy, Debug)]
 pub struct DatabaseReadMetric {
     pub class: &'static str,
@@ -141,7 +134,7 @@ fn finite_series_index(attributes: &[KeyValue]) -> Option<usize> {
     let mut index = 0usize;
     for attribute in attributes {
         let values: &[&str] = match attribute.key.as_str() {
-            "db.system.name" => &["sqlite"],
+            "db.system.name" => &["postgresql"],
             "db.pool.role" => &["reader", "writer"],
             "db.scheduling.class" | "db.admission.class" | "db.admission.queue.class" => {
                 &["critical", "interactive", "maintenance"]
@@ -316,12 +309,12 @@ impl GatewayMetrics {
     pub(crate) fn new(meter: Meter) -> Self {
         let database_operations = meter
             .u64_counter("pioneer.gateway.db.operations")
-            .with_description("Number of SQLite operations executed by the gateway")
+            .with_description("Number of PostgreSQL operations executed by the gateway")
             .with_unit("{operation}")
             .build();
         let database_operation_duration = meter
             .f64_histogram("pioneer.gateway.db.operation.duration")
-            .with_description("SQLite operation execution duration, excluding pool wait time")
+            .with_description("PostgreSQL operation execution duration, excluding pool wait time")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0,
@@ -330,7 +323,7 @@ impl GatewayMetrics {
             .build();
         let database_pool_acquire_duration = meter
             .f64_histogram("pioneer.gateway.db.pool.acquire.duration")
-            .with_description("Time to acquire a SQLite connection from the gateway pool")
+            .with_description("Time to acquire a PostgreSQL connection from the gateway pool")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -339,13 +332,13 @@ impl GatewayMetrics {
             .build();
         let database_read_operations = meter
             .u64_counter("pioneer.gateway.db.read.operations")
-            .with_description("Number of typed SQLite reader operations by scheduling class")
+            .with_description("Number of typed PostgreSQL reader operations by scheduling class")
             .with_unit("{operation}")
             .build();
         let database_read_duration = meter
             .f64_histogram("pioneer.gateway.db.read.duration")
             .with_description(
-                "End-to-end typed SQLite reader duration including admission and pool wait",
+                "End-to-end typed PostgreSQL reader duration including admission and pool wait",
             )
             .with_unit("ms")
             .with_boundaries(operation_duration_boundaries())
@@ -384,13 +377,13 @@ impl GatewayMetrics {
         let database_admission_events = meter
             .u64_counter("pioneer.gateway.db.admission.events")
             .with_description(
-                "SQLite writer-executor admission events by class, event, and grant reason",
+                "PostgreSQL writer-executor admission events by class, event, and grant reason",
             )
             .with_unit("{event}")
             .build();
         let database_admission_wait_duration = meter
             .f64_histogram("pioneer.gateway.db.admission.wait.duration")
-            .with_description("Time a SQLite write waits for writer-executor admission")
+            .with_description("Time a PostgreSQL write waits for writer-executor admission")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -399,7 +392,7 @@ impl GatewayMetrics {
             .build();
         let database_admission_quantum_duration = meter
             .f64_histogram("pioneer.gateway.db.admission.quantum.duration")
-            .with_description("Time one write retains the SQLite writer executor")
+            .with_description("Time one write retains the PostgreSQL writer executor")
             .with_unit("ms")
             .with_boundaries(vec![
                 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -408,7 +401,7 @@ impl GatewayMetrics {
             .build();
         let database_admission_queue_depth = meter
             .u64_histogram("pioneer.gateway.db.admission.queue.depth")
-            .with_description("Writer-executor queue depth at SQLite admission events")
+            .with_description("Writer-executor queue depth at PostgreSQL admission events")
             .with_unit("{request}")
             .with_boundaries(vec![
                 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
@@ -427,13 +420,13 @@ impl GatewayMetrics {
             .build();
         let database_workload_query_count = meter
             .u64_histogram("pioneer.gateway.db.workload.query_count")
-            .with_description("SQLite statement count within one bounded Gateway work unit")
+            .with_description("PostgreSQL statement count within one bounded Gateway work unit")
             .with_unit("{query}")
             .with_boundaries(operation_item_boundaries())
             .build();
         let database_workload_query_duration = meter
             .f64_histogram("pioneer.gateway.db.workload.query_duration")
-            .with_description("Cumulative SQLite execution time within one Gateway work unit")
+            .with_description("Cumulative PostgreSQL execution time within one Gateway work unit")
             .with_unit("ms")
             .with_boundaries(operation_duration_boundaries())
             .build();
@@ -1314,7 +1307,7 @@ fn record_database_pool_acquire(context: DatabasePoolContext, elapsed: Duration)
     metrics.database_pool_acquire_duration.record(
         elapsed.as_secs_f64() * 1_000.0,
         &[
-            KeyValue::new("db.system.name", "sqlite"),
+            KeyValue::new("db.system.name", "postgresql"),
             KeyValue::new("db.pool.role", context.role().as_str()),
             KeyValue::new("db.scheduling.class", context.class()),
         ],
@@ -1363,7 +1356,7 @@ impl Visit for PoolAcquireEventVisitor {
 
 fn database_operation_attributes(metric: DatabaseOperationMetric) -> [KeyValue; 7] {
     [
-        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.system.name", "postgresql"),
         KeyValue::new("db.pool.role", metric.role.as_str()),
         KeyValue::new("db.operation.name", metric.operation.as_str()),
         KeyValue::new("db.operation.type", metric.operation.kind()),
@@ -1551,7 +1544,7 @@ pub fn record_database_read_for_consent(metric: DatabaseReadMetric, generation: 
         return;
     };
     let attributes = [
-        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.system.name", "postgresql"),
         KeyValue::new("db.pool.role", DatabaseRole::Reader.as_str()),
         KeyValue::new("db.scheduling.class", metric.class),
         KeyValue::new("outcome", metric.outcome),
@@ -1588,7 +1581,7 @@ pub fn record_database_read_admission_for_consent(
         return;
     };
     let attributes = [
-        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.system.name", "postgresql"),
         KeyValue::new("db.pool.role", DatabaseRole::Reader.as_str()),
         KeyValue::new("db.admission.event", metric.event),
         KeyValue::new("db.admission.class", metric.class),
@@ -1638,7 +1631,7 @@ pub fn record_database_admission_for_consent(
         return;
     };
     let attributes = [
-        KeyValue::new("db.system.name", "sqlite"),
+        KeyValue::new("db.system.name", "postgresql"),
         KeyValue::new("db.pool.role", DatabaseRole::Writer.as_str()),
         KeyValue::new("db.admission.event", metric.event),
         KeyValue::new("db.admission.class", metric.class),
@@ -1701,7 +1694,7 @@ where
     metrics
         .meter
         .u64_observable_gauge("pioneer.gateway.db.pool.connections")
-        .with_description("Current and configured SQLite connection pool size")
+        .with_description("Current and configured PostgreSQL connection pool size")
         .with_unit("{connection}")
         .with_callback(move |gauge| {
             let (enabled, epoch) = super::telemetry_consent_snapshot();
@@ -1714,7 +1707,7 @@ where
             let idle = snapshot.idle.min(size);
             let in_use = size.saturating_sub(idle);
             let common = [
-                KeyValue::new("db.system.name", "sqlite"),
+                KeyValue::new("db.system.name", "postgresql"),
                 KeyValue::new("db.pool.role", role.as_str()),
             ];
             gauge.observe(
@@ -2050,7 +2043,7 @@ mod bound_db_regressions {
             .with_unit("{operation}")
             .build();
         let attributes = [
-            KeyValue::new("db.system.name", "sqlite"),
+            KeyValue::new("db.system.name", "postgresql"),
             KeyValue::new("db.pool.role", "reader"),
             KeyValue::new("db.scheduling.class", "maintenance"),
         ];
@@ -2132,7 +2125,7 @@ mod bound_db_regressions {
         let state = crate::telemetry::tests::gateway_test_state(provider.clone());
         let labels = |event| {
             [
-                KeyValue::new("db.system.name", "sqlite"),
+                KeyValue::new("db.system.name", "postgresql"),
                 KeyValue::new("db.pool.role", "reader"),
                 KeyValue::new("db.admission.event", event),
                 KeyValue::new("db.admission.class", "maintenance"),
@@ -2386,7 +2379,7 @@ mod bound_db_regressions {
                     assert_eq!(sample.unit, unit);
                     assert_eq!(sample.temporality, Temporality::Delta);
                     let mut labels = vec![
-                        ("db.system.name", "sqlite"),
+                        ("db.system.name", "postgresql"),
                         ("db.pool.role", "reader"),
                         ("db.operation.name", "select"),
                         ("db.operation.type", "read"),

@@ -1,5 +1,5 @@
-use gpui_kit::component::{theme::ActiveTheme, *};
-use gpui_kit::{prelude::*, *};
+use gpui_kit::component::theme::ActiveTheme;
+use gpui_kit::{App, Hsla, IntoElement, RenderOnce, Window};
 use pioneer_client::mcp::{
     presentation as mcp_presentation,
     types::{McpListItem, McpServerStatus},
@@ -15,8 +15,6 @@ pub(crate) struct McpServerCard {
     pending: bool,
 }
 impl McpServerCard {
-    pub const HEIGHT: f32 = pioneer_desktop_foundation::CatalogSummaryCard::HEIGHT;
-
     pub fn new(server: &McpListItem, cx: &mut App) -> Self {
         Self {
             title: mcp_presentation::mcp_display_name(server),

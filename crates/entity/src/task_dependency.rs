@@ -7,16 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_dependency")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_task_dependency_pair_kind")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_dependency_pair_kind")]
     pub task_id: String,
-    #[sea_orm(unique_key = "uidx_task_dependency_pair_kind")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_dependency_pair_kind")]
     pub depends_on_task_id: String,
-    #[sea_orm(unique_key = "uidx_task_dependency_pair_kind")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_dependency_pair_kind")]
     pub kind: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub condition_json: Option<String>,
+    pub condition_json: Option<Json>,
     pub created_at: DateTimeWithTimeZone,
 }
 

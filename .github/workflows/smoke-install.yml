@@ -2,15 +2,57 @@ name: Smoke Install
 
 on:
   workflow_dispatch:
+    inputs:
+      release_packages:
+        description: Build and verify the Linux Gateway and Desktop packages and Windows ARM64 Gateway
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  generate-release-model-catalog:
+    if: inputs.release_packages
+    uses: ./.github/workflows/release-model-catalog.yml
+
+  smoke-release-packages:
+    name: smoke-release-${{ matrix.target }}
+    if: inputs.release_packages
+    needs: generate-release-model-catalog
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: pioneer-gateway-linux-x86_64.zip
+            cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip
+            asset_name: pioneer-linux-x86_64.AppImage
+            update_asset_name: pioneer-linux-x86_64.AppImage
+            appimagetool_arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: pioneer-gateway-linux-aarch64.zip
+            cu_asset: pioneer-gateway-linux-aarch64-computer-use-package.zip
+            asset_name: pioneer-linux-aarch64.AppImage
+            update_asset_name: pioneer-linux-aarch64.AppImage
+            appimagetool_arch: aarch64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: pioneer-gateway-windows-aarch64.zip
+            cu_asset: pioneer-gateway-windows-aarch64-computer-use-package.zip
+            asset_name: Pioneer-aarch64.msi
+            update_asset_name: Pioneer-aarch64.exe
+    uses: ./.github/workflows/release-platform.yml
+    with:
+      platform: ${{ toJSON(matrix) }}
+
   smoke-path-warning-macos:
     name: smoke-path-warning-macos
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -30,6 +72,11 @@ jobs:
         with:
           toolchain: "1.99.0"
 
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: aarch64-apple-darwin
+          out: postgres-runtime
+
       - name: build-cli-and-prepare-local-assets
         shell: bash
         run: |
@@ -41,7 +88,7 @@ jobs:
 
           asset_name="pioneer-gateway-macos-aarch64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target aarch64-apple-darwin
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target aarch64-apple-darwin --postgres postgres-runtime
           sha="$(shasum -a 256 "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -56,7 +103,7 @@ jobs:
             echo "SMOKE_ASSET=${asset_path}"
             echo "SMOKE_CHECKSUMS=${smoke_dir}/SHA256SUMS"
             echo "SMOKE_INSTALL_ROOT=${install_root}"
-            echo "SMOKE_BINARY=${install_root}/bin/cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+            echo "SMOKE_BINARY=${install_root}/bin/runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
           } >> "${GITHUB_ENV}"
 
       - name: install-force-start-with-path-warning
@@ -85,13 +132,12 @@ jobs:
           assert any((w.get("code") == "path_update_skipped") for w in warnings), "expected path_update_skipped warning"
           PY
 
-      - name: verify-status-and-stop
+      - name: verify installed Gateway PostgreSQL lifecycle
         shell: bash
         run: |
           set -euo pipefail
-          status="$(env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" status --json)"
-          python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p.get("service_active"), "service should stay active"; assert p.get("gateway_reachable"), "gateway should stay reachable"' "${status}"
-          env HOME="${SMOKE_HOME}" "${SMOKE_BINARY}" stop
+          python -m pip install websockets==15.0.1
+          env HOME="${SMOKE_HOME}" python scripts/packaging/smoke-gateway-postgres.py --binary "${SMOKE_BINARY}"
 
       - name: cleanup
         if: always()
@@ -106,7 +152,7 @@ jobs:
   smoke-path-warning-linux:
     name: smoke-path-warning-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -138,6 +184,11 @@ jobs:
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: x86_64-unknown-linux-gnu
+          out: postgres-runtime
+
       - name: build-cli-and-prepare-local-assets
         shell: bash
         run: |
@@ -149,7 +200,7 @@ jobs:
 
           asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu --postgres postgres-runtime
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -214,7 +265,7 @@ jobs:
   smoke-path-warning-windows:
     name: smoke-path-warning-windows
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -228,6 +279,11 @@ jobs:
           toolchain: "1.99.0"
           targets: x86_64-pc-windows-msvc
 
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: x86_64-pc-windows-msvc
+          out: postgres-runtime
+
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
@@ -238,7 +294,7 @@ jobs:
 
           $assetName = "pioneer-gateway-windows-x86_64-computer-use-package.zip"
           $assetPath = Join-Path $smokeDir $assetName
-          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
+          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc --postgres postgres-runtime
 
           $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
           "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
@@ -283,14 +339,20 @@ jobs:
           }
           if (-not $hasWarning) { throw "expected path_update_skipped warning" }
 
-      - name: verify-status-and-stop
+      - name: verify installed Gateway PostgreSQL lifecycle
         shell: pwsh
         run: |
-          $statusJson = & $env:SMOKE_BINARY status --json
-          $status = $statusJson | ConvertFrom-Json
-          if (-not $status.service_active) { throw "service should stay active" }
-          if (-not $status.gateway_reachable) { throw "gateway should stay reachable" }
-          & $env:SMOKE_BINARY stop
+          python -m pip install websockets==15.0.1
+          if ($LASTEXITCODE -ne 0) { throw "websockets installation failed" }
+          python scripts/packaging/smoke-gateway-postgres.py --binary $env:SMOKE_BINARY
+          if ($LASTEXITCODE -ne 0) { throw "Bundled PostgreSQL lifecycle smoke failed" }
+
+      - name: report Gateway startup failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+          if (Test-Path $log) { Get-Content $log -Tail 30 }
 
       - name: cleanup
         if: always()
@@ -306,7 +368,7 @@ jobs:
   smoke-linux:
     name: smoke-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -338,6 +400,11 @@ jobs:
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
 
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: x86_64-unknown-linux-gnu
+          out: postgres-runtime
+
       - name: build-cli-and-prepare-local-assets
         shell: bash
         run: |
@@ -349,7 +416,7 @@ jobs:
 
           asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu --postgres postgres-runtime
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 
@@ -412,7 +479,7 @@ jobs:
   smoke-windows:
     name: smoke-windows
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -426,6 +493,11 @@ jobs:
           toolchain: "1.99.0"
           targets: x86_64-pc-windows-msvc
 
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: x86_64-pc-windows-msvc
+          out: postgres-runtime
+
       - name: build-cli-and-prepare-local-assets
         shell: pwsh
         run: |
@@ -436,7 +508,7 @@ jobs:
 
           $assetName = "pioneer-gateway-windows-x86_64-computer-use-package.zip"
           $assetPath = Join-Path $smokeDir $assetName
-          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc
+          python scripts/packaging/smoke-gateway-asset.py --binary target/x86_64-pc-windows-msvc/release/pioneer.exe --archive $assetPath --target x86_64-pc-windows-msvc --postgres postgres-runtime
 
           $sha = (Get-FileHash -Path $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
           "sha256:$sha $assetName" | Set-Content -Path (Join-Path $smokeDir "SHA256SUMS") -NoNewline
@@ -503,6 +575,13 @@ jobs:
             throw "gateway service should be stopped"
           }
 
+      - name: report Gateway startup failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+          if (Test-Path $log) { Get-Content $log -Tail 30 }
+
       - name: cleanup
         if: always()
         shell: pwsh
@@ -517,7 +596,7 @@ jobs:
   smoke-desktop-local-linux:
     name: smoke-desktop-local-linux
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -541,6 +620,15 @@ jobs:
             libegl1-mesa-dev \
             libgbm-dev \
             libssl-dev \
+            libasound2-dev \
+            libwebkit2gtk-4.1-dev \
+            libfontconfig-dev \
+            libfreetype6-dev \
+            libxkbcommon-x11-dev \
+            libx11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libgl1-mesa-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
             libxi-dev \
@@ -548,6 +636,11 @@ jobs:
             libxkbcommon-dev
           multiarch="$(gcc -print-multiarch)"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/${multiarch}" >> "${GITHUB_ENV}"
+
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: x86_64-unknown-linux-gnu
+          out: postgres-runtime
 
       - name: build-binaries-and-test-assets
         shell: bash
@@ -560,7 +653,7 @@ jobs:
 
           asset_name="pioneer-gateway-linux-x86_64-computer-use-package.zip"
           asset_path="${smoke_dir}/${asset_name}"
-          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu
+          python3 scripts/packaging/smoke-gateway-asset.py --binary target/release/pioneer --archive "${asset_path}" --target x86_64-unknown-linux-gnu --postgres postgres-runtime
           sha="$(sha256sum "${asset_path}" | awk '{print $1}')"
           printf 'sha256:%s %s\n' "${sha}" "${asset_name}" > "${smoke_dir}/SHA256SUMS"
 

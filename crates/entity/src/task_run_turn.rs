@@ -7,23 +7,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run_turn")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub task_id: String,
-    #[sea_orm(unique_key = "uidx_task_run_turn_run_sequence")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_task_run_turn_run_sequence")]
     pub run_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub execution_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub thread_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub kind: String,
-    #[sea_orm(unique_key = "uidx_task_run_turn_candidate_round")]
     pub round: i64,
     #[sea_orm(unique_key = "uidx_task_run_turn_run_sequence")]
     pub sequence: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub reviews_candidate_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub requested_by_candidate_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub requested_by_review_event_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub started_at: Option<DateTimeWithTimeZone>,

@@ -4,6 +4,7 @@ use std::path::Path;
 
 #[tokio::test]
 async fn owned_skill_keeps_native_installation_and_native_source_override() {
+    pioneer_postgres_test::with_database(async |fixture| {
     use pioneer_crud::{
         PluginNativeWrite, PluginOwnershipWrite, SkillInstallationRecord,
         WorkspaceSkillPolicyRecord,
@@ -11,7 +12,7 @@ async fn owned_skill_keeps_native_installation_and_native_source_override() {
     use pioneer_skills::{
         SkillAvailability, SkillRuntimeBudget, SkillTrustLevel, SkillUnavailableReason,
     };
-    let (_, store, workspace) = setup_workspace_manager().await;
+    let (_, store, workspace) = crate::message::tests::setup_postgres_workspace_manager(fixture).await;
     let fixture = tempfile::tempdir().unwrap();
     let package = fixture.path().join("package");
     let member = package.join("skills/member");
@@ -439,4 +440,6 @@ async fn owned_skill_keeps_native_installation_and_native_source_override() {
             .unwrap()
             .is_available()
     );
+    Ok(())
+    }).await.unwrap();
 }

@@ -7,13 +7,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "tool_output_chunk")]
 pub struct Model {
-    pub portable_revision: i64,
-    #[sea_orm(column_type = "Text")]
-    pub portable_identity: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub text_payload_id: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub metadata_payload_id: Option<String>,
     #[sea_orm(primary_key)]
     pub ordinal: i64,
     #[sea_orm(column_type = "Text", unique)]
@@ -22,10 +15,15 @@ pub struct Model {
     pub turn_id: String,
     #[sea_orm(column_type = "Text")]
     pub item_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub stream: String,
-    #[sea_orm(column_type = "Text")]
-    pub text: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub stream: Option<String>,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub text: Vec<u8>,
+    pub text_encoding: i16,
+    pub text_original_bytes: i64,
+    pub text_original_chars: i64,
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
+    pub text_sha256: Vec<u8>,
     #[sea_orm(column_type = "Text", nullable)]
     pub metadata: Option<String>,
     #[sea_orm(
@@ -35,7 +33,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

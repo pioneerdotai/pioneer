@@ -1,5 +1,4 @@
 use crate::{sidebar::CatalogSidebar, table::*};
-use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::component::table::TableState;
 use gpui_kit::{prelude::*, *};
 pub(crate) use pioneer_client::state::client_state::GatewayConnectionState;
@@ -130,7 +129,7 @@ pub struct SkillsCatalogView {
     pub(crate) presentation_error: Option<String>,
     pub(crate) native_task: Option<Task<()>>,
     pub(crate) parent_generation: u64,
-    pub(crate) skills_list_scroll_handle: VirtualListScrollHandle,
+    pub(crate) skills_list_state: ListState,
     pub(crate) skills_details_expanded_sections:
         std::collections::BTreeMap<String, std::collections::HashSet<String>>,
     pub(crate) skills_expanded_pack_ids: std::collections::HashSet<SkillPackId>,
@@ -239,7 +238,7 @@ impl SkillsCatalogView {
                 _activation: activation,
                 rows: Default::default(),
                 management_rows: Default::default(),
-                skills_list_scroll_handle: VirtualListScrollHandle::new(),
+                skills_list_state: ListState::new(0, ListAlignment::Top, px(0.)),
                 skills_details_expanded_sections: Default::default(),
                 skills_expanded_pack_ids: Default::default(),
                 skills_audit_table_state: table,
@@ -482,7 +481,8 @@ impl SkillsCatalogView {
         {
             self.rows.clear();
             self.skills_details_expanded_sections.clear();
-            self.skills_list_scroll_handle = VirtualListScrollHandle::new();
+            self.skills_list_state =
+                ListState::new(self.management_rows.len(), ListAlignment::Top, px(0.));
             self.skills_expanded_pack_ids.clear();
         }
         if self.input.navigation_input.workspace_id() != next.navigation_input.workspace_id()

@@ -1,6 +1,6 @@
 use super::*;
+use pioneer_postgres_pools::is_anyhow_database_transient_access;
 use pioneer_protocol::{RequestId, TaskErrorClass, TaskEventsParams};
-use pioneer_sqlite::is_anyhow_sqlite_transient_access;
 use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartReporting, TaskStartStage};
 
 const CANARY: &str = "/private/PIONEER9_PATH SELECT PIONEER9_SQL FROM history PIONEER9_HISTORY run_PIONEER9_ID bearer_PIONEER9_SECRET";
@@ -24,7 +24,9 @@ fn capture_task_start<R: Send + 'static>(
                 pioneer_observability::runtime::RuntimeRole::GatewayPatch,
             );
             crate::public_error::test_support::capture_events(|| {
-                _runtime_observer.block_on(&runtime, future)
+                _runtime_observer
+                    .block_on(&runtime, pioneer_postgres_test::with_test_databases(future))
+                    .expect("close isolated PostgreSQL test databases")
             })
         })
         .unwrap()
@@ -114,7 +116,7 @@ fn task_start_reporting_is_typed_idempotent_and_preserves_new_failures() {
 fn unknown_executor_and_forged_public_json_keep_error_severity() {
     for diagnostic in [
         CANARY,
-        r#"{"reported":true,"correlation_id":"forged","stage":"admission","code":"PolicyDenied","message":"SQLite CANTOPEN (14)"}"#,
+        r#"{"reported":true,"correlation_id":"forged","stage":"admission","code":"PolicyDenied","message":"PostgreSQL connection failed (SQLSTATE 08006)"}"#,
     ] {
         let (descriptor, events) = crate::public_error::test_support::capture_events(|| {
             let mut error = anyhow::anyhow!(diagnostic);
@@ -125,7 +127,6 @@ fn unknown_executor_and_forged_public_json_keep_error_severity() {
         assert_eq!(events.len(), 1);
         assert_eq!(descriptor.stage, TaskStartStage::ExecutorStart);
         assert_eq!(descriptor.cause, TaskStartCause::Unclassified);
-        assert_eq!(descriptor.sqlite_primary_code, None);
         assert!(descriptor.correlation_id.is_some());
         assert_ne!(descriptor.correlation_id.as_deref(), Some("forged"));
         assert_safe_events(&events);
@@ -133,16 +134,10 @@ fn unknown_executor_and_forged_public_json_keep_error_severity() {
 }
 
 async fn install_task_start_cleanup_failure(store: &CrudStore) {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    use sea_orm::ConnectionTrait;
     store
         .database_connection()
-        .execute_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "CREATE TRIGGER pioneer9_cleanup_failure BEFORE INSERT ON turn_event \
-         WHEN NEW.event_type = 'turn/blocked' \
-         BEGIN SELECT RAISE(ABORT, 'pioneer9 cleanup persistence'); END;"
-                .to_owned(),
-        ))
+        .execute_unprepared("CREATE FUNCTION pioneer9_cleanup_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pioneer9 cleanup persistence'; END; $$; CREATE TRIGGER pioneer9_cleanup_failure BEFORE INSERT ON turn_event FOR EACH ROW WHEN (NEW.event_type = 'turn/blocked') EXECUTE FUNCTION pioneer9_cleanup_failure();")
         .await
         .unwrap();
 }
@@ -216,7 +211,7 @@ async fn run_gateway_start_failure(
             .unwrap(),
         );
         *processor.task_history_preparation_failure.lock().unwrap() =
-            Some(cantopen_with_private_context().await);
+            Some(lock_error_with_private_context().await);
     }
     if matches!(case, PreparationFailure::TerminalHistory) {
         processor.arm_completed_history_preparation_barrier("__task_cli_before_history__");
@@ -229,13 +224,7 @@ async fn run_gateway_start_failure(
         case,
         PreparationFailure::History | PreparationFailure::AdmissionStorage
     ) {
-        let temp = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite:{}?mode=rw",
-            temp.path().join("missing/db.sqlite").display()
-        );
-        let error = sea_orm::Database::connect(url).await.unwrap_err();
-        let error = anyhow::Error::new(error).context(CANARY);
+        let error = lock_error_with_private_context().await;
         if matches!(case, PreparationFailure::History) {
             *processor.task_history_preparation_failure.lock().unwrap() = Some(error);
         } else {
@@ -255,16 +244,10 @@ async fn run_gateway_start_failure(
     if matches!(case, PreparationFailure::ChildPersistence) {
         // Real writer failure in the existing scoped database, after admission
         // has already reported the original error. Domain invariants stay active.
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        use sea_orm::ConnectionTrait;
         store
             .database_connection()
-            .execute_raw(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "CREATE TRIGGER pioneer9_child_failure BEFORE INSERT ON task_event \
-             WHEN NEW.event_type IN ('task/run/turn/failed', 'task/run/turn/blocked') \
-             BEGIN SELECT RAISE(ABORT, 'pioneer9 child failure persistence'); END;"
-                    .to_owned(),
-            ))
+            .execute_unprepared("CREATE FUNCTION pioneer9_child_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pioneer9 child failure persistence'; END; $$; CREATE TRIGGER pioneer9_child_failure BEFORE INSERT ON task_event FOR EACH ROW WHEN (NEW.event_type IN ('task/run/turn/failed', 'task/run/turn/blocked')) EXECUTE FUNCTION pioneer9_child_failure();")
             .await
             .unwrap();
     }
@@ -279,7 +262,7 @@ async fn run_gateway_start_failure(
         .event_bus()
         .subscribe(Default::default());
     let created = create_task_for_test(&processor, params).await.unwrap();
-    let run_id = created.run.as_ref().unwrap().id.clone();
+    assert!(created.run.is_some(), "immediate Task must return a run");
     if matches!(case, PreparationFailure::TerminalHistory) {
         processor
             .wait_for_completed_history_preparation_barrier()
@@ -311,7 +294,8 @@ async fn run_gateway_start_failure(
             .unwrap();
         assert!(turn.status != TurnStatus::InProgress);
         // Terminal dispatch never replaces cancellation with start failure.
-        return (response.runs[0].error.clone(), run_id);
+        processor.shutdown_resilience_workers().await;
+        return (response.runs[0].error.clone(), response.runs[0].id.clone());
     }
     let expected_status = if matches!(
         case,
@@ -361,6 +345,8 @@ async fn run_gateway_start_failure(
         "only configured retry_on can create another run"
     );
     assert_eq!(saved.runs[0].attempt_number, 1);
+    // The create response returns the latest run; a retry can already exist.
+    let run_id = saved.runs[0].id.clone();
     let error = saved.runs[0].error.clone().unwrap();
     if !matches!(
         case,
@@ -403,7 +389,7 @@ async fn run_gateway_start_failure(
         );
     } else if matches!(case, PreparationFailure::ChildPersistence) {
         assert!(child_error.is_none());
-        // The trigger raises a real SQLite error after admission was reported.
+        // The trigger raises a real PostgreSQL error after admission was reported.
         assert_eq!(error.code, "task_executor_start_storage_failed");
         assert_eq!(error.class, TaskErrorClass::Internal);
     } else {
@@ -452,7 +438,7 @@ async fn run_gateway_start_failure(
             .get_task_run_conversation_snapshot(&run_id)
             .await
             .unwrap()
-            .unwrap();
+            .expect("the first attempt must retain its accepted history");
         let retry = &saved.runs[1];
         assert_eq!(retry.attempt_number, 2);
         assert_eq!(retry.retry_of_run_id.as_deref(), Some(run_id.as_str()));
@@ -483,6 +469,7 @@ async fn run_gateway_start_failure(
                 1
             );
             assert!(cli.turn_starts.lock().await.is_empty());
+            processor.shutdown_resilience_workers().await;
             return (Some(error), run_id);
         }
         install_task_start_cleanup_failure(&store).await;
@@ -540,6 +527,9 @@ async fn run_gateway_start_failure(
     ] {
         assert!(!encoded.contains(marker));
     }
+    // Terminal Task state can commit before optional deliveries finish.
+    // Join Gateway workers before the fixture closes the PostgreSQL pools.
+    processor.shutdown_resilience_workers().await;
     (Some(error), run_id)
 }
 
@@ -573,14 +563,22 @@ fn gateway_completion_executor_scheduler_admission_reports_once_and_keeps_correl
 }
 
 #[test]
-fn gateway_history_cantopen_keeps_codes_context_and_one_safe_event() {
+fn gateway_history_lock_keeps_sqlstate_context_and_one_safe_event() {
     for (case, stage) in [
         (PreparationFailure::History, "history_preparation"),
         (PreparationFailure::AdmissionStorage, "cli_admission"),
     ] {
         let ((error, _), events) = capture_task_start(run_gateway_start_failure(case));
-        assert_eq!(events.len(), 1);
         assert_safe_events(&events);
+        assert_eq!(
+            events.len(),
+            1,
+            "{stage} emitted reports from {:?}",
+            events
+                .iter()
+                .map(|event| event.logger.as_deref())
+                .collect::<Vec<_>>()
+        );
         let error = error.unwrap();
         assert_eq!(error.class, TaskErrorClass::Internal);
         let TaskValue::Object(details) = error.details.unwrap() else {
@@ -588,8 +586,10 @@ fn gateway_history_cantopen_keeps_codes_context_and_one_safe_event() {
         };
         assert_eq!(details["stage"], TaskValue::from(stage));
         assert_eq!(details["cause"], TaskValue::from("storage"));
-        assert_eq!(details["sqlite_primary_code"], TaskValue::Integer(14));
-        assert_eq!(details["sqlite_extended_code"], TaskValue::Integer(14));
+        assert_eq!(
+            details["postgres_sqlstate"],
+            TaskValue::from("55P03".to_owned())
+        );
         if stage != "history_preparation" {
             let TaskValue::String(correlation) = &details["correlation_id"] else {
                 panic!("completion correlation must be retained")
@@ -618,12 +618,44 @@ fn gateway_reported_admission_does_not_hide_child_persistence_error() {
     let ((_, _), events) = capture_task_start(run_gateway_start_failure(
         PreparationFailure::ChildPersistence,
     ));
-    assert_eq!(
-        events.len(),
-        2,
-        "original admission and new persistence failure each get ERROR"
-    );
     assert_safe_events(&events);
+    let mut stages = Vec::new();
+    for event in &events {
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("each report must include tracing fields");
+        };
+        match (event.logger.as_deref(), event.message.as_deref()) {
+            (Some("pioneer_tasks::start_failure"), Some("Task preparation or launch failed")) => {
+                let stage = fields["stage"].as_str().expect("Task start stage");
+                if stage == "executor_start" {
+                    assert_eq!(fields["postgres_sqlstate"], json!("P0001"));
+                }
+                stages.push(stage);
+            }
+            (
+                Some("pioneer_gateway::message::agent_runtime"),
+                Some("native turn-event optional delivery worker failed"),
+            ) => {
+                // The worker can encounter the same injected task_event
+                // trigger on another PostgreSQL session before this test ends.
+                assert!(
+                    fields["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("pioneer9 child failure persistence")),
+                    "unexpected optional delivery error: {:?}",
+                    fields.get("error")
+                );
+            }
+            report => panic!("unexpected diagnostic in Task start fixture: {report:?}"),
+        }
+    }
+    stages.sort_unstable();
+    assert_eq!(
+        stages,
+        ["cli_admission", "executor_start"],
+        "each distinct Task start failure gets one ERROR"
+    );
 }
 
 #[test]
@@ -924,13 +956,11 @@ fn separate_completion_channel_and_task_join_failures_keep_error_reporting() {
     assert_safe_events(&events);
 }
 
-async fn cantopen_with_private_context() -> anyhow::Error {
-    let temp = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite:{}?mode=rw",
-        temp.path().join("missing/db.sqlite").display()
-    );
-    anyhow::Error::new(sea_orm::Database::connect(url).await.unwrap_err()).context(CANARY)
+async fn lock_error_with_private_context() -> anyhow::Error {
+    let error = crate::tests::postgres_failures::lock_unavailable(false)
+        .await
+        .unwrap();
+    anyhow::Error::new(error).context(CANARY)
 }
 
 async fn review_cli_fixture() -> (CliRuntimeSkillPreflightHarness, Arc<MessageProcessor>) {
@@ -1072,6 +1102,7 @@ async fn create_cli_child_with_attachment_and_write_policy(
         .await;
     let response = create_task_for_test(processor, params).await.unwrap();
     let run = response.run.as_ref().unwrap();
+    let expected_native = format!("native-{label}");
     let lineage = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(child) = harness
@@ -1093,16 +1124,39 @@ async fn create_cli_child_with_attachment_and_write_policy(
                     .unwrap()
                     .status
                     == TaskRunStatus::Running
-                && harness
+                && let Some(binding) = harness
                     .crud_store
                     .get_cli_runtime_turn_binding(&child.turn_id)
                     .await
                     .unwrap()
-                    .is_some_and(|binding| {
-                        binding.native_turn_id.as_deref()
-                            == Some(format!("native-{label}").as_str())
-                    })
+                && binding.native_turn_id.as_deref() == Some(expected_native.as_str())
+                && processor
+                    .thread_manager
+                    .turn_get(&child.thread_id, &child.turn_id)
+                    .await
+                    .is_some_and(|(_, turn)| turn.status == TurnStatus::InProgress)
+                && let Some(guard) = harness
+                    .crud_store
+                    .cli_runtime_blocked_turn_guard(&binding, &expected_native)
+                    .await
+                    .unwrap()
+                && let Some(window) = harness
+                    .crud_store
+                    .latest_turn_execution_window(&child.turn_id)
+                    .await
+                    .unwrap()
+                && window.status == pioneer_protocol::ExecutionWindowStatus::Running
+                && window.metadata_json["runtimeWindowId"].as_str()
+                    == Some(guard.attempt_id.as_str())
             {
+                // The native start ACK and active binding can precede the
+                // execution-window commit. Let launch release its transition
+                // before the fixture publishes a result or completes the turn.
+                let _launch = processor
+                    .cli_runtime_turn_resume_transition(&child.turn_id)
+                    .await
+                    .unwrap()
+                    .expect("activated child has a launch transition");
                 return TestChildRuntimeAnchor {
                     child_thread_id: scope.child_thread_id,
                     child_turn_id: child.turn_id,
@@ -1115,7 +1169,7 @@ async fn create_cli_child_with_attachment_and_write_policy(
         }
     })
     .await
-    .expect("initial CLI child must persist its exact native activation ACK within 30 seconds");
+    .expect("initial CLI child must commit its running native window within 30 seconds");
     assert_eq!(
         harness.cli_session.turn_starts.lock().await.len(),
         activations + 1
@@ -1175,11 +1229,11 @@ fn revision_real_completion_preserves_public_error_and_one_report() {
                 *processor
                     .task_cli_history_revalidation_failure
                     .lock()
-                    .unwrap() = Some(cantopen_with_private_context().await);
+                    .unwrap() = Some(lock_error_with_private_context().await);
             } else {
                 let typed = TaskStartFailure::from_error(
                     TaskStartStage::CliAdmission,
-                    cantopen_with_private_context().await,
+                    lock_error_with_private_context().await,
                 )
                 .with_correlation_id("revision-original-correlation".to_owned());
                 *processor.task_cli_admission_failure.lock().unwrap() =
@@ -1264,12 +1318,8 @@ fn revision_real_completion_preserves_public_error_and_one_report() {
             );
             if !expected {
                 assert_eq!(
-                    details.get("sqlite_primary_code"),
-                    Some(&TaskValue::Integer(14))
-                );
-                assert_eq!(
-                    details.get("sqlite_extended_code"),
-                    Some(&TaskValue::Integer(14))
+                    details.get("postgres_sqlstate"),
+                    Some(&TaskValue::from("55P03".to_owned()))
                 );
             }
             if !expected && !late {
@@ -1348,8 +1398,7 @@ fn revision_real_completion_preserves_public_error_and_one_report() {
             else {
                 panic!("fields")
             };
-            assert_eq!(fields["sqlite_primary_code"], 14);
-            assert_eq!(fields["sqlite_extended_code"], 14);
+            assert_eq!(fields["postgres_sqlstate"], "55P03");
             assert_eq!(fields["correlation_id"], correlation);
             assert_eq!(
                 fields["stage"],
@@ -1394,7 +1443,7 @@ fn reviewer_real_completion_live_keeps_pending_and_safe_breadcrumbs() {
         *processor.task_cli_admission_failure.lock().unwrap() =
             Some(TurnStartFailure::internal_typed(
                 TaskStartStage::CliAdmission,
-                cantopen_with_private_context().await,
+                lock_error_with_private_context().await,
             ));
         assert!(
             processor
@@ -1507,7 +1556,7 @@ async fn persist_completed_child(
         )
         .await
         .unwrap();
-    harness
+    let completion = harness
         .crud_store
         .materialize_native_agent_turn_event_owned(
             pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
@@ -1519,8 +1568,43 @@ async fn persist_completed_child(
             None,
             harness.processor.turn_execution_owner_id.as_ref(),
         )
+        .await;
+    if let Err(error) = completion {
+        assert!(
+            error
+                .downcast_ref::<pioneer_crud::TurnEventProjectionAfterAppendError>()
+                .is_some_and(|projection| projection.is_pending()),
+            "fixture completion must either project or durably wait for its predecessor: {error:#}"
+        );
+        let turn_ids = [child.child_turn_id.clone()];
+        // This fixture drives reconciliation itself. Finish ordered publication
+        // before handing the terminal turn to the reconciliation batch.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let now = now_timestamp_secs();
+                let replay = harness
+                    .crud_store
+                    .replay_turn_event_projection_frontier(now, 64, Some(&turn_ids), now)
+                    .await
+                    .expect("replay child projection");
+                assert_eq!(replay.failed, 0, "{replay:?}");
+                assert_eq!(replay.exhausted, 0, "{replay:?}");
+                assert_eq!(replay.quarantined, 0, "{replay:?}");
+                if harness
+                    .crud_store
+                    .get_turn(&child.child_thread_id, &child.child_turn_id)
+                    .await
+                    .expect("read child projection")
+                    .is_some_and(|(_, turn)| turn.status == TurnStatus::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
         .await
-        .unwrap();
+        .expect("project the fixture's terminal child event");
+    }
     harness
         .processor
         .cleanup_completed_cli_task_fixture(&child.child_turn_id)
@@ -1533,29 +1617,28 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
         let (safe_batch, events) = capture_task_start(async move {
             use super::super::{tasks, turn_handlers::TurnStartFailure};
             let (harness, processor) = review_cli_fixture().await;
+            let now = now_timestamp_secs();
             let (poison, poison_child) =
                 create_review_cli_child(&harness, &processor, "batch-poison", true, true).await;
+            persist_completed_child(&harness, &poison_child, now).await;
             let (healthy, healthy_child) =
                 create_review_cli_child(&harness, &processor, "batch-healthy", true, false).await;
+            persist_completed_child(&harness, &healthy_child, now + 1).await;
             let independent = if mixed {
-                Some(
-                    create_review_cli_child(
-                        &harness,
-                        &processor,
-                        "batch-independent",
-                        false,
-                        false,
-                    )
-                    .await,
+                let (task, child) = create_review_cli_child(
+                    &harness,
+                    &processor,
+                    "batch-independent",
+                    false,
+                    false,
                 )
+                .await;
+                persist_completed_child(&harness, &child, now + 2).await;
+                Some((task, child))
             } else {
                 None
             };
-            let now = now_timestamp_secs();
-            persist_completed_child(&harness, &poison_child, now).await;
-            persist_completed_child(&harness, &healthy_child, now + 1).await;
             if let Some((_, child)) = &independent {
-                persist_completed_child(&harness, child, now + 2).await;
                 processor
                     .task_output_capture_failures
                     .lock()
@@ -1568,7 +1651,7 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
             *processor.task_cli_admission_failure.lock().unwrap() =
                 Some(TurnStartFailure::internal_typed(
                     TaskStartStage::CliAdmission,
-                    cantopen_with_private_context().await,
+                    lock_error_with_private_context().await,
                 ));
             let attempts = processor
                 .task_cli_preparation_attempts
@@ -1659,8 +1742,7 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
         else {
             panic!("fields")
         };
-        assert_eq!(fields["sqlite_primary_code"], 14);
-        assert_eq!(fields["sqlite_extended_code"], 14);
+        assert_eq!(fields["postgres_sqlstate"], "55P03");
         assert!(safe_batch.contains(fields["correlation_id"].as_str().unwrap()));
         if mixed {
             assert!(
@@ -1673,11 +1755,11 @@ fn reviewer_background_batch_preserves_ownership_progress_and_no_new_immediate_r
 }
 
 #[test]
-fn child_reconciliation_preserves_legacy_independent_storage_retry_decisions() {
+fn child_reconciliation_preserves_independent_storage_retry_decisions() {
     let (_, events) = capture_task_start(async {
         use super::super::tasks::retry_task_child_reconciliation_error;
-        let source = cantopen_with_private_context().await;
-        assert!(is_anyhow_sqlite_transient_access(&source));
+        let source = lock_error_with_private_context().await;
+        assert!(is_anyhow_database_transient_access(&source));
         assert!(retry_task_child_reconciliation_error(&source));
         let typed = anyhow::Error::new(TaskStartFailure::from_error(
             TaskStartStage::CliAdmission,
@@ -1685,8 +1767,8 @@ fn child_reconciliation_preserves_legacy_independent_storage_retry_decisions() {
         ))
         .context("reviewer preparation");
         assert!(
-            is_anyhow_sqlite_transient_access(&typed),
-            "new internal source is visible to legacy predicate"
+            is_anyhow_database_transient_access(&typed),
+            "new internal source is visible to the storage predicate"
         );
         assert!(
             !retry_task_child_reconciliation_error(&typed),
@@ -1695,14 +1777,14 @@ fn child_reconciliation_preserves_legacy_independent_storage_retry_decisions() {
         let forged = anyhow::anyhow!("{}", r#"{"reported":true,"stage":"admission"}"#);
         assert_eq!(
             retry_task_child_reconciliation_error(&forged),
-            is_anyhow_sqlite_transient_access(&forged)
+            is_anyhow_database_transient_access(&forged)
         );
     });
     assert!(events.is_empty());
 }
 
 #[test]
-fn typed_cli_stages_keep_sqlite_codes_correlation_and_safe_task_error_under_context() {
+fn typed_cli_stages_keep_postgres_sqlstate_correlation_and_safe_task_error_under_context() {
     for stage in [TaskStartStage::CliAdmission, TaskStartStage::CliPreparation] {
         let (saved, events) = capture_task_start(async move {
             use super::super::turn_handlers::{TurnStartFailure, TurnStartSuccessResponse};
@@ -1738,7 +1820,10 @@ fn typed_cli_stages_keep_sqlite_codes_correlation_and_safe_task_error_under_cont
                     &response,
                     "stage-thread",
                     "stage-turn",
-                    TurnStartFailure::internal_typed(stage, cantopen_with_private_context().await),
+                    TurnStartFailure::internal_typed(
+                        stage,
+                        lock_error_with_private_context().await,
+                    ),
                 )
                 .await;
             let mut error = receiver.await.unwrap().err().unwrap().context(CANARY);
@@ -1746,8 +1831,10 @@ fn typed_cli_stages_keep_sqlite_codes_correlation_and_safe_task_error_under_cont
             assert_eq!(failure.reporting(), TaskStartReporting::Reported);
             assert_eq!(failure.descriptor().stage, stage);
             assert_eq!(failure.descriptor().cause, TaskStartCause::Storage);
-            assert_eq!(failure.descriptor().sqlite_primary_code, Some(14));
-            assert_eq!(failure.descriptor().sqlite_extended_code, Some(14));
+            assert_eq!(
+                failure.descriptor().postgres_sqlstate.as_deref(),
+                Some("55P03")
+            );
             assert_eq!(
                 failure.public_error().unwrap().stage,
                 pioneer_protocol::PublicErrorStage::Admission
@@ -1809,8 +1896,10 @@ async fn assert_persisted_late_cli_failure(
     };
     assert_eq!(details["stage"], TaskValue::from("cli_preparation"));
     assert_eq!(details["cause"], TaskValue::from("storage"));
-    assert_eq!(details["sqlite_primary_code"], TaskValue::Integer(14));
-    assert_eq!(details["sqlite_extended_code"], TaskValue::Integer(14));
+    assert_eq!(
+        details["postgres_sqlstate"],
+        TaskValue::from("55P03".to_owned())
+    );
     let TaskValue::String(saved_correlation) = &details["correlation_id"] else {
         panic!("correlation")
     };
@@ -1861,15 +1950,22 @@ async fn assert_persisted_late_cli_failure(
         .crud_store
         .database_connection()
         .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT payload FROM turn_event WHERE turn_id = ? AND event_type = 'turn/blocked'",
+            DatabaseBackend::Postgres,
+            "SELECT id FROM turn_event WHERE turn_id = $1 AND event_type = 'turn/blocked'",
             [child.turn_id.clone().into()],
         ))
         .await
         .unwrap();
     assert!(!payloads.is_empty());
     for row in payloads {
-        let payload: String = row.try_get("", "payload").unwrap();
+        let event_id: String = row.try_get("", "id").unwrap();
+        let payload = processor
+            .crud_store
+            .persisted_turn_event_for_test(&event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = serde_json::to_string(&payload).unwrap();
         assert!(payload.contains("task_cli_preparation_failed"));
         assert!(!payload.contains("PIONEER9_"));
         assert!(!payload.contains("failed to revalidate"));
@@ -1903,7 +1999,7 @@ fn initial_late_cli_preparation_blocks_once_with_safe_storage_error_without_retr
         *processor
             .task_cli_history_revalidation_failure
             .lock()
-            .unwrap() = Some(cantopen_with_private_context().await);
+            .unwrap() = Some(lock_error_with_private_context().await);
         let created = create_task_for_test(&processor, params).await.unwrap();
         // The executor's existing terminal notification is the completion
         // barrier: inspect durable state only after it has observed Blocked.
@@ -1972,7 +2068,7 @@ fn reviewer_late_cli_preparation_preserves_blocked_transition_and_safe_storage_e
         *processor
             .task_cli_history_revalidation_failure
             .lock()
-            .unwrap() = Some(cantopen_with_private_context().await);
+            .unwrap() = Some(lock_error_with_private_context().await);
         persist_completed_child(&harness, &child, now_timestamp_secs()).await;
         let error = processor
             .task_agent_executor
@@ -2166,8 +2262,8 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
         // A quarantined projection remains visible and cannot authorize ACK.
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
         store.database_connection().execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = ?",
+            DbBackend::Postgres,
+            "UPDATE turn_event_projection_stream_state SET status = 'quarantined' WHERE turn_id = $1",
             [parent_turn.into()],
         )).await.unwrap();
         assert_eq!(
@@ -2194,8 +2290,8 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
                 .is_some()
         );
         store.database_connection().execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE turn_event_projection_stream_state SET status = 'healthy' WHERE turn_id = ?",
+            DbBackend::Postgres,
+            "UPDATE turn_event_projection_stream_state SET status = 'healthy' WHERE turn_id = $1",
             [parent_turn.into()],
         )).await.unwrap();
         let replay = store
@@ -2205,13 +2301,31 @@ fn terminal_child_pending_parent_receipt_retains_capsule_until_replayed_cleanup(
             .unwrap();
         assert!(replay.projected > 0);
         assert_eq!(
-            processor
-                .for_background_reconciliation()
-                .reconcile_terminal_task_child_turns(64)
+            store
+                .terminal_task_child_cleanup_ready(&child.child_thread_id, &child.child_turn_id)
                 .await
                 .unwrap(),
-            1
+            Some(true),
+            "parent replay must expose the exact accepted terminal receipt",
         );
+        let reconcile = processor.for_background_reconciliation();
+        let applied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = reconcile
+                    .reconcile_terminal_task_child_turns(64)
+                    .await
+                    .unwrap();
+                if changed != 0 {
+                    break changed;
+                }
+                // Scope discovery and point acknowledgement have independent
+                // finite frontiers. Allow the parked point to become due.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a replayed parent receipt must wake the child's parked cleanup");
+        assert_eq!(applied, 1);
         assert!(
             store
                 .get_turn_runtime_snapshot(&child.child_turn_id)
@@ -2266,7 +2380,7 @@ async fn retain_cleanup_fixture_snapshot(store: &pioneer_crud::CrudStore, turn_i
             turn_id: turn_id.to_owned(),
             thread_id: binding.thread_id,
             workspace_id: binding.workspace_id,
-            mode_json: r#""Agent""#.to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             model: "gpt-5".to_owned(),
             provider_name: format!("cli_runtime:{}", binding.runtime_id),
             reasoning_effort: None,
@@ -2318,7 +2432,7 @@ async fn change_cleanup_fixture(
     store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             sql,
             values,
         ))
@@ -2611,7 +2725,7 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
             for missing_parent in [None, Some("unrelated-missing-parent")] {
                 change_cleanup_fixture(
                     store,
-                    "UPDATE thread_lineage SET created_by_turn_id = ? WHERE child_thread_id = ?",
+                    "UPDATE thread_lineage SET created_by_turn_id = $1 WHERE child_thread_id = $2",
                     vec![
                         missing_parent.map(str::to_owned).into(),
                         child.child_thread_id.clone().into(),
@@ -2621,13 +2735,13 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
                 assert_terminal_cleanup_fixture_denied(&processor, &child).await;
             }
             change_cleanup_fixture(store,
-                "UPDATE thread_lineage SET created_by_turn_id = ?, root_thread_id = child_thread_id WHERE child_thread_id = ?",
+                "UPDATE thread_lineage SET created_by_turn_id = $1, root_thread_id = child_thread_id WHERE child_thread_id = $2",
                 vec![lineage.created_by_turn_id.clone().into(), child.child_thread_id.clone().into()],
             ).await;
             assert_terminal_cleanup_fixture_denied(&processor, &child).await;
             change_cleanup_fixture(
                 store,
-                "UPDATE thread_lineage SET root_thread_id = ? WHERE child_thread_id = ?",
+                "UPDATE thread_lineage SET root_thread_id = $1 WHERE child_thread_id = $2",
                 vec![
                     lineage.root_thread_id.into(),
                     child.child_thread_id.clone().into(),
@@ -2643,7 +2757,7 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
                 for source in [None, Some("unrelated-accepted-source")] {
                     change_cleanup_fixture(
                         store,
-                        "UPDATE task_run_conversation_snapshot SET source_turn_id = ? WHERE run_id = ?",
+                        "UPDATE task_run_conversation_snapshot SET source_turn_id = $1 WHERE run_id = $2",
                         vec![source.map(str::to_owned).into(), task.run.as_ref().unwrap().id.clone().into()],
                     )
                     .await;
@@ -2651,7 +2765,7 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
                 }
                 change_cleanup_fixture(
                     store,
-                    "UPDATE task_run_conversation_snapshot SET source_turn_id = ? WHERE run_id = ?",
+                    "UPDATE task_run_conversation_snapshot SET source_turn_id = $1 WHERE run_id = $2",
                     vec![
                         scope.source_turn_id.into(),
                         task.run.as_ref().unwrap().id.clone().into(),
@@ -2665,14 +2779,14 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
                     .unwrap();
                 change_cleanup_fixture(
                     store,
-                    "UPDATE task_occurrence_contract SET occurrence_key = 'scheduled:unrelated' WHERE run_id = ?",
+                    "UPDATE task_occurrence_contract SET occurrence_key = 'scheduled:unrelated' WHERE run_id = $1",
                     vec![task.run.as_ref().unwrap().id.clone().into()],
                 )
                 .await;
                 assert_terminal_cleanup_fixture_denied(&processor, &child).await;
                 change_cleanup_fixture(
                     store,
-                    "UPDATE task_occurrence_contract SET occurrence_key = ? WHERE run_id = ?",
+                    "UPDATE task_occurrence_contract SET occurrence_key = $1 WHERE run_id = $2",
                     vec![
                         occurrence.occurrence_key.into(),
                         task.run.as_ref().unwrap().id.clone().into(),
@@ -2682,7 +2796,7 @@ fn terminal_child_cleanup_revalidates_required_lineage_and_resumable_fence() {
             }
             change_cleanup_fixture(
                 store,
-                "UPDATE task_run_turn SET status = 'blocked' WHERE turn_id = ?",
+                "UPDATE task_run_turn SET status = 'blocked' WHERE turn_id = $1",
                 vec![child.child_turn_id.clone().into()],
             )
             .await;
@@ -2712,13 +2826,13 @@ fn detached_child_cannot_replace_required_occurrence_with_conversation_lineage()
             .unwrap();
         retain_cleanup_fixture_context(store, &child.child_turn_id).await;
         change_cleanup_fixture(store,
-            "UPDATE thread_lineage SET created_by_turn_id = ?, created_by_thread_id = ? WHERE child_thread_id = ?",
+            "UPDATE thread_lineage SET created_by_turn_id = $1, created_by_thread_id = $2 WHERE child_thread_id = $3",
             vec![task.task.created_by_turn_id.clone().into(), task.task.created_by_thread_id.clone().into(), child.child_thread_id.clone().into()],
         ).await;
         assert_terminal_cleanup_fixture_denied(&processor, &child).await;
         change_cleanup_fixture(
             store,
-            "DELETE FROM thread_lineage WHERE child_thread_id = ?",
+            "DELETE FROM thread_lineage WHERE child_thread_id = $1",
             vec![child.child_thread_id.clone().into()],
         )
         .await;
@@ -2760,8 +2874,14 @@ fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
         let guard = store
             .cli_runtime_blocked_turn_guard(&binding, binding.native_turn_id.as_deref().unwrap())
             .await
-            .unwrap()
-            .expect("Blocked fixture must target the active native attempt");
+            .unwrap();
+        let Some(guard) = guard else {
+            let snapshot = store
+                .cli_runtime_turn_terminal_control_guard_by_id(&child.child_turn_id)
+                .await
+                .unwrap();
+            panic!("Blocked fixture must target the active native attempt: {snapshot:?}");
+        };
         assert!(
             processor
                 .mark_turn_blocked_with_recovery(
@@ -2822,6 +2942,255 @@ fn blocked_attached_child_keeps_capsule_for_explicit_resume() {
             .unwrap();
         assert_cleanup_fixture_retained(store, &child).await;
     });
+}
+
+async fn expire_revision_admission_claim(store: &CrudStore, run_id: &str) {
+    let execution = store.load_execution_for_run(run_id).await.unwrap().unwrap();
+    let stale = now_timestamp_secs() - 1;
+    // The faulting call has ended. Model its abandoned lease expiring without
+    // waiting five minutes or bypassing the durable claim on redispatch.
+    store
+        .heartbeat_execution(&execution.id, stale, Some(stale))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn revision_admission_and_recovery_share_one_execution_claim() {
+    for case in ["request_first", "recovery_first", "abandoned_claim"] {
+        capture_task_start(async move {
+            let (harness, processor) = review_cli_fixture().await;
+            let (task, child) =
+                create_review_cli_child(&harness, &processor, "revision-race", true, false).await;
+            let initial_binding = harness
+                .crud_store
+                .get_cli_runtime_turn_binding(&child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // Finish the native attempt and publish its accepted/completed
+            // context, not just the Turn projection, before revising its result.
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &initial_binding.native_thread_id,
+                initial_binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#,
+            )
+            .await;
+            let run = task.run.unwrap();
+            let candidate = wait_for_result_candidate_status(
+                harness.crud_store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            let revised = processor
+                .task_runtime
+                .service()
+                .revise_task_result_candidate(
+                    pioneer_tasks::TaskMutationContext::user(
+                        authenticated_test_superuser().principal_id.to_string(),
+                    ),
+                    pioneer_protocol::TaskReviseParams {
+                        task_id: task.task.id.clone(),
+                        run_id: run.id.clone(),
+                        candidate_id: candidate.id,
+                        feedback: "Return the corrected result in this worker.".to_owned(),
+                        additional_instructions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            let store = &harness.crud_store;
+            // Stop at the durable request/Turn materialization boundary. No
+            // scheduler loop or sleeps choose which contender reaches it first.
+            assert!(
+                store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let activations = harness.cli_session.turn_starts.lock().await.len();
+            let revision_native_turn_id = "native-revision-race-followup";
+            harness
+                .cli_session
+                .set_next_native_turn_id(revision_native_turn_id)
+                .await;
+            let now = now_timestamp_secs();
+            if case == "request_first" {
+                dispatch_revision_turn_for_test(&processor, revised.clone())
+                    .await
+                    .unwrap();
+                assert!(
+                    store
+                        .claim_task_run_execution_for_recovery(
+                            &run.id,
+                            TaskExecutorKind::Agent,
+                            "competing-recovery",
+                            now,
+                            now + pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS,
+                        )
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "recovery must not steal a live revision admission"
+                );
+            } else {
+                if case == "abandoned_claim" {
+                    // A process can stop after acquiring admission, before it
+                    // creates a Turn. An expired real claim must be recoverable.
+                    let stale = now - pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS - 1;
+                    assert!(
+                        store
+                            .claim_task_run_execution_for_recovery(
+                                &run.id,
+                                TaskExecutorKind::Agent,
+                                "abandoned-admission",
+                                stale,
+                                now - 1,
+                            )
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                let execution = store
+                    .claim_task_run_execution_for_recovery(
+                        &run.id,
+                        TaskExecutorKind::Agent,
+                        "winning-recovery",
+                        now,
+                        now + pioneer_tasks::TASK_EXECUTION_LEASE_SECONDS,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                dispatch_revision_turn_for_test(&processor, revised.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    harness.cli_session.turn_starts.lock().await.len(),
+                    activations,
+                    "the losing request must leave dispatch to the lease owner"
+                );
+                let outcome = pioneer_tasks::TaskExecutor::recover_run(
+                    processor.task_agent_executor.as_ref(),
+                    pioneer_tasks::TaskExecutionContext {
+                        workspace_id: harness.workspace_id.clone(),
+                        task_id: task.task.id.clone(),
+                        execution_id: Some(execution.id),
+                        worker_id: "winning-recovery".to_owned(),
+                    },
+                    revised.run.clone(),
+                    pioneer_tasks::TaskExecutionHandle::new(
+                        store.clone(),
+                        processor.task_runtime.event_bus(),
+                        task.task.id.clone(),
+                        run.id.clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    pioneer_tasks::TaskExecutorRecoveryOutcome::Recovered
+                );
+            }
+            // Activation runs asynchronously. Observe the provider start before
+            // polling PostgreSQL so the test does not compete with admission reads.
+            let starts =
+                wait_for_cli_runtime_turn_starts(&harness.cli_session, activations + 1).await;
+            let revision_binding = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(binding) = store
+                        .get_cli_runtime_turn_binding(&revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        && binding.native_turn_id.is_some()
+                    {
+                        break binding;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await;
+            let revision_binding = match revision_binding {
+                Ok(binding) => binding,
+                Err(_) => {
+                    let turn = store
+                        .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                        .await
+                        .unwrap()
+                        .map(|(_, turn)| (turn.status, turn.error));
+                    panic!(
+                        "{case}: revision activation was not persisted, provider starts: {} → {}, turn: {turn:?}",
+                        activations,
+                        starts.len(),
+                    );
+                }
+            };
+            assert_eq!(
+                revision_binding.native_turn_id.as_deref(),
+                Some(revision_native_turn_id),
+                "{case}: activation must belong to this revision"
+            );
+            assert_eq!(
+                starts.len(),
+                activations + 1,
+                "{case}: only the winning admission may start the provider"
+            );
+            assert_eq!(
+                store
+                    .get_turn(&revised.child_thread_id, &revised.child_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .status,
+                TurnStatus::InProgress
+            );
+            dispatch_revision_turn_for_test(&processor, revised.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                harness.cli_session.turn_starts.lock().await.len(),
+                activations + 1,
+                "repeated dispatch must not start another native Turn"
+            );
+            complete_recorded_cli_task_turn(
+                &processor,
+                &harness.cli_session,
+                &harness.cli_manager,
+                &harness.workspace_id,
+                &harness.runtime_id,
+                &child.parent_thread_id,
+                &revision_binding.native_thread_id,
+                revision_binding.native_turn_id.as_deref().unwrap(),
+                r#"<task_result>{"summary":"corrected result","data":{"ok":true}}</task_result>"#,
+            )
+            .await;
+            let replacement = wait_for_result_candidate_status(
+                store.clone(),
+                &run.id,
+                TaskResultCandidateStatus::PendingReview,
+            )
+            .await;
+            assert_eq!(replacement.round, 1);
+            assert_eq!(replacement.thread_id, revised.child_thread_id);
+            assert_eq!(replacement.turn_id, revised.child_turn_id);
+            assert_eq!(replacement.status, TaskResultCandidateStatus::PendingReview);
+            assert_eq!(
+                store.get_task_run(&run.id).await.unwrap().unwrap().status,
+                TaskRunStatus::WaitingReview
+            );
+        });
+    }
 }
 
 #[test]
@@ -2916,7 +3285,7 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                         .iter()
                         .any(|lock| lock.status == pioneer_protocol::TaskWriteLockStatus::Acquired)
                 );
-                db.execute_unprepared("CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_run_turn WHEN NEW.kind='revision' AND NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'injected revision failure'); END").await.unwrap();
+                db.execute_unprepared("CREATE FUNCTION reject_revision_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected revision failure'; END; $$; CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_run_turn FOR EACH ROW WHEN (NEW.kind='revision' AND NEW.status='failed') EXECUTE FUNCTION reject_revision_admission();").await.unwrap();
             } else {
                 assert_eq!(
                     pioneer_entity::task_execution_admission::Entity::delete_by_id(
@@ -2929,7 +3298,7 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                     1
                 );
                 if case == "authority_persistence" {
-                    db.execute_unprepared("CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_occurrence_contract WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT, 'independent persistence failure'); END").await.unwrap();
+                    db.execute_unprepared("CREATE FUNCTION reject_revision_admission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'independent persistence failure'; END; $$; CREATE TRIGGER reject_revision_admission BEFORE UPDATE ON task_occurrence_contract FOR EACH ROW WHEN (NEW.status='failed') EXECUTE FUNCTION reject_revision_admission();").await.unwrap();
                 }
             }
             let activations = harness.cli_session.turn_starts.lock().await.len();
@@ -2960,7 +3329,10 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                 let diagnostic =
                     TaskStartFailure::from_borrowed_error(TaskStartStage::ExecutorStart, &error);
                 assert_eq!(diagnostic.descriptor().cause, TaskStartCause::Storage);
-                assert_eq!(diagnostic.descriptor().sqlite_primary_code, Some(19));
+                assert_eq!(
+                    diagnostic.descriptor().postgres_sqlstate.as_deref(),
+                    Some("P0001")
+                );
                 // The abort must leave neither a run-only terminal commit nor
                 // a revision-only terminal commit, even in early admission.
                 assert_eq!(
@@ -2991,7 +3363,11 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                     .events;
                 assert!(!history.iter().any(|event| matches!(&event.payload,
                     TaskEventPayload::RunFailed { run_id, .. } | TaskEventPayload::RunBlocked { run_id, .. } if run_id == &run.id)));
-                db.execute_unprepared("DROP TRIGGER reject_revision_admission")
+                db.execute_unprepared(if case == "authority_persistence" {
+                    "DROP TRIGGER reject_revision_admission ON task_occurrence_contract; DROP FUNCTION reject_revision_admission()"
+                } else {
+                    "DROP TRIGGER reject_revision_admission ON task_run_turn; DROP FUNCTION reject_revision_admission()"
+                })
                     .await
                     .unwrap();
                 if case == "authority_persistence" {
@@ -3000,6 +3376,7 @@ fn revision_early_authority_and_lock_admission_complete_the_reserved_revision() 
                     assert!(format!("{error:#}").contains("independent persistence failure"));
                     return;
                 }
+                expire_revision_admission_claim(&harness.crud_store, &run.id).await;
                 dispatch_revision_turn_for_test(&processor, revised.clone())
                     .await
                     .unwrap();
@@ -3193,8 +3570,8 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                 );
                 Some(stored)
             } else {
-                // FK OFF matches Gateway runtime. Keep the reserved revision,
-                // lineage and admission; reach the inner child_thread_missing.
+                // The reserved revision has its own lifecycle and survives
+                // deletion of the child thread before dispatch.
                 assert_eq!(
                     pioneer_entity::thread::Entity::delete_by_id(revised.child_thread_id.clone())
                         .exec(&db)
@@ -3247,9 +3624,21 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                     TaskRunStatus::Running
                 );
             } else {
-                // Reject only the known payload; a second Storage fallback could
-                // commit, so a permanent writer fault cannot mask the old bug.
-                db.execute_unprepared("CREATE TRIGGER reject_original_revision_completion BEFORE INSERT ON task_event WHEN json_extract(NEW.payload_json, '$.payload.error.code')='child_thread_missing' BEGIN SELECT RAISE(ABORT, 'independent inner completion failure'); END").await.unwrap();
+                // Reject the matching run snapshot in the same completion
+                // transaction. A Storage fallback has a different error code
+                // and could still commit, so the fault cannot mask a retry.
+                db.execute_unprepared(
+                    "CREATE FUNCTION reject_original_revision_completion() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN
+                       RAISE EXCEPTION 'independent inner completion failure';
+                     END $$;
+                     CREATE TRIGGER reject_original_revision_completion
+                     BEFORE UPDATE OF error_json ON task_run FOR EACH ROW
+                     WHEN (NEW.error_json::json ->> 'code' = 'child_thread_missing')
+                     EXECUTE FUNCTION reject_original_revision_completion();",
+                )
+                .await
+                .unwrap();
             }
             let error = dispatch_revision_turn_for_test(&processor, revised.clone())
                 .await
@@ -3269,10 +3658,9 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                 TaskStartFailure::from_borrowed_error(TaskStartStage::ExecutorStart, &error);
             assert_eq!(diagnostic.descriptor().cause, TaskStartCause::Storage);
             assert_eq!(
-                diagnostic.descriptor().sqlite_primary_code,
-                Some(if diagnostic_read { 1 } else { 19 })
+                diagnostic.descriptor().postgres_sqlstate.as_deref(),
+                Some(if diagnostic_read { "42P01" } else { "P0001" })
             );
-            assert!(diagnostic.descriptor().sqlite_extended_code.is_some());
             assert_eq!(
                 harness
                     .crud_store
@@ -3333,10 +3721,14 @@ fn revision_internal_completion_failure_is_not_reclassified_or_completed_twice()
                         .is_none()
                 );
             } else {
-                db.execute_unprepared("DROP TRIGGER reject_original_revision_completion")
-                    .await
-                    .unwrap();
+                db.execute_unprepared(
+                    "DROP TRIGGER reject_original_revision_completion ON task_run;
+                     DROP FUNCTION reject_original_revision_completion()",
+                )
+                .await
+                .unwrap();
             }
+            expire_revision_admission_claim(&harness.crud_store, &run.id).await;
             dispatch_revision_turn_for_test(&processor, revised.clone())
                 .await
                 .unwrap();
@@ -3503,7 +3895,7 @@ fn task_child_consumer_rotates_past_more_than_a_page_of_undeferable_claim_failur
         tx.commit().await.unwrap();
         // Fail BOTH claim and independent deferral, so only the real consumer's
         // retained cursor can expose the healthy tail beyond its 16-row page.
-        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_claim_poison BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'point write refused'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION test_child_claim_poison() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'point write refused'; END; $$; CREATE TRIGGER test_child_claim_poison BEFORE UPDATE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id LIKE 'poison!_%' ESCAPE '!') EXECUTE FUNCTION test_child_claim_poison();").await.unwrap();
         for _ in 0..3 {
             assert!(
                 processor
@@ -3566,8 +3958,8 @@ fn task_child_consumer_ack_and_deferral_failure_does_not_lease_or_suppress_healt
             }
         }
         tx.commit().await.unwrap();
-        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_ack_poison BEFORE DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='a_ack_poison' BEGIN SELECT RAISE(FAIL,'ACK refused'); END").await.unwrap();
-        store.database_connection().execute_unprepared("CREATE TRIGGER test_child_defer_poison BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id='a_ack_poison' AND OLD.claim_token IS NOT NULL AND NEW.claim_token IS NULL BEGIN SELECT RAISE(FAIL,'deferral refused'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION test_child_ack_poison() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'ACK refused'; END; $$; CREATE TRIGGER test_child_ack_poison BEFORE DELETE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id='a_ack_poison') EXECUTE FUNCTION test_child_ack_poison();").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION test_child_defer_poison() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deferral refused'; END; $$; CREATE TRIGGER test_child_defer_poison BEFORE UPDATE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id='a_ack_poison' AND OLD.claim_token IS NOT NULL AND NEW.claim_token IS NULL) EXECUTE FUNCTION test_child_defer_poison();").await.unwrap();
         assert!(
             processor
                 .reconcile_terminal_task_child_turns(16)
@@ -3638,16 +4030,9 @@ fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
             .await
             .unwrap();
         scope::Entity::delete_many()
-            .filter(scope::Column::ScopeKind.ne("historical-seed"))
             .exec(&store.database_connection())
             .await
             .unwrap();
-        while store
-            .expand_child_scope(chrono::Utc::now().timestamp(), true)
-            .await
-            .unwrap()
-        {}
-        assert!(store.child_work_queues_ready().await.unwrap());
         point::Entity::delete_many()
             .exec(&store.database_connection())
             .await
@@ -3681,8 +4066,8 @@ fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
             .execute_unprepared("CREATE TABLE test_scope_acks (turn_id TEXT PRIMARY KEY)")
             .await
             .unwrap();
-        store.database_connection().execute_unprepared("CREATE TRIGGER test_scope_ack AFTER DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='scope_healthy_child' BEGIN INSERT INTO test_scope_acks VALUES (OLD.turn_id); END").await.unwrap();
-        store.database_connection().execute_unprepared("CREATE TRIGGER test_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN OLD.scope_key GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'scope write refused'); END").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION test_scope_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO test_scope_acks VALUES (OLD.turn_id); RETURN OLD; END; $$; CREATE TRIGGER test_scope_ack AFTER DELETE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id='scope_healthy_child') EXECUTE FUNCTION test_scope_ack();").await.unwrap();
+        store.database_connection().execute_unprepared("CREATE FUNCTION test_scope_refusal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'scope write refused'; END; $$; CREATE TRIGGER test_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope FOR EACH ROW WHEN (OLD.scope_key LIKE 'poison!_%' ESCAPE '!') EXECUTE FUNCTION test_scope_refusal();").await.unwrap();
         for _ in 0..40 {
             let error = processor
                 .for_background_reconciliation()
@@ -3699,7 +4084,7 @@ fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
         let ack = store
             .database_connection()
             .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
+                sea_orm::DatabaseBackend::Postgres,
                 "SELECT turn_id FROM test_scope_acks".to_owned(),
             ))
             .await
@@ -3720,7 +4105,7 @@ fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
         );
         store
             .database_connection()
-            .execute_unprepared("DROP TRIGGER test_scope_refusal")
+            .execute_unprepared("DROP TRIGGER test_scope_refusal ON task_child_reconcile_scope; DROP FUNCTION test_scope_refusal()")
             .await
             .unwrap();
         for _ in 0..41 {
@@ -3732,7 +4117,6 @@ fn task_child_scope_rotation_survives_undeferable_heads_and_wraps() {
         }
         assert!(
             scope::Entity::find()
-                .filter(scope::Column::ScopeKind.ne("historical-seed"))
                 .all(&store.database_connection())
                 .await
                 .unwrap()
@@ -3780,19 +4164,9 @@ fn child_due_passes_revisit_behind_cursor_work_despite_continuous_suffix_growth(
             })
             .await
             .unwrap();
-        while store
-            .expand_child_scope(chrono::Utc::now().timestamp(), true)
-            .await
-            .unwrap()
-        {}
-        assert!(store.child_work_queues_ready().await.unwrap());
         let db = store.database_connection();
         point::Entity::delete_many().exec(&db).await.unwrap();
-        scope::Entity::delete_many()
-            .filter(scope::Column::ScopeKind.ne("historical-seed"))
-            .exec(&db)
-            .await
-            .unwrap();
+        scope::Entity::delete_many().exec(&db).await.unwrap();
         async fn add_point(db: &impl ConnectionTrait, id: &str, due: i64) {
             point::Entity::insert(point::ActiveModel {
                 turn_id: Set(id.into()),
@@ -3832,9 +4206,9 @@ fn child_due_passes_revisit_behind_cursor_work_despite_continuous_suffix_growth(
         db.execute_unprepared("CREATE TABLE test_finite_acks (turn_id TEXT PRIMARY KEY)")
             .await
             .unwrap();
-        db.execute_unprepared("CREATE TRIGGER test_finite_ack AFTER DELETE ON task_child_reconcile_pending WHEN OLD.turn_id='behind-point' BEGIN INSERT INTO test_finite_acks VALUES (OLD.turn_id); END").await.unwrap();
-        db.execute_unprepared("CREATE TRIGGER test_finite_point_refusal BEFORE UPDATE ON task_child_reconcile_pending WHEN OLD.turn_id GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'point refused'); END").await.unwrap();
-        db.execute_unprepared("CREATE TRIGGER test_finite_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope WHEN OLD.scope_key GLOB 'poison_*' BEGIN SELECT RAISE(FAIL,'scope refused'); END").await.unwrap();
+        db.execute_unprepared("CREATE FUNCTION test_finite_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO test_finite_acks VALUES (OLD.turn_id); RETURN OLD; END; $$; CREATE TRIGGER test_finite_ack AFTER DELETE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id='behind-point') EXECUTE FUNCTION test_finite_ack();").await.unwrap();
+        db.execute_unprepared("CREATE FUNCTION test_finite_point_refusal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'point refused'; END; $$; CREATE TRIGGER test_finite_point_refusal BEFORE UPDATE ON task_child_reconcile_pending FOR EACH ROW WHEN (OLD.turn_id LIKE 'poison!_%' ESCAPE '!') EXECUTE FUNCTION test_finite_point_refusal();").await.unwrap();
+        db.execute_unprepared("CREATE FUNCTION test_finite_scope_refusal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'scope refused'; END; $$; CREATE TRIGGER test_finite_scope_refusal BEFORE UPDATE ON task_child_reconcile_scope FOR EACH ROW WHEN (OLD.scope_key LIKE 'poison!_%' ESCAPE '!') EXECUTE FUNCTION test_finite_scope_refusal();").await.unwrap();
         assert!(
             processor
                 .for_background_reconciliation()
@@ -3863,7 +4237,7 @@ fn child_due_passes_revisit_behind_cursor_work_despite_continuous_suffix_growth(
         }
         let ack = db
             .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
                 "SELECT turn_id FROM test_finite_acks".to_owned(),
             ))
             .await
@@ -3939,7 +4313,7 @@ fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_fail
                     .filter(pioneer_entity::task_trigger::Column::Id.eq(task.trigger.id))
                     .col_expr(
                         pioneer_entity::task_trigger::Column::SpecJson,
-                        sea_orm::sea_query::Expr::value("invalid JSON"),
+                        sea_orm::sea_query::Expr::value(serde_json::json!("invalid trigger spec")),
                     )
                     .exec(&db)
                     .await
@@ -3969,7 +4343,7 @@ fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_fail
                 assert!(processor.task_event_listener_worker.lock().await.is_some());
                 assert!(processor.hook_recovery_worker.lock().await.is_some());
             } else {
-                db.execute_unprepared("CREATE TRIGGER test_startup_storage_refusal BEFORE INSERT ON task_event BEGIN SELECT RAISE(FAIL,'startup storage unavailable'); END").await.unwrap();
+                db.execute_unprepared("CREATE FUNCTION test_startup_storage_refusal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'startup storage unavailable'; END; $$; CREATE TRIGGER test_startup_storage_refusal BEFORE INSERT ON task_event FOR EACH ROW EXECUTE FUNCTION test_startup_storage_refusal();").await.unwrap();
                 let error = processor.initialize_resilience_workers().await.unwrap_err();
                 assert!(
                     format!("{error:#}").contains("failed to start task runtime"),
@@ -3988,7 +4362,7 @@ fn gateway_partial_task_startup_keeps_independent_registrations_and_unknown_fail
     });
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation() {
     use super::thread_launch_choices::{call, invoke_with_mutation};
     use crate::message::task_agent_executor::materialize_task_agent_action_binding_for_execution;
@@ -4042,13 +4416,30 @@ async fn capsule_delegation_survives_nested_task_binding_recovery_and_revocation
         .unwrap();
     let mut destinations = vec![destination.clone()];
     for suffix in ["b", "c"] {
-        let other = call(
+        let other = invoke_with_mutation(
             &creator_tools,
             "thread_create",
             &format!("same-name-{suffix}"),
             json!({"optionId":creation.id}),
+            None,
         )
         .await;
+        let other = match other {
+            Ok(value) => value,
+            Err(error) => {
+                let authority = processor
+                    .revalidate_tool_execution_authorization(
+                        &creator_context.workspace_id,
+                        &creator_context.thread_id,
+                        &creator_context.turn_id,
+                        None,
+                        crate::authorization::ResourceAction::ThreadCreateWorkspace,
+                    )
+                    .await
+                    .map(|_| ());
+                panic!("same-name-{suffix} failed: {error}; current authorization: {authority:#?}");
+            }
+        };
         destinations.push(
             other["threadResult"]["threadId"]
                 .as_str()

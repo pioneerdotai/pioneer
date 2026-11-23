@@ -1,64 +1,12 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use migration::Migrator;
 use pioneer_config::AppConfig;
-use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-    SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor, is_anyhow_sqlite_lock,
-    normalize_relative_database_file_name, retry_with_backoff, sqlite_connection_url,
-    sqlite_read_only_connection_url,
-};
+use pioneer_postgres::BundledPostgres;
+use pioneer_postgres_pools::{MANAGED_SEARCH_PATH, PostgresDatabase, PostgresWriteExecutor};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
-
-#[derive(Debug, Clone)]
-struct GatewayDatabaseRuntimeConfig {
-    file_name: String,
-    max_connections: u32,
-    connect_timeout: Duration,
-    acquire_timeout: Duration,
-    idle_timeout: Duration,
-    sqlx_logging: bool,
-}
-
-const MIN_READER_CONNECTIONS: u32 = 4;
-
-impl GatewayDatabaseRuntimeConfig {
-    fn from_app_config(config: &AppConfig) -> Result<Self> {
-        let database = &config.gateway.database;
-
-        let file_name = normalize_relative_database_file_name(
-            database.file_name.as_str(),
-            "gateway.database.file_name",
-        )?;
-
-        if database.max_connections == 0 {
-            bail!("gateway.database.max_connections must be greater than 0");
-        }
-        if database.connect_timeout_ms == 0 {
-            bail!("gateway.database.connect_timeout_ms must be greater than 0");
-        }
-        if database.acquire_timeout_ms == 0 {
-            bail!("gateway.database.acquire_timeout_ms must be greater than 0");
-        }
-        if database.idle_timeout_ms == 0 {
-            bail!("gateway.database.idle_timeout_ms must be greater than 0");
-        }
-
-        Ok(Self {
-            file_name,
-            max_connections: database.max_connections.max(MIN_READER_CONNECTIONS),
-            connect_timeout: Duration::from_millis(database.connect_timeout_ms),
-            acquire_timeout: Duration::from_millis(database.acquire_timeout_ms),
-            idle_timeout: Duration::from_millis(database.idle_timeout_ms),
-            sqlx_logging: database.sqlx_logging,
-        })
-    }
-}
-
-const WRITER_MAX_CONNECTIONS: u32 = 1;
 #[path = "query_fingerprint.rs"]
 mod query_fingerprint;
 use query_fingerprint::QueryFingerprintLimiter;
@@ -67,268 +15,199 @@ pub(super) mod query_observer;
 #[cfg(test)]
 use query_fingerprint::QueryFingerprintState;
 #[cfg(test)]
-use query_observer::sqlite_operation;
+use query_observer::classify_operation;
 
-/// Existing DB owner boundary for installer preflight. No writable connection,
-/// migration execution, extension registration, startup repair or journal changes.
+/// Check the persisted migration history through a scoped read-only connection.
 pub(crate) async fn inspect_applied_migration_names(
     runtime_home: &Path,
     app_config: &AppConfig,
 ) -> Result<Option<Vec<String>>> {
-    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
-    let path = gateway_database_path(runtime_home, app_config)?;
-    // Only a positively absent database is a new installation. Metadata errors
-    // (including denied access) must not become an empty applied set.
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("migration inspection metadata unavailable"),
-        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "database is not a regular file"),
-    }
-    let mut options = connect_options(
-        sqlite_read_only_connection_url(&path),
-        1,
-        &config,
-        "pioneer-sqlite-reader-",
-    );
-    options.sqlx_logging(false);
-    options.map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-            .thread_name(|id| format!("pioneer-sqlite-reader-{id}"))
-    });
-    let reader = Database::connect(options)
-        .await
-        .context("migration inspection unavailable")?;
-    // Both handles are physically read-only; even an accidentally routed write
-    // is rejected by SQLite. There is no additional writable executor/pool.
-    let database = SqliteDatabase::new(reader.clone(), reader).maintenance();
-    let result = async {
-        database.validate_reader().await?;
-        pioneer_crud::CrudStore::new(database.clone())
-            .with_maintenance_access()
-            .inspect_applied_migration_names()
-            .await
-    }
-    .await;
-    let closed = database.close().await;
-    let names = result?;
-    closed.context("failed to close migration inspection")?;
-    Ok(Some(names))
-}
-
-pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<SqliteDatabase> {
-    initialize_inner(runtime_home, app_config, None).await
+    with_existing_database(
+        runtime_home,
+        app_config,
+        OperatorAccess::ReadOnly,
+        async |database, _| {
+            pioneer_crud::CrudStore::new(database)
+                .with_maintenance_access()
+                .inspect_applied_migration_names()
+                .await
+        },
+    )
+    .await
 }
 
 pub async fn initialize_with_startup(
     runtime_home: &Path,
     app_config: &AppConfig,
     startup: &pioneer_observability::GatewayStartupTrace,
-) -> Result<SqliteDatabase> {
-    initialize_inner(runtime_home, app_config, Some(startup)).await
-}
-
-async fn initialize_inner(
-    runtime_home: &Path,
-    app_config: &AppConfig,
-    startup: Option<&pioneer_observability::GatewayStartupTrace>,
-) -> Result<SqliteDatabase> {
-    let ownership = pioneer_sqlite::WriterOwnership::acquire(&gateway_database_path(
-        runtime_home,
-        app_config,
-    )?)?;
-    let runtime_home = runtime_home.to_path_buf();
-    let app_config = app_config.clone();
-    let startup = startup.cloned();
-    // This owned, idempotent bootstrap finishes even if its requester leaves.
-    // Otherwise cancelled pool creation could release the process lock while
-    // SQLx is still opening/configuring the physical writer. No services or
-    // watchers are started here; a discarded result closes its pools.
-    tokio::spawn(async move {
-        initialize_owned(&runtime_home, &app_config, startup.as_ref(), ownership).await
-    })
-    .await
-    .context("database initialization owner failed")?
-}
-
-async fn initialize_owned(
-    runtime_home: &Path,
-    app_config: &AppConfig,
-    startup: Option<&pioneer_observability::GatewayStartupTrace>,
-    ownership: Arc<pioneer_sqlite::WriterOwnership>,
-) -> Result<SqliteDatabase> {
-    let database_open_stage =
-        startup.map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseOpen));
-    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
-    pioneer_sqlite::search::register_auto_extension_once()
-        .context("failed to register SQLite search extension")?;
-    pioneer_sqlite::zstd::register_auto_extension_once()
-        .context("failed to register sqlite-zstd gateway database extension")?;
-
-    let database_path = runtime_home.join(config.file_name.as_str());
-    let writer_url = sqlite_connection_url(database_path.as_path());
-    let query_fingerprints = Arc::new(QueryFingerprintLimiter::default());
-
-    let mut writer_options = connect_options(
-        writer_url.clone(),
-        WRITER_MAX_CONNECTIONS,
-        &config,
-        "pioneer-sqlite-writer-",
-    );
-    let weak_ownership = Arc::downgrade(&ownership);
-    writer_options.map_sqlx_sqlite_pool_opts(move |options| {
-        let ownership = weak_ownership.clone();
-        options
-            .acquire_time_level(log::LevelFilter::Trace)
-            .after_connect(move |connection, _| {
-                let ownership = ownership.clone();
-                Box::pin(async move {
-                    let ownership = ownership.upgrade().ok_or_else(|| {
-                        sea_orm::sqlx::Error::Protocol("database writer owner closed".into())
-                    })?;
-                    ownership.retain_on_connection(connection).await
+) -> Result<(PostgresDatabase, Option<BundledPostgres>)> {
+    use pioneer_observability::{DatabaseRole, GatewayStartupStage};
+    let database_config = &app_config.gateway.database;
+    ensure_postgres_pool_config(database_config)?;
+    let stage = startup.stage(GatewayStartupStage::DatabaseOpen);
+    let capacity = database_config.max_connections.max(4);
+    let postgres;
+    let (mut writer_options, mut reader_options) =
+        if let Some(options) = external_options(runtime_home, app_config, capacity)? {
+            postgres = None;
+            options
+        } else {
+            let instance = BundledPostgres::start(runtime_home).await?;
+            let writer = instance.connect_options(capacity);
+            let reader = instance.reader_options(capacity);
+            postgres = Some(instance);
+            (writer, reader)
+        };
+    stage.succeed();
+    let prepared = async {
+        for (options, name, read_only) in [
+            (&mut writer_options, "pioneer_gateway_writer", false),
+            (&mut reader_options, "pioneer_gateway_reader", true),
+        ] {
+            options
+                .connect_timeout(Duration::from_millis(database_config.connect_timeout_ms))
+                .acquire_timeout(Duration::from_millis(database_config.acquire_timeout_ms))
+                .idle_timeout(Duration::from_millis(database_config.idle_timeout_ms))
+                .sqlx_logging(false)
+                .map_sqlx_postgres_opts(move |session| {
+                    let session = session
+                        .application_name(name)
+                        .options([("search_path", MANAGED_SEARCH_PATH)]);
+                    if read_only {
+                        session.options([("default_transaction_read_only", "on")])
+                    } else {
+                        session
+                    }
                 })
-            })
-    });
-    let mut writer = Database::connect(writer_options)
-        .await
-        .with_context(|| format!("failed to connect to gateway writer `{writer_url}`"))?;
-    if let Some(stage) = database_open_stage {
-        stage.succeed();
+                .map_sqlx_postgres_pool_opts(|pool| {
+                    pool.acquire_time_level("trace".parse().expect("valid SQLx timing level"))
+                });
+        }
+        let mut writer = Database::connect(writer_options)
+            .await
+            .map_err(|_| anyhow::anyhow!("open Gateway PostgreSQL writer pool"))?;
+        if postgres.is_none() {
+            use migration::MigratorTrait;
+            let stage = startup.stage(GatewayStartupStage::DatabaseMigrate);
+            if let Err(error) = Migrator::up(&writer, None).await {
+                let _ = writer.close().await;
+                return Err(error).context("apply Gateway PostgreSQL migrations");
+            }
+            stage.succeed();
+        }
+        let mut reader = match Database::connect(reader_options).await {
+            Ok(reader) => reader,
+            Err(_) => {
+                let _ = writer.close().await;
+                anyhow::bail!("open Gateway PostgreSQL reader pool");
+            }
+        };
+        let fingerprints = Arc::new(QueryFingerprintLimiter::default());
+        configure_observability(
+            &mut writer,
+            DatabaseRole::Writer,
+            capacity,
+            fingerprints.clone(),
+        );
+        configure_observability(&mut reader, DatabaseRole::Reader, capacity, fingerprints);
+        let executor = PostgresWriteExecutor::with_observer(writer, super::write_observer());
+        let database = PostgresDatabase::from_executor_with_read_observer(
+            reader,
+            executor,
+            super::read_observer(),
+        );
+        if let Err(error) = database.maintenance().validate_reader().await {
+            let _ = database.close().await;
+            return Err(error).context("validate Gateway PostgreSQL read pool");
+        }
+        Ok(database)
     }
-
-    let database_configure_stage = startup
-        .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseConfigure));
-    configure_observability(
-        &mut writer,
-        pioneer_observability::DatabaseRole::Writer,
-        WRITER_MAX_CONNECTIONS,
-        query_fingerprints.clone(),
-    );
-
-    let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer())
-        .retain_ownership(ownership);
-    writer
-        .ping(SqliteWriteClass::Maintenance)
-        .await
-        .context("failed to ping gateway writer")?;
-    retry_with_backoff(
-        || writer.apply_pragmas(SqliteWriteClass::Maintenance),
-        is_anyhow_sqlite_lock,
-        DEFAULT_LOCK_RETRY_ATTEMPTS,
-        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-    )
-    .await?;
-    if let Some(stage) = database_configure_stage {
-        stage.succeed();
+    .await;
+    match prepared {
+        Ok(database) => Ok((database, postgres)),
+        Err(error) => {
+            if let Some(postgres) = postgres {
+                let _ = postgres.stop().await;
+            }
+            Err(error)
+        }
     }
-
-    let database_migrate_stage = startup
-        .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseMigrate));
-    retry_with_backoff(
-        || async {
-            writer
-                .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
-                .await
-                .context("failed to apply gateway database migrations")
-        },
-        is_anyhow_sqlite_lock,
-        DEFAULT_LOCK_RETRY_ATTEMPTS,
-        Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-    )
-    .await?;
-    if let Some(stage) = database_migrate_stage {
-        stage.succeed();
-    }
-
-    let reader_url = sqlite_read_only_connection_url(database_path.as_path());
-    let mut reader_options = connect_options(
-        reader_url.clone(),
-        config.max_connections,
-        &config,
-        "pioneer-sqlite-reader-",
-    );
-    reader_options.map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-            .thread_name(|id| format!("pioneer-sqlite-reader-{id}"))
-    });
-    let reader_open_stage = startup
-        .map(|trace| trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderOpen));
-    let mut reader = Database::connect(reader_options)
-        .await
-        .with_context(|| format!("failed to connect to gateway read pool `{reader_url}`"))?;
-    if let Some(stage) = reader_open_stage {
-        stage.succeed();
-    }
-    let reader_configure_stage = startup.map(|trace| {
-        trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderConfigure)
-    });
-    configure_observability(
-        &mut reader,
-        pioneer_observability::DatabaseRole::Reader,
-        config.max_connections,
-        query_fingerprints,
-    );
-    if let Some(stage) = reader_configure_stage {
-        stage.succeed();
-    }
-
-    let database =
-        SqliteDatabase::from_executor_with_read_observer(reader, writer, super::read_observer());
-    let reader_validate_stage = startup.map(|trace| {
-        trace.stage(pioneer_observability::GatewayStartupStage::DatabaseReaderValidate)
-    });
-    database
-        .maintenance()
-        .validate_reader()
-        .await
-        .context("failed to validate gateway read pool")?;
-    if let Ok(metadata) = std::fs::metadata(database_path.as_path()) {
-        pioneer_observability::record_gateway_database_size_bytes(metadata.len());
-    }
-    if let Some(stage) = reader_validate_stage {
-        stage.succeed();
-    }
-
-    info!(
-        database_path = %database_path.display(),
-        reader_connections = config.max_connections,
-        writer_connections = WRITER_MAX_CONNECTIONS,
-        "gateway database is ready"
-    );
-
-    Ok(database)
 }
 
-fn connect_options(
-    database_url: String,
-    max_connections: u32,
-    config: &GatewayDatabaseRuntimeConfig,
-    worker_prefix: &'static str,
-) -> ConnectOptions {
-    let mut options = ConnectOptions::new(database_url);
-    options.max_connections(max_connections);
-    options.connect_timeout(config.connect_timeout);
-    options.acquire_timeout(config.acquire_timeout);
-    options.idle_timeout(config.idle_timeout);
-    options.sqlx_logging(config.sqlx_logging);
-    // SQLx measures the complete wait for a pool permit/connection. A TRACE
-    // event keeps normal logs quiet and is consumed by the observability layer.
-    options.map_sqlx_sqlite_pool_opts(|pool_options| {
-        pool_options.acquire_time_level(log::LevelFilter::Trace)
+fn external_options(
+    runtime_home: &Path,
+    config: &AppConfig,
+    capacity: u32,
+) -> Result<Option<(ConnectOptions, ConnectOptions)>> {
+    let database_config = &config.gateway.database;
+    let (url, source) = if let Some(url) = &database_config.development_url {
+        anyhow::ensure!(
+            pioneer_config::RuntimeEnvironment::current()
+                == pioneer_config::RuntimeEnvironment::Development,
+            "gateway.database.development_url is only available in development"
+        );
+        (url.as_str().to_owned(), "gateway.database.development_url")
+    } else {
+        let Some(url) = pioneer_config::gateway_database_url::resolve(config, runtime_home)? else {
+            return Ok(None);
+        };
+        (url, "DATABASE_URL")
+    };
+    let writer = external_writer_options(&url, source, capacity, database_config)?;
+    let mut reader = writer.clone();
+    reader.map_sqlx_postgres_opts(|options| {
+        options.options([
+            ("default_transaction_read_only", "on"),
+            ("search_path", MANAGED_SEARCH_PATH),
+        ])
     });
-    options.map_sqlx_sqlite_opts(move |sqlite_options| {
-        sqlite_options
-            .foreign_keys(false)
-            .busy_timeout(Duration::from_millis(DEFAULT_SQLITE_BUSY_TIMEOUT_MS))
-            .thread_name(move |id| format!("{worker_prefix}{id}"))
-    });
-    options
+    Ok(Some((writer, reader)))
+}
+
+fn external_writer_options(
+    url: &str,
+    source: &str,
+    capacity: u32,
+    config: &pioneer_config::GatewayDatabaseConfig,
+) -> Result<ConnectOptions> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| anyhow::anyhow!("{source} must be a valid PostgreSQL URL"))?;
+    let session = url
+        .parse::<sea_orm::sqlx::postgres::PgConnectOptions>()
+        .map_err(|_| anyhow::anyhow!("{source} must be a valid PostgreSQL URL"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "postgres" | "postgresql")
+            && !parsed.username().is_empty()
+            && !parsed.path().trim_start_matches('/').is_empty()
+            && !session.get_username().is_empty()
+            && session.get_database().is_some_and(|database| {
+                !matches!(database, "" | "postgres" | "template0" | "template1")
+            }),
+        "{source} must select an explicit role and a PostgreSQL application database"
+    );
+
+    let mut writer = ConnectOptions::new(parsed.to_string());
+    writer
+        .min_connections(0)
+        .max_connections(capacity)
+        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+        .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
+        .idle_timeout(Duration::from_millis(config.idle_timeout_ms))
+        .sqlx_logging(false)
+        .map_sqlx_postgres_opts(|session| session.options([("search_path", MANAGED_SEARCH_PATH)]));
+    Ok(writer)
+}
+
+fn ensure_postgres_pool_config(database: &pioneer_config::GatewayDatabaseConfig) -> Result<()> {
+    for (name, value) in [
+        ("max_connections", u64::from(database.max_connections)),
+        ("connect_timeout_ms", database.connect_timeout_ms),
+        ("acquire_timeout_ms", database.acquire_timeout_ms),
+        ("idle_timeout_ms", database.idle_timeout_ms),
+    ] {
+        anyhow::ensure!(value > 0, "gateway.database.{name} must be greater than 0");
+    }
+    Ok(())
 }
 
 fn configure_observability(
@@ -345,200 +224,326 @@ fn configure_observability(
     );
 }
 
-pub(crate) fn gateway_database_path(
-    runtime_home: &Path,
-    app_config: &AppConfig,
-) -> Result<PathBuf> {
-    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
-    Ok(runtime_home.join(config.file_name.as_str()))
+/// Coordinates Gateway and offline writers that share a runtime home.
+pub(crate) fn lock_gateway_database_owner(runtime_home: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let owner = options
+        .open(runtime_home.join("gateway-database.lock"))
+        .context("open Gateway database ownership lock")?;
+    match fs4::FileExt::try_lock(&owner) {
+        Ok(()) => Ok(owner),
+        Err(fs4::TryLockError::WouldBlock) => Err(pioneer_postgres::ClusterBusy.into()),
+        Err(error) => Err(error).context("lock Gateway database ownership"),
+    }
 }
 
-pub(crate) async fn initialize_existing_for_operations(
-    runtime_home: &Path,
-    app_config: &AppConfig,
-) -> Result<Option<SqliteDatabase>> {
-    let database_path = gateway_database_path(runtime_home, app_config)?;
-    if !database_path.exists() {
-        return Ok(None);
-    }
-
-    initialize(runtime_home, app_config).await.map(Some)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperatorAccess {
+    ReadOnly,
+    Write,
 }
 
-/// Preserve operator commands' existing offline migration behavior. Online
-/// reads share no writable connection with the active owner and need no lock.
-pub(crate) async fn read_existing_for_operations(
+pub(crate) async fn with_existing_database<T>(
     runtime_home: &Path,
     app_config: &AppConfig,
-) -> Result<Option<SqliteDatabase>> {
-    let path = gateway_database_path(runtime_home, app_config)?;
-    match std::fs::metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-        Ok(_) => {}
+    access: OperatorAccess,
+    operation: impl AsyncFnOnce(PostgresDatabase, Option<PathBuf>) -> Result<T>,
+) -> Result<Option<T>> {
+    let mut owned = None;
+    let prepared = async {
+        let (writer, reader, data_directory, _external_owner) = if let Some((writer, reader)) =
+            external_options(runtime_home, app_config, 2)?
+        {
+            let owner = if access == OperatorAccess::Write {
+                Some(lock_gateway_database_owner(runtime_home)?)
+            } else {
+                None
+            };
+            let (writer, reader) = operator_pools(writer, reader, access).await?;
+            (writer, reader, None, owner)
+        } else {
+            let directory = pioneer_postgres::data_directory(runtime_home);
+            match std::fs::metadata(directory.join("PG_VERSION")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("inspect Gateway PostgreSQL data"),
+                Ok(version) => {
+                    anyhow::ensure!(version.is_file(), "invalid PostgreSQL data version")
+                }
+            }
+            let installed = pioneer_config::load_install_state(&app_config.install_state_path()?)?;
+            let executable = match installed {
+                Some(installed) => installed.binary_path,
+                None => std::env::current_exe().context("locate Gateway executable")?,
+            };
+            let (writer, reader) =
+                match BundledPostgres::start_existing(runtime_home, &executable).await {
+                    Ok(instance) => {
+                        let writer = instance.connect_options(2);
+                        let reader = instance.reader_options(2);
+                        owned = Some(instance);
+                        operator_pools(writer, reader, access).await?
+                    }
+                    Err(error)
+                        if access == OperatorAccess::ReadOnly
+                            && error
+                                .downcast_ref::<pioneer_postgres::ClusterBusy>()
+                                .is_some() =>
+                    {
+                        let reader = BundledPostgres::running_reader(runtime_home).await?;
+                        (reader.clone(), reader)
+                    }
+                    Err(error) => return Err(error),
+                };
+            (writer, reader, Some(directory), None)
+        };
+        let database = PostgresDatabase::from_executor_with_read_observer(
+            reader,
+            PostgresWriteExecutor::with_observer(writer, super::write_observer()),
+            super::read_observer(),
+        )
+        .maintenance();
+        let result = operation(database.clone(), data_directory).await;
+        let closed = database.close().await;
+        let result = result?;
+        closed.context("close Gateway operator pools")?;
+        Ok(Some(result))
     }
-    match initialize_existing_for_operations(runtime_home, app_config).await {
-        Ok(database) => return Ok(database),
-        Err(error) if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() => {}
-        Err(error) => return Err(error),
-    }
-    pioneer_sqlite::search::register_auto_extension_once()
-        .context("failed to register SQLite search extension")?;
-    pioneer_sqlite::zstd::register_auto_extension_once()
-        .context("failed to register SQLite extensions for operator reads")?;
-    let config = GatewayDatabaseRuntimeConfig::from_app_config(app_config)?;
-    let mut options = connect_options(
-        sqlite_read_only_connection_url(&path),
-        1,
-        &config,
-        "pioneer-sqlite-operator-reader-",
-    );
-    options.map_sqlx_sqlite_opts(|options| {
-        options
-            .read_only(true)
-            .create_if_missing(false)
-            .pragma("query_only", "ON")
-    });
-    let mut reader = Database::connect(options)
+    .await;
+    let stopped = match owned {
+        Some(instance) => instance.stop().await,
+        None => Ok(()),
+    };
+    let result = prepared?;
+    stopped.context("stop offline operator PostgreSQL")?;
+    Ok(result)
+}
+
+async fn operator_pools(
+    writer: ConnectOptions,
+    reader: ConnectOptions,
+    access: OperatorAccess,
+) -> Result<(DatabaseConnection, DatabaseConnection)> {
+    let reader = Database::connect(reader)
         .await
-        .context("open operator read-only database")?;
-    configure_observability(
-        &mut reader,
-        pioneer_observability::DatabaseRole::Reader,
-        1,
-        Arc::new(QueryFingerprintLimiter::default()),
-    );
-    let writer = SqliteWriteExecutor::with_observer(reader.clone(), super::write_observer());
-    let database =
-        SqliteDatabase::from_executor_with_read_observer(reader, writer, super::read_observer())
-            .maintenance();
-    database.validate_reader().await?;
-    Ok(Some(database))
+        .map_err(|_| anyhow::anyhow!("open Gateway operator PostgreSQL reader"))?;
+    if access == OperatorAccess::ReadOnly {
+        return Ok((reader.clone(), reader));
+    }
+    let writer = Database::connect(writer).await;
+    match writer {
+        Ok(writer) => Ok((writer, reader)),
+        Err(_) => {
+            let _ = reader.close().await;
+            anyhow::bail!("open Gateway operator PostgreSQL writer")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
+    use migration::{Migrator, MigratorTrait};
     use pioneer_observability::DatabaseOperation;
-    use pioneer_sqlite::{
-        normalize_relative_database_file_name, sqlite_connection_url,
-        sqlite_read_only_connection_url,
-    };
     use sea_orm::{ConnectionTrait, DbBackend, Statement, StreamTrait, TransactionTrait};
-    use std::path::Path;
 
-    // NOT_RUN / NOT_COMPILED. Bootstrap PRAGMA must survive physical pool replacement.
-    #[tokio::test]
-    async fn replacement_writer_preserves_foreign_keys_off() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = pioneer_config::AppConfig::load().unwrap();
-        let runtime = super::GatewayDatabaseRuntimeConfig::from_app_config(&config).unwrap();
-        let options = super::connect_options(
-            sqlite_connection_url(&temp.path().join("replacement.db")),
-            1,
-            &runtime,
-            "pioneer-sqlite-writer-",
-        );
-        let writer = sea_orm::Database::connect(options).await.unwrap();
-        pioneer_sqlite::apply_sqlite_pragmas(&writer).await.unwrap();
-        // Closing the only physical connection forces SQLx to create a fresh one.
-        // Do not reapply bootstrap pragmas: this reproduces idle/lifetime replacement.
-        writer
-            .get_sqlite_connection_pool()
-            .acquire()
-            .await
-            .unwrap()
-            .close()
-            .await
-            .unwrap();
-        let pragma = writer
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "PRAGMA foreign_keys",
-            ))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pragma.try_get::<i64>("", "foreign_keys").unwrap(), 0);
-        writer.close().await.unwrap();
+    fn development_config(url: &url::Url) -> anyhow::Result<pioneer_config::AppConfig> {
+        let mut config = pioneer_config::AppConfig::load()?;
+        config.gateway.database.development_url = Some(serde_json::from_value(
+            serde_json::Value::String(url.to_string()),
+        )?);
+        Ok(config)
     }
 
     #[tokio::test]
-    async fn installer_inspection_reads_history_without_migrations_or_creation() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = pioneer_config::AppConfig::load().unwrap();
-        let path = super::gateway_database_path(temp.path(), &config).unwrap();
-        assert_eq!(
-            super::inspect_applied_migration_names(temp.path(), &config)
-                .await
-                .unwrap(),
-            None
-        );
-        assert!(!path.exists(), "inspection must not create a DB");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let writer = sea_orm::Database::connect(sqlite_connection_url(&path))
-            .await
-            .unwrap();
-        let db = pioneer_sqlite::SqliteDatabase::from_single_connection(writer);
-        db.execute_unprepared(
-            "CREATE TABLE seaql_migrations (version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
-        )
+    async fn gateway_postgres_startup_migrates_empty_database_and_recovers_committed_rows()
+    -> anyhow::Result<()> {
+        pioneer_postgres_test::with_empty_database(async |fixture| {
+            let config = development_config(fixture.url())?;
+            let home = tempfile::tempdir()?;
+            let trace = pioneer_observability::GatewayStartupTrace::start();
+
+            let (first, process) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(process.is_none(), "development owns only its two pools");
+            assert_eq!(
+                ConnectionTrait::get_database_backend(&first),
+                DbBackend::Postgres
+            );
+            first.maintenance().validate_reader().await?;
+
+            let writer = first.begin().await?;
+            writer
+                .execute_unprepared(
+                    "INSERT INTO workspace (id, name) VALUES ('persisted', 'After restart')",
+                )
+                .await?;
+            writer.commit().await?;
+            let result = first
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT name FROM workspace WHERE id = 'persisted'",
+                ))
+                .await?
+                .expect("committed workspace");
+            assert_eq!(result.try_get::<String>("", "name")?, "After restart");
+
+            let history = super::inspect_applied_migration_names(home.path(), &config)
+                .await?
+                .expect("development database has migration history");
+            let expected_history = Migrator::migrations()
+                .iter()
+                .map(|migration| migration.name().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(history, expected_history);
+            first.close().await?;
+
+            let (restarted, process) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(process.is_none());
+            let result = restarted
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT name FROM workspace WHERE id = 'persisted'",
+                ))
+                .await?
+                .expect("committed workspace after restart");
+            assert_eq!(result.try_get::<String>("", "name")?, "After restart");
+            assert_eq!(
+                super::inspect_applied_migration_names(home.path(), &config).await?,
+                Some(history),
+            );
+            restarted.close().await?;
+            assert!(!home.path().join("postgres").exists());
+            Ok(())
+        })
         .await
-        .unwrap();
-        db.execute_unprepared(
-            "INSERT INTO seaql_migrations VALUES ('future_unknown_to_installer', 1)",
-        )
-        .await
-        .unwrap();
-        db.close().await.unwrap();
-        let before = std::fs::read(&path).unwrap();
-        assert_eq!(
-            super::inspect_applied_migration_names(temp.path(), &config)
-                .await
-                .unwrap(),
-            Some(vec!["future_unknown_to_installer".into()])
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "no migrations/history writes"
-        );
-        // A malformed history is unknown, never an empty compatible set.
-        std::fs::write(&path, b"not a SQLite database").unwrap();
-        assert!(
-            super::inspect_applied_migration_names(temp.path(), &config)
-                .await
-                .is_err()
-        );
     }
 
-    #[test]
-    fn builds_read_only_sqlite_connection_url() {
-        let path = Path::new("/tmp/gateway.db");
-        let url = sqlite_read_only_connection_url(path);
-        assert_eq!(url, "sqlite:///tmp/gateway.db?mode=ro");
+    #[tokio::test]
+    async fn gateway_runtime_dotenv_selects_external_postgres_for_startup_and_inspection()
+    -> anyhow::Result<()> {
+        pioneer_postgres_test::with_empty_database(async |fixture| {
+            let home = tempfile::tempdir()?;
+            std::fs::write(
+                home.path().join(".env"),
+                format!("DATABASE_URL={}\n", fixture.url()),
+            )?;
+            let mut config = pioneer_config::AppConfig::load()?;
+            config.gateway.database.development_url = None;
+            let trace = pioneer_observability::GatewayStartupTrace::start();
+            let owner = super::lock_gateway_database_owner(home.path())?;
+
+            let (database, bundled) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(bundled.is_none());
+            let transaction = database.begin().await?;
+            transaction
+                .execute_unprepared(
+                    "INSERT INTO workspace (id, name) VALUES ('external', 'External database')",
+                )
+                .await?;
+            transaction.commit().await?;
+
+            let busy = super::with_existing_database(
+                home.path(),
+                &config,
+                super::OperatorAccess::Write,
+                async |_, _| Ok(()),
+            )
+            .await
+            .unwrap_err();
+            assert!(busy.is::<pioneer_postgres::ClusterBusy>());
+
+            let migrations = super::inspect_applied_migration_names(home.path(), &config)
+                .await?
+                .expect("external database migration history");
+            assert_eq!(migrations.len(), Migrator::migrations().len());
+            database.close().await?;
+            drop(owner);
+            let _owner = super::lock_gateway_database_owner(home.path())?;
+
+            let (restarted, bundled) =
+                super::initialize_with_startup(home.path(), &config, &trace).await?;
+            assert!(bundled.is_none());
+            assert!(restarted.reader_is_read_only().await?);
+            let workspace = restarted
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT name FROM workspace WHERE id = 'external'",
+                ))
+                .await?
+                .expect("workspace persisted across restart");
+            assert_eq!(
+                workspace.try_get::<String>("", "name")?,
+                "External database"
+            );
+            restarted.close().await?;
+            assert!(!home.path().join("postgres").exists());
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn installer_inspection_reads_postgres_history_without_applying_migrations()
+    -> anyhow::Result<()> {
+        pioneer_postgres_test::with_empty_database(async |fixture| {
+            let home = tempfile::tempdir()?;
+            let mut bundled = pioneer_config::AppConfig::load()?;
+            bundled.gateway.database.development_url = None;
+            assert_eq!(
+                super::inspect_applied_migration_names(home.path(), &bundled).await?,
+                None,
+            );
+            assert!(!home.path().join("postgres").exists());
+            let config = development_config(fixture.url())?;
+            assert!(
+                super::inspect_applied_migration_names(home.path(), &config).await.is_err(),
+                "a missing migration table is unknown"
+            );
+            let db = fixture.connection();
+            db.execute_unprepared(
+                "CREATE TABLE seaql_migrations (version TEXT PRIMARY KEY, applied_at BIGINT NOT NULL); INSERT INTO seaql_migrations VALUES ('future_unknown_to_installer', 1);"
+            ).await?;
+            assert_eq!(
+                super::inspect_applied_migration_names(home.path(), &config).await?,
+                Some(vec!["future_unknown_to_installer".into()]),
+            );
+            assert!(db.query_one_raw(Statement::from_string(
+                DbBackend::Postgres, "SELECT 1 FROM pg_class WHERE relname = 'workspace'",
+            )).await?.is_none());
+            db.execute_unprepared("DROP TABLE seaql_migrations; CREATE TABLE seaql_migrations (broken TEXT)").await?;
+            assert!(super::inspect_applied_migration_names(home.path(), &config).await.is_err());
+            Ok(())
+        }).await
     }
 
     #[test]
     fn classifies_sql_without_exporting_statement_text() {
         assert_eq!(
-            super::sqlite_operation(" SELECT * FROM thread"),
+            super::classify_operation(" SELECT * FROM thread"),
             DatabaseOperation::Select
         );
         assert_eq!(
-            super::sqlite_operation("insert into turn values (?)"),
+            super::classify_operation("insert into turn values ($1)"),
             DatabaseOperation::Insert
         );
         assert_eq!(
-            super::sqlite_operation("BEGIN IMMEDIATE"),
+            super::classify_operation("BEGIN"),
             DatabaseOperation::Transaction
         );
         assert_eq!(
-            super::sqlite_operation("PRAGMA journal_mode"),
-            DatabaseOperation::Pragma
+            super::classify_operation("EXPLAIN SELECT 1"),
+            DatabaseOperation::Select
         );
         assert_eq!(
-            super::sqlite_operation("WITH rows AS (...) SELECT 1"),
+            super::classify_operation("WITH rows AS (...) SELECT 1"),
             DatabaseOperation::Other
         );
     }
@@ -698,314 +703,132 @@ mod tests {
             "the regression requires an active observer registry"
         );
         for mode in 0..3 {
-            let runtime = tempfile::tempdir().unwrap();
-            let mut config = pioneer_config::AppConfig::load().unwrap();
-            config.gateway.database.file_name = format!("observed-bootstrap-{mode}.db");
-            let path = super::gateway_database_path(runtime.path(), &config).unwrap();
-            let home = runtime.path().to_owned();
-            let (ready, initialized) = tokio::sync::oneshot::channel();
-            let (release, released) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                let database = super::initialize(&home, &config).await?;
-                ready.send(()).unwrap();
-                let _ = released.await;
-                if mode == 0 {
-                    anyhow::bail!("bootstrap caller rejected initialized pools");
+            pioneer_postgres_test::with_database(async |fixture| {
+                let runtime = tempfile::tempdir()?;
+                let config = development_config(fixture.url())?;
+                let home = runtime.path().to_owned();
+                let (ready, initialized) = tokio::sync::oneshot::channel();
+                let (release, released) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let trace = pioneer_observability::GatewayStartupTrace::start();
+                    let (database, process) =
+                        super::initialize_with_startup(&home, &config, &trace).await?;
+                    assert!(process.is_none());
+                    ready.send(()).unwrap();
+                    let _ = released.await;
+                    if mode == 0 {
+                        anyhow::bail!("bootstrap caller rejected initialized pools");
+                    }
+                    Ok::<_, anyhow::Error>(database)
+                });
+                if initialized.await.is_err() {
+                    task.await??;
+                    anyhow::bail!("bootstrap task exited before reporting initialized pools");
                 }
-                Ok::<_, anyhow::Error>(database)
-            });
-            initialized.await.unwrap();
-            assert!(pioneer_sqlite::WriterOwnership::acquire(&path).is_err());
-            match mode {
-                0 => {
-                    release.send(()).unwrap();
-                    assert!(task.await.unwrap().is_err());
+                async fn extra_connections(
+                    db: &sea_orm::DatabaseConnection,
+                ) -> anyhow::Result<i64> {
+                    db.query_one_raw(Statement::from_string(
+                        DbBackend::Postgres,
+                        "SELECT count(*) AS connections FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND application_name IN ('pioneer_gateway_writer','pioneer_gateway_reader')",
+                    ))
+                    .await?
+                    .expect("database connection count")
+                    .try_get("", "connections")
+                    .map_err(Into::into)
                 }
-                1 => {
-                    task.abort();
-                    assert!(task.await.unwrap_err().is_cancelled());
-                    drop(release);
-                }
-                _ => {
-                    drop(task);
-                    release.send(()).unwrap();
-                }
-            }
-            // Native dispatched work may still be finishing; never force-unlock
-            // it. The owner must disappear naturally without explicit close.
-            let ownership = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    match pioneer_sqlite::WriterOwnership::acquire(&path) {
-                        Ok(owner) => break owner,
-                        Err(error)
-                            if error.downcast_ref::<pioneer_sqlite::WriterBusy>().is_some() =>
-                        {
-                            tokio::task::yield_now().await
-                        }
-                        Err(error) => panic!("unexpected reopen failure: {error:#}"),
+                assert!(extra_connections(fixture.connection()).await? >= 2);
+                match mode {
+                    0 => {
+                        release.send(()).unwrap();
+                        assert!(task.await?.is_err());
+                    }
+                    1 => {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                        drop(release);
+                    }
+                    _ => {
+                        drop(task);
+                        release.send(()).unwrap();
                     }
                 }
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while extra_connections(fixture.connection()).await? != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await??;
+                Ok(())
             })
             .await
-            .expect("observer must not retain a writer without Gateway");
-            drop(ownership);
+            .unwrap();
         }
     }
 
     #[tokio::test]
-    async fn initializes_independent_read_only_reader_and_single_writer() {
-        let runtime = tempfile::tempdir().expect("temporary Gateway runtime");
-        let mut config = pioneer_config::AppConfig::load().expect("load test config");
-        config.gateway.database.file_name = "routing-test.db".to_owned();
-        config.gateway.database.max_connections = 4;
+    async fn initializes_independent_read_only_reader_and_concurrent_writers() -> anyhow::Result<()>
+    {
+        pioneer_postgres_test::with_database(async |fixture| {
+            let runtime = tempfile::tempdir()?;
+            let mut config = development_config(fixture.url())?;
+            config.gateway.database.max_connections = 1;
+            let trace = pioneer_observability::GatewayStartupTrace::start();
+            let (database, process) =
+                super::initialize_with_startup(runtime.path(), &config, &trace).await?;
+            assert!(process.is_none());
+            assert_eq!(database.reader_max_connections(), 4);
+            assert_eq!(database.writer_max_connections(), 4);
+            assert!(database.reader_is_read_only().await?);
+            database.execute_unprepared(
+                "CREATE TABLE routing_probe (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, value text NOT NULL)"
+            ).await?;
 
-        let database = super::initialize(runtime.path(), &config)
-            .await
-            .expect("initialize split Gateway database");
-        assert_eq!(database.reader_max_connections(), 4);
-        assert_eq!(database.writer_max_connections(), 1);
-        assert!(
-            database
-                .reader_query_only_enabled()
-                .await
-                .expect("read query_only state")
-        );
-
-        database
-            .execute_unprepared(
-                "CREATE TABLE routing_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
-            )
-            .await
-            .expect("create probe through writer");
-        let inserted = database
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "INSERT INTO routing_probe(value) VALUES ('ok') RETURNING value".to_owned(),
-            ))
-            .await
-            .expect("route INSERT RETURNING through writer")
-            .expect("inserted probe row");
-        assert_eq!(inserted.try_get::<String>("", "value").unwrap(), "ok");
-
-        let selected = database
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT value FROM routing_probe".to_owned(),
-            ))
-            .await
-            .expect("query probe through reader")
-            .expect("selected probe row");
-        assert_eq!(selected.try_get::<String>("", "value").unwrap(), "ok");
-
-        let mut selected_stream = database
-            .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT value FROM routing_probe".to_owned(),
-            ))
-            .await
-            .expect("route streaming SELECT through reader");
-        let streamed = selected_stream
-            .next()
-            .await
-            .expect("streamed probe row")
-            .expect("read streamed probe row");
-        assert_eq!(streamed.try_get::<String>("", "value").unwrap(), "ok");
-        drop(selected_stream);
-
-        let mut inserted_stream = database
-            .stream_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "INSERT INTO routing_probe(value) VALUES ('streamed') RETURNING value".to_owned(),
-            ))
-            .await
-            .expect("route streaming INSERT RETURNING through writer");
-        let streamed_insert = inserted_stream
-            .next()
-            .await
-            .expect("streamed inserted row")
-            .expect("read streamed inserted row");
-        assert_eq!(
-            streamed_insert.try_get::<String>("", "value").unwrap(),
-            "streamed"
-        );
-        drop(inserted_stream);
-
-        let extension_probe = database
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT length(zstd_compress('reader-extension-probe', 1)) AS value".to_owned(),
-            ))
-            .await
-            .expect("sqlite-zstd must be registered on read connections")
-            .expect("sqlite-zstd probe row");
-        assert!(extension_probe.try_get::<i64>("", "value").unwrap() > 0);
-
-        let transaction = database.begin().await.expect("begin writer probe");
-        transaction
-            .execute_unprepared("UPDATE routing_probe SET value = 'uncommitted'")
-            .await
-            .expect("hold writer with an uncommitted update");
-        let transaction_value = transaction
-            .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT value FROM routing_probe".to_owned(),
-            ))
-            .await
-            .expect("read inside write transaction")
-            .expect("transaction probe row");
-        assert_eq!(
-            transaction_value.try_get::<String>("", "value").unwrap(),
-            "uncommitted"
-        );
-        let concurrent_read = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            database.query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT value FROM routing_probe".to_owned(),
-            )),
-        )
-        .await
-        .expect("ordinary read must not wait for the occupied writer")
-        .expect("query through independent reader")
-        .expect("concurrent probe row");
-        assert_eq!(
-            concurrent_read.try_get::<String>("", "value").unwrap(),
-            "ok"
-        );
-        transaction.rollback().await.expect("rollback writer probe");
-
-        database.close().await.expect("close both Gateway pools");
-    }
-
-    // The production Gateway initialization, fingerprint callback, wrappers,
-    // and SQLx worker transport are exercised together. This test is NOT_RUN
-    // until external acceptance of the entire changed tree.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[tokio::test]
-    async fn sql_cpu_capture_measures_workers_and_excludes_consumer_wait() {
-        use crate::database::attribution::scope_database_workload_result;
-        use pioneer_observability::{DatabaseOperationSite as Site, DatabaseWorkload as Workload};
-        use std::time::Duration;
-        pioneer_observability::init_tracing(false);
-        let runtime = tempfile::tempdir().unwrap();
-        let mut config = pioneer_config::AppConfig::load().unwrap();
-        config.gateway.database.file_name = "sql-cpu-test.db".into();
-        let database = super::initialize(runtime.path(), &config).await.unwrap();
-        let session = pioneer_observability::query_cpu::Session::start(
-            60,
-            pioneer_observability::telemetry_consent_snapshot().1,
-        )
-        .unwrap();
-        let (sum, maximum) = tokio::join!(
-            scope_database_workload_result(Workload::ThreadTreeLoad, Site::ThreadTreeLoad,
-                database.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000) SELECT sum(x) AS value FROM n"))),
-            scope_database_workload_result(Workload::TimelinePage, Site::TimelinePage,
-                database.query_one_raw(Statement::from_string(DbBackend::Sqlite,
-                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<400000) SELECT max(x) AS value FROM n"))),
-        );
-        assert_eq!(
-            sum.unwrap().unwrap().try_get::<i64>("", "value").unwrap(),
-            80_000_200_000
-        );
-        assert_eq!(
-            maximum
-                .unwrap()
-                .unwrap()
-                .try_get::<i64>("", "value")
-                .unwrap(),
-            400_000
-        );
-        scope_database_workload_result(Workload::SkillsWatch, Site::SkillsWatch, async {
-            let mut stream = database.stream_raw(Statement::from_string(DbBackend::Sqlite,
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT x FROM n"))
-                .await?;
-            assert!(stream.next().await.transpose()?.is_some());
-            // Deliberately stalled consumer: SQLx blocks on its bounded row
-            // channel. This wait must not be charged as SQLite worker CPU.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            drop(stream);
-            Ok::<_, sea_orm::DbErr>(())
-        }).await.unwrap();
-        database.close().await.unwrap(); // drain physical worker references
-        let snapshot = session.finish();
-        assert_eq!(snapshot.coverage.clock_api_errors, 0);
-        assert_eq!(snapshot.coverage.clock_regressions, 0);
-        assert_eq!(snapshot.coverage.scopes_without_callback, 0);
-        assert!(snapshot.coverage.measured_segments >= 3);
-        assert!(snapshot.coverage.cpu_clock_reads <= 40_000);
-        let json = serde_json::to_value(&snapshot).unwrap();
-        let groups = json["groups"].as_array().unwrap();
-        let group = |site: &str| {
-            groups
-                .iter()
-                .find(|g| g["site"].as_str() == Some(site))
-                .unwrap()
-        };
-        let sum = group("thread_tree_load");
-        let maximum = group("timeline_page");
-        let waiting = group("skills_watch");
-        assert!(sum["fingerprint"].is_string());
-        assert!(maximum["fingerprint"].is_string());
-        assert_ne!(sum["fingerprint"], maximum["fingerprint"]);
-        for completed in [sum, maximum] {
-            assert_eq!(completed["completed_calls"], 1);
-            assert!(completed["cpu_ns"].as_u64().unwrap() > 0);
-        }
-        assert_eq!(waiting["cancelled"], 1);
-        assert!(
-            waiting["cpu_ns"].as_u64().unwrap() < 150_000_000,
-            "a 300 ms blocked row consumer must not be charged as await duration"
-        );
-        assert_eq!(snapshot.measured_unknown.cpu_ns, None);
-    }
-
-    #[test]
-    fn reserves_four_reader_connections_even_for_legacy_single_connection_config() {
-        let mut config = pioneer_config::AppConfig::load().expect("load test config");
-        config.gateway.database.max_connections = 1;
-
-        let runtime = super::GatewayDatabaseRuntimeConfig::from_app_config(&config)
-            .expect("normalize database config");
-
-        assert_eq!(runtime.max_connections, super::MIN_READER_CONNECTIONS);
-    }
-
-    #[test]
-    fn sqlite_connection_urls_preserve_path_forms() {
-        for (path, expected) in [
-            ("/tmp/gateway.db", "sqlite:///tmp/gateway.db?mode=rwc"),
-            (
-                r"C:\Users\alex\gateway.db",
-                "sqlite:///C:/Users/alex/gateway.db?mode=rwc",
-            ),
-        ] {
-            let path = Path::new(path);
-            let url = sqlite_connection_url(path);
-            assert_eq!(url, expected);
-        }
-    }
-
-    #[test]
-    fn relative_database_file_names_reject_invalid_inputs() {
-        for (input, rejection_message, expected) in [
-            (
-                "   ",
-                "must reject empty file name",
-                "gateway.database.file_name must not be empty",
-            ),
-            (
-                "/tmp/gateway.db",
-                "must reject absolute file name",
-                "gateway.database.file_name must be relative",
-            ),
-        ] {
-            let error = normalize_relative_database_file_name(input, "gateway.database.file_name")
-                .expect_err(rejection_message);
-            assert!(
-                format!("{error:#}").contains(expected),
-                "unexpected error: {error:#}"
+            let insert = |value| Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO routing_probe(value) VALUES ($1) RETURNING value",
+                [sea_orm::Value::from(value)],
             );
-        }
+            let inserted = database.query_one_raw(insert("ok")).await?.expect("inserted row");
+            assert_eq!(inserted.try_get::<String>("", "value")?, "ok");
+            let select = || Statement::from_string(
+                DbBackend::Postgres, "SELECT value FROM routing_probe WHERE id = 1"
+            );
+            let mut selected = database.stream_raw(select()).await?;
+            let row = selected.next().await.expect("streamed row")?;
+            assert_eq!(row.try_get::<String>("", "value")?, "ok");
+            drop(selected);
+            let mut inserted = database.stream_raw(insert("streamed")).await?;
+            let row = inserted.next().await.expect("streamed insertion")?;
+            assert_eq!(row.try_get::<String>("", "value")?, "streamed");
+            drop(inserted);
+
+            let readonly = database.begin_read().await?;
+            let pgvector = readonly.query_one_raw(Statement::from_string(
+                DbBackend::Postgres, "SELECT '[3,4]'::vector <-> '[0,0]'::vector AS distance"
+            )).await?.expect("vector distance");
+            assert_eq!(pgvector.try_get::<f64>("", "distance")?, 5.0);
+            assert!(readonly.execute_unprepared("UPDATE routing_probe SET value = 'rejected'").await.is_err());
+            readonly.rollback().await?;
+
+            let transaction = database.begin().await?;
+            transaction.execute_unprepared("UPDATE routing_probe SET value = 'uncommitted' WHERE id = 1").await?;
+            let row = transaction.query_one_raw(select()).await?.expect("provisional update");
+            assert_eq!(row.try_get::<String>("", "value")?, "uncommitted");
+            let row = tokio::time::timeout(
+                std::time::Duration::from_secs(2), database.query_one_raw(select())
+            ).await??.expect("concurrent read");
+            assert_eq!(row.try_get::<String>("", "value")?, "ok");
+            let other_writer = database.begin().await?;
+            let row = other_writer.query_one_raw(insert("other writer")).await?.expect("other writer inserted");
+            assert_eq!(row.try_get::<String>("", "value")?, "other writer");
+            other_writer.commit().await?;
+            transaction.rollback().await?;
+            database.close().await?;
+            Ok(())
+        }).await
     }
 }

@@ -10,6 +10,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub singleton_id: i64,
     pub generation: i64,
+    #[sea_orm(column_type = "Text")]
     pub code_policy_fingerprint: String,
     pub updated_at: DateTimeWithTimeZone,
 }

@@ -1,20 +1,29 @@
 use super::*;
+
+struct ResumeTokioClock;
+
+impl Drop for ResumeTokioClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
 use crate::message::reconciliation_diagnostics::{Operation, Reporter};
 use sentry::SentryFutureExt;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_turn_event_delivery_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_terminal_effect_kick_uses_background_database_scope() {
     assert_native_kick_database_scope(true).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failure() {
     // Observe the existing end-of-quantum warning, rather than assuming a
     // fixed number of scheduler yields means the worker has started its sleep.
@@ -48,6 +57,7 @@ async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failur
         tracing_subscriber::registry().with(KickFailure(failures)),
     );
     tokio::time::pause();
+    let _resume_clock = ResumeTokioClock;
     processor.kick_native_terminal_effects();
     let first_failure = timeout(Duration::from_secs(10), failures_rx.recv())
         .await
@@ -111,32 +121,21 @@ async fn native_terminal_effect_kick_defers_coalesced_retry_after_storage_failur
 }
 
 async fn assert_native_kick_database_scope(terminal_effects: bool) {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
-        SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteClass,
+        PostgresWriteEvent, PostgresWriteExecutor,
     };
-    use sea_orm::{ConnectOptions, DbBackend, Statement};
+    use sea_orm::{DbBackend, Statement};
 
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("native-kick.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -179,7 +178,7 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
             .unwrap();
         let row = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM turn_event_delivery \
              WHERE turn_id='kick-turn' AND consumer='live_notification' \
              AND status='pending'"
@@ -208,8 +207,8 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
             if observer.reads.lock().unwrap().iter().any(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::AdmissionEnqueued {
-                        class: SqliteReadClass::Maintenance,
+                    PostgresReadEvent::AdmissionEnqueued {
+                        class: PostgresReadClass::Maintenance,
                         ..
                     }
                 )
@@ -229,17 +228,14 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
         observer.writes.lock().unwrap().is_empty(),
         "discovery must wait before writing"
     );
-    let query_only = timeout(
-        Duration::from_secs(10),
-        database.reader_query_only_enabled(),
-    )
-    .await
-    .expect("foreground read must proceed while the kick waits")
-    .unwrap();
-    assert!(query_only, "the physical reader must remain query-only");
+    let read_only = timeout(Duration::from_secs(10), database.reader_is_read_only())
+        .await
+        .expect("foreground read must proceed while the kick waits")
+        .unwrap();
+    assert!(read_only, "the physical reader must remain read-only");
     assert_eq!(
         processor.crud_store.database_connection().read_class(),
-        SqliteReadClass::Interactive
+        PostgresReadClass::Interactive
     );
     observer.reads.lock().unwrap().clear();
     drop(held);
@@ -260,15 +256,15 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     let reads = observer.reads.lock().unwrap().clone();
     assert!(reads.iter().any(|event| matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Maintenance,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Maintenance,
             ..
         }
     )));
     assert!(reads.iter().all(|event| !matches!(
         event,
-        SqliteReadEvent::OperationFinished {
-            class: SqliteReadClass::Interactive,
+        PostgresReadEvent::OperationFinished {
+            class: PostgresReadClass::Interactive,
             ..
         }
     )));
@@ -280,19 +276,19 @@ async fn assert_native_kick_database_scope(terminal_effects: bool) {
     } else {
         assert!(writes.iter().any(|event| matches!(
             event,
-            SqliteWriteEvent::Acquired {
-                class: SqliteWriteClass::Critical,
+            PostgresWriteEvent::Acquired {
+                class: PostgresWriteClass::Critical,
                 ..
             }
         )));
         assert!(writes.iter().all(|event| !matches!(event,
-            SqliteWriteEvent::Acquired { class, .. } if *class != SqliteWriteClass::Critical
+            PostgresWriteEvent::Acquired { class, .. } if *class != PostgresWriteClass::Critical
         )));
     }
     if !terminal_effects {
         let row = database
             .query_one_raw(Statement::from_string(
-                DbBackend::Sqlite,
+                DbBackend::Postgres,
                 "SELECT COUNT(*) AS count FROM turn_event_delivery \
                  WHERE turn_id='kick-turn' AND consumer='live_notification' \
                  AND status='delivered'"
@@ -315,9 +311,16 @@ pub(super) fn local_capture() -> (
     tracing::Dispatch,
 ) {
     let transport = sentry::test::TestTransport::new();
+    let (hub, dispatch) = capture_with_transport(transport.clone());
+    (hub, transport, dispatch)
+}
+
+fn capture_with_transport(
+    transport: Arc<impl sentry::Transport>,
+) -> (Arc<sentry::Hub>, tracing::Dispatch) {
     let options = sentry::ClientOptions::new()
         .dsn("https://public@sentry.invalid/1")
-        .transport(transport.clone());
+        .transport(transport);
     let hub = Arc::new(sentry::Hub::new(
         Some(Arc::new(options.into())),
         Arc::new(Default::default()),
@@ -325,31 +328,35 @@ pub(super) fn local_capture() -> (
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer()),
     );
-    (hub, transport, dispatch)
+    (hub, dispatch)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
+    struct EventTransport(tokio::sync::mpsc::UnboundedSender<sentry::protocol::Event<'static>>);
+
+    impl sentry::Transport for EventTransport {
+        fn send_envelope(&self, envelope: sentry::Envelope) {
+            if let Some(event) = envelope.event() {
+                let _ = self.0.send(event.clone());
+            }
+        }
+    }
+
     let (mut processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     // Keep writer settlement available: closing both pools stops recovery at
     // begin_pass after an uncertain write, before either domain reporter runs.
     // A closed reader supplies the same real PoolClosed error on every pass.
-    let writer = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-    let reader = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-    reader
-        .execute_unprepared("PRAGMA query_only=ON")
-        .await
-        .unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     reader.clone().close().await.unwrap();
-    processor.crud_store = Arc::new(CrudStore::new(pioneer_sqlite::SqliteDatabase::new(
-        reader, writer,
-    )));
+    processor.crud_store = Arc::new(CrudStore::new(
+        pioneer_postgres_pools::PostgresDatabase::new(reader, writer),
+    ));
     let processor = Arc::new(processor);
-    // SQLite pool setup uses a real worker thread. Pause only after the fixture
-    // is ready, so Tokio cannot advance its acquisition timeout while
-    // that thread is still opening the connection.
-    tokio::time::pause();
-    let (hub, transport, dispatch) = local_capture();
+    let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
+    let (hub, dispatch) = capture_with_transport(Arc::new(EventTransport(capture)));
     let projection = tokio::spawn(
         MessageProcessor::run_projection_delivery_resilience_worker(Arc::downgrade(&processor))
             .with_subscriber(dispatch.clone())
@@ -361,45 +368,32 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
             .bind_hub(hub),
     );
     let mut events = Vec::new();
-    // Existing replay/child errors mark successive real recovery passes.
-    // Delivery now runs in the independent, coalesced consumer owners.
-    for pass in 1..=3 {
-        let mut completed = false;
-        for _ in 0..1024 {
-            tokio::task::yield_now().await;
-            events.extend(transport.fetch_and_clear_events());
-            let projection_passes = events
-                .iter()
-                .filter(|event| {
-                    event.message.as_deref() == Some("turn event projection replay failed")
-                })
-                .count();
-            let lifecycle_passes = events
-                .iter()
-                .filter(|event| {
-                    event.message.as_deref() == Some("task child terminal reconciler failed")
-                })
-                .count();
-            if projection_passes >= pass && lifecycle_passes >= pass {
-                completed = true;
-                break;
+    let mut projection_passes = 0;
+    let mut lifecycle_passes = 0;
+    // A third pass entering each loop proves the first two reached their
+    // reporters. Real PostgreSQL I/O and the retry clock advance together.
+    let completed = timeout(Duration::from_secs(20), async {
+        while projection_passes < 3 || lifecycle_passes < 3 {
+            let event = captured.recv().await.expect("worker diagnostics stream");
+            match event.message.as_deref() {
+                Some("turn event projection replay failed") => projection_passes += 1,
+                Some("task child terminal reconciler failed") => lifecycle_passes += 1,
+                _ => {}
             }
-            // Existing retry policy also retries the ConnectionAcquire wrapper;
-            // drive its backoff without changing production timing or sleeping.
-            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+            events.push(event);
         }
-        assert!(
-            completed,
-            "both workers must finish their real reconciliation pass"
-        );
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    }
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "both workers must complete repeated passes (projection entered {projection_passes}, lifecycle entered {lifecycle_passes})",
+    );
     projection.abort();
     lifecycle.abort();
     let _ = projection.await;
     let _ = lifecycle.await;
     processor.shutdown_resilience_workers().await;
-    events.extend(transport.fetch_and_clear_events());
+    events.extend(std::iter::from_fn(|| captured.try_recv().ok()));
     let diagnostics: Vec<_> = events
         .iter()
         .filter(|event| {
@@ -445,7 +439,7 @@ async fn reconciliation_reporting_is_retained_in_both_real_worker_loops() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_complete_reconciliation_results_recover_only_their_reporter() {
     let (processor, _, _, _, _, _) = setup_workspace_message_processor().await;
     let processor = Arc::new(processor);
@@ -495,7 +489,7 @@ async fn real_complete_reconciliation_results_recover_only_their_reporter() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_durable_progress_followed_by_real_error_does_not_recover() {
     let (processor, store, workspace_id) =
         setup_execution_window_terminal_turn("diagnostic_thread", "diagnostic_turn").await;

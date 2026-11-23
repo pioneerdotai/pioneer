@@ -7,15 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_cli_runtime_execution_segment")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_turn_cli_runtime_execution_segment_attempt_index")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_turn_cli_runtime_execution_segment_attempt_index"
+    )]
     pub attempt_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text")]
     pub turn_id: String,
     #[sea_orm(unique_key = "uidx_turn_cli_runtime_execution_segment_attempt_index")]
     pub segment_index: i64,
-    #[sea_orm(unique_key = "uidx_turn_cli_runtime_execution_segment_runtime_native_turn")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_turn_cli_runtime_execution_segment_runtime_native_turn"
+    )]
     pub runtime_id: String,
     #[sea_orm(column_type = "Text")]
     pub native_thread_id: String,
@@ -24,6 +30,7 @@ pub struct Model {
         unique_key = "uidx_turn_cli_runtime_execution_segment_runtime_native_turn"
     )]
     pub native_turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub failure_reason: Option<String>,
@@ -38,7 +45,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn_cli_runtime_attempt: HasOne<super::turn_cli_runtime_attempt::Entity>,
+    pub turn_cli_runtime_attempt: BelongsTo<super::turn_cli_runtime_attempt::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

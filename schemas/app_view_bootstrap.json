@@ -3,6 +3,21 @@
   "title": "AppViewBootstrap",
   "type": "object",
   "properties": {
+    "dev_url": {
+      "description": "Verified local authoring URL. The relative URL remains a native-only lease handle for dev views and must never be loaded into their browser.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "development": {
+      "default": false,
+      "type": "boolean"
+    },
     "execution_id": {
       "type": "string"
     },

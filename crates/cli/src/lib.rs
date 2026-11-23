@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 include!(concat!(env!("OUT_DIR"), "/pioneer-build-section.rs"));
+mod dev_app;
 #[cfg(all(debug_assertions, feature = "computer-use"))]
 mod dev_runtime;
 mod diagnostics;
@@ -182,6 +183,7 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
             ))),
             None => Err(usage_error("missing device command; expected `create`")),
         },
+        Some("dev") => dev_app::run(args),
         Some("diagnostics") => diagnostics::run(args),
         Some("task-invariants") => task_invariants::run(args),
         Some("secrets") => secrets::run(args),
@@ -692,10 +694,14 @@ fn help_text() -> String {
                  [--managed-by desktop|script|manual|unknown] [--no-start] [--force-start] [--json]
   {command} self-update (alias of `update`)
   {command} start [--json]      Install and start the persistent gateway service
+  {command} dev app add <project> --url <origin>
+  {command} dev app list
+  {command} dev app remove <id>
+                                Use selected local Gateway/workspace; --gateway/--workspace override
   {command} status [--json]     Show gateway service status
   {command} device create [--json]  Create a pending device session and one-time activation code
-  {command} task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]
-                                Scan task/subagent runtime invariants in a SQLite gateway DB
+  {command} task-invariants [--json] [--stale-turn-after-seconds <seconds>]
+                                Scan task/subagent runtime invariants in a PostgreSQL gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} stop                Stop and uninstall the persistent gateway service
@@ -803,8 +809,8 @@ mod tests {
             .expect_err("unknown secrets command should fail");
         assert!(is_usage_error(&error));
 
-        let error = run_with_args(args(&["task-invariants", "--json"]))
-            .expect_err("missing task-invariants db should fail");
+        let error = run_with_args(args(&["task-invariants", "--unexpected"]))
+            .expect_err("unknown task-invariants option should fail");
         assert!(is_usage_error(&error));
     }
 }

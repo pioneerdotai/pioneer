@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action_outbox")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub action_id: String,
+    #[sea_orm(column_type = "Text")]
     pub owner_execution_id: String,
     #[sea_orm(column_type = "Text")]
     pub payload_json: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub attempts: i64,
     pub next_attempt_at: Option<DateTimeWithTimeZone>,
@@ -28,7 +30,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_action: HasOne<super::agent_action::Entity>,
+    pub agent_action: BelongsTo<super::agent_action::Entity>,
     #[sea_orm(
         belongs_to,
         from = "owner_execution_id",
@@ -36,7 +38,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

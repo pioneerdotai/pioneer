@@ -7,16 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "gateway_principal")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique_key = "idx_gateway_principal_nickname")]
     pub gateway_id: String,
+    #[sea_orm(column_type = "Text")]
     pub kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub role_key: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub display_name: String,
+    #[sea_orm(column_type = "Text")]
     pub nickname: String,
-    #[sea_orm(unique_key = "idx_gateway_principal_nickname")]
+    #[sea_orm(column_type = "Text", unique_key = "idx_gateway_principal_nickname")]
     pub nickname_key: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -36,7 +41,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub gateway_identity: HasOne<super::gateway_identity::Entity>,
+    pub gateway_identity: BelongsTo<super::gateway_identity::Entity>,
     #[sea_orm(has_many)]
     pub principal_avatar_revisions: HasMany<super::principal_avatar_revision::Entity>,
     #[sea_orm(has_many)]

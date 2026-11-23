@@ -3,16 +3,11 @@ use gpui_kit::component::{button::*, scroll::Scrollbar, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::presentation as mcp_presentation;
 use pioneer_client::mcp::types::{McpListItem, McpServerStatus};
-use std::rc::Rc;
-
-const MCP_SERVER_CARD_HEIGHT: f32 = crate::McpServerCard::HEIGHT;
-const MCP_SERVER_ROW_GAP: f32 = 10.0;
-const MCP_SERVER_ROW_HEIGHT: f32 = MCP_SERVER_CARD_HEIGHT + MCP_SERVER_ROW_GAP;
 
 impl McpCatalogView {
     pub(crate) fn render_mcp(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
-        let servers = Rc::new(self.input.mcp_servers.clone());
+        let servers = &self.input.mcp_servers;
 
         v_flex()
             .size_full()
@@ -38,29 +33,21 @@ impl McpCatalogView {
                                 this.child(empty_state(desktop_entity.clone(), cx))
                             })
                             .when(!servers.is_empty(), |this| {
-                                this.child(self.render_mcp_servers_virtual_list(
-                                    servers.clone(),
-                                    desktop_entity.clone(),
-                                    cx,
-                                ))
+                                this.child(self.render_mcp_servers_list())
                             }),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_mcp_servers_virtual_list(
-        &self,
-        servers: Rc<Vec<McpListItem>>,
-        _desktop_entity: Entity<Self>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let item_sizes = Rc::new(
-            (0..servers.len())
-                .map(|_| size(px(0.), px(MCP_SERVER_ROW_HEIGHT)))
-                .collect::<Vec<_>>(),
-        );
-        let scroll_handle = self.mcp_list_scroll_handle.clone();
+    fn render_mcp_servers_list(&self) -> AnyElement {
+        let items: Vec<_> = self
+            .input
+            .mcp_servers
+            .iter()
+            .map(|server| self.rows.get(&server.id).cloned())
+            .collect();
+        let scroll_handle = self.mcp_list_state.clone();
 
         div()
             .w_full()
@@ -68,23 +55,15 @@ impl McpCatalogView {
             .relative()
             .overflow_hidden()
             .child(
-                v_virtual_list(
-                    cx.entity(),
-                    "mcp-installed-virtual-list",
-                    item_sizes,
-                    move |view, visible_range, _, _cx| {
-                        visible_range
-                            .filter_map(|ix| {
-                                servers
-                                    .get(ix)
-                                    .and_then(|server| view.rows.get(&server.id))
-                                    .map(|row| row.clone().into_any_element())
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .with_sizing_behavior(ListSizingBehavior::Auto)
-                .track_scroll(&scroll_handle),
+                gpui_kit::list(scroll_handle.clone(), move |ix, _, _| {
+                    items
+                        .get(ix)
+                        .and_then(Option::as_ref)
+                        .map(|row| row.clone().into_any_element())
+                        .unwrap_or_else(|| div().into_any_element())
+                })
+                .size_full()
+                .with_sizing_behavior(ListSizingBehavior::Auto),
             )
             .child(
                 div()
@@ -108,8 +87,7 @@ impl McpCatalogView {
         v_flex()
             .id(identity)
             .w_full()
-            .h(px(MCP_SERVER_ROW_HEIGHT))
-            .pb(px(MCP_SERVER_ROW_GAP))
+            .pb_2p5()
             .cursor_pointer()
             .on_click({
                 let desktop_entity = desktop_entity.clone();
@@ -148,12 +126,6 @@ impl McpCatalogView {
                 format!("http: {url}")
             }
         }
-    }
-
-    pub(super) fn mcp_capability_labels(
-        counts: &[mcp_presentation::McpCapabilityCount],
-    ) -> Vec<String> {
-        crate::McpServerCard::mcp_capability_labels(counts)
     }
 }
 
@@ -201,7 +173,7 @@ impl McpCatalogView {
     pub(crate) fn sync_rows(&mut self, cx: &mut Context<Self>) {
         self.rows
             .retain(|id, _| self.input.mcp_servers.iter().any(|s| &s.id == id));
-        for server in &self.input.mcp_servers {
+        for (ix, server) in self.input.mcp_servers.iter().enumerate() {
             let pending = self.input.is_mcp_pending(&server.id);
             if let Some(row) = self.rows.get(&server.id) {
                 row.update(cx, |row, cx| {
@@ -215,6 +187,7 @@ impl McpCatalogView {
                         row.server = Arc::new(server.clone());
                         row.pending = pending;
                         if visible_changed {
+                            self.mcp_list_state.remeasure_items(ix..ix + 1);
                             cx.notify();
                         }
                     }

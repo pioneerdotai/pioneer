@@ -13,6 +13,8 @@ pub struct Model {
     pub turn_id: String,
     pub revision: i64,
     pub present: i64,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

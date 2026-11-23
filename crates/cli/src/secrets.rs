@@ -414,7 +414,7 @@ mod tests {
             }],
             mcp_orphans: McpSecretOrphanStatusReport {
                 available: true,
-                gateway_db_path: PathBuf::from("/tmp/pioneer/gateway.db"),
+                gateway_db_path: Some(PathBuf::from("/tmp/pioneer/postgres/data")),
                 active_refs: Some(1),
                 stored_refs: Some(2),
                 orphan_refs: Some(1),

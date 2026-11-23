@@ -717,7 +717,7 @@ async fn drain(
     completed
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kinds() {
     let mut h = Harness::new().await;
     h.baseline().await;
@@ -833,7 +833,7 @@ async fn saved_toggles_probe_only_the_changed_instance_across_workspaces_and_kin
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn model_discovery_read_and_processing_errors_still_report_incidents() {
     for read_failure in [true, false] {
         let mut h = Harness::new().await;
@@ -886,7 +886,7 @@ async fn model_discovery_read_and_processing_errors_still_report_incidents() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn identical_reordered_and_compaction_only_saves_do_not_invalidate_or_schedule() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -979,7 +979,7 @@ async fn identical_reordered_and_compaction_only_saves_do_not_invalidate_or_sche
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn added_changed_and_removed_instances_do_not_reset_existing_siblings() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1048,7 +1048,7 @@ async fn added_changed_and_removed_instances_do_not_reset_existing_siblings() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fake_scheduler_rerun_and_retry_keep_selected_ids_and_independent_retry() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1080,7 +1080,7 @@ async fn fake_scheduler_rerun_and_retry_keep_selected_ids_and_independent_retry(
     assert_eq!(h.counts.lock().unwrap().len(), 4);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn first_targeted_scheduler_execution_keeps_a_complete_catalog() {
     let h = Harness::new().await;
     let mut settings = h.runtimes();
@@ -1116,7 +1116,7 @@ async fn first_targeted_scheduler_execution_keeps_a_complete_catalog() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn save_failure_leaves_snapshots_epochs_and_commands_untouched() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1185,7 +1185,7 @@ async fn save_failure_leaves_snapshots_epochs_and_commands_untouched() {
     assert!(h.counts.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn projection_failure_rolls_back_file_before_any_readiness_publication() {
     use sea_orm::ConnectionTrait;
     let h = Harness::new().await;
@@ -1198,7 +1198,7 @@ async fn projection_failure_rolls_back_file_before_any_readiness_publication() {
         .unwrap();
     let contents = std::fs::read(h.settings_path()).unwrap();
     h.processor.crud_store.database_connection().execute_unprepared(
-        "CREATE TRIGGER reject_toggle_projection BEFORE INSERT ON agent_identity BEGIN SELECT RAISE(ABORT, 'injected CLI projection failure'); END;"
+        "CREATE FUNCTION reject_toggle_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected CLI projection failure'; END; $$; CREATE TRIGGER reject_toggle_projection BEFORE INSERT ON agent_identity FOR EACH ROW EXECUTE FUNCTION reject_toggle_projection();"
     ).await.unwrap();
     let mut settings = h.runtimes();
     settings.instances[0].enabled = false;
@@ -1259,7 +1259,7 @@ async fn retired_workspace_epoch_is_not_reused_by_a_new_seed() {
     assert!(supervisor.snapshot("ws").await.unwrap().models.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn successive_saves_coalesce_ids_and_preserve_known_catalogs_until_regular_cleanup() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1350,7 +1350,7 @@ async fn successive_saves_coalesce_ids_and_preserve_known_catalogs_until_regular
     assert!(scheduler.task_workspaces.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn settings_application_lock_keeps_seed_and_probe_from_reading_staged_configuration() {
     let h = Harness::new().await;
     let path = h.settings_path();
@@ -1441,7 +1441,7 @@ async fn settings_application_lock_keeps_seed_and_probe_from_reading_staged_conf
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn queued_probe_does_not_start_after_its_instance_is_disabled() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1544,7 +1544,7 @@ fn merged_full_request_does_not_promote_a_selected_force_to_a_full_rerun() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn merged_command_behind_full_probe_repeats_only_the_forced_id_on_fake() {
     let h = Harness::new().await;
     h.baseline().await;
@@ -1797,12 +1797,12 @@ async fn deferred_forced_global_request_survives_listing_failure(ordinary_full_b
     assert!(scheduler.rerun.is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deferred_global_force_reaches_rerun_after_workspace_listing_recovers() {
     deferred_forced_global_request_survives_listing_failure(false).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_full_request_cannot_discharge_deferred_global_force() {
     deferred_forced_global_request_survives_listing_failure(true).await;
 }
@@ -1884,7 +1884,7 @@ async fn assert_cli_save_failure_outcome(mode: FailedCliSave) {
     );
     if rollback {
         h.processor.crud_store.database_connection().execute_unprepared(
-            "CREATE TRIGGER reject_failed_toggle_projection BEFORE INSERT ON agent_identity BEGIN SELECT RAISE(ABORT, 'injected CLI projection failure'); END;"
+            "CREATE FUNCTION reject_failed_toggle_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected CLI projection failure'; END; $$; CREATE TRIGGER reject_failed_toggle_projection BEFORE INSERT ON agent_identity FOR EACH ROW EXECUTE FUNCTION reject_failed_toggle_projection();"
         ).await.unwrap();
     }
     let mut settings = h.runtimes();
@@ -2052,22 +2052,22 @@ async fn assert_cli_save_failure_outcome(mode: FailedCliSave) {
     assert!(h.commands().is_empty());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn save_error_after_rename_fences_actual_changed_cli_configuration() {
     assert_cli_save_failure_outcome(FailedCliSave::AfterWrite).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_projection_and_failed_rollback_fence_actual_changed_cli_configuration() {
     assert_cli_save_failure_outcome(FailedCliSave::RollbackBeforeWrite).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unreadable_save_outcome_fences_only_attempted_ids_without_rewriting_file() {
     assert_cli_save_failure_outcome(FailedCliSave::UnknownFile).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn rollback_error_after_restoring_file_preserves_confirmed_readiness() {
     assert_cli_save_failure_outcome(FailedCliSave::RollbackAfterRestoringFile).await;
 }

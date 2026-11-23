@@ -40,8 +40,10 @@ pub(in crate::message) fn authority(
     }
 }
 
-pub(in crate::message) async fn fixture() -> (IsolatedEpic4Harness, MessageProcessor) {
-    let harness = IsolatedEpic4Harness::new().await.unwrap();
+pub(in crate::message) async fn fixture(
+    test_database: &pioneer_postgres_test::TestDatabase,
+) -> (IsolatedEpic4Harness, MessageProcessor) {
+    let harness = IsolatedEpic4Harness::new(test_database).await.unwrap();
     let store = Arc::new(pioneer_crud::CrudStore::new(harness.database.clone()));
     let processor = MessageProcessor::new(
         Arc::new(crate::thread::ThreadManager::new("fixture", "echo")),
@@ -78,138 +80,143 @@ async fn list_all(processor: &MessageProcessor, authority: &ThreadReadAuthority)
 
 #[tokio::test]
 async fn list_filters_private_metadata_and_rechecks_acl_on_cursor_continuation() {
-    let (harness, processor) = fixture().await;
-    harness.database.execute_unprepared("UPDATE thread SET preview='secret-preview-B' WHERE id='T00000000000000000002'; INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('T00000000000000000003','T00000000000000000002','T00000000000000000002',1,CURRENT_TIMESTAMP)").await.unwrap();
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let b = authority(MEMBER_B_ID, THREAD_RED_PRIVATE_B_ID, true);
-    let a_rows = list_all(&processor, &a).await;
-    let b_rows = list_all(&processor, &b).await;
-    assert!(
-        a_rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["threadId"] == THREAD_RED_PRIVATE_A_ID)
-    );
-    assert!(
-        b_rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["threadId"] == THREAD_RED_PRIVATE_B_ID)
-    );
-    for (rows, hidden_id, hidden_title) in [
-        (&a_rows, THREAD_RED_PRIVATE_B_ID, "Red private B"),
-        (&b_rows, THREAD_RED_PRIVATE_A_ID, "Red private A"),
-    ] {
-        let encoded = rows.to_string();
-        assert!(!encoded.contains(hidden_id));
-        assert!(!encoded.contains(hidden_title));
-    }
-    assert!(!a_rows.to_string().contains("secret-preview-B"));
-    let workspace_row = a_rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["threadId"] == THREAD_RED_WORKSPACE_ID)
-        .unwrap();
-    assert!(workspace_row.get("parentThreadId").is_none());
-    assert!(workspace_row.get("rootThreadId").is_none());
-    assert!(
-        !processor
-            .thread_source_readable(&a, THREAD_RED_PRIVATE_B_ID)
-            .await
-            .unwrap()
-    );
-    // A broader user ACL does not widen a capsule-restricted execution.
-    let capsule_only = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false);
-    let restricted_rows = list_all(&processor, &capsule_only).await;
-    assert_eq!(restricted_rows.as_array().unwrap().len(), 1);
-    assert_eq!(restricted_rows[0]["threadId"], THREAD_RED_PRIVATE_A_ID);
-    assert!(
-        !processor
-            .thread_source_readable(&capsule_only, THREAD_RED_WORKSPACE_ID)
-            .await
-            .unwrap()
-    );
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_unprepared("UPDATE thread SET preview='secret-preview-B' WHERE id='T00000000000000000002'; INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('T00000000000000000003','T00000000000000000002','T00000000000000000002',1,CURRENT_TIMESTAMP)").await.unwrap();
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let b = authority(MEMBER_B_ID, THREAD_RED_PRIVATE_B_ID, true);
+            let a_rows = list_all(&processor, &a).await;
+            let b_rows = list_all(&processor, &b).await;
+            assert!(
+                a_rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["threadId"] == THREAD_RED_PRIVATE_A_ID)
+            );
+            assert!(
+                b_rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["threadId"] == THREAD_RED_PRIVATE_B_ID)
+            );
+            for (rows, hidden_id, hidden_title) in [
+                (&a_rows, THREAD_RED_PRIVATE_B_ID, "Red private B"),
+                (&b_rows, THREAD_RED_PRIVATE_A_ID, "Red private A"),
+            ] {
+                let encoded = rows.to_string();
+                assert!(!encoded.contains(hidden_id));
+                assert!(!encoded.contains(hidden_title));
+            }
+            assert!(!a_rows.to_string().contains("secret-preview-B"));
+            let workspace_row = a_rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["threadId"] == THREAD_RED_WORKSPACE_ID)
+                .unwrap();
+            assert!(workspace_row.get("parentThreadId").is_none());
+            assert!(workspace_row.get("rootThreadId").is_none());
+            assert!(
+                !processor
+                    .thread_source_readable(&a, THREAD_RED_PRIVATE_B_ID)
+                    .await
+                    .unwrap()
+            );
+            // A broader user ACL does not widen a capsule-restricted execution.
+            let capsule_only = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false);
+            let restricted_rows = list_all(&processor, &capsule_only).await;
+            assert_eq!(restricted_rows.as_array().unwrap().len(), 1);
+            assert_eq!(restricted_rows[0]["threadId"], THREAD_RED_PRIVATE_A_ID);
+            assert!(
+                !processor
+                    .thread_source_readable(&capsule_only, THREAD_RED_WORKSPACE_ID)
+                    .await
+                    .unwrap()
+            );
 
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let first = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    let cursor = first["nextCursor"].as_str().unwrap().to_owned();
-    // Same cursor cannot be transferred to another user or page-size contract.
-    assert!(
-        processor
-            .thread_list_page(
-                &b,
-                ThreadsListParams {
-                    limit: 1,
-                    cursor: Some(cursor.clone())
-                },
-                &codec
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        processor
-            .thread_list_page(
-                &a,
-                ThreadsListParams {
-                    limit: 2,
-                    cursor: Some(cursor.clone())
-                },
-                &codec
-            )
-            .await
-            .is_err()
-    );
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "DELETE FROM workspace_membership WHERE principal_id=? AND workspace_id=?",
-            [MEMBER_A_ID.into(), WORKSPACE_RED_ID.into()],
-        ))
-        .await
-        .unwrap();
-    assert!(
-        !processor
-            .thread_source_readable(&a, THREAD_RED_PRIVATE_A_ID)
-            .await
-            .unwrap()
-    );
-    let next = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: Some(cursor),
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    assert_eq!(next["threads"], json!([]));
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let first = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+            // Same cursor cannot be transferred to another user or page-size contract.
+            assert!(
+                processor
+                    .thread_list_page(
+                        &b,
+                        ThreadsListParams {
+                            limit: 1,
+                            cursor: Some(cursor.clone())
+                        },
+                        &codec
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                processor
+                    .thread_list_page(
+                        &a,
+                        ThreadsListParams {
+                            limit: 2,
+                            cursor: Some(cursor.clone())
+                        },
+                        &codec
+                    )
+                    .await
+                    .is_err()
+            );
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM workspace_membership WHERE principal_id=$1 AND workspace_id=$2",
+                    [MEMBER_A_ID.into(), WORKSPACE_RED_ID.into()],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                !processor
+                    .thread_source_readable(&a, THREAD_RED_PRIVATE_A_ID)
+                    .await
+                    .unwrap()
+            );
+            let next = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: Some(cursor),
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            assert_eq!(next["threads"], json!([]));
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 async fn add_thread(processor: &MessageProcessor, id: &str, parent: Option<&str>, internal: bool) {
     let db = processor.crud_store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind) VALUES (?,?,'child title','child preview','agent','m','echo','closed','system','hidden',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'system')",
+    db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,sidebar_visibility,access_class,created_at,updated_at,created_by_actor_kind) VALUES ($1,$2,'child title','child preview','agent','m','echo','closed','system','hidden',$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'system')",
         [id.into(), WORKSPACE_RED_ID.into(), (if internal { "internal" } else { "workspace" }).into()])).await.unwrap();
     if let Some(parent) = parent {
-        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,created_by_thread_id,created_by_turn_id) VALUES (?,?,?,1,CURRENT_TIMESTAMP,?,'read-root-turn')",
+        db.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,created_by_thread_id,created_by_turn_id) VALUES ($1,$2,$3,1,CURRENT_TIMESTAMP,$4,'read-root-turn')",
             [id.into(), parent.into(), THREAD_RED_WORKSPACE_ID.into(), THREAD_RED_WORKSPACE_ID.into()])).await.unwrap();
     }
 }
@@ -218,1031 +225,1066 @@ async fn add_thread(processor: &MessageProcessor, id: &str, parent: Option<&str>
 // fixtures above retain their real hidden/system semantics.
 async fn make_conversation(processor: &MessageProcessor, id: &str) {
     processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "UPDATE thread SET origin_kind='user',sidebar_visibility='visible',access_class='workspace' WHERE id=?",
+        DatabaseBackend::Postgres,
+        "UPDATE thread SET origin_kind='user',sidebar_visibility='visible',access_class='workspace' WHERE id=$1",
         [id.into()],
     )).await.unwrap();
 }
 
 #[tokio::test]
 async fn recursive_pages_cover_large_intermediate_subtree_without_siblings_or_cycle() {
-    let (_harness, processor) = fixture().await;
-    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
-    add_thread(&processor, "branch", Some(THREAD_RED_WORKSPACE_ID), false).await;
-    add_thread(&processor, "sibling", Some(THREAD_RED_WORKSPACE_ID), false).await;
-    for n in 0..141 {
-        add_thread(&processor, &format!("leaf-{n:03}"), Some("branch"), false).await;
-    }
-    add_thread(&processor, "grandchild", Some("leaf-000"), false).await;
-    // Malformed edge back to the requested node must terminate, never emit it.
-    processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "UPDATE thread_lineage SET parent_thread_id='grandchild' WHERE child_thread_id='branch'", [])).await.unwrap();
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let mut cursor = None;
-    let mut found = std::collections::BTreeMap::new();
-    let mut ended = false;
-    for page_index in 0..100 {
-        let page = processor
-            .thread_children_page(
-                &a,
-                ThreadsChildrenListParams {
-                    thread_id: "branch".into(),
-                    recursive: true,
-                    limit: 7,
-                    cursor,
-                },
-                &codec,
-            )
-            .await
-            .unwrap();
-        for row in page["threads"].as_array().unwrap() {
-            let id = row["threadId"].as_str().unwrap().to_owned();
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (_harness, processor) = fixture(test_database).await;
+            let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+            add_thread(&processor, "branch", Some(THREAD_RED_WORKSPACE_ID), false).await;
+            add_thread(&processor, "sibling", Some(THREAD_RED_WORKSPACE_ID), false).await;
+            for n in 0..141 {
+                add_thread(&processor, &format!("leaf-{n:03}"), Some("branch"), false).await;
+            }
+            add_thread(&processor, "grandchild", Some("leaf-000"), false).await;
+            // Malformed edge back to the requested node must terminate, never emit it.
+            processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "UPDATE thread_lineage SET parent_thread_id='grandchild' WHERE child_thread_id='branch'", [])).await.unwrap();
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let mut cursor = None;
+            let mut found = std::collections::BTreeMap::new();
+            let mut ended = false;
+            for page_index in 0..100 {
+                let page = processor
+                    .thread_children_page(
+                        &a,
+                        ThreadsChildrenListParams {
+                            thread_id: "branch".into(),
+                            recursive: true,
+                            limit: 7,
+                            cursor,
+                        },
+                        &codec,
+                    )
+                    .await
+                    .unwrap();
+                for row in page["threads"].as_array().unwrap() {
+                    let id = row["threadId"].as_str().unwrap().to_owned();
+                    assert!(
+                        found.insert(id, row["depth"].as_u64().unwrap()).is_none(),
+                        "duplicate descendant"
+                    );
+                }
+                if page_index == 0 {
+                    assert_eq!(page["eof"], false);
+                    // Neither a sibling's metadata/activity nor an inaccessible thread
+                    // elsewhere in this workspace belongs to this subtree's revision.
+                    processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE thread SET name='unrelated edit',preview='new preview',updated_at='2030-01-01 00:00:00+00:00' WHERE id IN ('sibling',$1)",
+                        [THREAD_RED_PRIVATE_B_ID.into()],
+                    )).await.unwrap();
+                }
+                if page["eof"] == true {
+                    ended = true;
+                    break;
+                }
+                cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+            }
+            assert!(ended);
+            assert_eq!(found.len(), 142);
+            assert_eq!(found.get("grandchild"), Some(&2));
+            for n in 0..141 {
+                assert_eq!(found.get(&format!("leaf-{n:03}")), Some(&1));
+            }
+            assert!(!found.contains_key("branch"));
+            assert!(!found.contains_key("sibling"));
+            assert!(!found.contains_key(THREAD_RED_WORKSPACE_ID));
+            let first = processor
+                .thread_children_page(
+                    &a,
+                    ThreadsChildrenListParams {
+                        thread_id: "branch".into(),
+                        recursive: true,
+                        limit: 7,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            processor
+                .crud_store
+                .database_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread_lineage SET parent_thread_id='sibling' WHERE child_thread_id='leaf-140'",
+                    [],
+                ))
+                .await
+                .unwrap();
+            let error = processor
+                .thread_children_page(
+                    &a,
+                    ThreadsChildrenListParams {
+                        thread_id: "branch".into(),
+                        recursive: true,
+                        limit: 7,
+                        cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap_err();
             assert!(
-                found.insert(id, row["depth"].as_u64().unwrap()).is_none(),
-                "duplicate descendant"
+                error.to_string().contains("stale"),
+                "reparenting an unvisited descendant must not silently skip it"
             );
-        }
-        if page_index == 0 {
-            assert_eq!(page["eof"], false);
-            // Neither a sibling's metadata/activity nor an inaccessible thread
-            // elsewhere in this workspace belongs to this subtree's revision.
-            processor.crud_store.database_connection().execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE thread SET name='unrelated edit',preview='new preview',updated_at='2030-01-01 00:00:00+00:00' WHERE id IN ('sibling',?)",
-                [THREAD_RED_PRIVATE_B_ID.into()],
-            )).await.unwrap();
-        }
-        if page["eof"] == true {
-            ended = true;
-            break;
-        }
-        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
-    }
-    assert!(ended);
-    assert_eq!(found.len(), 142);
-    assert_eq!(found.get("grandchild"), Some(&2));
-    for n in 0..141 {
-        assert_eq!(found.get(&format!("leaf-{n:03}")), Some(&1));
-    }
-    assert!(!found.contains_key("branch"));
-    assert!(!found.contains_key("sibling"));
-    assert!(!found.contains_key(THREAD_RED_WORKSPACE_ID));
-    let first = processor
-        .thread_children_page(
-            &a,
-            ThreadsChildrenListParams {
-                thread_id: "branch".into(),
-                recursive: true,
-                limit: 7,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    processor
-        .crud_store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread_lineage SET parent_thread_id='sibling' WHERE child_thread_id='leaf-140'",
-            [],
-        ))
-        .await
-        .unwrap();
-    let error = processor
-        .thread_children_page(
-            &a,
-            ThreadsChildrenListParams {
-                thread_id: "branch".into(),
-                recursive: true,
-                limit: 7,
-                cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
-            },
-            &codec,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("stale"),
-        "reparenting an unvisited descendant must not silently skip it"
-    );
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn children_cursor_pins_pending_metadata_and_detects_deleted_unvisited_child() {
-    let (harness, processor) = fixture().await;
-    add_thread(&processor, "fragment-root", None, false).await;
-    add_thread(&processor, "fragment-child", Some("fragment-root"), false).await;
-    add_thread(&processor, "fragment-tail", Some("fragment-root"), false).await;
-    add_thread(&processor, "outside-child", Some("fragment-tail"), false).await;
-    let title = "🌍\"\n".repeat(450_000);
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET name=? WHERE id='fragment-child'",
-            [title.into()],
-        ))
-        .await
-        .unwrap();
-    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let params = ThreadsChildrenListParams {
-        thread_id: "fragment-root".into(),
-        recursive: false,
-        limit: 1,
-        cursor: None,
-    };
-    let first = processor
-        .thread_children_page(&a, params.clone(), &codec)
-        .await
-        .unwrap();
-    let fragment = &first["threads"][0]["fragment"];
-    assert_eq!(fragment["offset"], 0);
-    assert_eq!(fragment["eof"], false);
-    assert!(pioneer_tools::thread_read_page_fits(&first));
-    let cursor = first["nextCursor"].as_str().unwrap().to_owned();
-    // A grandchild is outside a direct-children traversal, even though it would
-    // be relevant to recursive=true. The pending fragment must still continue.
-    harness.database.execute_unprepared(
-        "UPDATE thread SET name='outside direct traversal',preview='activity',updated_at='2030-01-01 00:00:00+00:00' WHERE id='outside-child'",
-    ).await.unwrap();
-    let continuation = ThreadsChildrenListParams {
-        cursor: Some(cursor),
-        ..params.clone()
-    };
-    let second = processor
-        .thread_children_page(&a, continuation.clone(), &codec)
-        .await
-        .unwrap();
-    assert_eq!(
-        second["threads"][0]["fragment"]["offset"],
-        fragment["nextOffset"]
-    );
-    assert_eq!(
-        second["threads"][0]["fragment"]["version"],
-        fragment["version"]
-    );
-    assert!(pioneer_tools::thread_read_page_fits(&second));
-    harness
-        .database
-        .execute_unprepared(
-            "UPDATE thread SET name='changed pending title' WHERE id='fragment-child'",
-        )
-        .await
-        .unwrap();
-    assert!(
-        processor
-            .thread_children_page(&a, continuation, &codec)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("stale")
-    );
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            add_thread(&processor, "fragment-root", None, false).await;
+            add_thread(&processor, "fragment-child", Some("fragment-root"), false).await;
+            add_thread(&processor, "fragment-tail", Some("fragment-root"), false).await;
+            add_thread(&processor, "outside-child", Some("fragment-tail"), false).await;
+            let title = "🌍\"\n".repeat(450_000);
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET name=$1 WHERE id='fragment-child'",
+                    [title.into()],
+                ))
+                .await
+                .unwrap();
+            let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let params = ThreadsChildrenListParams {
+                thread_id: "fragment-root".into(),
+                recursive: false,
+                limit: 1,
+                cursor: None,
+            };
+            let first = processor
+                .thread_children_page(&a, params.clone(), &codec)
+                .await
+                .unwrap();
+            let fragment = &first["threads"][0]["fragment"];
+            assert_eq!(fragment["offset"], 0);
+            assert_eq!(fragment["eof"], false);
+            assert!(pioneer_tools::thread_read_page_fits(&first));
+            let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+            // A grandchild is outside a direct-children traversal, even though it would
+            // be relevant to recursive=true. The pending fragment must still continue.
+            harness.database.execute_unprepared(
+                "UPDATE thread SET name='outside direct traversal',preview='activity',updated_at='2030-01-01 00:00:00+00:00' WHERE id='outside-child'",
+            ).await.unwrap();
+            let continuation = ThreadsChildrenListParams {
+                cursor: Some(cursor),
+                ..params.clone()
+            };
+            let second = processor
+                .thread_children_page(&a, continuation.clone(), &codec)
+                .await
+                .unwrap();
+            assert_eq!(
+                second["threads"][0]["fragment"]["offset"],
+                fragment["nextOffset"]
+            );
+            assert_eq!(
+                second["threads"][0]["fragment"]["version"],
+                fragment["version"]
+            );
+            assert!(pioneer_tools::thread_read_page_fits(&second));
+            harness
+                .database
+                .execute_unprepared(
+                    "UPDATE thread SET name='changed pending title' WHERE id='fragment-child'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                processor
+                    .thread_children_page(&a, continuation, &codec)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stale")
+            );
 
-    // After restarting with the new metadata, deletion beyond the first page
-    // must invalidate that walk rather than silently report an earlier EOF.
-    let restarted = processor
-        .thread_children_page(&a, params.clone(), &codec)
-        .await
-        .unwrap();
-    assert_eq!(restarted["threads"][0]["title"], "changed pending title");
-    harness
-        .database
-        .execute_unprepared("DELETE FROM thread WHERE id='fragment-tail'")
-        .await
-        .unwrap();
-    let continuation = ThreadsChildrenListParams {
-        cursor: Some(restarted["nextCursor"].as_str().unwrap().to_owned()),
-        ..params
-    };
-    assert!(
-        processor
-            .thread_children_page(&a, continuation, &codec)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("stale")
-    );
+            // After restarting with the new metadata, deletion beyond the first page
+            // must invalidate that walk rather than silently report an earlier EOF.
+            let restarted = processor
+                .thread_children_page(&a, params.clone(), &codec)
+                .await
+                .unwrap();
+            assert_eq!(restarted["threads"][0]["title"], "changed pending title");
+            harness
+                .database
+                .execute_unprepared("DELETE FROM thread WHERE id='fragment-tail'")
+                .await
+                .unwrap();
+            let continuation = ThreadsChildrenListParams {
+                cursor: Some(restarted["nextCursor"].as_str().unwrap().to_owned()),
+                ..params
+            };
+            assert!(
+                processor
+                    .thread_children_page(&a, continuation, &codec)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stale")
+            );
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn internal_child_requires_authorized_root_and_parent_history_cursor_is_independent() {
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('read-root-turn',?,'completed','conversation','user','principal',?,'2026-01-01 00:00:00 +00:00','2026-01-01 00:00:00 +00:00')",
-        [THREAD_RED_WORKSPACE_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    persist_test_execution_authorization_context_for_principal(
-        &processor,
-        &member(MEMBER_A_ID),
-        WORKSPACE_RED_ID,
-        THREAD_RED_WORKSPACE_ID,
-        "read-root-turn",
-    )
-    .await;
-    add_thread(
-        &processor,
-        "internal-child",
-        Some(THREAD_RED_WORKSPACE_ID),
-        true,
-    )
-    .await;
-    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
-    assert!(
-        processor
-            .thread_source_readable(&a, "internal-child")
-            .await
-            .unwrap()
-    );
-    let mut no_child_grant = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
-    no_child_grant.observe_children = false;
-    assert!(
-        !processor
-            .thread_source_readable(&no_child_grant, "internal-child")
-            .await
-            .unwrap()
-    );
-    let unavailable = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_WORKSPACE_ID,
-            1,
-            None,
-            |_| async { Err(anyhow::anyhow!("authorization source unavailable")) },
-        )
-        .await;
-    assert!(
-        unavailable.is_err(),
-        "authorization failure must not masquerade as filtered EOF"
-    );
-    // The real stored parent context is required by internal-child resolution.
-    let first = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_WORKSPACE_ID,
-            1,
-            None,
-            |_| async { Ok(true) },
-        )
-        .await
-        .unwrap();
-    assert!(
-        !list_all(&processor, &a)
-            .await
-            .to_string()
-            .contains("internal-child")
-    );
-    let children = processor
-        .thread_children_page(
-            &a,
-            ThreadsChildrenListParams {
-                thread_id: THREAD_RED_WORKSPACE_ID.into(),
-                recursive: false,
-                limit: 100,
-                cursor: None,
-            },
-            &processor.thread_read_cursor_codec().unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(
-        children["threads"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["threadId"] == "internal-child")
-    );
-    assert!(!first.eof);
-    let parent_cursor = first.next_cursor.clone().unwrap();
-    let reference = first.events[0]["childReference"]["threadId"]
-        .as_str()
-        .unwrap();
-    let child = processor
-        .read_saved_thread_history(WORKSPACE_RED_ID, reference, 1, None, |_| async {
-            Ok(false)
-        })
-        .await
-        .unwrap();
-    assert!(child.eof);
-    let resumed = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_WORKSPACE_ID,
-            1,
-            Some(parent_cursor),
-            |_| async { Ok(true) },
-        )
-        .await
-        .unwrap();
-    assert_ne!(first.events[0]["eventId"], resumed.events[0]["eventId"]);
-    assert!(resumed.eof);
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "DELETE FROM workspace_membership WHERE principal_id=? AND workspace_id=?",
-            [MEMBER_A_ID.into(), WORKSPACE_RED_ID.into()],
-        ))
-        .await
-        .unwrap();
-    assert!(
-        !processor
-            .thread_source_readable(&a, "internal-child")
-            .await
-            .unwrap()
-    );
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('read-root-turn',$1,'completed','conversation','user','principal',$2,'2026-01-01 00:00:00 +00:00','2026-01-01 00:00:00 +00:00')",
+                [THREAD_RED_WORKSPACE_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            persist_test_execution_authorization_context_for_principal(
+                &processor,
+                &member(MEMBER_A_ID),
+                WORKSPACE_RED_ID,
+                THREAD_RED_WORKSPACE_ID,
+                "read-root-turn",
+            )
+            .await;
+            add_thread(
+                &processor,
+                "internal-child",
+                Some(THREAD_RED_WORKSPACE_ID),
+                true,
+            )
+            .await;
+            let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+            assert!(
+                processor
+                    .thread_source_readable(&a, "internal-child")
+                    .await
+                    .unwrap()
+            );
+            let mut no_child_grant = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+            no_child_grant.observe_children = false;
+            assert!(
+                !processor
+                    .thread_source_readable(&no_child_grant, "internal-child")
+                    .await
+                    .unwrap()
+            );
+            let unavailable = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_WORKSPACE_ID,
+                    1,
+                    None,
+                    |_| async { Err(anyhow::anyhow!("authorization source unavailable")) },
+                )
+                .await;
+            assert!(
+                unavailable.is_err(),
+                "authorization failure must not masquerade as filtered EOF"
+            );
+            // The real stored parent context is required by internal-child resolution.
+            let first = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_WORKSPACE_ID,
+                    1,
+                    None,
+                    |_| async { Ok(true) },
+                )
+                .await
+                .unwrap();
+            assert!(
+                !list_all(&processor, &a)
+                    .await
+                    .to_string()
+                    .contains("internal-child")
+            );
+            let children = processor
+                .thread_children_page(
+                    &a,
+                    ThreadsChildrenListParams {
+                        thread_id: THREAD_RED_WORKSPACE_ID.into(),
+                        recursive: false,
+                        limit: 100,
+                        cursor: None,
+                    },
+                    &processor.thread_read_cursor_codec().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                children["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["threadId"] == "internal-child")
+            );
+            assert!(!first.eof);
+            let parent_cursor = first.next_cursor.clone().unwrap();
+            let reference = first.events[0]["childReference"]["threadId"]
+                .as_str()
+                .unwrap();
+            let child = processor
+                .read_saved_thread_history(WORKSPACE_RED_ID, reference, 1, None, |_| async {
+                    Ok(false)
+                })
+                .await
+                .unwrap();
+            assert!(child.eof);
+            let resumed = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_WORKSPACE_ID,
+                    1,
+                    Some(parent_cursor),
+                    |_| async { Ok(true) },
+                )
+                .await
+                .unwrap();
+            assert_ne!(first.events[0]["eventId"], resumed.events[0]["eventId"]);
+            assert!(resumed.eof);
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "DELETE FROM workspace_membership WHERE principal_id=$1 AND workspace_id=$2",
+                    [MEMBER_A_ID.into(), WORKSPACE_RED_ID.into()],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                !processor
+                    .thread_source_readable(&a, "internal-child")
+                    .await
+                    .unwrap()
+            );
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn oversized_saved_input_reconstructs_exactly_and_edits_invalidate_continuation() {
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('large-turn',?,'completed','conversation','user','principal',?,'2026-01-01 00:00:00 +00:00','2026-01-01 00:00:00 +00:00')",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    let text = "🌍漢字\"\n".repeat(240000);
-    let input = pioneer_protocol::UserInput::Text {
-        text: text.clone(),
-        text_elements: Vec::new(),
-    };
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('large-input','large-turn',0,'text',?,?,'2026-01-01 00:00:01 +00:00')",
-        [text.clone().into(), serde_json::to_string(&input).unwrap().into()])).await.unwrap();
-    let before = harness
-        .database
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) AS n FROM thread_read_cursor".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "n")
-        .unwrap();
-    let mut cursor = None;
-    let mut saved_cursor = None;
-    let mut fragments = String::new();
-    let mut ended = false;
-    for _ in 0..200 {
-        let page = processor
-            .read_saved_thread_history(
-                WORKSPACE_RED_ID,
-                THREAD_RED_PRIVATE_A_ID,
-                1,
-                cursor,
-                |_| async { Ok(false) },
-            )
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_vec(&page.events).unwrap().len()
-                < pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
-        );
-        for event in &page.events {
-            if let Some(fragment) = event.get("fragment") {
-                assert_eq!(
-                    fragment["offset"].as_u64().unwrap() as usize,
-                    fragments.len()
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('large-turn',$1,'completed','conversation','user','principal',$2,'2026-01-01 00:00:00 +00:00','2026-01-01 00:00:00 +00:00')",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            let text = "🌍漢字\"\n".repeat(240000);
+            let input = pioneer_protocol::UserInput::Text {
+                text: text.clone(),
+                text_elements: Vec::new(),
+            };
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('large-input','large-turn',0,'text',$1,$2,'2026-01-01 00:00:01 +00:00')",
+                [text.clone().into(), serde_json::to_string(&input).unwrap().into()])).await.unwrap();
+            let before = harness
+                .database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS n FROM thread_read_cursor".to_owned(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "n")
+                .unwrap();
+            let mut cursor = None;
+            let mut saved_cursor = None;
+            let mut fragments = String::new();
+            let mut ended = false;
+            for _ in 0..200 {
+                let page = processor
+                    .read_saved_thread_history(
+                        WORKSPACE_RED_ID,
+                        THREAD_RED_PRIVATE_A_ID,
+                        1,
+                        cursor,
+                        |_| async { Ok(false) },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    serde_json::to_vec(&page.events).unwrap().len()
+                        < pioneer_protocol::TOOL_RESPONSE_MAX_BYTES
                 );
-                fragments.push_str(fragment["text"].as_str().unwrap());
+                for event in &page.events {
+                    if let Some(fragment) = event.get("fragment") {
+                        assert_eq!(
+                            fragment["offset"].as_u64().unwrap() as usize,
+                            fragments.len()
+                        );
+                        fragments.push_str(fragment["text"].as_str().unwrap());
+                    }
+                }
+                if saved_cursor.is_none() {
+                    saved_cursor = page.next_cursor.clone();
+                }
+                if page.eof {
+                    ended = true;
+                    break;
+                }
+                cursor = page.next_cursor;
             }
-        }
-        if saved_cursor.is_none() {
-            saved_cursor = page.next_cursor.clone();
-        }
-        if page.eof {
-            ended = true;
-            break;
-        }
-        cursor = page.next_cursor;
-    }
-    assert!(ended);
-    let reconstructed: Value = serde_json::from_str(&fragments).unwrap();
-    assert_eq!(reconstructed["content"]["input"]["text"], text);
-    let after = harness
-        .database
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) AS n FROM thread_read_cursor".to_owned(),
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "n")
-        .unwrap();
-    assert_eq!(
-        before, after,
-        "history observation must not mark any conversation read"
-    );
-    harness.database.execute_unprepared("UPDATE turn SET message_revision=message_revision+1, message_deleted_at=CURRENT_TIMESTAMP WHERE id='large-turn'").await.unwrap();
-    let stale = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            1,
-            saved_cursor,
-            |_| async { Ok(false) },
-        )
-        .await;
-    assert!(stale.err().unwrap().to_string().contains("stale"));
-    let deleted = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            100,
-            None,
-            |_| async { Ok(false) },
-        )
-        .await
-        .unwrap();
-    assert!(
-        !serde_json::to_string(&deleted.events)
-            .unwrap()
-            .contains("🌍")
-    );
+            assert!(ended);
+            let reconstructed: Value = serde_json::from_str(&fragments).unwrap();
+            assert_eq!(reconstructed["content"]["input"]["text"], text);
+            let after = harness
+                .database
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*) AS n FROM thread_read_cursor".to_owned(),
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<i64>("", "n")
+                .unwrap();
+            assert_eq!(
+                before, after,
+                "history observation must not mark any conversation read"
+            );
+            harness.database.execute_unprepared("UPDATE turn SET message_revision=message_revision+1, message_deleted_at=CURRENT_TIMESTAMP WHERE id='large-turn'").await.unwrap();
+            let stale = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    1,
+                    saved_cursor,
+                    |_| async { Ok(false) },
+                )
+                .await;
+            assert!(stale.err().unwrap().to_string().contains("stale"));
+            let deleted = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    100,
+                    None,
+                    |_| async { Ok(false) },
+                )
+                .await
+                .unwrap();
+            assert!(
+                !serde_json::to_string(&deleted.events)
+                    .unwrap()
+                    .contains("🌍")
+            );
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn legacy_tool_result_and_retained_log_are_readable_but_deleted_turn_is_not() {
-    use pioneer_protocol::{
-        ThreadToolResultReadParams, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
-        ToolStoragePayload, TurnItem, TurnItemExecutionClass,
-    };
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('legacy-tool-turn',?,'completed','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    let text = "retained 🌍 output\n".repeat(1000);
-    // A legacy shell item can retain its typed display without a separate full
-    // result. Unknown external tools only allow summary display payloads.
-    let item = TurnItem::DynamicToolCall {
-        id: "legacy-tool".into(),
-        tool_name: "exec_command".into(),
-        arguments: json!({"exact":42}),
-        status: ToolCallStatus::Completed,
-        execution_class: TurnItemExecutionClass::Standard,
-        recovery_policy: None,
-        output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
-        display: ToolDisplayPayload::Shell {
-            stdout: Some(text.clone()),
-            stderr: None,
-            aggregated_output: None,
-            exit_code: Some(0),
-            duration_ms: None,
-            timed_out: None,
-            truncated: false,
-        },
-        storage: ToolStoragePayload::None,
-        recovery: None,
-        success: Some(true),
-        outcome: None,
-        observation: None,
-    };
-    processor
-        .crud_store
-        .materialize_item_completed(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: WORKSPACE_RED_ID.into(),
-                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                turn_id: "legacy-tool-turn".into(),
-                item,
-            },
-            1_800_000_000,
-        )
-        .await
-        .unwrap();
-    processor
-        .crud_store
-        .record_tool_output(
-            "legacy-log",
-            &pioneer_protocol::ItemDeltaNotification {
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            use pioneer_protocol::{
+                ThreadToolResultReadParams, ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot,
+                ToolStoragePayload, TurnItem, TurnItemExecutionClass,
+            };
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('legacy-tool-turn',$1,'completed','conversation','user','principal',$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            let text = "retained 🌍 output\n".repeat(1000);
+            // A legacy shell item can retain its typed display without a separate full
+            // result. Unknown external tools only allow summary display payloads.
+            let item = TurnItem::DynamicToolCall {
+                id: "legacy-tool".into(),
+                tool_name: "exec_command".into(),
+                arguments: json!({"exact":42}),
+                status: ToolCallStatus::Completed,
+                execution_class: TurnItemExecutionClass::Standard,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
+                display: ToolDisplayPayload::Shell {
+                    stdout: Some(text.clone()),
+                    stderr: None,
+                    aggregated_output: None,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    timed_out: None,
+                    truncated: false,
+                },
+                storage: ToolStoragePayload::None,
+                recovery: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            };
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "legacy-tool-turn".into(),
+                        item,
+                    },
+                    1_800_000_000,
+                )
+                .await
+                .unwrap();
+            processor
+                .crud_store
+                .record_tool_output(
+                    "legacy-log",
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "legacy-tool-turn".into(),
+                        item_id: "legacy-tool".into(),
+                        delta: "retained stdout".into(),
+                        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                        payload: None,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let mut params = ThreadToolResultReadParams {
                 workspace_id: WORKSPACE_RED_ID.into(),
                 thread_id: THREAD_RED_PRIVATE_A_ID.into(),
                 turn_id: "legacy-tool-turn".into(),
                 item_id: "legacy-tool".into(),
-                delta: "retained stdout".into(),
-                stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-                payload: None,
-                markdown: None,
-                markdown_version: None,
-            },
-        )
-        .await
-        .unwrap();
-    let mut params = ThreadToolResultReadParams {
-        workspace_id: WORKSPACE_RED_ID.into(),
-        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-        turn_id: "legacy-tool-turn".into(),
-        item_id: "legacy-tool".into(),
-        output_log: false,
-        cursor: None,
-        max_tokens: Some(500),
-        max_bytes: Some(1000),
-    };
-    let mut restored = String::new();
-    let mut eof = false;
-    for _ in 0..200 {
-        let page = processor
-            .read_thread_tool_result(params.clone())
-            .await
-            .unwrap();
-        let wire = serde_json::to_string(&page).unwrap();
-        assert!(wire.len() <= 1000 && pioneer_compaction::text_tokens(&wire) <= 500);
-        restored.push_str(&page.text);
-        if page.eof {
-            eof = true;
-            break;
-        }
-        params.cursor = page.next;
-    }
-    assert!(eof);
-    let saved: Value = serde_json::from_str(&restored).unwrap();
-    assert_eq!(saved["fullResultSaved"], false);
-    assert_eq!(saved["item"]["display"]["stdout"], text);
-    params.output_log = true;
-    params.cursor = None;
-    let log = processor
-        .read_thread_tool_result(params.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&log.text).unwrap()["text"],
-        "retained stdout"
-    );
-    harness.database.execute_unprepared("UPDATE turn SET message_revision=message_revision+1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='legacy-tool-turn'").await.unwrap();
-    assert!(
-        processor
-            .read_thread_tool_result(params.clone())
-            .await
-            .is_err()
-    );
-    params.output_log = false;
-    assert!(processor.read_thread_tool_result(params).await.is_err());
+                output_log: false,
+                cursor: None,
+                max_tokens: Some(500),
+                max_bytes: Some(1000),
+            };
+            let mut restored = String::new();
+            let mut eof = false;
+            for _ in 0..200 {
+                let page = processor
+                    .read_thread_tool_result(params.clone())
+                    .await
+                    .unwrap();
+                let wire = serde_json::to_string(&page).unwrap();
+                assert!(wire.len() <= 1000 && pioneer_compaction::text_tokens(&wire) <= 500);
+                restored.push_str(&page.text);
+                if page.eof {
+                    eof = true;
+                    break;
+                }
+                params.cursor = page.next;
+            }
+            assert!(eof);
+            let saved: Value = serde_json::from_str(&restored).unwrap();
+            assert_eq!(saved["fullResultSaved"], false);
+            assert_eq!(saved["item"]["display"]["stdout"], text);
+            params.output_log = true;
+            params.cursor = None;
+            let log = processor
+                .read_thread_tool_result(params.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&log.text).unwrap()["text"],
+                "retained stdout"
+            );
+            harness.database.execute_unprepared("UPDATE turn SET message_revision=message_revision+1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='legacy-tool-turn'").await.unwrap();
+            assert!(
+                processor
+                    .read_thread_tool_result(params.clone())
+                    .await
+                    .is_err()
+            );
+            params.output_log = false;
+            assert!(processor.read_thread_tool_result(params).await.is_err());
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn public_result_reader_honors_token_budget_with_real_cursors_for_all_sources() {
-    use pioneer_protocol::{
-        ThreadToolResultReadParams, ThreadToolResultReadResponse, ToolCallStatus,
-        ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
-        TurnItemExecutionClass,
-    };
-
-    async fn call(
-        handler: &Arc<dyn ToolHandler>,
-        params: &ThreadToolResultReadParams,
-    ) -> Result<Box<dyn ToolOutput>, ToolError> {
-        handler
-            .handle(
-                ToolInvocation {
-                    call_id: "budget-read".into(),
-                    tool_name: "threads_tools_result_read".into(),
-                    source: pioneer_tools::ToolCallSource::Model,
-                    payload: ToolPayload::Function {
-                        arguments: serde_json::to_value(params).unwrap(),
-                    },
-                    workdir: Default::default(),
-                    environment: Default::default(),
-                    attempt_id: 0,
-                    idempotency_key: None,
-                    recovery: Default::default(),
-                    permission_metadata: Default::default(),
-                    execution_security_snapshot: None,
-                    apply_patch_preflight: None,
-                    cancellation: tokio_util::sync::CancellationToken::new(),
-                },
-                pioneer_tools::ToolEventBus::new(8).start_trace(
-                    "budget-turn",
-                    "budget-read",
-                    "threads_tools_result_read",
-                ),
-            )
-            .await
-    }
-
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('budget-turn',?,'in_progress','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()],
-    )).await.unwrap();
-    // Reach the public reader through a live member execution within the
-    // member role's supervised ceiling, as in the anchored-handler fixture.
-    let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-        pioneer_protocol::TurnPermissionMode::Supervised,
-        pioneer_protocol::TurnPermissionProfileSource::Composer,
-    );
-    let mut authorization = crate::authorization::ExecutionAuthorizationContext::for_test(
-        &member(MEMBER_A_ID),
-        WORKSPACE_RED_ID,
-        THREAD_RED_PRIVATE_A_ID,
-        &profile,
-        None,
-    );
-    authorization.bind_test_provider_authority(
-        "openai",
-        "test-model",
-        processor
-            .provider_registry
-            .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
-            .unwrap()
-            .as_str(),
-    );
-    assert!(
-        processor
-            .crud_store
-            .set_turn_execution_authorization_context(
-                "budget-turn",
-                &authorization.to_persisted_json().unwrap(),
-            )
-            .await
-            .unwrap()
-    );
-    let text = (0..180)
-        .map(|n| format!("{n:04}:🌍e\u{301}漢字 \"\\\n"))
-        .collect::<String>();
-    for id in ["canonical-budget", "saved-item-budget"] {
-        let item = TurnItem::DynamicToolCall {
-            id: id.into(),
-            tool_name: "exec_command".into(),
-            arguments: json!({"exact":42}),
-            status: ToolCallStatus::Completed,
-            execution_class: TurnItemExecutionClass::Standard,
-            recovery_policy: None,
-            output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
-            display: ToolDisplayPayload::Shell {
-                stdout: Some(text.clone()),
-                stderr: None,
-                aggregated_output: None,
-                exit_code: Some(0),
-                duration_ms: None,
-                timed_out: None,
-                truncated: false,
-            },
-            storage: ToolStoragePayload::None,
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        processor
-            .crud_store
-            .materialize_item_completed(
-                pioneer_protocol::ItemCompletedNotification {
-                    workspace_id: WORKSPACE_RED_ID.into(),
-                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                    turn_id: "budget-turn".into(),
-                    item,
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
-    }
-    let canonical = json!({"output":text,"sentinel":"complete🌍"}).to_string();
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('budget-source','budget-turn','canonical-budget',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",
-        [canonical.clone().into()],
-    )).await.unwrap();
-    let mut log = String::new();
-    for (index, delta) in [text.clone(), "last 🌍 chunk\n".repeat(90)]
-        .into_iter()
-        .enumerate()
-    {
-        processor
-            .crud_store
-            .record_tool_output(
-                &format!("budget-log-{index}"),
-                &pioneer_protocol::ItemDeltaNotification {
-                    workspace_id: WORKSPACE_RED_ID.into(),
-                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                    turn_id: "budget-turn".into(),
-                    item_id: "saved-item-budget".into(),
-                    delta: delta.clone(),
-                    stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-                    payload: None,
-                    markdown: None,
-                    markdown_version: None,
-                },
-            )
-            .await
-            .unwrap();
-        log.push_str(&json!({"stream":"stdout","text":delta,"metadata":null}).to_string());
-    }
-    let processor = Arc::new(processor);
-    let bundle = processor.thread_result_tools(TurnToolContext {
-        workspace_id: WORKSPACE_RED_ID.into(),
-        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-        turn_id: "budget-turn".into(),
-    });
-    let handler = &bundle
-        .handlers
-        .iter()
-        .find(|(name, _)| name == "threads_tools_result_read")
-        .unwrap()
-        .1;
-    for (item_id, output_log, expected) in [
-        ("canonical-budget", false, Some(canonical)),
-        ("saved-item-budget", false, None),
-        ("saved-item-budget", true, Some(log)),
-    ] {
-        let mut params = ThreadToolResultReadParams {
-            workspace_id: WORKSPACE_RED_ID.into(),
-            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-            turn_id: "budget-turn".into(),
-            item_id: item_id.into(),
-            output_log,
-            cursor: None,
-            max_tokens: Some(1),
-            max_bytes: None,
-        };
-        let error = call(handler, &params)
-            .await
-            .err()
-            .expect("framing cannot fit one token");
-        assert!(error.to_string().contains("budget"));
-        params.max_tokens = Some(500);
-        // The legacy saved view has typed metadata as well as stdout. Compare
-        // every byte with its explicitly enlarged public representation too.
-        let expected = if let Some(expected) = expected {
-            expected
-        } else {
-            let unbudgeted = ThreadToolResultReadParams {
-                max_tokens: Some(500_000),
-                max_bytes: Some(2 * 1024 * 1024),
-                ..params.clone()
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            use pioneer_protocol::{
+                ThreadToolResultReadParams, ThreadToolResultReadResponse, ToolCallStatus,
+                ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
+                TurnItemExecutionClass,
             };
-            let whole: ThreadToolResultReadResponse =
-                serde_json::from_str(&call(handler, &unbudgeted).await.unwrap().raw_text())
-                    .unwrap();
-            assert!(whole.eof && whole.next.is_none());
-            let saved: Value = serde_json::from_str(&whole.text).unwrap();
-            assert_eq!(saved["kind"], "saved_item");
-            assert_eq!(saved["fullResultSaved"], false);
-            assert_eq!(saved["item"]["id"], item_id);
-            assert_eq!(saved["item"]["display"]["stdout"], text);
-            whole.text
-        };
-        let mut defaults = ThreadToolResultReadParams {
-            max_tokens: None,
-            max_bytes: None,
-            cursor: None,
-            ..params.clone()
-        };
-        let mut default_text = String::new();
-        loop {
-            let output = call(handler, &defaults).await.unwrap();
-            let wire = output.raw_text();
-            assert!(wire.len() <= 32768 && pioneer_compaction::text_tokens(&wire) <= 4096);
-            let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
-            default_text.push_str(&page.text);
-            if page.eof {
-                break;
+
+            async fn call(
+                handler: &Arc<dyn ToolHandler>,
+                params: &ThreadToolResultReadParams,
+            ) -> Result<Box<dyn ToolOutput>, ToolError> {
+                handler
+                    .handle(
+                        ToolInvocation {
+                            call_id: "budget-read".into(),
+                            tool_name: "threads_tools_result_read".into(),
+                            source: pioneer_tools::ToolCallSource::Model,
+                            payload: ToolPayload::Function {
+                                arguments: serde_json::to_value(params).unwrap(),
+                            },
+                            workdir: Default::default(),
+                            environment: Default::default(),
+                            attempt_id: 0,
+                            idempotency_key: None,
+                            recovery: Default::default(),
+                            permission_metadata: Default::default(),
+                            execution_security_snapshot: None,
+                            apply_patch_preflight: None,
+                            cancellation: tokio_util::sync::CancellationToken::new(),
+                        },
+                        pioneer_tools::ToolEventBus::new(8).start_trace(
+                            "budget-turn",
+                            "budget-read",
+                            "threads_tools_result_read",
+                        ),
+                    )
+                    .await
             }
-            assert!(!page.text.is_empty());
-            defaults.cursor = page.next;
-            // Equivalent explicit defaults must retain the same cursor scope.
-            defaults.max_tokens = Some(4096);
-            defaults.max_bytes = Some(32768);
-        }
-        assert_eq!(default_text, expected);
-        let mut restored = String::new();
-        let mut pages = 0;
-        let mut rollovers = 0;
-        loop {
-            let output = call(handler, &params).await.unwrap();
-            let wire = output.raw_text();
-            assert!(output.success());
+
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('budget-turn',$1,'in_progress','conversation','user','principal',$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()],
+            )).await.unwrap();
+            // Reach the public reader through a live member execution within the
+            // member role's supervised ceiling, as in the anchored-handler fixture.
+            let profile = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            );
+            let mut authorization = crate::authorization::ExecutionAuthorizationContext::for_test(
+                &member(MEMBER_A_ID),
+                WORKSPACE_RED_ID,
+                THREAD_RED_PRIVATE_A_ID,
+                &profile,
+                None,
+            );
+            authorization.bind_test_provider_authority(
+                "openai",
+                "test-model",
+                processor
+                    .provider_registry
+                    .authority_fingerprint_for_workspace(WORKSPACE_RED_ID, "openai")
+                    .unwrap()
+                    .as_str(),
+            );
             assert!(
-                pioneer_compaction::text_tokens(&wire) <= 500,
-                "{item_id}, log={output_log}"
+                processor
+                    .crud_store
+                    .set_turn_execution_authorization_context(
+                        "budget-turn",
+                        &authorization.to_persisted_json().unwrap(),
+                    )
+                    .await
+                    .unwrap()
             );
-            assert_eq!(
-                serde_json::from_str::<Value>(&wire).unwrap(),
-                output.raw_json()
-            );
-            assert!(pioneer_tools::thread_read_page_fits(&output.raw_json()));
-            let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
-            let start = params.cursor.as_ref().map_or(0, |cursor| cursor.offset);
-            let end = start + page.text.chars().count() as u64;
-            restored.push_str(&page.text);
-            pages += 1;
-            assert!(pages < 200, "reader must make progress");
-            if page.eof {
-                assert!(page.next.is_none());
-                break;
+            let text = (0..180)
+                .map(|n| format!("{n:04}:🌍e\u{301}漢字 \"\\\n"))
+                .collect::<String>();
+            for id in ["canonical-budget", "saved-item-budget"] {
+                let item = TurnItem::DynamicToolCall {
+                    id: id.into(),
+                    tool_name: "exec_command".into(),
+                    arguments: json!({"exact":42}),
+                    status: ToolCallStatus::Completed,
+                    execution_class: TurnItemExecutionClass::Standard,
+                    recovery_policy: None,
+                    output_policy: ToolOutputPolicySnapshot::for_external_runtime_tool_name("exec_command"),
+                    display: ToolDisplayPayload::Shell {
+                        stdout: Some(text.clone()),
+                        stderr: None,
+                        aggregated_output: None,
+                        exit_code: Some(0),
+                        duration_ms: None,
+                        timed_out: None,
+                        truncated: false,
+                    },
+                    storage: ToolStoragePayload::None,
+                    recovery: None,
+                    success: Some(true),
+                    outcome: None,
+                    observation: None,
+                };
+                processor
+                    .crud_store
+                    .materialize_item_completed(
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: WORKSPACE_RED_ID.into(),
+                            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                            turn_id: "budget-turn".into(),
+                            item,
+                        },
+                        1_800_000_000,
+                    )
+                    .await
+                    .unwrap();
             }
-            let next = page.next.expect("nonterminal page needs a public cursor");
-            assert!(serde_json::to_vec(&next).unwrap().len() <= 16384);
-            if output_log && next.offset == 0 {
-                rollovers += 1;
-            } else {
-                assert!(!page.text.is_empty());
-                assert_eq!(next.offset, end, "offsets count Unicode scalars, not bytes");
+            let canonical = json!({"output":text,"sentinel":"complete🌍"}).to_string();
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('budget-source','budget-turn','canonical-budget',1,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)",
+                [canonical.clone().into()],
+            )).await.unwrap();
+            let mut log = String::new();
+            for (index, delta) in [text.clone(), "last 🌍 chunk\n".repeat(90)]
+                .into_iter()
+                .enumerate()
+            {
+                processor
+                    .crud_store
+                    .record_tool_output(
+                        &format!("budget-log-{index}"),
+                        &pioneer_protocol::ItemDeltaNotification {
+                            workspace_id: WORKSPACE_RED_ID.into(),
+                            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                            turn_id: "budget-turn".into(),
+                            item_id: "saved-item-budget".into(),
+                            delta: delta.clone(),
+                            stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                            payload: None,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                log.push_str(&json!({"stream":"stdout","text":delta,"metadata":null}).to_string());
             }
-            params.cursor = Some(next);
-        }
-        assert!(pages > 1, "fixture must exercise protected continuation");
-        assert_eq!(restored, expected, "{item_id}, log={output_log}");
-        if output_log {
-            assert_eq!(rollovers, 1, "continue through both retained log chunks");
-        }
-    }
+            let processor = Arc::new(processor);
+            let bundle = processor.thread_result_tools(TurnToolContext {
+                workspace_id: WORKSPACE_RED_ID.into(),
+                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                turn_id: "budget-turn".into(),
+            });
+            let handler = &bundle
+                .handlers
+                .iter()
+                .find(|(name, _)| name == "threads_tools_result_read")
+                .unwrap()
+                .1;
+            for (item_id, output_log, expected) in [
+                ("canonical-budget", false, Some(canonical)),
+                ("saved-item-budget", false, None),
+                ("saved-item-budget", true, Some(log)),
+            ] {
+                let mut params = ThreadToolResultReadParams {
+                    workspace_id: WORKSPACE_RED_ID.into(),
+                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                    turn_id: "budget-turn".into(),
+                    item_id: item_id.into(),
+                    output_log,
+                    cursor: None,
+                    max_tokens: Some(1),
+                    max_bytes: None,
+                };
+                let error = call(handler, &params)
+                    .await
+                    .err()
+                    .expect("framing cannot fit one token");
+                assert!(error.to_string().contains("budget"));
+                params.max_tokens = Some(500);
+                // The legacy saved view has typed metadata as well as stdout. Compare
+                // every byte with its explicitly enlarged public representation too.
+                let expected = if let Some(expected) = expected {
+                    expected
+                } else {
+                    let unbudgeted = ThreadToolResultReadParams {
+                        max_tokens: Some(500_000),
+                        max_bytes: Some(2 * 1024 * 1024),
+                        ..params.clone()
+                    };
+                    let whole: ThreadToolResultReadResponse =
+                        serde_json::from_str(&call(handler, &unbudgeted).await.unwrap().raw_text())
+                            .unwrap();
+                    assert!(whole.eof && whole.next.is_none());
+                    let saved: Value = serde_json::from_str(&whole.text).unwrap();
+                    assert_eq!(saved["kind"], "saved_item");
+                    assert_eq!(saved["fullResultSaved"], false);
+                    assert_eq!(saved["item"]["id"], item_id);
+                    assert_eq!(saved["item"]["display"]["stdout"], text);
+                    whole.text
+                };
+                let mut defaults = ThreadToolResultReadParams {
+                    max_tokens: None,
+                    max_bytes: None,
+                    cursor: None,
+                    ..params.clone()
+                };
+                let mut default_text = String::new();
+                loop {
+                    let output = call(handler, &defaults).await.unwrap();
+                    let wire = output.raw_text();
+                    assert!(wire.len() <= 32768 && pioneer_compaction::text_tokens(&wire) <= 4096);
+                    let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
+                    default_text.push_str(&page.text);
+                    if page.eof {
+                        break;
+                    }
+                    assert!(!page.text.is_empty());
+                    defaults.cursor = page.next;
+                    // Equivalent explicit defaults must retain the same cursor scope.
+                    defaults.max_tokens = Some(4096);
+                    defaults.max_bytes = Some(32768);
+                }
+                assert_eq!(default_text, expected);
+                let mut restored = String::new();
+                let mut pages = 0;
+                let mut rollovers = 0;
+                loop {
+                    let output = call(handler, &params).await.unwrap();
+                    let wire = output.raw_text();
+                    assert!(output.success());
+                    assert!(
+                        pioneer_compaction::text_tokens(&wire) <= 500,
+                        "{item_id}, log={output_log}"
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&wire).unwrap(),
+                        output.raw_json()
+                    );
+                    assert!(pioneer_tools::thread_read_page_fits(&output.raw_json()));
+                    let page: ThreadToolResultReadResponse = serde_json::from_str(&wire).unwrap();
+                    let start = params.cursor.as_ref().map_or(0, |cursor| cursor.offset);
+                    let end = start + page.text.chars().count() as u64;
+                    restored.push_str(&page.text);
+                    pages += 1;
+                    assert!(pages < 200, "reader must make progress");
+                    if page.eof {
+                        assert!(page.next.is_none());
+                        break;
+                    }
+                    let next = page.next.expect("nonterminal page needs a public cursor");
+                    assert!(serde_json::to_vec(&next).unwrap().len() <= 16384);
+                    if output_log && next.offset == 0 {
+                        rollovers += 1;
+                    } else {
+                        assert!(!page.text.is_empty());
+                        assert_eq!(next.offset, end, "offsets count Unicode scalars, not bytes");
+                    }
+                    params.cursor = Some(next);
+                }
+                assert!(pages > 1, "fixture must exercise protected continuation");
+                assert_eq!(restored, expected, "{item_id}, log={output_log}");
+                if output_log {
+                    assert_eq!(rollovers, 1, "continue through both retained log chunks");
+                }
+            }
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn saved_observation_result_cannot_replay_a_now_inaccessible_thread() {
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('saved-list-turn',?,'completed','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    let item:pioneer_protocol::TurnItem=serde_json::from_value(json!({
-        "type":"dynamicToolCall","id":"saved-list","toolName":"threads_list","arguments":{"limit":20},"status":"completed",
-        "outputPolicy":pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("threads_list"),
-        "display":{"kind":"hidden"},"storage":{"kind":"none"},"success":true,
-    })).unwrap();
-    processor
-        .crud_store
-        .materialize_item_completed(
-            pioneer_protocol::ItemCompletedNotification {
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('saved-list-turn',$1,'completed','conversation','user','principal',$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            let item:pioneer_protocol::TurnItem=serde_json::from_value(json!({
+                "type":"dynamicToolCall","id":"saved-list","toolName":"threads_list","arguments":{"limit":20},"status":"completed",
+                "outputPolicy":pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("threads_list"),
+                "display":{"kind":"hidden"},"storage":{"kind":"none"},"success":true,
+            })).unwrap();
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "saved-list-turn".into(),
+                        item: item.clone(),
+                    },
+                    1_800_000_000,
+                )
+                .await
+                .unwrap();
+            let response = json!({"threads":[{"threadId":THREAD_RED_PRIVATE_B_ID,"title":"private B saved title"}],"nextCursor":null,"eof":true});
+            let mut envelope = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_list","tool_call_id":"saved-list","content":response.to_string()},"ignored": "padding ".repeat(150_000)});
+            for _ in 0..24 {
+                envelope = json!({"value":envelope});
+            }
+            let payload = envelope.to_string();
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('saved-list-source','saved-list-turn','saved-list',1,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)",[payload.into()])).await.unwrap();
+            let params = pioneer_protocol::ThreadToolResultReadParams {
                 workspace_id: WORKSPACE_RED_ID.into(),
                 thread_id: THREAD_RED_PRIVATE_A_ID.into(),
                 turn_id: "saved-list-turn".into(),
-                item: item.clone(),
-            },
-            1_800_000_000,
-        )
-        .await
-        .unwrap();
-    let response = json!({"threads":[{"threadId":THREAD_RED_PRIVATE_B_ID,"title":"private B saved title"}],"nextCursor":null,"eof":true});
-    let mut envelope = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_list","tool_call_id":"saved-list","content":response.to_string()},"ignored": "padding ".repeat(150_000)});
-    for _ in 0..24 {
-        envelope = json!({"value":envelope});
-    }
-    let payload = envelope.to_string();
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('saved-list-source','saved-list-turn','saved-list',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",[payload.into()])).await.unwrap();
-    let params = pioneer_protocol::ThreadToolResultReadParams {
-        workspace_id: WORKSPACE_RED_ID.into(),
-        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-        turn_id: "saved-list-turn".into(),
-        item_id: "saved-list".into(),
-        output_log: false,
-        cursor: None,
-        max_tokens: None,
-        max_bytes: None,
-    };
-    let metadata = processor
-        .crud_store
-        .tool_result_access_source(
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            "saved-list-turn",
-            "saved-list",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(metadata["toolName"], "threads_list");
-    assert!(
-        processor
-            .crud_store
-            .tool_result_access_source(
-                WORKSPACE_RED_ID,
-                THREAD_RED_PRIVATE_B_ID,
-                "saved-list-turn",
-                "saved-list"
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let mut foreign = params.clone();
-    foreign.thread_id = THREAD_RED_PRIVATE_B_ID.into();
-    assert!(
-        processor.read_thread_tool_result(foreign).await.is_err(),
-        "an accessible source cannot authorize a result in another thread"
-    );
-    let cached_page = processor
-        .read_thread_tool_result(params.clone())
-        .await
-        .unwrap();
-    let cached_item: pioneer_protocol::TurnItem = serde_json::from_value(json!({
-        "type":"dynamicToolCall","id":"cached-read","toolName":"threads_tools_result_read","arguments":params,"status":"completed",
-        "outputPolicy":pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("threads_tools_result_read"),
-        "display":{"kind":"hidden"},"storage":{"kind":"none"},"success":true,
-    })).unwrap();
-    processor
-        .crud_store
-        .materialize_item_completed(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: WORKSPACE_RED_ID.into(),
-                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                turn_id: "saved-list-turn".into(),
-                item: cached_item.clone(),
-            },
-            1_800_000_000,
-        )
-        .await
-        .unwrap();
-    let cached_payload = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_tools_result_read","tool_call_id":"cached-read","content":serde_json::to_string(&cached_page).unwrap()}}).to_string();
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('cached-read-source','saved-list-turn','cached-read',2,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [cached_payload.into()])).await.unwrap();
-    let mut cached_params = params.clone();
-    cached_params.item_id = "cached-read".into();
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    assert!(
-        !processor
-            .saved_thread_read_result_disclosable(
-                &a,
-                &params,
-                &serde_json::to_value(&item).unwrap()
-            )
-            .await
-            .unwrap()
-    );
-    let response = json!({"threads":[{"threadId":THREAD_RED_PRIVATE_A_ID,"title":"available A"}],"nextCursor":null,"eof":true});
-    let mut envelope = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_list","tool_call_id":"saved-list","content":response.to_string()},"ignored": "padding ".repeat(500_000)});
-    for _ in 0..24 {
-        envelope = json!({"value":envelope});
-    }
-    let payload = envelope.to_string();
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE turn_llm_context SET payload=? WHERE id='saved-list-source'",
-            [payload.into()],
-        ))
-        .await
-        .unwrap();
-    assert!(
-        processor
-            .saved_thread_read_result_disclosable(
-                &a,
-                &params,
-                &serde_json::to_value(&item).unwrap()
-            )
-            .await
-            .unwrap()
-    );
-    assert!(
-        !processor
-            .saved_thread_read_result_disclosable(
-                &a,
-                &cached_params,
-                &serde_json::to_value(&cached_item).unwrap()
-            )
-            .await
-            .unwrap(),
-        "access to a replacement result must not authorize stale cached private metadata"
-    );
-    let mut deep = json!({"retained":"metadata"});
-    for _ in 0..180 {
-        deep = json!({"nested":deep});
-    }
-    let mut saved_item = serde_json::to_value(&item).unwrap();
-    saved_item["storage"] = json!({"kind":"metadata","metadata":deep});
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "UPDATE turn_item SET payload=? WHERE turn_id='saved-list-turn' AND item_id='saved-list'", [saved_item.to_string().into()])).await.unwrap();
-    let metadata = processor
-        .crud_store
-        .tool_result_access_source(
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            "saved-list-turn",
-            "saved-list",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        processor
-            .saved_thread_read_result_disclosable(&a, &params, &metadata)
-            .await
-            .unwrap(),
-        "authorization must not deserialize arbitrary retained output/storage"
-    );
-    let mut cursor = None;
-    let mut restored = String::new();
-    let mut pages = 0;
-    loop {
-        let mut request = params.clone();
-        request.cursor = cursor;
-        let page = processor.read_thread_tool_result(request).await.unwrap();
-        let projected = serde_json::to_value(&page).unwrap();
-        assert!(pioneer_tools::thread_read_page_fits(&projected));
-        let encoded = serde_json::to_string(&projected).unwrap();
-        assert!(encoded.len() <= 32768 && pioneer_compaction::text_tokens(&encoded) <= 4096);
-        restored.push_str(&page.text);
-        pages += 1;
-        if page.eof {
-            break;
-        }
-        cursor = page.next;
-        assert!(cursor.is_some());
-    }
-    assert!(pages > 1);
-    assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), envelope);
+                item_id: "saved-list".into(),
+                output_log: false,
+                cursor: None,
+                max_tokens: None,
+                max_bytes: None,
+            };
+            let metadata = processor
+                .crud_store
+                .tool_result_access_source(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    "saved-list-turn",
+                    "saved-list",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata["toolName"], "threads_list");
+            assert!(
+                processor
+                    .crud_store
+                    .tool_result_access_source(
+                        WORKSPACE_RED_ID,
+                        THREAD_RED_PRIVATE_B_ID,
+                        "saved-list-turn",
+                        "saved-list"
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let mut foreign = params.clone();
+            foreign.thread_id = THREAD_RED_PRIVATE_B_ID.into();
+            assert!(
+                processor.read_thread_tool_result(foreign).await.is_err(),
+                "an accessible source cannot authorize a result in another thread"
+            );
+            let cached_page = processor
+                .read_thread_tool_result(params.clone())
+                .await
+                .unwrap();
+            let cached_item: pioneer_protocol::TurnItem = serde_json::from_value(json!({
+                "type":"dynamicToolCall","id":"cached-read","toolName":"threads_tools_result_read","arguments":params,"status":"completed",
+                "outputPolicy":pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("threads_tools_result_read"),
+                "display":{"kind":"hidden"},"storage":{"kind":"none"},"success":true,
+            })).unwrap();
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: WORKSPACE_RED_ID.into(),
+                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                        turn_id: "saved-list-turn".into(),
+                        item: cached_item.clone(),
+                    },
+                    1_800_000_000,
+                )
+                .await
+                .unwrap();
+            let cached_payload = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_tools_result_read","tool_call_id":"cached-read","content":serde_json::to_string(&cached_page).unwrap()}}).to_string();
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('cached-read-source','saved-list-turn','cached-read',2,'tool_result_v2',$1,'{}',CURRENT_TIMESTAMP)", [cached_payload.into()])).await.unwrap();
+            let mut cached_params = params.clone();
+            cached_params.item_id = "cached-read".into();
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            assert!(
+                !processor
+                    .saved_thread_read_result_disclosable(
+                        &a,
+                        &params,
+                        &serde_json::to_value(&item).unwrap()
+                    )
+                    .await
+                    .unwrap()
+            );
+            let response = json!({"threads":[{"threadId":THREAD_RED_PRIVATE_A_ID,"title":"available A"}],"nextCursor":null,"eof":true});
+            let mut envelope = json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"threads_list","tool_call_id":"saved-list","content":response.to_string()},"ignored": "padding ".repeat(500_000)});
+            for _ in 0..24 {
+                envelope = json!({"value":envelope});
+            }
+            let payload = envelope.to_string();
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE turn_llm_context SET payload=$1 WHERE id='saved-list-source'",
+                    [payload.into()],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                processor
+                    .saved_thread_read_result_disclosable(
+                        &a,
+                        &params,
+                        &serde_json::to_value(&item).unwrap()
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !processor
+                    .saved_thread_read_result_disclosable(
+                        &a,
+                        &cached_params,
+                        &serde_json::to_value(&cached_item).unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                "access to a replacement result must not authorize stale cached private metadata"
+            );
+            let mut deep = json!({"retained":"metadata"});
+            for _ in 0..180 {
+                deep = json!({"nested":deep});
+            }
+            let mut saved_item = serde_json::to_value(&item).unwrap();
+            saved_item["storage"] = json!({"kind":"metadata","metadata":deep});
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "UPDATE turn_item SET payload=$1::text::json,payload_payload_id=NULL WHERE turn_id='saved-list-turn' AND item_id='saved-list'", [saved_item.to_string().into()])).await.unwrap();
+            let metadata = processor
+                .crud_store
+                .tool_result_access_source(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    "saved-list-turn",
+                    "saved-list",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                processor
+                    .saved_thread_read_result_disclosable(&a, &params, &metadata)
+                    .await
+                    .unwrap(),
+                "authorization must not deserialize arbitrary retained output/storage"
+            );
+            let mut cursor = None;
+            let mut restored = String::new();
+            let mut pages = 0;
+            loop {
+                let mut request = params.clone();
+                request.cursor = cursor;
+                let page = processor.read_thread_tool_result(request).await.unwrap();
+                let projected = serde_json::to_value(&page).unwrap();
+                assert!(pioneer_tools::thread_read_page_fits(&projected));
+                let encoded = serde_json::to_string(&projected).unwrap();
+                assert!(encoded.len() <= 32768 && pioneer_compaction::text_tokens(&encoded) <= 4096);
+                restored.push_str(&page.text);
+                pages += 1;
+                if page.eof {
+                    break;
+                }
+                cursor = page.next;
+                assert!(cursor.is_some());
+            }
+            assert!(pages > 1);
+            assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(), envelope);
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[path = "anchor_tests.rs"]
@@ -1250,1039 +1292,1096 @@ mod anchor_tests;
 
 #[tokio::test]
 async fn history_keeps_messages_above_old_budgets_whole() {
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('whole-turn',?,'completed','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    for (index, text) in ["a".repeat(5000), "漢字🌍\n\"".repeat(16000)]
-        .into_iter()
-        .enumerate()
-    {
-        let input = pioneer_protocol::UserInput::Text {
-            text: text.clone(),
-            text_elements: Vec::new(),
-        };
-        harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,'whole-turn',?,'text',?,?,CURRENT_TIMESTAMP)",
-            [format!("whole-input-{index}").into(), (index as i64).into(), text.clone().into(), serde_json::to_string(&input).unwrap().into()])).await.unwrap();
-    }
-    let page = processor
-        .read_saved_thread_history(
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            100,
-            None,
-            |_| async { Ok(false) },
-        )
-        .await
-        .unwrap();
-    let inputs = page
-        .events
-        .iter()
-        .filter(|event| event["kind"] == "input")
-        .collect::<Vec<_>>();
-    assert_eq!(inputs.len(), 2);
-    assert!(inputs.iter().all(|event| event.get("fragment").is_none()));
-    let mut lengths = inputs
-        .iter()
-        .map(|event| event["content"]["input"]["text"].as_str().unwrap().len())
-        .collect::<Vec<_>>();
-    lengths.sort();
-    assert_eq!(lengths, vec![5000, "漢字🌍\n\"".repeat(16000).len()]);
-    assert!(page.eof);
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('whole-turn',$1,'completed','conversation','user','principal',$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            for (index, text) in ["a".repeat(5000), "漢字🌍\n\"".repeat(16000)]
+                .into_iter()
+                .enumerate()
+            {
+                let input = pioneer_protocol::UserInput::Text {
+                    text: text.clone(),
+                    text_elements: Vec::new(),
+                };
+                harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                    "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ($1,'whole-turn',$2,'text',$3,$4,CURRENT_TIMESTAMP)",
+                    [format!("whole-input-{index}").into(), (index as i64).into(), text.clone().into(), serde_json::to_string(&input).unwrap().into()])).await.unwrap();
+            }
+            let page = processor
+                .read_saved_thread_history(
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    100,
+                    None,
+                    |_| async { Ok(false) },
+                )
+                .await
+                .unwrap();
+            let inputs = page
+                .events
+                .iter()
+                .filter(|event| event["kind"] == "input")
+                .collect::<Vec<_>>();
+            assert_eq!(inputs.len(), 2);
+            assert!(inputs.iter().all(|event| event.get("fragment").is_none()));
+            let mut lengths = inputs
+                .iter()
+                .map(|event| event["content"]["input"]["text"].as_str().unwrap().len())
+                .collect::<Vec<_>>();
+            lengths.sort();
+            assert_eq!(lengths, vec![5000, "漢字🌍\n\"".repeat(16000).len()]);
+            assert!(page.eof);
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn metadata_returns_full_titles_and_explicit_preview_truncation_across_pages() {
-    let (harness, processor) = fixture().await;
-    let title = "long title 漢🌍 ".repeat(200);
-    let preview = "p".repeat(170);
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET name=?,preview=? WHERE id=?",
-            [
-                title.clone().into(),
-                preview.into(),
-                THREAD_RED_PRIVATE_A_ID.into(),
-            ],
-        ))
-        .await
-        .unwrap();
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let metadata = processor
-        .thread_read_metadata(&a, THREAD_RED_PRIVATE_A_ID)
-        .await
-        .unwrap();
-    assert_eq!(metadata["title"], title);
-    assert_eq!(metadata["titleTruncated"], false);
-    assert_eq!(metadata["preview"].as_str().unwrap().chars().count(), 160);
-    assert_eq!(metadata["previewTruncated"], true);
-    for index in 0..205 {
-        add_thread(&processor, &format!("list-{index:03}"), None, false).await;
-        make_conversation(&processor, &format!("list-{index:03}")).await;
-    }
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let mut cursor = None;
-    let mut ids = std::collections::BTreeSet::new();
-    loop {
-        let page = processor
-            .thread_list_page(&a, ThreadsListParams { limit: 100, cursor }, &codec)
-            .await
-            .unwrap();
-        assert!(page["threads"].as_array().unwrap().len() <= 100);
-        for row in page["threads"].as_array().unwrap() {
-            assert!(ids.insert(row["threadId"].as_str().unwrap().to_owned()));
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            let title = "long title 漢🌍 ".repeat(200);
+            let preview = "p".repeat(170);
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET name=$1,preview=$2 WHERE id=$3",
+                    [
+                        title.clone().into(),
+                        preview.into(),
+                        THREAD_RED_PRIVATE_A_ID.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let metadata = processor
+                .thread_read_metadata(&a, THREAD_RED_PRIVATE_A_ID)
+                .await
+                .unwrap();
+            assert_eq!(metadata["title"], title);
+            assert_eq!(metadata["titleTruncated"], false);
+            assert_eq!(metadata["preview"].as_str().unwrap().chars().count(), 160);
+            assert_eq!(metadata["previewTruncated"], true);
+            for index in 0..205 {
+                add_thread(&processor, &format!("list-{index:03}"), None, false).await;
+                make_conversation(&processor, &format!("list-{index:03}")).await;
+            }
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let mut cursor = None;
+            let mut ids = std::collections::BTreeSet::new();
+            loop {
+                let page = processor
+                    .thread_list_page(&a, ThreadsListParams { limit: 100, cursor }, &codec)
+                    .await
+                    .unwrap();
+                assert!(page["threads"].as_array().unwrap().len() <= 100);
+                for row in page["threads"].as_array().unwrap() {
+                    assert!(ids.insert(row["threadId"].as_str().unwrap().to_owned()));
+                }
+                if page["eof"] == true {
+                    break;
+                }
+                cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(ids.iter().filter(|id| id.starts_with("list-")).count(), 205);
+            let first = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET name='changed' WHERE id=$1",
+                    [THREAD_RED_PRIVATE_A_ID.into()],
+                ))
+                .await
+                .unwrap();
+            let continued = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                continued["threads"][0]["threadId"],
+                first["threads"][0]["threadId"]
+            );
         }
-        if page["eof"] == true {
-            break;
-        }
-        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
-    }
-    assert_eq!(ids.iter().filter(|id| id.starts_with("list-")).count(), 205);
-    let first = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET name='changed' WHERE id=?",
-            [THREAD_RED_PRIVATE_A_ID.into()],
-        ))
-        .await
-        .unwrap();
-    let continued = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    assert_ne!(
-        continued["threads"][0]["threadId"],
-        first["threads"][0]["threadId"]
-    );
+        .await;
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn oversized_title_reconstructs_without_losing_metadata_or_continuation() {
-    let (harness, processor) = fixture().await;
-    let title = "🌍\"\n".repeat(450_000);
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET name=? WHERE id=?",
-            [title.clone().into(), THREAD_RED_PRIVATE_A_ID.into()],
-        ))
-        .await
-        .unwrap();
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let mut cursor = None;
-    let mut restored = String::new();
-    loop {
-        let page = processor
-            .thread_list_page(&a, ThreadsListParams { limit: 100, cursor }, &codec)
-            .await
-            .unwrap();
-        assert!(pioneer_tools::thread_read_page_fits(&page));
-        for row in page["threads"].as_array().unwrap() {
-            if row["threadId"] == THREAD_RED_PRIVATE_A_ID {
-                let fragment = &row["fragment"];
-                assert_eq!(
-                    fragment["offset"].as_u64().unwrap() as usize,
-                    restored.len()
-                );
-                restored.push_str(fragment["text"].as_str().unwrap());
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            let title = "🌍\"\n".repeat(450_000);
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET name=$1 WHERE id=$2",
+                    [title.clone().into(), THREAD_RED_PRIVATE_A_ID.into()],
+                ))
+                .await
+                .unwrap();
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let mut cursor = None;
+            let mut restored = String::new();
+            loop {
+                let page = processor
+                    .thread_list_page(&a, ThreadsListParams { limit: 100, cursor }, &codec)
+                    .await
+                    .unwrap();
+                assert!(pioneer_tools::thread_read_page_fits(&page));
+                for row in page["threads"].as_array().unwrap() {
+                    if row["threadId"] == THREAD_RED_PRIVATE_A_ID {
+                        let fragment = &row["fragment"];
+                        assert_eq!(
+                            fragment["offset"].as_u64().unwrap() as usize,
+                            restored.len()
+                        );
+                        restored.push_str(fragment["text"].as_str().unwrap());
+                    }
+                }
+                if page["eof"] == true {
+                    break;
+                }
+                cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+                assert!(cursor.as_ref().unwrap().len() <= 16384);
             }
+            assert_eq!(
+                serde_json::from_str::<Value>(&restored).unwrap()["title"],
+                title
+            );
         }
-        if page["eof"] == true {
-            break;
-        }
-        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
-        assert!(cursor.as_ref().unwrap().len() <= 16384);
-    }
-    assert_eq!(
-        serde_json::from_str::<Value>(&restored).unwrap()["title"],
-        title
-    );
+        .await;
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn list_creation_key_survives_skips_activity_insertions_deletion_and_access_loss() {
-    let (harness, processor) = fixture().await;
-    for (id, date) in [
-        ("z-old", "2050-01-01 00:00:00.123456000+00:00"),
-        ("a-new", "2050-01-01 00:00:01+00:00"),
-        ("b-tie", "2050-01-01 00:00:00.123456789+00:00"),
-        ("c-tie", "2050-01-01 00:00:00.123456789+00:00"),
-        ("d-fraction", "2050-01-01 00:00:00.123456788+00:00"),
-    ] {
-        add_thread(&processor, id, None, false).await;
-        make_conversation(&processor, id).await;
-        harness
-            .database
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE thread SET created_at=? WHERE id=?",
-                [date.into(), id.into()],
-            ))
-            .await
-            .unwrap();
-    }
-    // More than one candidate quantum must be skipped without disclosing IDs
-    // or mistaking the empty first response for EOF.
-    for index in 0..205 {
-        let id = format!("denied-{index:03}");
-        add_thread(&processor, &id, None, true).await;
-        make_conversation(&processor, &id).await;
-        harness
-            .database
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE thread SET access_class='private' WHERE id=?",
-                [id.clone().into()],
-            ))
-            .await
-            .unwrap();
-        harness
-            .database
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id=?",
-                [id.into()],
-            ))
-            .await
-            .unwrap();
-    }
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let first = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    assert_eq!(first["threads"], json!([]));
-    assert_eq!(first["eof"], false);
-    let newest = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: Some(first["nextCursor"].as_str().unwrap().into()),
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    assert_eq!(newest["threads"][0]["threadId"], "a-new");
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            for (id, date) in [
+                ("z-old", "2050-01-01 00:00:00.123456+00:00"),
+                ("a-new", "2050-01-01 00:00:01+00:00"),
+                ("b-tie", "2050-01-01 00:00:00.123458+00:00"),
+                ("c-tie", "2050-01-01 00:00:00.123458+00:00"),
+                ("d-fraction", "2050-01-01 00:00:00.123457+00:00"),
+            ] {
+                add_thread(&processor, id, None, false).await;
+                make_conversation(&processor, id).await;
+                harness
+                    .database
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE thread SET created_at=$1::text::timestamptz WHERE id=$2",
+                        [date.into(), id.into()],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            // More than one candidate quantum must be skipped without disclosing IDs
+            // or mistaking the empty first response for EOF.
+            for index in 0..205 {
+                let id = format!("denied-{index:03}");
+                add_thread(&processor, &id, None, true).await;
+                make_conversation(&processor, &id).await;
+                harness
+                    .database
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE thread SET access_class='private' WHERE id=$1",
+                        [id.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                harness
+                    .database
+                    .execute_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Postgres,
+                        "UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id=$1",
+                        [id.into()],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let first = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            assert_eq!(first["threads"], json!([]));
+            assert_eq!(first["eof"], false);
+            let newest = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: Some(first["nextCursor"].as_str().unwrap().into()),
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            assert_eq!(newest["threads"][0]["threadId"], "a-new");
 
-    harness.database.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "UPDATE thread SET name='unrelated',preview='activity',status='running',updated_at='2060-01-01 00:00:00+00:00' WHERE id=?",
-        [THREAD_RED_PRIVATE_B_ID.into()],
-    )).await.unwrap();
-    harness
-        .database
-        .execute_unprepared("DELETE FROM thread WHERE id='a-new'")
-        .await
-        .unwrap();
-    add_thread(&processor, "0-latest", None, false).await;
-    make_conversation(&processor, "0-latest").await;
-    harness
-        .database
-        .execute_unprepared(
-            "UPDATE thread SET created_at='2052-01-01 00:00:00+00:00' WHERE id='0-latest'",
-        )
-        .await
-        .unwrap();
+            harness.database.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE thread SET name='unrelated',preview='activity',status='running',updated_at='2060-01-01 00:00:00+00:00' WHERE id=$1",
+                [THREAD_RED_PRIVATE_B_ID.into()],
+            )).await.unwrap();
+            harness
+                .database
+                .execute_unprepared("DELETE FROM thread WHERE id='a-new'")
+                .await
+                .unwrap();
+            add_thread(&processor, "0-latest", None, false).await;
+            make_conversation(&processor, "0-latest").await;
+            harness
+                .database
+                .execute_unprepared(
+                    "UPDATE thread SET created_at='2052-01-01 00:00:00+00:00' WHERE id='0-latest'",
+                )
+                .await
+                .unwrap();
 
-    let mut cursor = Some(newest["nextCursor"].as_str().unwrap().to_owned());
-    let mut found = Vec::new();
-    loop {
-        let page = processor
-            .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
-            .await
-            .unwrap();
-        for row in page["threads"].as_array().unwrap() {
-            let id = row["threadId"].as_str().unwrap().to_owned();
-            assert!(!found.contains(&id), "a candidate was revisited");
-            found.push(id);
-        }
-        if page["eof"] == true {
-            break;
-        }
-        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
-    }
-    assert_eq!(&found[..4], ["c-tie", "b-tie", "d-fraction", "z-old"]);
-    assert!(
-        !found
-            .iter()
-            .any(|id| id == "0-latest" || id.starts_with("denied-"))
-    );
+            let mut cursor = Some(newest["nextCursor"].as_str().unwrap().to_owned());
+            let mut found = Vec::new();
+            loop {
+                let page = processor
+                    .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
+                    .await
+                    .unwrap();
+                for row in page["threads"].as_array().unwrap() {
+                    let id = row["threadId"].as_str().unwrap().to_owned();
+                    assert!(!found.contains(&id), "a candidate was revisited");
+                    found.push(id);
+                }
+                if page["eof"] == true {
+                    break;
+                }
+                cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(&found[..4], ["c-tie", "b-tie", "d-fraction", "z-old"]);
+            assert!(
+                !found
+                    .iter()
+                    .any(|id| id == "0-latest" || id.starts_with("denied-"))
+            );
 
-    let restart = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    assert_eq!(restart["threads"][0]["threadId"], "0-latest");
-    // Revoke only a candidate's access, preserving authority to read the root.
-    // The next page must skip it and still reach all remaining available rows.
-    harness
-        .database
-        .execute_unprepared("UPDATE thread SET access_class='private' WHERE id='c-tie'")
-        .await
-        .unwrap();
-    assert!(!processor.thread_source_readable(&a, "c-tie").await.unwrap());
-    let mut cursor = Some(restart["nextCursor"].as_str().unwrap().to_owned());
-    let mut after_revocation = Vec::new();
-    loop {
-        let page = processor
-            .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
-            .await
-            .unwrap();
-        after_revocation.extend(
-            page["threads"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|row| row["threadId"].as_str().unwrap().to_owned()),
-        );
-        if page["eof"] == true {
-            break;
-        }
-        cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
-    }
-    found.remove(0);
-    assert_eq!(after_revocation, found);
+            let restart = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            assert_eq!(restart["threads"][0]["threadId"], "0-latest");
+            // Revoke only a candidate's access, preserving authority to read the root.
+            // The next page must skip it and still reach all remaining available rows.
+            harness
+                .database
+                .execute_unprepared("UPDATE thread SET access_class='private' WHERE id='c-tie'")
+                .await
+                .unwrap();
+            assert!(!processor.thread_source_readable(&a, "c-tie").await.unwrap());
+            let mut cursor = Some(restart["nextCursor"].as_str().unwrap().to_owned());
+            let mut after_revocation = Vec::new();
+            loop {
+                let page = processor
+                    .thread_list_page(&a, ThreadsListParams { limit: 1, cursor }, &codec)
+                    .await
+                    .unwrap();
+                after_revocation.extend(
+                    page["threads"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["threadId"].as_str().unwrap().to_owned()),
+                );
+                if page["eof"] == true {
+                    break;
+                }
+                cursor = Some(page["nextCursor"].as_str().unwrap().to_owned());
+            }
+            found.remove(0);
+            assert_eq!(after_revocation, found);
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn list_rejects_legacy_tampered_and_cross_scope_cursors_with_public_errors() {
-    use base64::Engine as _;
-    let (_harness, processor) = fixture().await;
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let first = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
-                limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    let current = first["nextCursor"].as_str().unwrap();
-    let mut tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(current)
-        .unwrap();
-    *tampered.last_mut().unwrap() ^= 1;
-    let legacy = codec
-        .encode(
-            &json!({"revision":"old", "after":"old-id", "fragment":null}),
-            &a.scope("list", "", false, 1),
-        )
-        .unwrap();
-    let incompatible = codec
-        .encode(
-            &json!({"revision":"old", "after":"old-id", "fragment":null}),
-            &a.list_scope(1),
-        )
-        .unwrap();
-    for cursor in [
-        legacy,
-        incompatible,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered),
-    ] {
-        let error = processor
-            .thread_list_page(
-                &a,
-                ThreadsListParams {
-                    limit: 1,
-                    cursor: Some(cursor),
-                },
-                &codec,
-            )
-            .await
-            .unwrap_err();
-        let public = safe_read_error(&error);
-        assert_eq!(public_read_error(&public).1, "read_cursor_incompatible");
-    }
-    let mut other_workspace = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    other_workspace.workspace_id = "other-workspace".into();
-    let mut other_execution = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    other_execution.current_thread_id = "other-execution-thread".into();
-    let mut other_turn = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    other_turn.current_turn_id = "other-execution-turn".into();
-    for other in [
-        authority(MEMBER_B_ID, THREAD_RED_PRIVATE_A_ID, true),
-        authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true),
-        authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false),
-        other_workspace,
-        other_execution,
-        other_turn,
-    ] {
-        let error = processor
-            .thread_list_page(
-                &other,
-                ThreadsListParams {
-                    limit: 1,
-                    cursor: Some(current.into()),
-                },
-                &codec,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            public_read_error(&safe_read_error(&error)).1,
-            "read_cursor_incompatible"
-        );
-    }
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            use base64::Engine as _;
+            let (_harness, processor) = fixture(test_database).await;
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let first = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            let current = first["nextCursor"].as_str().unwrap();
+            let mut tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(current)
+                .unwrap();
+            *tampered.last_mut().unwrap() ^= 1;
+            let legacy = codec
+                .encode(
+                    &json!({"revision":"old", "after":"old-id", "fragment":null}),
+                    &a.scope("list", "", false, 1),
+                )
+                .unwrap();
+            let incompatible = codec
+                .encode(
+                    &json!({"revision":"old", "after":"old-id", "fragment":null}),
+                    &a.list_scope(1),
+                )
+                .unwrap();
+            for cursor in [
+                legacy,
+                incompatible,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered),
+            ] {
+                let error = processor
+                    .thread_list_page(
+                        &a,
+                        ThreadsListParams {
+                            limit: 1,
+                            cursor: Some(cursor),
+                        },
+                        &codec,
+                    )
+                    .await
+                    .unwrap_err();
+                let public = safe_read_error(&error);
+                assert_eq!(public_read_error(&public).1, "read_cursor_incompatible");
+            }
+            let mut other_workspace = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            other_workspace.workspace_id = "other-workspace".into();
+            let mut other_execution = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            other_execution.current_thread_id = "other-execution-thread".into();
+            let mut other_turn = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            other_turn.current_turn_id = "other-execution-turn".into();
+            for other in [
+                authority(MEMBER_B_ID, THREAD_RED_PRIVATE_A_ID, true),
+                authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true),
+                authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, false),
+                other_workspace,
+                other_execution,
+                other_turn,
+            ] {
+                let error = processor
+                    .thread_list_page(
+                        &other,
+                        ThreadsListParams {
+                            limit: 1,
+                            cursor: Some(current.into()),
+                        },
+                        &codec,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    public_read_error(&safe_read_error(&error)).1,
+                    "read_cursor_incompatible"
+                );
+            }
+        }
+        .await;
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn list_fragment_pins_only_its_source_and_reports_change_disappearance_or_denial() {
-    let (harness, processor) = fixture().await;
-    add_thread(&processor, "pending-card", None, false).await;
-    make_conversation(&processor, "pending-card").await;
-    let title = "🌍\"\n".repeat(450_000);
-    harness.database.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "UPDATE thread SET name=?,created_at='2050-01-01 00:00:00.123456789+00:00' WHERE id='pending-card'",
-        [title.clone().into()],
-    )).await.unwrap();
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let first = processor
-        .thread_list_page(
-            &a,
-            ThreadsListParams {
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            add_thread(&processor, "pending-card", None, false).await;
+            make_conversation(&processor, "pending-card").await;
+            let title = "🌍\"\n".repeat(450_000);
+            harness.database.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE thread SET name=$1,created_at='2050-01-01 00:00:00.123456789+00:00' WHERE id='pending-card'",
+                [title.clone().into()],
+            )).await.unwrap();
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let first = processor
+                .thread_list_page(
+                    &a,
+                    ThreadsListParams {
+                        limit: 1,
+                        cursor: None,
+                    },
+                    &codec,
+                )
+                .await
+                .unwrap();
+            let fragment = &first["threads"][0]["fragment"];
+            assert_eq!(fragment["eof"], false);
+            let continuation = ThreadsListParams {
                 limit: 1,
-                cursor: None,
-            },
-            &codec,
-        )
-        .await
-        .unwrap();
-    let fragment = &first["threads"][0]["fragment"];
-    assert_eq!(fragment["eof"], false);
-    let continuation = ThreadsListParams {
-        limit: 1,
-        cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
-    };
-    add_thread(&processor, "new-before-pending", None, false).await;
-    make_conversation(&processor, "new-before-pending").await;
-    harness.database.execute_unprepared("UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id='new-before-pending'; UPDATE thread SET name='unrelated change',preview='activity',updated_at='2060-01-01 00:00:00+00:00' WHERE id='T00000000000000000002'").await.unwrap();
-    let second = processor
-        .thread_list_page(&a, continuation.clone(), &codec)
-        .await
-        .unwrap();
-    assert_eq!(second["threads"][0]["threadId"], "pending-card");
-    assert_eq!(
-        second["threads"][0]["fragment"]["offset"],
-        fragment["nextOffset"]
-    );
-    assert_eq!(
-        second["threads"][0]["fragment"]["version"],
-        fragment["version"]
-    );
-    for change in [
-        "sidebar_visibility='hidden'",
-        "origin_kind='task_run'",
-        "access_class='internal'",
-    ] {
-        harness
-            .database
-            .execute_unprepared(&format!(
-                "UPDATE thread SET {change} WHERE id='pending-card'"
-            ))
-            .await
-            .unwrap();
-        let error = processor
-            .thread_list_page(&a, continuation.clone(), &codec)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            public_read_error(&safe_read_error(&error)).1,
-            "read_source_unavailable"
-        );
-        make_conversation(&processor, "pending-card").await;
-    }
-    harness
-        .database
-        .execute_unprepared("UPDATE thread SET name='changed source' WHERE id='pending-card'")
-        .await
-        .unwrap();
-    let error = processor
-        .thread_list_page(&a, continuation.clone(), &codec)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        public_read_error(&safe_read_error(&error)).1,
-        "read_source_changed"
-    );
-    harness
-        .database
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET name=?,access_class='private' WHERE id='pending-card'",
-            [title.into()],
-        ))
-        .await
-        .unwrap();
-    let error = processor
-        .thread_list_page(&a, continuation.clone(), &codec)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        public_read_error(&safe_read_error(&error)).1,
-        "read_source_unavailable"
-    );
-    harness
-        .database
-        .execute_unprepared("DELETE FROM thread WHERE id='pending-card'")
-        .await
-        .unwrap();
-    let error = processor
-        .thread_list_page(&a, continuation, &codec)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        public_read_error(&safe_read_error(&error)).1,
-        "read_source_unavailable"
-    );
+                cursor: Some(first["nextCursor"].as_str().unwrap().to_owned()),
+            };
+            add_thread(&processor, "new-before-pending", None, false).await;
+            make_conversation(&processor, "new-before-pending").await;
+            harness.database.execute_unprepared("UPDATE thread SET created_at='2051-01-01 00:00:00+00:00' WHERE id='new-before-pending'; UPDATE thread SET name='unrelated change',preview='activity',updated_at='2060-01-01 00:00:00+00:00' WHERE id='T00000000000000000002'").await.unwrap();
+            let second = processor
+                .thread_list_page(&a, continuation.clone(), &codec)
+                .await
+                .unwrap();
+            assert_eq!(second["threads"][0]["threadId"], "pending-card");
+            assert_eq!(
+                second["threads"][0]["fragment"]["offset"],
+                fragment["nextOffset"]
+            );
+            assert_eq!(
+                second["threads"][0]["fragment"]["version"],
+                fragment["version"]
+            );
+            for change in [
+                "sidebar_visibility='hidden'",
+                "origin_kind='task_run'",
+                "access_class='internal'",
+            ] {
+                harness
+                    .database
+                    .execute_unprepared(&format!(
+                        "UPDATE thread SET {change} WHERE id='pending-card'"
+                    ))
+                    .await
+                    .unwrap();
+                let error = processor
+                    .thread_list_page(&a, continuation.clone(), &codec)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    public_read_error(&safe_read_error(&error)).1,
+                    "read_source_unavailable"
+                );
+                make_conversation(&processor, "pending-card").await;
+            }
+            harness
+                .database
+                .execute_unprepared("UPDATE thread SET name='changed source' WHERE id='pending-card'")
+                .await
+                .unwrap();
+            let error = processor
+                .thread_list_page(&a, continuation.clone(), &codec)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                public_read_error(&safe_read_error(&error)).1,
+                "read_source_changed"
+            );
+            harness
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET name=$1,access_class='private' WHERE id='pending-card'",
+                    [title.into()],
+                ))
+                .await
+                .unwrap();
+            let error = processor
+                .thread_list_page(&a, continuation.clone(), &codec)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                public_read_error(&safe_read_error(&error)).1,
+                "read_source_unavailable"
+            );
+            harness
+                .database
+                .execute_unprepared("DELETE FROM thread WHERE id='pending-card'")
+                .await
+                .unwrap();
+            let error = processor
+                .thread_list_page(&a, continuation, &codec)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                public_read_error(&safe_read_error(&error)).1,
+                "read_source_unavailable"
+            );
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn list_conversation_boundary_excludes_internal_quanta_but_keeps_visible_agent_roots() {
-    let (harness, processor) = fixture().await;
-    for (id, origin) in [
-        ("root-collaborative", "collaborative"),
-        ("root-dm", "direct_message"),
-        ("root-legacy", "user"),
-    ] {
-        add_thread(&processor, id, Some(THREAD_RED_WORKSPACE_ID), false).await;
-        make_conversation(&processor, id).await;
-        harness.database.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET origin_kind=?,created_by_actor_kind='agent_execution',created_by_actor_id='E00000000000000000001',created_at='2050-01-01 00:00:00+00:00' WHERE id=?",
-            [origin.into(), id.into()],
-        )).await.unwrap();
-    }
-    // More than a processing quantum, interleaved between new and old roots.
-    // Includes readable hidden children, nested descendants and inconsistent
-    // combinations to exercise each independent part of the list predicate.
-    for index in 0..205 {
-        let id = format!("internal-{index:03}");
-        let parent = if index == 0 {
-            THREAD_RED_WORKSPACE_ID
-        } else {
-            "internal-000"
-        };
-        add_thread(&processor, &id, Some(parent), false).await;
-        let (origin, visibility, access) = match index % 5 {
-            0 => ("task_run", "visible", "workspace"),
-            1 => ("user", "hidden", "workspace"),
-            2 => ("user", "visible", "internal"),
-            3 => ("system", "visible", "workspace"),
-            _ => ("task_run", "hidden", "internal"),
-        };
-        harness.database.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "UPDATE thread SET origin_kind=?,sidebar_visibility=?,access_class=?,created_at='2040-01-01 00:00:00+00:00' WHERE id=?",
-            [origin.into(), visibility.into(), access.into(), id.into()],
-        )).await.unwrap();
-    }
-    let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
-    let rows = list_all(&processor, &a).await;
-    let ids = rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["threadId"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(&ids[..3], &["root-legacy", "root-dm", "root-collaborative"]);
-    assert!(ids.contains(&THREAD_RED_PRIVATE_A_ID));
-    assert!(ids.contains(&THREAD_RED_WORKSPACE_ID));
-    assert!(!ids.contains(&THREAD_RED_PRIVATE_B_ID));
-    assert!(!ids.iter().any(|id| id.starts_with("internal-")));
-    assert_eq!(ids.len(), 5);
-    for row in rows.as_array().unwrap().iter().take(3) {
-        assert_eq!(row["archived"], true);
-    }
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (harness, processor) = fixture(test_database).await;
+            for (id, origin) in [
+                ("root-collaborative", "collaborative"),
+                ("root-dm", "direct_message"),
+                ("root-legacy", "user"),
+            ] {
+                add_thread(&processor, id, Some(THREAD_RED_WORKSPACE_ID), false).await;
+                make_conversation(&processor, id).await;
+                harness.database.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET origin_kind=$1,created_by_actor_kind='agent_execution',created_by_actor_id='E00000000000000000001',created_at='2050-01-01 00:00:00+00:00' WHERE id=$2",
+                    [origin.into(), id.into()],
+                )).await.unwrap();
+            }
+            // More than a processing quantum, interleaved between new and old roots.
+            // Includes readable hidden children, nested descendants and inconsistent
+            // combinations to exercise each independent part of the list predicate.
+            for index in 0..205 {
+                let id = format!("internal-{index:03}");
+                let parent = if index == 0 {
+                    THREAD_RED_WORKSPACE_ID
+                } else {
+                    "internal-000"
+                };
+                add_thread(&processor, &id, Some(parent), false).await;
+                let (origin, visibility, access) = match index % 5 {
+                    0 => ("task_run", "visible", "workspace"),
+                    1 => ("user", "hidden", "workspace"),
+                    2 => ("user", "visible", "internal"),
+                    3 => ("system", "visible", "workspace"),
+                    _ => ("task_run", "hidden", "internal"),
+                };
+                harness.database.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "UPDATE thread SET origin_kind=$1,sidebar_visibility=$2,access_class=$3,created_at='2040-01-01 00:00:00+00:00' WHERE id=$4",
+                    [origin.into(), visibility.into(), access.into(), id.into()],
+                )).await.unwrap();
+            }
+            let a = authority(MEMBER_A_ID, THREAD_RED_WORKSPACE_ID, true);
+            let rows = list_all(&processor, &a).await;
+            let ids = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["threadId"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(&ids[..3], &["root-legacy", "root-dm", "root-collaborative"]);
+            assert!(ids.contains(&THREAD_RED_PRIVATE_A_ID));
+            assert!(ids.contains(&THREAD_RED_WORKSPACE_ID));
+            assert!(!ids.contains(&THREAD_RED_PRIVATE_B_ID));
+            assert!(!ids.iter().any(|id| id.starts_with("internal-")));
+            assert_eq!(ids.len(), 5);
+            for row in rows.as_array().unwrap().iter().take(3) {
+                assert_eq!(row["archived"], true);
+            }
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn list_rejects_previous_candidate_scope_even_for_pending_readable_child_fragments() {
-    let (_harness, processor) = fixture().await;
-    add_thread(&processor, "old-hidden-card", None, false).await;
-    let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
-    let codec = processor.thread_read_cursor_codec().unwrap();
-    let metadata = processor
-        .thread_read_metadata(&a, "old-hidden-card")
-        .await
-        .unwrap();
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_string(&metadata).unwrap().as_bytes(),
-    ));
-    let old_scope = json!([
-        a.scope("list-created-desc-v1", "", false, 1),
-        a.current_turn_id
-    ])
-    .to_string();
-    for fragment in [
-        None,
-        Some(MetadataFragment {
-            thread_id: "old-hidden-card".into(),
-            digest,
-            offset: 1,
-        }),
-    ] {
-        let cursor = codec
-            .encode(
-                &ListCursor {
-                    after: Some(pioneer_crud::ThreadReadPosition {
-                        created_at: "2050-01-01 00:00:00+00:00".into(),
-                        id: "old-hidden-card".into(),
-                    }),
-                    fragment,
-                },
-                &old_scope,
-            )
-            .unwrap();
-        let error = processor
-            .thread_list_page(
-                &a,
-                ThreadsListParams {
-                    limit: 1,
-                    cursor: Some(cursor),
-                },
-                &codec,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            public_read_error(&safe_read_error(&error)).1,
-            "read_cursor_incompatible"
-        );
-    }
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            let (_harness, processor) = fixture(test_database).await;
+            add_thread(&processor, "old-hidden-card", None, false).await;
+            let a = authority(MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, true);
+            let codec = processor.thread_read_cursor_codec().unwrap();
+            let metadata = processor
+                .thread_read_metadata(&a, "old-hidden-card")
+                .await
+                .unwrap();
+            let digest = hex::encode(Sha256::digest(
+                serde_json::to_string(&metadata).unwrap().as_bytes(),
+            ));
+            let old_scope = json!([
+                a.scope("list-created-desc-v1", "", false, 1),
+                a.current_turn_id
+            ])
+            .to_string();
+            for fragment in [
+                None,
+                Some(MetadataFragment {
+                    thread_id: "old-hidden-card".into(),
+                    digest,
+                    offset: 1,
+                }),
+            ] {
+                let cursor = codec
+                    .encode(
+                        &ListCursor {
+                            after: Some(pioneer_crud::ThreadReadPosition {
+                                created_at: "2050-01-01 00:00:00+00:00".into(),
+                                id: "old-hidden-card".into(),
+                            }),
+                            fragment,
+                        },
+                        &old_scope,
+                    )
+                    .unwrap();
+                let error = processor
+                    .thread_list_page(
+                        &a,
+                        ThreadsListParams {
+                            limit: 1,
+                            cursor: Some(cursor),
+                        },
+                        &codec,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    public_read_error(&safe_read_error(&error)).1,
+                    "read_cursor_incompatible"
+                );
+            }
+        }
+        .await;
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn shell_saved_source_survives_summary_timeline_and_compact_replay() {
-    use pioneer_protocol::{
-        LlmOutputPolicy, StorageOutputPolicy, ThreadToolResultReadParams, TimelineOutputPolicy,
-        ToolCallStatus, ToolOutputPolicySnapshot, TurnItem, TurnItemExecutionClass,
-    };
-    let (harness, processor) = fixture().await;
-    harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('shell-source-turn',?,'completed','conversation','user','principal',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
-    let unique = "UNIQUE_MIDDLE_FRAGMENT_FOR_SAVED_READER";
-    let stdout = format!("{}{unique}{}", "α".repeat(15000), "β".repeat(15000));
-    let raw = json!({"stdout":stdout,"stderr":"", "aggregated_output":stdout,
-        "session_id":19,"timed_out":false,"duration_ms":10,
-        "truncated":{"stdout":false,"stderr":false,"aggregated_output":false},
-        "output_stats":{"full_output_available":false}});
-    for (index, (proxy, log_source)) in [(false, false), (true, false), (false, true)]
-        .into_iter()
-        .enumerate()
-    {
-        let mut raw = raw.clone();
-        if log_source {
-            raw["stdout"] = "bounded native tail".into();
-            raw["aggregated_output"] = "bounded native tail".into();
-            raw["output_stats"] =
-                json!({"full_output_available":true,"truncation_method":"retained_output_log"});
-        }
-        let item_id = format!("saved-shell-{index}");
-        let name = "skill.fixture.shell";
-        let mut policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
-        policy.timeline = TimelineOutputPolicy::Summary { max_chars: 200 };
-        policy.storage = StorageOutputPolicy::Full {
-            max_bytes: 512 * 1024,
-        };
-        policy.llm = LlmOutputPolicy::Full { max_bytes: 4096 };
-        let kind = if proxy {
-            pioneer_tools::ToolOutputProjectionKind::DynamicFunctionProxy {
-                target_tool_name: name.into(),
-                target_policy: policy.clone(),
-                target_projection_kind: Box::new(
-                    pioneer_tools::ToolOutputProjectionKind::DynamicShell,
-                ),
-            }
-        } else {
-            pioneer_tools::ToolOutputProjectionKind::DynamicShell
-        };
-        let envelope = pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
-            call_id: &item_id,
-            tool_name: name,
-            arguments: &Value::Null,
-            raw_output_text: "UI",
-            raw_output_json: &raw,
-            success: true,
-            outcome: &pioneer_tools::ToolOutcome::ok(),
-            output_policy: &policy,
-            output_projection: &kind,
-        });
-        assert!(
-            matches!(&envelope.storage,pioneer_protocol::ToolStoragePayload::Shell { stdout:Some(text),.. } if text.contains(unique) != log_source)
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains(unique)
-        );
-        let item = TurnItem::DynamicToolCall {
-            id: item_id.clone(),
-            tool_name: name.into(),
-            arguments: json!({}),
-            status: ToolCallStatus::Completed,
-            execution_class: TurnItemExecutionClass::Standard,
-            recovery_policy: None,
-            output_policy: policy.clone(),
-            display: envelope.display.clone(),
-            storage: envelope.storage.clone(),
-            recovery: None,
-            success: Some(true),
-            outcome: None,
-            observation: None,
-        };
-        processor
-            .crud_store
-            .materialize_item_completed(
-                pioneer_protocol::ItemCompletedNotification {
-                    workspace_id: WORKSPACE_RED_ID.into(),
-                    thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                    turn_id: "shell-source-turn".into(),
-                    item,
-                },
-                1_800_000_000,
-            )
-            .await
-            .unwrap();
-        if log_source {
-            processor
-                .crud_store
-                .record_tool_output(
-                    &format!("native-source-{index}"),
-                    &pioneer_protocol::ItemDeltaNotification {
-                        workspace_id: WORKSPACE_RED_ID.into(),
-                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                        turn_id: "shell-source-turn".into(),
-                        item_id: item_id.clone(),
-                        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-                        delta: stdout.clone(),
-                        payload: None,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        if log_source {
-            // Crash after native failure terminal ACK, before canonical delivery.
-            let interrupted = format!("{item_id}-interrupted");
-            let controls = pioneer_tools::ToolResultView::Json {
-                value: json!({"retained_output_log":true,"retained_output_log_item":item_id,
-                    "output_stats":{"full_output_available":false,"truncation_method":"retained_output_log"}}),
-                truncated: false,
+    pioneer_postgres_test::with_database(async |test_database| {
+        async {
+            use pioneer_protocol::{
+                LlmOutputPolicy, StorageOutputPolicy, ThreadToolResultReadParams, TimelineOutputPolicy,
+                ToolCallStatus, ToolOutputPolicySnapshot, TurnItem, TurnItemExecutionClass,
             };
-            processor
-                .crud_store
-                .append_turn_llm_context(
-                    pioneer_crud::NewTurnLlmContextEntry {
-                        turn_id: "shell-source-turn".into(),
-                        item_id: Some(interrupted.clone()),
-                        attempt_id: None,
-                        sequence: 0,
-                        source: "shell_control_v1".into(),
-                        tool_name: Some(name.into()),
-                        payload: serde_json::to_string(&controls).unwrap(),
-                        output_policy_snapshot: serde_json::to_string(&policy).unwrap(),
-                        created_at: chrono::Utc::now().fixed_offset(),
-                        expires_at: None,
-                    },
-                    &format!("interrupted-controls-{index}"),
-                )
-                .await
-                .unwrap();
-            processor
-                .crud_store
-                .materialize_item_completed(
-                    pioneer_protocol::ItemCompletedNotification {
-                        workspace_id: WORKSPACE_RED_ID.into(),
-                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                        turn_id: "shell-source-turn".into(),
-                        item: TurnItem::DynamicToolCall {
-                            id: interrupted.clone(),
-                            tool_name: name.into(),
-                            arguments: json!({}),
-                            status: ToolCallStatus::Failed,
-                            execution_class: TurnItemExecutionClass::Standard,
-                            recovery_policy: None,
-                            output_policy: policy.clone(),
-                            display: pioneer_protocol::ToolDisplayPayload::Hidden,
-                            storage: pioneer_protocol::ToolStoragePayload::Shell {
-                                stdout: None,
-                                stderr: Some("cancelled after capture".into()),
-                                aggregated_output: None,
-                                exit_code: None,
-                                duration_ms: None,
-                                timed_out: None,
-                                truncated: true,
-                            },
-                            recovery: None,
-                            success: Some(false),
-                            outcome: None,
-                            observation: None,
+            let (harness, processor) = fixture(test_database).await;
+            harness.database.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,initiated_by_actor_kind,initiated_by_actor_id,created_at,updated_at) VALUES ('shell-source-turn',$1,'completed','conversation','user','principal',$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [THREAD_RED_PRIVATE_A_ID.into(), MEMBER_A_ID.into()])).await.unwrap();
+            let unique = "UNIQUE_MIDDLE_FRAGMENT_FOR_SAVED_READER";
+            let stdout = format!("{}{unique}{}", "α".repeat(15000), "β".repeat(15000));
+            let raw = json!({"stdout":stdout,"stderr":"", "aggregated_output":stdout,
+                "session_id":19,"timed_out":false,"duration_ms":10,
+                "truncated":{"stdout":false,"stderr":false,"aggregated_output":false},
+                "output_stats":{"full_output_available":false}});
+            for (index, (proxy, log_source)) in [(false, false), (true, false), (false, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut raw = raw.clone();
+                if log_source {
+                    raw["stdout"] = "bounded native tail".into();
+                    raw["aggregated_output"] = "bounded native tail".into();
+                    raw["output_stats"] =
+                        json!({"full_output_available":true,"truncation_method":"retained_output_log"});
+                }
+                let item_id = format!("saved-shell-{index}");
+                let name = "skill.fixture.shell";
+                let mut policy = ToolOutputPolicySnapshot::for_tool_name("exec_command");
+                policy.timeline = TimelineOutputPolicy::Summary { max_chars: 200 };
+                policy.storage = StorageOutputPolicy::Full {
+                    max_bytes: 512 * 1024,
+                };
+                policy.llm = LlmOutputPolicy::Full { max_bytes: 4096 };
+                let kind = if proxy {
+                    pioneer_tools::ToolOutputProjectionKind::DynamicFunctionProxy {
+                        target_tool_name: name.into(),
+                        target_policy: policy.clone(),
+                        target_projection_kind: Box::new(
+                            pioneer_tools::ToolOutputProjectionKind::DynamicShell,
+                        ),
+                    }
+                } else {
+                    pioneer_tools::ToolOutputProjectionKind::DynamicShell
+                };
+                let envelope = pioneer_tools::project_tool_result(pioneer_tools::ToolProjectionInput {
+                    call_id: &item_id,
+                    tool_name: name,
+                    arguments: &Value::Null,
+                    raw_output_text: "UI",
+                    raw_output_json: &raw,
+                    success: true,
+                    outcome: &pioneer_tools::ToolOutcome::ok(),
+                    output_policy: &policy,
+                    output_projection: &kind,
+                });
+                assert!(
+                    matches!(&envelope.storage,pioneer_protocol::ToolStoragePayload::Shell { stdout:Some(text),.. } if text.contains(unique) != log_source)
+                );
+                assert!(
+                    !serde_json::to_string(&envelope.display)
+                        .unwrap()
+                        .contains(unique)
+                );
+                let item = TurnItem::DynamicToolCall {
+                    id: item_id.clone(),
+                    tool_name: name.into(),
+                    arguments: json!({}),
+                    status: ToolCallStatus::Completed,
+                    execution_class: TurnItemExecutionClass::Standard,
+                    recovery_policy: None,
+                    output_policy: policy.clone(),
+                    display: envelope.display.clone(),
+                    storage: envelope.storage.clone(),
+                    recovery: None,
+                    success: Some(true),
+                    outcome: None,
+                    observation: None,
+                };
+                processor
+                    .crud_store
+                    .materialize_item_completed(
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: WORKSPACE_RED_ID.into(),
+                            thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                            turn_id: "shell-source-turn".into(),
+                            item,
                         },
-                    },
-                    1_800_000_001,
+                        1_800_000_000,
+                    )
+                    .await
+                    .unwrap();
+                if log_source {
+                    processor
+                        .crud_store
+                        .record_tool_output(
+                            &format!("native-source-{index}"),
+                            &pioneer_protocol::ItemDeltaNotification {
+                                workspace_id: WORKSPACE_RED_ID.into(),
+                                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                                turn_id: "shell-source-turn".into(),
+                                item_id: item_id.clone(),
+                                stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                                delta: stdout.clone(),
+                                payload: None,
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                if log_source {
+                    // Crash after native failure terminal ACK, before canonical delivery.
+                    let interrupted = format!("{item_id}-interrupted");
+                    let controls = pioneer_tools::ToolResultView::Json {
+                        value: json!({"retained_output_log":true,"retained_output_log_item":item_id,
+                            "output_stats":{"full_output_available":false,"truncation_method":"retained_output_log"}}),
+                        truncated: false,
+                    };
+                    processor
+                        .crud_store
+                        .append_turn_llm_context(
+                            pioneer_crud::NewTurnLlmContextEntry {
+                                turn_id: "shell-source-turn".into(),
+                                item_id: Some(interrupted.clone()),
+                                attempt_id: None,
+                                sequence: 0,
+                                source: "shell_control_v1".into(),
+                                tool_name: Some(name.into()),
+                                payload: serde_json::to_string(&controls).unwrap(),
+                                output_policy_snapshot: serde_json::to_string(&policy).unwrap(),
+                                created_at: chrono::Utc::now().fixed_offset(),
+                                expires_at: None,
+                            },
+                            &format!("interrupted-controls-{index}"),
+                        )
+                        .await
+                        .unwrap();
+                    processor
+                        .crud_store
+                        .materialize_item_completed(
+                            pioneer_protocol::ItemCompletedNotification {
+                                workspace_id: WORKSPACE_RED_ID.into(),
+                                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                                turn_id: "shell-source-turn".into(),
+                                item: TurnItem::DynamicToolCall {
+                                    id: interrupted.clone(),
+                                    tool_name: name.into(),
+                                    arguments: json!({}),
+                                    status: ToolCallStatus::Failed,
+                                    execution_class: TurnItemExecutionClass::Standard,
+                                    recovery_policy: None,
+                                    output_policy: policy.clone(),
+                                    display: pioneer_protocol::ToolDisplayPayload::Hidden,
+                                    storage: pioneer_protocol::ToolStoragePayload::Shell {
+                                        stdout: None,
+                                        stderr: Some("cancelled after capture".into()),
+                                        aggregated_output: None,
+                                        exit_code: None,
+                                        duration_ms: None,
+                                        timed_out: None,
+                                        truncated: true,
+                                    },
+                                    recovery: None,
+                                    success: Some(false),
+                                    outcome: None,
+                                    observation: None,
+                                },
+                            },
+                            1_800_000_001,
+                        )
+                        .await
+                        .unwrap();
+                    processor
+                        .crud_store
+                        .record_tool_output(
+                            &format!("interrupted-output-{index}"),
+                            &pioneer_protocol::ItemDeltaNotification {
+                                workspace_id: WORKSPACE_RED_ID.into(),
+                                thread_id: THREAD_RED_PRIVATE_A_ID.into(),
+                                turn_id: "shell-source-turn".into(),
+                                item_id: interrupted.clone(),
+                                stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+                                delta: stdout.clone(),
+                                payload: None,
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let (_, recovered) = crate::compaction::recover_undelivered_shell_outcome(
+                        &processor.crud_store,
+                        WORKSPACE_RED_ID,
+                        THREAD_RED_PRIVATE_A_ID,
+                        "shell-source-turn",
+                        &interrupted,
+                        "interrupted-provider-call",
+                        name,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let recovered_value: Value = serde_json::from_str(&recovered.content).unwrap();
+                    assert_eq!(
+                        recovered_value["saved_source"]["reference"]["output_log"],
+                        true
+                    );
+                    assert_eq!(
+                        recovered_value["output_stats"]["full_output_available"],
+                        false
+                    );
+                    assert_eq!(
+                        recovered_value["saved_source"]["reference"]["item_id"],
+                        item_id
+                    );
+                    assert!(!recovered.content.contains(unique));
+                    let (_, replayed) = crate::compaction::recover_undelivered_shell_outcome(
+                        &processor.crud_store,
+                        WORKSPACE_RED_ID,
+                        THREAD_RED_PRIVATE_A_ID,
+                        "shell-source-turn",
+                        &interrupted,
+                        "interrupted-provider-call",
+                        name,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(replayed, recovered);
+                }
+                let mut reference = json!({"workspace_id":WORKSPACE_RED_ID,"thread_id":THREAD_RED_PRIVATE_A_ID,
+                    "turn_id":"shell-source-turn","item_id":item_id});
+                let mut model_message = envelope
+                    .to_model_input_item("provider-call", name)
+                    .into_chat_message();
+                if log_source {
+                    // Host attestation is supplied only after the real saved chunk ACK.
+                    model_message.application_context = Some(json!({"retained_output_log":true}));
+                }
+                let compact = pioneer_agent::compaction::recovered_shell_result_message(
+                    model_message,
+                    &policy,
+                    true,
+                    &reference.to_string(),
                 )
-                .await
                 .unwrap();
-            processor
-                .crud_store
-                .record_tool_output(
-                    &format!("interrupted-output-{index}"),
-                    &pioneer_protocol::ItemDeltaNotification {
-                        workspace_id: WORKSPACE_RED_ID.into(),
-                        thread_id: THREAD_RED_PRIVATE_A_ID.into(),
-                        turn_id: "shell-source-turn".into(),
-                        item_id: interrupted.clone(),
-                        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
-                        delta: stdout.clone(),
-                        payload: None,
-                        markdown: None,
-                        markdown_version: None,
-                    },
+                let model: Value = serde_json::from_str(&compact.content).unwrap();
+                assert!(!compact.content.contains(unique));
+                assert!(model.get("aggregated_output").is_none());
+                assert_eq!(model["session_id"], 19);
+                if log_source {
+                    reference["output_log"] = true.into();
+                }
+                assert_eq!(model["saved_source"]["reference"], reference);
+                assert_eq!(model["output_stats"]["full_output_available"], log_source);
+                let payload = serde_json::to_string(&pioneer_tools::ToolResultView::Json {
+                    value: serde_json::to_value(&compact).unwrap(),
+                    truncated: false,
+                })
+                .unwrap();
+                processor
+                    .crud_store
+                    .append_turn_llm_context(
+                        pioneer_crud::NewTurnLlmContextEntry {
+                            turn_id: "shell-source-turn".into(),
+                            item_id: Some(item_id.clone()),
+                            attempt_id: None,
+                            sequence: 0,
+                            source: "tool_result_v2".into(),
+                            tool_name: Some(name.into()),
+                            payload: payload.clone(),
+                            output_policy_snapshot: serde_json::to_string(&policy).unwrap(),
+                            created_at: chrono::Utc::now().fixed_offset(),
+                            expires_at: None,
+                        },
+                        &format!("saved-shell-delivery-{index}"),
+                    )
+                    .await
+                    .unwrap();
+                let saved = processor
+                    .crud_store
+                    .list_turn_llm_context("shell-source-turn")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.item_id.as_deref() == Some(item_id.as_str()))
+                    .unwrap();
+                let view: pioneer_tools::ToolResultView = serde_json::from_str(&saved.payload).unwrap();
+                let pioneer_tools::ToolResultView::Json { value, .. } = view else {
+                    panic!("canonical view");
+                };
+                let restored: pioneer_provider::ChatMessage = serde_json::from_value(value).unwrap();
+                let restored = pioneer_agent::compaction::restored_tool_result_message(
+                    &restored,
+                    &reference.to_string(),
                 )
-                .await
                 .unwrap();
-            let (_, recovered) = crate::compaction::recover_undelivered_shell_outcome(
-                &processor.crud_store,
-                WORKSPACE_RED_ID,
-                THREAD_RED_PRIVATE_A_ID,
-                "shell-source-turn",
-                &interrupted,
-                "interrupted-provider-call",
-                name,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let recovered_value: Value = serde_json::from_str(&recovered.content).unwrap();
-            assert_eq!(
-                recovered_value["saved_source"]["reference"]["output_log"],
-                true
-            );
-            assert_eq!(
-                recovered_value["output_stats"]["full_output_available"],
-                false
-            );
-            assert_eq!(
-                recovered_value["saved_source"]["reference"]["item_id"],
-                item_id
-            );
-            assert!(!recovered.content.contains(unique));
-            let (_, replayed) = crate::compaction::recover_undelivered_shell_outcome(
-                &processor.crud_store,
-                WORKSPACE_RED_ID,
-                THREAD_RED_PRIVATE_A_ID,
-                "shell-source-turn",
-                &interrupted,
-                "interrupted-provider-call",
-                name,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(replayed, recovered);
-        }
-        let mut reference = json!({"workspace_id":WORKSPACE_RED_ID,"thread_id":THREAD_RED_PRIVATE_A_ID,
-            "turn_id":"shell-source-turn","item_id":item_id});
-        let mut model_message = envelope
-            .to_model_input_item("provider-call", name)
-            .into_chat_message();
-        if log_source {
-            // Host attestation is supplied only after the real saved chunk ACK.
-            model_message.application_context = Some(json!({"retained_output_log":true}));
-        }
-        let compact = pioneer_agent::compaction::recovered_shell_result_message(
-            model_message,
-            &policy,
-            true,
-            &reference.to_string(),
-        )
-        .unwrap();
-        let model: Value = serde_json::from_str(&compact.content).unwrap();
-        assert!(!compact.content.contains(unique));
-        assert!(model.get("aggregated_output").is_none());
-        assert_eq!(model["session_id"], 19);
-        if log_source {
-            reference["output_log"] = true.into();
-        }
-        assert_eq!(model["saved_source"]["reference"], reference);
-        assert_eq!(model["output_stats"]["full_output_available"], log_source);
-        let payload = serde_json::to_string(&pioneer_tools::ToolResultView::Json {
-            value: serde_json::to_value(&compact).unwrap(),
-            truncated: false,
-        })
-        .unwrap();
-        processor
-            .crud_store
-            .append_turn_llm_context(
-                pioneer_crud::NewTurnLlmContextEntry {
+                assert_eq!(restored, compact);
+                // Later context preparation may have room for controls but not the
+                // optional saved locator. Durable canonical bytes must stay intact.
+                let mut mandatory = model.clone();
+                mandatory.as_object_mut().unwrap().remove("saved_source");
+                mandatory["stdout"] = "".into();
+                mandatory["truncated"]["stdout"] = true.into();
+                mandatory["model_output_truncated"] = true.into();
+                let mut mandatory_message = restored.clone();
+                mandatory_message.content = serde_json::to_string(&mandatory).unwrap();
+                let smaller_budget =
+                    pioneer_compaction::text_tokens(&serde_json::to_string(&mandatory_message).unwrap());
+                let mut with_locator = mandatory_message.clone();
+                mandatory["saved_source"] = model["saved_source"].clone();
+                with_locator.content = serde_json::to_string(&mandatory).unwrap();
+                assert!(
+                    pioneer_compaction::text_tokens(&serde_json::to_string(&with_locator).unwrap())
+                        > smaller_budget
+                );
+                let smaller = pioneer_agent::compaction::restored_tool_result_with_budget(
+                    &restored,
+                    &reference.to_string(),
+                    smaller_budget,
+                )
+                .unwrap();
+                let smaller_value: Value = serde_json::from_str(&smaller.content).unwrap();
+                assert!(smaller_value.get("saved_source").is_none());
+                assert_eq!(smaller_value["session_id"], 19);
+                assert_eq!(smaller_value["timed_out"], false);
+                assert_eq!(smaller_value["tool_outcome"], model["tool_outcome"]);
+                assert!(
+                    pioneer_compaction::text_tokens(&serde_json::to_string(&smaller).unwrap())
+                        <= smaller_budget
+                );
+                assert!(
+                    pioneer_agent::compaction::restored_tool_result_with_budget(
+                        &restored,
+                        &reference.to_string(),
+                        8
+                    )
+                    .is_err()
+                );
+                let mut params = ThreadToolResultReadParams {
+                    workspace_id: model["saved_source"]["reference"]["workspace_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    thread_id: model["saved_source"]["reference"]["thread_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
                     turn_id: "shell-source-turn".into(),
-                    item_id: Some(item_id.clone()),
-                    attempt_id: None,
-                    sequence: 0,
-                    source: "tool_result_v2".into(),
-                    tool_name: Some(name.into()),
-                    payload: payload.clone(),
-                    output_policy_snapshot: serde_json::to_string(&policy).unwrap(),
-                    created_at: chrono::Utc::now().fixed_offset(),
-                    expires_at: None,
-                },
-                &format!("saved-shell-delivery-{index}"),
-            )
-            .await
-            .unwrap();
-        let saved = processor
-            .crud_store
-            .list_turn_llm_context("shell-source-turn")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|row| row.item_id.as_deref() == Some(item_id.as_str()))
-            .unwrap();
-        let view: pioneer_tools::ToolResultView = serde_json::from_str(&saved.payload).unwrap();
-        let pioneer_tools::ToolResultView::Json { value, .. } = view else {
-            panic!("canonical view");
-        };
-        let restored: pioneer_provider::ChatMessage = serde_json::from_value(value).unwrap();
-        let restored = pioneer_agent::compaction::restored_tool_result_message(
-            &restored,
-            &reference.to_string(),
-        )
-        .unwrap();
-        assert_eq!(restored, compact);
-        // Later context preparation may have room for controls but not the
-        // optional saved locator. Durable canonical bytes must stay intact.
-        let mut mandatory = model.clone();
-        mandatory.as_object_mut().unwrap().remove("saved_source");
-        mandatory["stdout"] = "".into();
-        mandatory["truncated"]["stdout"] = true.into();
-        mandatory["model_output_truncated"] = true.into();
-        let mut mandatory_message = restored.clone();
-        mandatory_message.content = serde_json::to_string(&mandatory).unwrap();
-        let smaller_budget =
-            pioneer_compaction::text_tokens(&serde_json::to_string(&mandatory_message).unwrap());
-        let mut with_locator = mandatory_message.clone();
-        mandatory["saved_source"] = model["saved_source"].clone();
-        with_locator.content = serde_json::to_string(&mandatory).unwrap();
-        assert!(
-            pioneer_compaction::text_tokens(&serde_json::to_string(&with_locator).unwrap())
-                > smaller_budget
-        );
-        let smaller = pioneer_agent::compaction::restored_tool_result_with_budget(
-            &restored,
-            &reference.to_string(),
-            smaller_budget,
-        )
-        .unwrap();
-        let smaller_value: Value = serde_json::from_str(&smaller.content).unwrap();
-        assert!(smaller_value.get("saved_source").is_none());
-        assert_eq!(smaller_value["session_id"], 19);
-        assert_eq!(smaller_value["timed_out"], false);
-        assert_eq!(smaller_value["tool_outcome"], model["tool_outcome"]);
-        assert!(
-            pioneer_compaction::text_tokens(&serde_json::to_string(&smaller).unwrap())
-                <= smaller_budget
-        );
-        assert!(
-            pioneer_agent::compaction::restored_tool_result_with_budget(
-                &restored,
-                &reference.to_string(),
-                8
-            )
-            .is_err()
-        );
-        let mut params = ThreadToolResultReadParams {
-            workspace_id: model["saved_source"]["reference"]["workspace_id"]
-                .as_str()
-                .unwrap()
-                .into(),
-            thread_id: model["saved_source"]["reference"]["thread_id"]
-                .as_str()
-                .unwrap()
-                .into(),
-            turn_id: "shell-source-turn".into(),
-            item_id: item_id.clone(),
-            cursor: None,
-            max_tokens: Some(8192),
-            max_bytes: Some(32768),
-            output_log: log_source,
-        };
-        let mut complete = String::new();
-        loop {
-            let page = processor
-                .read_thread_tool_result(params.clone())
-                .await
-                .unwrap();
-            complete.push_str(&page.text);
-            params.cursor = page.next;
-            if page.eof {
-                break;
+                    item_id: item_id.clone(),
+                    cursor: None,
+                    max_tokens: Some(8192),
+                    max_bytes: Some(32768),
+                    output_log: log_source,
+                };
+                let mut complete = String::new();
+                loop {
+                    let page = processor
+                        .read_thread_tool_result(params.clone())
+                        .await
+                        .unwrap();
+                    complete.push_str(&page.text);
+                    params.cursor = page.next;
+                    if page.eof {
+                        break;
+                    }
+                }
+                assert!(
+                    complete.contains(unique),
+                    "reader must retrieve the omitted middle from storage, not canonical replay"
+                );
+                let after = processor
+                    .crud_store
+                    .list_turn_llm_context("shell-source-turn")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.item_id.as_deref() == Some(item_id.as_str()))
+                    .unwrap();
+                assert_eq!(after.payload, payload);
+                params.cursor = None;
+                params.workspace_id = "foreign".into();
+                assert!(processor.read_thread_tool_result(params).await.is_err());
             }
-        }
-        assert!(
-            complete.contains(unique),
-            "reader must retrieve the omitted middle from storage, not canonical replay"
-        );
-        let after = processor
-            .crud_store
-            .list_turn_llm_context("shell-source-turn")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|row| row.item_id.as_deref() == Some(item_id.as_str()))
-            .unwrap();
-        assert_eq!(after.payload, payload);
-        params.cursor = None;
-        params.workspace_id = "foreign".into();
-        assert!(processor.read_thread_tool_result(params).await.is_err());
-    }
+        }.await;
+        Ok(())
+    }).await.unwrap();
 }

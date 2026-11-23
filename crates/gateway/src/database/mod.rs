@@ -3,15 +3,9 @@ pub(crate) mod attribution;
 mod connection;
 pub(crate) mod maintenance;
 pub(crate) mod startup;
-mod zstd_column;
-
-#[cfg(test)]
-pub(crate) use zstd_column::compress_history_payloads_for_test;
 
 pub(crate) use admission::{read_observer, write_observer};
-#[cfg(test)]
-pub(crate) use connection::initialize;
 pub(crate) use connection::{
-    gateway_database_path, initialize_existing_for_operations, initialize_with_startup,
-    inspect_applied_migration_names, read_existing_for_operations,
+    OperatorAccess, initialize_with_startup, inspect_applied_migration_names,
+    lock_gateway_database_owner, with_existing_database,
 };

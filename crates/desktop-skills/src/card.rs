@@ -1,4 +1,4 @@
-use gpui_kit::component::{theme::ActiveTheme, *};
+use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::{prelude::*, *};
 use pioneer_client::skills::{presentation as skill_presentation, types::SkillListItem};
 
@@ -13,9 +13,8 @@ pub(crate) struct SkillCard {
     status_color: Hsla,
     pending: bool,
 }
-impl SkillCard {
-    pub const HEIGHT: f32 = pioneer_desktop_foundation::CatalogCard::HEIGHT;
 
+impl SkillCard {
     pub fn new(skill: &SkillListItem, cx: &mut App) -> Self {
         let summary = skill_presentation::skill_summary_presentation(skill);
         Self {

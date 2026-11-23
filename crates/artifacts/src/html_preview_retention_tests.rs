@@ -1,9 +1,9 @@
-// Included in the existing service fixture module. Execution requires review.
+// Included in the artifact service test module.
 
 use sea_orm::{DbBackend, Statement};
 
-async fn preview_fixture() -> TestHarness {
-    let harness = setup().await;
+async fn preview_fixture(database: &TestDatabase) -> TestHarness {
+    let harness = setup(database).await;
     let db = harness.store.database_connection();
     db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('preview-thread','ws_a','','agent','fixture','fixture','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     db.execute_unprepared("INSERT INTO turn(id,thread_id,status,created_at,updated_at) VALUES('preview-turn','preview-thread','in_progress',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
@@ -29,17 +29,41 @@ fn preview_request(index: &str, bytes: Vec<u8>) -> IngestArtifactBytesRequest {
 }
 
 async fn preview_maintenance(service: &ArtifactService) {
+    use pioneer_crud::HtmlPreviewIoOutcome;
     let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+    let store = service.store.with_maintenance_access();
     // A retirement can occur after this pass's blob EOF. The next pass must
     // discover that newly durable orphan without depending on cursor ordering.
     for _ in 0..2 {
         let mut idle = false;
         for _ in 0..128 {
+            let now = Utc::now().timestamp_millis();
+            let claim = store
+                .claim_html_preview_io_work(now, 300_000)
+                .await
+                .unwrap();
+            if let Some(claim) = &claim {
+                if claim.row.family == "copies" {
+                    service
+                        .cleanup_claimed_html_preview_copy(claim)
+                        .await
+                        .unwrap();
+                } else {
+                    // The Gateway compaction worker owns witness verification.
+                    assert!(
+                        store
+                            .defer_html_preview_io_work(claim, HtmlPreviewIoOutcome::Retry, now)
+                            .await
+                            .unwrap()
+                    );
+                }
+            }
             if service
                 .html_preview_maintenance_outcome(&mut progress)
                 .await
                 .unwrap()
                 != crate::HtmlPreviewMaintenanceOutcome::More
+                && claim.is_none()
             {
                 idle = true;
                 break;
@@ -51,7 +75,8 @@ async fn preview_maintenance(service: &ArtifactService) {
 
 #[tokio::test]
 async fn html_preview_lists_filter_before_identity_pagination_and_preserve_publications() {
-    let harness = preview_fixture().await;
+    with_database(async |database| {
+    let harness = preview_fixture(database).await;
     let mut visible = std::collections::BTreeSet::new();
     let mut all_ids = Vec::new();
     for index in 0..6 {
@@ -210,6 +235,8 @@ async fn html_preview_lists_filter_before_identity_pagination_and_preserve_publi
             .iter()
             .any(|s| s.artifact.artifact_id == adopted.artifact.artifact_id)
     );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
@@ -219,8 +246,9 @@ async fn html_preview_active_delivery_frozen_context_and_copies_release_both_for
 }
 
 async fn preview_release_after_owners(six_frames: bool) {
+    with_database(async |database| {
     use pioneer_provider::{ChatMessage, MessageContentPart};
-    let mut harness = preview_fixture().await;
+    let mut harness = preview_fixture(database).await;
     harness.service.gc_policy.grace_secs = 0;
     let mut source_request = preview_request("input", b"<html>source</html>".to_vec());
     if six_frames {
@@ -383,7 +411,7 @@ async fn preview_release_after_owners(six_frames: bool) {
     // An abort in the middle of version retirement rolls the canonical archive
     // and every logical owner back together; no file deletion is yet eligible.
     let failing_index = if six_frames { "dark-768" } else { "768" };
-    harness.store.database_connection().execute_unprepared(&format!("CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version WHEN EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND json_extract(a.metadata_json,'$.htmlTool.index')='{failing_index}') BEGIN SELECT RAISE(ABORT,'fixture release rollback'); END")).await.unwrap();
+    harness.store.database_connection().execute_unprepared(&format!("CREATE FUNCTION fail_preview_release() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS(SELECT 1 FROM artifact a WHERE a.id=OLD.artifact_id AND a.created_by_actor_id='html_preview' AND a.metadata_json::json #>> '{{htmlTool,index}}'='{failing_index}') THEN RAISE EXCEPTION 'fixture release rollback'; END IF; RETURN OLD; END; $$; CREATE TRIGGER fail_preview_release BEFORE DELETE ON artifact_version FOR EACH ROW EXECUTE FUNCTION fail_preview_release()")).await.unwrap();
     let mut rollback_progress = crate::HtmlPreviewMaintenanceProgress::default();
     let mut rolled_back = false;
     for _ in 0..64 {
@@ -402,7 +430,7 @@ async fn preview_release_after_owners(six_frames: bool) {
         .store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT COUNT(*) n FROM html_preview_io_work WHERE family='copies'",
         ))
         .await
@@ -429,7 +457,7 @@ async fn preview_release_after_owners(six_frames: bool) {
     harness
         .store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_preview_release")
+        .execute_unprepared("DROP TRIGGER fail_preview_release ON artifact_version")
         .await
         .unwrap();
     preview_maintenance(&harness.service).await;
@@ -473,6 +501,8 @@ async fn preview_release_after_owners(six_frames: bool) {
         harness.service.blob_store.clone(),
     ))
     .await;
+    Ok(())
+    }).await.unwrap();
 }
 
 struct PreviewDeletionGate {
@@ -576,7 +606,8 @@ impl ArtifactBlobStore for PreviewDeletionGate {
 
 #[tokio::test]
 async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_restart() {
-    let mut harness = preview_fixture().await;
+    with_database(async |database| {
+    let mut harness = preview_fixture(database).await;
     let storage = Arc::new(PreviewDeletionGate {
         local: LocalArtifactBlobStore::new(harness._temp.path()),
         fail_once: AtomicBool::new(false),
@@ -764,7 +795,7 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
 
     // Failed ordinary registration follows a different production cleanup path
     // from GC. Cancel its caller after unlink has actually been dispatched.
-    harness.store.database_connection().execute_unprepared("CREATE TRIGGER fail_cancel_registration BEFORE INSERT ON artifact BEGIN SELECT RAISE(ABORT,'fixture registration failure'); END").await.unwrap();
+    harness.store.database_connection().execute_unprepared("CREATE FUNCTION fail_cancel_registration() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture registration failure'; END; $$; CREATE TRIGGER fail_cancel_registration BEFORE INSERT ON artifact FOR EACH ROW EXECUTE FUNCTION fail_cancel_registration()").await.unwrap();
     storage.late_once.store(true, Ordering::SeqCst);
     let failed_service = harness.service.clone();
     let failed = tokio::spawn(async move {
@@ -789,7 +820,7 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
     harness
         .store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER fail_cancel_registration")
+        .execute_unprepared("DROP TRIGGER fail_cancel_registration ON artifact")
         .await
         .unwrap();
     let next_service = harness.service.clone();
@@ -886,7 +917,7 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
         .blob_path("ws_a", &staged.storage_key)
         .unwrap();
     assert!(staged_path.exists());
-    harness.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE artifact_blob SET created_at='2000-01-01 00:00:00+00:00' WHERE storage_key IN (?1,?2)",[ordinary.storage_key.clone().into(),staged.storage_key.clone().into()])).await.unwrap();
+    harness.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,"UPDATE artifact_blob SET created_at='2000-01-01 00:00:00+00:00' WHERE storage_key IN ($1,$2)",[ordinary.storage_key.clone().into(),staged.storage_key.clone().into()])).await.unwrap();
     preview_maintenance(&harness.service).await;
     assert!(!staged_path.exists());
     assert!(
@@ -904,12 +935,15 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
             .exists(),
         "permanent shared owner remains readable"
     );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn html_preview_quiescent_pass_reaches_idle_and_discovers_later_preview() {
+    with_database(async |database| {
     use sha2::{Digest, Sha256};
-    let mut harness = preview_fixture().await;
+    let mut harness = preview_fixture(database).await;
     harness.service.gc_policy.grace_secs = 0;
     // One indexed frozen header and 17 referenced blobs deliberately give
     // the independent traversals different EOF phases at page size sixteen.
@@ -990,6 +1024,8 @@ async fn html_preview_quiescent_pass_reaches_idle_and_discovers_later_preview() 
         assert!(idle);
     }
     assert!(!path.exists());
+        Ok(())
+    }).await.unwrap();
 }
 
 // Capture-layout validation is a retention boundary: ambiguous/mixed siblings
@@ -1010,51 +1046,56 @@ async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups()
             "unexpected",
         ],
     ] {
-        let harness = preview_fixture().await;
-        let mut summaries = Vec::new();
-        for (ordinal, index) in indices.iter().enumerate() {
-            let mut request = preview_request(index, vec![ordinal as u8]);
-            if *index != "360" {
-                request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
-            }
-            summaries.push(harness.service.ingest_bytes(request).await.unwrap());
-        }
-        harness
-            .store
-            .database_connection()
-            .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
-            .await
-            .unwrap();
-        let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
-        let mut rejected = false;
-        for _ in 0..128 {
-            match harness
-                .service
-                .html_preview_maintenance_quantum(&mut progress)
-                .await
-            {
-                Err(_) => {
-                    rejected = true;
-                    break;
+        with_database(async |database| {
+            let harness = preview_fixture(database).await;
+            let mut summaries = Vec::new();
+            for (ordinal, index) in indices.iter().enumerate() {
+                let mut request = preview_request(index, vec![ordinal as u8]);
+                if *index != "360" {
+                    request.metadata.get_mut("htmlTool").unwrap()["version"] = json!(2);
                 }
-                Ok(false) => break,
-                Ok(true) => {}
+                summaries.push(harness.service.ingest_bytes(request).await.unwrap());
             }
-        }
-        assert!(rejected, "ambiguous capture group must be preserved");
-        for summary in summaries {
-            assert!(
-                harness
-                    .store
-                    .get_artifact_version_blob(
-                        "ws_a",
-                        &summary.artifact.artifact_id,
-                        summary.artifact.version_id.as_deref(),
-                    )
+            harness
+                .store
+                .database_connection()
+                .execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
+                .await
+                .unwrap();
+            let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+            let mut rejected = false;
+            for _ in 0..128 {
+                match harness
+                    .service
+                    .html_preview_maintenance_quantum(&mut progress)
                     .await
-                    .is_ok()
-            );
-        }
+                {
+                    Err(_) => {
+                        rejected = true;
+                        break;
+                    }
+                    Ok(false) => break,
+                    Ok(true) => {}
+                }
+            }
+            assert!(rejected, "ambiguous capture group must be preserved");
+            for summary in summaries {
+                assert!(
+                    harness
+                        .store
+                        .get_artifact_version_blob(
+                            "ws_a",
+                            &summary.artifact.artifact_id,
+                            summary.artifact.version_id.as_deref(),
+                        )
+                        .await
+                        .is_ok()
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -1062,125 +1103,152 @@ async fn html_preview_retention_preserves_mixed_duplicate_and_oversized_groups()
 // and a release that happens before the worker waits must remain observable.
 #[tokio::test]
 async fn preview_contention_defers_and_release_is_retained_after_unlock() {
-    let harness = preview_fixture().await;
-    let activity = harness.service.html_preview_activity_signaled().await;
-    let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
-    assert_eq!(
-        harness
-            .service
-            .html_preview_maintenance_outcome(&mut progress)
-            .await
-            .unwrap(),
-        crate::HtmlPreviewMaintenanceOutcome::Deferred,
-    );
-    drop(activity);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        harness.service.html_preview_release_notified(),
-    )
+    with_database(async |database| {
+        let harness = preview_fixture(database).await;
+        let activity = harness.service.html_preview_activity_signaled().await;
+        let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
+        assert_eq!(
+            harness
+                .service
+                .html_preview_maintenance_outcome(&mut progress)
+                .await
+                .unwrap(),
+            crate::HtmlPreviewMaintenanceOutcome::Deferred,
+        );
+        drop(activity);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            harness.service.html_preview_release_notified(),
+        )
+        .await
+        .expect("release hint survives until maintenance waits");
+        // A stale 'finished' flag would skip the retirement traversal on resume.
+        let request = preview_request("input", b"<html>deferred</html>".to_vec());
+        harness.service.ingest_bytes(request).await.unwrap();
+        assert_ne!(
+            harness
+                .service
+                .html_preview_maintenance_outcome(&mut progress)
+                .await
+                .unwrap(),
+            crate::HtmlPreviewMaintenanceOutcome::Deferred,
+        );
+        Ok(())
+    })
     .await
-    .expect("release hint survives until maintenance waits");
-    // A stale 'finished' flag would skip the retirement traversal on resume.
-    let request = preview_request("input", b"<html>deferred</html>".to_vec());
-    harness.service.ingest_bytes(request).await.unwrap();
-    assert_ne!(
-        harness
-            .service
-            .html_preview_maintenance_outcome(&mut progress)
-            .await
-            .unwrap(),
-        crate::HtmlPreviewMaintenanceOutcome::Deferred,
-    );
+    .unwrap();
 }
 
 #[tokio::test]
 async fn released_copy_cleanup_without_local_root_is_deferred() {
-    let harness = preview_fixture().await;
-    let service = ArtifactService::new(
-        harness.store.clone(),
-        Arc::new(FakeReadBlobStore {
-            storage_key: "unused".into(),
-            mode: FakeReadMode::Missing,
-        }),
-    );
-    let previous =
+    with_database(async |database| {
+        let harness = preview_fixture(database).await;
+        let service = ArtifactService::new(
+            harness.store.clone(),
+            Arc::new(FakeReadBlobStore {
+                storage_key: "unused".into(),
+                mode: FakeReadMode::Missing,
+            }),
+        );
+        let previous =
         json!({"htmlTool":{"retention":"released","releasedCopies":["/unavailable/copy.html"]}})
             .to_string();
-    assert!(
-        service
-            .prepare_html_preview_copy_cleanup("ws_a", &previous)
-            .await
-            .unwrap()
-            .is_none()
-    );
+        assert!(
+            service
+                .prepare_html_preview_copy_cleanup("ws_a", &previous)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn released_copy_partial_failure_retries_without_losing_remaining_paths() {
-    let harness = preview_fixture().await;
-    let root = harness.service.blob_store.local_artifact_root().unwrap();
-    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
-        .unwrap()
-        .join("partial");
-    tokio::fs::create_dir_all(&directory).await.unwrap();
-    let first = directory.join("one.html");
-    let second = directory.join("two.html");
-    tokio::fs::write(&first, "one").await.unwrap();
-    // A directory in place of a file causes a real, deterministic partial I/O
-    // failure after the first copy was removed.
-    tokio::fs::create_dir(&second).await.unwrap();
-    let previous =
-        json!({"htmlTool":{"retention":"released","releasedCopies":[first,second]}}).to_string();
-    assert!(
-        harness
+    with_database(async |database| {
+        let harness = preview_fixture(database).await;
+        let root = harness.service.blob_store.local_artifact_root().unwrap();
+        let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+            .unwrap()
+            .join("partial");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let first = directory.join("one.html");
+        let second = directory.join("two.html");
+        tokio::fs::write(&first, "one").await.unwrap();
+        // A directory in place of a file causes a real, deterministic partial I/O
+        // failure after the first copy was removed.
+        tokio::fs::create_dir(&second).await.unwrap();
+        let previous = json!({"htmlTool":{"retention":"released","releasedCopies":[first,second]}})
+            .to_string();
+        assert!(
+            harness
+                .service
+                .prepare_html_preview_copy_cleanup("ws_a", &previous)
+                .await
+                .is_err()
+        );
+        assert!(!first.exists());
+        assert!(second.exists());
+        tokio::fs::remove_dir(&second).await.unwrap();
+        tokio::fs::write(&second, "two").await.unwrap();
+        let prepared = harness
             .service
             .prepare_html_preview_copy_cleanup("ws_a", &previous)
             .await
-            .is_err()
-    );
-    assert!(!first.exists());
-    assert!(second.exists());
-    tokio::fs::remove_dir(&second).await.unwrap();
-    tokio::fs::write(&second, "two").await.unwrap();
-    let prepared = harness
-        .service
-        .prepare_html_preview_copy_cleanup("ws_a", &previous)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!second.exists());
-    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
-    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+            .unwrap()
+            .unwrap();
+        assert!(!second.exists());
+        let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn physical_copy_preparation_succeeds_with_disconnected_database() {
-    let harness = preview_fixture().await;
-    let service = ArtifactService::new(
-        Arc::new(CrudStore::new(sea_orm::DatabaseConnection::default())),
-        harness.service.blob_store.clone(),
-    );
-    let root = service.blob_store.local_artifact_root().unwrap();
-    let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
-        .unwrap()
-        .join("no-database");
-    tokio::fs::create_dir_all(&directory).await.unwrap();
-    let path = directory.join("frame.html");
-    tokio::fs::write(&path, "retired frame").await.unwrap();
-    let previous = json!({"htmlTool":{"retention":"released","releasedCopies":[path]}}).to_string();
-    let prepared = service
-        .prepare_html_preview_copy_cleanup("ws_a", &previous)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!path.exists());
-    let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
-    assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+    with_database(async |database| {
+        let harness = preview_fixture(database).await;
+        let writer = database.connect().await?;
+        let reader = database.connect_read_only().await?;
+        let store = CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
+            reader.clone(),
+            writer.clone(),
+        ));
+        reader.close().await?;
+        writer.close().await?;
+        let service = ArtifactService::new(Arc::new(store), harness.service.blob_store.clone());
+        let root = service.blob_store.local_artifact_root().unwrap();
+        let directory = crate::artifact_readable_copy_workspace_root(&root, "ws_a")
+            .unwrap()
+            .join("no-database");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("frame.html");
+        tokio::fs::write(&path, "retired frame").await.unwrap();
+        let previous =
+            json!({"htmlTool":{"retention":"released","releasedCopies":[path]}}).to_string();
+        let prepared = service
+            .prepare_html_preview_copy_cleanup("ws_a", &previous)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+        let metadata: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(metadata["htmlTool"]["releasedCopies"], json!([]));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn retirement_failure_retries_same_owner_after_eof_without_external_wake() {
-    let harness = preview_fixture().await;
+    with_database(async |database| {
+    let harness = preview_fixture(database).await;
     let preview = harness
         .service
         .ingest_bytes(preview_request("input", b"retry retirement".to_vec()))
@@ -1190,7 +1258,7 @@ async fn retirement_failure_retries_same_owner_after_eof_without_external_wake()
     db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='preview-turn'")
         .await
         .unwrap();
-    db.execute_unprepared("CREATE TRIGGER fail_single_retirement BEFORE DELETE ON artifact_version BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END").await.unwrap();
+    db.execute_unprepared("CREATE FUNCTION fail_single_retirement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture retirement failure'; END; $$; CREATE TRIGGER fail_single_retirement BEFORE DELETE ON artifact_version FOR EACH ROW EXECUTE FUNCTION fail_single_retirement()").await.unwrap();
     let mut progress = crate::HtmlPreviewMaintenanceProgress::default();
     let mut failed = false;
     for _ in 0..128 {
@@ -1205,7 +1273,7 @@ async fn retirement_failure_retries_same_owner_after_eof_without_external_wake()
         }
     }
     assert!(failed);
-    db.execute_unprepared("DROP TRIGGER fail_single_retirement")
+    db.execute_unprepared("DROP TRIGGER fail_single_retirement ON artifact_version")
         .await
         .unwrap();
     // DDL repair sends no domain wake. Retain the original cursors and drive
@@ -1238,11 +1306,14 @@ async fn retirement_failure_retries_same_owner_after_eof_without_external_wake()
             .await
             .is_err()
     );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn blob_retry_reaches_durable_deletion_while_activity_remains_held() {
-    let mut harness = preview_fixture().await;
+    with_database(async |database| {
+    let mut harness = preview_fixture(database).await;
     let storage = Arc::new(PreviewDeletionGate {
         local: LocalArtifactBlobStore::new(harness._temp.path()),
         fail_once: AtomicBool::new(false),
@@ -1295,7 +1366,7 @@ async fn blob_retry_reaches_durable_deletion_while_activity_remains_held() {
             .html_preview_maintenance_outcome(&mut progress)
             .await;
         let count: i64 = harness.store.database_connection().query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite, "SELECT COUNT(*) AS n FROM artifact_blob WHERE workspace_id='ws_a' AND storage_key=?",
+            DbBackend::Postgres, "SELECT COUNT(*) AS n FROM artifact_blob WHERE workspace_id='ws_a' AND storage_key=$1",
             [blob.storage_key.clone().into()],
         )).await.unwrap().unwrap().try_get("", "n").unwrap();
         if count == 0 {
@@ -1309,4 +1380,6 @@ async fn blob_retry_reaches_durable_deletion_while_activity_remains_held() {
     );
     assert!(!path.exists());
     drop(activity);
+        Ok(())
+    }).await.unwrap();
 }

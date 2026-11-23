@@ -93,6 +93,25 @@ impl Drop for ThreadCapabilityController {
 }
 
 impl ClientCore {
+    pub(super) fn refresh_thread_capabilities_after_promotion(&self, thread_id: &str) {
+        if self
+            .thread_capability_snapshot(thread_id)
+            .and_then(|publication| publication.snapshot.clone())
+            .is_some_and(|snapshot| snapshot.thread.is_some())
+        {
+            return;
+        }
+        // A draft has workspace creation authority but no persisted thread
+        // authority. Its in-flight or failed lookup cannot serve the first
+        // durable turn, even while the same composer remains mounted.
+        self.invalidate_thread_capabilities(Some(thread_id));
+        if self.active_thread_id().as_deref() == Some(thread_id) {
+            self.thread_capability_intent(ThreadCapabilityIntent::Observe {
+                thread_id: thread_id.to_owned(),
+            });
+        }
+    }
+
     pub fn thread_capability_snapshot(
         &self,
         thread_id: &str,

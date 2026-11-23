@@ -163,12 +163,12 @@ async fn serve_refresh(stream: tokio::net::TcpStream, now: u64, generation: &Ato
     socket.send(SocketMessage::Close(None)).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_push_crosses_socket_into_shared_client_without_tree_reload() {
     committed_push_client_fixture(false).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn hidden_task_cli_start_keeps_combined_sidebar_scope_without_client_recovery() {
     committed_push_client_fixture(true).await;
 }
@@ -223,7 +223,7 @@ async fn committed_push_client_fixture(hidden_cli_start: bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
         // Push scope cancellation can replace a pooled connection; keep the
         // schema on disk and exercise the Gateway's separate reader/writer pools.
-        let (_directory, workspaces, store, workspace) = setup_pooled_file_workspace_manager().await;
+        let (_directory, workspaces, store, workspace) = setup_pooled_workspace_manager().await;
         prepare_post_access_unread_fixture(&store, &workspace).await;
         let sessions = Arc::new(SessionManager::new());
         let (source_tx, mut source_wire_rx) = crate::session::test_support::outbound_channel(128);

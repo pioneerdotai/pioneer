@@ -1219,7 +1219,7 @@ impl MessageProcessor {
         if guard.is_some() || !self.tool_loop_config.skills.enabled {
             return;
         }
-        let this = self.with_database_class(SqliteWriteClass::Maintenance);
+        let this = self.with_database_class(PostgresWriteClass::Maintenance);
         let stop = CancellationToken::new();
         let worker_stop = stop.clone();
         let handle = tokio::spawn(async move {

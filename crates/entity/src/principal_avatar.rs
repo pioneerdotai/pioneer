@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "principal_avatar")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub principal_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub revision_id: String,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(
@@ -19,7 +19,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub principal_avatar_revision: HasOne<super::principal_avatar_revision::Entity>,
+    pub principal_avatar_revision: BelongsTo<super::principal_avatar_revision::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

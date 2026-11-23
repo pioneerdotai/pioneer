@@ -97,17 +97,10 @@ pub(super) async fn agent_avatar_route(
         .request_id()
         .cloned()
         .expect("native HTTP authentication always assigns a request ID");
-    let content = match path.avatar_revision.as_str() {
-        PIONEER_AGENT_AVATAR_REVISION => PIONEER_AGENT_AVATAR_BYTES,
-        CODEX_AGENT_AVATAR_REVISION => CODEX_AGENT_AVATAR_BYTES,
-        CLAUDE_AGENT_AVATAR_REVISION => CLAUDE_AGENT_AVATAR_BYTES,
-        OPENCODE_AGENT_AVATAR_LIGHT_REVISION => OPENCODE_AGENT_AVATAR_LIGHT_BYTES,
-        OPENCODE_AGENT_AVATAR_DARK_REVISION => OPENCODE_AGENT_AVATAR_DARK_BYTES,
-        _ => {
-            record_avatar_hidden(&request_id, "invalid_revision");
-            return Err(HttpError::not_found(request_id));
-        }
-    };
+    let content = system_agent_avatar(path.avatar_revision.as_str()).ok_or_else(|| {
+        record_avatar_hidden(&request_id, "invalid_revision");
+        HttpError::not_found(request_id.clone())
+    })?;
 
     avatar_representation_response(
         content,
@@ -119,7 +112,18 @@ pub(super) async fn agent_avatar_route(
     )
 }
 
-fn avatar_response(
+pub(super) fn system_agent_avatar(revision: &str) -> Option<&'static [u8]> {
+    Some(match revision {
+        PIONEER_AGENT_AVATAR_REVISION => PIONEER_AGENT_AVATAR_BYTES,
+        CODEX_AGENT_AVATAR_REVISION => CODEX_AGENT_AVATAR_BYTES,
+        CLAUDE_AGENT_AVATAR_REVISION => CLAUDE_AGENT_AVATAR_BYTES,
+        OPENCODE_AGENT_AVATAR_LIGHT_REVISION => OPENCODE_AGENT_AVATAR_LIGHT_BYTES,
+        OPENCODE_AGENT_AVATAR_DARK_REVISION => OPENCODE_AGENT_AVATAR_DARK_BYTES,
+        _ => return None,
+    })
+}
+
+pub(super) fn avatar_response(
     snapshot: MemberAvatarSnapshot,
     method: Method,
     request_headers: &HeaderMap,
@@ -135,7 +139,7 @@ fn avatar_response(
     )
 }
 
-fn map_avatar_error(error: MemberServiceError, request_id: RequestId) -> HttpError {
+pub(super) fn map_avatar_error(error: MemberServiceError, request_id: RequestId) -> HttpError {
     let kind = match error {
         MemberServiceError::Authorization(decision) => {
             match external_error_for_decision(&decision)

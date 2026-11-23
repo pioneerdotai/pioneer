@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "hook_run_attempt")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_hook_run_attempt_run_number")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_hook_run_attempt_run_number")]
     pub hook_run_id: String,
     #[sea_orm(unique_key = "uidx_hook_run_attempt_run_number")]
     pub attempt_number: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub contribution_count: i64,
     pub diagnostic_count: i64,
@@ -20,6 +21,7 @@ pub struct Model {
     pub contribution_hashes_json: String,
     #[sea_orm(column_type = "Text")]
     pub diagnostic_previews_json: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub error_code: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message_preview: Option<String>,

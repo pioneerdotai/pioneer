@@ -1,0 +1,29 @@
+[package]
+name = "pioneer-crud-timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-crud-artifacts.workspace = true
+pioneer-crud-conversations.workspace = true
+pioneer-crud-execution.workspace = true
+pioneer-crud-payloads.workspace = true
+pioneer-crud-tasks.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-postgres-pools.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+pioneer-crud-access = { workspace = true, features = ["test-support"] }
+pioneer-postgres-test.workspace = true
+tokio.workspace = true

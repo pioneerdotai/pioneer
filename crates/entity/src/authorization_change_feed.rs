@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub generation: i64,
-    pub change_kind: String,
     #[sea_orm(column_type = "Text")]
-    pub affected_scope_json: String,
+    pub change_kind: String,
+    pub affected_scope_json: Json,
     pub created_at: DateTimeWithTimeZone,
 }
 

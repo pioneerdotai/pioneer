@@ -126,6 +126,12 @@ pub trait Provider: Send + Sync {
             && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
     }
 
+    /// Whether this endpoint can retain tool definitions with an explicit
+    /// prohibition on new calls. Compatible transports opt in per endpoint.
+    fn keeps_tools_when_disabled(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Selects the native file-tool wire contract for this provider/model.
     /// The decision is provider-owned and fail-closed for unknown families;
     /// callers must use the same result for both catalog and prompt output.

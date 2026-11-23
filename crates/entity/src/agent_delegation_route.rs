@@ -7,21 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_delegation_route")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub source_execution_id: String,
+    #[sea_orm(column_type = "Text")]
     pub destination_thread_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_agent_identity_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub home_capsule_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub route_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub grant_fingerprint: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_capsule_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_capsule_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_gateway_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_gateway_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_identity_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_profile_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub allowed_actions_json: String,
@@ -32,10 +46,13 @@ pub struct Model {
     pub destination_policy_generation: i64,
     pub hop_count: i64,
     pub max_hops: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub return_route_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub authority_actor_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub authority_fingerprint: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -49,7 +66,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

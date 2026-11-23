@@ -17,10 +17,6 @@ use pioneer_client::skills::{
 use std::collections::HashSet;
 use std::rc::Rc;
 
-const INSTALLED_SKILL_CARD_HEIGHT: f32 = crate::SkillCard::HEIGHT;
-const INSTALLED_SKILL_ROW_GAP: f32 = 10.0;
-const INSTALLED_SKILL_ROW_HEIGHT: f32 = INSTALLED_SKILL_CARD_HEIGHT + INSTALLED_SKILL_ROW_GAP;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopSkillManagementRow {
     Standalone(SkillListItem),
@@ -287,27 +283,19 @@ impl SkillsCatalogView {
                                 )
                             })
                             .when(!management_rows.is_empty(), |this| {
-                                this.child(self.render_skill_management_virtual_list(
-                                    management_rows.clone(),
-                                    cx,
-                                ))
+                                this.child(self.render_skill_management_list(&management_rows))
                             }),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_skill_management_virtual_list(
-        &self,
-        rows: Rc<Vec<DesktopSkillManagementRow>>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let item_sizes = Rc::new(
-            (0..rows.len())
-                .map(|_| size(px(0.), px(INSTALLED_SKILL_ROW_HEIGHT)))
-                .collect::<Vec<_>>(),
-        );
-        let scroll_handle = self.skills_list_scroll_handle.clone();
+    fn render_skill_management_list(&self, rows: &[DesktopSkillManagementRow]) -> AnyElement {
+        let items: Vec<_> = rows
+            .iter()
+            .map(|row| self.rows.get(&row.identity()).cloned())
+            .collect();
+        let scroll_handle = self.skills_list_state.clone();
 
         div()
             .w_full()
@@ -315,22 +303,15 @@ impl SkillsCatalogView {
             .relative()
             .overflow_hidden()
             .child(
-                v_virtual_list(
-                    cx.entity(),
-                    "skills-installed-virtual-list",
-                    item_sizes,
-                    move |view, visible_range, _, _cx| {
-                        visible_range
-                            .filter_map(|ix| {
-                                rows.get(ix)
-                                    .and_then(|row| view.rows.get(&row.identity()))
-                                    .map(|row| row.clone().into_any_element())
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .with_sizing_behavior(ListSizingBehavior::Auto)
-                .track_scroll(&scroll_handle),
+                gpui_kit::list(scroll_handle.clone(), move |ix, _, _| {
+                    items
+                        .get(ix)
+                        .and_then(Option::as_ref)
+                        .map(|row| row.clone().into_any_element())
+                        .unwrap_or_else(|| div().into_any_element())
+                })
+                .size_full()
+                .with_sizing_behavior(ListSizingBehavior::Auto),
             )
             .child(
                 div()
@@ -354,8 +335,7 @@ impl SkillsCatalogView {
         v_flex()
             .id(identity)
             .w_full()
-            .h(px(INSTALLED_SKILL_ROW_HEIGHT))
-            .pb(px(INSTALLED_SKILL_ROW_GAP))
+            .pb_2p5()
             .cursor_pointer()
             .on_click({
                 let desktop_entity = desktop_entity.clone();
@@ -390,8 +370,7 @@ impl SkillsCatalogView {
         h_flex()
             .id(identity)
             .w_full()
-            .h(px(INSTALLED_SKILL_ROW_HEIGHT))
-            .pb(px(INSTALLED_SKILL_ROW_GAP))
+            .pb_2p5()
             .cursor_pointer()
             .on_click(move |_, _, cx| {
                 let _ = desktop_entity.update(cx, |view, cx| {
@@ -413,8 +392,8 @@ impl SkillsCatalogView {
             })
             .child(
                 h_flex()
+                    .id("skill-pack-card")
                     .w_full()
-                    .h(px(INSTALLED_SKILL_CARD_HEIGHT))
                     .pt_3()
                     .px_4()
                     .pb_3()
@@ -427,8 +406,7 @@ impl SkillsCatalogView {
                     .justify_between()
                     .child(
                         v_flex()
-                            .h_full()
-                            .justify_between()
+                            .gap_2()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -715,9 +693,23 @@ impl SkillsCatalogView {
             .iter()
             .map(DesktopSkillManagementRow::identity)
             .eq(rows.iter().map(DesktopSkillManagementRow::identity));
+        let previous_ids: Vec<_> = self
+            .management_rows
+            .iter()
+            .map(DesktopSkillManagementRow::identity)
+            .collect();
+        let next_ids: Vec<_> = rows
+            .iter()
+            .map(DesktopSkillManagementRow::identity)
+            .collect();
+        pioneer_desktop_foundation::reconcile_catalog_list(
+            &self.skills_list_state,
+            &previous_ids,
+            &next_ids,
+        );
         self.rows
             .retain(|id, _| rows.iter().any(|row| &row.identity() == id));
-        for row in &rows {
+        for (ix, row) in rows.iter().enumerate() {
             let id = row.identity();
             let pending = match row {
                 DesktopSkillManagementRow::Standalone(skill)
@@ -744,6 +736,7 @@ impl SkillsCatalogView {
                         view.pending = pending;
                         view.connected = connected;
                         view.can_manage = can_manage;
+                        self.skills_list_state.remeasure_items(ix..ix + 1);
                         cx.notify();
                     }
                 });

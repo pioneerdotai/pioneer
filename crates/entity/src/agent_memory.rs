@@ -7,22 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_agent_memory_active_key")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_agent_memory_active_key")]
     pub scope_kind: String,
     #[sea_orm(column_type = "Text")]
     pub scope_key: String,
-    #[sea_orm(unique_key = "uidx_agent_memory_active_key")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_agent_memory_active_key")]
     pub scope_key_hash: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub workspace_id: Option<String>,
-    #[sea_orm(unique_key = "uidx_agent_memory_active_key")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_agent_memory_active_key")]
     pub namespace: String,
+    #[sea_orm(column_type = "Text")]
     pub category: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub key: Option<String>,
-    #[sea_orm(unique_key = "uidx_agent_memory_active_key")]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_agent_memory_active_key"
+    )]
     pub active_key: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub sensitivity: String,
     #[sea_orm(column_type = "Double")]
     pub confidence: f64,
@@ -31,26 +40,37 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub content_preview: Option<String>,
     pub payload_version: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_thread_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_item_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub created_by_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub last_accessed_at: Option<DateTimeWithTimeZone>,
     pub access_count: i64,
     pub expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub superseded_by: Option<String>,
     pub deleted_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub deleted_by_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub deleted_by_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub delete_reason: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub policy_version: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub repair_status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub metadata_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_context_kind: Option<String>,
     #[sea_orm(has_one)]
     pub agent_memory_identity: HasOne<super::agent_memory_identity::Entity>,

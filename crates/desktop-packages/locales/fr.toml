@@ -147,3 +147,13 @@ repair_notice = "Poursuivez l’action interrompue, réappliquez les réglages o
 fresh_package_required = "Le paquet enregistré est absent ou modifié. Choisissez-en un autre ou supprimez le application."
 reapply_native_change = "Modification non enregistrée. Réappliquez-la dans Réglages ou supprimez le application."
 retained_notice = "Les données appartiennent à cet ID. Mettez à jour ce application ou supprimez ses données explicitement. Une nouvelle installation ne les récupère pas automatiquement."
+
+[plugins.details_settings]
+title = "Paramètres"
+enabled_description = "Active ce plugin et ses fonctionnalités dans l’espace de travail actuel."
+implicit_description = "Autorise les agents à utiliser automatiquement ce plugin même s’il n’est pas explicitement nommé dans la demande."
+
+[apps.details_settings]
+title = "Paramètres"
+enabled_description = "Rend cette application disponible dans l’espace de travail actuel."
+implicit_description = "Autorise les agents à utiliser automatiquement cette application même si elle n’est pas explicitement nommée dans la demande."

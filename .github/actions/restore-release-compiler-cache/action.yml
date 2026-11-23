@@ -1,0 +1,80 @@
+name: Restore Intel Mac release compiler cache
+description: Reuse sccache entries from a successful tagged release of this repository.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # Native builds may depend on the selected Apple linker and SDK.
+        sdk=$( { xcodebuild -version; xcrun --sdk macosx --show-sdk-build-version; } | shasum -a 256 | cut -c1-16)
+        echo "RELEASE_CACHE_PREFIX=release-sccache-v1-x86_64-apple-darwin-$GITHUB_JOB-$sdk-attempt-" >> "$GITHUB_ENV"
+        echo "RELEASE_CACHE_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+    - id: install
+      uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      continue-on-error: true
+      with:
+        version: v0.19.0
+        disable_annotations: 'true'
+    - id: prior
+      if: steps.install.outcome == 'success'
+      uses: actions/github-script@v8
+      continue-on-error: true
+      with:
+        script: |
+          const since = new Date(Date.now() - 14 * 86400000).toISOString();
+          const prefix = process.env.RELEASE_CACHE_PREFIX;
+          const pages = github.paginate.iterator(github.rest.actions.listWorkflowRuns, {
+            ...context.repo, workflow_id: 'release.yml', event: 'push',
+            status: 'success', created: `>=${since}`, per_page: 100
+          });
+          for await (const page of pages) {
+            for (const run of page.data) {
+              if (run.id >= context.runId || run.head_repository?.full_name !== process.env.GITHUB_REPOSITORY) continue;
+              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts,
+                {...context.repo, run_id: run.id, per_page: 100});
+              const candidates = artifacts.filter(a => !a.expired && a.name.startsWith(prefix) &&
+                /^[1-9]\d*$/.test(a.name.slice(prefix.length)));
+              if (!candidates.length) continue;
+              // Only restore results built from the commit of a release tag.
+              const tag = await github.rest.repos.getCommit({...context.repo, ref: `refs/tags/${run.head_branch}`});
+              if (tag.data.sha !== run.head_sha) continue;
+              candidates.sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)));
+              core.setOutput('artifact', String(candidates[0].id));
+              core.setOutput('run', String(run.id));
+              return;
+            }
+          }
+    - id: download
+      if: steps.prior.outputs.artifact != ''
+      uses: actions/download-artifact@v7
+      continue-on-error: true
+      with:
+        artifact-ids: ${{ steps.prior.outputs.artifact }}
+        run-id: ${{ steps.prior.outputs.run }}
+        github-token: ${{ github.token }}
+        path: ${{ runner.temp }}/release-sccache-restored
+        merge-multiple: true
+    - if: steps.install.outcome == 'success'
+      shell: bash
+      env:
+        RESTORED: ${{ steps.download.outcome }}
+        SOURCE_RUN: ${{ steps.prior.outputs.run }}
+      run: |
+        export SCCACHE_DIR="$RUNNER_TEMP/release-sccache-cold"
+        source=cold
+        if [[ "$RESTORED" == success ]]; then
+          export SCCACHE_DIR="$RUNNER_TEMP/release-sccache-restored"
+          source="run $SOURCE_RUN"
+        fi
+        export SCCACHE_CACHE_SIZE=2G SCCACHE_IDLE_TIMEOUT=0
+        if "$SCCACHE_PATH" --start-server; then
+          {
+            echo "SCCACHE_DIR=$SCCACHE_DIR"
+            echo "RUSTC_WRAPPER=$SCCACHE_PATH"
+            echo "SCCACHE_CACHE_SIZE=$SCCACHE_CACHE_SIZE"
+            echo "RELEASE_COMPILE_STARTED=$(date +%s)"
+          } >> "$GITHUB_ENV"
+        else
+          echo "::warning::Compiler cache unavailable; continuing with Cargo"
+        fi
+        echo "Compiler cache setup and restore ($source): $(( $(date +%s) - RELEASE_CACHE_STARTED )) s" >> "$GITHUB_STEP_SUMMARY"

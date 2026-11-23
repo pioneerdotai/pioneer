@@ -39,6 +39,7 @@ impl MessageProcessor {
     pub(crate) async fn shutdown_app_runtimes(&self) {}
 
     pub(in crate::message) async fn stop_app_runtime(&self, app: &str) -> anyhow::Result<()> {
+        self.stop_dev_view(app).await;
         self.host_api.fence_app(app);
         Ok(())
     }

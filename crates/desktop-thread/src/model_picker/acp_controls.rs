@@ -1,4 +1,13 @@
 use super::*;
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Selectable, form::field, h_flex, input::Input, v_flex,
+};
+
+#[derive(Clone)]
+struct AcpControls {
+    owner: WeakEntity<ComposerModelPickerView>,
+    input: Arc<ComposerModelPickerPublication>,
+}
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{
     menu::{DropdownMenu, PopupMenuItem},
@@ -26,7 +35,7 @@ impl ComposerModelPickerView {
         {
             return;
         }
-        let Some(snapshot) = self.state.input.acp_session.clone() else {
+        let Some(snapshot) = self.input.acp_session.clone() else {
             return;
         };
         let Ok(prepared) = self
@@ -68,7 +77,7 @@ impl ComposerModelPickerView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.acp_busy = false;
-                if view.state.input.acp_session.as_ref().is_none_or(|current| {
+                if view.input.acp_session.as_ref().is_none_or(|current| {
                     current.runtime_id != snapshot.runtime_id
                         || current.generation != snapshot.generation
                 }) {
@@ -126,7 +135,7 @@ impl ComposerModelPickerView {
     }
 
     fn acp_button(
-        state: &ModelSelectorDialogState,
+        state: &AcpControls,
         id: String,
         label: String,
         operation: Operation,
@@ -141,7 +150,12 @@ impl ComposerModelPickerView {
             })
     }
 
-    pub(super) fn render_acp_controls(state: ModelSelectorDialogState, cx: &mut App) -> AnyElement {
+    pub(super) fn render_acp_controls(
+        owner: WeakEntity<Self>,
+        input: Arc<ComposerModelPickerPublication>,
+        cx: &mut App,
+    ) -> AnyElement {
+        let state = AcpControls { owner, input };
         let Some(snapshot) = state.input.acp_session.as_ref() else {
             return div().into_any_element();
         };

@@ -24,7 +24,6 @@ pub(crate) mod native_budget;
 mod origins;
 #[cfg(test)]
 pub(crate) use origins::resolve_message_origins;
-mod result_budget;
 mod service;
 pub(crate) use service::apply_cli_usage;
 #[cfg(test)]
@@ -568,13 +567,6 @@ impl CompactionRunner {
                     .await?;
                 let mut excerpts = Vec::with_capacity(entries.len());
                 for entry in entries {
-                    self.store
-                        .compaction_prepare_references(
-                            &self.workspace,
-                            &entry.thread_id,
-                            std::slice::from_ref(&entry.source),
-                        )
-                        .await?;
                     let payload = self
                         .store
                         .compaction_reference_payload(
@@ -1189,13 +1181,6 @@ impl CompactionRunner {
         {
             request.input.previous_summary.clear();
         }
-        self.store
-            .compaction_prepare_references(
-                &self.workspace,
-                &first.thread_id,
-                std::slice::from_ref(&first.source),
-            )
-            .await?;
         // Reference-only bodies are optional context. They never acquire coverage.
         // Reserve a source fragment before adding them, so they cannot starve work.
         let initial = self
@@ -1245,13 +1230,6 @@ impl CompactionRunner {
                 .compaction_manifest_page(&self.snapshot.id, false, cursor.unit, cursor.source)
                 .await?;
             let Some(entry) = page.first() else { break };
-            self.store
-                .compaction_prepare_references(
-                    &self.workspace,
-                    &entry.thread_id,
-                    std::slice::from_ref(&entry.source),
-                )
-                .await?;
             let fragment = self
                 .active_payload_fragment_with_projection(
                     &entry.thread_id,

@@ -27,14 +27,22 @@ const MCP_CANCELLATION_NOTIFICATION_GRACE: Duration = Duration::from_millis(250)
 #[derive(Default)]
 pub struct RmcpRuntimeConnector {
     oauth: Option<Arc<dyn crate::McpOAuthProvider>>,
+    http_resolver: Option<Arc<dyn crate::McpHttpResolver>>,
 }
 
 impl RmcpRuntimeConnector {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn with_http_resolver(mut self, resolver: Arc<dyn crate::McpHttpResolver>) -> Self {
+        self.http_resolver = Some(resolver);
+        self
+    }
     pub fn with_oauth(oauth: Arc<dyn crate::McpOAuthProvider>) -> Self {
-        Self { oauth: Some(oauth) }
+        Self {
+            oauth: Some(oauth),
+            http_resolver: None,
+        }
     }
 }
 
@@ -155,8 +163,17 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     None => None,
                 };
                 let had_authorization = authorized.is_some();
+                let http_builder = reqwest_0_13::Client::builder();
+                let http_builder = if installation.is_pioneer() {
+                    // Internal execution credentials must remain on the direct backend hop.
+                    http_builder
+                        .no_proxy()
+                        .redirect(reqwest_0_13::redirect::Policy::none())
+                } else {
+                    http_builder
+                };
                 let http = crate::oauth::ManagedHttpClient {
-                    plain: reqwest_0_13::Client::builder().build().map_err(|_| {
+                    plain: http_builder.build().map_err(|_| {
                         McpRuntimeError::failed("HTTP client initialization failed")
                     })?,
                     authorized,
@@ -167,6 +184,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     },
                     id: installation_id.clone(),
                     installation: installation.clone(),
+                    resolver: self.http_resolver.clone(),
                 };
                 let transport = build_streamable_http_transport(&transport, http)?;
                 let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -382,6 +400,26 @@ impl McpRuntimeSession for RmcpRuntimeSession {
         timeout: Duration,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<McpToolCallResult, McpRuntimeError> {
+        self.call_tool_with_caller(
+            raw_tool_name,
+            arguments,
+            budget,
+            timeout,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    async fn call_tool_with_caller(
+        &mut self,
+        raw_tool_name: &str,
+        arguments: serde_json::Value,
+        budget: crate::McpInvocationBudget,
+        timeout: Duration,
+        cancellation: tokio_util::sync::CancellationToken,
+        caller: Option<crate::McpCaller>,
+    ) -> Result<McpToolCallResult, McpRuntimeError> {
         let Some(client) = self.client.as_ref() else {
             return Err(McpRuntimeError::failed("MCP session is closed"));
         };
@@ -409,11 +447,15 @@ impl McpRuntimeSession for RmcpRuntimeSession {
         let started = Instant::now();
         let effective_timeout = self.tool_timeout.min(timeout).max(Duration::from_millis(1));
         let peer = client.peer();
+        let mut request = CallToolRequest::new(
+            CallToolRequestParams::new(raw_tool_name.to_owned()).with_arguments(arguments),
+        );
+        if let Some(caller) = caller {
+            request.extensions.insert(caller);
+        }
         let handle = peer
             .send_cancellable_request(
-                ClientRequest::CallToolRequest(CallToolRequest::new(
-                    CallToolRequestParams::new(raw_tool_name.to_owned()).with_arguments(arguments),
-                )),
+                ClientRequest::CallToolRequest(request),
                 PeerRequestOptions::no_options(),
             )
             .await
@@ -734,8 +776,10 @@ fn classify_runtime_error<E: std::error::Error + 'static>(
     };
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = source {
-        if let Some(crate::oauth::ManagedHttpError::OAuth(runtime)) =
-            error.downcast_ref::<crate::oauth::ManagedHttpError>()
+        if let Some(
+            crate::oauth::ManagedHttpError::OAuth(runtime)
+            | crate::oauth::ManagedHttpError::Routing(runtime),
+        ) = error.downcast_ref::<crate::oauth::ManagedHttpError>()
         {
             return runtime.clone();
         }

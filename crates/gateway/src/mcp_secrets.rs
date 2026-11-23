@@ -126,294 +126,322 @@ pub(crate) async fn garbage_collection_orphan_mcp_secrets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{McpAuditEventRecord, McpServerInstallationRecord};
     use pioneer_keystore::{MemorySecretStore, SecretId, SecretKind, SecretMeta, SecretStore};
-    use sea_orm::Database;
     use std::sync::Arc;
 
     // In-memory fixture only; no user's keystore.
     #[tokio::test]
     async fn interrupted_parent_retains_uncertain_refs_until_explicit_cleanup() {
-        use sea_orm::{EntityTrait, Set};
-        let (store, secrets) = setup_gc().await;
-        let now = chrono::Utc::now().fixed_offset();
-        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-            id: Set("ws_gc".into()),
-            name: Set("GC fixture".into()),
-            is_active: Set(true),
-            is_current: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
+        pioneer_postgres_test::with_database(async |test_database| {
+            use sea_orm::{EntityTrait, Set};
+            let (store, secrets) = setup_gc(test_database).await;
+            let now = chrono::Utc::now().fixed_offset();
+            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                id: Set("ws_gc".into()),
+                name: Set("GC fixture".into()),
+                is_active: Set(true),
+                is_current: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+            })
+            .exec(&store.database_connection())
+            .await
+            .unwrap();
+            let id = "P".repeat(21);
+            let pending = serde_json::json!({"kind":"native","native_committed":false,
+                "children":[{"kind":"mcp","id":"reserved_native"}],"cleanup_refs":["uncertain"]})
+            .to_string();
+            store
+                .insert_plugin_installation(&pioneer_crud::PackageRecord {
+                    kind: pioneer_crud::PackageKind::Plugin,
+                    app_manifest_json: None,
+                    app_localizations_json: None,
+                    operation_error_json: None,
+                    id: id.clone(),
+                    workspace_id: "ws_gc".into(),
+                    name: "fixture.tools".into(),
+                    version: None,
+                    source_upload_id: "fixture".into(),
+                    package_path: "/managed/package".into(),
+                    data_path: "/managed/data".into(),
+                    package_fingerprint: "fixture".into(),
+                    enabled: true,
+                    allow_implicit_invocation: false,
+                    state: "installing".into(),
+                    revision: 1,
+                    display_name: None,
+                    short_description: None,
+                    description: None,
+                    long_description: None,
+                    developer_name: None,
+                    author_name: None,
+                    author_email: None,
+                    author_url: None,
+                    homepage: None,
+                    repository: None,
+                    documentation_url: None,
+                    support_url: None,
+                    privacy_policy_url: None,
+                    terms_of_service_url: None,
+                    license: None,
+                    category: None,
+                    brand_color: None,
+                    logo_path: None,
+                    logo_revision: None,
+                    composer_icon_path: None,
+                    composer_icon_revision: None,
+                    pending_json: Some(pending.clone()),
+                    last_error: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            store
+                .interrupt_plugin_mutation(&id, 1, &pending, "fixture interruption")
+                .await
+                .unwrap();
+            secrets
+                .put_mcp_secret("uncertain", "fixture value", None)
+                .unwrap();
+            secrets
+                .put_mcp_secret("orphan", "fixture orphan", None)
+                .unwrap();
+            let report = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+                .await
+                .unwrap();
+            assert_eq!(report.deleted_refs, 1);
+            assert!(secrets.get_mcp_secret("uncertain").unwrap().is_some());
+            assert!(secrets.get_mcp_secret("orphan").unwrap().is_none());
+            assert_eq!(
+                store
+                    .find_package_installation(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pending_json
+                    .as_deref(),
+                Some(pending.as_str())
+            );
+            secrets.delete_mcp_secret("uncertain").unwrap();
+            store
+                .finish_plugin_mutation(&id, 1, "installed", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+                    .await
+                    .unwrap()
+                    .active_refs,
+                0
+            );
+            Ok(())
         })
-        .exec(&store.database_connection())
         .await
         .unwrap();
-        let id = "P".repeat(21);
-        let pending = serde_json::json!({"kind":"native","native_committed":false,
-            "children":[{"kind":"mcp","id":"reserved_native"}],"cleanup_refs":["uncertain"]})
-        .to_string();
-        store
-            .insert_plugin_installation(&pioneer_crud::PackageRecord {
-                kind: pioneer_crud::PackageKind::Plugin,
-                app_manifest_json: None,
-                app_localizations_json: None,
-                operation_error_json: None,
-                id: id.clone(),
-                workspace_id: "ws_gc".into(),
-                name: "fixture.tools".into(),
-                version: None,
-                source_upload_id: "fixture".into(),
-                package_path: "/managed/package".into(),
-                data_path: "/managed/data".into(),
-                package_fingerprint: "fixture".into(),
-                enabled: true,
-                allow_implicit_invocation: false,
-                state: "installing".into(),
-                revision: 1,
-                display_name: None,
-                short_description: None,
-                description: None,
-                long_description: None,
-                developer_name: None,
-                author_name: None,
-                author_email: None,
-                author_url: None,
-                homepage: None,
-                repository: None,
-                documentation_url: None,
-                support_url: None,
-                privacy_policy_url: None,
-                terms_of_service_url: None,
-                license: None,
-                category: None,
-                brand_color: None,
-                logo_path: None,
-                logo_revision: None,
-                composer_icon_path: None,
-                composer_icon_revision: None,
-                pending_json: Some(pending.clone()),
-                last_error: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .unwrap();
-        store
-            .interrupt_plugin_mutation(&id, 1, &pending, "fixture interruption")
-            .await
-            .unwrap();
-        secrets
-            .put_mcp_secret("uncertain", "fixture value", None)
-            .unwrap();
-        secrets
-            .put_mcp_secret("orphan", "fixture orphan", None)
-            .unwrap();
-        let report = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
-            .await
-            .unwrap();
-        assert_eq!(report.deleted_refs, 1);
-        assert!(secrets.get_mcp_secret("uncertain").unwrap().is_some());
-        assert!(secrets.get_mcp_secret("orphan").unwrap().is_none());
-        assert_eq!(
-            store
-                .find_package_installation(&id)
-                .await
-                .unwrap()
-                .unwrap()
-                .pending_json
-                .as_deref(),
-            Some(pending.as_str())
-        );
-        secrets.delete_mcp_secret("uncertain").unwrap();
-        store
-            .finish_plugin_mutation(&id, 1, "installed", None)
-            .await
-            .unwrap();
-        assert_eq!(
-            garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
-                .await
-                .unwrap()
-                .active_refs,
-            0
-        );
     }
 
     #[tokio::test]
     async fn oauth_gc_keeps_active_registration_and_deletes_only_orphans_after_restart() {
-        let (store, secrets) = setup_gc().await;
-        seed_installation(&store, "native", vec![]).await;
-        let id = store
-            .find_mcp_server_installation("workspace", "ws_gc", "native")
-            .await
-            .unwrap()
-            .unwrap()
-            .id
-            .unwrap();
-        let persistence = secrets.mcp_oauth_persistence();
-        let registration = pioneer_mcp_oauth::Registration {
-            token_endpoint_auth_method: None,
-            client_id: "client".into(),
-            client_secret: Some("secret-canary".into()),
-            redirect_uri: "http://127.0.0.1:37643/oauth/mcp/callback".into(),
-            scopes: vec![],
-            application_type: None,
-            registration_request: None,
-            registration_response: None,
-        };
-        let record = pioneer_mcp_oauth::AuthorizationRecord {
-            identity: "hash".into(),
-            resource: "https://resource.test/mcp".into(),
-            issuer: "https://issuer.test".into(),
-            registration,
-            credentials: None,
-            pending_consent: None,
-        };
-        persistence.write(&id, record.clone()).await.unwrap();
-        persistence.write("orphan", record).await.unwrap();
-        let dry = garbage_collection_orphan_mcp_secrets(&store, &secrets, true)
-            .await
-            .unwrap();
-        assert_eq!(dry.oauth_orphans, 1);
-        assert_eq!(dry.oauth_deleted, 0);
-        let applied = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
-            .await
-            .unwrap();
-        assert_eq!(applied.oauth_deleted, 1);
-        assert!(persistence.read(&id).await.unwrap().is_some());
-        assert!(persistence.read("orphan").await.unwrap().is_none());
-        let again = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
-            .await
-            .unwrap();
-        assert_eq!(again.oauth_orphans, 0);
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (store, secrets) = setup_gc(test_database).await;
+            seed_installation(&store, "native", vec![]).await;
+            let id = store
+                .find_mcp_server_installation("workspace", "ws_gc", "native")
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+                .unwrap();
+            let persistence = secrets.mcp_oauth_persistence();
+            let registration = pioneer_mcp_oauth::Registration {
+                token_endpoint_auth_method: None,
+                client_id: "client".into(),
+                client_secret: Some("secret-canary".into()),
+                redirect_uri: "http://127.0.0.1:37643/oauth/mcp/callback".into(),
+                scopes: vec![],
+                application_type: None,
+                registration_request: None,
+                registration_response: None,
+            };
+            let record = pioneer_mcp_oauth::AuthorizationRecord {
+                identity: "hash".into(),
+                resource: "https://resource.test/mcp".into(),
+                issuer: "https://issuer.test".into(),
+                registration,
+                credentials: None,
+                pending_consent: None,
+            };
+            persistence.write(&id, record.clone()).await.unwrap();
+            persistence.write("orphan", record).await.unwrap();
+            let dry = garbage_collection_orphan_mcp_secrets(&store, &secrets, true)
+                .await
+                .unwrap();
+            assert_eq!(dry.oauth_orphans, 1);
+            assert_eq!(dry.oauth_deleted, 0);
+            let applied = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+                .await
+                .unwrap();
+            assert_eq!(applied.oauth_deleted, 1);
+            assert!(persistence.read(&id).await.unwrap().is_some());
+            assert!(persistence.read("orphan").await.unwrap().is_none());
+            let again = garbage_collection_orphan_mcp_secrets(&store, &secrets, false)
+                .await
+                .unwrap();
+            assert_eq!(again.oauth_orphans, 0);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn gc_dry_run_reports_orphans_without_deleting() {
-        let (crud_store, gateway_secrets) = setup_gc().await;
-        seed_installation(
-            &crud_store,
-            "resend",
-            vec![secret_ref("active_ref", "env", "RESEND_API_KEY")],
-        )
-        .await;
-        gateway_secrets
-            .put_mcp_secret("active_ref", "active", None)
-            .expect("put active");
-        gateway_secrets
-            .put_mcp_secret("orphan_ref", "orphan", None)
-            .expect("put orphan");
-
-        let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
-            .await
-            .expect("dry-run GC");
-
-        assert_eq!(report.active_refs, 1);
-        assert_eq!(report.stored_refs, 2);
-        assert_eq!(report.orphan_refs, 1);
-        assert_eq!(report.deleted_refs, 0);
-        assert!(report.failed_deletes.is_empty());
-        assert_eq!(
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (crud_store, gateway_secrets) = setup_gc(test_database).await;
+            seed_installation(
+                &crud_store,
+                "resend",
+                vec![secret_ref("active_ref", "env", "RESEND_API_KEY")],
+            )
+            .await;
             gateway_secrets
-                .get_mcp_secret("orphan_ref")
-                .expect("read orphan"),
-            Some("orphan".to_owned())
-        );
+                .put_mcp_secret("active_ref", "active", None)
+                .expect("put active");
+            gateway_secrets
+                .put_mcp_secret("orphan_ref", "orphan", None)
+                .expect("put orphan");
+
+            let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, true)
+                .await
+                .expect("dry-run GC");
+
+            assert_eq!(report.active_refs, 1);
+            assert_eq!(report.stored_refs, 2);
+            assert_eq!(report.orphan_refs, 1);
+            assert_eq!(report.deleted_refs, 0);
+            assert!(report.failed_deletes.is_empty());
+            assert_eq!(
+                gateway_secrets
+                    .get_mcp_secret("orphan_ref")
+                    .expect("read orphan"),
+                Some("orphan".to_owned())
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn gc_deletes_orphans_and_keeps_active_and_non_mcp_entries() {
-        let (crud_store, gateway_secrets) = setup_gc().await;
-        seed_installation(
-            &crud_store,
-            "resend",
-            vec![secret_ref("active_ref", "env", "RESEND_API_KEY")],
-        )
-        .await;
-        gateway_secrets
-            .put_mcp_secret("active_ref", "active", None)
-            .expect("put active");
-        gateway_secrets
-            .put_mcp_secret("orphan_ref", "orphan", None)
-            .expect("put orphan");
-        gateway_secrets
-            .set_provider_api_key("openrouter", "sk-provider")
-            .expect("put provider");
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (crud_store, gateway_secrets) = setup_gc(test_database).await;
+            seed_installation(
+                &crud_store,
+                "resend",
+                vec![secret_ref("active_ref", "env", "RESEND_API_KEY")],
+            )
+            .await;
+            gateway_secrets
+                .put_mcp_secret("active_ref", "active", None)
+                .expect("put active");
+            gateway_secrets
+                .put_mcp_secret("orphan_ref", "orphan", None)
+                .expect("put orphan");
+            gateway_secrets
+                .set_provider_api_key("openrouter", "sk-provider")
+                .expect("put provider");
 
-        let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
-            .await
-            .expect("GC");
+            let report =
+                garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
+                    .await
+                    .expect("GC");
 
-        assert_eq!(report.active_refs, 1);
-        assert_eq!(report.stored_refs, 2);
-        assert_eq!(report.orphan_refs, 1);
-        assert_eq!(report.deleted_refs, 1);
-        assert!(report.failed_deletes.is_empty());
-        assert_eq!(
-            gateway_secrets
-                .get_mcp_secret("active_ref")
-                .expect("read active"),
-            Some("active".to_owned())
-        );
-        assert_eq!(
-            gateway_secrets
-                .get_mcp_secret("orphan_ref")
-                .expect("read orphan"),
-            None
-        );
-        assert_eq!(
-            gateway_secrets
-                .get_provider_api_key("openrouter")
-                .expect("read provider"),
-            Some("sk-provider".to_owned())
-        );
+            assert_eq!(report.active_refs, 1);
+            assert_eq!(report.stored_refs, 2);
+            assert_eq!(report.orphan_refs, 1);
+            assert_eq!(report.deleted_refs, 1);
+            assert!(report.failed_deletes.is_empty());
+            assert_eq!(
+                gateway_secrets
+                    .get_mcp_secret("active_ref")
+                    .expect("read active"),
+                Some("active".to_owned())
+            );
+            assert_eq!(
+                gateway_secrets
+                    .get_mcp_secret("orphan_ref")
+                    .expect("read orphan"),
+                None
+            );
+            assert_eq!(
+                gateway_secrets
+                    .get_provider_api_key("openrouter")
+                    .expect("read provider"),
+                Some("sk-provider".to_owned())
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn gc_fails_on_invalid_active_secret_refs_json() {
-        let (crud_store, gateway_secrets) = setup_gc().await;
-        let mut record = installation_record("broken", vec![]);
-        record.secret_refs_json = "not-json".to_owned();
-        persist_installation(&crud_store, record).await;
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (crud_store, gateway_secrets) = setup_gc(test_database).await;
+            let mut record = installation_record("broken", vec![]);
+            record.secret_refs_json = serde_json::json!("invalid secret refs").to_string();
+            persist_installation(&crud_store, record).await;
 
-        let error = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
-            .await
-            .expect_err("invalid refs should fail GC");
-        assert!(
-            format!("{error:#}").contains("failed to decode MCP secret refs"),
-            "unexpected error: {error:#}"
-        );
+            let error = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
+                .await
+                .expect_err("invalid refs should fail GC");
+            assert!(
+                format!("{error:#}").contains("failed to decode MCP secret refs"),
+                "unexpected error: {error:#}"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn gc_reports_delete_failures() {
-        let (crud_store, _gateway_secrets) = setup_gc().await;
-        let failing_store = Arc::new(DeleteFailingStore::new());
-        let gateway_secrets = GatewaySecrets::new(failing_store.clone());
-        failing_store
-            .put_string(
-                &SecretId::mcp_secret("orphan_ref").expect("mcp id"),
-                "orphan",
-                SecretMeta::new(SecretKind::McpSecret, Some("orphan".to_owned()), 123),
-            )
-            .expect("seed failing store");
+        pioneer_postgres_test::with_database(async |test_database| {
+            let (crud_store, _gateway_secrets) = setup_gc(test_database).await;
+            let failing_store = Arc::new(DeleteFailingStore::new());
+            let gateway_secrets = GatewaySecrets::new(failing_store.clone());
+            failing_store
+                .put_string(
+                    &SecretId::mcp_secret("orphan_ref").expect("mcp id"),
+                    "orphan",
+                    SecretMeta::new(SecretKind::McpSecret, Some("orphan".to_owned()), 123),
+                )
+                .expect("seed failing store");
 
-        let report = garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
-            .await
-            .expect("GC with delete failure");
+            let report =
+                garbage_collection_orphan_mcp_secrets(&crud_store, &gateway_secrets, false)
+                    .await
+                    .expect("GC with delete failure");
 
-        assert_eq!(report.orphan_refs, 1);
-        assert_eq!(report.deleted_refs, 0);
-        assert_eq!(report.failed_deletes.len(), 1);
-        assert_eq!(report.failed_deletes[0].ref_id, "orphan_ref");
+            assert_eq!(report.orphan_refs, 1);
+            assert_eq!(report.deleted_refs, 0);
+            assert_eq!(report.failed_deletes.len(), 1);
+            assert_eq!(report.failed_deletes[0].ref_id, "orphan_ref");
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
-    async fn setup_gc() -> (CrudStore, GatewaySecrets) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite");
-        Migrator::up(&connection, None).await.expect("migrate");
-        let crud_store = CrudStore::new(connection);
+    async fn setup_gc(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> (CrudStore, GatewaySecrets) {
+        let crud_store = CrudStore::new(test_database.connection().clone());
         let gateway_secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
         (crud_store, gateway_secrets)
     }

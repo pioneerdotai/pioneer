@@ -54,6 +54,7 @@ impl AssetSource for PioneerAssetsSource {
 pub enum PioneerIconName {
     Bolt,
     FolderTree,
+    LayoutGridCircles,
     Mcp,
     Plugin,
     Users,
@@ -65,6 +66,7 @@ impl IconNamed for PioneerIconName {
         match self {
             Self::Bolt => "icons/bolt.svg",
             Self::FolderTree => "icons/folder-tree.svg",
+            Self::LayoutGridCircles => "icons/layout-grid-circles.svg",
             Self::Mcp => "icons/mcp.svg",
             Self::Plugin => "icons/box.svg",
             Self::Users => "icons/users.svg",

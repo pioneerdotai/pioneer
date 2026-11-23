@@ -7,19 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_domain_commit")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub mutation_kind: String,
-    #[sea_orm(unique_key = "uq_agent_domain_commit_execution_idempotency")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_domain_commit_execution_idempotency"
+    )]
     pub idempotency_key: String,
+    #[sea_orm(column_type = "Text")]
     pub request_fingerprint: String,
-    #[sea_orm(unique_key = "uq_agent_domain_commit_execution_idempotency")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_agent_domain_commit_execution_idempotency"
+    )]
     pub execution_id: String,
+    #[sea_orm(column_type = "Text")]
     pub actor_identity_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub receipt_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub outbox_id: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub committed_at: DateTimeWithTimeZone,
 }

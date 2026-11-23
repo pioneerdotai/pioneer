@@ -46,6 +46,24 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  prepare-postgres:
+    runs-on: ${{ fromJSON(inputs.platform).target == 'aarch64-pc-windows-msvc' && 'windows-latest' || fromJSON(inputs.platform).os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: ${{ fromJSON(inputs.platform).target }}
+          out: postgres-runtime
+      - uses: actions/upload-artifact@v6
+        with:
+          name: postgres-runtime-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: postgres-runtime/
+          retention-days: 7
+          if-no-files-found: error
+
   build-gateway-default:
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
@@ -78,12 +96,30 @@ jobs:
         with:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-default-v2
           cache-workspace-crates: false
+      - name: restore-intel-compiler-cache
+        if: fromJSON(inputs.platform).target == 'x86_64-apple-darwin'
+        continue-on-error: true
+        uses: ./.github/actions/restore-release-compiler-cache
       - name: compile-gateway
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "default"
           --asset "${{ fromJSON(inputs.platform).asset }}"
           --out release-gateway
+      - name: save-intel-compiler-cache
+        if: env.RELEASE_COMPILE_STARTED != ''
+        continue-on-error: true
+        uses: ./.github/actions/save-release-compiler-cache
+      - &release-timings
+        name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-${{ fromJSON(inputs.platform).target }}-${{ github.job }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing-*.html
+          retention-days: 7
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -131,12 +167,21 @@ jobs:
         with:
           shared-key: release-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-v2
           cache-workspace-crates: false
+      - name: restore-intel-compiler-cache
+        if: fromJSON(inputs.platform).target == 'x86_64-apple-darwin'
+        continue-on-error: true
+        uses: ./.github/actions/restore-release-compiler-cache
       - name: compile-gateway
         run: >-
           python scripts/packaging/build-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant "computer-use"
           --asset "${{ fromJSON(inputs.platform).cu_asset }}"
           --out release-gateway
+      - name: save-intel-compiler-cache
+        if: env.RELEASE_COMPILE_STARTED != ''
+        continue-on-error: true
+        uses: ./.github/actions/save-release-compiler-cache
+      - *release-timings
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -187,6 +232,7 @@ jobs:
           cache-workspace-crates: false
       - name: compile-desktop-and-updater
         run: python scripts/packaging/build-desktop.py --target "${{ fromJSON(inputs.platform).target }}" --out release-desktop
+      - *release-timings
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-inputs-desktop-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -203,9 +249,16 @@ jobs:
           compression-level: 0
 
   package-gateway-default:
-    needs: build-gateway-default
+    needs: [build-gateway-default, prepare-postgres]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
       WINDOWS_SIGNING_REQUIRED: "false"
       WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
       WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
@@ -229,11 +282,23 @@ jobs:
         with:
           role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-default
           path: gateway-inputs
+      - uses: ./.github/actions/download-release-input
+        if: runner.os == 'macOS'
+        with:
+          role: notary-gateway-default-${{ fromJSON(inputs.platform).target }}
+          path: notary-logs
+          optional: 'true'
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
+          path: postgres-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant default --asset "${{ fromJSON(inputs.platform).asset }}"
-          --inputs gateway-inputs --out gateway-final
+          --inputs gateway-inputs --postgres postgres-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -246,9 +311,17 @@ jobs:
           path: gateway-final/assets/
           retention-days: 7
           if-no-files-found: error
+      - name: retain-notarization-reports
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: notary-gateway-default-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: notary-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   package-gateway-computer-use:
-    needs: [build-gateway-computer-use, prepare-cua]
+    needs: [build-gateway-computer-use, prepare-cua, prepare-postgres]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -313,11 +386,15 @@ jobs:
           PYMODES
       - uses: ./.github/actions/macos-signing
         if: runner.os == 'macOS'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
+          path: postgres-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant computer-use --asset "${{ fromJSON(inputs.platform).cu_asset }}"
-          --inputs gateway-inputs --prepared cua-prepared --out gateway-final
+          --inputs gateway-inputs --prepared cua-prepared --postgres postgres-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}

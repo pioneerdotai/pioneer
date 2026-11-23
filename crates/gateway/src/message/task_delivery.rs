@@ -614,12 +614,30 @@ impl MessageProcessor {
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
         Ok(match outcome {
-            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(delivered) => {
                 closing.finish(if promised {
                     Fact::Confirmed
                 } else {
                     Fact::Returned
                 });
+                if delivered.mode == TaskDeliveryMode::Thread
+                    && delivered.error_snapshot.is_none()
+                    && let (Some(thread), Some(turn)) = (
+                        delivered.target_thread_id.as_deref(),
+                        delivered.delivered_turn_id.as_deref(),
+                    )
+                {
+                    // The final text may already be visible. The acknowledged
+                    // delivery now authorizes its inline HTML publications.
+                    let item = pioneer_protocol::task_delivery_result_item_id(&delivered.id);
+                    self.notify_semantic_timeline_blocks_changed(
+                        &delivered.workspace_id,
+                        thread,
+                        vec![pioneer_crud::assistant_block_id(turn, &item)],
+                        Vec::new(),
+                    )
+                    .await;
+                }
                 if let Some(thread_id) = title_recovery {
                     self.recover_thread_title(thread_id).await;
                 }
@@ -886,7 +904,7 @@ impl MessageProcessor {
                 agent_action.map(|prepared| prepared.plan.input),
             )
             .await?;
-        let notification = serde_json::from_str(persisted.payload_json.as_str())
+        let notification = serde_json::from_value(persisted.payload_json)
             .context("durable user notification payload is invalid")?;
         if persisted.status != "delivered" {
             bail!("durable user notification receipt is not delivered");
@@ -1538,7 +1556,7 @@ fn task_user_notification_from_row(
     row: pioneer_entity::user_notification_outbox::Model,
 ) -> Result<pioneer_protocol::TaskUserNotification> {
     let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
-        serde_json::from_str(row.payload_json.as_str())
+        serde_json::from_value(row.payload_json)
             .context("durable user notification payload is invalid")?;
     if payload.notification_id != row.id
         || payload.workspace_id != row.workspace_id
@@ -1774,7 +1792,7 @@ mod historical_grant_delivery_tests {
         Set,
     };
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_result_delivery_and_post_commit_replay_keep_author_receipt_and_originals() {
         for mode in [TaskDeliveryMode::Thread, TaskDeliveryMode::UserNotification] {
             let fixture = historical_task_fixture(mode).await;
@@ -1919,7 +1937,7 @@ mod historical_grant_delivery_tests {
                     .unwrap();
                 assert_eq!(notification.len(), 1);
                 let payload: pioneer_protocol::TaskUserNotificationDeliveredNotification =
-                    serde_json::from_str(&notification[0].payload_json).unwrap();
+                    serde_json::from_value(notification[0].payload_json.clone()).unwrap();
                 assert_eq!(payload.author.as_ref(), author.agent.as_ref());
             }
             assert_eq!(
@@ -1946,7 +1964,7 @@ mod historical_grant_delivery_tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_delivery_still_rejects_corrupt_snapshots_and_revoked_authority() {
         for corruption in ["outer", "nested", "task", "identity", "route"] {
             let destination_thread_id = if corruption == "route" {

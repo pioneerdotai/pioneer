@@ -22,7 +22,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_checkpoint: HasOne<super::compaction_checkpoint::Entity>,
+    pub compaction_checkpoint: BelongsTo<super::compaction_checkpoint::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

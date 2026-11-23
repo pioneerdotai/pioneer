@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_event_fanout_cursor")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
     pub last_sequence: i64,
     pub created_at: DateTimeWithTimeZone,
@@ -19,7 +19,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task: HasOne<super::task::Entity>,
+    pub task: BelongsTo<super::task::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
