@@ -2953,7 +2953,6 @@ mod tests {
 
     #[tokio::test]
     async fn cli_projector_large_mcp_result_passes_durable_payload_validation() {
-        use migration::{Migrator, MigratorTrait};
         use pioneer_crud::CrudStore;
         use pioneer_protocol::{
             PersistedActorRef, SandboxMode, Thread, ThreadMode, ThreadOriginKind,
@@ -2961,190 +2960,193 @@ mod tests {
             UserInput,
         };
 
-        let connection = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite");
-        Migrator::up(&connection, None)
-            .await
-            .expect("projector fixture migrations");
-        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection);
-        let store = CrudStore::new(database);
-        let context = context();
-        let timestamp = 1_700_030_000;
-        let thread = Thread {
-            context_window: None,
-            service_mode: None,
-            context_authority: None,
-            workspace_id: context.workspace_id.clone(),
-            id: context.thread_id.clone(),
-            name: None,
-            preview: String::new(),
-            preview_author: None,
-            mode: ThreadMode::Agent,
-            model: "test-model".to_owned(),
-            model_provider: "echo".to_owned(),
-            reasoning_effort: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            status: ThreadStatus::Active,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let turn = Turn {
-            work_owner: Default::default(),
-            id: context.turn_id.clone(),
-            status: TurnStatus::InProgress,
-            turn_kind: Default::default(),
-            origin: Default::default(),
-            mode: ThreadMode::Agent,
-            author: None,
-            reply_to_turn_id: None,
-            mentions: Vec::new(),
-            message_revision: 0,
-            message_deleted: false,
-            error: None,
-            prompt_manifest: None,
-            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-        };
-        {
-            use sea_orm::EntityTrait;
-            pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
-                id: sea_orm::Set(thread.workspace_id.clone()),
-                name: sea_orm::Set("Observation fixture".to_owned()),
-                is_active: sea_orm::Set(true),
-                is_current: sea_orm::Set(true),
-                ..Default::default()
-            })
-            .exec(&store.database_connection())
-            .await
-            .expect("observation workspace should exist");
-        }
-        store
-            .upsert_thread_model(&thread, PersistedActorRef::System)
-            .await
-            .expect("thread fixture");
-        store
-            .materialize_turn_start(
-                &thread,
-                SandboxMode::FullAccess,
-                &turn,
-                &[UserInput::Text {
-                    text: "Read MCP result".to_owned(),
-                    text_elements: Vec::new(),
-                }],
-                PersistedActorRef::System,
-            )
-            .await
-            .expect("started turn fixture");
-
-        for (raw_tool_name, chars) in [
-            ("asc_list_app_store_versions", 6_989),
-            ("asc_list_territory_availabilities", 17_278),
-        ] {
-            let message = "界".repeat(chars);
-            let metadata = json!({
-                "canonicalCallableName": format!("mcp__asc__{raw_tool_name}"),
-                "serverName": "App Store Connect",
-                "rawToolName": raw_tool_name,
-                "arguments": {"appId": "app-1"},
-                "status": "completed",
-                "success": true,
-                "message": message,
-                "result": [{"type": "text", "text": message}],
-                "providerCallId": raw_tool_name,
-                "sessionGeneration": 7
-            });
-            let event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-                native_thread_id: Some("native_thread_1".to_owned()),
-                native_turn_id: "native_turn_1".to_owned(),
-                native_item_id: raw_tool_name.to_owned(),
-                item_kind: "mcpToolCall".to_owned(),
-                text: None,
-                summary: Vec::new(),
-                content: Vec::new(),
-                phase: RuntimeAgentMessagePhase::FinalAnswer,
-                metadata: Some(metadata.clone()),
-                native_item_redacted: None,
-                native: None,
-            });
-            let original_event = event.clone();
-            let projected = project_cli_runtime_event(&context, &event);
-            assert_eq!(event, original_event, "native result must remain intact");
-            assert_eq!(projected.durable.len(), 1);
-            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
-                panic!("expected MCP completion");
-            };
-            let TurnItem::DynamicToolCall {
-                arguments,
-                status,
-                output_policy,
-                display: ToolDisplayPayload::Summary(summary),
-                storage: ToolStoragePayload::Metadata { metadata: stored },
-                success,
-                recovery,
-                outcome,
-                ..
-            } = &notification.item
-            else {
-                panic!("expected MCP summary with metadata-only storage");
-            };
-            let expected_metadata = ToolMetadata::from_json(metadata);
-            assert_eq!(summary.metadata, expected_metadata);
-            assert_eq!(stored, &expected_metadata);
-            assert_eq!(arguments["appId"], "app-1");
-            assert_eq!(arguments["nativeItemId"], raw_tool_name);
-            assert_eq!(*status, pioneer_protocol::ToolCallStatus::Completed);
-            assert_eq!(*success, Some(true));
-            assert!(recovery.is_none());
-            assert!(outcome.is_none());
-            assert_eq!(
-                output_policy.timeline,
-                TimelineOutputPolicy::Summary { max_chars: 2_000 }
+        pioneer_postgres_test::with_database(async |fixture| {
+            let database = pioneer_postgres_pools::PostgresDatabase::new(
+                fixture.connect_read_only().await?,
+                fixture.connection().clone(),
             );
-            assert_eq!(
-                summary.title.chars().count()
-                    + summary
-                        .lines
-                        .iter()
-                        .map(|line| line.chars().count())
-                        .sum::<usize>(),
-                2_000
-            );
-            assert!(summary.truncated);
-            assert!(message.starts_with(&summary.lines[0]));
-
-            // The original unbounded card must still fail the CrudStore guard.
-            let mut unbounded = notification.clone();
-            let TurnItem::DynamicToolCall { display, .. } = &mut unbounded.item else {
-                unreachable!();
+            let store = CrudStore::new(database);
+            let context = context();
+            let timestamp = 1_700_030_000;
+            let thread = Thread {
+                context_window: None,
+                service_mode: None,
+                context_authority: None,
+                workspace_id: context.workspace_id.clone(),
+                id: context.thread_id.clone(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "test-model".to_owned(),
+                model_provider: "echo".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
             };
-            let mut unbounded_summary = summary.clone();
-            unbounded_summary.lines = vec![message];
-            unbounded_summary.truncated = false;
-            *display = ToolDisplayPayload::Summary(unbounded_summary);
-            let error = store
-                .materialize_item_completed(unbounded, timestamp + 1)
+            let turn = Turn {
+                work_owner: Default::default(),
+                id: context.turn_id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: ThreadMode::Agent,
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            {
+                use sea_orm::EntityTrait;
+                pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+                    id: sea_orm::Set(thread.workspace_id.clone()),
+                    name: sea_orm::Set("Observation fixture".to_owned()),
+                    is_active: sea_orm::Set(true),
+                    is_current: sea_orm::Set(false),
+                    ..Default::default()
+                })
+                .exec(&store.database_connection())
                 .await
-                .expect_err("oversized display must remain forbidden");
-            assert!(format!("{error:#}").contains("display summary exceeds policy limit"));
+                .expect("observation workspace should exist");
+            }
             store
-                .materialize_item_completed(notification.clone(), timestamp + 1)
+                .upsert_thread_model(&thread, PersistedActorRef::System)
                 .await
-                .expect("bounded MCP completion must persist");
-            let persisted = store
-                .get_turn_item_events(&context.thread_id, &context.turn_id)
+                .expect("thread fixture");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[UserInput::Text {
+                        text: "Read MCP result".to_owned(),
+                        text_elements: Vec::new(),
+                    }],
+                    PersistedActorRef::System,
+                )
                 .await
-                .expect("read durable events")
-                .expect("fixture thread exists");
-            assert!(persisted.events.iter().any(|event| {
-                matches!(&event.payload, TurnItemEventPayload::ItemCompleted { item, .. }
+                .expect("started turn fixture");
+
+            for (raw_tool_name, chars) in [
+                ("asc_list_app_store_versions", 6_989),
+                ("asc_list_territory_availabilities", 17_278),
+            ] {
+                let message = "界".repeat(chars);
+                let metadata = json!({
+                    "canonicalCallableName": format!("mcp__asc__{raw_tool_name}"),
+                    "serverName": "App Store Connect",
+                    "rawToolName": raw_tool_name,
+                    "arguments": {"appId": "app-1"},
+                    "status": "completed",
+                    "success": true,
+                    "message": message,
+                    "result": [{"type": "text", "text": message}],
+                    "providerCallId": raw_tool_name,
+                    "sessionGeneration": 7
+                });
+                let event = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                    native_thread_id: Some("native_thread_1".to_owned()),
+                    native_turn_id: "native_turn_1".to_owned(),
+                    native_item_id: raw_tool_name.to_owned(),
+                    item_kind: "mcpToolCall".to_owned(),
+                    text: None,
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    phase: RuntimeAgentMessagePhase::FinalAnswer,
+                    metadata: Some(metadata.clone()),
+                    native_item_redacted: None,
+                    native: None,
+                });
+                let original_event = event.clone();
+                let projected = project_cli_runtime_event(&context, &event);
+                assert_eq!(event, original_event, "native result must remain intact");
+                assert_eq!(projected.durable.len(), 1);
+                let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0]
+                else {
+                    panic!("expected MCP completion");
+                };
+                let TurnItem::DynamicToolCall {
+                    arguments,
+                    status,
+                    output_policy,
+                    display: ToolDisplayPayload::Summary(summary),
+                    storage: ToolStoragePayload::Metadata { metadata: stored },
+                    success,
+                    recovery,
+                    outcome,
+                    ..
+                } = &notification.item
+                else {
+                    panic!("expected MCP summary with metadata-only storage");
+                };
+                let expected_metadata = ToolMetadata::from_json(metadata);
+                assert_eq!(summary.metadata, expected_metadata);
+                assert_eq!(stored, &expected_metadata);
+                assert_eq!(arguments["appId"], "app-1");
+                assert_eq!(arguments["nativeItemId"], raw_tool_name);
+                assert_eq!(*status, pioneer_protocol::ToolCallStatus::Completed);
+                assert_eq!(*success, Some(true));
+                assert!(recovery.is_none());
+                assert!(outcome.is_none());
+                assert_eq!(
+                    output_policy.timeline,
+                    TimelineOutputPolicy::Summary { max_chars: 2_000 }
+                );
+                assert_eq!(
+                    summary.title.chars().count()
+                        + summary
+                            .lines
+                            .iter()
+                            .map(|line| line.chars().count())
+                            .sum::<usize>(),
+                    2_000
+                );
+                assert!(summary.truncated);
+                assert!(message.starts_with(&summary.lines[0]));
+
+                // The original unbounded card must still fail the CrudStore guard.
+                let mut unbounded = notification.clone();
+                let TurnItem::DynamicToolCall { display, .. } = &mut unbounded.item else {
+                    unreachable!();
+                };
+                let mut unbounded_summary = summary.clone();
+                unbounded_summary.lines = vec![message];
+                unbounded_summary.truncated = false;
+                *display = ToolDisplayPayload::Summary(unbounded_summary);
+                let error = store
+                    .materialize_item_completed(unbounded, timestamp + 1)
+                    .await
+                    .expect_err("oversized display must remain forbidden");
+                assert!(format!("{error:#}").contains("display summary exceeds policy limit"));
+                store
+                    .materialize_item_completed(notification.clone(), timestamp + 1)
+                    .await
+                    .expect("bounded MCP completion must persist");
+                let persisted = store
+                    .get_turn_item_events(&context.thread_id, &context.turn_id)
+                    .await
+                    .expect("read durable events")
+                    .expect("fixture thread exists");
+                assert!(persisted.events.iter().any(|event| {
+                    matches!(&event.payload, TurnItemEventPayload::ItemCompleted { item, .. }
                     if item == &notification.item)
-            }));
-        }
+                }));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

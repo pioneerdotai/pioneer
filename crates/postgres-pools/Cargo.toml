@@ -1,0 +1,24 @@
+[package]
+name = "pioneer-postgres-pools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow.workspace = true
+pioneer-observability.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm-migration = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sqlparser = { version = "0.64", features = ["visitor"] }
+tokio.workspace = true
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["postgres-vector"] }
+tracing.workspace = true
+pioneer-postgres-test.workspace = true

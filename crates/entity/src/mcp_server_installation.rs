@@ -7,28 +7,37 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "mcp_server_installation")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_mcp_server_installation_scope_name")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_mcp_server_installation_scope_name"
+    )]
     pub scope_kind: String,
-    #[sea_orm(unique_key = "uq_mcp_server_installation_scope_name")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_mcp_server_installation_scope_name"
+    )]
     pub scope_key: String,
-    #[sea_orm(unique_key = "uq_mcp_server_installation_scope_name")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_mcp_server_installation_scope_name"
+    )]
     pub name: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub display_name: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub source_kind: String,
+    pub source_ref: Json,
     #[sea_orm(column_type = "Text")]
-    pub source_ref: String,
     pub transport_kind: String,
-    #[sea_orm(column_type = "Text")]
-    pub transport_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub auth_json: String,
-    #[sea_orm(column_type = "Text")]
-    pub secret_refs_json: String,
+    pub transport_json: Json,
+    pub auth_json: Json,
+    pub secret_refs_json: Json,
     pub enabled: bool,
     pub allow_implicit_invocation: bool,
     pub required: bool,
+    #[sea_orm(column_type = "Text")]
     pub fingerprint: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

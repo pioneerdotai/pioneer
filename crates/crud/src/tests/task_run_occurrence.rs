@@ -1,93 +1,19 @@
 //! Regression code only. These tests must be run after implementation review.
 use super::*;
 use crate::TaskRunOccurrenceReconcileClaim;
-use crate::repositories::task_run_occurrence_reconcile as queue;
-use crate::task_run_occurrence::{Preparation, PreparedOccurrence};
+use crate::store::tasks::run_occurrence::{Preparation, PreparedOccurrence};
+use pioneer_crud_tasks::occurrence_reconcile as queue;
 use pioneer_entity::{
     task_run as runs, task_run_occurrence_reconcile_pending as pending,
     task_run_occurrence_reconcile_sequence as sequence, turn as turns,
 };
 use sea_orm::IntoActiveModel;
-use sea_orm::sea_query::{ExprTrait, Query};
 
 const NOW: i64 = 4_000_000_000;
-const MIGRATION: &str = "m20261002_000001_task_run_occurrence_reconcile";
-
-// Event-driven fixture creation needs the cancellation marker columns. Use
-// that prefix with the shared helper's orthogonal TaskEvent storage projection.
-// Storage precedes the tracker, so tracker_rollback_steps still removes only
-// the tracker and its historical successors, without irreversible migrations.
-struct TrackerFixtureMigrator;
-
-impl MigratorTrait for TrackerFixtureMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through("m20261008_000008_native_cancellation_context")
-    }
-}
-
-fn tracker_rollback_steps() -> u32 {
-    (TrackerFixtureMigrator::migrations()
-        .iter()
-        .rev()
-        .position(|migration| migration.name() == MIGRATION)
-        .expect("parent tracker migration is registered")
-        + 1)
-    .try_into()
-    .unwrap()
-}
-
-// Only event-driven fixtures need today's terminal timeline projector. Pure
-// migration tests retain the tracker schema and its exact rollback boundary.
-async fn tracker_projector_store() -> CrudStore {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task").await;
-    add_inbox_runtime_fields_to_legacy_projector_fixture(&store).await;
-    add_thread_unread_column_to_legacy_fixture(&store).await;
-    // Current canonical append atomically persists content-free observations.
-    // Install only its orthogonal tables; preserve the tracker receipt/down boundary.
-    let tx = store.connection.begin().await.unwrap();
-    let schema = migration::SchemaManager::new(&*tx);
-    Migrator::migrations()
-        .into_iter()
-        .find(|m| m.name() == "m20261109_000001_execution_observability")
-        .unwrap()
-        .up(&schema)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let transaction = store.connection.begin().await.unwrap();
-    let schema = migration::SchemaManager::new(&*transaction);
-    schema
-        .alter_table(
-            migration::Table::alter()
-                .table(sea_orm::sea_query::Alias::new("turn_cli_runtime_binding"))
-                .add_column(
-                    migration::ColumnDef::new(sea_orm::sea_query::Alias::new("frozen_manifest_id"))
-                        .text()
-                        .null(),
-                )
-                .to_owned(),
-        )
-        .await
-        .unwrap();
-    // The shared migration helper already installed portable_payload. Install
-    // only the CLI projection without adding a later migration receipt.
-    let projection = Migrator::migrations()
-        .into_iter()
-        .find(|migration| migration.name() == "m20261027_000003_portable_cli_mapping")
-        .unwrap();
-    projection.up(&schema).await.unwrap();
-    transaction.commit().await.unwrap();
-    store
-}
-
-// The existing status/null/generation matrix remains the legacy trigger owner.
 async fn terminal_task_run_occurrence_fixture(
     kind: Option<TurnKind>,
 ) -> (CrudStore, Thread, TaskRun) {
-    // Install legacy producers before the domain births, so this trigger suite
-    // does not inherit conservative tickets from the current typed producers.
     let store = test_store_with_workspace("ws_task").await;
-    restore_legacy_occurrence_tracking(&store).await;
     super::terminal_task_run_occurrence_fixture_with_store(store, kind).await
 }
 
@@ -128,261 +54,58 @@ async fn prepared(store: &CrudStore, id: &str) -> PreparedOccurrence {
     };
     *prepared
 }
+async fn update_run_in_transaction(
+    tx: &sea_orm::DatabaseTransaction,
+    id: &str,
+    update: sea_orm::UpdateMany<runs::Entity>,
+) -> anyhow::Result<()> {
+    let before = runs::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(tx)
+        .await?;
+    update.filter(runs::Column::Id.eq(id)).exec(tx).await?;
+    let after = runs::Entity::find_by_id(id).one(tx).await?;
+    pioneer_crud_tasks::task_occurrence_producers::run_change(tx, before.as_ref(), after.as_ref())
+        .await
+}
+
 async fn run_status(store: &CrudStore, id: &str, status: &str) {
-    runs::Entity::update_many()
-        .col_expr(runs::Column::Status, Expr::val(status))
-        .filter(runs::Column::Id.eq(id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-}
-async fn turn_status(store: &CrudStore, id: &str, status: &str) {
-    turns::Entity::update_many()
-        .col_expr(turns::Column::Status, Expr::val(status))
-        .filter(turns::Column::Id.eq(id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn predicate_matrix_and_unknown_null_semantics_match_original_sql() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    for (run_status_value, target) in [
-        ("succeeded", Some("completed")),
-        ("failed", Some("failed")),
-        ("timed_out", Some("failed")),
-        ("blocked", Some("blocked")),
-        ("cancelled", Some("interrupted")),
-        ("running", None),
-        ("unknown", None),
-    ] {
-        run_status(&store, &run.id, run_status_value).await;
-        for status in [
-            "in_progress",
-            "completed",
-            "failed",
-            "blocked",
-            "interrupted",
-            "unknown",
-        ] {
-            turn_status(&store, &run.id, status).await;
-            let expected = target.is_some_and(|target| target != status);
-            assert_eq!(
-                row(&store, &run.id).await.is_some(),
-                expected,
-                "{run_status_value}/{status}"
-            );
-            assert_eq!(
-                queue::is_mismatch(&store.connection, &run.id)
-                    .await
-                    .unwrap(),
-                expected
-            );
-        }
-    }
-    // Test the exact repository expression with nullable values, keeping all
-    // production NOT NULL constraints installed.
-    for (run, turn, expected) in [
-        (None, Some("failed"), false),
-        (Some("succeeded"), None, false),
-        (Some("unknown"), Some("failed"), false),
-        (Some("succeeded"), Some("unknown"), true),
-        (Some("blocked"), Some("blocked"), false),
-    ] {
-        let query = Query::select()
-            .expr(Expr::val(1))
-            .and_where(queue::mismatch_status_predicate(
-                Expr::val(run).into(),
-                Expr::val(turn).into(),
-            ))
-            .to_owned();
-        assert_eq!(
-            store
-                .connection
-                .query_one_raw(DatabaseBackend::Sqlite.build(&query))
-                .await
-                .unwrap()
-                .is_some(),
-            expected
-        );
-    }
-}
-
-#[tokio::test]
-async fn same_status_error_only_and_noncanonical_or_missing_pairs_do_not_enqueue() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    turn_status(&store, &run.id, "completed").await;
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::ErrorJson,
-            Expr::val(Some("{\"message\":\"different\"}")),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    turns::Entity::update_many()
-        .col_expr(turns::Column::Status, Expr::val("failed"))
-        .col_expr(turns::Column::TurnKind, Expr::val("conversation"))
-        .filter(turns::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    let (missing, _, run) = terminal_task_run_occurrence_fixture(None).await;
-    assert!(row(&missing, &run.id).await.is_none());
-}
-
-#[tokio::test]
-async fn both_late_inserts_deletes_and_id_moves_track_exact_current_pairs() {
-    let (store, thread, run) = terminal_task_run_occurrence_fixture(None).await;
-    let occurrence = Turn {
-        turn_kind: TurnKind::TaskRun,
-        ..sample_turn(&run.id)
-    };
-    // Exercise physical source DML on a valid Turn without event-history FK
-    // dependents. A projected Turn's identity cannot be renamed independently
-    // of those dependents; this fixture must not disable their constraints.
-    crate::repositories::turn::upsert_turn(
-        &store.connection,
-        &run.id,
-        &thread.id,
-        &occurrence,
-        None,
-        None,
-        unix_to_datetime(1_700_000_000),
-        unix_to_datetime(1_700_000_000),
+    let tx = store.connection.begin().await.unwrap();
+    update_run_in_transaction(
+        &tx,
+        id,
+        runs::Entity::update_many().col_expr(runs::Column::Status, Expr::val(status)),
     )
     .await
     .unwrap();
-    let first = row(&store, &run.id).await.unwrap();
-    let saved = runs::Entity::find_by_id(run.id.clone())
-        .one(&store.connection)
+    tx.commit().await.unwrap();
+}
+async fn turn_status(store: &CrudStore, id: &str, status: &str) {
+    let tx = store.connection.begin().await.unwrap();
+    let before = turns::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(&tx)
         .await
         .unwrap()
         .unwrap();
-    runs::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
+    turns::Entity::update_many()
+        .col_expr(turns::Column::Status, Expr::val(status))
+        .filter(turns::Column::Id.eq(id))
+        .exec(&tx)
         .await
         .unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    runs::Entity::insert(saved.into_active_model())
-        .exec(&store.connection)
+    let after = turns::Entity::find_by_id(id)
+        .one(&tx)
+        .await
+        .unwrap()
+        .unwrap();
+    pioneer_crud_tasks::task_occurrence_producers::turn_change(&tx, Some(&before), Some(&after))
         .await
         .unwrap();
-    let second = row(&store, &run.id).await.unwrap();
-    assert!(
-        second.generation > first.generation,
-        "delete/reinsert must exclude ABA"
-    );
-    for (old, new) in [
-        (run.id.as_str(), "moved_run"),
-        ("moved_run", run.id.as_str()),
-    ] {
-        runs::Entity::update_many()
-            .col_expr(runs::Column::Id, Expr::val(new))
-            .filter(runs::Column::Id.eq(old))
-            .exec(&store.connection)
-            .await
-            .unwrap();
-        assert!(row(&store, "moved_run").await.is_none());
-    }
-    let third = row(&store, &run.id).await.unwrap();
-    assert!(third.generation > second.generation);
-    for (old, new) in [
-        (run.id.as_str(), "moved_turn"),
-        ("moved_turn", run.id.as_str()),
-    ] {
-        // INSERT always creates compaction bookkeeping with a non-cascading
-        // identity FK. Move that dependent atomically with this physical DML
-        // fixture, preserving its sequence and enforcing every FK throughout.
-        use pioneer_entity::compaction_turn_creation as creation;
-        let tx = store.connection.begin().await.unwrap();
-        let mut dependent = creation::Entity::find()
-            .filter(creation::Column::TurnId.eq(old))
-            .one(&tx)
-            .await
-            .unwrap()
-            .unwrap();
-        creation::Entity::delete_by_id(dependent.sequence)
-            .exec(&tx)
-            .await
-            .unwrap();
-        turns::Entity::update_many()
-            .col_expr(turns::Column::Id, Expr::val(new))
-            .filter(turns::Column::Id.eq(old))
-            .exec(&tx)
-            .await
-            .unwrap();
-        dependent.turn_id = new.to_owned();
-        creation::Entity::insert(dependent.into_active_model())
-            .exec(&tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        assert!(row(&store, "moved_turn").await.is_none());
-        if new == "moved_turn" {
-            assert!(row(&store, &run.id).await.is_none());
-        }
-    }
-    assert!(row(&store, &run.id).await.unwrap().generation > third.generation);
-    turns::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_none());
+    tx.commit().await.unwrap();
 }
 
-#[tokio::test]
-async fn trigger_updates_preserve_retry_and_ignore_noops_heartbeat_updated_at() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let claim = claimed(&store).await;
-    let before = row(&store, &run.id).await.unwrap();
-    runs::Entity::update_many()
-        .col_expr(runs::Column::Status, Expr::val("succeeded"))
-        .col_expr(
-            runs::Column::HeartbeatAt,
-            Expr::val(Some(unix_to_datetime(NOW))),
-        )
-        .col_expr(runs::Column::UpdatedAt, Expr::val(unix_to_datetime(NOW)))
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert_eq!(row(&store, &run.id).await.unwrap(), before);
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::CompletedAt,
-            Expr::val(Some(unix_to_datetime(NOW - 1))),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let after = row(&store, &run.id).await.unwrap();
-    assert!(after.generation > before.generation);
-    assert_eq!(after.next_attempt_at, claim.next_attempt_at);
-    assert_eq!(after.attempt_count, claim.attempt_count);
-    assert!(after.claim_token.is_none());
-    assert!(
-        store
-            .discover_task_run_occurrence_reconcile(NOW, 64)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        store
-            .reconcile_claimed_task_run_occurrence(&claim, NOW)
-            .await
-            .unwrap(),
-        TaskRunOccurrenceTerminalizationOutcome::StaleClaim
-    );
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let candidate = store
@@ -436,144 +159,19 @@ async fn one_holder_at_a_time_reclaim_new_token_and_old_holder_cannot_commit() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
-async fn run_and_turn_freshness_ignores_equal_timestamps_and_checks_all_used_fields() {
-    for change in [
-        "completed_at",
-        "error_json",
-        "turn_error",
-        "turn_prompt",
-        "thread_id",
-        "thread_workspace",
-        "resume",
-    ] {
-        let (store, thread, run) =
-            terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-        let claim = claimed(&store).await;
-        let prepared = prepared(&store, &run.id).await;
-        let run_time = runs::Entity::find_by_id(run.id.clone())
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .updated_at;
-        let turn_time = turns::Entity::find_by_id(run.id.clone())
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap()
-            .updated_at;
-        match change {
-            "completed_at" => {
-                runs::Entity::update_many()
-                    .col_expr(
-                        runs::Column::CompletedAt,
-                        Expr::val(Some(unix_to_datetime(NOW))),
-                    )
-                    .filter(runs::Column::Id.eq(&run.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            "error_json" => {
-                runs::Entity::update_many()
-                    .col_expr(runs::Column::ErrorJson, Expr::val(Some("{}")))
-                    .filter(runs::Column::Id.eq(&run.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            "turn_error" => {
-                turns::Entity::update_many()
-                    .col_expr(turns::Column::Error, Expr::val(Some("changed")))
-                    .filter(turns::Column::Id.eq(&run.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            "turn_prompt" => {
-                turns::Entity::update_many()
-                    .col_expr(
-                        turns::Column::PromptManifestJson,
-                        Expr::val("{\"changed\":true}"),
-                    )
-                    .filter(turns::Column::Id.eq(&run.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            "thread_id" => {
-                turns::Entity::update_many()
-                    .col_expr(turns::Column::ThreadId, Expr::val("other_thread"))
-                    .filter(turns::Column::Id.eq(&run.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            "thread_workspace" => {
-                pioneer_entity::thread::Entity::update_many()
-                    .col_expr(
-                        pioneer_entity::thread::Column::WorkspaceId,
-                        Expr::val("other_workspace"),
-                    )
-                    .filter(pioneer_entity::thread::Column::Id.eq(&thread.id))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-            _ => run_status(&store, &run.id, "running").await,
-        }
-        assert_eq!(
-            runs::Entity::find_by_id(run.id.clone())
-                .one(&store.connection)
-                .await
-                .unwrap()
-                .unwrap()
-                .updated_at,
-            run_time
-        );
-        assert_eq!(
-            turns::Entity::find_by_id(run.id.clone())
-                .one(&store.connection)
-                .await
-                .unwrap()
-                .unwrap()
-                .updated_at,
-            turn_time
-        );
-        assert_eq!(
-            store
-                .with_maintenance_reads_and_critical_writes()
-                .commit_task_run_occurrence(prepared, Some(claim))
-                .await
-                .unwrap(),
-            TaskRunOccurrenceTerminalizationOutcome::StaleClaim,
-            "{change}"
-        );
-        assert_eq!(
-            turns::Entity::find_by_id(run.id.clone())
-                .one(&store.connection)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            "in_progress"
-        );
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     turn_status(&store, &run.id, "completed").await;
     let seq = generation(&store).await;
     let tx = store.connection.begin().await.unwrap();
-    runs::Entity::update_many()
-        .col_expr(runs::Column::Status, Expr::val("failed"))
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&tx)
-        .await
-        .unwrap();
+    update_run_in_transaction(
+        &tx,
+        &run.id,
+        runs::Entity::update_many().col_expr(runs::Column::Status, Expr::val("failed")),
+    )
+    .await
+    .unwrap();
     assert!(
         pending::Entity::find_by_id(run.id.clone())
             .one(&tx)
@@ -591,9 +189,9 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
         .count(&store.connection)
         .await
         .unwrap();
-    // Test-only SQLite trigger: status history is written after the Turn upsert,
+    // Test-only PostgreSQL trigger: status history is written after the Turn upsert,
     // hence failure rolls back its status and the tracker trigger's deletion.
-    store.connection.execute_unprepared("CREATE TRIGGER reject_occurrence_history BEFORE INSERT ON turn_status_history BEGIN SELECT RAISE(ABORT,'fixture projection blocker'); END").await.unwrap();
+    store.connection.execute_unprepared("CREATE FUNCTION reject_occurrence_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture projection blocker'; END; $$; CREATE TRIGGER reject_occurrence_history BEFORE INSERT ON turn_status_history FOR EACH ROW EXECUTE FUNCTION reject_occurrence_history()").await.unwrap();
     assert!(
         store
             .reconcile_claimed_task_run_occurrence(&claim, NOW)
@@ -619,7 +217,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     );
     store
         .connection
-        .execute_unprepared("DROP TRIGGER reject_occurrence_history")
+        .execute_unprepared("DROP TRIGGER reject_occurrence_history ON turn_status_history")
         .await
         .unwrap();
     let next = store
@@ -643,7 +241,7 @@ async fn source_rollback_and_projection_failure_roll_back_tracker_and_event() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     // Remove the dependency without changing the occurrence's canonical scope.
@@ -701,7 +299,7 @@ async fn poison_missing_thread_keeps_backoff_and_allows_later_repair() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let claim = claimed(&store).await;
@@ -724,195 +322,7 @@ async fn ordinary_event_driven_repair_can_overtake_claimed_background_work() {
     assert!(row(&store, &run.id).await.is_none());
 }
 
-#[tokio::test]
-async fn migration_accepts_history_tracks_later_old_updates_and_down_removes_objects() {
-    let store = tracker_projector_store().await;
-    let (store, _, run) =
-        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
-    let maintenance = store.with_maintenance_access();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert!(
-        row(&store, &run.id).await.is_none(),
-        "no history backfill on install"
-    );
-    assert_eq!(generation(&store).await, 0);
-    // A same-value source update is not a new discrepancy; a later real update
-    // of this pre-install ID is tracked regardless of its creation timestamp.
-    run_status(&store, &run.id, "succeeded").await;
-    assert!(row(&store, &run.id).await.is_none());
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::CompletedAt,
-            Expr::val(Some(unix_to_datetime(NOW))),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_some());
-    assert_eq!(
-        pending::Entity::find()
-            .count(&store.connection)
-            .await
-            .unwrap(),
-        1
-    );
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let objects = store
-        .connection
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE name LIKE ?",
-            ["task_run_occurrence_reconcile%".into()],
-        ))
-        .await
-        .unwrap();
-    assert!(objects.is_empty());
-    let indexes = store
-        .connection
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT name FROM sqlite_master WHERE name=?",
-            ["idx_task_run_occurrence_reconcile_due".into()],
-        ))
-        .await
-        .unwrap();
-    assert!(indexes.is_empty());
-    let migrations = TrackerFixtureMigrator::migrations();
-    let target = migrations.iter().find(|m| m.name() == MIGRATION).unwrap();
-    assert_eq!(target.name(), MIGRATION);
-    assert_eq!(target.use_transaction(), Some(true));
-    assert!(
-        !TrackerFixtureMigrator::get_applied_migrations(&store.connection)
-            .await
-            .unwrap()
-            .iter()
-            .any(|migration| migration.name() == MIGRATION)
-    );
-}
-
-#[tokio::test]
-async fn generation_overflow_and_missing_singleton_reject_source_write_atomically() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    sequence::Entity::update_many()
-        .col_expr(sequence::Column::Generation, Expr::val(i64::MAX))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let before = row(&store, &run.id).await.unwrap();
-    assert!(
-        runs::Entity::update_many()
-            .col_expr(
-                runs::Column::CompletedAt,
-                Expr::val(Some(unix_to_datetime(NOW)))
-            )
-            .filter(runs::Column::Id.eq(&run.id))
-            .exec(&store.connection)
-            .await
-            .is_err()
-    );
-    assert_eq!(generation(&store).await, i64::MAX);
-    assert_eq!(row(&store, &run.id).await.unwrap(), before);
-    sequence::Entity::delete_by_id(1)
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    assert!(
-        turns::Entity::update_many()
-            .col_expr(turns::Column::Status, Expr::val("completed"))
-            .filter(turns::Column::Id.eq(&run.id))
-            .exec(&store.connection)
-            .await
-            .is_err()
-    );
-    assert_eq!(row(&store, &run.id).await.unwrap(), before);
-}
-
-#[tokio::test]
-async fn due_plan_empty_deferred_and_due_backlog_use_covering_index_without_sort() {
-    let store = test_store_with_workspace("ws_task").await;
-    for phase in ["empty", "deferred", "backlog"] {
-        if phase != "empty" {
-            // Service rows are fixture data, never a scan of domain history.
-            for chunk in 0..32 {
-                let values = (0..128)
-                    .map(|offset| {
-                        let id = chunk * 128 + offset;
-                        pending::ActiveModel {
-                            run_id: Set(format!("plan_{id:05}")),
-                            generation: Set(id + 1),
-                            next_attempt_at: Set(if phase == "deferred" {
-                                NOW + 100
-                            } else {
-                                NOW - 100
-                            }),
-                            attempt_count: Set(0),
-                            claim_token: Set(None),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if phase == "deferred" {
-                    pending::Entity::insert_many(values)
-                        .exec(&store.connection)
-                        .await
-                        .unwrap();
-                }
-            }
-            if phase == "backlog" {
-                pending::Entity::update_many()
-                    .col_expr(pending::Column::NextAttemptAt, Expr::val(NOW - 100))
-                    .exec(&store.connection)
-                    .await
-                    .unwrap();
-            }
-        }
-        let statement = DatabaseBackend::Sqlite.build(&queue::due_query(NOW, 64));
-        assert!(!statement.sql.contains("task_run "));
-        assert!(!statement.sql.contains("JOIN"));
-        // EXPLAIN QUERY PLAN has no SeaQuery builder; preserve builder values.
-        let explain = Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            format!("EXPLAIN QUERY PLAN {}", statement.sql),
-            statement.values.unwrap().0,
-        );
-        let plan = store.connection.query_all_raw(explain).await.unwrap();
-        let details = plan
-            .into_iter()
-            .map(|r| r.try_get::<String>("", "detail").unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            details
-                .iter()
-                .any(|d| d.contains("COVERING INDEX idx_task_run_occurrence_reconcile_due")),
-            "{phase}: {details:?}"
-        );
-        assert!(
-            details.iter().all(|d| !d.contains("TEMP B-TREE")),
-            "{phase}: {details:?}"
-        );
-        assert_eq!(
-            store
-                .discover_task_run_occurrence_reconcile(NOW, 10000)
-                .await
-                .unwrap()
-                .len(),
-            if phase == "backlog" { 64 } else { 0 }
-        );
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn every_terminal_mapping_commits_through_common_turn_event_projector() {
     for (status, target) in [
         ("succeeded", TurnStatus::Completed),
@@ -1064,7 +474,7 @@ async fn running_occurrence_fixture() -> (CrudStore, Thread, TaskRun) {
     (store, thread, run)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_tracker() {
     let (store, thread, run) = running_occurrence_fixture().await;
     assert!(row(&store, &run.id).await.is_none());
@@ -1090,7 +500,7 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         .unwrap();
     assert!(row(&store, &run.id).await.is_none());
     let accepted =
-        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+        pioneer_crud_execution::event_append::latest_event_for_turn(&store.connection, &run.id)
             .await
             .unwrap()
             .unwrap();
@@ -1098,11 +508,10 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
         &accepted.payload,
         CanonicalTurnEventPayload::TurnCompleted(_)
     ));
-    let marker =
-        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
-            .await
-            .unwrap()
-            .unwrap();
+    let marker = pioneer_crud_conversations::projection_stream::find(&store.connection, &run.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         marker.accepted_terminal_event_id.as_ref(),
         Some(&accepted.id)
@@ -1179,7 +588,7 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
     );
     assert!(row(&store, &run.id).await.is_none());
     let replayed =
-        crate::repositories::turn_event::latest_event_for_turn(&store.connection, &run.id)
+        pioneer_crud_execution::event_append::latest_event_for_turn(&store.connection, &run.id)
             .await
             .unwrap()
             .unwrap();
@@ -1187,7 +596,7 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
     assert_eq!(replayed.sequence, accepted.sequence);
     assert_eq!(replayed.idempotency_key, accepted.idempotency_key);
     let replayed_marker =
-        crate::repositories::turn_event_projection_stream_state::find(&store.connection, &run.id)
+        pioneer_crud_conversations::projection_stream::find(&store.connection, &run.id)
             .await
             .unwrap()
             .unwrap();
@@ -1205,7 +614,7 @@ async fn terminal_commit_without_fanout_and_generic_recovery_replay_change_track
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn resume_of_old_blocked_run_invalidates_claim_then_subsequent_completion_tracks_again() {
     let (store, task, run, job, child_thread, child_turn) =
         task_owned_resume_conflict_fixture("ws_task", "tracker_resume").await;
@@ -1267,28 +676,28 @@ async fn resume_of_old_blocked_run_invalidates_claim_then_subsequent_completion_
 
 #[derive(Default)]
 struct Routes {
-    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
-    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+    reads: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_postgres_pools::PostgresWriteEvent>>,
     maintenance_queued: tokio::sync::Notify,
     watch_claim: std::sync::atomic::AtomicBool,
     critical_queued: tokio::sync::Notify,
     watch_repair: std::sync::atomic::AtomicBool,
 }
-impl pioneer_sqlite::SqliteReadObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
-        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+impl pioneer_postgres_pools::PostgresReadObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresReadEvent) {
+        if let pioneer_postgres_pools::PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl pioneer_sqlite::SqliteWriteObserver for Routes {
-    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+impl pioneer_postgres_pools::PostgresWriteObserver for Routes {
+    fn observe(&self, event: pioneer_postgres_pools::PostgresWriteEvent) {
         self.writes.lock().unwrap().push(event);
         if self.watch_claim.load(Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Maintenance,
                     ..
                 }
             )
@@ -1298,8 +707,8 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
         if self.watch_repair.load(Ordering::SeqCst)
             && matches!(
                 event,
-                pioneer_sqlite::SqliteWriteEvent::Enqueued {
-                    class: pioneer_sqlite::SqliteWriteClass::Critical,
+                pioneer_postgres_pools::PostgresWriteEvent::Enqueued {
+                    class: pioneer_postgres_pools::PostgresWriteClass::Critical,
                     ..
                 }
             )
@@ -1308,33 +717,27 @@ impl pioneer_sqlite::SqliteWriteObserver for Routes {
         }
     }
 }
-async fn disk_store(path: &std::path::Path, routes: Arc<Routes>) -> CrudStore {
-    let mut options = sea_orm::ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| o.pragma("journal_mode", "WAL"));
-    let writer = Database::connect(options).await.unwrap();
-    let executor = pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, routes.clone());
-    // Follow startup ordering: migrate through the executor before opening the
-    // physical read-only pool and before any source recovery or replay.
-    executor
-        .run_migrations::<Migrator>(pioneer_sqlite::SqliteWriteClass::Maintenance, None)
+async fn observed_store(
+    fixture: &pioneer_postgres_test::TestDatabase,
+    routes: Arc<Routes>,
+) -> CrudStore {
+    let writer = fixture.connect_with_limit(1).await.unwrap();
+    let reader = fixture
+        .connect_with_options(|options| {
+            options
+                .max_connections(1)
+                .map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+        })
         .await
         .unwrap();
-    let mut options =
-        sea_orm::ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(path));
-    options
-        .max_connections(1)
-        .min_connections(1)
-        .map_sqlx_sqlite_opts(|o| {
-            o.read_only(true)
-                .create_if_missing(false)
-                .pragma("query_only", "ON")
-        });
-    let reader = Database::connect(options).await.unwrap();
+    let executor =
+        pioneer_postgres_pools::PostgresWriteExecutor::with_observer(writer, routes.clone());
     CrudStore::new(
-        pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(reader, executor, routes),
+        pioneer_postgres_pools::PostgresDatabase::from_executor_with_read_observer(
+            reader, executor, routes,
+        ),
     )
 }
 async fn populate_disk_pair(store: &CrudStore) -> String {
@@ -1343,7 +746,7 @@ async fn populate_disk_pair(store: &CrudStore) -> String {
         id: Set("ws_task".into()),
         name: Set("Tracker".into()),
         is_active: Set(true),
-        is_current: Set(true),
+        is_current: Set(false),
         created_at: Set(timestamp),
         updated_at: Set(timestamp),
     })
@@ -1388,27 +791,16 @@ async fn populate_disk_pair(store: &CrudStore) -> String {
         .unwrap();
     run.id
 }
-async fn remove_disk_fixture(store: CrudStore, path: std::path::PathBuf) {
-    store.connection.close().await.unwrap();
-    std::fs::remove_file(&path).unwrap();
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_log() {
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
-    let store = disk_store(&path, Arc::new(Routes::default())).await;
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let store = observed_store(&fixture, Arc::new(Routes::default())).await;
     let id = populate_disk_pair(&store).await;
     let claim = claimed(&store).await;
     let before = row(&store, &id).await.unwrap();
     let seq = generation(&store).await;
     store.connection.close().await.unwrap();
-    let store = disk_store(&path, Arc::new(Routes::default())).await;
+    let store = observed_store(&fixture, Arc::new(Routes::default())).await;
     assert_eq!(row(&store, &id).await.unwrap(), before);
     assert_eq!(generation(&store).await, seq);
     assert!(
@@ -1447,19 +839,16 @@ async fn reopen_retains_pending_generation_claim_and_backoff_without_completed_l
         seq,
         "sequence survives draining the set"
     );
-    remove_disk_fixture(store, path).await;
+    store.connection.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_executor() {
-    use pioneer_sqlite::{SqliteReadClass, SqliteWriteClass, SqliteWriteEvent};
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass, PostgresWriteEvent};
     use std::time::Duration;
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-routing-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
     let routes = Arc::new(Routes::default());
-    let store = disk_store(&path, routes.clone()).await;
+    let store = observed_store(&fixture, routes.clone()).await;
     let id = populate_disk_pair(&store).await;
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
@@ -1474,7 +863,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
     assert!(
         routes.writes.lock().unwrap().is_empty(),
@@ -1505,7 +894,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
         before,
         "cancelled queued claim never changed durable attempt"
     );
-    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
+    assert!(routes.writes.lock().unwrap().iter().any(|e|matches!(e,PostgresWriteEvent::Cancelled {class:PostgresWriteClass::Maintenance,queue,..} if queue.maintenance==0)));
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
     let claim = store
@@ -1519,9 +908,9 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
-    assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(e,SqliteWriteEvent::Enqueued {class,..} if *class!=SqliteWriteClass::Maintenance)));
+    assert!(routes.writes.lock().unwrap().iter().all(|e| !matches!(e,PostgresWriteEvent::Enqueued {class,..} if *class!=PostgresWriteClass::Maintenance)));
     routes.reads.lock().unwrap().clear();
     routes.writes.lock().unwrap().clear();
     let events_before = pioneer_entity::turn_event::Entity::find()
@@ -1557,7 +946,7 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
     cancellation.abort();
     assert!(cancellation.await.unwrap_err().is_cancelled());
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(e,
-        SqliteWriteEvent::Cancelled {class:SqliteWriteClass::Critical,queue,..} if queue.critical == 0)));
+        PostgresWriteEvent::Cancelled {class:PostgresWriteClass::Critical,queue,..} if queue.critical == 0)));
     hold.rollback().await.unwrap();
     assert_eq!(
         turns::Entity::find_by_id(&id)
@@ -1604,204 +993,31 @@ async fn scheduling_routes_cancellation_and_interactive_reads_use_existing_execu
             .lock()
             .unwrap()
             .iter()
-            .all(|c| *c == SqliteReadClass::Maintenance)
+            .all(|c| *c == PostgresReadClass::Maintenance)
     );
     assert!(routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Critical,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Critical,
             ..
         }
     )));
     assert!(!routes.writes.lock().unwrap().iter().any(|e| matches!(
         e,
-        SqliteWriteEvent::Enqueued {
-            class: SqliteWriteClass::Interactive,
+        PostgresWriteEvent::Enqueued {
+            class: PostgresWriteClass::Interactive,
             ..
         }
     )));
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
+    assert!(store.connection.reader_is_read_only().await.unwrap());
     // Mutating RETURNING must route to the writer, even through query_one_raw.
-    store.with_maintenance_access().connection.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
-        "UPDATE task_run_occurrence_reconcile_sequence SET generation=generation WHERE singleton=? RETURNING generation",[1.into()])).await.unwrap().unwrap();
-    assert!(store.connection.reader_query_only_enabled().await.unwrap());
-    remove_disk_fixture(store, path).await;
+    store.with_maintenance_access().connection.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "UPDATE task_run_occurrence_reconcile_sequence SET generation=generation WHERE singleton=$1 RETURNING generation",[1_i64.into()])).await.unwrap().unwrap();
+    assert!(store.connection.reader_is_read_only().await.unwrap());
+    store.connection.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn migration_installation_and_completion_marker_rollback_together() {
-    let store = test_store_with_workspace_migrator::<TrackerFixtureMigrator>("ws_task")
-        .await
-        .with_maintenance_access();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    // Deliberately collide with the second installed trigger, after the new
-    // tables/index/seed and first trigger have already been written.
-    store.connection.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_task_run_update AFTER UPDATE ON task_run WHEN 0 BEGIN SELECT 1; END").await.unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    assert!(TrackerFixtureMigrator::up(&*tx, None).await.is_err());
-    tx.rollback().await.unwrap();
-    let query = Query::select()
-        .column("name")
-        .from("sqlite_master")
-        .and_where(Expr::col("name").is_in([
-            "task_run_occurrence_reconcile_pending",
-            "task_run_occurrence_reconcile_sequence",
-            "task_run_occurrence_reconcile_task_run_insert",
-            "idx_task_run_occurrence_reconcile_due",
-        ]))
-        .to_owned();
-    assert!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&query))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let marker = Query::select()
-        .column("version")
-        .from("seaql_migrations")
-        .and_where(Expr::col("version").eq(MIGRATION))
-        .to_owned();
-    assert!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    store
-        .connection
-        .execute_unprepared("DROP TRIGGER task_run_occurrence_reconcile_task_run_update")
-        .await
-        .unwrap();
-    let tx = store.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(
-        store
-            .connection
-            .query_all_raw(DatabaseBackend::Sqlite.build(&marker))
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "parent tracker completion marker must be installed"
-    );
-    assert_eq!(generation(&store).await, 0);
-}
-
-#[tokio::test]
-async fn changed_after_discovery_loses_claim_and_reincarnation_cannot_accept_old_result() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(NOW, 64)
-        .await
-        .unwrap()
-        .remove(0);
-    turn_status(&store, &run.id, "failed").await;
-    assert!(
-        store
-            .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let claim = claimed(&store).await;
-    let preparation = prepared(&store, &run.id).await;
-    let saved = runs::Entity::find_by_id(run.id.clone())
-        .one(&store.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    runs::Entity::delete_by_id(run.id.clone())
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    runs::Entity::insert(saved.into_active_model())
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let current = row(&store, &run.id).await.unwrap();
-    assert!(current.generation > claim.generation);
-    assert_eq!(
-        store
-            .with_maintenance_reads_and_critical_writes()
-            .commit_task_run_occurrence(preparation, Some(claim))
-            .await
-            .unwrap(),
-        TaskRunOccurrenceTerminalizationOutcome::StaleClaim
-    );
-    assert_eq!(row(&store, &run.id).await.unwrap(), current);
-}
-
-#[tokio::test]
-async fn attempt_count_saturates_but_poison_row_stays_retryable_forever() {
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(NOW, 64)
-        .await
-        .unwrap()
-        .remove(0);
-    let mut now = NOW;
-    for attempt in 1..=24 {
-        let claim = store
-            .claim_task_run_occurrence_reconcile(&candidate, &|| now)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claim.attempt_count, std::cmp::min(attempt, 16));
-        let expected_delay = [5, 10, 20, 40, 80, 160, 300][(attempt as usize - 1).min(6)];
-        assert_eq!(claim.next_attempt_at, now + expected_delay);
-        let stored = row(&store, &run.id).await.unwrap();
-        assert_eq!(stored.next_attempt_at, now + expected_delay);
-        assert_eq!(
-            stored.claim_token.as_deref(),
-            Some(claim.claim_token.as_str())
-        );
-        now = claim.next_attempt_at;
-    }
-}
-
-#[tokio::test]
-async fn recovery_completed_at_write_tracks_preinstall_run_without_history_discovery() {
-    let store = tracker_projector_store().await;
-    let (store, _, run) =
-        terminal_task_run_occurrence_fixture_with_store(store, Some(TurnKind::TaskRun)).await;
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::CompletedAt,
-            Expr::val(None::<sea_orm::entity::prelude::DateTimeWithTimeZone>),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let maintenance = store.with_maintenance_access();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::down(&*tx, Some(tracker_rollback_steps()))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let tx = maintenance.connection.begin().await.unwrap();
-    TrackerFixtureMigrator::up(&*tx, None).await.unwrap();
-    tx.commit().await.unwrap();
-    assert!(row(&store, &run.id).await.is_none());
-    // The existing generic recovery still owns its algorithm. Its actual
-    // completed_at UPDATE, after tracker installation, supplies the work item.
-    maintenance
-        .repair_terminal_runs_missing_completed_at()
-        .await
-        .unwrap();
-    assert!(row(&store, &run.id).await.is_some());
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_back_repair() {
     let (store, thread, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let effect = cleanup_effect_preparation("ws_task", &thread.id, &run.id, "occurrence_effect");
@@ -1876,238 +1092,7 @@ async fn auxiliary_native_effect_payload_edit_with_same_hash_timestamp_rolls_bac
     );
 }
 
-#[tokio::test]
-async fn failed_claim_deferral_fences_generation_token_due_count_and_ambiguous_success() {
-    use crate::{
-        TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailurePhase as Phase,
-    };
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let maintenance = store.with_maintenance_access();
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(NOW, 64)
-        .await
-        .unwrap()
-        .remove(0);
-    // SQLite trigger DDL has no SeaQuery builder. This rejects only token SET,
-    // preserving ordinary service bookkeeping writes for the same candidate.
-    maintenance.connection.execute_unprepared("CREATE TRIGGER reject_claim BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'individual claim refusal'); END").await.unwrap();
-    let failure = match queue::claim(
-        &maintenance.connection,
-        &candidate,
-        "rejected".into(),
-        &|| NOW,
-    )
-    .await
-    {
-        Err(failure) => failure,
-        _ => panic!("claim must be rejected"),
-    };
-    assert_eq!(failure.phase, Phase::Reservation);
-    let snapshot = failure.snapshot.unwrap();
-    assert_eq!(
-        queue::defer_failed_claim(&maintenance.connection, &snapshot, &|| NOW)
-            .await
-            .unwrap(),
-        Deferral::Deferred
-    );
-    let deferred = row(&store, &run.id).await.unwrap();
-    assert_eq!(deferred.attempt_count, 1);
-    assert_eq!(deferred.next_attempt_at, NOW + 5);
-    assert_eq!(deferred.claim_token, snapshot.claim_token);
-    assert_eq!(
-        queue::defer_failed_claim(&maintenance.connection, &snapshot, &|| NOW + 100)
-            .await
-            .unwrap(),
-        Deferral::StateChanged
-    );
-    assert_eq!(row(&store, &run.id).await.unwrap(), deferred);
-    // Source refresh must also invalidate the token. Remove the injected token
-    // write blocker before changing the source, while retaining the failed
-    // attempt's exact snapshot to test its later stale deferral.
-    maintenance
-        .connection
-        .execute_unprepared("DROP TRIGGER reject_claim")
-        .await
-        .unwrap();
-    // A late result of the same refusal cannot postpone a new generation.
-    runs::Entity::update_many()
-        .col_expr(
-            runs::Column::ErrorJson,
-            Expr::val("{\"message\":\"changed\"}"),
-        )
-        .filter(runs::Column::Id.eq(&run.id))
-        .exec(&store.connection)
-        .await
-        .unwrap();
-    let updated = row(&store, &run.id).await.unwrap();
-    assert_eq!(
-        queue::defer_failed_claim(&maintenance.connection, &deferred, &|| NOW + 100)
-            .await
-            .unwrap(),
-        Deferral::StateChanged
-    );
-    assert_eq!(row(&store, &run.id).await.unwrap(), updated);
-    let candidate = TaskRunOccurrenceReconcileCandidate {
-        run_id: run.id.clone(),
-        generation: updated.generation,
-    };
-    let first = store
-        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW + 5)
-        .await
-        .unwrap()
-        .unwrap();
-    let old_holder_snapshot = row(&store, &run.id).await.unwrap();
-    let second = store
-        .claim_task_run_occurrence_reconcile(&candidate, &|| first.next_attempt_at)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(first.claim_token, second.claim_token);
-    let current = row(&store, &run.id).await.unwrap();
-    assert_eq!(
-        queue::defer_failed_claim(&maintenance.connection, &old_holder_snapshot, &|| NOW + 100)
-            .await
-            .unwrap(),
-        Deferral::StateChanged
-    );
-    // Model a lost commit acknowledgement: the successful token/due/count are
-    // durable, but the caller holds only its pre-commit snapshot for deferral.
-    assert_eq!(
-        queue::defer_failed_claim(&maintenance.connection, &updated, &|| NOW + 100)
-            .await
-            .unwrap(),
-        Deferral::StateChanged
-    );
-    assert_eq!(row(&store, &run.id).await.unwrap(), current);
-}
-
-#[tokio::test]
-async fn unavailable_bookkeeping_is_reported_without_claim_or_durable_backoff_promise() {
-    use crate::{
-        TaskRunOccurrenceClaimDeferral as Deferral, TaskRunOccurrenceClaimFailure,
-        TaskRunOccurrenceClaimFailurePhase as Phase,
-    };
-    let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(NOW, 64)
-        .await
-        .unwrap()
-        .remove(0);
-    let before = row(&store, &run.id).await.unwrap();
-    // Reject every service update, including the fallback deferral. Trigger
-    // DDL is SQLite-specific; no production invariant is changed by this test.
-    store.connection.execute_unprepared("CREATE TRIGGER reject_bookkeeping BEFORE UPDATE ON task_run_occurrence_reconcile_pending BEGIN SELECT RAISE(ABORT,'bookkeeping unavailable'); END").await.unwrap();
-    let failure = store
-        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
-        .await
-        .unwrap_err()
-        .downcast::<TaskRunOccurrenceClaimFailure>()
-        .unwrap();
-    assert_eq!(failure.phase, Phase::Reservation);
-    assert_eq!(failure.deferral, Deferral::Failed);
-    assert!(failure.deferral_error.is_some());
-    assert_eq!(row(&store, &run.id).await.unwrap(), before);
-    store.connection.clone().close().await.unwrap();
-    let failure = store
-        .claim_task_run_occurrence_reconcile(&candidate, &|| NOW)
-        .await
-        .unwrap_err()
-        .downcast::<TaskRunOccurrenceClaimFailure>()
-        .unwrap();
-    assert_eq!(failure.phase, Phase::AdvisoryRead);
-    assert_eq!(failure.deferral, Deferral::NoSnapshot);
-}
-
-#[tokio::test]
-async fn claim_uses_time_after_discovery_instead_of_the_advisory_clock() {
-    let (store, _, _) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
-    let clock = std::sync::atomic::AtomicI64::new(NOW);
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(clock.load(Ordering::SeqCst), 64)
-        .await
-        .unwrap()
-        .remove(0);
-    clock.store(NOW + 100, Ordering::SeqCst);
-    let claim = store
-        .claim_task_run_occurrence_reconcile(&candidate, &|| clock.load(Ordering::SeqCst))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(claim.next_attempt_at, NOW + 105);
-    assert_eq!(
-        row(&store, &candidate.run_id)
-            .await
-            .unwrap()
-            .next_attempt_at,
-        NOW + 105
-    );
-}
-
-#[tokio::test]
-async fn claim_and_failed_claim_deferral_use_time_after_waiting_for_writer() {
-    use std::time::Duration;
-    let path = std::env::temp_dir().join(format!(
-        "pioneer-occurrence-clock-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
-    let routes = Arc::new(Routes::default());
-    let store = disk_store(&path, routes.clone()).await;
-    let id = populate_disk_pair(&store).await;
-    let candidate = store
-        .discover_task_run_occurrence_reconcile(NOW, 64)
-        .await
-        .unwrap()
-        .remove(0);
-    let clock = Arc::new(std::sync::atomic::AtomicI64::new(NOW));
-    let hold = store.connection.begin().await.unwrap();
-    routes.watch_claim.store(true, Ordering::SeqCst);
-    let worker = store.clone();
-    let c = candidate.clone();
-    let time = clock.clone();
-    let waiting = tokio::spawn(async move {
-        worker
-            .claim_task_run_occurrence_reconcile(&c, &|| time.load(Ordering::SeqCst))
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), routes.maintenance_queued.notified())
-        .await
-        .unwrap();
-    clock.store(NOW + 100, Ordering::SeqCst);
-    hold.rollback().await.unwrap();
-    let claim = waiting.await.unwrap().unwrap().unwrap();
-    assert_eq!(claim.next_attempt_at, NOW + 105);
-    let snapshot = row(&store, &id).await.unwrap();
-    clock.store(claim.next_attempt_at, Ordering::SeqCst);
-    routes.watch_claim.store(false, Ordering::SeqCst);
-    let hold = store.connection.begin().await.unwrap();
-    routes.watch_claim.store(true, Ordering::SeqCst);
-    let worker = store.clone();
-    let time = clock.clone();
-    let waiting = tokio::spawn(async move {
-        queue::defer_failed_claim(
-            &worker.with_maintenance_access().connection,
-            &snapshot,
-            &|| time.load(Ordering::SeqCst),
-        )
-        .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), routes.maintenance_queued.notified())
-        .await
-        .unwrap();
-    clock.store(NOW + 200, Ordering::SeqCst);
-    hold.rollback().await.unwrap();
-    assert_eq!(
-        waiting.await.unwrap().unwrap(),
-        crate::TaskRunOccurrenceClaimDeferral::Deferred
-    );
-    let row = row(&store, &id).await.unwrap();
-    assert_eq!(row.attempt_count, 2);
-    assert_eq!(row.next_attempt_at, NOW + 210);
-    assert_eq!(row.claim_token.as_deref(), Some(claim.claim_token.as_str()));
-    remove_disk_fixture(store, path).await;
-}
-
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn background_repair_waits_for_predecessor_then_retries_without_source_pair_change() {
     let (store, _, run) = terminal_task_run_occurrence_fixture(Some(TurnKind::TaskRun)).await;
     let run_before = runs::Entity::find_by_id(&run.id)

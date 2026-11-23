@@ -335,7 +335,7 @@ async fn change_cli(processor: &MessageProcessor, enabled: bool, binary: &str) {
     sync_test_cli_runtime_identities(processor).await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn existing_cli_task_recovery_refuses_changed_engine_with_a_current_catalog() {
     let (processor, workspace) = processor_with_registry(test_provider()).await;
     let (response, run, execution) = task_fixture(&processor, &workspace, true).await;
@@ -436,7 +436,7 @@ async fn existing_cli_task_recovery_refuses_changed_engine_with_a_current_catalo
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn old_cli_task_admits_after_off_on_technical_change_and_return_without_rewriting_contract() {
     let (processor, workspace) = processor_with_registry(test_provider()).await;
     let (response, run, execution) = task_fixture(&processor, &workspace, true).await;
@@ -623,7 +623,7 @@ async fn old_cli_task_admits_after_off_on_technical_change_and_return_without_re
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn configuration_change_between_preparation_and_graph_commit_rolls_back() {
     let (processor, workspace) = processor_with_registry(test_provider()).await;
     let (response, run, execution) = task_fixture(&processor, &workspace, true).await;
@@ -652,7 +652,7 @@ async fn configuration_change_between_preparation_and_graph_commit_rolls_back() 
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn native_source_disable_between_preparation_and_commit_is_not_a_connection_refresh() {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
     let (processor, workspace) = processor_with_registry(test_provider()).await;
@@ -693,7 +693,7 @@ async fn native_source_disable_between_preparation_and_commit_is_not_a_connectio
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_cli_task_provider_grant_is_not_resolved_as_an_api_connection() {
     let registry = test_provider();
     let (processor, workspace) = processor_with_registry(registry.clone()).await;
@@ -749,7 +749,7 @@ async fn legacy_cli_task_provider_grant_is_not_resolved_as_an_api_connection() {
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn api_task_rotates_connection_only_after_current_authorization_and_keeps_saved_envelope() {
     let key = Arc::new(std::sync::RwLock::new("key-one".to_owned()));
     let registry = Arc::new(pioneer_provider::ProviderRegistry::new({

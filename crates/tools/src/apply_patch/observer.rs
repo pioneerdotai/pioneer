@@ -298,7 +298,7 @@ impl DurableCommitObserver {
 
     /// Seeds the process-local journal with the exact recovery plan that was
     /// prepared while the executor held the complete target lock set. The
-    /// durable SQLite adapter calls this only after its Pending row has been
+    /// durable PostgreSQL adapter calls this only after its Pending row has been
     /// committed, so every subsequent filesystem operation has a recoverable
     /// local and durable intent before it starts.
     pub fn seed_admission_with_admission(

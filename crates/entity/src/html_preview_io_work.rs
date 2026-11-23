@@ -7,19 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "html_preview_io_work")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub family: String,
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub object_id: String,
+    #[sea_orm(column_type = "Text")]
     pub incarnation: String,
+    #[sea_orm(column_type = "Text")]
     pub requested_revision: String,
+    #[sea_orm(column_type = "Text")]
     pub pass_revision: String,
+    #[sea_orm(column_type = "Text")]
     pub state: String,
     #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub ordinal: i64,
     pub due_at: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub cursor_id: Option<String>,
@@ -28,6 +33,7 @@ pub struct Model {
     pub upper_id: Option<String>,
     pub upper_ordinal: Option<i64>,
     pub seed_version: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub error_class: Option<String>,
 }
 

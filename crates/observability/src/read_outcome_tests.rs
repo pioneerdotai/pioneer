@@ -123,7 +123,7 @@ fn delayed_read_completion_never_promotes_stale_or_disabled_callback_epoch() {
             let mut points = std::mem::take(&mut *output.0.lock().unwrap());
             points.sort_by(|a, b| a.name.cmp(&b.name));
             let attributes = BTreeMap::from([
-                ("db.system.name".into(), "sqlite".into()),
+                ("db.system.name".into(), "postgresql".into()),
                 ("db.pool.role".into(), "reader".into()),
                 ("db.scheduling.class".into(), "maintenance".into()),
                 ("outcome".into(), outcome.into()),

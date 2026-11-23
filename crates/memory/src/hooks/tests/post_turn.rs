@@ -852,9 +852,9 @@ async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_
     fact["facts"][0]["semantic"]["scope_hint"] = serde_json::json!("project_workspace");
     fact["facts"][0]["semantic"]["sensitivity"] = serde_json::json!("none");
     fact["facts"][0]["semantic"]["durability"] = serde_json::json!("project_lifetime");
-    fact["facts"][0]["content"] = serde_json::json!("Pioneer uses SQLite.");
-    fact["facts"][0]["value"] = serde_json::json!("SQLite");
-    fact["facts"][0]["evidence"]["quote_or_span"] = serde_json::json!("Pioneer uses SQLite.");
+    fact["facts"][0]["content"] = serde_json::json!("Pioneer uses PostgreSQL.");
+    fact["facts"][0]["value"] = serde_json::json!("PostgreSQL");
+    fact["facts"][0]["evidence"]["quote_or_span"] = serde_json::json!("Pioneer uses PostgreSQL.");
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(fact.to_string()));
     let hook = MemoryPostTurnExtractorHook {
         write_provider: Some(write_provider.clone()),
@@ -863,7 +863,7 @@ async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_
     };
     let mut request = test_post_turn_hook_request(
         memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
-        "Investigate this in the background. Pioneer uses SQLite.",
+        "Investigate this in the background. Pioneer uses PostgreSQL.",
         "The accepted background investigation is complete.",
     );
     request.context.thread_id =
@@ -2507,218 +2507,226 @@ async fn intent_normalization_preserves_direct_and_inferred_evidence_explicitnes
 
 #[tokio::test]
 async fn conflicting_candidate_replay_merges_sources_without_creation_or_revival() {
-    use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::{AgentMemoryListFilter, CrudStore};
-    use pioneer_protocol::MemoryCandidatesRejectParams;
-    use sea_orm::Database;
+    pioneer_postgres_test::with_database(async |database| {
+        use pioneer_crud::{AgentMemoryListFilter, CrudStore};
+        use pioneer_protocol::MemoryCandidatesRejectParams;
 
-    let connection = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&connection, None).await.unwrap();
-    let store = Arc::new(CrudStore::new(connection).with_maintenance_access());
-    let mut config = crate::MemoryServiceConfig::default();
-    config.candidate_policy.review_enabled = true;
-    let service = crate::MemoryService::new(
-        store.clone(),
-        Arc::new(crate::InMemoryMemoryBackend::default()),
-        config,
-    );
-    let context = crate::MemoryOperationContext {
-        workspace_id: Some("candidate_workspace".into()),
-        now_unix: Some(1_771_000_000),
-        ..Default::default()
-    };
-    let fact = parse_memory_post_turn_extractor_json(
-        &valid_post_turn_extractor_json(),
-        &MemoryPostTurnExtractorConfig::default(),
-    )
-    .unwrap()
-    .facts
-    .into_iter()
-    .next()
-    .unwrap();
-    let mut params = memory_semantic_write_params_from_extracted_fact(
-        0,
-        fact,
-        &test_memory_turn_context(),
-        &MemoryTurnPolicy::normal_default_allow(),
-        &MemoryPostTurnExtractorConfig::default(),
-        MemorySourceContextKind::DirectUserConversation,
-        None,
-        None,
-    )
-    .unwrap();
-    params.scope = MemoryScope {
-        kind: MemoryScopeKind::User,
-        key: "workspace:candidate_workspace:user:default".into(),
-    };
-    params.semantic.scope_hint = MemoryScopeHint::UserWorkspace;
-    params.disposition = Some(MemorySemanticWriteDisposition::AcceptActive);
-    let active = service
-        .write_semantic_memory(context.clone(), params.clone())
-        .await
+        let reader = database.connect_read_only().await?;
+        let store = Arc::new(
+            CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
+                reader,
+                database.connection().clone(),
+            ))
+            .with_maintenance_access(),
+        );
+        let mut config = crate::MemoryServiceConfig::default();
+        config.candidate_policy.review_enabled = true;
+        let service = crate::MemoryService::new(
+            store.clone(),
+            Arc::new(crate::InMemoryMemoryBackend::default()),
+            config,
+        );
+        let context = crate::MemoryOperationContext {
+            workspace_id: Some("candidate_workspace".into()),
+            now_unix: Some(1_771_000_000),
+            ..Default::default()
+        };
+        let fact = parse_memory_post_turn_extractor_json(
+            &valid_post_turn_extractor_json(),
+            &MemoryPostTurnExtractorConfig::default(),
+        )
         .unwrap()
-        .record
+        .facts
+        .into_iter()
+        .next()
         .unwrap();
-    let original = store
-        .get_agent_memory_record(&active.id, true)
-        .await
-        .unwrap()
+        let mut params = memory_semantic_write_params_from_extracted_fact(
+            0,
+            fact,
+            &test_memory_turn_context(),
+            &MemoryTurnPolicy::normal_default_allow(),
+            &MemoryPostTurnExtractorConfig::default(),
+            MemorySourceContextKind::DirectUserConversation,
+            None,
+            None,
+        )
         .unwrap();
+        params.scope = MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "workspace:candidate_workspace:user:default".into(),
+        };
+        params.semantic.scope_hint = MemoryScopeHint::UserWorkspace;
+        params.disposition = Some(MemorySemanticWriteDisposition::AcceptActive);
+        let active = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        let original = store
+            .get_agent_memory_record(&active.id, true)
+            .await
+            .unwrap()
+            .unwrap();
 
-    params.semantic.intent = MemoryIntent::ImplicitCandidate;
-    params.disposition = Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
-    params.content = "Имя пользователя: Борис".into();
-    params.value = Some("Борис".into());
-    let evidence = params.evidence.as_mut().unwrap();
-    evidence.source_thread_id = Some("candidate_thread".into());
-    evidence.source_turn_id = Some("candidate_turn_one".into());
-    evidence.source_item_id = None;
-    evidence.quote_or_span = Some("Меня зовут Борис".into());
-    let provenance = params.provenance.as_mut().unwrap();
-    provenance.source_thread_id = evidence.source_thread_id.clone();
-    provenance.source_turn_id = evidence.source_turn_id.clone();
-    let first = service
-        .write_semantic_memory(context.clone(), params.clone())
-        .await
-        .unwrap();
-    let candidate_id = first.candidate.as_ref().unwrap().id.clone();
-    assert_eq!(first.relation, MemoryWriteRelation::Contradiction);
-    assert!(first.created);
-    assert!(!first.evidence_merged);
-    assert!(first.record.is_none());
-    let mut stats = MemoryPostTurnExtractorStats::default();
-    stats.observe_write_response(&first);
-    let replay = service
-        .write_semantic_memory(context.clone(), params.clone())
-        .await
-        .unwrap();
-    assert!(!replay.created);
-    assert!(replay.evidence_merged);
-    for (response, count) in [(first, 1), (replay, 1)] {
-        let candidate = response.candidate.as_ref().unwrap();
+        params.semantic.intent = MemoryIntent::ImplicitCandidate;
+        params.disposition = Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy);
+        params.content = "Имя пользователя: Борис".into();
+        params.value = Some("Борис".into());
+        let evidence = params.evidence.as_mut().unwrap();
+        evidence.source_thread_id = Some("candidate_thread".into());
+        evidence.source_turn_id = Some("candidate_turn_one".into());
+        evidence.source_item_id = None;
+        evidence.quote_or_span = Some("Меня зовут Борис".into());
+        let provenance = params.provenance.as_mut().unwrap();
+        provenance.source_thread_id = evidence.source_thread_id.clone();
+        provenance.source_turn_id = evidence.source_turn_id.clone();
+        let first = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .unwrap();
+        let candidate_id = first.candidate.as_ref().unwrap().id.clone();
+        assert_eq!(first.relation, MemoryWriteRelation::Contradiction);
+        assert!(first.created);
+        assert!(!first.evidence_merged);
+        assert!(first.record.is_none());
+        let mut stats = MemoryPostTurnExtractorStats::default();
+        stats.observe_write_response(&first);
+        let replay = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .unwrap();
+        assert!(!replay.created);
+        assert!(replay.evidence_merged);
+        for (response, count) in [(first, 1), (replay, 1)] {
+            let candidate = response.candidate.as_ref().unwrap();
+            assert_eq!(candidate.id, candidate_id);
+            assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
+            assert_eq!(candidate.metadata["evidence"]["count"], count);
+            assert_eq!(
+                candidate.metadata["evidence"]["sources"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                count as usize
+            );
+            assert_eq!(
+                candidate.metadata["evidence"]["sources"][0]["source_turn_id"],
+                "candidate_turn_one"
+            );
+            if !response.created {
+                assert!(response.evidence_merged);
+                stats.observe_write_response(&response);
+            }
+        }
+        params.evidence.as_mut().unwrap().source_turn_id = Some("candidate_turn_two".into());
+        params.provenance.as_mut().unwrap().source_turn_id = Some("candidate_turn_two".into());
+        let second = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .unwrap();
+        assert!(!second.created);
+        assert!(second.evidence_merged);
+        let candidate = second.candidate.as_ref().unwrap();
         assert_eq!(candidate.id, candidate_id);
         assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
-        assert_eq!(candidate.metadata["evidence"]["count"], count);
+        assert_eq!(candidate.metadata["evidence"]["count"], 2);
+        let sources = candidate.metadata["evidence"]["sources"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1]["source_turn_id"], "candidate_turn_two");
+        assert_eq!(
+            candidate.provenance.source_turn_id.as_deref(),
+            Some("candidate_turn_one")
+        );
+        stats.observe_write_response(&second);
+        assert_eq!(stats.pending_created_count, 1);
+        assert_eq!(stats.duplicate_or_merged_count, 2);
+        assert_eq!(stats.auto_approved_count, 0);
+        assert_eq!(stats.active_created_count, 0);
+        assert_eq!(stats.active_updated_count, 0);
+        assert_eq!(stats.rejected_or_suppressed_count, 0);
+
+        service
+            .reject_candidate(
+                context.clone(),
+                MemoryCandidatesRejectParams {
+                    candidate_id: candidate_id.clone(),
+                    reason: Some("keep original".into()),
+                    actor: None,
+                },
+            )
+            .await
+            .unwrap();
+        params.evidence.as_mut().unwrap().source_turn_id = Some("candidate_turn_three".into());
+        params.provenance.as_mut().unwrap().source_turn_id = Some("candidate_turn_three".into());
+        let rejected = service
+            .write_semantic_memory(context.clone(), params.clone())
+            .await
+            .unwrap();
+        assert!(!rejected.created);
+        assert!(rejected.evidence_merged);
+        assert!(rejected.record.is_none());
+        let candidate = rejected.candidate.as_ref().unwrap();
+        assert_eq!(candidate.id, candidate_id);
+        assert_eq!(candidate.status, MemoryCandidateStatus::Rejected);
+        assert_eq!(candidate.metadata["evidence"]["count"], 3);
         assert_eq!(
             candidate.metadata["evidence"]["sources"]
                 .as_array()
                 .unwrap()
                 .len(),
-            count as usize
+            3
         );
         assert_eq!(
-            candidate.metadata["evidence"]["sources"][0]["source_turn_id"],
-            "candidate_turn_one"
+            candidate.metadata["evidence"]["sources"][2]["source_turn_id"],
+            "candidate_turn_three"
         );
-        if !response.created {
-            assert!(response.evidence_merged);
-            stats.observe_write_response(&response);
-        }
-    }
-    params.evidence.as_mut().unwrap().source_turn_id = Some("candidate_turn_two".into());
-    params.provenance.as_mut().unwrap().source_turn_id = Some("candidate_turn_two".into());
-    let second = service
-        .write_semantic_memory(context.clone(), params.clone())
-        .await
-        .unwrap();
-    assert!(!second.created);
-    assert!(second.evidence_merged);
-    let candidate = second.candidate.as_ref().unwrap();
-    assert_eq!(candidate.id, candidate_id);
-    assert_eq!(candidate.status, MemoryCandidateStatus::AskOnUse);
-    assert_eq!(candidate.metadata["evidence"]["count"], 2);
-    let sources = candidate.metadata["evidence"]["sources"]
-        .as_array()
-        .unwrap();
-    assert_eq!(sources.len(), 2);
-    assert_eq!(sources[1]["source_turn_id"], "candidate_turn_two");
-    assert_eq!(
-        candidate.provenance.source_turn_id.as_deref(),
-        Some("candidate_turn_one")
-    );
-    stats.observe_write_response(&second);
-    assert_eq!(stats.pending_created_count, 1);
-    assert_eq!(stats.duplicate_or_merged_count, 2);
-    assert_eq!(stats.auto_approved_count, 0);
-    assert_eq!(stats.active_created_count, 0);
-    assert_eq!(stats.active_updated_count, 0);
-    assert_eq!(stats.rejected_or_suppressed_count, 0);
-
-    service
-        .reject_candidate(
-            context.clone(),
-            MemoryCandidatesRejectParams {
-                candidate_id: candidate_id.clone(),
-                reason: Some("keep original".into()),
-                actor: None,
-            },
-        )
-        .await
-        .unwrap();
-    params.evidence.as_mut().unwrap().source_turn_id = Some("candidate_turn_three".into());
-    params.provenance.as_mut().unwrap().source_turn_id = Some("candidate_turn_three".into());
-    let rejected = service
-        .write_semantic_memory(context.clone(), params.clone())
-        .await
-        .unwrap();
-    assert!(!rejected.created);
-    assert!(rejected.evidence_merged);
-    assert!(rejected.record.is_none());
-    let candidate = rejected.candidate.as_ref().unwrap();
-    assert_eq!(candidate.id, candidate_id);
-    assert_eq!(candidate.status, MemoryCandidateStatus::Rejected);
-    assert_eq!(candidate.metadata["evidence"]["count"], 3);
-    assert_eq!(
-        candidate.metadata["evidence"]["sources"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    assert_eq!(
-        candidate.metadata["evidence"]["sources"][2]["source_turn_id"],
-        "candidate_turn_three"
-    );
-    assert_eq!(candidate.decision_reason.as_deref(), Some("keep original"));
-    stats.observe_write_response(&rejected);
-    assert_eq!(stats.pending_created_count, 1);
-    assert_eq!(stats.duplicate_or_merged_count, 3);
-    assert_eq!(stats.rejected_or_suppressed_count, 1);
-    let records = store
-        .list_agent_memory_records(AgentMemoryListFilter {
-            scopes: vec![params.scope],
-            statuses: vec![MemoryStatus::Active],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0], original);
-    let candidates = store
-        .list_agent_memory_candidates(pioneer_crud::AgentMemoryCandidateListFilter {
-            scopes: vec![original.scope.clone()],
-            statuses: vec![
-                MemoryCandidateStatus::AskOnUse,
-                MemoryCandidateStatus::Rejected,
-            ],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].id, candidate_id);
-    // Workspace-wide events also catch orphan events with generated, unused IDs.
-    let events = store
-        .list_workspace_agent_memory_events("candidate_workspace", 100)
-        .await
-        .unwrap();
-    let creations: Vec<_> = events
-        .iter()
-        .filter(|event| event.event_kind == "candidate_created")
-        .collect();
-    assert_eq!(creations.len(), 1);
-    assert_eq!(
-        creations[0].candidate_id.as_deref(),
-        Some(candidate_id.as_str())
-    );
+        assert_eq!(candidate.decision_reason.as_deref(), Some("keep original"));
+        stats.observe_write_response(&rejected);
+        assert_eq!(stats.pending_created_count, 1);
+        assert_eq!(stats.duplicate_or_merged_count, 3);
+        assert_eq!(stats.rejected_or_suppressed_count, 1);
+        let records = store
+            .list_agent_memory_records(AgentMemoryListFilter {
+                scopes: vec![params.scope],
+                statuses: vec![MemoryStatus::Active],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], original);
+        let candidates = store
+            .list_agent_memory_candidates(pioneer_crud::AgentMemoryCandidateListFilter {
+                scopes: vec![original.scope.clone()],
+                statuses: vec![
+                    MemoryCandidateStatus::AskOnUse,
+                    MemoryCandidateStatus::Rejected,
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, candidate_id);
+        // Workspace-wide events also catch orphan events with generated, unused IDs.
+        let events = store
+            .list_workspace_agent_memory_events("candidate_workspace", 100)
+            .await
+            .unwrap();
+        let creations: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_kind == "candidate_created")
+            .collect();
+        assert_eq!(creations.len(), 1);
+        assert_eq!(
+            creations[0].candidate_id.as_deref(),
+            Some(candidate_id.as_str())
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }

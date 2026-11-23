@@ -81,7 +81,49 @@ Agents retrieve relevant context within workspace and thread permissions and a b
 
 ## Under the hood
 
-Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by SQLite. Clients connect over a JSON-RPC WebSocket API.
+Pioneer is a Rust workspace with a native GPUI desktop app and a gateway backed by PostgreSQL. Clients connect over a JSON-RPC WebSocket API.
+
+Gateway releases include PostgreSQL 19 and pgvector. Starting a local Gateway initializes its private database in the Gateway data directory. The same database is opened on later starts and application updates within the same PostgreSQL major version. Desktop installs the same database runtime when it sets up a local Gateway.
+
+Bundled PostgreSQL 18 clusters from development builds require a PostgreSQL
+major-version upgrade before switching to a Gateway with bundled PostgreSQL 19.
+
+For a self-hosted Gateway with an external PostgreSQL 18 or 19 server or cluster,
+set `DATABASE_URL` in the Gateway process environment or in
+`~/.pioneer/.env` under the service account.
+
+```dotenv
+DATABASE_URL=postgresql://pioneer_app:YOUR_PASSWORD@db.example.com:5432/pioneer?sslmode=verify-full
+```
+
+Create a dedicated application database with pgvector available and give the
+configured role permission to apply Pioneer migrations. For a cluster, use
+its writable primary endpoint. Gateway applies migrations at startup and
+opens its reader and writer pools against that database. Use one active
+Gateway instance per database.
+
+From the repository root, start Gateway against your development database with
+an inline environment variable:
+
+```sh
+DATABASE_URL="postgresql://$(id -un)@127.0.0.1:5432/pioneer_dev" cargo run -p pioneer-cli -- start
+```
+
+For a repeatable setup, put `DATABASE_URL` in `.env` next to the workspace
+`Cargo.toml` and run `cargo run -p pioneer-cli -- start`. Development precedence
+is `gateway.database.development_url`, the process environment or the URL saved
+by `start` for the background service, the workspace `.env`, then
+`~/.pioneer.dev/.env`. Running `start` without an inline URL, or running `stop`,
+clears the saved service override. Use a separate database for development.
+
+On first initialization of a bundled cluster, Gateway uses PGConfig's
+`DESKTOP` profile with its PostgreSQL 18 tuning rules. The calculator receives the detected RAM budget, logical CPU
+count and storage type. On Linux, the RAM input respects a detected cgroup limit. PGConfig supplies the
+server connection limit, currently 100. Gateway sets its pool sizes separately.
+The generated file is `postgres/data/pioneer-tuning.conf`. Add manual
+overrides below its include in `postgresql.conf`.
+
+On Windows ARM64, the bundled PostgreSQL and pgvector run through Windows 11's built-in x64 emulation.
 
 ```mermaid
 flowchart TB
@@ -136,15 +178,21 @@ in every mode; `--skip-build` remains accepted and never triggers a nested build
 The release workflow supplies the shared model catalog and run/commit/target
 provenance. Missing or mismatched inputs fail without a compilation fallback.
 
-The server assets retain their existing names and formats: gzip for Linux and
-macOS aarch64, ZIP for Windows and macOS x86_64. Computer-use assets are named
-`pioneer-gateway-{os}-{arch}-computer-use-package.zip` and contain the verified
-CUA 0.38.0 runtime. Install the complete CU archive; copying only `pioneer` cannot install
-the driver. The installer keeps the executable and `bin/cua` together and retains
-recovery files when schema compatibility is unknown.
+Server assets are named `pioneer-gateway-{os}-{arch}.zip`. Computer-use assets
+are named `pioneer-gateway-{os}-{arch}-computer-use-package.zip` and include
+the verified CUA runtime. The installer activates the executable together with
+`bin/runtime` and retains recovery files when schema compatibility is unknown.
+Both variants ship PostgreSQL and pgvector under `runtime/postgres/`. Computer
+Use files live under `runtime/cua/`. On macOS the Computer Use executable and
+driver are in the signed `runtime/Pioneer Gateway.app`.
 
-Gateway updates use the complete `-computer-use-package.zip` asset
-through `pioneer update` or `pioneer self-update`.
+Gateway updates use the complete archive through `pioneer update` or
+`pioneer self-update`. For the first layout update from a PostgreSQL build
+whose CLI only understands the older `cua/` layout, use the current
+`install.sh` or `install.ps1`. Pass `--computer-use` or `-ComputerUse` to
+update the Computer Use variant. Desktop launches the installer bundled with
+its own update and can switch an existing PostgreSQL Gateway to the new layout
+directly.
 
 Server/default installations retain their normal update procedure and do not
 need computer use or Desktop. Use `--headless` / `-Headless` for an explicit

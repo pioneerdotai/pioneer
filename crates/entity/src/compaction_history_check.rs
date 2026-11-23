@@ -19,8 +19,7 @@ pub struct Model {
     pub failures: i64,
     pub next_attempt_ms: i64,
     pub attempt_deadline_ms: Option<i64>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub diagnostic: Option<String>,
+    pub diagnostic: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub config_hash: Option<String>,
     pub managed: i64,
@@ -33,7 +32,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

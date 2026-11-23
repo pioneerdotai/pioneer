@@ -1534,7 +1534,7 @@ impl TaskAgentExecutor {
         match self.processor() {
             Ok(processor) => Ok(Some(match origin {
                 TaskChildReconciliationOrigin::Live => {
-                    processor.with_database_class(SqliteWriteClass::Critical)
+                    processor.with_database_class(PostgresWriteClass::Critical)
                 }
                 TaskChildReconciliationOrigin::DurableBackground => {
                     processor.for_background_reconciliation()
@@ -1597,7 +1597,7 @@ impl TaskAgentExecutor {
     ) -> Result<TaskExecutorStartOutcome> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
@@ -4960,8 +4960,7 @@ impl TaskAgentExecutor {
             child_runtime.task_run_turn.run_id.clone(),
         );
         self.complete_child_turn(&processor, child_runtime, handle)
-            .await?;
-        Ok(true)
+            .await
     }
 
     /// Reopen and dispatch a blocked task child through the native
@@ -5413,7 +5412,7 @@ impl TaskAgentExecutor {
         processor: &Arc<MessageProcessor>,
         child_runtime: TaskRunChildRuntime,
         handle: TaskExecutionHandle,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bus = processor.task_runtime.event_bus();
         let generation = bus.closing_run_generation(&child_runtime.task_run_turn.run_id);
         let parent = match child_runtime.task_run_turn.reviews_candidate_id.as_deref() {
@@ -5457,7 +5456,14 @@ impl TaskAgentExecutor {
         if let (Some((run, turn)), Some(episode)) = (identity, result_episode) {
             bus.handoff_result_closing(&run, &turn, episode, generation);
         }
-        result
+        match result {
+            // The terminal child remains discoverable. The claimed background
+            // path defers it through its existing next-attempt deadline.
+            Err(error) if error.is::<crate::compaction::frozen::TaskOutputHistoryChanged>() => {
+                Ok(false)
+            }
+            result => result.map(|()| true),
+        }
     }
 
     async fn complete_child_turn_observed(
@@ -5508,44 +5514,7 @@ impl TaskAgentExecutor {
             .review_policy
             .clone()
             .filter(|policy| policy.is_enabled());
-        if let Some(candidate) = processor
-            .crud_store
-            .get_accepted_task_result_candidate(child_runtime.task_run_turn.run_id.as_str())
-            .await?
-            && candidate.task_run_turn_id == child_runtime.task_run_turn.id
-            && let Some(result) = candidate.result
-        {
-            handle
-                .complete_run(
-                    Some(result),
-                    candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
-                )
-                .await?;
-            closing.finish(Fact::Duplicate);
-            mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
-            return Ok(());
-        }
-        if let Some(candidate) = processor
-            .crud_store
-            .get_task_result_candidate_by_turn(child_runtime.task_run_turn.id.as_str())
-            .await?
-            && matches!(
-                candidate.status,
-                TaskResultCandidateStatus::PendingReview
-                    | TaskResultCandidateStatus::ExtractionFailed
-                    | TaskResultCandidateStatus::Rejected
-                    | TaskResultCandidateStatus::Superseded
-                    | TaskResultCandidateStatus::Cancelled
-            )
-        {
-            closing.finish(match candidate.status {
-                TaskResultCandidateStatus::PendingReview => Fact::PendingReview,
-                TaskResultCandidateStatus::ExtractionFailed => Fact::InvalidResult,
-                TaskResultCandidateStatus::Rejected => Fact::Rejected,
-                TaskResultCandidateStatus::Superseded => Fact::Superseded,
-                TaskResultCandidateStatus::Cancelled => Fact::Cancelled,
-                _ => Fact::Returned,
-            });
+        if reuse_published_child_result(processor, &child_runtime, &handle, closing).await? {
             return Ok(());
         }
 
@@ -5610,9 +5579,19 @@ impl TaskAgentExecutor {
                     None => pending_review_result_candidate(&completed_turn, result, completed_at),
                 };
                 let candidate_for_review = candidate.clone();
-                handle
+                if let Err(error) = handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 closing.finish(
                     if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
                         Fact::InvalidResult
@@ -5636,14 +5615,24 @@ impl TaskAgentExecutor {
                 let candidate =
                     accepted_result_candidate(&completed_turn, result.clone(), completed_at);
                 let review_event = runtime_auto_accept_review_event(&candidate, completed_at);
-                handle
+                if let Err(error) = handle
                     .record_auto_accepted_result_candidate(
                         completed_turn,
                         candidate,
                         review_event,
                         completed_at,
                     )
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 handle.complete_run(Some(result), completed_at).await?;
                 closing.finish(Fact::Accepted);
                 mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
@@ -5659,9 +5648,19 @@ impl TaskAgentExecutor {
                 let candidate =
                     extraction_failed_result_candidate(&completed_turn, error, completed_at);
                 let candidate_for_review = candidate.clone();
-                handle
+                if let Err(error) = handle
                     .record_pending_review_result_candidate(completed_turn, candidate, completed_at)
-                    .await?;
+                    .await
+                {
+                    return recover_child_completion_replay(
+                        processor,
+                        &child_runtime,
+                        &handle,
+                        closing,
+                        error,
+                    )
+                    .await;
+                }
                 closing.finish(
                     if candidate_for_review.status == TaskResultCandidateStatus::ExtractionFailed {
                         Fact::InvalidResult
@@ -6851,7 +6850,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let failed_at = now_timestamp_secs();
         let error = task_turn_failure_error(
@@ -6888,7 +6887,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let cancelled_at = now_timestamp_secs();
         let error = task_error(
@@ -6940,7 +6939,7 @@ impl TaskAgentExecutor {
     ) -> Result<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
         let error = match start_failure {
@@ -7078,7 +7077,7 @@ impl TaskExecutor for TaskAgentExecutor {
     ) -> pioneer_tasks::TaskRuntimeResult<()> {
         let processor = self
             .processor()?
-            .with_database_class(SqliteWriteClass::Critical);
+            .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let task_run_turns = processor.crud_store.list_task_run_turns(run_id).await?;
         let cancelled_at = now_timestamp_secs();
@@ -8041,37 +8040,36 @@ where
 #[cfg(test)]
 mod prepared_snapshot_tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::compaction::PagedSource;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
-    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
+    use sea_orm::{ConnectionTrait, TransactionTrait};
     use std::{collections::BTreeSet, sync::Arc};
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_history_preparation_does_not_inherit_critical_transition_writes() {
         let store = fixture("scope-ws").await;
         let live = ordinary_history_store(&store.with_critical_writes());
         assert_eq!(
             live.database_connection().read_class(),
-            SqliteReadClass::Interactive
+            PostgresReadClass::Interactive
         );
         assert_eq!(
             live.database_connection().write_class(),
-            SqliteWriteClass::Interactive
+            PostgresWriteClass::Interactive
         );
         let background =
             ordinary_history_store(&store.with_maintenance_reads_and_critical_writes());
         assert_eq!(
             background.database_connection().read_class(),
-            SqliteReadClass::Maintenance
+            PostgresReadClass::Maintenance
         );
         assert_eq!(
             background.database_connection().write_class(),
-            SqliteWriteClass::Maintenance
+            PostgresWriteClass::Maintenance
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn legacy_task_restart_restores_standalone_and_nested_affinity_without_snapshot_rewrite()
     {
         use pioneer_entity::{task as task_entity, turn as turn_entity};
@@ -8099,7 +8097,7 @@ mod prepared_snapshot_tests {
                     turn_id: turn.into(),
                     thread_id: thread.into(),
                     workspace_id: "legacy-affinity".into(),
-                    mode_json: serde_json::to_string(&ThreadMode::Agent).unwrap(),
+                    mode: pioneer_protocol::ThreadMode::Agent,
                     model: "m".into(),
                     provider_name: "p".into(),
                     reasoning_effort: None,
@@ -8176,7 +8174,7 @@ mod prepared_snapshot_tests {
         row.created_by_thread_id = Set(Some("parent".into()));
         row.created_by_turn_id = Set(Some("own-turn".into()));
         row.lifecycle_policy_json = Set(Some(
-            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+            serde_json::to_value(&pioneer_protocol::TaskLifecyclePolicy {
                 attachment: TaskAttachmentMode::Attached,
                 on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
                 on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
@@ -8234,7 +8232,7 @@ mod prepared_snapshot_tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn common_cold_recovery_restores_legacy_task_routing_from_durable_binding() {
         use pioneer_entity::{
             task as task_entity, task_run, thread as thread_entity, turn as turn_entity,
@@ -8258,7 +8256,7 @@ mod prepared_snapshot_tests {
         child.parent_task_id = Set(Some("own-task".into()));
         child.root_task_id = Set(Some("own-task".into()));
         child.lifecycle_policy_json = Set(Some(
-            serde_json::to_string(&pioneer_protocol::TaskLifecyclePolicy {
+            serde_json::to_value(&pioneer_protocol::TaskLifecyclePolicy {
                 attachment: TaskAttachmentMode::Attached,
                 on_parent_cancel: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
                 on_parent_failure: pioneer_protocol::TaskParentTerminalAction::KeepRunning,
@@ -8425,11 +8423,10 @@ mod prepared_snapshot_tests {
     }
 
     async fn fixture(workspace: &str) -> pioneer_crud::CrudStore {
-        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-        let database = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&database, None).await.unwrap();
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let database = fixture.connection().clone();
         database.execute_unprepared(&format!(
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',1,1);
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',TRUE,FALSE);
              INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('parent','{workspace}','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('execution','{workspace}','','agent','m','p','active','task','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('own-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('loser-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('winner-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
              INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('own-input','own-turn',0,'text','own history','{{\"type\":\"text\",\"text\":\"own history\"}}',CURRENT_TIMESTAMP),('loser-input','loser-turn',0,'text','losing history','{{\"type\":\"text\",\"text\":\"losing history\"}}',CURRENT_TIMESTAMP),('winner-input','winner-turn',0,'text','winning history','{{\"type\":\"text\",\"text\":\"winning history\"}}',CURRENT_TIMESTAMP);
@@ -8492,7 +8489,7 @@ mod prepared_snapshot_tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn own_insert_if_absent_snapshot_reuses_only_prepared_messages() {
         let store = fixture("own-ws").await;
         let prepared = prepared(&store, "own-ws", "own-turn", "own history").await;
@@ -8526,7 +8523,7 @@ mod prepared_snapshot_tests {
         assert_eq!(persisted.task_id, "own-task");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn competing_insert_if_absent_snapshot_restores_only_winner_messages() {
         let store = fixture("race-ws").await;
         let loser = prepared(&store, "race-ws", "loser-turn", "losing history").await;
@@ -8593,7 +8590,7 @@ mod prepared_snapshot_tests {
         assert_eq!(persisted.task_id, "race-task");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn competing_legacy_snapshot_keeps_literal_technical_ordinal_with_accepted_import() {
         use pioneer_crud::compaction::FrozenImportRecord;
         use pioneer_keystore::MemorySecretStore;
@@ -8773,8 +8770,8 @@ mod prepared_snapshot_tests {
         let record_json = serde_json::to_string(&record).unwrap();
         let tx = store.database_connection().begin().await.unwrap();
         tx.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES (?,0,2,?,?,?,?,?,?)",
+            DbBackend::Postgres,
+            "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ($1,0,2,$2,$3,$4,$5,$6,$7)",
             [
                 winner.descriptor.manifest_id.clone().into(),
                 source.scope.clone().into(),
@@ -8789,8 +8786,8 @@ mod prepared_snapshot_tests {
         .unwrap();
         let advanced = tx
             .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE compaction_frozen_history SET next_import=1 WHERE id=? AND ready=0",
+                DbBackend::Postgres,
+                "UPDATE compaction_frozen_history SET next_import=1 WHERE id=$1 AND ready=0",
                 [winner.descriptor.manifest_id.clone().into()],
             ))
             .await
@@ -9599,6 +9596,101 @@ async fn ensure_task_run_occurrence_anchor(
     Ok(())
 }
 
+async fn reuse_published_child_result(
+    processor: &Arc<MessageProcessor>,
+    child_runtime: &TaskRunChildRuntime,
+    handle: &TaskExecutionHandle,
+    closing: &mut Closing,
+) -> Result<bool> {
+    let turn = &child_runtime.task_run_turn;
+    if let Some(candidate) = processor
+        .crud_store
+        .get_accepted_task_result_candidate(turn.run_id.as_str())
+        .await?
+        && candidate.task_run_turn_id == turn.id
+        && let Some(result) = candidate.result
+    {
+        handle
+            .complete_run(
+                Some(result),
+                candidate.resolved_at.unwrap_or_else(now_timestamp_secs),
+            )
+            .await?;
+        closing.finish(Fact::Duplicate);
+        mark_task_run_occurrence_turn_completed(processor, &child_runtime.lineage).await?;
+        return Ok(true);
+    }
+    if let Some(candidate) = processor
+        .crud_store
+        .get_task_result_candidate_by_turn(turn.id.as_str())
+        .await?
+        && matches!(
+            candidate.status,
+            TaskResultCandidateStatus::PendingReview
+                | TaskResultCandidateStatus::ExtractionFailed
+                | TaskResultCandidateStatus::Rejected
+                | TaskResultCandidateStatus::Superseded
+                | TaskResultCandidateStatus::Cancelled
+        )
+    {
+        closing.finish(match candidate.status {
+            TaskResultCandidateStatus::PendingReview => Fact::PendingReview,
+            TaskResultCandidateStatus::ExtractionFailed => Fact::InvalidResult,
+            TaskResultCandidateStatus::Rejected => Fact::Rejected,
+            TaskResultCandidateStatus::Superseded => Fact::Superseded,
+            TaskResultCandidateStatus::Cancelled => Fact::Cancelled,
+            _ => Fact::Returned,
+        });
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn recover_child_completion_replay(
+    processor: &Arc<MessageProcessor>,
+    child_runtime: &TaskRunChildRuntime,
+    handle: &TaskExecutionHandle,
+    closing: &mut Closing,
+    error: anyhow::Error,
+) -> Result<()> {
+    use pioneer_crud::TaskChildCompletionReplay;
+
+    let Some(replay) = error.downcast_ref::<TaskChildCompletionReplay>() else {
+        return Err(error);
+    };
+    let turn = &child_runtime.task_run_turn;
+    let retry_attempt = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(&turn.run_id)
+        .await?
+        .map_or(0, |occurrence| occurrence.retry_attempt);
+    let key = format!("run:{}:turn:{}:completed", turn.run_id, turn.turn_id);
+    let key = if retry_attempt == 0 {
+        key
+    } else {
+        format!("{key}:run:{}:retry:{retry_attempt}", turn.run_id)
+    };
+    if replay.idempotency_key != key {
+        return Err(error);
+    }
+    // Check the committed child projection after the rejected batch rolled
+    // back. A reopened or replaced execution is not this completion.
+    let mut published_turn = turn.clone();
+    published_turn.status = TaskRunTurnStatus::CandidateCreated;
+    published_turn.completed_at = replay.completed_at;
+    if processor
+        .crud_store
+        .get_task_run_turn_by_turn(&turn.thread_id, &turn.turn_id)
+        .await?
+        .as_ref()
+        == Some(&published_turn)
+        && reuse_published_child_result(processor, child_runtime, handle, closing).await?
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
 async fn mark_task_run_occurrence_turn_completed(
     processor: &Arc<MessageProcessor>,
     lineage: &TaskThreadLineage,
@@ -10333,7 +10425,7 @@ fn spawn_execution_heartbeat(
         let Some(owner) = processor.upgrade() else {
             return;
         };
-        let owner = owner.with_database_class(SqliteWriteClass::Critical);
+        let owner = owner.with_database_class(PostgresWriteClass::Critical);
         let Ok(Some(resource_state)) = pioneer_crud::load_agent_execution_resource_state(
             &owner.crud_store.database_connection(),
             execution_id.as_str(),
@@ -10366,7 +10458,7 @@ fn spawn_execution_heartbeat(
             let Some(processor) = processor.upgrade() else {
                 break;
             };
-            let processor = processor.with_database_class(SqliteWriteClass::Critical);
+            let processor = processor.with_database_class(PostgresWriteClass::Critical);
             let Ok(Some(execution)) = processor.crud_store.load_execution_for_run(&run_id).await
             else {
                 break;
@@ -12462,7 +12554,6 @@ fn first_meaningful_line(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
         SkillsSecurityLoopConfig, SkillsValidationLoopConfig,
@@ -12482,7 +12573,7 @@ mod tests {
     use pioneer_tools::{
         ComputerUseToolsConfig, ToolLoopBudgetConfig, ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     fn test_task_run_turn() -> TaskRunTurn {
         TaskRunTurn {
@@ -12850,7 +12941,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn missing_execution_checkpoint_context_falls_back_to_none() {
         let (processor, _task, task_run_turn, _lineage) =
             task_artifact_harness("missing_checkpoint_context").await;
@@ -12861,7 +12952,7 @@ mod tests {
         assert!(context.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn child_runtime_without_persisted_lineage_fails_closed() {
         let (processor, _task, task_run_turn, _lineage) =
             task_artifact_harness("missing_child_lineage").await;
@@ -12877,7 +12968,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn agent_task_without_persisted_execution_admission_fails_closed() {
         let (processor, task, _task_run_turn, _lineage) =
             task_artifact_harness("missing_task_admission").await;
@@ -12893,7 +12984,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unavailable_workspace_skill_policy_projection_fails_closed() {
         let (processor, task, _task_run_turn, _lineage) =
             task_artifact_harness("skill_policy_unavailable").await;
@@ -12917,8 +13008,8 @@ mod tests {
     async fn task_artifact_harness(
         name: &str,
     ) -> (Arc<MessageProcessor>, Task, TaskRunTurn, TaskThreadLineage) {
-        let connection = Database::connect("sqlite::memory:").await.expect("sqlite");
-        Migrator::up(&connection, None).await.expect("migrate");
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connection().clone();
         crate::bootstrap::bootstrap(&connection)
             .await
             .expect("bootstrap");
@@ -13123,7 +13214,7 @@ mod tests {
             .expect("ingest artifact")
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
         let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
         use crate::session::test_support::{
@@ -13139,16 +13230,16 @@ mod tests {
             (&execution.thread_id, "internal"),
         ] {
             db.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES (?,?,'','agent','model','provider','active','user',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                DbBackend::Postgres,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ($1,$2,'','agent','model','provider','active','user',$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 [thread_id.clone().into(), task.workspace_id.clone().into(), access_class.into()],
             ))
             .await
             .expect("HTML response collaboration thread");
         }
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,$2,'in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [execution.turn_id.clone().into(), execution.thread_id.clone().into()],
         ))
         .await
@@ -13276,6 +13367,8 @@ mod tests {
         assert_eq!(repeated.artifacts.len(), 2);
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         pioneer_entity::thread_lineage::ActiveModel {
+            insertion_ordinal: Default::default(),
+            publication_xid: Default::default(),
             child_thread_id: Set(lineage.child_thread_id.clone()),
             parent_thread_id: Set(lineage.parent_thread_id.clone()),
             root_thread_id: Set(lineage.root_thread_id.clone()),
@@ -13307,8 +13400,8 @@ mod tests {
             .await
             .expect("source execution provenance");
         db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'completed','conversation','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            DbBackend::Postgres,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ($1,$2,'completed','conversation','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             [execution.run_id.clone().into(), lineage.parent_thread_id.clone().into()],
         )).await.expect("canonical delivery destination Turn");
         let final_source = pioneer_protocol::TurnItem::AgentMessage {
@@ -13338,7 +13431,7 @@ mod tests {
                 item_id: Set(item.item_id().into()),
                 item_type: Set("agent_message".into()),
                 status: Set(Some("completed".into())),
-                payload: Set(serde_json::to_string(&item).expect("item payload")),
+                payload: Set(Some(serde_json::to_value(&item).expect("item payload"))),
                 active_attempt_number: Set(0),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -13400,7 +13493,7 @@ mod tests {
             status: Set("delivered".into()),
             attempt_count: Set(1),
             max_attempts: Set(3),
-            result_snapshot_json: Set(Some(serde_json::to_string(&legacy_result).unwrap())),
+            result_snapshot_json: Set(Some(serde_json::to_value(&legacy_result).unwrap())),
             delivered_turn_id: Set(Some(execution.run_id.clone())),
             created_at: Set(now),
             updated_at: Set(now),
@@ -13515,7 +13608,7 @@ mod tests {
                 .is_empty()
         );
         let mut delivery: pioneer_entity::task_delivery::ActiveModel = delivery.into();
-        delivery.result_snapshot_json = Set(Some(serde_json::to_string(&normalized).unwrap()));
+        delivery.result_snapshot_json = Set(Some(serde_json::to_value(&normalized).unwrap()));
         let delivered = delivery.update(&db).await.expect("fresh result snapshot");
         assert_eq!(
             restored,
@@ -13537,14 +13630,14 @@ mod tests {
         modern.delivery_key = Set(modern_id.into());
         let mut partial_result = normalized.clone();
         partial_result.artifacts.truncate(1);
-        modern.result_snapshot_json = Set(Some(serde_json::to_string(&partial_result).unwrap()));
+        modern.result_snapshot_json = Set(Some(serde_json::to_value(&partial_result).unwrap()));
         modern.insert(&db).await.unwrap();
         let modern_item = pioneer_protocol::task_delivery_result_item_id(modern_id);
         let legacy_id = "html-legacy-delivery";
         let mut legacy: pioneer_entity::task_delivery::ActiveModel = delivered.clone().into();
         legacy.id = Set(legacy_id.into());
         legacy.delivery_key = Set(legacy_id.into());
-        legacy.result_snapshot_json = Set(Some(serde_json::to_string(&legacy_result).unwrap()));
+        legacy.result_snapshot_json = Set(Some(serde_json::to_value(&legacy_result).unwrap()));
         legacy.insert(&db).await.unwrap();
         let legacy_item = pioneer_protocol::task_delivery_result_item_id(legacy_id);
         for id in [&modern_item, &legacy_item] {
@@ -13622,7 +13715,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut modern: pioneer_entity::task_delivery::ActiveModel = modern.into();
-        modern.result_snapshot_json = Set(Some(serde_json::to_string(&wrong_pin).unwrap()));
+        modern.result_snapshot_json = Set(Some(serde_json::to_value(&wrong_pin).unwrap()));
         modern.update(&db).await.unwrap();
         assert!(
             processor
@@ -13638,7 +13731,7 @@ mod tests {
         );
         let mut failed: pioneer_entity::task_delivery::ActiveModel = delivered.into();
         failed.error_snapshot_json = Set(Some(
-            serde_json::to_string(&TaskError {
+            serde_json::to_value(&TaskError {
                 recovery_diagnostic: None,
                 code: "failed_execution".into(),
                 message: "Execution failed".into(),
@@ -13838,7 +13931,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_existing_id_gets_task_result_binding() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("existing").await;
         let source = ingest_task_test_artifact(
@@ -13895,7 +13988,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn review_candidate_artifact_existing_id_gets_task_result_candidate_binding() {
         let (processor, task, task_run_turn, lineage) =
             task_artifact_harness("candidate_existing").await;
@@ -13980,7 +14073,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_path_is_rejected_without_an_execution_owned_handle() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("path").await;
         let output_dir = std::env::current_dir()
@@ -14043,7 +14136,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(output_dir.as_path()).await;
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_rejects_cross_workspace_id() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("foreign").await;
         let other_workspace = processor
@@ -14083,7 +14176,7 @@ mod tests {
         assert_eq!(error.code, "task_artifact_invalid");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn task_artifact_rejects_unbound_workspace_artifact() {
         let (processor, task, task_run_turn, lineage) = task_artifact_harness("unbound").await;
         let source =
@@ -14118,7 +14211,7 @@ mod tests {
         assert_eq!(error.code, "task_artifact_invalid");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn include_artifacts_context_renders_refs_without_paths() {
         let (processor, task, _task_run_turn, lineage) = task_artifact_harness("context").await;
         let source = ingest_task_test_artifact(
@@ -14178,7 +14271,7 @@ mod tests {
         assert!(!diagnostics.is_empty());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_grant_cannot_start_a_task_model_execution() {
         use crate::message::tests::task_launch_continuity::historical_task_fixture;
         use sea_orm::{EntityTrait, PaginatorTrait};
@@ -14223,7 +14316,7 @@ mod tests {
         fixture.assert_no_provider_requests();
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn historical_reviewer_recovery_with_an_existing_in_progress_turn_remains_execution() {
         use crate::message::tests::task_launch_continuity::historical_task_fixture;
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait, Set};
@@ -14251,7 +14344,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .into_active_model();
-        spec_row.review_policy_json = Set(Some(serde_json::to_string(&policy).unwrap()));
+        spec_row.review_policy_json = Set(Some(serde_json::to_value(&policy).unwrap()));
         spec_row.update(&db).await.unwrap();
         let parent = resolve_parent_context(processor, &response.task)
             .await
@@ -14270,28 +14363,6 @@ mod tests {
             &fixture.execution,
             now,
         );
-        handle
-            .link_child_thread_with_runtime(
-                lineage_from_task_run_turn(
-                    &response.task,
-                    &fixture.run,
-                    &response.agent_specs[0],
-                    &parent,
-                    &candidate_turn,
-                    now,
-                ),
-                task_run_primary_binding_from_turn(
-                    &response.task,
-                    &fixture.run,
-                    &fixture.execution,
-                    &candidate_turn,
-                    now,
-                ),
-                candidate_turn.clone(),
-                now,
-            )
-            .await
-            .unwrap();
         let mut candidate_thread = processor
             .crud_store
             .get_thread_model("continuity-root")
@@ -14330,6 +14401,28 @@ mod tests {
                 &source_turn,
                 &[],
                 source_turn.author.as_ref().unwrap().actor.clone(),
+            )
+            .await
+            .unwrap();
+        handle
+            .link_child_thread_with_runtime(
+                lineage_from_task_run_turn(
+                    &response.task,
+                    &fixture.run,
+                    &response.agent_specs[0],
+                    &parent,
+                    &candidate_turn,
+                    now,
+                ),
+                task_run_primary_binding_from_turn(
+                    &response.task,
+                    &fixture.run,
+                    &fixture.execution,
+                    &candidate_turn,
+                    now,
+                ),
+                candidate_turn.clone(),
+                now,
             )
             .await
             .unwrap();

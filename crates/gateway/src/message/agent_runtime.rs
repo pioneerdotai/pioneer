@@ -1,7 +1,7 @@
 use super::cli_runtime::CLIRuntimeObservationGapReconciliation;
 use super::turn_handlers::CliRuntimeRecoveryStartFailure;
 use super::*;
-use crate::patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity};
+use crate::patch_history_observer::{PostgresPatchObserver, reserve_patch_history_capacity};
 use anyhow::{Context, Result, bail};
 use futures_util::{FutureExt, StreamExt};
 use pioneer_observability::closing::{Closing, Fact, Phase};
@@ -11,8 +11,8 @@ use pioneer_observability::{
     record_gateway_markdown_message, record_gateway_markdown_stage,
 };
 use pioneer_tools::apply_patch::history::{
-    AppliedPatchDelta, AppliedPatchRecord, PatchHistoryProvenance, SnapshotDomain,
-    SqliteAppliedPatchStore, SqliteCommitIntentStore, StoredPatchRecord, TurnDiffAuthority,
+    AppliedPatchDelta, AppliedPatchRecord, PatchHistoryProvenance, PostgresAppliedPatchStore,
+    PostgresCommitIntentStore, SnapshotDomain, StoredPatchRecord, TurnDiffAuthority,
     TurnFilesystemCoverage, TurnFilesystemMutationSource,
 };
 use sha2::{Digest, Sha256};
@@ -49,13 +49,13 @@ pub(super) struct NativeTurnEventDeliveryWorkers {
 struct NativeTurnEventDeliveryGuard {
     wake: Arc<NativeTurnEventDeliveryWake>,
     owned: bool,
-    recovery: pioneer_sqlite::WorkSignal,
+    recovery: pioneer_postgres_pools::WorkSignal,
 }
 
 impl NativeTurnEventDeliveryGuard {
     fn acquire(
         wake: Arc<NativeTurnEventDeliveryWake>,
-        recovery: pioneer_sqlite::WorkSignal,
+        recovery: pioneer_postgres_pools::WorkSignal,
     ) -> Option<Self> {
         wake.running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -238,7 +238,7 @@ fn turn_llm_context_delivery_key(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn native_patch_history_from_item(
+async fn native_patch_history_from_item(
     item: &pioneer_protocol::TurnItem,
 ) -> Result<Option<(AppliedPatchRecord, [u8; 32], AppliedPatchDelta)>> {
     let pioneer_protocol::TurnItem::FileChange {
@@ -287,10 +287,10 @@ fn native_patch_history_from_item(
     // references.  During the same process, the tool runtime can hand the
     // exact committed prefix to the lifecycle consumer through its bounded
     // registry; this avoids copying source bytes through protocol items while
-    // still preserving partial-step history.  After restart the SQLite intent
+    // still preserving partial-step history. After restart the PostgreSQL intent
     // recovery plan remains the authoritative fallback.
     if let Some((_, committed_changes)) =
-        pioneer_tools::native_patch_history_record(&record.identity)
+        pioneer_tools::native_patch_history_record(&record.identity).await
     {
         if !committed_changes.is_empty() {
             delta = AppliedPatchDelta::from_changes(committed_changes);
@@ -573,32 +573,6 @@ fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus
     }
 }
 
-// Same SeaORM -> SQLx driver chain used by the existing memory write mapper.
-// SQLite extended codes preserve the primary BUSY/LOCKED code in the low byte.
-pub(super) fn native_preparation_has_typed_sqlite_lock(error: &anyhow::Error) -> bool {
-    use sea_orm::{DbErr, RuntimeErr, SqlxError};
-    let Some(db_error) = error.downcast_ref::<DbErr>() else {
-        return false;
-    };
-    let (DbErr::Conn(RuntimeErr::SqlxError(cause))
-    | DbErr::Exec(RuntimeErr::SqlxError(cause))
-    | DbErr::Query(RuntimeErr::SqlxError(cause))) = db_error
-    else {
-        return false;
-    };
-    let SqlxError::Database(database) = cause.as_ref() else {
-        return false;
-    };
-    database
-        .code()
-        .and_then(|code| code.parse::<i32>().ok())
-        .is_some_and(native_preparation_sqlite_code_is_lock)
-}
-
-fn native_preparation_sqlite_code_is_lock(code: i32) -> bool {
-    matches!(code & 0xff, 5 | 6)
-}
-
 fn confirm_owned_cancellation_lookup(
     result: anyhow::Result<bool>,
 ) -> Result<bool, DurableCommitRejection> {
@@ -648,9 +622,7 @@ fn classify_native_preparation_error(error: anyhow::Error) -> DurableCommitRejec
             "required immutable native cancellation context is unavailable",
         );
     }
-    if native_preparation_has_typed_sqlite_lock(&error)
-        || pioneer_sqlite::is_anyhow_sqlite_transient_access(&error)
-    {
+    if pioneer_postgres_pools::is_anyhow_database_transient_access(&error) {
         DurableCommitRejection::retryable(
             "storage_temporarily_unavailable",
             "native preparation could not access storage",
@@ -679,7 +651,7 @@ fn classify_durable_commit_guard_error(
         return Ok(true);
     }
 
-    if pioneer_sqlite::is_anyhow_sqlite_transient_access(error) {
+    if pioneer_postgres_pools::is_anyhow_database_transient_access(error) {
         Err(DurableCommitRejection::retryable(
             "storage_temporarily_unavailable",
             "durable commit authorization could not access storage",
@@ -1007,7 +979,7 @@ impl MessageProcessor {
                                         "gateway message processor is no longer available",
                                     ));
                                 };
-                                let this = this.with_database_class(SqliteWriteClass::Critical);
+                                let this = this.with_database_class(PostgresWriteClass::Critical);
                                 this.commit_leased_durable_agent_event(event, actor_generation).await
                             } else {
                                 #[cfg(test)]
@@ -1079,7 +1051,7 @@ impl MessageProcessor {
                                 if AssertUnwindSafe(work.scope(async {
                                     if let Some(weak) = &this {
                                         let Some(this) = weak.upgrade() else { return; };
-                                        let this = this.with_database_class(SqliteWriteClass::Critical);
+                                        let this = this.with_database_class(PostgresWriteClass::Critical);
                                         this.handle_progress_agent_event(event).await;
                                     } else {
                                         #[cfg(test)]
@@ -2504,17 +2476,18 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
-                let rejection = if pioneer_sqlite::is_anyhow_sqlite_transient_access(&error) {
-                    DurableCommitRejection::retryable(
-                        "storage_temporarily_unavailable",
-                        "durable commit authorization could not access storage",
-                    )
-                } else {
-                    DurableCommitRejection::permanent(
-                        "execution_fenced",
-                        "durable event no longer has execution authority",
-                    )
-                };
+                let rejection =
+                    if pioneer_postgres_pools::is_anyhow_database_transient_access(&error) {
+                        DurableCommitRejection::retryable(
+                            "storage_temporarily_unavailable",
+                            "durable commit authorization could not access storage",
+                        )
+                    } else {
+                        DurableCommitRejection::permanent(
+                            "execution_fenced",
+                            "durable event no longer has execution authority",
+                        )
+                    };
                 warn!(
                     rejection_code = rejection.code(),
                     retryable = rejection.is_retryable(),
@@ -3489,7 +3462,7 @@ impl MessageProcessor {
                             if !wake.pending.load(Ordering::SeqCst) {
                                 tokio::select! {
                                     _ = wake.deadline_wake.notified() => {}
-                                    _ = pioneer_sqlite::wait_for_unix_deadline(deadline) => {}
+                                    _ = pioneer_postgres_pools::wait_for_unix_deadline(deadline) => {}
                                 }
                             }
                             wake.pending.store(true, Ordering::SeqCst);
@@ -3578,7 +3551,7 @@ impl MessageProcessor {
         let shutdown = workers.shutdown.clone();
         struct OwnerGuard {
             running: Arc<AtomicBool>,
-            control: pioneer_sqlite::WorkSignal,
+            control: pioneer_postgres_pools::WorkSignal,
             shutdown: tokio_util::sync::CancellationToken,
             complete: bool,
         }
@@ -3712,7 +3685,7 @@ impl MessageProcessor {
         turn_id: &str,
         item: &pioneer_protocol::TurnItem,
     ) -> Result<()> {
-        let parsed = native_patch_history_from_item(item)?;
+        let parsed = native_patch_history_from_item(item).await?;
         let Some((record, plan_fingerprint, delta)) = parsed else {
             // If terminal observer publication failed after the durable record
             // was inserted, the model-visible item may not contain a history
@@ -3727,7 +3700,7 @@ impl MessageProcessor {
                 call_id.to_owned(),
             )
             .map_err(|error| anyhow::anyhow!("invalid native patch identity: {error}"))?;
-            let store = SqliteAppliedPatchStore::new(self.crud_store.database_connection());
+            let store = PostgresAppliedPatchStore::new(self.crud_store.database_connection());
             if store.get(&identity).await?.is_some() {
                 self.project_native_patch_projection(&thread_id, &turn_id, false)
                     .await?;
@@ -3744,8 +3717,8 @@ impl MessageProcessor {
         }
         let thread_id = record.identity.thread_id.clone();
         let turn_id = record.identity.turn_id.clone();
-        let store = SqliteAppliedPatchStore::new(self.crud_store.database_connection());
-        let intent_store = SqliteCommitIntentStore::new(self.crud_store.database_connection());
+        let store = PostgresAppliedPatchStore::new(self.crud_store.database_connection());
+        let intent_store = PostgresCommitIntentStore::new(self.crud_store.database_connection());
         // Lifecycle delivery is at-least-once.  A repeated ItemCompleted
         // notification must reuse the immutable record that was already
         // promoted instead of minting a new timestamp/metadata tuple and
@@ -3806,7 +3779,7 @@ impl MessageProcessor {
                 },
             }
         } else {
-            // If the process-local observer has a record but its SQLite
+            // If the process-local observer has a record but its PostgreSQL
             // promotion was interrupted, recover the exact snapshots from
             // content-addressed storage. Never substitute the pre-mutation
             // recovery plan: contextual Update may have been replanned against
@@ -3859,10 +3832,10 @@ impl MessageProcessor {
         final_state: bool,
     ) -> Result<()> {
         let db = self.crud_store.database_connection();
-        let records = SqliteAppliedPatchStore::new(db.clone());
-        let intent_store = SqliteCommitIntentStore::new(self.crud_store.database_connection());
+        let records = PostgresAppliedPatchStore::new(db.clone());
+        let intent_store = PostgresCommitIntentStore::new(self.crud_store.database_connection());
         let existing_projection =
-            pioneer_tools::apply_patch::history::SqliteTurnDiffStore::new(db.clone())
+            pioneer_tools::apply_patch::history::PostgresTurnDiffStore::new(db.clone())
                 .get(thread_id, turn_id)
                 .await?;
         let (record_count, _) = records.record_summary_for_turn(thread_id, turn_id).await?;
@@ -3889,7 +3862,7 @@ impl MessageProcessor {
         } else {
             TurnFilesystemCoverage::Pending
         };
-        let state = crate::patch_history_observer::SqlitePatchObserver::project_live(
+        let state = crate::patch_history_observer::PostgresPatchObserver::project_live(
             db,
             thread_id.to_owned(),
             turn_id.to_owned(),
@@ -4050,7 +4023,7 @@ impl MessageProcessor {
         // the existing result (or a fail-closed recovery error) without
         // touching the workspace.
         let admission_permit = reserve_patch_history_capacity().await?;
-        let observer = Arc::new(SqlitePatchObserver::new(
+        let observer = Arc::new(PostgresPatchObserver::new(
             self.crud_store.database_connection(),
             identity.clone(),
             admission_permit,
@@ -8235,11 +8208,8 @@ impl MessageProcessor {
                             let failure_stage = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "failure_stage")
                             });
-                            let sqlite_primary_code = root_error.as_ref().and_then(|error| {
-                                hook_error_metadata_i64(error, "sqlite_primary_code")
-                            });
-                            let sqlite_extended_code = root_error.as_ref().and_then(|error| {
-                                hook_error_metadata_i64(error, "sqlite_extended_code")
+                            let postgres_sqlstate = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "postgres_sqlstate")
                             });
                             let termination = root_error.as_ref().and_then(|error| {
                                 hook_error_metadata_text(error, "termination")
@@ -8282,8 +8252,9 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
-                                    sqlite_primary_code = sqlite_primary_code,
-                                    sqlite_extended_code = sqlite_extended_code,
+
+
+                                    postgres_sqlstate = postgres_sqlstate,
                                     http_status = ?http_status,
                                     provider_error_reason,
                                     provider_request_id,
@@ -8308,8 +8279,9 @@ impl MessageProcessor {
                                     model = model.unwrap_or("unknown"),
                                     failure_class = failure_class.unwrap_or("unknown"),
                                     failure_stage = failure_stage.unwrap_or("unknown"),
-                                    sqlite_primary_code = sqlite_primary_code,
-                                    sqlite_extended_code = sqlite_extended_code,
+
+
+                                    postgres_sqlstate = postgres_sqlstate,
                                     http_status = ?http_status,
                                     provider_error_reason,
                                     provider_request_id,

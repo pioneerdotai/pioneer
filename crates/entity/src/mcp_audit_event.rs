@@ -7,19 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "mcp_audit_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub server_installation_id: Option<String>,
-    pub server_name: String,
-    pub raw_tool_name: Option<String>,
-    pub callable_name: Option<String>,
-    pub catalog_version: Option<String>,
-    pub action: String,
-    pub decision: String,
-    pub reason_code: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub details_json: String,
+    pub server_name: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub raw_tool_name: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub callable_name: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub catalog_version: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub action: String,
+    #[sea_orm(column_type = "Text")]
+    pub decision: String,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reason_code: Option<String>,
+    pub details_json: Json,
     pub created_at: DateTimeWithTimeZone,
 }
 

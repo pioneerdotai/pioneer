@@ -33,10 +33,9 @@ fn native_patch_observer_registry()
 }
 
 /// Publishes the process-local observer only as a handoff between the tool
-/// executor and the gateway lifecycle consumer.  Durable recovery remains in
-/// SQLite; this registry is bounded and is never treated as the source of
-/// truth after restart.
-pub fn native_patch_history_record(
+/// executor and the gateway lifecycle consumer. PostgreSQL owns durable
+/// recovery. The bounded registry is only used for the in-process handoff.
+pub async fn native_patch_history_record(
     identity: &InvocationIdentity,
 ) -> Option<(StoredPatchRecord, Vec<CommittedPatchChange>)> {
     let key = (
@@ -49,7 +48,11 @@ pub fn native_patch_history_record(
         .ok()?
         .get(&key)?
         .clone();
-    observer.record(identity).ok().flatten()
+    let identity = identity.clone();
+    pioneer_observability::work::spawn_blocking(move || observer.record(&identity).ok().flatten())
+        .await
+        .ok()
+        .flatten()
 }
 
 pub fn register_native_patch_observer(
@@ -95,7 +98,7 @@ pub fn unregister_native_patch_observer(identity: &InvocationIdentity) {
 }
 
 /// Releases all process-local native patch observers for a terminal turn.
-/// SQLite intent/record rows remain the source of truth; this only drops the
+/// PostgreSQL intent/record rows remain the source of truth; this only drops the
 /// bounded in-process hand-off objects and their history-capacity permits.
 pub fn unregister_native_patch_observers_for_turn(thread_id: &str, turn_id: &str) {
     if let Ok(mut registry) = native_patch_observer_registry().lock() {

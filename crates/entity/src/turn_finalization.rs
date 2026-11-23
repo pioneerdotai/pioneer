@@ -7,16 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_finalization")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     pub generation: i64,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub item_id: String,
     #[sea_orm(column_type = "Text")]
     pub item_json: String,
+    #[sea_orm(column_type = "Text")]
     pub item_digest: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub prepared_at: DateTimeWithTimeZone,
     pub committed_at: Option<DateTimeWithTimeZone>,
@@ -29,7 +33,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub turn: HasOne<super::turn::Entity>,
+    pub turn: BelongsTo<super::turn::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

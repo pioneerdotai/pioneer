@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_work_resource_scope")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub root_execution_id: String,
     pub scope_generation: i64,
     pub max_concurrency: i64,
@@ -20,6 +20,7 @@ pub struct Model {
     pub queue_generation: i64,
     pub last_scheduled_sequence: i64,
     pub last_scheduled_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
@@ -30,7 +31,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_execution: HasOne<super::agent_execution::Entity>,
+    pub agent_execution: BelongsTo<super::agent_execution::Entity>,
     #[sea_orm(has_many)]
     pub agent_work_branch_schedules: HasMany<super::agent_work_branch_schedule::Entity>,
 }

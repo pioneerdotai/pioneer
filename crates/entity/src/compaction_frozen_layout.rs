@@ -21,6 +21,9 @@ pub struct Model {
     pub cleanup_to: i64,
     pub cleanup_next: i64,
     pub failed: i64,
+    pub verified_span_revision: Option<i64>,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",
@@ -28,7 +31,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_frozen_history: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history: BelongsTo<super::compaction_frozen_history::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

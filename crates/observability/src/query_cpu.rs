@@ -1,4 +1,4 @@
-//! Capture-only attribution of SQLx command CPU on named Gateway SQLite workers.
+//! Capture-only attribution of client-side CPU in Gateway PostgreSQL query scopes.
 //! No SQL, identifiers, errors, or per-query records leave this bounded collector.
 use serde::Serialize;
 use std::{
@@ -10,7 +10,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context as LayerContext, registry::LookupSpan};
 
-pub(crate) const TARGET: &str = "pioneer_sqlite::query_cpu";
+pub(crate) const TARGET: &str = "pioneer_postgres_pools::query_cpu";
 const MAX_SCOPES: usize = 128;
 const MAX_SEGMENTS: u64 = 20_000;
 // Independent first-admission reservations: unmeasured sequential scopes cannot
@@ -35,7 +35,6 @@ const MAX_MEASURED_KEY_BYTES: usize = MAX_MEASURED_GROUPS * 128;
 const MAX_UNMEASURED_KEY_BYTES: usize = MAX_UNMEASURED_GROUPS * 128;
 pub(crate) const MAX_GROUP_KEY_BYTES: usize = MAX_MEASURED_KEY_BYTES + MAX_UNMEASURED_KEY_BYTES;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-static LIVE_SPANS: AtomicUsize = AtomicUsize::new(0);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static SESSION: OnceLock<Mutex<Option<Weak<SessionState>>>> = OnceLock::new();
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -60,13 +59,99 @@ impl Key {
 thread_local! {
     static CREATING: RefCell<Option<Key>> = const { RefCell::new(None) };
     static CALLER: RefCell<Option<Key>> = const { RefCell::new(None) };
-    static WORKER: RefCell<Option<Segment>> = const { RefCell::new(None) };
+    static SEGMENT: RefCell<Option<Segment>> = const { RefCell::new(None) };
 }
 struct Segment {
     key: Key,
     depth: u32,
     start: Option<u64>,
     conflicted: bool,
+}
+impl Segment {
+    fn enter(key: &Key) -> bool {
+        SEGMENT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if let Some(segment) = slot.as_mut() {
+                segment.depth += 1;
+                if !segment.key.same(key) {
+                    segment.conflicted = true;
+                    let mut data = lock(&key.session.data);
+                    if key.session.writable(&data) {
+                        data.coverage.nested_scope_conflicts += 1;
+                    }
+                }
+                return true;
+            }
+            let mut data = lock(&key.session.data);
+            if !key.session.writable(&data) || !data.queries.contains_key(&key.id) {
+                return false;
+            }
+            let start = if data.coverage.reserved_segments < MAX_SEGMENTS {
+                data.coverage.reserved_segments += 1;
+                read_clock(&mut data.coverage)
+            } else {
+                data.coverage.segment_reservation_overflow += 1;
+                None
+            };
+            if start.is_some() {
+                data.queries.get_mut(&key.id).unwrap().open_segments += 1;
+            }
+            *slot = Some(Self {
+                key: key.clone(),
+                depth: 1,
+                start,
+                conflicted: false,
+            });
+            true
+        })
+    }
+
+    fn exit() {
+        let segment = SEGMENT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let segment = slot.as_mut().expect("query guard owns a segment");
+            segment.depth -= 1;
+            if segment.depth == 0 {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        let Some(Self {
+            key,
+            start: Some(start),
+            conflicted,
+            ..
+        }) = segment
+        else {
+            return;
+        };
+        let mut data = lock(&key.session.data);
+        if !key.session.writable(&data) {
+            return;
+        }
+        let end = read_clock(&mut data.coverage);
+        if let Some(query) = data.queries.get_mut(&key.id) {
+            query.open_segments -= 1;
+            // Nested query owners share this interval. Its CPU has no single SQL identity.
+            query.fingerprint_conflict |= conflicted;
+        }
+        let Some(end) = end else {
+            return;
+        };
+        let Some(delta) = end.checked_sub(start) else {
+            data.coverage.clock_regressions += 1;
+            return;
+        };
+        if delta == 0 {
+            data.coverage.clock_zero_deltas += 1;
+        }
+        data.coverage.measured_segments += 1;
+        if let Some(query) = data.queries.get_mut(&key.id) {
+            query.totals.measured_segments += 1;
+            *query.totals.cpu_ns.get_or_insert(0) += delta;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize)]
@@ -353,11 +438,11 @@ impl SessionState {
             measured_unknown: data.unknown.clone(),
             group_overflow: data.overflow.clone(),
             coverage: data.coverage.clone(),
-            measurement: "CPU of SQLx commands in query scopes on Gateway SQLite workers",
+            measurement: "Client-side CPU in Gateway PostgreSQL query scopes",
             limitations: &[
-                "Includes preparation, SQLite execution, row processing/transfer and cleanup; not sqlite3_step alone.",
+                "Measures client preparation, driver and row polling, and cleanup on the executing thread. Time between polls and PostgreSQL server CPU are outside the measurement.",
                 "Private SQLx command kinds, including pool service commands under a scope, cannot be separated.",
-                "Scopes begun before capture, uninstrumented work and worker bootstrap are not reconstructed.",
+                "Scopes begun before capture and work outside the instrumented query scope are not reconstructed.",
                 "Open segments at window end have no endpoint CPU measurement; their unmeasured cost is unknown.",
                 "Clock representation is nanoseconds, resolution is OS dependent; zero deltas may be below resolution.",
                 "Consent changes can invalidate existing WorkCarrier owners; missing context remains explicit unknown.",
@@ -471,7 +556,7 @@ pub(crate) fn close_on_opt_out() {
     }
 }
 
-/// A caller reference to the same diagnostic state carried by SQLx's span.
+/// The client query context and its private diagnostic span.
 /// The state does not own this span, avoiding a reference cycle.
 #[derive(Default)]
 pub struct QueryScope {
@@ -536,7 +621,8 @@ impl QueryScope {
         drop(data);
         let key = Key { session, id };
         let previous = CREATING.with(|s| s.replace(Some(key.clone())));
-        let span = tracing::info_span!(target: "pioneer_sqlite::query_cpu", "sqlite.query_cpu");
+        let span =
+            tracing::info_span!(target: "pioneer_postgres_pools::query_cpu", "postgres.query_cpu");
         CREATING.with(|s| {
             s.replace(previous);
         });
@@ -553,7 +639,14 @@ impl QueryScope {
             key: Some(key),
         }
     }
+    /// Enter for one synchronous piece of query work, such as a poll or drop.
     pub fn enter(&self) -> QueryGuard<'_> {
+        let mut guard = self.enter_context();
+        guard.measuring = self.key.as_ref().is_some_and(Segment::enter);
+        guard
+    }
+
+    fn enter_context(&self) -> QueryGuard<'_> {
         let restore = self.key.is_some() || ACTIVE.load(Ordering::Acquire);
         let previous = if restore {
             CALLER.with(|s| s.replace(self.key.clone()))
@@ -564,6 +657,7 @@ impl QueryScope {
             _entered: self.span.as_ref().map(Span::enter),
             previous,
             restore,
+            measuring: false,
             _not_send: PhantomData,
         }
     }
@@ -594,17 +688,21 @@ impl Drop for QueryScope {
                 }
             }
         }
-        // Span drops only after outcome is set; worker refs may close it later.
+        // Set the outcome before releasing the diagnostic span.
     }
 }
 pub struct QueryGuard<'a> {
     _entered: Option<tracing::span::Entered<'a>>,
     previous: Option<Key>,
     restore: bool,
+    measuring: bool,
     _not_send: PhantomData<Rc<()>>,
 }
 impl Drop for QueryGuard<'_> {
     fn drop(&mut self) {
+        if self.measuring {
+            Segment::exit();
+        }
         if self.restore {
             CALLER.with(|s| {
                 s.replace(self.previous.take());
@@ -689,8 +787,8 @@ impl<F: Future<Output = Result<T, E>>, T, E> Future for ObservedFuture<F> {
 }
 impl<F> Drop for ObservedFuture<F> {
     fn drop(&mut self) {
-        let _guard = self.scope.enter();
         if self.live {
+            let _guard = self.scope.enter();
             self.live = false;
             // SAFETY: drop in place exactly once; pinning is maintained.
             unsafe {
@@ -709,14 +807,6 @@ pub(crate) fn target_enabled(target: &str) -> bool {
     // verbose SQLx/SeaORM spans or events as a side effect of capture.
     target == TARGET
 }
-fn key_for<S>(id: &Id, ctx: &LayerContext<'_, S>) -> Option<Key>
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    ctx.span(id)?
-        .scope()
-        .find_map(|span| span.extensions().get::<Key>().cloned())
-}
 impl<S> Layer<S> for QueryCpuLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -728,129 +818,16 @@ where
         if let Some(key) = CREATING.with(|s| s.borrow().clone()) {
             if let Some(span) = ctx.span(id) {
                 span.extensions_mut().insert(key);
-                LIVE_SPANS.fetch_add(1, Ordering::Relaxed);
             }
         }
-    }
-    fn on_enter(&self, id: &Id, ctx: LayerContext<'_, S>) {
-        if !ACTIVE.load(Ordering::Acquire) && LIVE_SPANS.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        // Thread names are application prefixes, not operating system TIDs.
-        let thread = std::thread::current();
-        if !thread.name().is_some_and(|n| {
-            n.starts_with("pioneer-sqlite-reader-") || n.starts_with("pioneer-sqlite-writer-")
-        }) {
-            return;
-        }
-        let Some(key) = key_for(id, &ctx) else {
-            return;
-        };
-        WORKER.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if let Some(segment) = slot.as_mut() {
-                segment.depth += 1;
-                if !segment.key.same(&key) {
-                    segment.conflicted = true;
-                    let mut data = lock(&key.session.data);
-                    if key.session.writable(&data) {
-                        data.coverage.nested_scope_conflicts += 1;
-                    }
-                }
-                return;
-            }
-            let mut data = lock(&key.session.data);
-            if !key.session.writable(&data) {
-                return;
-            }
-            if data.coverage.reserved_segments >= MAX_SEGMENTS {
-                data.coverage.segment_reservation_overflow += 1;
-                // Retain nesting balance even when no clock budget remains.
-                *slot = Some(Segment {
-                    key: key.clone(),
-                    depth: 1,
-                    start: None,
-                    conflicted: false,
-                });
-                return;
-            }
-            if !data.queries.contains_key(&key.id) {
-                return;
-            }
-            data.coverage.reserved_segments += 1;
-            let start = read_clock(&mut data.coverage);
-            if start.is_some() {
-                data.queries.get_mut(&key.id).unwrap().open_segments += 1;
-            }
-            drop(data);
-            *slot = Some(Segment {
-                key,
-                depth: 1,
-                start,
-                conflicted: false,
-            });
-        });
-    }
-    fn on_exit(&self, id: &Id, ctx: LayerContext<'_, S>) {
-        if LIVE_SPANS.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        if key_for(id, &ctx).is_none() {
-            return;
-        }
-        WORKER.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let Some(segment) = slot.as_mut() else {
-                return;
-            };
-            segment.depth -= 1;
-            if segment.depth != 0 {
-                return;
-            }
-            let segment = slot.take().unwrap();
-            let Some(start) = segment.start else {
-                return;
-            };
-            let key = segment.key;
-            let mut data = lock(&key.session.data);
-            if !key.session.writable(&data) {
-                return;
-            }
-            let end = read_clock(&mut data.coverage);
-            if let Some(query) = data.queries.get_mut(&key.id) {
-                query.open_segments -= 1;
-                // Different diagnostic owners nested on one worker cannot be
-                // separated by this clock segment. Retain CPU as unknown.
-                query.fingerprint_conflict |= segment.conflicted;
-            }
-            let Some(end) = end else {
-                return;
-            };
-            let Some(delta) = end.checked_sub(start) else {
-                data.coverage.clock_regressions += 1;
-                return;
-            };
-            if delta == 0 {
-                data.coverage.clock_zero_deltas += 1;
-            }
-            data.coverage.measured_segments += 1;
-            if let Some(query) = data.queries.get_mut(&key.id) {
-                query.totals.measured_segments += 1;
-                *query.totals.cpu_ns.get_or_insert(0) += delta;
-            }
-        });
     }
     fn on_close(&self, id: Id, ctx: LayerContext<'_, S>) {
-        if LIVE_SPANS.load(Ordering::Relaxed) == 0 {
-            return;
-        }
         let Some(span) = ctx.span(&id) else {
             return;
         };
         let Some(key) = span.extensions().get::<Key>().cloned() else {
             return;
         };
-        LIVE_SPANS.fetch_sub(1, Ordering::Relaxed);
         let mut data = lock(&key.session.data);
         // At deadline leave it registered for the sealed incomplete snapshot.
         // Registry extensions still drop normally even when recording is shut.
@@ -1121,7 +1098,7 @@ pub(crate) mod tests {
     }
 
     // Shared with diagnostics owner-path regressions. Real scope/callback and
-    // named SQLite-worker span boundaries; no SQL connections or fabricated totals.
+    // query-scope span boundaries; no SQL connections or fabricated totals.
     pub(crate) fn capture_command(fingerprint: u64, measured: bool) {
         capture_scope(Some(fingerprint), measured, None);
     }
@@ -1138,24 +1115,12 @@ pub(crate) mod tests {
             let carrier = crate::work::capture().with_database(trace.context());
             let _work = carrier.enter();
             let scope = control.map_or_else(QueryScope::new, QueryScope::control);
-            if measured {
-                if let Some(span) = scope.span.clone() {
-                    let worker_dispatch = dispatch.clone();
-                    std::thread::Builder::new()
-                        .name("pioneer-sqlite-reader-capture-test".into())
-                        .spawn(move || {
-                            tracing::dispatcher::with_default(&worker_dispatch, || {
-                                let _entered = span.enter();
-                                std::hint::black_box(17_u64.wrapping_mul(23));
-                            })
-                        })
-                        .unwrap()
-                        .join()
-                        .unwrap();
-                }
-            }
             {
-                let _entered = scope.enter();
+                let _entered = if measured {
+                    scope.enter()
+                } else {
+                    scope.enter_context()
+                };
                 record_fingerprint(fingerprint);
             }
             scope.finish(true);
@@ -1527,40 +1492,93 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
-    fn callback_and_worker_close_order_preserve_one_segment_and_one_completion() {
+    fn pending_poll_closes_cpu_segment_before_resuming_on_another_thread() {
+        let _serial = lock(&SERIAL);
+        let dispatch = dispatch();
+        tracing::dispatcher::with_default(&dispatch, || {
+            let session = Session::start(60, crate::telemetry_consent_snapshot().1).unwrap();
+            let mut first_poll = true;
+            let future = std::future::poll_fn(move |_| {
+                record_fingerprint(Some(17));
+                if std::mem::replace(&mut first_poll, false) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok::<(), ()>(()))
+                }
+            });
+            let mut observed = Box::pin(ObservedFuture::new(future, QueryScope::new()));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(observed.as_mut().poll(&mut cx).is_pending());
+            {
+                let data = lock(&session.state.data);
+                assert_eq!(data.coverage.measured_segments, 1);
+                assert_eq!(data.coverage.cpu_clock_reads, 2);
+            }
+
+            // Unrelated traced CPU work on the first thread, even with the
+            // query span as a parent, cannot create or extend a query segment.
+            {
+                let parent = observed.scope.span.as_ref().unwrap();
+                let unrelated = tracing::trace_span!(target: "pioneer_postgres_pools::query_cpu", parent: parent, "unrelated");
+                let _entered = unrelated.enter();
+                for n in 0_u64..1024 {
+                    std::hint::black_box(n.wrapping_mul(n));
+                }
+                record_fingerprint(Some(99));
+            }
+            assert_eq!(lock(&session.state.data).coverage.cpu_clock_reads, 2);
+
+            std::thread::spawn(move || {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert_eq!(observed.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+                drop(observed);
+            })
+            .join()
+            .unwrap();
+
+            let snapshot = session.finish();
+            assert_eq!(snapshot.coverage.cpu_clock_reads, 4);
+            assert_eq!(snapshot.coverage.unfinished_segments, 0);
+            assert_eq!(snapshot.groups.len(), 1);
+            let group = &snapshot.groups[0];
+            assert_eq!(group.key.fingerprint.as_deref(), Some("0000000000000011"));
+            assert_eq!(group.totals.completed_calls, 1);
+            assert_eq!(group.totals.measured_segments, 2);
+            assert!(group.totals.cpu_ns.is_some());
+        });
+    }
+
+    #[test]
+    fn callback_and_poll_owner_close_order_preserve_one_segment_and_one_completion() {
         let _serial = lock(&SERIAL);
         let dispatch = dispatch();
         tracing::dispatcher::with_default(&dispatch, || {
             let session = Session::start(60, crate::telemetry_consent_snapshot().1).unwrap();
             for callback_first in [true, false] {
-                let scope = QueryScope::new();
-                let worker_span = scope.span.as_ref().unwrap().clone();
+                let scope = Arc::new(QueryScope::new());
                 let ready = Arc::new(Barrier::new(2));
                 let release = Arc::new(Barrier::new(2));
                 let thread_dispatch = dispatch.clone();
                 let worker = {
                     let ready = ready.clone();
                     let release = release.clone();
-                    std::thread::Builder::new()
-                        .name("pioneer-sqlite-reader-test".into())
-                        .spawn(move || {
-                            tracing::dispatcher::with_default(&thread_dispatch, || {
-                                let _outer = worker_span.enter();
-                                // A nested private span sees the same ancestor. It must
-                                // not create a second CPU segment.
-                                let nested =
-                                    tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "nested");
-                                let _nested = nested.enter();
-                                ready.wait();
-                                release.wait();
-                            });
-                        })
-                        .unwrap()
+                    let scope = scope.clone();
+                    std::thread::spawn(move || {
+                        tracing::dispatcher::with_default(&thread_dispatch, || {
+                            let _outer = scope.enter();
+                            let _same_scope = scope.enter();
+                            let span = tracing::trace_span!(target: "pioneer_postgres_pools::query_cpu", "nested");
+                            let _nested = span.enter();
+                            ready.wait();
+                            release.wait();
+                        });
+                    })
                 };
                 ready.wait();
                 if callback_first {
-                    let _guard = scope.enter();
+                    let _guard = scope.enter_context();
                     record_fingerprint(Some(17));
                 }
                 scope.finish(true);
@@ -1572,7 +1590,7 @@ pub(crate) mod tests {
                     release.wait();
                     worker.join().unwrap();
                     {
-                        let _guard = scope.enter();
+                        let _guard = scope.enter_context();
                         record_fingerprint(Some(17));
                     }
                     drop(scope);
@@ -1594,35 +1612,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sealing_live_worker_then_new_generation_cannot_transfer_cpu_or_late_fingerprint() {
+    fn sealing_live_segment_then_new_generation_cannot_transfer_cpu_or_late_fingerprint() {
         let _serial = lock(&SERIAL);
         let dispatch = dispatch();
         tracing::dispatcher::with_default(&dispatch, || {
             let epoch = crate::telemetry_consent_snapshot().1;
             let session = Session::start(60, epoch).unwrap();
             assert!(Session::start(60, epoch).is_none(), "overlap is rejected");
-            let scope = QueryScope::new();
-            let span = scope.span.as_ref().unwrap().clone();
+            let scope = Arc::new(QueryScope::new());
             let ready = Arc::new(Barrier::new(2));
             let release = Arc::new(Barrier::new(2));
             let thread_dispatch = dispatch.clone();
             let worker = {
                 let ready = ready.clone();
                 let release = release.clone();
-                std::thread::Builder::new()
-                    .name("pioneer-sqlite-writer-test".into())
-                    .spawn(move || {
-                        tracing::dispatcher::with_default(&thread_dispatch, || {
-                            let _outer = span.enter();
-                            ready.wait();
-                            release.wait();
-                            // Enter/exit after sealing must still balance cleanup.
-                            let nested =
-                                tracing::trace_span!(target: "pioneer_sqlite::query_cpu", "late_nested");
-                            let _nested = nested.enter();
-                        });
-                    })
-                    .unwrap()
+                let scope = scope.clone();
+                std::thread::spawn(move || {
+                    tracing::dispatcher::with_default(&thread_dispatch, || {
+                        let _outer = scope.enter();
+                        ready.wait();
+                        release.wait();
+                        // Enter/exit after sealing must still balance cleanup.
+                        let _nested = scope.enter();
+                    });
+                })
             };
             ready.wait();
             let closed = session.finish();
@@ -1640,7 +1653,7 @@ pub(crate) mod tests {
             drop(scope);
             let fresh = QueryScope::new();
             {
-                let _guard = fresh.enter();
+                let _guard = fresh.enter_context();
                 record_fingerprint(Some(23));
             }
             fresh.finish(true);
@@ -1655,35 +1668,22 @@ pub(crate) mod tests {
             assert_eq!(current.groups[0].totals.completed_calls, 1);
             assert_eq!(current.groups[0].totals.cpu_ns, None);
             assert_eq!(current.coverage.cpu_clock_reads, 0);
-            assert!(WORKER.with(|s| s.borrow().is_none()));
+            assert!(SEGMENT.with(|s| s.borrow().is_none()));
 
-            // A different owner nested on one worker has no independent
+            // A different owner nested on one thread has no independent
             // endpoint interval. Combined CPU must lose the outer SQL identity.
             let session = Session::start(60, epoch).unwrap();
             let outer = QueryScope::new();
             {
                 let _entered = outer.enter();
                 record_fingerprint(Some(17));
+                let inner = QueryScope::new();
+                {
+                    let _inner = inner.enter();
+                    record_fingerprint(Some(19));
+                }
+                inner.finish(true);
             }
-            let span = outer.span.as_ref().unwrap().clone();
-            let worker_dispatch = dispatch.clone();
-            std::thread::Builder::new()
-                .name("pioneer-sqlite-reader-mixed".into())
-                .spawn(move || {
-                    tracing::dispatcher::with_default(&worker_dispatch, || {
-                        let _entered = span.enter();
-                        let inner = QueryScope::new();
-                        {
-                            let _inner = inner.enter();
-                            record_fingerprint(Some(19));
-                        }
-                        inner.finish(true);
-                        drop(inner);
-                    });
-                })
-                .unwrap()
-                .join()
-                .unwrap();
             outer.finish(true);
             drop(outer);
             let mixed = session.finish();
@@ -1711,7 +1711,7 @@ pub(crate) mod tests {
             drop(QueryScope::new()); // one rejected reservation
             for (i, scope) in scopes.into_iter().enumerate() {
                 {
-                    let _guard = scope.enter();
+                    let _guard = scope.enter_context();
                     if i == 0 {
                         record_fingerprint(None);
                         record_fingerprint(Some(7)); // mixed callback identities stay unknown
@@ -1723,20 +1723,9 @@ pub(crate) mod tests {
                 drop(scope);
             }
             let measured = QueryScope::new();
-            let span = measured.span.as_ref().unwrap().clone();
-            let thread_dispatch = dispatch.clone();
-            std::thread::Builder::new()
-                .name("pioneer-sqlite-reader-budget".into())
-                .spawn(move || {
-                    tracing::dispatcher::with_default(&thread_dispatch, || {
-                        for _ in 0..=MAX_SEGMENTS {
-                            let _entered = span.enter();
-                        }
-                    });
-                })
-                .unwrap()
-                .join()
-                .unwrap();
+            for _ in 0..=MAX_SEGMENTS {
+                let _entered = measured.enter();
+            }
             // No callback: any measured CPU belongs to unknown, not hash zero.
             drop(measured);
             let snapshot = session.finish();

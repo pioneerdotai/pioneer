@@ -6,14 +6,10 @@ use tracing_subscriber::prelude::*;
 const OP: Operation = Operation::NativeFinalization;
 const CANARY: &str = "/private/canary.db SELECT secret FROM users turn-canary task-canary thread-canary token-canary";
 
-fn cantopen(code: i32) -> Diagnostic {
+fn connection_failure(code: &[u8; 5]) -> Diagnostic {
     Diagnostic {
-        operation: OP,
-        cause: Cause::SqliteCantOpen,
-        phase: None,
-        reason: None,
-        sqlite_primary_code: Some(14),
-        sqlite_code: Some(code),
+        sqlstate: Some(*code),
+        ..Diagnostic::new(OP, Cause::PostgresConnection)
     }
 }
 fn pool_error() -> anyhow::Error {
@@ -33,27 +29,19 @@ fn fields<'a>(
     fields
 }
 
-#[tokio::test]
-async fn typed_sqlite_codes_survive_real_wrappers_and_context() {
-    let (_directory, _manager, store, _) =
-        crate::message::tests::setup_pooled_file_workspace_manager().await;
-    let database = store.with_maintenance_access().database_connection();
-    let directory = tempfile::tempdir().unwrap();
-    let missing = directory.path().join("missing").join("canary.db");
-    // Use the project's writer executor, no ad hoc connection or writer permit.
-    let error = database
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "ATTACH DATABASE ? AS diagnostic_fixture",
-            [missing.to_string_lossy().as_ref().into()],
-        ))
-        .await
-        .unwrap_err();
+#[pioneer_postgres_test::postgres_test]
+async fn typed_postgres_errors_survive_real_wrappers_and_context() -> anyhow::Result<()> {
+    use crate::tests::postgres_failures::{lock_unavailable, rejected_statement};
+    let error = lock_unavailable(false).await?;
+    let expected = Diagnostic {
+        sqlstate: Some(*b"55P03"),
+        ..Diagnostic::new(OP, Cause::PostgresContention)
+    };
     let anyhow_error = anyhow::Error::new(error.clone())
         .context(CANARY)
         .context("outer context");
     let diagnostic = Diagnostic::extract(OP, &anyhow_error);
-    assert_eq!(diagnostic, cantopen(14));
+    assert_eq!(diagnostic, expected);
     let events = capture(|| {
         let mut reporter = Reporter::new(OP);
         let start = Instant::now();
@@ -69,9 +57,8 @@ async fn typed_sqlite_codes_survive_real_wrappers_and_context() {
         tracing::error!("safe neighbor canary checkpoint");
     });
     assert_eq!(events.len(), 2);
-    assert_eq!(fields(&events[0])["sqlite_primary_code"], 14);
-    assert_eq!(fields(&events[0])["sqlite_code"], 14);
-    assert_eq!(fields(&events[0])["cause"], "sqlite_cantopen");
+    assert_eq!(fields(&events[0])["cause"], "postgres_contention");
+    assert_eq!(fields(&events[0])["sqlstate"], "55P03");
     let recovery = events[1]
         .breadcrumbs
         .iter()
@@ -79,10 +66,8 @@ async fn typed_sqlite_codes_survive_real_wrappers_and_context() {
             crumb.message.as_deref() == Some("reconciliation recovered after observed failures")
         })
         .unwrap();
-    assert_eq!(recovery.data["sqlite_primary_code"], 14);
-    assert_eq!(recovery.data["sqlite_code"], 14);
+    assert_eq!(recovery.data["cause"], "postgres_contention");
     let serialized = serde_json::to_string(&events).unwrap();
-    assert!(!serialized.contains(missing.to_string_lossy().as_ref()));
     for canary in CANARY.split_whitespace() {
         assert!(!serialized.contains(canary));
     }
@@ -98,29 +83,49 @@ async fn typed_sqlite_codes_survive_real_wrappers_and_context() {
     ] {
         assert_eq!(
             Diagnostic::extract(OP, &anyhow::Error::new(wrapper).context(CANARY)),
-            cantopen(14)
+            expected
         );
     }
-    assert_eq!(Diagnostic::extract(OP, &runtime.into()), cantopen(14));
-    database
-        .execute_unprepared(
-            "CREATE TABLE diagnostic_code_fixture (id INTEGER PRIMARY KEY, value TEXT UNIQUE)",
-        )
-        .await
-        .unwrap();
-    database
-        .execute_unprepared("INSERT INTO diagnostic_code_fixture VALUES (1, 'canary')")
-        .await
-        .unwrap();
-    let extended = database
-        .execute_unprepared("INSERT INTO diagnostic_code_fixture VALUES (2, 'canary')")
-        .await
-        .unwrap_err();
-    let extended = Diagnostic::extract(OP, &extended.into());
-    assert_eq!(extended.sqlite_primary_code, Some(19));
-    assert_eq!(extended.sqlite_code, Some(2067));
-    assert_eq!(extended.cause, Cause::SqliteOther);
-    assert!(!extended.cause.confirmed_storage());
+    assert_eq!(Diagnostic::extract(OP, &runtime.into()), expected);
+    let constraint = Diagnostic::extract(OP, &rejected_statement().await?.into());
+    assert_eq!(constraint.cause, Cause::Unclassified);
+    assert!(!constraint.cause.confirmed_storage());
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_contention_is_classified_from_the_driver_error() -> anyhow::Result<()> {
+    use sea_orm::TransactionTrait;
+
+    pioneer_postgres_test::with_database(async |fixture| {
+        let writer = fixture.connection();
+        writer
+            .execute_unprepared(
+                "CREATE TABLE diagnostic_lock_fixture (id int PRIMARY KEY);
+             INSERT INTO diagnostic_lock_fixture VALUES (1)",
+            )
+            .await?;
+        let lock = writer.begin().await?;
+        lock.execute_unprepared("SELECT id FROM diagnostic_lock_fixture WHERE id = 1 FOR UPDATE")
+            .await?;
+        let contender = fixture.connect().await?;
+        let error = contender
+            .execute_unprepared(
+                "SELECT id FROM diagnostic_lock_fixture WHERE id = 1 FOR UPDATE NOWAIT",
+            )
+            .await
+            .expect_err("another PostgreSQL session holds the row lock");
+        lock.rollback().await?;
+
+        let error = anyhow::Error::new(error).context(CANARY);
+        let diagnostic = Diagnostic::extract(OP, &error);
+        assert_eq!(diagnostic.cause, Cause::PostgresContention);
+        assert!(is_storage_failure(&error));
+        assert_eq!(diagnostic.sqlstate, Some(*b"55P03"));
+        assert!(!is_storage_failure(&anyhow::anyhow!("SQLSTATE 55P03")));
+        Ok(())
+    })
+    .await
 }
 
 #[derive(Debug)]
@@ -155,9 +160,9 @@ impl DatabaseError for OtherBackend {
 #[test]
 fn untyped_lost_and_other_backend_causes_stay_unclassified() {
     for error in [
-        anyhow::anyhow!("SQLite code 14 unable to open database file {CANARY}"),
-        anyhow::Error::new(DbErr::Custom("SQLITE_CANTOPEN".into())),
-        anyhow::Error::new(DbErr::Query(RuntimeErr::Internal("code 14".into()))),
+        anyhow::anyhow!("PostgreSQL SQLSTATE 08006 connection failure {CANARY}"),
+        anyhow::Error::new(DbErr::Custom("SQLSTATE 08006".into())),
+        anyhow::Error::new(DbErr::Query(RuntimeErr::Internal("SQLSTATE 08006".into()))),
         anyhow::Error::new(DbErr::Exec(RuntimeErr::SqlxError(Arc::new(
             SqlxError::Database(Box::new(OtherBackend)),
         ))))
@@ -186,12 +191,8 @@ fn typed_pool_sources_and_non_storage_errors() {
     let start = Instant::now();
     let mut reporter = Reporter::new(OP);
     let other = Diagnostic {
-        operation: OP,
-        cause: Cause::SqliteOther,
-        phase: None,
-        reason: None,
-        sqlite_primary_code: Some(19),
-        sqlite_code: Some(2067),
+        sqlstate: Some(*b"23505"),
+        ..Diagnostic::new(OP, Cause::Unclassified)
     };
     for _ in 0..2 {
         assert!(reporter.failure(other, start).is_some());
@@ -203,17 +204,22 @@ fn typed_pool_sources_and_non_storage_errors() {
 fn first_boundary_and_continuous_failure_summaries() {
     let start = Instant::now();
     let mut reporter = Reporter::new(OP);
-    let first = reporter.failure(cantopen(14), start).unwrap();
+    let first = reporter
+        .failure(connection_failure(b"08001"), start)
+        .unwrap();
     assert_eq!((first.failures, first.suppressed), (1, 0));
     for seconds in [1, 2, 599] {
         assert!(
             reporter
-                .failure(cantopen(14), start + Duration::from_secs(seconds))
+                .failure(
+                    connection_failure(b"08001"),
+                    start + Duration::from_secs(seconds)
+                )
                 .is_none()
         );
     }
     let next = reporter
-        .failure(cantopen(14), start + REPORT_WINDOW)
+        .failure(connection_failure(b"08001"), start + REPORT_WINDOW)
         .unwrap();
     assert_eq!(
         (next.failures, next.suppressed, next.suppressed_since_report),
@@ -221,11 +227,14 @@ fn first_boundary_and_continuous_failure_summaries() {
     );
     assert!(
         reporter
-            .failure(cantopen(14), start + REPORT_WINDOW + Duration::from_secs(1))
+            .failure(
+                connection_failure(b"08001"),
+                start + REPORT_WINDOW + Duration::from_secs(1)
+            )
             .is_none()
     );
     let next = reporter
-        .failure(cantopen(14), start + REPORT_WINDOW * 2)
+        .failure(connection_failure(b"08001"), start + REPORT_WINDOW * 2)
         .unwrap();
     assert_eq!(
         (next.failures, next.suppressed, next.suppressed_since_report),
@@ -248,11 +257,15 @@ fn first_boundary_and_continuous_failure_summaries() {
 fn recovery_preserves_window_and_new_episode_counts() {
     let start = Instant::now();
     let mut reporter = Reporter::new(OP);
-    assert!(reporter.failure(cantopen(14), start).is_some());
+    assert!(
+        reporter
+            .failure(connection_failure(b"08001"), start)
+            .is_some()
+    );
     assert!(reporter.success(start + Duration::from_secs(1)).is_some());
     assert!(
         reporter
-            .failure(cantopen(14), start + Duration::from_secs(2))
+            .failure(connection_failure(b"08001"), start + Duration::from_secs(2))
             .is_none()
     );
     let recovery = reporter.success(start + Duration::from_secs(3)).unwrap();
@@ -267,7 +280,7 @@ fn recovery_preserves_window_and_new_episode_counts() {
     assert_eq!(recovery.elapsed, Duration::from_secs(1));
     assert!(
         reporter
-            .failure(cantopen(14), start + REPORT_WINDOW)
+            .failure(connection_failure(b"08001"), start + REPORT_WINDOW)
             .is_some()
     );
 }
@@ -277,7 +290,11 @@ fn cause_changes_unknown_errors_and_operations_are_independent() {
     let start = Instant::now();
     let mut reporter = Reporter::new(OP);
     let mut other = Reporter::new(Operation::TaskRunOccurrence);
-    assert!(reporter.failure(cantopen(14), start).is_some());
+    assert!(
+        reporter
+            .failure(connection_failure(b"08001"), start)
+            .is_some()
+    );
     other.observe::<usize>(&Err(pool_error()), start);
     other.observe(&Ok(0usize), start);
     assert!(reporter.episode.is_some());
@@ -289,9 +306,21 @@ fn cause_changes_unknown_errors_and_operations_are_independent() {
         );
         assert!(reporter.episode.is_some());
     }
-    assert!(reporter.failure(cantopen(14), start).is_none());
-    assert!(reporter.failure(cantopen(270), start).is_some());
-    assert!(reporter.failure(cantopen(526), start).is_some());
+    assert!(
+        reporter
+            .failure(connection_failure(b"08001"), start)
+            .is_none()
+    );
+    assert!(
+        reporter
+            .failure(connection_failure(b"08006"), start)
+            .is_some()
+    );
+    assert!(
+        reporter
+            .failure(connection_failure(b"57P01"), start)
+            .is_some()
+    );
     assert!(
         reporter
             .failure(Diagnostic::new(OP, Cause::PoolTimeout), start)
@@ -304,14 +333,20 @@ fn cause_changes_unknown_errors_and_operations_are_independent() {
 fn counters_saturate_without_consuming_episode_history() {
     let start = Instant::now();
     let mut reporter = Reporter::new(OP);
-    reporter.failure(cantopen(14), start).unwrap();
+    reporter
+        .failure(connection_failure(b"08001"), start)
+        .unwrap();
     let episode = reporter.episode.as_mut().unwrap();
     episode.failures = u64::MAX;
     episode.suppressed = u64::MAX;
     reporter.suppressed_since_report = u64::MAX;
-    assert!(reporter.failure(cantopen(14), start).is_none());
+    assert!(
+        reporter
+            .failure(connection_failure(b"08001"), start)
+            .is_none()
+    );
     let next = reporter
-        .failure(cantopen(14), start + REPORT_WINDOW)
+        .failure(connection_failure(b"08001"), start + REPORT_WINDOW)
         .unwrap();
     assert_eq!(
         (next.failures, next.suppressed, next.suppressed_since_report),
@@ -389,7 +424,7 @@ fn occurrence_repair_phase_and_reason_survive_storage_source_classification() {
 }
 
 #[test]
-fn finalization_operation_survives_typed_sqlite_or_pool_cause() {
+fn finalization_operation_survives_typed_pool_cause() {
     let error = pool_error()
         .context(pioneer_crud::NativeFinalizationPhase::WriterBegin)
         .context(CANARY);

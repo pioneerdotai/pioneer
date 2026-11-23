@@ -4,21 +4,24 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[sea_orm::model]
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_episodic_embedding_artifacts")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub pipeline_identity_hash: String,
+    #[sea_orm(column_type = "Text")]
     pub input_hash: String,
+    #[sea_orm(column_type = "Text")]
     pub provider_id: String,
     #[sea_orm(column_type = "Text")]
     pub model: String,
     pub dimension: i64,
     pub normalized: bool,
-    #[sea_orm(column_type = "Binary(1)")]
-    pub vector_bytes: Vec<u8>,
+    pub embedding: PgVector,
     pub created_at: DateTimeWithTimeZone,
     pub last_used_at: DateTimeWithTimeZone,
 }

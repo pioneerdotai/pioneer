@@ -1,7 +1,7 @@
 //! Lossless Apply Patch outcomes and durable history vocabulary.
 //!
 //! This crate defines the durable handoff between PatchEngine execution,
-//! SQLite-backed applied-patch history, content-addressed snapshots, and the
+//! PostgreSQL-backed applied-patch history, content-addressed snapshots, and the
 //! rebuildable per-turn diff projection. It never reads the current workspace
 //! or Git to reconstruct historical state.
 
@@ -37,11 +37,11 @@ pub use codex::{
     CodexAggregateProjectionStore, CodexAggregateState, CodexAggregateTracker,
     CodexProtocolSupport, normalize_codex_diff_updated, parse_changed_files, select_codex_protocol,
 };
-pub use db_codex::SqliteCodexAggregateStore;
-pub use db_intent::{BeginNextOutcome, SqliteCommitIntentStore};
-pub use db_projection::SqliteTurnDiffStore;
-pub use db_snapshots::{SnapshotReconciliationReport, SqliteSnapshotStore};
-pub use db_store::SqliteAppliedPatchStore;
+pub use db_codex::PostgresCodexAggregateStore;
+pub use db_intent::{BeginNextOutcome, PostgresCommitIntentStore};
+pub use db_projection::PostgresTurnDiffStore;
+pub use db_snapshots::{PostgresSnapshotStore, SnapshotReconciliationReport};
+pub use db_store::PostgresAppliedPatchStore;
 pub use intent::{CommitIntentJournal, IntentError, IntentStatus, PatchCommitIntent};
 pub use projection::{
     AgentDiffUpdatedProjection, ProjectionError, TURN_DIFF_STATE_SCHEMA_VERSION,
@@ -73,7 +73,7 @@ pub const APPLY_PATCH_RESULT_SCHEMA_VERSION: u16 = 1;
 
 /// Stable, content-free identifier for one invocation's immutable history
 /// record.  The same identity/ordinal pair must produce the same value on
-/// replay, before or after SQLite persistence.
+/// replay, before or after PostgreSQL persistence.
 pub fn applied_patch_record_id(identity: &InvocationIdentity, ordinal: u64) -> String {
     let mut digest = Sha256::new();
     digest.update(identity.thread_id.as_bytes());

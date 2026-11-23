@@ -28,7 +28,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

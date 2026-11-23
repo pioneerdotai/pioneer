@@ -7,21 +7,29 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "recovery_job")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub item_id: String,
+    #[sea_orm(column_type = "Text")]
     pub item_type: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_attempt_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub trigger: String,
+    #[sea_orm(column_type = "Text")]
     pub action: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub reason: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub policy: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub error_class: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub transport_stage: Option<String>,
     pub retry_after_ms: Option<i64>,
     pub provider_attempt_number: i64,
@@ -33,9 +41,11 @@ pub struct Model {
     pub last_error: Option<String>,
     pub scheduled_at: DateTimeWithTimeZone,
     pub next_run_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
     pub claimed_at: Option<DateTimeWithTimeZone>,
     pub claim_expires_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub active_attempt_id: Option<String>,
     pub active_attempt_started_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,

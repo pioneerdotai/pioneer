@@ -13,15 +13,11 @@ const CLAIM_MS: i64 = 300_000;
 #[derive(Default)]
 pub(crate) struct Progress {
     previews: HtmlPreviewMaintenanceProgress,
-    witness_after: (String, i64),
-    witness_upper: Option<(String, i64)>,
     blocked_after: (String, String, i64),
     blocked_upper: Option<(String, String, i64)>,
-    finished: [bool; 2],
-    io_seeded: bool,
+    blocked_finished: bool,
+    previews_finished: bool,
     revisit: bool,
-    // Includes fallback witness preparation, which advances before physical IO.
-    retry_debt: bool,
 }
 
 async fn settle(
@@ -47,7 +43,7 @@ async fn io_quantum(store: &CrudStore, service: &ArtifactService) -> anyhow::Res
         return Ok(false);
     };
     match claim.row.family.as_str() {
-        "seed_witness" | "seed_copies" => {
+        "seed_witness" | "seed_copies" if !claim.row.workspace_id.is_empty() => {
             anyhow::ensure!(
                 store.html_preview_io_seed_quantum(&claim).await?,
                 "HTML IO seed fence lost"
@@ -83,37 +79,7 @@ async fn io_quantum(store: &CrudStore, service: &ArtifactService) -> anyhow::Res
                 settle(store, &claim, HtmlPreviewIoOutcome::Quarantine).await?
             }
         },
-        "copies" => match store.load_html_preview_io_copies(&claim).await? {
-            HtmlPreviewIoSource::Ready((workspace, previous)) => {
-                match service
-                    .prepare_html_preview_copy_cleanup(&workspace, &previous)
-                    .await
-                {
-                    Ok(Some(prepared)) => {
-                        if !store
-                            .finish_html_preview_copy_cleanup_claimed(&claim, &previous, &prepared)
-                            .await?
-                        {
-                            settle(store, &claim, HtmlPreviewIoOutcome::Retry).await?;
-                        }
-                    }
-                    Ok(None) => settle(store, &claim, HtmlPreviewIoOutcome::Retry).await?,
-                    Err(pioneer_artifacts::ArtifactError::ContentInvariant { .. }) => {
-                        settle(store, &claim, HtmlPreviewIoOutcome::Quarantine).await?
-                    }
-                    Err(_) => settle(store, &claim, HtmlPreviewIoOutcome::Retry).await?,
-                }
-            }
-            HtmlPreviewIoSource::Retry => {
-                settle(store, &claim, HtmlPreviewIoOutcome::Retry).await?
-            }
-            HtmlPreviewIoSource::Obsolete => {
-                settle(store, &claim, HtmlPreviewIoOutcome::Done).await?
-            }
-            HtmlPreviewIoSource::Quarantine => {
-                settle(store, &claim, HtmlPreviewIoOutcome::Quarantine).await?
-            }
-        },
+        "copies" => service.cleanup_claimed_html_preview_copy(&claim).await?,
         _ => settle(store, &claim, HtmlPreviewIoOutcome::Quarantine).await?,
     }
     Ok(true)
@@ -124,106 +90,45 @@ pub(crate) async fn quantum(
     service: &ArtifactService,
     progress: &mut Progress,
 ) -> anyhow::Result<bool> {
-    let result = pass_quantum(store, service, progress).await;
-    if progress.retry_debt && progress.finished[0] {
-        // Only fallback witness owns this debt. Rewind it at its own EOF,
-        // independently of preview Deferred, blocked recovery and queue backlog.
-        progress.witness_after = Default::default();
-        progress.witness_upper = None;
-        progress.finished[0] = false;
-        progress.retry_debt = false;
-        if result.is_ok() {
-            anyhow::bail!("HTML witness discovery pass requires retry");
+    let store = store.with_maintenance_access();
+    // Latch the recovery frontier for this pass. Immediately rescanning its
+    // parked rows would requeue work that just reported an active hold.
+    if !progress.blocked_finished {
+        if progress.blocked_upper.is_none() {
+            progress.blocked_upper = Some(store.html_preview_io_recovery_frontier().await?);
+        }
+        match store
+            .recover_html_preview_io_blocked_through(
+                &progress.blocked_after,
+                progress.blocked_upper.as_ref().expect("captured frontier"),
+            )
+            .await?
+        {
+            Some(next) => progress.blocked_after = next,
+            None => progress.blocked_finished = true,
         }
     }
-    result
-}
-
-async fn pass_quantum(
-    store: &CrudStore,
-    service: &ArtifactService,
-    progress: &mut Progress,
-) -> anyhow::Result<bool> {
-    let store = store.with_maintenance_access();
-    // Bounded queue recovery runs even after a lost local wake or restart.
-    if progress.blocked_upper.is_none() {
-        progress.blocked_upper = Some(store.html_preview_io_recovery_frontier().await?);
-    }
-    let blocked_next = store
-        .recover_html_preview_io_blocked_through(
-            &progress.blocked_after,
-            progress.blocked_upper.as_ref().expect("captured frontier"),
-        )
-        .await?;
-    if blocked_next.is_none() {
-        progress.blocked_upper = None;
-    }
-    let blocked_more = blocked_next.is_some();
-    progress.blocked_after = blocked_next.unwrap_or_default();
+    let blocked_more = !progress.blocked_finished;
     let io_result = io_quantum(&store, service).await;
 
-    if !progress.io_seeded {
-        progress.io_seeded = store.html_preview_io_seed_complete().await?;
-    }
-    let mut witness_error = None;
-    if progress.io_seeded {
-        progress.finished[0] = true;
-    } else if !progress.finished[0] {
-        if progress.witness_upper.is_none() {
-            progress.witness_upper = Some(store.html_preview_witness_frontier().await?);
-        }
-        let (next, witness) = store
-            .html_preview_archive_witness_page_through(
-                &progress.witness_after,
-                progress.witness_upper.as_ref().expect("captured frontier"),
-            )
-            .await?;
-        if let Some(next) = next {
-            progress.witness_after = next;
-        } else {
-            progress.witness_after = (String::new(), 0);
-            progress.finished[0] = true;
-        }
-        if let Some(witness) = witness {
-            let retry_debt = progress.retry_debt;
-            progress.retry_debt = true;
-            if let Err(error) =
-                crate::compaction::frozen::prepare_html_preview_archive_witness(&store, &witness)
-                    .await
-            {
-                witness_error = Some(error);
-            } else {
-                progress.retry_debt = retry_debt;
-            }
-        }
-    }
     let mut deferred = false;
-    if !progress.finished[1] {
+    if !progress.previews_finished {
         match service
             .html_preview_maintenance_outcome(&mut progress.previews)
             .await?
         {
             HtmlPreviewMaintenanceOutcome::More => {}
-            HtmlPreviewMaintenanceOutcome::Idle => progress.finished[1] = true,
+            HtmlPreviewMaintenanceOutcome::Idle => progress.previews_finished = true,
             HtmlPreviewMaintenanceOutcome::Deferred => deferred = true,
         }
     }
     // One poison IO row cannot prevent progress of retirement and BlobGC.
     let io_more = io_result?;
-    if let Some(error) = witness_error {
-        // IO tickets/claim deadlines already recover queue failures. Only the
-        // legacy fallback advances a local cursor before physical preparation.
-        return Err(error);
-    }
-    if progress.finished.iter().all(|done| *done)
-        && !blocked_more
-        && progress.revisit
-        && !progress.retry_debt
-    {
+    if progress.previews_finished && !blocked_more && progress.revisit {
         *progress = Progress::default();
         return Ok(true);
     }
-    Ok(blocked_more || io_more || !progress.finished[0] || (!deferred && !progress.finished[1]))
+    Ok(blocked_more || io_more || (!deferred && !progress.previews_finished))
 }
 
 pub(super) async fn run(
@@ -273,10 +178,13 @@ pub(super) async fn run(
                 };
                 if release_only {
                     progress.previews.invalidate_completed();
-                    progress.finished[1] = false;
+                    progress.previews_finished = false;
+                    progress.blocked_after = Default::default();
+                    progress.blocked_upper = None;
+                    progress.blocked_finished = false;
                     continue;
                 }
-                if progress.finished.iter().all(|done| *done) {
+                if progress.previews_finished {
                     progress = Progress::default();
                 } else {
                     progress.previews.invalidate_completed();

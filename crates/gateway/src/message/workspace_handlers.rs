@@ -20,7 +20,8 @@ impl MessageProcessor {
             Ok(workspaces) => workspaces,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to list workspaces: {message}"),
                     ),
@@ -71,15 +72,34 @@ impl MessageProcessor {
         params: WorkspaceCreateParams,
     ) {
         let connection_id = request_context.connection_id();
-        let workspace = match self
-            .workspace_manager
-            .create_workspace(params.workspace_id.as_str(), params.name.as_deref())
-            .await
-        {
+        let creation = async {
+            // Use the same catalog generation as settings updates.
+            let _settings_guard = self.gateway_settings_update_lock.lock().await;
+            let identities = self
+                .load_cli_runtime_instances()
+                .and_then(|configured| {
+                    super::agent_action_tools::cli_identity_catalog(self, &configured)
+                })
+                .map_err(|error| {
+                    WorkspaceError::Internal(format!(
+                        "failed to load CLI identity catalog: {error:#}"
+                    ))
+                })?;
+            self.workspace_manager
+                .create_workspace_with_cli_identities(
+                    params.workspace_id.as_str(),
+                    params.name.as_deref(),
+                    &identities,
+                )
+                .await
+        }
+        .await;
+        let workspace = match creation {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to create workspace: {message}"),
                     ),
@@ -161,7 +181,8 @@ impl MessageProcessor {
             }
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to ensure default workspace: {message}"),
                     ),
@@ -238,7 +259,8 @@ impl MessageProcessor {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to select workspace: {message}"),
                     ),
@@ -312,7 +334,8 @@ impl MessageProcessor {
             Ok(workspace) => workspace,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to update workspace: {message}"),
                     ),

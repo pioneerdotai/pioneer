@@ -346,6 +346,8 @@ fn render_linux_systemd_service(
         Type=simple
         {environment_section}
         ExecStart={exec} {mode_arg}
+        KillMode=mixed
+        TimeoutStopSec=90
         Restart=always
         RestartSec=2
 

@@ -7,35 +7,48 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "self_improvement_run")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
+    #[sea_orm(column_type = "Text", unique_key = "uq_self_improvement_run_daily")]
     pub workspace_id: String,
     #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
     pub activation_epoch: i64,
-    #[sea_orm(unique_key = "uq_self_improvement_run_daily")]
+    #[sea_orm(column_type = "Text", unique_key = "uq_self_improvement_run_daily")]
     pub scheduled_date_utc: String,
     pub source_lower_exclusive: i64,
     pub source_upper_inclusive: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claim_token: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub claimed_by: Option<String>,
     pub lease_expires_at: Option<DateTimeWithTimeZone>,
     pub attempt_count: i64,
     pub next_attempt_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(column_type = "Text")]
     pub learner_provider: String,
+    #[sea_orm(column_type = "Text")]
     pub learner_model: String,
+    #[sea_orm(column_type = "Text")]
     pub reviewer_provider: String,
+    #[sea_orm(column_type = "Text")]
     pub reviewer_model: String,
+    #[sea_orm(column_type = "Text")]
     pub pipeline_contract_version: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub analysis_cursor_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub analysis_digest_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub outcome: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub applied_action: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub skill_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub previous_version_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub resulting_version_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub result_summary: Option<String>,
@@ -56,7 +69,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

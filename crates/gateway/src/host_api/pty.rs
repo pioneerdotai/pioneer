@@ -1,5 +1,5 @@
 //! Interactive PTYs under the Gateway OS account. No UI or user impersonation.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, PtySize};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,25 +49,17 @@ struct Create {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    session_id: String,
     sequence: u64,
     bytes: Vec<u8>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Resize {
-    session_id: String,
     dimensions: Dimensions,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Session {
-    session_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadOutput {
-    session_id: String,
     after: u64,
 }
 struct Output {
@@ -349,6 +341,7 @@ impl PtyOwner {
                         touched: Instant::now(),
                     }),
                 };
+                #[cfg(windows)]
                 let pty = startup.pty.as_mut().expect("owned startup");
                 let write_status = output.clone();
                 let write_signal = self.output_signal.clone();
@@ -648,13 +641,14 @@ impl PtyOwner {
                 return Ok(json!({"session_id":id,"input_sequence":0,"retention_seconds":300}));
             }
         }
-        let id = params
-            .get("session_id")
-            .and_then(Value::as_str)
-            .context("host.invalid_params")?
-            .to_owned();
+        let Value::Object(mut fields) = params else {
+            bail!("host.invalid_params");
+        };
+        let Some(Value::String(id)) = fields.remove("session_id") else {
+            bail!("host.invalid_params");
+        };
         if method == "host.pty.close" {
-            let _: Session = serde_json::from_value(params).context("host.invalid_params")?;
+            ensure!(fields.is_empty(), "host.invalid_params");
             // Idempotent within this execution. IDs never address another owner.
             self.sessions.remove(&id);
             return Ok(json!({"closed":true}));
@@ -666,7 +660,8 @@ impl PtyOwner {
         pty.touched = Instant::now();
         match method {
             "host.pty.input" => {
-                let input: Input = serde_json::from_value(params).context("host.invalid_params")?;
+                let input: Input =
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
                 if input.bytes.len() > 16384 || input.bytes.is_empty() {
                     bail!("host.input_limit");
                 }
@@ -714,7 +709,8 @@ impl PtyOwner {
                 Ok(json!({"accepted_sequence":pty.input_sequence}))
             }
             "host.pty.resize" => {
-                let p: Resize = serde_json::from_value(params).context("host.invalid_params")?;
+                let p: Resize =
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
                 pty.master
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -725,11 +721,11 @@ impl PtyOwner {
             }
             "host.pty.read" => {
                 let p: ReadOutput =
-                    serde_json::from_value(params).context("host.invalid_params")?;
-                self.read_output(&p.session_id, p.after, 16384)
+                    serde_json::from_value(Value::Object(fields)).context("host.invalid_params")?;
+                self.read_output(&id, p.after, 16384)
             }
             "host.pty.keepalive" => {
-                let _: Session = serde_json::from_value(params).context("host.invalid_params")?;
+                ensure!(fields.is_empty(), "host.invalid_params");
                 Ok(json!({"alive":true}))
             }
             _ => bail!("host.method_not_allowed"),

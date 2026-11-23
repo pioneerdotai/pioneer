@@ -155,7 +155,7 @@ fn task_parent_launch(selected: TurnCapability) -> AgentLaunchSelection {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_parent_pinning_uses_server_expansion_and_preserves_a_native_ceiling() {
     let harness = setup_cli_runtime_security_harness(None).await;
     let root = unique_temp_dir("c2-task-parent");
@@ -241,7 +241,7 @@ async fn task_parent_pinning_uses_server_expansion_and_preserves_a_native_ceilin
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn cli_restore_requires_committed_ready_bindings_and_current_parent_authority() {
     use sea_orm::ConnectionTrait;
     let harness = setup_cli_runtime_security_harness(None).await;
@@ -543,7 +543,7 @@ fn ordinary_owned_cli_start_uses_native_skill_and_ready_parent_for_both_provider
     });
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owner() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = unique_temp_dir("plugin-transfer-owner");
@@ -860,7 +860,7 @@ async fn plugin_previews_and_update_require_the_full_authenticated_transfer_owne
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = unique_temp_dir("plugin-implicit-policy");
@@ -954,29 +954,33 @@ async fn plugin_policy_rpc_preserves_independent_toggles_and_frozen_task_grants(
 #[test]
 fn app_selection_preserves_both_parent_domains_and_blocks_owned_leaf_bypass() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async{
-        let harness=setup_cli_runtime_security_harness(None).await;
-        let root=unique_temp_dir("app-selection-owner");
-        let (app,skill,selected)=seed_owned_c2_package(&harness.crud_store,&harness.workspace_id,&root.join("app"),pioneer_protocol::PackageKind::App).await;
-        let (plugin,_,plugin_selected)=seed_owned_c2_skill(&harness.crud_store,&harness.workspace_id,&root.join("plugin")).await;
-        let result=harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected.clone(),plugin_selected.clone()]).await.unwrap();
-        assert_eq!(result.presentation.len(),2);
-        assert_eq!(result.presentation[0].label.as_deref(),Some("Authoritative App"));
-        assert!(matches!(&result.presentation[0].kind,TurnCapabilityKind::App{app_id,expected_revision:1} if app_id==&app));
-        let snapshot=result.plugin_selection.unwrap();assert_eq!(snapshot.parents.len(),2);
-        assert_eq!(snapshot.parents[0].kind,pioneer_protocol::PackageKind::App);
-        assert_eq!(snapshot.parents[1].kind,pioneer_protocol::PackageKind::Plugin);
-        assert!(snapshot.children.iter().any(|c|c.parent_id==app&&c.id==skill.as_str()));
-        let raw=TurnCapability{id:pioneer_protocol::skill_capability_key(&skill),kind:TurnCapabilityKind::Skill{skill_id:skill,pack_id:None},label:None};
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[raw]).await.is_err());
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[pioneer_protocol::package_capability(pioneer_protocol::PackageKind::Plugin,&app,1)]).await.is_err());
-        assert!(harness.processor.normalize_turn_skill_capabilities("foreign-workspace",&[selected.clone()]).await.is_err());
-        let guards=super::super::packages::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
-        harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&app,1,"updating",false,"{\"kind\":\"enable\"}").await.unwrap();
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected]).await.is_err());
-        assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[plugin_selected]).await.is_ok());
-        assert!(harness.crud_store.find_package_installation(&plugin).await.unwrap().unwrap().enabled);
-        std::fs::remove_dir_all(root).unwrap();
-    });
+         pioneer_postgres_test::with_test_databases(async {
+            let harness=setup_cli_runtime_security_harness(None).await;
+            let root=unique_temp_dir("app-selection-owner");
+            let (app,skill,selected)=seed_owned_c2_package(&harness.crud_store,&harness.workspace_id,&root.join("app"),pioneer_protocol::PackageKind::App).await;
+            let (plugin,_,plugin_selected)=seed_owned_c2_skill(&harness.crud_store,&harness.workspace_id,&root.join("plugin")).await;
+            let result=harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected.clone(),plugin_selected.clone()]).await.unwrap();
+            assert_eq!(result.presentation.len(),2);
+            assert_eq!(result.presentation[0].label.as_deref(),Some("Authoritative App"));
+            assert!(matches!(&result.presentation[0].kind,TurnCapabilityKind::App{app_id,expected_revision:1} if app_id==&app));
+            let snapshot=result.plugin_selection.unwrap();assert_eq!(snapshot.parents.len(),2);
+            assert_eq!(snapshot.parents[0].kind,pioneer_protocol::PackageKind::App);
+            assert_eq!(snapshot.parents[1].kind,pioneer_protocol::PackageKind::Plugin);
+            assert!(snapshot.children.iter().any(|c|c.parent_id==app&&c.id==skill.as_str()));
+            let raw=TurnCapability{id:pioneer_protocol::skill_capability_key(&skill),kind:TurnCapabilityKind::Skill{skill_id:skill,pack_id:None},label:None};
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[raw]).await.is_err());
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[pioneer_protocol::package_capability(pioneer_protocol::PackageKind::Plugin,&app,1)]).await.is_err());
+            assert!(harness.processor.normalize_turn_skill_capabilities("foreign-workspace",&[selected.clone()]).await.is_err());
+            let guards=super::super::packages::acquire_plugin_selection_admission(&harness.crud_store,&harness.processor.plugin_mutation_locks,&harness.workspace_id,&snapshot).await.unwrap();drop(guards);
+            harness.crud_store.begin_plugin_mutation(&harness.workspace_id,&app,1,"updating",false,"{\"kind\":\"enable\"}").await.unwrap();
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[selected]).await.is_err());
+            assert!(harness.processor.normalize_turn_skill_capabilities(&harness.workspace_id,&[plugin_selected]).await.is_ok());
+            assert!(harness.crud_store.find_package_installation(&plugin).await.unwrap().unwrap().enabled);
+            std::fs::remove_dir_all(root).unwrap();
+         })
+         .await
+         .expect("close isolated PostgreSQL test databases")
+     });
 }
 
 // NOT_RUN / NOT_COMPILED. Real authenticated transfer and App facade, no providers.
@@ -1238,7 +1242,7 @@ async fn install_rpc_app(
     installed
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = unique_temp_dir("app-rpc-correction");
@@ -1366,7 +1370,7 @@ async fn app_rpc_install_read_selection_and_damaged_inventory_removal() {
 }
 
 // NOT_RUN / NOT_COMPILED. Native edits and package updates share real secret storage.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn app_update_preserves_native_mcp_secret_override() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = unique_temp_dir("app-native-mcp-override");
@@ -1557,7 +1561,7 @@ async fn dev_fixture_endpoint(
     )
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let grants = crate::view_grants::ViewGrantService::new(&Default::default()).unwrap();
@@ -2118,7 +2122,7 @@ async fn dev_app_sources_refresh_recover_and_remove_without_touching_release() {
 }
 
 // File-event regression sources only: NOT_RUN / NOT_COMPILED.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn dev_app_observes_repairs_of_invalid_nested_skills_after_restart_and_creation() {
     let mut harness = setup_cli_runtime_security_harness(None).await;
     let root = tempfile::tempdir().unwrap();

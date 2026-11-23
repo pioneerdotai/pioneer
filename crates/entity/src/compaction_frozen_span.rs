@@ -16,6 +16,8 @@ pub struct Model {
     pub end: i64,
     #[sea_orm(column_type = "Text")]
     pub source_manifest: String,
+    #[sea_orm(unique)]
+    pub insertion_ordinal: i64,
     #[sea_orm(
         belongs_to,
         relation_enum = "CompactionFrozenHistory2",
@@ -24,7 +26,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_frozen_history_2: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history_2: BelongsTo<super::compaction_frozen_history::Entity>,
     #[sea_orm(
         belongs_to,
         relation_enum = "CompactionFrozenHistory1",
@@ -33,7 +35,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "NoAction"
     )]
-    pub compaction_frozen_history_1: HasOne<super::compaction_frozen_history::Entity>,
+    pub compaction_frozen_history_1: BelongsTo<super::compaction_frozen_history::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

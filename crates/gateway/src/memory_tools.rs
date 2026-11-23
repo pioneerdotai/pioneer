@@ -1819,19 +1819,18 @@ pub(super) fn classify_memory_manifest_failure(
                 return failure;
             }
             Some(SqlxError::Database(database)) => {
-                // A numeric code from another backend cannot establish SQLite origin.
-                if let Some(sqlite) =
-                    database.try_downcast_ref::<sea_orm::sqlx::sqlite::SqliteError>()
-                {
-                    use sea_orm::sqlx::error::DatabaseError;
-                    if let Some(code) = sqlite.code().and_then(|code| code.parse::<i32>().ok()) {
-                        failure.sqlite_primary_code = Some(code & 0xff);
-                        failure.sqlite_extended_code = Some(code);
-                        if matches!(code & 0xff, 5 | 6) {
-                            failure.class = MemoryManifestFailureClass::StorageTransient;
-                        }
-                        return failure;
+                if let Some(postgres) = database.try_downcast_ref::<sea_orm::SqlxPostgresError>() {
+                    let code = postgres.code().as_bytes();
+                    failure.postgres_sqlstate = <[u8; 5]>::try_from(code).ok().filter(|code| {
+                        code.iter()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    });
+                    if matches!(code, [b'0', b'8', ..] | b"57P03")
+                        || postgres_memory_write_conflict(postgres)
+                    {
+                        failure.class = MemoryManifestFailureClass::StorageTransient;
                     }
+                    return failure;
                 }
             }
             _ => {}
@@ -1848,7 +1847,7 @@ pub(super) fn classify_memory_manifest_failure(
     failure
 }
 
-/// Use typed causes and SQLite result codes, never raw error text.
+/// Use typed database error causes for deciding whether to retry a memory write.
 fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::MemoryWriteFailure {
     use pioneer_memory::MemoryWriteFailure;
     use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
@@ -1869,11 +1868,9 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
                     return MemoryWriteFailure::StorageTransient;
                 }
                 SqlxError::Database(database) => {
-                    // Extended SQLite codes retain BUSY=5 / LOCKED=6 in the low byte.
                     if database
-                        .code()
-                        .and_then(|code| code.parse::<i32>().ok())
-                        .is_some_and(sqlite_write_failure_code_is_transient)
+                        .try_downcast_ref::<sea_orm::SqlxPostgresError>()
+                        .is_some_and(postgres_memory_write_conflict)
                     {
                         return MemoryWriteFailure::StorageTransient;
                     }
@@ -1885,8 +1882,10 @@ fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::Memory
     MemoryWriteFailure::Unclassified
 }
 
-fn sqlite_write_failure_code_is_transient(code: i32) -> bool {
-    matches!(code & 0xff, 5 | 6)
+fn postgres_memory_write_conflict(error: &sea_orm::SqlxPostgresError) -> bool {
+    // These SQLSTATEs reject the statement or transaction, so retrying does
+    // not repeat a write whose commit outcome could be unknown.
+    matches!(error.code(), "40001" | "40P01" | "55P03")
 }
 
 #[derive(Clone)]
@@ -3191,7 +3190,7 @@ mod tests {
             );
         }
         assert_eq!(
-            classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")),
+            classify_memory_write_failure(anyhow::anyhow!("lock unavailable (SQLSTATE 55P03)")),
             MemoryWriteFailure::Unclassified
         );
         assert_eq!(
@@ -3209,7 +3208,7 @@ mod tests {
         );
         assert_eq!(
             classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom(
-                "SQLITE_BUSY".into()
+                "SQLSTATE 55P03".into()
             ))),
             MemoryWriteFailure::Unclassified
         );
@@ -3637,8 +3636,8 @@ mod tests {
 mod response_validation_tests;
 
 #[cfg(test)]
-#[path = "memory_tools/sqlite_write_failure_tests.rs"]
-mod sqlite_write_failure_tests;
+#[path = "memory_tools/postgres_write_failure_tests.rs"]
+mod postgres_write_failure_tests;
 
 #[cfg(test)]
 #[path = "memory_manifest_failure_tests.rs"]

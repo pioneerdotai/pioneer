@@ -862,552 +862,612 @@ mod tests {
 
     #[tokio::test]
     async fn current_role_permission_cap_fences_a_wider_admitted_execution() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        let store = CrudStore::new(harness.database.clone());
-        let member = principal(
-            MEMBER_A_ID,
-            PrincipalKind::User,
-            Some(RoleKey::new("member").expect("member role")),
-            "D00000000000000000001",
-            "S00000000000000000001",
-        );
-        let wide_context = ExecutionAuthorizationContext::for_test(
-            &member,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            None,
-        );
-        let registry = ExecutionLeaseRegistry::default();
-        let error = registry
-            .register(&store, "V00000000000000000009", &wide_context, 2)
-            .await
-            .expect_err("current supervised role must not continue a full-access admission");
-        assert!(format!("{error:#}").contains("no current collaborator authority"));
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                let store = CrudStore::new(harness.database.clone());
+                let member = principal(
+                    MEMBER_A_ID,
+                    PrincipalKind::User,
+                    Some(RoleKey::new("member").expect("member role")),
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                );
+                let wide_context = ExecutionAuthorizationContext::for_test(
+                    &member,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    None,
+                );
+                let registry = ExecutionLeaseRegistry::default();
+                let error = registry
+                    .register(&store, "V00000000000000000009", &wide_context, 2)
+                    .await
+                    .expect_err(
+                        "current supervised role must not continue a full-access admission",
+                    );
+                assert!(format!("{error:#}").contains("no current collaborator authority"));
 
-        let supervised = pioneer_protocol::compile_turn_permission_profile(
-            pioneer_protocol::TurnPermissionMode::Supervised,
-            pioneer_protocol::TurnPermissionProfileSource::Composer,
-        );
-        let supervised_context = ExecutionAuthorizationContext::for_test(
-            &member,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &supervised,
-            None,
-        );
-        registry
-            .register(&store, "V00000000000000000010", &supervised_context, 2)
-            .await
-            .expect("equal current role cap keeps the execution active");
+                let supervised = pioneer_protocol::compile_turn_permission_profile(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                );
+                let supervised_context = ExecutionAuthorizationContext::for_test(
+                    &member,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &supervised,
+                    None,
+                );
+                registry
+                    .register(&store, "V00000000000000000010", &supervised_context, 2)
+                    .await
+                    .expect("equal current role cap keeps the execution active");
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn progress_cache_admits_only_current_active_continuation_lease() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        let store = CrudStore::new(harness.database.clone());
-        let member = principal(
-            MEMBER_A_ID,
-            PrincipalKind::User,
-            Some(RoleKey::member()),
-            "D00000000000000000001",
-            "S00000000000000000001",
-        );
-        let supervised = pioneer_protocol::compile_turn_permission_profile(
-            pioneer_protocol::TurnPermissionMode::Supervised,
-            pioneer_protocol::TurnPermissionProfileSource::Composer,
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &member,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &supervised,
-            None,
-        );
-        let registry = ExecutionLeaseRegistry::default();
-        let execution_id = "V00000000000000000010";
-        registry
-            .register(&store, execution_id, &context, 7)
-            .await
-            .expect("register current execution lease");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                let store = CrudStore::new(harness.database.clone());
+                let member = principal(
+                    MEMBER_A_ID,
+                    PrincipalKind::User,
+                    Some(RoleKey::member()),
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                );
+                let supervised = pioneer_protocol::compile_turn_permission_profile(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &member,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &supervised,
+                    None,
+                );
+                let registry = ExecutionLeaseRegistry::default();
+                let execution_id = "V00000000000000000010";
+                registry
+                    .register(&store, execution_id, &context, 7)
+                    .await
+                    .expect("register current execution lease");
 
-        assert!(
-            registry
-                .guard_progress_cached(execution_id, 7)
-                .await
-                .expect("current progress lease should validate")
-        );
-        assert!(
-            !registry
-                .guard_progress_cached(execution_id, 8)
-                .await
-                .expect("stale progress lease should request durable reprojection")
-        );
+                assert!(
+                    registry
+                        .guard_progress_cached(execution_id, 7)
+                        .await
+                        .expect("current progress lease should validate")
+                );
+                assert!(
+                    !registry
+                        .guard_progress_cached(execution_id, 8)
+                        .await
+                        .expect("stale progress lease should request durable reprojection")
+                );
 
-        registry
-            .leases
-            .write()
-            .await
-            .get_mut(execution_id)
-            .expect("registered lease")
-            .state = ExecutionLeaseState::Fenced;
-        assert!(
-            registry
-                .guard_progress_cached(execution_id, 7)
-                .await
-                .expect_err("a current fenced lease must fail closed")
-                .to_string()
-                .contains("fenced")
-        );
+                registry
+                    .leases
+                    .write()
+                    .await
+                    .get_mut(execution_id)
+                    .expect("registered lease")
+                    .state = ExecutionLeaseState::Fenced;
+                assert!(
+                    registry
+                        .guard_progress_cached(execution_id, 7)
+                        .await
+                        .expect_err("a current fenced lease must fail closed")
+                        .to_string()
+                        .contains("fenced")
+                );
 
-        registry.finish(execution_id).await;
-        assert!(
-            !registry
-                .guard_progress_cached(execution_id, 7)
-                .await
-                .expect("a missing lease should request durable restoration")
-        );
+                registry.finish(execution_id).await;
+                assert!(
+                    !registry
+                        .guard_progress_cached(execution_id, 7)
+                        .await
+                        .expect("a missing lease should request durable restoration")
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn superuser_started_execution_is_controlled_by_every_current_thread_member() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        add_member_b_to_private_root(&harness).await;
-        let store = CrudStore::new(harness.database.clone());
-        let superuser = principal(
-            crate::auth::test_support::TEST_SUPERUSER_ID,
-            PrincipalKind::Superuser,
-            None,
-            "D00000000000000000001",
-            "S00000000000000000001",
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &superuser,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            None,
-        );
-        let registry = ExecutionLeaseRegistry::default();
-        registry
-            .register(&store, "V00000000000000000001", &context, 1)
-            .await
-            .expect("register collaborative lease");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                add_member_b_to_private_root(&harness).await;
+                let store = CrudStore::new(harness.database.clone());
+                let superuser = principal(
+                    crate::auth::test_support::TEST_SUPERUSER_ID,
+                    PrincipalKind::Superuser,
+                    None,
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &superuser,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    None,
+                );
+                let registry = ExecutionLeaseRegistry::default();
+                registry
+                    .register(&store, "V00000000000000000001", &context, 1)
+                    .await
+                    .expect("register collaborative lease");
 
-        let leases = registry.leases.read().await;
-        let lease = leases
-            .get("V00000000000000000001")
-            .expect("registered lease");
-        let member_a = PrincipalId::new(MEMBER_A_ID).unwrap();
-        let member_b = PrincipalId::new(MEMBER_B_ID).unwrap();
-        for action in [
-            ResourceAction::AgentExecutionObserve,
-            ResourceAction::AgentExecutionCancel,
-            ResourceAction::AgentExecutionSteer,
-            ResourceAction::AgentRequestRespond,
-            ResourceAction::TaskCreate,
-        ] {
-            let collaborators = lease
-                .action_collaborators
-                .get(&action)
-                .expect("Member action is projected");
-            assert!(collaborators.contains(&member_a));
-            assert!(collaborators.contains(&member_b));
-        }
+                let leases = registry.leases.read().await;
+                let lease = leases
+                    .get("V00000000000000000001")
+                    .expect("registered lease");
+                let member_a = PrincipalId::new(MEMBER_A_ID).unwrap();
+                let member_b = PrincipalId::new(MEMBER_B_ID).unwrap();
+                for action in [
+                    ResourceAction::AgentExecutionObserve,
+                    ResourceAction::AgentExecutionCancel,
+                    ResourceAction::AgentExecutionSteer,
+                    ResourceAction::AgentRequestRespond,
+                    ResourceAction::TaskCreate,
+                ] {
+                    let collaborators = lease
+                        .action_collaborators
+                        .get(&action)
+                        .expect("Member action is projected");
+                    assert!(collaborators.contains(&member_a));
+                    assert!(collaborators.contains(&member_b));
+                }
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn participant_add_reprojects_running_execution_without_fencing_it() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        let store = CrudStore::new(harness.database.clone());
-        let member_a = principal(
-            MEMBER_A_ID,
-            PrincipalKind::User,
-            Some(RoleKey::member()),
-            "D0000000000000000000A",
-            "S0000000000000000000A",
-        );
-        let supervised = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-            pioneer_protocol::TurnPermissionMode::Supervised,
-            pioneer_protocol::TurnPermissionProfileSource::Composer,
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &member_a,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &supervised,
-            None,
-        );
-        let registry = ExecutionLeaseRegistry::default();
-        registry
-            .register(&store, "V00000000000000000004", &context, 1)
-            .await
-            .expect("register running collaborative execution");
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                let store = CrudStore::new(harness.database.clone());
+                let member_a = principal(
+                    MEMBER_A_ID,
+                    PrincipalKind::User,
+                    Some(RoleKey::member()),
+                    "D0000000000000000000A",
+                    "S0000000000000000000A",
+                );
+                let supervised = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                    pioneer_protocol::TurnPermissionMode::Supervised,
+                    pioneer_protocol::TurnPermissionProfileSource::Composer,
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &member_a,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &supervised,
+                    None,
+                );
+                let registry = ExecutionLeaseRegistry::default();
+                registry
+                    .register(&store, "V00000000000000000004", &context, 1)
+                    .await
+                    .expect("register running collaborative execution");
 
-        let member_b = PrincipalId::new(MEMBER_B_ID).expect("Member B id");
-        {
-            let leases = registry.leases.read().await;
-            let lease = leases
-                .get("V00000000000000000004")
-                .expect("registered lease");
-            assert!(
-                lease
-                    .action_collaborators
-                    .get(&ResourceAction::AgentRequestRespond)
-                    .is_none_or(|ids| !ids.contains(&member_b))
-            );
-        }
+                let member_b = PrincipalId::new(MEMBER_B_ID).expect("Member B id");
+                {
+                    let leases = registry.leases.read().await;
+                    let lease = leases
+                        .get("V00000000000000000004")
+                        .expect("registered lease");
+                    assert!(
+                        lease
+                            .action_collaborators
+                            .get(&ResourceAction::AgentRequestRespond)
+                            .is_none_or(|ids| !ids.contains(&member_b))
+                    );
+                }
 
-        add_member_b_to_private_root(&harness).await;
-        let signal = crate::authorization::AuthorizationInvalidationHub::default()
-            .publish(
-                pioneer_protocol::AccessChangeKind::ThreadParticipantAdded,
-                Some(member_b.clone()),
-                WORKSPACE_RED_ID,
-                Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
-            )
-            .await
-            .expect("publish participant-add invalidation");
-        let reprojection = registry
-            .reproject_scope(&store, &signal)
-            .await
-            .expect("reproject shared execution");
-        assert!(
-            reprojection.fenced_execution_ids.is_empty(),
-            "adding a collaborator must not stop the running shared execution"
-        );
+                add_member_b_to_private_root(&harness).await;
+                let signal = crate::authorization::AuthorizationInvalidationHub::default()
+                    .publish(
+                        pioneer_protocol::AccessChangeKind::ThreadParticipantAdded,
+                        Some(member_b.clone()),
+                        WORKSPACE_RED_ID,
+                        Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+                    )
+                    .await
+                    .expect("publish participant-add invalidation");
+                let reprojection = registry
+                    .reproject_scope(&store, &signal)
+                    .await
+                    .expect("reproject shared execution");
+                assert!(
+                    reprojection.fenced_execution_ids.is_empty(),
+                    "adding a collaborator must not stop the running shared execution"
+                );
 
-        let leases = registry.leases.read().await;
-        let lease = leases
-            .get("V00000000000000000004")
-            .expect("reprojected lease");
-        for action in [
-            ResourceAction::AgentExecutionCancel,
-            ResourceAction::AgentExecutionSteer,
-            ResourceAction::AgentRequestRespond,
-            ResourceAction::TaskCreate,
-        ] {
-            assert!(
-                lease
-                    .action_collaborators
-                    .get(&action)
-                    .is_some_and(|ids| ids.contains(&member_b)),
-                "new collaborator must receive current `{}` authority",
-                action.safe_name()
-            );
-        }
+                let leases = registry.leases.read().await;
+                let lease = leases
+                    .get("V00000000000000000004")
+                    .expect("reprojected lease");
+                for action in [
+                    ResourceAction::AgentExecutionCancel,
+                    ResourceAction::AgentExecutionSteer,
+                    ResourceAction::AgentRequestRespond,
+                    ResourceAction::TaskCreate,
+                ] {
+                    assert!(
+                        lease
+                            .action_collaborators
+                            .get(&action)
+                            .is_some_and(|ids| ids.contains(&member_b)),
+                        "new collaborator must receive current `{}` authority",
+                        action.safe_name()
+                    );
+                }
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn collaboration_action_does_not_require_backend_start_authority() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        add_member_b_to_private_root(&harness).await;
-        harness
-            .database
-            .execute_unprepared(&format!(
-                "UPDATE gateway_principal SET role_key='synthetic_observer' \
-                 WHERE id='{MEMBER_B_ID}'"
-            ))
-            .await
-            .expect("assign test observer role");
-        let store = CrudStore::new(harness.database.clone());
-        let superuser = principal(
-            crate::auth::test_support::TEST_SUPERUSER_ID,
-            PrincipalKind::Superuser,
-            None,
-            "D00000000000000000001",
-            "S00000000000000000001",
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &superuser,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            None,
-        );
-        let projected = project_lease(
-            &store,
-            ExecutionLease {
-                execution_id: "V00000000000000000002".to_owned(),
-                workspace_id: WORKSPACE_RED_ID.to_owned(),
-                root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
-                actor_principal_id: superuser.principal_id.clone(),
-                actor_session_id: superuser.session_id.clone(),
-                admitted_role_key: context.role_key().to_owned(),
-                admitted_policy_generation: 1,
-                projected_policy_generation: 1,
-                continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
-                continuation_action: context.continuation_action(),
-                continuation_provider: context
-                    .continuation_provider()
-                    .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
-                continuation_cli_runtime: None,
-                granted_skill_ids: Vec::new(),
-                granted_mcp_server_ids: Vec::new(),
-                admitted_permission_cap: context.permission_profile_cap().clone(),
-                immutable_actions: context
-                    .granted_action_names()
-                    .iter()
-                    .filter_map(|name| ResourceAction::from_safe_name(name))
-                    .collect(),
-                projected_actions: BTreeSet::new(),
-                collaborator_ids: BTreeSet::new(),
-                action_collaborators: BTreeMap::new(),
-                state: ExecutionLeaseState::Fenced,
-            },
-        )
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                add_member_b_to_private_root(&harness).await;
+                harness
+                    .database
+                    .execute_unprepared(&format!(
+                        "UPDATE gateway_principal SET role_key='synthetic_observer' \
+                         WHERE id='{MEMBER_B_ID}'"
+                    ))
+                    .await
+                    .expect("assign test observer role");
+                let store = CrudStore::new(harness.database.clone());
+                let superuser = principal(
+                    crate::auth::test_support::TEST_SUPERUSER_ID,
+                    PrincipalKind::Superuser,
+                    None,
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &superuser,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    None,
+                );
+                let projected = project_lease(
+                    &store,
+                    ExecutionLease {
+                        execution_id: "V00000000000000000002".to_owned(),
+                        workspace_id: WORKSPACE_RED_ID.to_owned(),
+                        root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
+                        actor_principal_id: superuser.principal_id.clone(),
+                        actor_session_id: superuser.session_id.clone(),
+                        admitted_role_key: context.role_key().to_owned(),
+                        admitted_policy_generation: 1,
+                        projected_policy_generation: 1,
+                        continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
+                        continuation_action: context.continuation_action(),
+                        continuation_provider: context
+                            .continuation_provider()
+                            .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
+                        continuation_cli_runtime: None,
+                        granted_skill_ids: Vec::new(),
+                        granted_mcp_server_ids: Vec::new(),
+                        admitted_permission_cap: context.permission_profile_cap().clone(),
+                        immutable_actions: context
+                            .granted_action_names()
+                            .iter()
+                            .filter_map(|name| ResourceAction::from_safe_name(name))
+                            .collect(),
+                        projected_actions: BTreeSet::new(),
+                        collaborator_ids: BTreeSet::new(),
+                        action_collaborators: BTreeMap::new(),
+                        state: ExecutionLeaseState::Fenced,
+                    },
+                )
+                .await
+                .expect("project lease");
+                let observer = PrincipalId::new(MEMBER_B_ID).unwrap();
+                assert!(
+                    projected
+                        .action_collaborators
+                        .get(&ResourceAction::AgentExecutionObserve)
+                        .is_some_and(|ids| ids.contains(&observer))
+                );
+                assert!(
+                    projected
+                        .action_collaborators
+                        .get(&ResourceAction::ProviderUse)
+                        .is_none_or(|ids| !ids.contains(&observer))
+                );
+                assert!(
+                    projected
+                        .action_collaborators
+                        .get(&ResourceAction::AgentExecutionCancel)
+                        .is_none_or(|ids| !ids.contains(&observer))
+                );
+            }
+            .await;
+            Ok(())
+        })
         .await
-        .expect("project lease");
-        let observer = PrincipalId::new(MEMBER_B_ID).unwrap();
-        assert!(
-            projected
-                .action_collaborators
-                .get(&ResourceAction::AgentExecutionObserve)
-                .is_some_and(|ids| ids.contains(&observer))
-        );
-        assert!(
-            projected
-                .action_collaborators
-                .get(&ResourceAction::ProviderUse)
-                .is_none_or(|ids| !ids.contains(&observer))
-        );
-        assert!(
-            projected
-                .action_collaborators
-                .get(&ResourceAction::AgentExecutionCancel)
-                .is_none_or(|ids| !ids.contains(&observer))
-        );
+        .unwrap();
     }
 
     #[tokio::test]
     async fn approval_role_can_respond_without_start_or_backend_authority() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        add_member_b_to_private_root(&harness).await;
-        harness
-            .database
-            .execute_unprepared(&format!(
-                "UPDATE gateway_principal SET role_key='synthetic_approver' \
-                 WHERE id='{MEMBER_B_ID}'"
-            ))
-            .await
-            .expect("assign test approver role");
-        let store = CrudStore::new(harness.database.clone());
-        let superuser = principal(
-            crate::auth::test_support::TEST_SUPERUSER_ID,
-            PrincipalKind::Superuser,
-            None,
-            "D00000000000000000001",
-            "S00000000000000000001",
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &superuser,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            None,
-        );
-        let projected = project_lease(
-            &store,
-            ExecutionLease {
-                execution_id: "V00000000000000000003".to_owned(),
-                workspace_id: WORKSPACE_RED_ID.to_owned(),
-                root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
-                actor_principal_id: superuser.principal_id.clone(),
-                actor_session_id: superuser.session_id.clone(),
-                admitted_role_key: context.role_key().to_owned(),
-                admitted_policy_generation: 1,
-                projected_policy_generation: 1,
-                continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
-                continuation_action: context.continuation_action(),
-                continuation_provider: context
-                    .continuation_provider()
-                    .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
-                continuation_cli_runtime: None,
-                granted_skill_ids: Vec::new(),
-                granted_mcp_server_ids: Vec::new(),
-                admitted_permission_cap: context.permission_profile_cap().clone(),
-                immutable_actions: context
-                    .granted_action_names()
-                    .iter()
-                    .filter_map(|name| ResourceAction::from_safe_name(name))
-                    .collect(),
-                projected_actions: BTreeSet::new(),
-                collaborator_ids: BTreeSet::new(),
-                action_collaborators: BTreeMap::new(),
-                state: ExecutionLeaseState::Fenced,
-            },
-        )
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                add_member_b_to_private_root(&harness).await;
+                harness
+                    .database
+                    .execute_unprepared(&format!(
+                        "UPDATE gateway_principal SET role_key='synthetic_approver' \
+                         WHERE id='{MEMBER_B_ID}'"
+                    ))
+                    .await
+                    .expect("assign test approver role");
+                let store = CrudStore::new(harness.database.clone());
+                let superuser = principal(
+                    crate::auth::test_support::TEST_SUPERUSER_ID,
+                    PrincipalKind::Superuser,
+                    None,
+                    "D00000000000000000001",
+                    "S00000000000000000001",
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &superuser,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                    None,
+                );
+                let projected = project_lease(
+                    &store,
+                    ExecutionLease {
+                        execution_id: "V00000000000000000003".to_owned(),
+                        workspace_id: WORKSPACE_RED_ID.to_owned(),
+                        root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
+                        actor_principal_id: superuser.principal_id.clone(),
+                        actor_session_id: superuser.session_id.clone(),
+                        admitted_role_key: context.role_key().to_owned(),
+                        admitted_policy_generation: 1,
+                        projected_policy_generation: 1,
+                        continuity_policy: ExecutionContinuityPolicy::StopOnAuthorityLoss,
+                        continuation_action: context.continuation_action(),
+                        continuation_provider: context
+                            .continuation_provider()
+                            .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
+                        continuation_cli_runtime: None,
+                        granted_skill_ids: Vec::new(),
+                        granted_mcp_server_ids: Vec::new(),
+                        admitted_permission_cap: context.permission_profile_cap().clone(),
+                        immutable_actions: context
+                            .granted_action_names()
+                            .iter()
+                            .filter_map(|name| ResourceAction::from_safe_name(name))
+                            .collect(),
+                        projected_actions: BTreeSet::new(),
+                        collaborator_ids: BTreeSet::new(),
+                        action_collaborators: BTreeMap::new(),
+                        state: ExecutionLeaseState::Fenced,
+                    },
+                )
+                .await
+                .expect("project lease");
+                let approver = PrincipalId::new(MEMBER_B_ID).unwrap();
+                assert!(
+                    projected
+                        .action_collaborators
+                        .get(&ResourceAction::AgentRequestRespond)
+                        .is_some_and(|ids| ids.contains(&approver))
+                );
+                for action in [
+                    ResourceAction::AgentTurnStart,
+                    ResourceAction::ProviderUse,
+                    ResourceAction::AgentExecutionCancel,
+                ] {
+                    assert!(
+                        projected
+                            .action_collaborators
+                            .get(&action)
+                            .is_none_or(|ids| !ids.contains(&approver))
+                    );
+                }
+            }
+            .await;
+            Ok(())
+        })
         .await
-        .expect("project lease");
-        let approver = PrincipalId::new(MEMBER_B_ID).unwrap();
-        assert!(
-            projected
-                .action_collaborators
-                .get(&ResourceAction::AgentRequestRespond)
-                .is_some_and(|ids| ids.contains(&approver))
-        );
-        for action in [
-            ResourceAction::AgentTurnStart,
-            ResourceAction::ProviderUse,
-            ResourceAction::AgentExecutionCancel,
-        ] {
-            assert!(
-                projected
-                    .action_collaborators
-                    .get(&action)
-                    .is_none_or(|ids| !ids.contains(&approver))
-            );
-        }
+        .unwrap();
     }
 
     #[tokio::test]
     async fn revoked_initiator_session_does_not_orphan_shared_task_authority() {
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("isolated authorization fixture");
-        add_member_b_to_private_root(&harness).await;
-        let store = CrudStore::new(harness.database.clone());
-        let member_a = principal(
-            MEMBER_A_ID,
-            PrincipalKind::User,
-            Some(RoleKey::member()),
-            "D0000000000000000000A",
-            "S0000000000000000000A",
-        );
-        let context = ExecutionAuthorizationContext::for_test(
-            &member_a,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
-                pioneer_protocol::TurnPermissionMode::Supervised,
-                pioneer_protocol::TurnPermissionProfileSource::Composer,
-            ),
-            None,
-        );
-        let initiating_session =
-            pioneer_crud::load_session(&harness.database, &member_a.session_id)
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("isolated authorization fixture");
+                add_member_b_to_private_root(&harness).await;
+                let store = CrudStore::new(harness.database.clone());
+                let member_a = principal(
+                    MEMBER_A_ID,
+                    PrincipalKind::User,
+                    Some(RoleKey::member()),
+                    "D0000000000000000000A",
+                    "S0000000000000000000A",
+                );
+                let context = ExecutionAuthorizationContext::for_test(
+                    &member_a,
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    &pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                        pioneer_protocol::TurnPermissionMode::Supervised,
+                        pioneer_protocol::TurnPermissionProfileSource::Composer,
+                    ),
+                    None,
+                );
+                let initiating_session =
+                    pioneer_crud::load_session(&harness.database, &member_a.session_id)
+                        .await
+                        .expect("load initiating session")
+                        .expect("fixture initiating session");
+                pioneer_crud::mark_session_revoked(
+                    &harness.database,
+                    initiating_session,
+                    pioneer_protocol::AuthSessionRevokeReason::SelfRevoke,
+                    chrono::Utc::now().into(),
+                )
                 .await
-                .expect("load initiating session")
-                .expect("fixture initiating session");
-        pioneer_crud::mark_session_revoked(
-            &harness.database,
-            initiating_session,
-            pioneer_protocol::AuthSessionRevokeReason::SelfRevoke,
-            chrono::Utc::now().into(),
-        )
-        .await
-        .expect("revoke initiating bearer");
-        harness
-            .database
-            .execute_unprepared(&format!(
-                "DELETE FROM thread_membership \
-                   WHERE thread_id='{THREAD_RED_PRIVATE_A_ID}' AND principal_id='{MEMBER_A_ID}'",
-            ))
-            .await
-            .expect("remove initiating collaboration access");
+                .expect("revoke initiating bearer");
+                harness
+                    .database
+                    .execute_unprepared(&format!(
+                        "DELETE FROM thread_membership \
+                           WHERE thread_id='{THREAD_RED_PRIVATE_A_ID}' AND principal_id='{MEMBER_A_ID}'",
+                    ))
+                    .await
+                    .expect("remove initiating collaboration access");
 
-        let revalidated = ExecutionLeaseRegistry::default()
-            .revalidate_context(&store, &context, ResourceAction::TaskCreate, 2)
-            .await
-            .expect("remaining thread Member keeps shared Task authority");
-        assert_eq!(revalidated.principal().principal_id.as_str(), MEMBER_B_ID);
+                let revalidated = ExecutionLeaseRegistry::default()
+                    .revalidate_context(&store, &context, ResourceAction::TaskCreate, 2)
+                    .await
+                    .expect("remaining thread Member keeps shared Task authority");
+                assert_eq!(revalidated.principal().principal_id.as_str(), MEMBER_B_ID);
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
     #[tokio::test]
     async fn optional_creation_admission_uses_workspace_and_cannot_borrow_collaborator_rights() {
-        use crate::authorization::{
-            ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
-        };
-        let harness = IsolatedEpic4Harness::new().await.unwrap();
-        let store = CrudStore::new(harness.database.clone());
-        let mut member = principal(
-            MEMBER_A_ID,
-            PrincipalKind::User,
-            Some(RoleKey::member()),
-            "D0000000000000000000A",
-            "S0000000000000000000A",
-        );
-        let params: pioneer_protocol::TurnStartParams = serde_json::from_value(serde_json::json!({
-            "thread_id":THREAD_RED_PRIVATE_A_ID, "turn_id":"V00000000000000000008", "input":[],
-        }))
-        .unwrap();
-        let mut request = ExecutionAdmissionRequest::for_turn(
-            ExecutionAdmissionEntryPoint::InteractiveTurn,
-            ResourceAction::AgentTurnStart,
-            Vec::new(),
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            "openai",
-            "model",
-            &params,
-            &[],
-            Some("a".repeat(64)),
-        )
-        .unwrap();
-        let admission = ExecutionAdmissionService::new(store.clone());
-        let context = admission
-            .admit_context(&member, 1, &request, None)
-            .await
-            .unwrap();
-        let registry = ExecutionLeaseRegistry::default();
-        for action in [
-            ResourceAction::ThreadCreatePrivate,
-            ResourceAction::ThreadCreateWorkspace,
-        ] {
-            assert!(context.grants_action(action));
-            registry
-                .revalidate_context(&store, &context, action, 1)
-                .await
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                use crate::authorization::{
+                    ExecutionAdmissionEntryPoint, ExecutionAdmissionRequest, ExecutionAdmissionService,
+                };
+                let harness = IsolatedEpic4Harness::new(test_database).await.unwrap();
+                let store = CrudStore::new(harness.database.clone());
+                let mut member = principal(
+                    MEMBER_A_ID,
+                    PrincipalKind::User,
+                    Some(RoleKey::member()),
+                    "D0000000000000000000A",
+                    "S0000000000000000000A",
+                );
+                let params: pioneer_protocol::TurnStartParams = serde_json::from_value(serde_json::json!({
+                    "thread_id":THREAD_RED_PRIVATE_A_ID, "turn_id":"V00000000000000000008", "input":[],
+                }))
                 .unwrap();
-        }
-        request.workspace_id = crate::tests::authorization::WORKSPACE_GREEN_ID.into();
-        assert!(admission.admit(&member, 1, &request).await.is_err());
-        request.workspace_id = WORKSPACE_RED_ID.into();
-        // A role with ordinary execution authority but no create action still
-        // admits a conversation. No extra create grant is required to start it.
-        member.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
-        harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='synthetic_executor' WHERE id='{MEMBER_A_ID}'")).await.unwrap();
-        request.provider = "allowed-provider".into();
-        request.model = "allowed-model".into();
-        let restricted = admission
-            .admit_context(&member, 1, &request, None)
-            .await
-            .unwrap();
-        assert!(restricted.grants_action(ResourceAction::AgentTurnStart));
-        assert!(!restricted.grants_action(ResourceAction::ThreadCreatePrivate));
-        assert!(!restricted.grants_action(ResourceAction::ThreadCreateWorkspace));
-        // Restore Member, then revoke membership. A Superuser in the same
-        // gateway must not lend creation authority to this admitted initiator.
-        harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='member' WHERE id='{MEMBER_A_ID}'; DELETE FROM workspace_membership WHERE principal_id='{MEMBER_A_ID}' AND workspace_id='{WORKSPACE_RED_ID}'")).await.unwrap();
-        for action in [
-            ResourceAction::ThreadCreatePrivate,
-            ResourceAction::ThreadCreateWorkspace,
-        ] {
-            assert!(
-                registry
-                    .revalidate_context(&store, &context, action, 1)
+                let mut request = ExecutionAdmissionRequest::for_turn(
+                    ExecutionAdmissionEntryPoint::InteractiveTurn,
+                    ResourceAction::AgentTurnStart,
+                    Vec::new(),
+                    WORKSPACE_RED_ID,
+                    THREAD_RED_PRIVATE_A_ID,
+                    "openai",
+                    "model",
+                    &params,
+                    &[],
+                    Some("a".repeat(64)),
+                )
+                .unwrap();
+                let admission = ExecutionAdmissionService::new(store.clone());
+                let context = admission
+                    .admit_context(&member, 1, &request, None)
                     .await
-                    .is_err()
-            );
-            assert!(
-                context.grants_action(action),
-                "revocation must not rewrite immutable grants"
-            );
-            assert!(
-                !restricted.grants_action(action),
-                "current wider rights cannot expand an older grant"
-            );
-        }
+                    .unwrap();
+                let registry = ExecutionLeaseRegistry::default();
+                for action in [
+                    ResourceAction::ThreadCreatePrivate,
+                    ResourceAction::ThreadCreateWorkspace,
+                ] {
+                    assert!(context.grants_action(action));
+                    registry
+                        .revalidate_context(&store, &context, action, 1)
+                        .await
+                        .unwrap();
+                }
+                request.workspace_id = crate::tests::authorization::WORKSPACE_GREEN_ID.into();
+                assert!(admission.admit(&member, 1, &request).await.is_err());
+                request.workspace_id = WORKSPACE_RED_ID.into();
+                // A role with ordinary execution authority but no create action still
+                // admits a conversation. No extra create grant is required to start it.
+                member.role_key = Some(RoleKey::new("synthetic_executor").unwrap());
+                harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='synthetic_executor' WHERE id='{MEMBER_A_ID}'")).await.unwrap();
+                request.provider = "allowed-provider".into();
+                request.model = "allowed-model".into();
+                let restricted = admission
+                    .admit_context(&member, 1, &request, None)
+                    .await
+                    .unwrap();
+                assert!(restricted.grants_action(ResourceAction::AgentTurnStart));
+                assert!(!restricted.grants_action(ResourceAction::ThreadCreatePrivate));
+                assert!(!restricted.grants_action(ResourceAction::ThreadCreateWorkspace));
+                // Restore Member, then revoke membership. A Superuser in the same
+                // gateway must not lend creation authority to this admitted initiator.
+                harness.database.execute_unprepared(&format!("UPDATE gateway_principal SET role_key='member' WHERE id='{MEMBER_A_ID}'; DELETE FROM workspace_membership WHERE principal_id='{MEMBER_A_ID}' AND workspace_id='{WORKSPACE_RED_ID}'")).await.unwrap();
+                for action in [
+                    ResourceAction::ThreadCreatePrivate,
+                    ResourceAction::ThreadCreateWorkspace,
+                ] {
+                    assert!(
+                        registry
+                            .revalidate_context(&store, &context, action, 1)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        context.grants_action(action),
+                        "revocation must not rewrite immutable grants"
+                    );
+                    assert!(
+                        !restricted.grants_action(action),
+                        "current wider rights cannot expand an older grant"
+                    );
+                }
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
 }

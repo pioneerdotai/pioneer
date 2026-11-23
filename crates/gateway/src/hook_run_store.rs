@@ -20,15 +20,15 @@ use pioneer_hooks::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::sync::Arc;
 
-/// Called only after CRUD has returned and released the serialized writer.
+/// Called after CRUD has returned and released its connection.
 /// RuntimeErr does not expose its SQLx error as a standard source, so inspect
 /// that typed wrapper explicitly while walking anyhow's context/source chain.
 fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
     let diagnostic = error
         .chain()
         .find_map(|cause| {
-            if let Some(sqlite) = cause.downcast_ref::<sea_orm::SqlxSqliteError>() {
-                return sqlite_diagnostic(sqlite);
+            if let Some(postgres) = cause.downcast_ref::<sea_orm::SqlxPostgresError>() {
+                return Some(postgres_diagnostic(postgres));
             }
             let sqlx = if let Some(sqlx) = cause.downcast_ref::<sea_orm::SqlxError>() {
                 Some(sqlx)
@@ -42,32 +42,28 @@ fn append_audit_error(error: anyhow::Error) -> HookRunStoreError {
             let sea_orm::SqlxError::Database(database) = sqlx? else {
                 return None;
             };
-            sqlite_diagnostic(database.try_downcast_ref::<sea_orm::SqlxSqliteError>()?)
+            database
+                .try_downcast_ref::<sea_orm::SqlxPostgresError>()
+                .map(postgres_diagnostic)
         })
         .unwrap_or_default();
     HookRunStoreError::internal_with_diagnostic("failed to append hook audit events", diagnostic)
 }
 
-fn sqlite_diagnostic(sqlite: &sea_orm::SqlxSqliteError) -> Option<HookRunStoreDiagnostic> {
-    use sea_orm::sqlx::error::DatabaseError;
-    // code() is SQLx's typed numeric SQLite code API, not Display/error text.
-    let extended = sqlite.code()?.parse::<i32>().ok()?;
-    Some(sqlite_code_diagnostic(extended))
+fn postgres_diagnostic(error: &sea_orm::SqlxPostgresError) -> HookRunStoreDiagnostic {
+    HookRunStoreDiagnostic {
+        cause_class: postgres_cause(error.code().as_bytes()),
+    }
 }
 
-fn sqlite_code_diagnostic(extended: i32) -> HookRunStoreDiagnostic {
-    let primary = extended & 0xff;
-    let cause_class = match primary {
-        5 => HookRunStoreCauseClass::SqliteBusy,
-        6 => HookRunStoreCauseClass::SqliteLocked,
-        14 => HookRunStoreCauseClass::SqliteCantOpen,
-        19 => HookRunStoreCauseClass::SqliteConstraint,
-        _ => HookRunStoreCauseClass::SqliteOther,
-    };
-    HookRunStoreDiagnostic {
-        cause_class,
-        sqlite_primary_code: Some(primary),
-        sqlite_extended_code: Some(extended),
+fn postgres_cause(sqlstate: &[u8]) -> HookRunStoreCauseClass {
+    match sqlstate {
+        [b'2', b'3', ..] => HookRunStoreCauseClass::PostgresConstraint,
+        [b'0', b'8', ..] | b"57P01" | b"57P02" | b"57P03" => {
+            HookRunStoreCauseClass::PostgresConnection
+        }
+        b"40001" | b"40P01" | b"55P03" => HookRunStoreCauseClass::PostgresContention,
+        _ => HookRunStoreCauseClass::PostgresOther,
     }
 }
 
@@ -493,7 +489,6 @@ mod diagnostic_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_entity::{hook_audit_event, hook_run, hook_run_attempt};
     use pioneer_hooks::{
         AuditContribution, HookAuditEventKind, HookAwaitPolicy, HookCapabilities, HookCapability,
@@ -506,33 +501,27 @@ mod tests {
         HookRuntimeOptions, HookSectionId, HookSubscription, HookSubscriptionId,
         HookSubscriptionRegistry, HookValue, PromptSectionContribution,
     };
-    use sea_orm::{Database, DatabaseConnection, EntityTrait};
+    use sea_orm::{DatabaseConnection, EntityTrait};
     use std::time::Duration;
 
     #[test]
-    fn sqlite_primary_and_extended_codes_have_distinct_safe_classes() {
-        // SQLite native result codes, including extended variants. This tests
-        // the numeric mapping; typed-source extraction is tested below.
-        for (code, primary, class) in [
-            (5, 5, HookRunStoreCauseClass::SqliteBusy),
-            (517, 5, HookRunStoreCauseClass::SqliteBusy),
-            (6, 6, HookRunStoreCauseClass::SqliteLocked),
-            (262, 6, HookRunStoreCauseClass::SqliteLocked),
-            (14, 14, HookRunStoreCauseClass::SqliteCantOpen),
-            (526, 14, HookRunStoreCauseClass::SqliteCantOpen),
-            (19, 19, HookRunStoreCauseClass::SqliteConstraint),
-            (1811, 19, HookRunStoreCauseClass::SqliteConstraint),
-            (1, 1, HookRunStoreCauseClass::SqliteOther),
+    fn postgres_sqlstates_have_distinct_safe_classes() {
+        for (sqlstate, expected) in [
+            (b"23505", HookRunStoreCauseClass::PostgresConstraint),
+            (b"23514", HookRunStoreCauseClass::PostgresConstraint),
+            (b"08006", HookRunStoreCauseClass::PostgresConnection),
+            (b"57P01", HookRunStoreCauseClass::PostgresConnection),
+            (b"40001", HookRunStoreCauseClass::PostgresContention),
+            (b"40P01", HookRunStoreCauseClass::PostgresContention),
+            (b"55P03", HookRunStoreCauseClass::PostgresContention),
+            (b"42601", HookRunStoreCauseClass::PostgresOther),
         ] {
-            let diagnostic = sqlite_code_diagnostic(code);
-            assert_eq!(diagnostic.cause_class, class);
-            assert_eq!(diagnostic.sqlite_primary_code, Some(primary));
-            assert_eq!(diagnostic.sqlite_extended_code, Some(code));
+            assert_eq!(postgres_cause(sqlstate), expected);
         }
     }
 
     #[test]
-    fn untyped_sqlite_looking_errors_remain_unclassified_and_discard_canaries() {
+    fn untyped_database_looking_errors_remain_unclassified_and_discard_canaries() {
         use anyhow::Context;
         let canary = "SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY";
         for error in [
@@ -541,7 +530,7 @@ mod tests {
                 "CANTOPEN (code: 14) {canary}"
             ))),
             anyhow::Error::new(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::Internal(
-                format!("SQLite constraint (code: 19) {canary}"),
+                format!("PostgreSQL constraint (SQLSTATE 23505) {canary}"),
             ))),
             Err::<(), _>(anyhow::anyhow!("{canary}"))
                 .context("database locked")
@@ -555,79 +544,85 @@ mod tests {
         }
     }
 
-    async fn audit_failure_fixture() -> (Arc<CrudStore>, CrudHookRunStore) {
-        use sea_orm::{ConnectionTrait, DbBackend, Statement};
-        // Disable SQLx query logging in this isolated fixture so telemetry
-        // assertions inspect the adapter/runtime event without SQL breadcrumbs.
-        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
-        options.sqlx_logging(false);
-        let connection = Database::connect(options)
-            .await
-            .expect("fixture connection");
-        Migrator::up(&connection, None)
-            .await
-            .expect("fixture migrations");
-        let crud = Arc::new(CrudStore::new(connection));
+    async fn audit_failure_fixture(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> (Arc<CrudStore>, CrudHookRunStore) {
+        use sea_orm::ConnectionTrait;
+        let crud = Arc::new(CrudStore::new(db.connection().clone()));
         let store = CrudHookRunStore::new(crud.clone());
-        // A deterministic, typed SQLITE_CONSTRAINT_TRIGGER error. The raw
-        // SQLite message contains secrets and must be discarded by the adapter.
-        crud.database_connection().execute_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "CREATE TRIGGER audit_diagnostic_failure BEFORE INSERT ON hook_audit_event BEGIN SELECT RAISE(ABORT, 'SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY'); END;".to_owned(),
-        )).await.expect("install controlled failure trigger");
+        crud.database_connection()
+            .execute_unprepared(
+                r#"
+            CREATE FUNCTION audit_diagnostic_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION
+                    'SELECT SQL_CANARY FROM /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY'
+                    USING ERRCODE = '23514';
+                END;
+            $$;
+            CREATE TRIGGER audit_diagnostic_failure BEFORE INSERT ON hook_audit_event
+            FOR EACH ROW EXECUTE FUNCTION audit_diagnostic_failure()
+        "#,
+            )
+            .await
+            .expect("install controlled failure trigger");
         (crud, store)
     }
 
     #[tokio::test]
-    async fn typed_sqlite_cause_survives_anyhow_context_without_raw_error() {
-        use anyhow::Context;
-        use sea_orm::{ConnectionTrait, DbBackend, Statement};
-        let (_, crud, _) = migrated_store().await;
-        let db = crud.database_connection();
-        db.execute_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "CREATE TABLE diagnostic_constraint (value INTEGER CHECK (value > 0))".to_owned(),
-        ))
-        .await
-        .expect("create fixture table");
-        let raw = db
-            .execute_raw(Statement::from_string(
-                DbBackend::Sqlite,
-                "INSERT INTO diagnostic_constraint (value) VALUES (-1)".to_owned(),
+    async fn typed_postgres_cause_survives_anyhow_context_without_raw_error() {
+        pioneer_postgres_test::with_database(async |fixture| {
+            use anyhow::Context;
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let (_, crud, _) = migrated_store(fixture).await;
+            let db = crud.database_connection();
+            db.execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "CREATE TABLE diagnostic_constraint (value INTEGER CHECK (value > 0))".to_owned(),
             ))
             .await
-            .expect_err("real typed SQLite constraint");
-        for error in [
-            anyhow::Error::new(raw.clone()),
-            Err::<(), _>(raw)
-                .context("SELECT SQL_CANARY /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY")
-                .unwrap_err(),
-        ] {
-            let safe = append_audit_error(error);
-            assert_eq!(
-                safe.diagnostic(),
-                HookRunStoreDiagnostic {
-                    cause_class: HookRunStoreCauseClass::SqliteConstraint,
-                    sqlite_primary_code: Some(19),
-                    sqlite_extended_code: Some(275),
-                }
-            );
-            let encoded = format!("{safe:?} {safe}");
-            for secret in [
-                "diagnostic_constraint",
-                "SELECT SQL_CANARY",
-                "PATH_CANARY",
-                "ID_CANARY",
-                "AUDIT_PAYLOAD_CANARY",
+            .expect("create fixture table");
+            let raw = db
+                .execute_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "INSERT INTO diagnostic_constraint (value) VALUES (-1)".to_owned(),
+                ))
+                .await
+                .expect_err("real typed PostgreSQL constraint");
+            for error in [
+                anyhow::Error::new(raw.clone()),
+                Err::<(), _>(raw)
+                    .context(
+                        "SELECT SQL_CANARY /private/PATH_CANARY ID_CANARY AUDIT_PAYLOAD_CANARY",
+                    )
+                    .unwrap_err(),
             ] {
-                assert!(!encoded.contains(secret));
+                let safe = append_audit_error(error);
+                assert_eq!(
+                    safe.diagnostic(),
+                    HookRunStoreDiagnostic {
+                        cause_class: HookRunStoreCauseClass::PostgresConstraint,
+                    }
+                );
+                let encoded = format!("{safe:?} {safe}");
+                for secret in [
+                    "diagnostic_constraint",
+                    "SELECT SQL_CANARY",
+                    "PATH_CANARY",
+                    "ID_CANARY",
+                    "AUDIT_PAYLOAD_CANARY",
+                ] {
+                    assert!(!encoded.contains(secret));
+                }
+                assert!(std::error::Error::source(&safe).is_none());
             }
-            assert!(std::error::Error::source(&safe).is_none());
-        }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
-    async fn run_audit_failure_fixture(durable: bool) {
-        let (crud, store) = audit_failure_fixture().await;
+    async fn run_audit_failure_fixture(db: &pioneer_postgres_test::TestDatabase, durable: bool) {
+        let (crud, store) = audit_failure_fixture(db).await;
         let handlers = Arc::new(HookRegistry::new());
         let subscriptions = Arc::new(HookSubscriptionRegistry::new());
         let hook_id = HookId::new("ID_CANARY").expect("hook id");
@@ -700,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_adapter_reports_safe_sqlite_diagnostics_and_preserves_execution_policy() {
+    fn audit_adapter_reports_safe_postgres_diagnostics_and_preserves_execution_policy() {
         use tracing_subscriber::prelude::*;
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -731,7 +726,12 @@ mod tests {
             let events = sentry::test::with_captured_events(|| {
                 tracing::subscriber::with_default(subscriber, || {
                     executor.block_on(async {
-                        run_audit_failure_fixture(durable).await;
+                        pioneer_postgres_test::with_database(async |db| {
+                            run_audit_failure_fixture(db, durable).await;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
                     })
                 });
             });
@@ -750,9 +750,7 @@ mod tests {
             };
             assert_eq!(fields["operation"], "append_audit_events");
             assert_eq!(fields["phase"], "turn.pre_prompt_compile");
-            assert_eq!(fields["cause_class"], "sqlite_constraint");
-            assert_eq!(fields["sqlite_primary_code"], 19);
-            assert_eq!(fields["sqlite_extended_code"], 1811);
+            assert_eq!(fields["cause_class"], "postgres_constraint");
             assert!(event.exception.values.is_empty());
             let encoded =
                 serde_json::to_string(&events).expect("serialize entire captured telemetry");
@@ -930,13 +928,10 @@ mod tests {
         }
     }
 
-    async fn migrated_store() -> (DatabaseConnection, Arc<CrudStore>, CrudHookRunStore) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect to sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
+    async fn migrated_store(
+        db: &pioneer_postgres_test::TestDatabase,
+    ) -> (DatabaseConnection, Arc<CrudStore>, CrudHookRunStore) {
+        let connection = db.connection().clone();
         let crud_store = Arc::new(CrudStore::new(connection.clone()));
         let hook_store = CrudHookRunStore::new(crud_store.clone());
         (connection, crud_store, hook_store)
@@ -1026,493 +1021,551 @@ mod tests {
 
     #[tokio::test]
     async fn crud_hook_run_store_persists_success() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let run = hook_store
-            .create_or_load_run(new_store_run("gateway:hook:success"))
-            .await
-            .expect("run should create");
-        let running = hook_store
-            .mark_run_running(&run.id, 1_700_000_000_010)
-            .await
-            .expect("run should mark running");
-        assert_eq!(running.status, HookRunStatus::Running);
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let run = hook_store
+                .create_or_load_run(new_store_run("gateway:hook:success"))
+                .await
+                .expect("run should create");
+            let running = hook_store
+                .mark_run_running(&run.id, 1_700_000_000_010)
+                .await
+                .expect("run should mark running");
+            assert_eq!(running.status, HookRunStatus::Running);
 
-        let attempt = hook_store
-            .append_attempt(NewHookRunAttemptStoreRecord {
-                hook_run_id: run.id.clone(),
-                attempt_number: 1,
-                status: HookRunStatus::Running,
-                contribution_hashes: Vec::new(),
-                diagnostic_previews: Vec::new(),
-                error: None,
-                started_at_unix_ms: Some(1_700_000_000_010),
-                completed_at_unix_ms: None,
-                duration_ms: None,
-            })
-            .await
-            .expect("attempt should append");
-        let completed_attempt = hook_store
-            .complete_attempt(
-                &attempt.id,
-                HookRunAttemptStoreCompletion {
-                    status: HookRunStatus::Succeeded,
+            let attempt = hook_store
+                .append_attempt(NewHookRunAttemptStoreRecord {
+                    hook_run_id: run.id.clone(),
+                    attempt_number: 1,
+                    status: HookRunStatus::Running,
                     contribution_hashes: Vec::new(),
                     diagnostic_previews: Vec::new(),
                     error: None,
-                    completed_at_unix_ms: 1_700_000_000_050,
-                    duration_ms: Some(40),
-                },
-            )
-            .await
-            .expect("attempt should complete");
-        assert_eq!(completed_attempt.status, HookRunStatus::Succeeded);
+                    started_at_unix_ms: Some(1_700_000_000_010),
+                    completed_at_unix_ms: None,
+                    duration_ms: None,
+                })
+                .await
+                .expect("attempt should append");
+            let completed_attempt = hook_store
+                .complete_attempt(
+                    &attempt.id,
+                    HookRunAttemptStoreCompletion {
+                        status: HookRunStatus::Succeeded,
+                        contribution_hashes: Vec::new(),
+                        diagnostic_previews: Vec::new(),
+                        error: None,
+                        completed_at_unix_ms: 1_700_000_000_050,
+                        duration_ms: Some(40),
+                    },
+                )
+                .await
+                .expect("attempt should complete");
+            assert_eq!(completed_attempt.status, HookRunStatus::Succeeded);
 
-        let completed = hook_store
-            .complete_run(
-                &run.id,
-                HookRunStoreCompletion {
-                    status: HookRunStatus::Succeeded,
-                    contribution_hashes: Vec::new(),
-                    diagnostic_previews: Vec::new(),
-                    error: None,
-                    completed_at_unix_ms: 1_700_000_000_050,
-                },
-            )
-            .await
-            .expect("run should complete");
-        assert_eq!(completed.status, HookRunStatus::Succeeded);
-        assert_eq!(completed.attempt_count, 1);
+            let completed = hook_store
+                .complete_run(
+                    &run.id,
+                    HookRunStoreCompletion {
+                        status: HookRunStatus::Succeeded,
+                        contribution_hashes: Vec::new(),
+                        diagnostic_previews: Vec::new(),
+                        error: None,
+                        completed_at_unix_ms: 1_700_000_000_050,
+                    },
+                )
+                .await
+                .expect("run should complete");
+            assert_eq!(completed.status, HookRunStatus::Succeeded);
+            assert_eq!(completed.attempt_count, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_maps_duplicate_create_to_existing_run() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let first = hook_store
-            .create_or_load_run(new_store_run("gateway:hook:duplicate"))
-            .await
-            .expect("first create should succeed");
-        let second = hook_store
-            .create_or_load_run(new_store_run("gateway:hook:duplicate"))
-            .await
-            .expect("second create should load");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let first = hook_store
+                .create_or_load_run(new_store_run("gateway:hook:duplicate"))
+                .await
+                .expect("first create should succeed");
+            let second = hook_store
+                .create_or_load_run(new_store_run("gateway:hook:duplicate"))
+                .await
+                .expect("second create should load");
 
-        assert_eq!(first.id, second.id);
+            assert_eq!(first.id, second.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn phase_21_crud_hook_run_store_lists_due_recoverable_queued_runs() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let mut run = new_store_run("gateway:hook:recoverable:queued");
-        run.phase = HookPhase::TurnPostTurn;
-        run.queued_at_unix_ms = Some(1_000);
-        run.resume_state = Some(phase_21_resume_state());
-        let created = hook_store
-            .create_or_load_run(run)
-            .await
-            .expect("run should create");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let mut run = new_store_run("gateway:hook:recoverable:queued");
+            run.phase = HookPhase::TurnPostTurn;
+            run.queued_at_unix_ms = Some(1_000);
+            run.resume_state = Some(phase_21_resume_state());
+            let created = hook_store
+                .create_or_load_run(run)
+                .await
+                .expect("run should create");
 
-        let records = hook_store
-            .list_recoverable_runs(HookRecoveryScan {
-                now_unix_ms: 1_001,
-                batch_size: 10,
-                stale_running_after_ms: 1_000,
-                phases: Some(vec![HookPhase::TurnPostTurn]),
-            })
-            .await
-            .expect("recoverable runs should list");
+            let records = hook_store
+                .list_recoverable_runs(HookRecoveryScan {
+                    now_unix_ms: 1_001,
+                    batch_size: 10,
+                    stale_running_after_ms: 1_000,
+                    phases: Some(vec![HookPhase::TurnPostTurn]),
+                })
+                .await
+                .expect("recoverable runs should list");
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].run.id, created.id);
-        assert!(records[0].resume_state.is_some());
-        assert!(records[0].attempts.is_empty());
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].run.id, created.id);
+            assert!(records[0].resume_state.is_some());
+            assert!(records[0].attempts.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn phase_21_crud_hook_run_store_does_not_list_future_retry() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let mut run = new_store_run("gateway:hook:recoverable:future");
-        run.phase = HookPhase::TurnPostTurn;
-        run.queued_at_unix_ms = Some(5_000);
-        run.resume_state = Some(phase_21_resume_state());
-        hook_store
-            .create_or_load_run(run)
-            .await
-            .expect("run should create");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let mut run = new_store_run("gateway:hook:recoverable:future");
+            run.phase = HookPhase::TurnPostTurn;
+            run.queued_at_unix_ms = Some(5_000);
+            run.resume_state = Some(phase_21_resume_state());
+            hook_store
+                .create_or_load_run(run)
+                .await
+                .expect("run should create");
 
-        let records = hook_store
-            .list_recoverable_runs(HookRecoveryScan {
-                now_unix_ms: 4_999,
-                batch_size: 10,
-                stale_running_after_ms: 1_000,
-                phases: Some(vec![HookPhase::TurnPostTurn]),
-            })
-            .await
-            .expect("recoverable runs should list");
+            let records = hook_store
+                .list_recoverable_runs(HookRecoveryScan {
+                    now_unix_ms: 4_999,
+                    batch_size: 10,
+                    stale_running_after_ms: 1_000,
+                    phases: Some(vec![HookPhase::TurnPostTurn]),
+                })
+                .await
+                .expect("recoverable runs should list");
 
-        assert!(records.is_empty());
+            assert!(records.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn phase_21_crud_hook_run_store_schedules_retry_and_lists_when_due() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let mut run = new_store_run("gateway:hook:recoverable:retry");
-        run.phase = HookPhase::TurnPostTurn;
-        run.queued_at_unix_ms = Some(1_000);
-        run.resume_state = Some(phase_21_resume_state());
-        let created = hook_store
-            .create_or_load_run(run)
-            .await
-            .expect("run should create");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let mut run = new_store_run("gateway:hook:recoverable:retry");
+            run.phase = HookPhase::TurnPostTurn;
+            run.queued_at_unix_ms = Some(1_000);
+            run.resume_state = Some(phase_21_resume_state());
+            let created = hook_store
+                .create_or_load_run(run)
+                .await
+                .expect("run should create");
 
-        let scheduled = hook_store
-            .schedule_run_retry(
-                &created.id,
-                HookRetrySchedule {
-                    queued_at_unix_ms: 3_000,
-                    deadline_at_unix_ms: None,
-                    diagnostic_previews: Vec::new(),
-                },
-            )
-            .await
-            .expect("retry should schedule");
-        assert_eq!(scheduled.status, HookRunStatus::Queued);
+            let scheduled = hook_store
+                .schedule_run_retry(
+                    &created.id,
+                    HookRetrySchedule {
+                        queued_at_unix_ms: 3_000,
+                        deadline_at_unix_ms: None,
+                        diagnostic_previews: Vec::new(),
+                    },
+                )
+                .await
+                .expect("retry should schedule");
+            assert_eq!(scheduled.status, HookRunStatus::Queued);
 
-        let before_due = hook_store
-            .list_recoverable_runs(HookRecoveryScan {
-                now_unix_ms: 2_999,
-                batch_size: 10,
-                stale_running_after_ms: 1_000,
-                phases: Some(vec![HookPhase::TurnPostTurn]),
-            })
-            .await
-            .expect("recoverable runs should list");
-        assert!(before_due.is_empty());
+            let before_due = hook_store
+                .list_recoverable_runs(HookRecoveryScan {
+                    now_unix_ms: 2_999,
+                    batch_size: 10,
+                    stale_running_after_ms: 1_000,
+                    phases: Some(vec![HookPhase::TurnPostTurn]),
+                })
+                .await
+                .expect("recoverable runs should list");
+            assert!(before_due.is_empty());
 
-        let after_due = hook_store
-            .list_recoverable_runs(HookRecoveryScan {
-                now_unix_ms: 3_000,
-                batch_size: 10,
-                stale_running_after_ms: 1_000,
-                phases: Some(vec![HookPhase::TurnPostTurn]),
-            })
-            .await
-            .expect("recoverable runs should list");
-        assert_eq!(after_due.len(), 1);
-        assert_eq!(after_due[0].run.id, created.id);
+            let after_due = hook_store
+                .list_recoverable_runs(HookRecoveryScan {
+                    now_unix_ms: 3_000,
+                    batch_size: 10,
+                    stale_running_after_ms: 1_000,
+                    phases: Some(vec![HookPhase::TurnPostTurn]),
+                })
+                .await
+                .expect("recoverable runs should list");
+            assert_eq!(after_due.len(), 1);
+            assert_eq!(after_due[0].run.id, created.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn phase_21_crud_hook_run_store_marks_stale_running_timed_out() {
-        let (_connection, _crud_store, hook_store) = migrated_store().await;
-        let mut run = new_store_run("gateway:hook:recoverable:stale");
-        run.phase = HookPhase::TurnPostTurn;
-        run.resume_state = Some(phase_21_resume_state());
-        let created = hook_store
-            .create_or_load_run(run)
-            .await
-            .expect("run should create");
-        hook_store
-            .mark_run_running(&created.id, 1_000)
-            .await
-            .expect("run should mark running");
-        let attempt = hook_store
-            .append_attempt(NewHookRunAttemptStoreRecord {
-                hook_run_id: created.id.clone(),
-                attempt_number: 1,
-                status: HookRunStatus::Running,
-                contribution_hashes: Vec::new(),
-                diagnostic_previews: Vec::new(),
-                error: None,
-                started_at_unix_ms: Some(1_000),
-                completed_at_unix_ms: None,
-                duration_ms: None,
-            })
-            .await
-            .expect("attempt should append");
-
-        let records = hook_store
-            .list_recoverable_runs(HookRecoveryScan {
-                now_unix_ms: 3_000,
-                batch_size: 10,
-                stale_running_after_ms: 1_000,
-                phases: Some(vec![HookPhase::TurnPostTurn]),
-            })
-            .await
-            .expect("recoverable runs should list");
-        assert_eq!(records.len(), 1);
-
-        let completed = hook_store
-            .mark_stale_run_timed_out(
-                &created.id,
-                HookRunStoreCompletion {
-                    status: HookRunStatus::TimedOut,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (_connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let mut run = new_store_run("gateway:hook:recoverable:stale");
+            run.phase = HookPhase::TurnPostTurn;
+            run.resume_state = Some(phase_21_resume_state());
+            let created = hook_store
+                .create_or_load_run(run)
+                .await
+                .expect("run should create");
+            hook_store
+                .mark_run_running(&created.id, 1_000)
+                .await
+                .expect("run should mark running");
+            let attempt = hook_store
+                .append_attempt(NewHookRunAttemptStoreRecord {
+                    hook_run_id: created.id.clone(),
+                    attempt_number: 1,
+                    status: HookRunStatus::Running,
                     contribution_hashes: Vec::new(),
                     diagnostic_previews: Vec::new(),
                     error: None,
-                    completed_at_unix_ms: 3_000,
-                },
-            )
-            .await
-            .expect("stale run should mark timed out");
-        assert_eq!(completed.status, HookRunStatus::TimedOut);
+                    started_at_unix_ms: Some(1_000),
+                    completed_at_unix_ms: None,
+                    duration_ms: None,
+                })
+                .await
+                .expect("attempt should append");
 
-        let attempts = _crud_store
-            .list_hook_run_attempts(&created.id)
-            .await
-            .expect("attempts should list");
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].id, attempt.id);
-        assert_eq!(attempts[0].status, HookRunStatus::TimedOut);
+            let records = hook_store
+                .list_recoverable_runs(HookRecoveryScan {
+                    now_unix_ms: 3_000,
+                    batch_size: 10,
+                    stale_running_after_ms: 1_000,
+                    phases: Some(vec![HookPhase::TurnPostTurn]),
+                })
+                .await
+                .expect("recoverable runs should list");
+            assert_eq!(records.len(), 1);
+
+            let completed = hook_store
+                .mark_stale_run_timed_out(
+                    &created.id,
+                    HookRunStoreCompletion {
+                        status: HookRunStatus::TimedOut,
+                        contribution_hashes: Vec::new(),
+                        diagnostic_previews: Vec::new(),
+                        error: None,
+                        completed_at_unix_ms: 3_000,
+                    },
+                )
+                .await
+                .expect("stale run should mark timed out");
+            assert_eq!(completed.status, HookRunStatus::TimedOut);
+
+            let attempts = _crud_store
+                .list_hook_run_attempts(&created.id)
+                .await
+                .expect("attempts should list");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].id, attempt.id);
+            assert_eq!(attempts[0].status, HookRunStatus::TimedOut);
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_persists_failure() {
-        let (connection, _crud_store, hook_store) = migrated_store().await;
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let hook_id = HookId::new("gateway.phase15.failure").expect("valid hook id");
-        handlers
-            .register_handler(Arc::new(FailingHandler {
-                id: hook_id.clone(),
-            }))
-            .expect("handler registers");
-        subscriptions
-            .register_subscription(
-                handlers.as_ref(),
-                HookSubscription::new(
-                    HookSubscriptionId::new("gateway.phase15.failure").expect("valid sub id"),
-                    hook_id,
-                    HookPhase::TurnPrePromptCompile,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            let hook_id = HookId::new("gateway.phase15.failure").expect("valid hook id");
+            handlers
+                .register_handler(Arc::new(FailingHandler {
+                    id: hook_id.clone(),
+                }))
+                .expect("handler registers");
+            subscriptions
+                .register_subscription(
+                    handlers.as_ref(),
+                    HookSubscription::new(
+                        HookSubscriptionId::new("gateway.phase15.failure").expect("valid sub id"),
+                        hook_id,
+                        HookPhase::TurnPrePromptCompile,
+                    )
+                    .with_failure_policy(HookFailurePolicy::BestEffort),
                 )
-                .with_failure_policy(HookFailurePolicy::BestEffort),
-            )
-            .expect("subscription registers");
+                .expect("subscription registers");
 
-        let runtime = HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
-        let response = runtime
-            .run_phase(phase_15_request())
-            .await
-            .expect("best-effort hook failure should not fail phase");
-        assert_eq!(response.runs[0].status, HookRunStatus::Failed);
+            let runtime =
+                HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
+            let response = runtime
+                .run_phase(phase_15_request())
+                .await
+                .expect("best-effort hook failure should not fail phase");
+            assert_eq!(response.runs[0].status, HookRunStatus::Failed);
 
-        let run = one_run_row(&connection).await;
-        let attempt = one_attempt_row(&connection).await;
-        assert_eq!(run.status, "failed");
-        assert_eq!(run.attempt_count, 1);
-        assert_eq!(run.error_code.as_deref(), Some("gateway.phase15.failed"));
-        assert_eq!(attempt.status, "failed");
-        assert_eq!(
-            attempt.error_code.as_deref(),
-            Some("gateway.phase15.failed")
-        );
+            let run = one_run_row(&connection).await;
+            let attempt = one_attempt_row(&connection).await;
+            assert_eq!(run.status, "failed");
+            assert_eq!(run.attempt_count, 1);
+            assert_eq!(run.error_code.as_deref(), Some("gateway.phase15.failed"));
+            assert_eq!(attempt.status, "failed");
+            assert_eq!(
+                attempt.error_code.as_deref(),
+                Some("gateway.phase15.failed")
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_persists_timeout() {
-        let (connection, _crud_store, hook_store) = migrated_store().await;
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let hook_id = HookId::new("gateway.phase15.timeout").expect("valid hook id");
-        handlers
-            .register_handler(Arc::new(SlowHandler {
-                id: hook_id.clone(),
-            }))
-            .expect("handler registers");
-        subscriptions
-            .register_subscription(
-                handlers.as_ref(),
-                HookSubscription::new(
-                    HookSubscriptionId::new("gateway.phase15.timeout").expect("valid sub id"),
-                    hook_id,
-                    HookPhase::TurnPrePromptCompile,
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            let hook_id = HookId::new("gateway.phase15.timeout").expect("valid hook id");
+            handlers
+                .register_handler(Arc::new(SlowHandler {
+                    id: hook_id.clone(),
+                }))
+                .expect("handler registers");
+            subscriptions
+                .register_subscription(
+                    handlers.as_ref(),
+                    HookSubscription::new(
+                        HookSubscriptionId::new("gateway.phase15.timeout").expect("valid sub id"),
+                        hook_id,
+                        HookPhase::TurnPrePromptCompile,
+                    )
+                    .with_execution_policy(HookExecutionPolicy {
+                        await_policy: HookAwaitPolicy::Deadline,
+                        timeout_ms: Some(1),
+                        max_parallelism: None,
+                    })
+                    .with_failure_policy(HookFailurePolicy::BestEffort),
                 )
-                .with_execution_policy(HookExecutionPolicy {
-                    await_policy: HookAwaitPolicy::Deadline,
-                    timeout_ms: Some(1),
-                    max_parallelism: None,
-                })
-                .with_failure_policy(HookFailurePolicy::BestEffort),
-            )
-            .expect("subscription registers");
+                .expect("subscription registers");
 
-        let runtime = HookRuntime::with_options_and_run_store(
-            handlers,
-            subscriptions,
-            HookRuntimeOptions {
-                default_deadline_timeout_ms: 1,
-                ..HookRuntimeOptions::default()
-            },
-            Arc::new(hook_store),
-        );
-        let response = runtime
-            .run_phase(phase_15_request())
-            .await
-            .expect("best-effort hook timeout should not fail phase");
-        assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
+            let runtime = HookRuntime::with_options_and_run_store(
+                handlers,
+                subscriptions,
+                HookRuntimeOptions {
+                    default_deadline_timeout_ms: 1,
+                    ..HookRuntimeOptions::default()
+                },
+                Arc::new(hook_store),
+            );
+            let response = runtime
+                .run_phase(phase_15_request())
+                .await
+                .expect("best-effort hook timeout should not fail phase");
+            assert_eq!(response.runs[0].status, HookRunStatus::TimedOut);
 
-        let run = one_run_row(&connection).await;
-        let attempt = one_attempt_row(&connection).await;
-        assert_eq!(run.status, "timed_out");
-        assert_eq!(run.attempt_count, 1);
-        assert_eq!(run.error_code.as_deref(), Some("hook.timeout"));
-        assert_eq!(attempt.status, "timed_out");
-        assert_eq!(attempt.error_code.as_deref(), Some("hook.timeout"));
-        assert!(run.deadline_at.is_some());
+            let run = one_run_row(&connection).await;
+            let attempt = one_attempt_row(&connection).await;
+            assert_eq!(run.status, "timed_out");
+            assert_eq!(run.attempt_count, 1);
+            assert_eq!(run.error_code.as_deref(), Some("hook.timeout"));
+            assert_eq!(attempt.status, "timed_out");
+            assert_eq!(attempt.error_code.as_deref(), Some("hook.timeout"));
+            assert!(run.deadline_at.is_some());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_runtime_does_not_store_raw_prompt_contribution() {
-        let (connection, _crud_store, hook_store) = migrated_store().await;
-        let secret = "SECRET_PROMPT_SECTION_SHOULD_NOT_BE_STORED";
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        handlers
-            .register_handler(Arc::new(PromptContributionHandler {
-                id: HookId::new("gateway.phase15.prompt").expect("valid hook id"),
-                secret: secret.to_owned(),
-            }))
-            .expect("handler registers");
-        subscriptions
-            .register_subscription(
-                handlers.as_ref(),
-                HookSubscription::new(
-                    HookSubscriptionId::new("gateway.phase15.prompt").expect("valid sub id"),
-                    HookId::new("gateway.phase15.prompt").expect("valid hook id"),
-                    HookPhase::TurnPrePromptCompile,
-                ),
-            )
-            .expect("subscription registers");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let secret = "SECRET_PROMPT_SECTION_SHOULD_NOT_BE_STORED";
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            handlers
+                .register_handler(Arc::new(PromptContributionHandler {
+                    id: HookId::new("gateway.phase15.prompt").expect("valid hook id"),
+                    secret: secret.to_owned(),
+                }))
+                .expect("handler registers");
+            subscriptions
+                .register_subscription(
+                    handlers.as_ref(),
+                    HookSubscription::new(
+                        HookSubscriptionId::new("gateway.phase15.prompt").expect("valid sub id"),
+                        HookId::new("gateway.phase15.prompt").expect("valid hook id"),
+                        HookPhase::TurnPrePromptCompile,
+                    ),
+                )
+                .expect("subscription registers");
 
-        let runtime = HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
-        let response = runtime
-            .run_phase(phase_15_request())
-            .await
-            .expect("hook runtime should succeed");
-        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+            let runtime =
+                HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
+            let response = runtime
+                .run_phase(phase_15_request())
+                .await
+                .expect("hook runtime should succeed");
+            assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
 
-        let run_rows = hook_run::Entity::find()
-            .all(&connection)
-            .await
-            .expect("hook run rows should query");
-        let attempt_rows = hook_run_attempt::Entity::find()
-            .all(&connection)
-            .await
-            .expect("hook run attempt rows should query");
-        let persisted_text = format!("{run_rows:?}{attempt_rows:?}");
-        assert!(
-            !persisted_text.contains(secret),
-            "hook run persistence must not store raw prompt contribution"
-        );
-        assert!(persisted_text.contains("sha256:"));
+            let run_rows = hook_run::Entity::find()
+                .all(&connection)
+                .await
+                .expect("hook run rows should query");
+            let attempt_rows = hook_run_attempt::Entity::find()
+                .all(&connection)
+                .await
+                .expect("hook run attempt rows should query");
+            let persisted_text = format!("{run_rows:?}{attempt_rows:?}");
+            assert!(
+                !persisted_text.contains(secret),
+                "hook run persistence must not store raw prompt contribution"
+            );
+            assert!(persisted_text.contains("sha256:"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_persists_audit_contribution_rows() {
-        let (connection, crud_store, hook_store) = migrated_store().await;
-        let handlers = Arc::new(HookRegistry::new());
-        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
-        let hook_id = HookId::new("gateway.phase15.audit").expect("valid hook id");
-        handlers
-            .register_handler(Arc::new(AuditContributionHandler {
-                id: hook_id.clone(),
-                details: None,
-                idempotent: false,
-            }))
-            .expect("handler registers");
-        subscriptions
-            .register_subscription(
-                handlers.as_ref(),
-                HookSubscription::new(
-                    HookSubscriptionId::new("gateway.phase15.audit").expect("valid sub id"),
-                    hook_id,
-                    HookPhase::TurnPrePromptCompile,
-                ),
-            )
-            .expect("subscription registers");
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (connection, crud_store, hook_store) = migrated_store(fixture).await;
+            let handlers = Arc::new(HookRegistry::new());
+            let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+            let hook_id = HookId::new("gateway.phase15.audit").expect("valid hook id");
+            handlers
+                .register_handler(Arc::new(AuditContributionHandler {
+                    id: hook_id.clone(),
+                    details: None,
+                    idempotent: false,
+                }))
+                .expect("handler registers");
+            subscriptions
+                .register_subscription(
+                    handlers.as_ref(),
+                    HookSubscription::new(
+                        HookSubscriptionId::new("gateway.phase15.audit").expect("valid sub id"),
+                        hook_id,
+                        HookPhase::TurnPrePromptCompile,
+                    ),
+                )
+                .expect("subscription registers");
 
-        let runtime = HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
-        let response = runtime
-            .run_phase(phase_15_request())
-            .await
-            .expect("hook runtime should succeed");
-        assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
+            let runtime =
+                HookRuntime::with_run_store(handlers, subscriptions, Arc::new(hook_store));
+            let response = runtime
+                .run_phase(phase_15_request())
+                .await
+                .expect("hook runtime should succeed");
+            assert_eq!(response.runs[0].status, HookRunStatus::Succeeded);
 
-        let run = one_run_row(&connection).await;
-        let audit_row = one_audit_row(&connection).await;
-        assert_eq!(audit_row.hook_run_id, run.id);
-        assert_eq!(audit_row.event_kind, "test.gateway_hook_audit");
-        assert_eq!(audit_row.safe_for_user, false);
-        assert!(
-            audit_row
-                .contribution_hash
-                .as_deref()
-                .unwrap_or("")
-                .starts_with("sha256:")
-        );
-        let records = crud_store
-            .list_hook_audit_events_for_run(&HookRunId::new(run.id).expect("valid run id"))
-            .await
-            .expect("hook audit event list should succeed");
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].details,
-            HookValue::Text("gateway audit detail".to_owned())
-        );
+            let run = one_run_row(&connection).await;
+            let audit_row = one_audit_row(&connection).await;
+            assert_eq!(audit_row.hook_run_id, run.id);
+            assert_eq!(audit_row.event_kind, "test.gateway_hook_audit");
+            assert_eq!(audit_row.safe_for_user, false);
+            assert!(
+                audit_row
+                    .contribution_hash
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with("sha256:")
+            );
+            let records = crud_store
+                .list_hook_audit_events_for_run(&HookRunId::new(run.id).expect("valid run id"))
+                .await
+                .expect("hook audit event list should succeed");
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].details,
+                HookValue::Text("gateway audit detail".to_owned())
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn crud_hook_run_store_deduplicates_stable_audit_identity_and_rejects_conflict() {
-        let (connection, _crud_store, hook_store) = migrated_store().await;
-        let run = hook_store
-            .create_or_load_run(new_store_run("gateway:hook:audit:idempotent"))
-            .await
-            .expect("audit fixture run should create");
-        let event = NewHookAuditEventStoreRecord {
-            id: Some("auditStableIdentity01".to_owned()),
-            hook_run_id: run.id,
-            hook_run_attempt_id: None,
-            subscription_id: HookSubscriptionId::new("sub.gateway.audit.idempotent")
-                .expect("valid subscription id"),
-            hook_id: HookId::new("hook.gateway.audit.idempotent").expect("valid hook id"),
-            phase: HookPhase::TurnPrePromptCompile,
-            context: HookContext::default(),
-            event_kind: HookAuditEventKind::new("test.gateway_hook_audit.idempotent")
-                .expect("valid audit kind"),
-            contribution_hash: Some(
-                pioneer_hooks::HookContributionHash::new(format!("sha256:{}", "a".repeat(64)))
-                    .expect("valid contribution hash"),
-            ),
-            details: HookValue::Text("stable audit".to_owned()),
-            safe_for_user: false,
-            created_at_unix_ms: Some(1_700_000_000_000),
-        };
-
-        let first = hook_store
-            .append_audit_events(vec![event.clone()])
-            .await
-            .expect("first audit append should persist");
-        let replay = hook_store
-            .append_audit_events(vec![event.clone()])
-            .await
-            .expect("exact audit replay should be idempotent");
-        assert_eq!(first[0].id, replay[0].id);
-        assert_eq!(
-            hook_audit_event::Entity::find()
-                .all(&connection)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let (connection, _crud_store, hook_store) = migrated_store(fixture).await;
+            let run = hook_store
+                .create_or_load_run(new_store_run("gateway:hook:audit:idempotent"))
                 .await
-                .expect("audit rows should query")
-                .len(),
-            1
-        );
+                .expect("audit fixture run should create");
+            let event = NewHookAuditEventStoreRecord {
+                id: Some("auditStableIdentity01".to_owned()),
+                hook_run_id: run.id,
+                hook_run_attempt_id: None,
+                subscription_id: HookSubscriptionId::new("sub.gateway.audit.idempotent")
+                    .expect("valid subscription id"),
+                hook_id: HookId::new("hook.gateway.audit.idempotent").expect("valid hook id"),
+                phase: HookPhase::TurnPrePromptCompile,
+                context: HookContext::default(),
+                event_kind: HookAuditEventKind::new("test.gateway_hook_audit.idempotent")
+                    .expect("valid audit kind"),
+                contribution_hash: Some(
+                    pioneer_hooks::HookContributionHash::new(format!("sha256:{}", "a".repeat(64)))
+                        .expect("valid contribution hash"),
+                ),
+                details: HookValue::Text("stable audit".to_owned()),
+                safe_for_user: false,
+                created_at_unix_ms: Some(1_700_000_000_000),
+            };
 
-        let mut conflicting = event;
-        conflicting.details = HookValue::Text("different audit".to_owned());
-        assert!(
-            hook_store
-                .append_audit_events(vec![conflicting])
+            let first = hook_store
+                .append_audit_events(vec![event.clone()])
                 .await
-                .is_err(),
-            "a stable identity must fail closed when replayed with different semantics"
-        );
+                .expect("first audit append should persist");
+            let replay = hook_store
+                .append_audit_events(vec![event.clone()])
+                .await
+                .expect("exact audit replay should be idempotent");
+            assert_eq!(first[0].id, replay[0].id);
+            assert_eq!(
+                hook_audit_event::Entity::find()
+                    .all(&connection)
+                    .await
+                    .expect("audit rows should query")
+                    .len(),
+                1
+            );
+
+            let mut conflicting = event;
+            conflicting.details = HookValue::Text("different audit".to_owned());
+            assert!(
+                hook_store
+                    .append_audit_events(vec![conflicting])
+                    .await
+                    .is_err(),
+                "a stable identity must fail closed when replayed with different semantics"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

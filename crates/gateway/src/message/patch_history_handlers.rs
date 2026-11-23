@@ -18,8 +18,8 @@ use pioneer_protocol::{
 };
 use pioneer_tools::apply_patch::history::{
     CommitOrdinal, ExecutionHistoryCursor, FileHistoryCursor, HistoryCoverage, HistoryQueryLimits,
-    InvocationIdentity, SqliteAppliedPatchStore, SqliteCodexAggregateStore, SqliteTurnDiffStore,
-    StoredPatchRecord, TurnFilesystemCoverage,
+    InvocationIdentity, PostgresAppliedPatchStore, PostgresCodexAggregateStore,
+    PostgresTurnDiffStore, StoredPatchRecord, TurnFilesystemCoverage,
 };
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -136,8 +136,8 @@ impl MessageProcessor {
             }
         };
         let database = self.crud_store.database_connection();
-        let records = SqliteAppliedPatchStore::new(database.clone());
-        let codex = SqliteCodexAggregateStore::new(database);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let codex = PostgresCodexAggregateStore::new(database);
         let codex_state = match codex
             .get(params.thread_id.trim(), params.turn_id.trim())
             .await
@@ -178,7 +178,7 @@ impl MessageProcessor {
         {
             Ok(page) => {
                 let filesystem = match turn_filesystem_coverage(
-                    &SqliteTurnDiffStore::new(self.crud_store.database_connection()),
+                    &PostgresTurnDiffStore::new(self.crud_store.database_connection()),
                     params.thread_id.trim(),
                     params.turn_id.trim(),
                 )
@@ -305,7 +305,7 @@ impl MessageProcessor {
             None => None,
         };
         let database = self.crud_store.database_connection();
-        let records = SqliteAppliedPatchStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
         let thread_ids = scope
             .iter()
             .map(|entry| entry.thread_id.clone())
@@ -336,7 +336,7 @@ impl MessageProcessor {
             }
         };
         let filesystem = match filesystem_coverage_for_threads(
-            &SqliteTurnDiffStore::new(database.clone()),
+            &PostgresTurnDiffStore::new(database.clone()),
             thread_ids.as_slice(),
         )
         .await
@@ -350,7 +350,7 @@ impl MessageProcessor {
         };
         let coverage = match thread_query_coverage_for_scope(
             &records,
-            &SqliteCodexAggregateStore::new(database),
+            &PostgresCodexAggregateStore::new(database),
             thread_ids.as_slice(),
             &base_coverage,
             filesystem,
@@ -482,7 +482,7 @@ impl MessageProcessor {
                 }
             };
         let database = self.crud_store.database_connection();
-        let records = SqliteAppliedPatchStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
         let mut scoped_items = Vec::new();
         for scope_entry in &scope {
             let local_cursor = params.cursor.as_ref().and_then(|cursor| {
@@ -599,7 +599,7 @@ impl MessageProcessor {
             }
         };
         let filesystem = match filesystem_coverage_for_threads(
-            &SqliteTurnDiffStore::new(database.clone()),
+            &PostgresTurnDiffStore::new(database.clone()),
             thread_ids.as_slice(),
         )
         .await
@@ -613,7 +613,7 @@ impl MessageProcessor {
         };
         let coverage = match thread_query_coverage_for_scope(
             &records,
-            &SqliteCodexAggregateStore::new(database),
+            &PostgresCodexAggregateStore::new(database),
             thread_ids.as_slice(),
             &base_coverage,
             filesystem,
@@ -712,7 +712,7 @@ impl MessageProcessor {
             .await;
             return;
         }
-        let records = SqliteAppliedPatchStore::new(self.crud_store.database_connection());
+        let records = PostgresAppliedPatchStore::new(self.crud_store.database_connection());
         match selected_record(
             &records,
             params.thread_id.trim(),
@@ -795,7 +795,7 @@ impl MessageProcessor {
             }
         };
         let database = self.crud_store.database_connection();
-        let records = SqliteAppliedPatchStore::new(database.clone());
+        let records = PostgresAppliedPatchStore::new(database.clone());
         let rendered = match &params.selection {
             PatchDiffSelection::Record { selector } => {
                 match selected_record(
@@ -830,7 +830,7 @@ impl MessageProcessor {
                 after_ordinal,
                 through_ordinal,
             } => {
-                let codex = SqliteCodexAggregateStore::new(database);
+                let codex = PostgresCodexAggregateStore::new(database);
                 match codex
                     .get(params.thread_id.trim(), params.turn_id.trim())
                     .await
@@ -900,7 +900,7 @@ impl MessageProcessor {
         match rendered {
             Ok(rendered) => {
                 let filesystem = match turn_filesystem_coverage(
-                    &SqliteTurnDiffStore::new(self.crud_store.database_connection()),
+                    &PostgresTurnDiffStore::new(self.crud_store.database_connection()),
                     params.thread_id.trim(),
                     params.turn_id.trim(),
                 )
@@ -1032,7 +1032,7 @@ fn patch_history_error(
 }
 
 async fn selected_record(
-    records: &SqliteAppliedPatchStore,
+    records: &PostgresAppliedPatchStore,
     thread_id: &str,
     turn_id: &str,
     selector: &PatchRecordSelector,
@@ -1064,8 +1064,8 @@ async fn selected_record(
 }
 
 async fn thread_query_coverage_for_scope(
-    records: &SqliteAppliedPatchStore,
-    codex: &SqliteCodexAggregateStore,
+    records: &PostgresAppliedPatchStore,
+    codex: &PostgresCodexAggregateStore,
     thread_ids: &[String],
     base: &HistoryCoverage,
     filesystem: TurnFilesystemCoverage,
@@ -1203,7 +1203,7 @@ fn execution_context(
 }
 
 async fn turn_filesystem_coverage(
-    store: &SqliteTurnDiffStore,
+    store: &PostgresTurnDiffStore,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<TurnFilesystemCoverage> {
@@ -1215,7 +1215,7 @@ async fn turn_filesystem_coverage(
 }
 
 async fn filesystem_coverage_for_threads(
-    store: &SqliteTurnDiffStore,
+    store: &PostgresTurnDiffStore,
     thread_ids: &[String],
 ) -> Result<TurnFilesystemCoverage> {
     let states = store.list_for_threads(thread_ids).await?;

@@ -73,10 +73,6 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
             }
         }
         let started = Instant::now();
-        // Do not put a local timeout around dispatched SQLite work. Dropping
-        // the SQLx future does not interrupt sqlite3_step on its worker thread,
-        // so a timed-out quantum can keep consuming reader capacity while the
-        // maintenance loop starts another one.
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
@@ -86,7 +82,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                     let result = match addressed.as_ref() {
                         Some(pending) => match pending.front() {
                             Some((id, through)) => store.cleanup_projection_receipts_for_turn(id, *through).await,
-                            None => Ok(ProjectionReceiptCleanupOutcome { backfill_ready: true, ..Default::default() }),
+                            None => Ok(ProjectionReceiptCleanupOutcome::default()),
                         },
                         None => store.cleanup_projection_receipts_quantum(after_turn_id.as_deref(), through_turn_id.as_deref()).await,
                     };
@@ -102,11 +98,7 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
             let mut retry = false;
             match result {
                 Ok(outcome) | Err(QuantumError::StreamFailed(outcome)) => {
-                    if !outcome.backfill_ready {
-                        // Backfill completion publishes an unscoped wake and
-                        // startup discovery then reconstructs all durable work.
-                        pending.clear();
-                    } else if let Some((id, through)) = pending.pop_front() {
+                    if let Some((id, through)) = pending.pop_front() {
                         scanned += u64::from(outcome.last_turn_id.is_some());
                         deleted += outcome.rows_deleted;
                         source_bytes += outcome.source_bytes;
@@ -166,10 +158,6 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
         }
         let mut parked = false;
         let pause = match result {
-            Ok(outcome) if !outcome.backfill_ready => {
-                parked = true;
-                IDLE_PAUSE
-            }
             Ok(outcome) | Err(QuantumError::StreamFailed(outcome)) => {
                 if let Some(turn_id) = outcome.last_turn_id {
                     after_turn_id = Some(turn_id);
@@ -271,14 +259,21 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_worker_does_not_touch_an_unmigrated_database() {
-        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            run(Arc::new(CrudStore::new(db)), cancellation),
-        )
+        pioneer_postgres_test::with_empty_database(async |database| {
+            let store = Arc::new(CrudStore::new(
+                pioneer_postgres_pools::PostgresDatabase::new(
+                    database.connect_read_only().await?,
+                    database.connection().clone(),
+                ),
+            ));
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(1), run(store, cancellation))
+                .await
+                .expect("cancelled worker must return immediately");
+            Ok(())
+        })
         .await
-        .expect("cancelled worker must return immediately");
+        .unwrap();
     }
 }

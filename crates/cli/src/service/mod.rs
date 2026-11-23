@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use pioneer_config::{
-    AppConfig, InstallManagedBy, InstallState, load_install_state, save_install_state,
+    AppConfig, InstallManagedBy, InstallState, RuntimeEnvironment, gateway_database_url,
+    load_install_state, save_install_state,
 };
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -13,6 +14,8 @@ pub const SERVICE_MODE_ARG: &str = "gateway-service";
 
 pub(crate) struct ServiceSettings {
     pub service_name: String,
+    #[cfg(windows)]
+    pub runtime_home: PathBuf,
     #[cfg(target_os = "macos")]
     pub legacy_service_names: Vec<String>,
     #[cfg(target_os = "macos")]
@@ -234,6 +237,11 @@ pub fn start_gateway_service() -> Result<GatewayServiceStartReport> {
         // executable. Observe dev shutdown before registering this build.
         platform::stop_gateway_service(&settings)?;
     }
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
+        report.observe("service.database_url.save", || {
+            gateway_database_url::save_development_service_override(&config.runtime_home_dir()?)
+        })?;
+    }
     report.warnings = platform::start_gateway_service(
         &settings,
         &mut report,
@@ -251,7 +259,11 @@ pub fn stop_gateway_service() -> Result<()> {
     let settings = load_service_settings_from_config(&config)?;
     // Stopping changes service state, not the installed package identity. This
     // command may also be issued by a temporary installer during replacement.
-    platform::stop_gateway_service(&settings)
+    platform::stop_gateway_service(&settings)?;
+    if RuntimeEnvironment::current() == RuntimeEnvironment::Development {
+        gateway_database_url::clear_development_service_override(&config.runtime_home_dir()?)?;
+    }
+    Ok(())
 }
 
 pub fn create_device() -> Result<pioneer_protocol::AuthDeviceCreateResponse> {
@@ -298,7 +310,7 @@ pub fn gateway_service_status() -> Result<GatewayServiceStatus> {
     })
 }
 
-fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
+pub(crate) fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
     let config = AppConfig::load().context("failed to load app config")?;
     let runtime_home = config
         .ensure_runtime_home_dir()
@@ -306,7 +318,7 @@ fn load_config_and_runtime_home() -> Result<(AppConfig, PathBuf)> {
     Ok((config, runtime_home))
 }
 
-fn block_on_gateway_operation<F, T>(future: F) -> Result<T>
+pub(crate) fn block_on_gateway_operation<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -363,9 +375,11 @@ fn load_service_settings_from_config(config: &AppConfig) -> Result<ServiceSettin
     legacy_service_names.sort();
     legacy_service_names.dedup();
 
-    config.runtime_home_dir()?;
+    let _runtime_home = config.runtime_home_dir()?;
     Ok(ServiceSettings {
         service_name,
+        #[cfg(windows)]
+        runtime_home: _runtime_home,
         #[cfg(target_os = "macos")]
         legacy_service_names,
         #[cfg(target_os = "macos")]
@@ -628,7 +642,7 @@ mod tests {
         let managed_root = root.join("managed");
         let mut previous = None;
         let cu = if cfg!(target_os = "macos") {
-            "gateway-runtime/payload/cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+            "gateway-runtime/payload/runtime/Pioneer Gateway.app/Contents/MacOS/pioneer"
         } else {
             "gateway-runtime/payload/pioneer"
         };

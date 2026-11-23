@@ -93,7 +93,7 @@ async fn rows(store: &CrudStore, consumer: &str) -> Vec<turn_event_delivery::Mod
         .unwrap()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn commit_after_empty_claim_retains_wake_for_each_consumer() {
     for consumer in [LIVE, EPISODIC] {
         let (processor, store, workspace) = fixture().await;
@@ -120,7 +120,7 @@ async fn commit_after_empty_claim_retains_wake_for_each_consumer() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn released_owner_neither_steals_replacement_wake_nor_resets_its_running_bit() {
     for consumer in [LIVE, EPISODIC] {
         let (processor, store, workspace) = fixture().await;
@@ -187,7 +187,7 @@ impl ThreadEpisodicIngestor for BlockingIngestor {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn blocked_episodic_effect_does_not_hold_next_live_batch() {
     let (processor, store, workspace) = fixture().await;
     let ingestor = Arc::new(BlockingIngestor::default());
@@ -243,7 +243,7 @@ async fn blocked_episodic_effect_does_not_hold_next_live_batch() {
     processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn exhausted_quantum_hands_causal_remainder_to_each_consumer_without_a_new_kick() {
     let (processor, store, workspace) = fixture().await;
     for index in 0..129 {
@@ -283,7 +283,7 @@ async fn exhausted_quantum_hands_causal_remainder_to_each_consumer_without_a_new
     processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn periodic_and_commit_kicks_share_consumer_owners() {
     let (processor, store, workspace) = fixture().await;
     let processor = Arc::new(processor);
@@ -329,7 +329,7 @@ async fn periodic_and_commit_kicks_share_consumer_owners() {
     processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn coalesced_storage_failures_wait_and_shutdown_releases_both_owners() {
     let (processor, store, _) = fixture().await;
     store.database_connection().close().await.unwrap();
@@ -378,9 +378,11 @@ async fn coalesced_storage_failures_wait_and_shutdown_releases_both_owners() {
             .tasks
             .is_empty()
     );
+    // PostgreSQL fixture cleanup runs on this runtime and needs real IO deadlines.
+    tokio::time::resume();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shutdown_retains_claim_and_restored_processor_recovers_with_a_new_token() {
     let (processor, store, workspace) = fixture().await;
     let ingestor = Arc::new(BlockingIngestor::default());
@@ -458,7 +460,7 @@ async fn shutdown_retains_claim_and_restored_processor_recovers_with_a_new_token
     restored.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn acknowledgement_and_deferral_storage_errors_leave_leases_for_recovery() {
     for (consumer, status) in [(LIVE, "delivered"), (EPISODIC, "failed")] {
         let (processor, store, workspace) = fixture().await;
@@ -474,7 +476,7 @@ async fn acknowledgement_and_deferral_storage_errors_leave_leases_for_recovery()
         // Failure at the real acknowledgement/deferral boundary, rather than
         // a mock result from a copied drain algorithm.
         store.database_connection().execute_unprepared(&format!(
-            "CREATE TRIGGER reject_delivery_status BEFORE UPDATE OF status ON turn_event_delivery WHEN NEW.consumer = '{consumer}' AND NEW.status = '{status}' BEGIN SELECT RAISE(ABORT, 'fixture delivery storage failure'); END"
+            "CREATE FUNCTION reject_delivery_status() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture delivery storage failure'; END; $$; CREATE TRIGGER reject_delivery_status BEFORE UPDATE OF status ON turn_event_delivery FOR EACH ROW WHEN (NEW.consumer = '{consumer}' AND NEW.status = '{status}') EXECUTE FUNCTION reject_delivery_status();"
         )).await.unwrap();
         let owner = wake(&processor, consumer);
         owner.claim_barrier.arm("storage_failed");
@@ -494,7 +496,7 @@ async fn acknowledgement_and_deferral_storage_errors_leave_leases_for_recovery()
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn future_due_retry_does_not_spin_or_unblock_its_causal_successor() {
     let (processor, store, workspace) = fixture().await;
     commit(&store, &workspace, "retry-head").await;
@@ -553,7 +555,7 @@ async fn future_due_retry_does_not_spin_or_unblock_its_causal_successor() {
     processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn eligible_retry_timer_drains_without_a_new_commit_or_kick() {
     let (processor, store, workspace) = fixture().await;
     commit(&store, &workspace, "timed-retry").await;
@@ -583,7 +585,7 @@ async fn eligible_retry_timer_drains_without_a_new_commit_or_kick() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deadline_ignores_past_successors_behind_future_causal_head() {
     let (_processor, store, workspace) = fixture().await;
     commit(&store, &workspace, "head").await;
@@ -665,7 +667,7 @@ async fn deadline_ignores_past_successors_behind_future_causal_head() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn projection_deadline_tracks_healthy_watermark_successor_and_quarantine() {
     use pioneer_entity::{
         turn_event_projection_state as projection, turn_event_projection_stream_state as stream,
@@ -761,7 +763,7 @@ async fn projection_deadline_tracks_healthy_watermark_successor_and_quarantine()
     assert_eq!(replay.next_eligible_at_unix, Some(deadline));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn projection_recovery_deadline_storage_errors_remain_errors() {
     let (_processor, store, _) = fixture().await;
     store.database_connection().close().await.unwrap();
@@ -774,31 +776,21 @@ async fn projection_recovery_deadline_storage_errors_remain_errors() {
     assert!(store.next_turn_event_delivery_deadline(LIVE).await.is_err());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_queries() {
-    use pioneer_sqlite::{
-        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadOutcome,
+        PostgresWriteExecutor,
     };
-    use sea_orm::ConnectOptions;
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("empty-delivery-owners.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, _) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, _) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let processor = Arc::new(MessageProcessor::with_agent_manager(
@@ -817,9 +809,9 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
             .filter(|event| {
                 matches!(
                     event,
-                    SqliteReadEvent::OperationFinished {
-                        class: SqliteReadClass::Maintenance,
-                        outcome: SqliteReadOutcome::Ok,
+                    PostgresReadEvent::OperationFinished {
+                        class: PostgresReadClass::Maintenance,
+                        outcome: PostgresReadOutcome::Ok,
                         ..
                     }
                 )
@@ -882,7 +874,7 @@ async fn empty_delivery_owners_and_projection_cycles_do_not_repeat_deadline_quer
     processor.shutdown_resilience_workers().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn ready_batch_settlement_does_not_wait_for_a_slow_sibling_turn() {
     let (processor, store, workspace) = fixture().await;
     let ingestor = Arc::new(BlockingIngestor::default());

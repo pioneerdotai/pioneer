@@ -2423,7 +2423,7 @@ impl MessageProcessor {
             started_at_unix_ms: row.started_at.map(|value| value.timestamp_millis()),
             completed_at_unix_ms: row.completed_at.map(|value| value.timestamp_millis()),
             item,
-            metadata: parse_optional_metadata(row.metadata_json.as_str())?,
+            metadata: optional_metadata(row.metadata_json.clone()),
         })
     }
 
@@ -2895,12 +2895,16 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
     if value.trim().is_empty() {
         return Ok(None);
     }
-    let parsed: JsonValue = serde_json::from_str(value)
-        .with_context(|| "failed to decode work item projection metadata")?;
-    match &parsed {
-        JsonValue::Null => Ok(None),
-        JsonValue::Object(map) if map.is_empty() => Ok(None),
-        _ => Ok(Some(parsed)),
+    let parsed = serde_json::from_str(value).context("failed to decode timeline metadata")?;
+    Ok(optional_metadata(parsed))
+}
+
+fn optional_metadata(value: JsonValue) -> Option<JsonValue> {
+    match &value {
+        JsonValue::Null => None,
+        JsonValue::Object(map) if map.is_empty() => None,
+        JsonValue::String(text) if text.trim().is_empty() => None,
+        _ => Some(value),
     }
 }
 

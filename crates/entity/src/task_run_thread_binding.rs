@@ -7,14 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run_thread_binding")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub task_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text")]
     pub run_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub execution_id: Option<String>,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub binding_kind: String,
     pub created_at: DateTimeWithTimeZone,
 }

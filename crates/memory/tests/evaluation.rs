@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-use migration::{Migrator, MigratorTrait};
-use pioneer_crud::CrudStore;
+mod support;
 use pioneer_memory::{
     InMemoryMemoryBackend, MemoryBackend, MemoryOperationContext, MemoryService,
     MemoryServiceConfig, classify_semantic_memory_fact, format_memory_debug_trace,
 };
+use pioneer_postgres_test::{TestDatabase, with_database};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryAttribute, MemoryCandidatePolicyDecision,
     MemoryCandidateStatus, MemoryCategory, MemoryDurability, MemoryEvidenceActorRole,
@@ -16,7 +16,6 @@ use pioneer_protocol::{
     MemorySensitivityHint, MemorySourceContextKind, MemorySubject, MemoryWriteEvidence,
     MemoryWriteRelation,
 };
-use sea_orm::Database;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -183,12 +182,8 @@ struct MemoryEvaluationServiceHarness {
 }
 
 impl MemoryEvaluationServiceHarness {
-    async fn new() -> Self {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite");
-        Migrator::up(&connection, None).await.expect("migrate");
-        let store = Arc::new(CrudStore::new(connection));
+    async fn new(database: &TestDatabase) -> Self {
+        let store = support::postgres_store(database).await;
         let backend: Arc<dyn MemoryBackend> = Arc::new(InMemoryMemoryBackend::default());
         let service = MemoryService::new(store, backend, MemoryServiceConfig::default());
         Self { service }
@@ -937,26 +932,31 @@ async fn evaluation_write_durable_allow_fixtures_match_expected_outcomes() {
     let runner = MemoryEvaluationRunner;
 
     for fixture in durable_allow_fixture_catalog() {
-        let harness = MemoryEvaluationServiceHarness::new().await;
-        let run = runner
-            .run_write_fixture(&harness.service, &fixture)
-            .await
-            .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
+        with_database(async |database| {
+            let harness = MemoryEvaluationServiceHarness::new(database).await;
+            let run = runner
+                .run_write_fixture(&harness.service, &fixture)
+                .await
+                .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
 
-        assert_write_run_matches_fixture(&fixture, &run);
-        assert!(
-            run.write.memory_id.is_some(),
-            "{} expected active memory id; report={:?}",
-            fixture.id,
-            run.debug
-        );
-        assert_eq!(
-            run.write.source_context_kind,
-            Some(fixture.source_context_kind),
-            "{} source context persistence; report={:?}",
-            fixture.id,
-            run.debug
-        );
+            assert_write_run_matches_fixture(&fixture, &run);
+            assert!(
+                run.write.memory_id.is_some(),
+                "{} expected active memory id; report={:?}",
+                fixture.id,
+                run.debug
+            );
+            assert_eq!(
+                run.write.source_context_kind,
+                Some(fixture.source_context_kind),
+                "{} source context persistence; report={:?}",
+                fixture.id,
+                run.debug
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -965,19 +965,24 @@ async fn evaluation_write_terminal_fixtures_do_not_create_active_memory() {
     let runner = MemoryEvaluationRunner;
 
     for fixture in unsafe_terminal_fixture_catalog() {
-        let harness = MemoryEvaluationServiceHarness::new().await;
-        let run = runner
-            .run_write_fixture(&harness.service, &fixture)
-            .await
-            .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
+        with_database(async |database| {
+            let harness = MemoryEvaluationServiceHarness::new(database).await;
+            let run = runner
+                .run_write_fixture(&harness.service, &fixture)
+                .await
+                .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
 
-        assert_write_run_matches_fixture(&fixture, &run);
-        assert!(
-            run.write.memory_id.is_none(),
-            "{} must not create active memory; report={:?}",
-            fixture.id,
-            run.debug
-        );
+            assert_write_run_matches_fixture(&fixture, &run);
+            assert!(
+                run.write.memory_id.is_none(),
+                "{} must not create active memory; report={:?}",
+                fixture.id,
+                run.debug
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 
@@ -1056,24 +1061,29 @@ fn assert_write_run_matches_fixture(
 
 #[tokio::test]
 async fn evaluation_debug_report_is_bounded_and_omits_raw_sensitive_text() {
-    let fixture = unsafe_terminal_fixture_catalog()
-        .into_iter()
-        .find(|fixture| fixture.id == "direct_user_secret_like_value")
-        .expect("secret fixture exists");
-    let runner = MemoryEvaluationRunner;
-    let harness = MemoryEvaluationServiceHarness::new().await;
-    let run = runner
-        .run_write_fixture(&harness.service, &fixture)
-        .await
-        .expect("secret fixture writes through quality gate");
-    let trace = run.debug.trace.as_deref().expect("debug trace");
+    with_database(async |database| {
+        let fixture = unsafe_terminal_fixture_catalog()
+            .into_iter()
+            .find(|fixture| fixture.id == "direct_user_secret_like_value")
+            .expect("secret fixture exists");
+        let runner = MemoryEvaluationRunner;
+        let harness = MemoryEvaluationServiceHarness::new(database).await;
+        let run = runner
+            .run_write_fixture(&harness.service, &fixture)
+            .await
+            .expect("secret fixture writes through quality gate");
+        let trace = run.debug.trace.as_deref().expect("debug trace");
 
-    assert!(trace.len() <= EVALUATION_DEBUG_TRACE_MAX_CHARS);
-    assert!(!trace.contains("sk-example"));
-    assert!(!trace.contains("tool dump"));
-    assert!(!trace.contains("provider prompt"));
-    assert!(trace.contains("quality_action"));
-    assert!(trace.contains("quality_reasons"));
+        assert!(trace.len() <= EVALUATION_DEBUG_TRACE_MAX_CHARS);
+        assert!(!trace.contains("sk-example"));
+        assert!(!trace.contains("tool dump"));
+        assert!(!trace.contains("provider prompt"));
+        assert!(trace.contains("quality_action"));
+        assert!(trace.contains("quality_reasons"));
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1101,18 +1111,23 @@ async fn evaluation_adversarial_wording_cannot_override_source_context() {
     for (fixture_id, adversarial_content) in adversarial {
         let mut fixture = fixture_by_id(fixture_id);
         fixture.content = adversarial_content;
-        let harness = MemoryEvaluationServiceHarness::new().await;
-        let run = runner
-            .run_write_fixture(&harness.service, &fixture)
-            .await
-            .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
+        with_database(async |database| {
+            let harness = MemoryEvaluationServiceHarness::new(database).await;
+            let run = runner
+                .run_write_fixture(&harness.service, &fixture)
+                .await
+                .unwrap_or_else(|error| panic!("{} write failed: {error:#}", fixture.id));
 
-        assert_write_run_matches_fixture(&fixture, &run);
-        assert!(
-            run.write.memory_id.is_none(),
-            "{} adversarial wording created durable memory: {run:?}",
-            fixture.id
-        );
+            assert_write_run_matches_fixture(&fixture, &run);
+            assert!(
+                run.write.memory_id.is_none(),
+                "{} adversarial wording created durable memory: {run:?}",
+                fixture.id
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
 

@@ -51,7 +51,7 @@ async fn charge(
     call
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -66,6 +66,8 @@ async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges()
     materialize_artifact_api_thread(&store, &workspace, "observe_child", "observe_child_turn")
         .await;
     thread_lineage::Entity::insert(thread_lineage::ActiveModel {
+        insertion_ordinal: Default::default(),
+        publication_xid: Default::default(),
         child_thread_id: Set("observe_child".into()),
         parent_thread_id: Set(h.sandbox_thread_id.clone()),
         root_thread_id: Set(h.sandbox_thread_id.clone()),
@@ -88,7 +90,7 @@ async fn summary_uses_unique_leaf_own_and_authorized_causal_descendant_charges()
     assert_eq!(summary["allocation"]["all_cost_unallocated"], true);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn context_rpc_returns_bounded_content_free_breakdown_and_enforces_thread_acl() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -220,7 +222,7 @@ async fn context_rpc_returns_bounded_content_free_breakdown_and_enforces_thread_
     assert_eq!(error.error.message, "not_found");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fixed_frontier_pages_keep_operation_positions_while_append_and_updates_continue() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -275,7 +277,7 @@ async fn fixed_frontier_pages_keep_operation_positions_while_append_and_updates_
     assert_eq!(attempts, 2);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn overlapping_work_preserves_union_exclusive_time_and_period_unknowns() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -350,7 +352,7 @@ async fn overlapping_work_preserves_union_exclusive_time_and_period_unknowns() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn nested_workspace_journal_usage_remains_visible_in_its_verified_thread_scope() {
     for cli_item in [false, true] {
         let mut h = setup_semantic_timeline_query_harness().await;
@@ -486,7 +488,7 @@ async fn nested_workspace_journal_usage_remains_visible_in_its_verified_thread_s
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn selected_amounts_preserve_reported_zero_currency_scopes_partial_and_unknowns() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -561,7 +563,7 @@ async fn selected_amounts_preserve_reported_zero_currency_scopes_partial_and_unk
     assert_eq!(zero["own_amounts"][0]["basis"], "provider_reported");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_refinement() {
     let mut h = setup_semantic_timeline_query_harness().await;
     let store = h.processor.crud_store.clone();
@@ -592,16 +594,40 @@ async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_re
             updated_at: 101,
         };
         store.record_provider_usage(record.clone()).await.unwrap();
+        let mut financial = usage;
+        let evidence = financial["accounting"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pricing");
+        let fact = pioneer_crud::ExecutionObservationInput {
+            workspace_id: workspace.clone(),
+            operation_id: format!("provider:journal:{id}"),
+            revision: 0,
+            thread_id: Some(h.sandbox_thread_id.clone()),
+            turn_id: None,
+            owner_kind: "thread".into(),
+            owner_id: h.sandbox_thread_id.clone(),
+            parent_operation_id: None,
+            kind: "provider_attempt".into(),
+            purpose: "summary".into(),
+            provider: Some("fixture".into()),
+            model: Some("fixture".into()),
+            status: "completed".into(),
+            recorded_at_ms: record.started_at * 1000,
+            facts: json!({
+                "usage": financial,
+                "legacy_owner_id": record.owner_id,
+                "usage_source_fingerprint": crate::message::execution_observability::source_fingerprint(&record.usage_json),
+                "timing": {"prepared_at_unix_seconds": record.started_at}
+            }),
+            tariff_evidence: evidence,
+        };
+        store
+            .record_execution_observation(fact.prepare().unwrap())
+            .await
+            .unwrap();
         legacy.push(record);
     }
-    assert!(
-        store
-            .with_maintenance_access()
-            .backfill_aux_execution_observations_quantum()
-            .await
-            .unwrap()
-            .complete
-    );
     let frontier = store
         .execution_workspace_frontier(&workspace)
         .await
@@ -786,7 +812,7 @@ async fn legacy_reconciliation_survives_read_overlay_redelivery_and_versioned_re
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn auxiliary_spawned_decoder_body_eof_reaches_the_drain_owner_and_journal() {
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -154,7 +154,7 @@ impl MessageProcessor {
         }
         let cancel = CancellationToken::new();
         let child = cancel.clone();
-        let owner = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        let owner = self.scoped_with_database_class(PostgresWriteClass::Maintenance);
         let task = tokio::spawn(async move {
             let recovery = async {
                 let backend = owner
@@ -1099,7 +1099,7 @@ mod backend_execution_access_tests {
         updated_at: chrono::DateTime::from_timestamp(1, 0).unwrap().fixed_offset(),
     }
     }
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn current_app_execution_authenticates_without_consent_and_stop_retires_it() {
         let (processor, _, _, _, _, workspace) =
             crate::message::tests::setup_workspace_message_processor().await;

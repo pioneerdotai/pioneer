@@ -46,6 +46,24 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  prepare-postgres:
+    runs-on: ${{ fromJSON(inputs.platform).target == 'aarch64-pc-windows-msvc' && 'windows-latest' || fromJSON(inputs.platform).os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/prepare-postgres-runtime
+        with:
+          target: ${{ fromJSON(inputs.platform).target }}
+          out: postgres-runtime
+      - uses: actions/upload-artifact@v6
+        with:
+          name: postgres-runtime-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: postgres-runtime/
+          retention-days: 7
+          if-no-files-found: error
+
   build-gateway-default:
     runs-on: ${{ fromJSON(inputs.platform).os }}
     defaults:
@@ -231,9 +249,16 @@ jobs:
           compression-level: 0
 
   package-gateway-default:
-    needs: build-gateway-default
+    needs: [build-gateway-default, prepare-postgres]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_DESKTOP_SIGN_IDENTITY: ${{ secrets.MACOS_DESKTOP_SIGN_IDENTITY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_BASE64: ${{ secrets.APPLE_NOTARIZATION_KEY_BASE64 }}
       WINDOWS_SIGNING_REQUIRED: "false"
       WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
       WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
@@ -257,11 +282,23 @@ jobs:
         with:
           role: compiled-gateway-${{ fromJSON(inputs.platform).target }}-default
           path: gateway-inputs
+      - uses: ./.github/actions/download-release-input
+        if: runner.os == 'macOS'
+        with:
+          role: notary-gateway-default-${{ fromJSON(inputs.platform).target }}
+          path: notary-logs
+          optional: 'true'
+      - uses: ./.github/actions/macos-signing
+        if: runner.os == 'macOS'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
+          path: postgres-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant default --asset "${{ fromJSON(inputs.platform).asset }}"
-          --inputs gateway-inputs --out gateway-final
+          --inputs gateway-inputs --postgres postgres-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-default-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -274,9 +311,17 @@ jobs:
           path: gateway-final/assets/
           retention-days: 7
           if-no-files-found: error
+      - name: retain-notarization-reports
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: notary-gateway-default-${{ fromJSON(inputs.platform).target }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: notary-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   package-gateway-computer-use:
-    needs: [build-gateway-computer-use, prepare-cua]
+    needs: [build-gateway-computer-use, prepare-cua, prepare-postgres]
     runs-on: ${{ fromJSON(inputs.platform).os }}
     env:
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -341,11 +386,15 @@ jobs:
           PYMODES
       - uses: ./.github/actions/macos-signing
         if: runner.os == 'macOS'
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: postgres-runtime-${{ fromJSON(inputs.platform).target }}
+          path: postgres-runtime
       - name: package-ready-gateway
         run: >-
           python scripts/packaging/package-gateway.py --target "${{ fromJSON(inputs.platform).target }}"
           --variant computer-use --asset "${{ fromJSON(inputs.platform).cu_asset }}"
-          --inputs gateway-inputs --prepared cua-prepared --out gateway-final
+          --inputs gateway-inputs --prepared cua-prepared --postgres postgres-runtime --out gateway-final
       - uses: actions/upload-artifact@v6
         with:
           name: symbol-mapping-gateway-${{ fromJSON(inputs.platform).target }}-computer-use-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
@@ -542,3 +591,139 @@ jobs:
         run: |
           security default-keychain -d user -s login.keychain-db || true
           security delete-keychain "${RUNNER_TEMP}/pioneer-signing.keychain-db" || true
+
+  smoke-installed-postgres:
+    if: contains(fromJSON(inputs.platform).target, 'linux')
+    needs: [package-gateway-default, package-desktop]
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    timeout-minutes: 20
+    env:
+      GATEWAY_ASSET: ${{ fromJSON(inputs.platform).asset }}
+      DESKTOP_ASSET: ${{ fromJSON(inputs.platform).asset_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: gateway-assets-${{ fromJSON(inputs.platform).target }}-default
+          path: gateway-asset
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: desktop-assets-${{ fromJSON(inputs.platform).target }}
+          path: desktop-asset
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: isolate installed-package smoke
+        run: |
+          set -euo pipefail
+          mapfile -t postgres_packages < <(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'postgresql*' 2>/dev/null | awk '$1 == "ii" {print $2}')
+          if (( ${#postgres_packages[@]} )); then
+            sudo apt-get purge -y "${postgres_packages[@]}"
+          fi
+          if command -v postgres >/dev/null || command -v psql >/dev/null || pgrep -x postgres >/dev/null; then
+            echo "System PostgreSQL is still available on the isolated release runner" >&2
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb xauth xdotool imagemagick tesseract-ocr tesseract-ocr-eng \
+            fonts-dejavu-core mesa-vulkan-drivers libasound2t64 libgbm1 libssl3t64 \
+            libpipewire-0.3-0 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 \
+            libegl1 libfontconfig1 libfreetype6 libwebkit2gtk-4.1-0 libx11-6 \
+            libxi6 libxtst6 libxext6 libxcb-shape0 libxcb-xfixes0 libgl1
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          systemctl --user show-environment >/dev/null
+          python -m pip install websockets==15.0.1
+          printf 'PIONEER_INSTALL_ROOT=%s\nPIONEER_LINK_PATH=%s\nXDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' \
+            "$RUNNER_TEMP/pioneer-smoke-install" "$RUNNER_TEMP/pioneer-smoke-bin/pioneer" \
+            "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+      - name: install final Gateway and run PostgreSQL lifecycle smoke
+        run: |
+          set -euo pipefail
+          asset="$GITHUB_WORKSPACE/gateway-asset/$GATEWAY_ASSET"
+          expected=$(python - "$asset.provenance.json" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1]))["sha256"])
+          PY
+          )
+          printf 'sha256:%s %s\n' "$expected" "$GATEWAY_ASSET" > "$RUNNER_TEMP/gateway-SHA256SUMS"
+          env -u PIONEER_TEST_POSTGRES_ADMIN_URL \
+            PIONEER_LOCAL_ASSET_FILE="$asset" \
+            PIONEER_LOCAL_CHECKSUMS_FILE="$RUNNER_TEMP/gateway-SHA256SUMS" \
+            bash install.sh --force-start
+          python scripts/packaging/smoke-gateway-postgres.py --binary "$PIONEER_LINK_PATH"
+      - name: start the final Desktop AppImage and select its local Gateway
+        run: |
+          set -euo pipefail
+          desktop="$GITHUB_WORKSPACE/desktop-asset/$DESKTOP_ASSET"
+          chmod +x "$desktop"
+          export PIONEER_INSTALL_ROOT="$RUNNER_TEMP/pioneer-smoke-desktop-install"
+          export PIONEER_LINK_PATH="$RUNNER_TEMP/pioneer-smoke-desktop-bin/pioneer"
+          export PIONEER_CONFIG="$RUNNER_TEMP/pioneer-smoke-desktop.toml"
+          cat > "$PIONEER_CONFIG" <<'TOML'
+          home_directory = ".pioneer-release-smoke-desktop"
+
+          [gateway]
+          service_name = "com.pioneer.gateway.smoke.desktop"
+          listen_addr = "127.0.0.1:17880"
+          TOML
+          xvfb-run -a -s '-screen 0 1280x960x24' \
+            python scripts/packaging/smoke-gateway-postgres.py \
+              --binary "$PIONEER_LINK_PATH" --desktop "$desktop"
+      - name: stop installed Gateway
+        if: always()
+        run: |
+          if [[ -x "$PIONEER_LINK_PATH" ]]; then
+            "$PIONEER_LINK_PATH" stop
+          fi
+
+  smoke-installed-postgres-windows-arm:
+    if: fromJSON(inputs.platform).target == 'aarch64-pc-windows-msvc'
+    needs: package-gateway-default
+    runs-on: ${{ fromJSON(inputs.platform).os }}
+    timeout-minutes: 20
+    env:
+      GATEWAY_ASSET: ${{ fromJSON(inputs.platform).asset }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/download-release-input
+        with:
+          role: gateway-assets-aarch64-pc-windows-msvc-default
+          path: gateway-asset
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: install and verify the Gateway on Windows ARM64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((Get-Command postgres, psql -ErrorAction SilentlyContinue) -or
+              (Get-Service "postgresql*" -ErrorAction SilentlyContinue) -or
+              (Get-Process postgres -ErrorAction SilentlyContinue)) {
+            throw "System PostgreSQL is present on the Windows ARM64 release runner"
+          }
+          Remove-Item Env:PIONEER_TEST_POSTGRES_ADMIN_URL -ErrorAction SilentlyContinue
+          python -m pip install websockets==15.0.1
+          $env:PIONEER_INSTALL_ROOT = Join-Path $env:RUNNER_TEMP "pioneer-release-smoke"
+          $asset = Join-Path (Join-Path $env:GITHUB_WORKSPACE "gateway-asset") $env:GATEWAY_ASSET
+          $sha = (Get-Content "$asset.provenance.json" -Raw | ConvertFrom-Json).sha256
+          $checksums = Join-Path $env:RUNNER_TEMP "gateway-SHA256SUMS"
+          "sha256:$sha $env:GATEWAY_ASSET" | Set-Content $checksums -Encoding utf8
+          $binary = Join-Path $env:PIONEER_INSTALL_ROOT "bin\pioneer.exe"
+          try {
+            ./install.ps1 -ForceStart -LocalAssetFile $asset -LocalChecksumsFile $checksums
+            python scripts/packaging/smoke-gateway-postgres.py --binary $binary
+          } catch {
+            $log = Join-Path $env:USERPROFILE ".pioneer/gateway-service.log"
+            if (Test-Path $log) { Get-Content $log -Tail 30 }
+            throw
+          } finally {
+            if (Test-Path $binary) { & $binary stop }
+          }

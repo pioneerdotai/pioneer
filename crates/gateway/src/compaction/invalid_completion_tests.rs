@@ -49,7 +49,7 @@ fn assert_same_request(f: &Fixture, start: usize, end: usize) {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn two_invalid_completions_then_success_survive_runner_restart() {
     let f = fixture(
         "small",
@@ -98,8 +98,8 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
     assert_eq!(state.attempts, 3);
     assert_eq!(state.deadline_ms, f.runner.snapshot.admission.deadline_ms);
     let observations = f.store.database_connection().query_all_raw(Statement::from_string(
-        DbBackend::Sqlite,
-        "SELECT observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
+        DbBackend::Postgres,
+        "SELECT observation::text AS observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
     )).await.unwrap();
     assert_eq!(observations.len(), 3);
     for observation in &observations[..2] {
@@ -112,7 +112,7 @@ async fn two_invalid_completions_then_success_survive_runner_restart() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn third_invalid_completion_stops_without_checkpoint_or_fourth_call() {
     let f = fixture(
         "small",
@@ -148,7 +148,7 @@ async fn third_invalid_completion_stops_without_checkpoint_or_fourth_call() {
         .store
         .database_connection()
         .query_one_raw(Statement::from_string(
-            DbBackend::Sqlite,
+            DbBackend::Postgres,
             "SELECT COUNT(*) AS count FROM compaction_checkpoint WHERE operation_id='operation'",
         ))
         .await
@@ -157,7 +157,7 @@ async fn third_invalid_completion_stops_without_checkpoint_or_fourth_call() {
     assert_eq!(row.try_get::<i64>("", "count").unwrap(), 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn invalid_portion_exhaustion_preserves_previous_summary_and_cursor() {
     let f = fixture(
         &"漢字🌍".repeat(4000),
@@ -214,7 +214,7 @@ async fn invalid_portion_exhaustion_preserves_previous_summary_and_cursor() {
     assert_eq!(retried.previous_summary, checkpoint.summary);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn next_portion_has_its_own_attempt_budget_after_third_call_succeeds() {
     let f = fixture(
         &"漢字🌍".repeat(4000),
@@ -251,7 +251,7 @@ async fn next_portion_has_its_own_attempt_budget_after_third_call_succeeds() {
     assert_eq!(saved(&f).await.corrections, 0);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn mixed_failures_cannot_make_a_fourth_call_for_the_same_portion() {
     for replies in [
         vec![
@@ -289,7 +289,7 @@ async fn mixed_failures_cannot_make_a_fourth_call_for_the_same_portion() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deadline_and_stop_during_invalid_completion_backoff_prevent_the_next_call() {
     for stop in [false, true] {
         let f = fixture("small", vec![Reply::Invalid, Reply::Success], true, false).await;
@@ -329,8 +329,8 @@ async fn attempt_history(f: &Fixture) -> Vec<String> {
     f.store
         .database_connection()
         .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
+            DbBackend::Postgres,
+            "SELECT observation::text AS observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
         ))
         .await
         .unwrap()
@@ -339,7 +339,7 @@ async fn attempt_history(f: &Fixture) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deadline_resume_executes_after_third_portion_or_correction_call_was_interrupted() {
     for correction in [false, true] {
         let text = if correction {

@@ -121,11 +121,9 @@ fn external_ref_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_provider::{
         AttachmentTransportKind, attachments::upload_registry_key_for_authority,
     };
-    use sea_orm::Database;
 
     const TEST_AUTHORITY_FINGERPRINT: &str = "test-authority-generation-a";
 
@@ -144,14 +142,10 @@ mod tests {
         )
     }
 
-    async fn setup_backend() -> CrudArtifactExternalRefCacheBackend {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite in-memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must run");
-        let store = Arc::new(CrudStore::new(connection));
+    async fn setup_backend(
+        test_database: &pioneer_postgres_test::TestDatabase,
+    ) -> CrudArtifactExternalRefCacheBackend {
+        let store = Arc::new(CrudStore::new(test_database.connection().clone()));
         CrudArtifactExternalRefCacheBackend::new(store)
     }
 
@@ -165,203 +159,223 @@ mod tests {
 
     #[tokio::test]
     async fn non_artifact_uploads_are_not_cached() {
-        let backend = setup_backend().await;
-        let key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "aabbccdd",
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let backend = setup_backend(test_database).await;
+            let key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "aabbccdd",
+            );
 
-        backend
-            .store_uploaded_reference(ArtifactExternalRefStoreRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "aabbccdd".to_owned(),
-                registry_key: key.clone(),
-                provider_file_id: "file-1".to_owned(),
-                uploaded_at_unix_ms: 210,
-                ttl_secs: 300,
-                expires_at_unix_ms: 510,
-                mime_type: "application/pdf".to_owned(),
-                size_bytes: 123,
-                file_name: "doc.pdf".to_owned(),
-                artifact: None,
-            })
-            .await
-            .expect("store should be a no-op");
+            backend
+                .store_uploaded_reference(ArtifactExternalRefStoreRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "aabbccdd".to_owned(),
+                    registry_key: key.clone(),
+                    provider_file_id: "file-1".to_owned(),
+                    uploaded_at_unix_ms: 210,
+                    ttl_secs: 300,
+                    expires_at_unix_ms: 510,
+                    mime_type: "application/pdf".to_owned(),
+                    size_bytes: 123,
+                    file_name: "doc.pdf".to_owned(),
+                    artifact: None,
+                })
+                .await
+                .expect("store should be a no-op");
 
-        let hit = backend
-            .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "aabbccdd".to_owned(),
-                registry_key: key.clone(),
-                now_unix_ms: 200,
-                artifact: None,
-            })
-            .await
-            .expect("lookup should succeed");
-        assert!(hit.is_none());
+            let hit = backend
+                .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "aabbccdd".to_owned(),
+                    registry_key: key.clone(),
+                    now_unix_ms: 200,
+                    artifact: None,
+                })
+                .await
+                .expect("lookup should succeed");
+            assert!(hit.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_upload_stores_external_ref_and_reuses_it() {
-        let backend = setup_backend().await;
-        let key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "artifactsha",
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let backend = setup_backend(test_database).await;
+            let key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "artifactsha",
+            );
 
-        backend
-            .store_uploaded_reference(ArtifactExternalRefStoreRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "artifactsha".to_owned(),
-                registry_key: key,
-                provider_file_id: "file-artifact".to_owned(),
-                uploaded_at_unix_ms: 100,
-                ttl_secs: 300,
-                expires_at_unix_ms: 400,
-                mime_type: "application/pdf".to_owned(),
-                size_bytes: 100,
-                file_name: "artifact.pdf".to_owned(),
-                artifact: Some(artifact_context("ws_a")),
-            })
-            .await
-            .expect("store artifact-backed reference");
+            backend
+                .store_uploaded_reference(ArtifactExternalRefStoreRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "artifactsha".to_owned(),
+                    registry_key: key,
+                    provider_file_id: "file-artifact".to_owned(),
+                    uploaded_at_unix_ms: 100,
+                    ttl_secs: 300,
+                    expires_at_unix_ms: 400,
+                    mime_type: "application/pdf".to_owned(),
+                    size_bytes: 100,
+                    file_name: "artifact.pdf".to_owned(),
+                    artifact: Some(artifact_context("ws_a")),
+                })
+                .await
+                .expect("store artifact-backed reference");
 
-        let different_sha_key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "different-sha",
-        );
-        let hit = backend
-            .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "different-sha".to_owned(),
-                registry_key: different_sha_key,
-                now_unix_ms: 150,
-                artifact: Some(artifact_context("ws_a")),
-            })
-            .await
-            .expect("lookup artifact-backed reference");
-        assert_eq!(hit.as_deref(), Some("file-artifact"));
+            let different_sha_key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "different-sha",
+            );
+            let hit = backend
+                .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "different-sha".to_owned(),
+                    registry_key: different_sha_key,
+                    now_unix_ms: 150,
+                    artifact: Some(artifact_context("ws_a")),
+                })
+                .await
+                .expect("lookup artifact-backed reference");
+            assert_eq!(hit.as_deref(), Some("file-artifact"));
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn expired_artifact_external_ref_is_ignored() {
-        let backend = setup_backend().await;
-        let key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "expired-artifact",
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let backend = setup_backend(test_database).await;
+            let key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "expired-artifact",
+            );
 
-        backend
-            .store_uploaded_reference(ArtifactExternalRefStoreRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "expired-artifact".to_owned(),
-                registry_key: key,
-                provider_file_id: "file-expired-artifact".to_owned(),
-                uploaded_at_unix_ms: 10,
-                ttl_secs: 10,
-                expires_at_unix_ms: 20,
-                mime_type: "application/pdf".to_owned(),
-                size_bytes: 100,
-                file_name: "expired.pdf".to_owned(),
-                artifact: Some(artifact_context("ws_a")),
-            })
-            .await
-            .expect("store artifact-backed reference");
+            backend
+                .store_uploaded_reference(ArtifactExternalRefStoreRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "expired-artifact".to_owned(),
+                    registry_key: key,
+                    provider_file_id: "file-expired-artifact".to_owned(),
+                    uploaded_at_unix_ms: 10,
+                    ttl_secs: 10,
+                    expires_at_unix_ms: 20,
+                    mime_type: "application/pdf".to_owned(),
+                    size_bytes: 100,
+                    file_name: "expired.pdf".to_owned(),
+                    artifact: Some(artifact_context("ws_a")),
+                })
+                .await
+                .expect("store artifact-backed reference");
 
-        let missing_registry_key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "missing-registry",
-        );
-        let hit = backend
-            .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "missing-registry".to_owned(),
-                registry_key: missing_registry_key,
-                now_unix_ms: 25,
-                artifact: Some(artifact_context("ws_a")),
-            })
-            .await
-            .expect("lookup expired artifact-backed reference");
-        assert!(hit.is_none());
+            let missing_registry_key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "missing-registry",
+            );
+            let hit = backend
+                .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "missing-registry".to_owned(),
+                    registry_key: missing_registry_key,
+                    now_unix_ms: 25,
+                    artifact: Some(artifact_context("ws_a")),
+                })
+                .await
+                .expect("lookup expired artifact-backed reference");
+            assert!(hit.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn artifact_external_ref_is_workspace_scoped() {
-        let backend = setup_backend().await;
-        let key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "workspace-a",
-        );
+        pioneer_postgres_test::with_database(async |test_database| {
+            let backend = setup_backend(test_database).await;
+            let key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "workspace-a",
+            );
 
-        backend
-            .store_uploaded_reference(ArtifactExternalRefStoreRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "workspace-a".to_owned(),
-                registry_key: key,
-                provider_file_id: "file-workspace-a".to_owned(),
-                uploaded_at_unix_ms: 100,
-                ttl_secs: 300,
-                expires_at_unix_ms: 400,
-                mime_type: "application/pdf".to_owned(),
-                size_bytes: 100,
-                file_name: "workspace.pdf".to_owned(),
-                artifact: Some(artifact_context("ws_a")),
-            })
-            .await
-            .expect("store workspace A artifact-backed reference");
+            backend
+                .store_uploaded_reference(ArtifactExternalRefStoreRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "workspace-a".to_owned(),
+                    registry_key: key,
+                    provider_file_id: "file-workspace-a".to_owned(),
+                    uploaded_at_unix_ms: 100,
+                    ttl_secs: 300,
+                    expires_at_unix_ms: 400,
+                    mime_type: "application/pdf".to_owned(),
+                    size_bytes: 100,
+                    file_name: "workspace.pdf".to_owned(),
+                    artifact: Some(artifact_context("ws_a")),
+                })
+                .await
+                .expect("store workspace A artifact-backed reference");
 
-        let missing_registry_key = upload_registry_key(
-            "openai",
-            "gpt-4.1-mini",
-            AttachmentTransportKind::Upload,
-            "workspace-b",
-        );
-        let hit = backend
-            .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
-                provider: "openai".to_owned(),
-                authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
-                model_family: "gpt-4.1-mini".to_owned(),
-                transport_kind: AttachmentTransportKind::Upload,
-                sha256: "workspace-b".to_owned(),
-                registry_key: missing_registry_key,
-                now_unix_ms: 150,
-                artifact: Some(artifact_context("ws_b")),
-            })
-            .await
-            .expect("lookup workspace B artifact-backed reference");
-        assert!(hit.is_none());
+            let missing_registry_key = upload_registry_key(
+                "openai",
+                "gpt-4.1-mini",
+                AttachmentTransportKind::Upload,
+                "workspace-b",
+            );
+            let hit = backend
+                .lookup_uploaded_reference(ArtifactExternalRefLookupRequest {
+                    provider: "openai".to_owned(),
+                    authority_fingerprint: TEST_AUTHORITY_FINGERPRINT.to_owned(),
+                    model_family: "gpt-4.1-mini".to_owned(),
+                    transport_kind: AttachmentTransportKind::Upload,
+                    sha256: "workspace-b".to_owned(),
+                    registry_key: missing_registry_key,
+                    now_unix_ms: 150,
+                    artifact: Some(artifact_context("ws_b")),
+                })
+                .await
+                .expect("lookup workspace B artifact-backed reference");
+            assert!(hit.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

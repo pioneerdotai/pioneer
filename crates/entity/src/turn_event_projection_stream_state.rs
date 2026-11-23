@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_event_projection_stream_state")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub turn_id: String,
+    #[sea_orm(column_type = "Text")]
     pub thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub blocking_event_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub last_error: Option<String>,

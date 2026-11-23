@@ -4679,23 +4679,6 @@ impl RecoveryCoordinator {
             .get_turn_location(turn_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("retained history scope is missing"))?;
-        let mut preparation_after = 0;
-        while let Some(next) = store
-            .compaction_prepare_turn_context_quantum(
-                &workspace,
-                &thread,
-                turn_id,
-                preparation_after,
-            )
-            .await?
-        {
-            anyhow::ensure!(
-                next > preparation_after,
-                "retained history preparation made no progress"
-            );
-            preparation_after = next;
-            tokio::task::yield_now().await;
-        }
         let high_water = store
             .compaction_source_high_water(
                 &workspace,
@@ -5878,7 +5861,6 @@ mod tests {
         RetainedProviderHistoryRow, RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
         assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
     };
-    use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
         AgentManager, AgentTurnHookRuntimeContext, ResolvedArtifactInput,
         SkillsDependenciesLoopConfig, SkillsLoopConfig, SkillsRuntimeLoopConfig,
@@ -5916,7 +5898,7 @@ mod tests {
         ComputerUseToolsConfig, ExecutionWindowsConfig, ToolLoopBudgetConfig,
         ToolRetryBudgetConfig, WebToolsConfig,
     };
-    use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -6141,7 +6123,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    fn assert_duplicate_recovery(error: &anyhow::Error) {
+        assert!(
+            matches!(
+                error.downcast_ref::<sea_orm::DbErr>().and_then(sea_orm::DbErr::sql_err),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(message))
+                    if message.contains("uq_recovery_job_unresolved_turn")
+            ),
+            "expected the unresolved turn constraint, got {error:#}"
+        );
+    }
+
+    #[pioneer_postgres_test::postgres_test]
     async fn compaction_restore_bounds_full_results_and_keeps_round_scoped_sources() {
         let (store, _, coordinator) = setup_coordinator_with_agent().await;
         let workspace = "ws_restore_bounded";
@@ -6247,7 +6240,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn compaction_restore_uses_acknowledged_shell_outcome_without_replay_row() {
         let (store, _, coordinator) = setup_coordinator_with_agent().await;
         let (workspace, thread, turn, item) = (
@@ -6616,8 +6609,8 @@ mod tests {
             store
                 .database_connection()
                 .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                    sea_orm::DbBackend::Postgres,
+                    "UPDATE turn_llm_context SET payload=$1 WHERE id=$2",
                     [
                         serde_json::to_string(&invalid).unwrap().into(),
                         legacy_row_id.clone().into(),
@@ -6634,8 +6627,8 @@ mod tests {
         store
             .database_connection()
             .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DbBackend::Sqlite,
-                "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                sea_orm::DbBackend::Postgres,
+                "UPDATE turn_llm_context SET payload=$1 WHERE id=$2",
                 [
                     serde_json::to_string(&legacy).unwrap().into(),
                     legacy_row_id.into(),
@@ -6783,7 +6776,7 @@ mod tests {
         assert_eq!(policy.max_wall_clock_secs, 900);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn compaction_legacy_recovery_policy_preserves_admission_and_one_retry() {
         let (_store, coordinator) = setup_coordinator().await;
         let mut job = coordinator
@@ -6841,7 +6834,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn primary_chat_requires_provider_owned_overflow_before_durable_compaction() {
         use anyhow::Result;
         use pioneer_protocol::AgentDurableEvent;
@@ -7228,14 +7221,15 @@ mod tests {
     async fn setup_coordinator_with_tool_loop_config(
         tool_loop_config: ToolLoopConfig,
     ) -> (Arc<CrudStore>, Arc<AgentManager>, RecoveryCoordinator) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        let crud_store = Arc::new(CrudStore::new(connection));
-        ensure_recovery_test_execution_authority(crud_store.as_ref()).await;
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let reader = fixture.connect_read_only().await.unwrap();
+        let database =
+            pioneer_postgres_pools::PostgresDatabase::new(reader, fixture.connection().clone());
+        let crud_store = Arc::new(CrudStore::new(database));
+        crate::session::test_support::ensure_test_superuser_execution_authority(
+            crud_store.as_ref(),
+        )
+        .await;
         let provider_registry = Arc::new(ProviderRegistry::with_provider(
             "echo",
             Arc::new(EchoProvider::new()),
@@ -7274,59 +7268,6 @@ mod tests {
             }))
             .await;
         (crud_store, agent_manager, coordinator)
-    }
-
-    async fn ensure_recovery_test_execution_authority(crud_store: &CrudStore) {
-        crud_store
-            .database_connection()
-            .execute_unprepared(
-                "INSERT OR IGNORE INTO gateway_identity(\
-                    id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
-                    created_at,updated_at\
-                 ) VALUES(\
-                    'G00000000000000000001',1,1,2,CURRENT_TIMESTAMP,\
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-                 );\
-                 INSERT OR IGNORE INTO gateway_principal(\
-                    id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
-                    created_at,updated_at,removed_at\
-                 ) VALUES(\
-                    'P00000000000000000001','G00000000000000000001','superuser',NULL,'active',\
-                    'Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-                 );\
-                 INSERT OR IGNORE INTO device(\
-                    id,gateway_id,principal_id,installation_id,display_name,client_kind,\
-                    platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
-                 ) VALUES(\
-                    'D00000000000000000001','G00000000000000000001',\
-                    'P00000000000000000001','recovery-test-superuser','Recovery Test Superuser',\
-                    'desktop','test','1','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                    CURRENT_TIMESTAMP,NULL\
-                 );\
-                 INSERT OR IGNORE INTO auth_session(\
-                    id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
-                    activation_token_hash,activation_locator_hash,activation_failed_attempts,\
-                    activation_expires_at,activated_at,status,refresh_generation,created_at,\
-                    updated_at,last_seen_at,last_refreshed_at,refresh_expires_at,revoked_at,\
-                    revoke_reason\
-                 ) VALUES(\
-                    'S00000000000000000001','G00000000000000000001',\
-                    'P00000000000000000001','D00000000000000000001',\
-                    'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
-                    datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
-                    CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                    datetime('now','+90 days'),NULL,NULL\
-                 );\
-                 INSERT OR IGNORE INTO auth_refresh_credential(\
-                    id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
-                 ) VALUES(\
-                    'R00000000000000000001','S00000000000000000001',\
-                    'F00000000000000000001',0,randomblob(32),CURRENT_TIMESTAMP,\
-                    datetime('now','+90 days')\
-                 );",
-            )
-            .await
-            .expect("recovery test execution authority should materialize");
     }
 
     async fn setup_coordinator_with_agent()
@@ -7375,7 +7316,7 @@ mod tests {
         .expect("test Turn execution should persist");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn live_gateway_owner_never_recovers_its_normal_prebinding_turns() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let now_unix = 1_700_000_200;
@@ -7430,7 +7371,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn expired_foreign_prebinding_cli_turn_is_claimed_by_kind_not_binding_absence() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_expired_cli_owner";
@@ -7487,7 +7428,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn owned_recovering_execution_retries_job_creation_after_claim_crash() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let now = 1_700_000_200;
@@ -7623,7 +7564,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn orphan_repair_finishes_its_pass_before_a_new_suffix() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let now = 1_700_000_200;
@@ -7713,7 +7654,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_start_transition_fences_a_recovery_candidate_selected_before_cas() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_start_recovery_race";
@@ -8151,7 +8092,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn restored_recovery_turn_request_uses_runtime_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_restore_snapshot";
@@ -8357,7 +8298,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(skill_dir);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cli_runtime_recovery_routes_through_native_attempt_without_runtime_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_cli_native_recovery";
@@ -8517,7 +8458,7 @@ mod tests {
         assert_eq!(pending_job.run_count, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn legacy_cli_recovery_backfills_window_one_before_opening_window_two() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_cli_legacy_window";
@@ -8595,7 +8536,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cli_recovery_checkpoint_counts_progress_only_in_the_current_window() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_cli_current_window_progress";
@@ -8707,7 +8648,7 @@ mod tests {
         assert_eq!(usage.consecutive_no_progress_windows, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn virtual_week_with_causal_progress_survives_windows_and_coordinator_restart() {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
@@ -8766,7 +8707,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn persisted_no_progress_windows_trip_recovery_circuit_breaker_after_coordinator_restart()
     {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
@@ -8826,7 +8767,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn durable_progress_resets_persisted_recovery_circuit_breaker() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let timestamp = chrono::Utc::now().fixed_offset();
@@ -8887,7 +8828,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cli_runtime_recovery_blocks_before_exceeding_the_shared_window_limit() {
         let mut tool_loop_config = test_tool_loop_config();
         tool_loop_config
@@ -9013,7 +8954,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn native_recovery_blocks_before_exceeding_the_shared_window_limit() {
         let mut tool_loop_config = test_tool_loop_config();
         tool_loop_config
@@ -9111,7 +9052,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn restored_recovery_turn_request_checkpoints_stale_window_and_advances_index() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_restore_running_window";
@@ -9195,7 +9136,7 @@ mod tests {
         assert_eq!(payload.provider_budget.exhausted_observed, None);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn startup_recovery_refuses_to_create_a_window_past_the_shared_limit() {
         let mut tool_loop_config = test_tool_loop_config();
         tool_loop_config
@@ -9263,7 +9204,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn runtime_recovery_checkpoints_running_window_before_restart() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_runtime_checkpoint";
@@ -9409,7 +9350,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn restored_recovery_turn_request_does_not_close_stale_window_for_invalid_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_restore_invalid_snapshot";
@@ -9431,14 +9372,14 @@ mod tests {
                 turn_id: turn_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 workspace_id: workspace_id.to_owned(),
-                mode_json: "{invalid".to_owned(),
+                mode: pioneer_protocol::ThreadMode::Agent,
                 model: "test-model".to_owned(),
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
-                input_json: "[]".to_owned(),
+                input_json: r#"{"invalid":"expected a list"}"#.to_owned(),
                 capabilities_json: "[]".to_owned(),
                 resolved_artifacts_json: "[]".to_owned(),
                 runtime_environment_json: "{}".to_owned(),
@@ -9489,7 +9430,7 @@ mod tests {
         assert_eq!(still_running.status, ExecutionWindowStatus::Running);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn restored_recovery_turn_request_rejects_missing_security_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_restore_missing_security";
@@ -9548,7 +9489,7 @@ mod tests {
         assert_eq!(still_running.status, ExecutionWindowStatus::Running);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn tool_item_recovery_restores_turn_from_runtime_snapshot_when_loop_missing() {
         let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let workspace_id = "ws_tool_restore";
@@ -9617,7 +9558,7 @@ mod tests {
         assert_eq!(reloaded.status, RecoveryJobStatus::Active);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn incomplete_in_flight_tool_history_blocks_before_restored_provider_execution() {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let workspace_id = "ws_tool_uncertain";
@@ -9735,7 +9676,7 @@ mod tests {
         assert_eq!(reloaded.status, RecoveryJobStatus::Blocked);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn tool_item_recovery_blocks_when_loop_missing_and_runtime_snapshot_missing() {
         let (crud_store, _agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let workspace_id = "ws_tool_missing_snapshot";
@@ -9807,7 +9748,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn startup_recovery_context_loads_latest_checkpoint_for_in_progress_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_startup_checkpoint";
@@ -9998,7 +9939,7 @@ mod tests {
         assert!(missing_checkpoint_context.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn startup_recovery_job_starts_restored_turn_from_checkpoint() {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
         let workspace_id = "ws_startup_restore";
@@ -10186,7 +10127,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn time_and_no_progress_stops_preserve_last_provider_fact() {
         for (max_wall_clock_secs, no_progress_limit, stop_reason) in [
             (
@@ -10254,7 +10195,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_http_403_reloads_as_bounded_unchanged_request_retry() {
         let (store, coordinator) = setup_coordinator().await;
         let restarted = CrudStore::new(store.database_connection());
@@ -10344,7 +10285,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn non_403_auth_and_local_failures_keep_existing_policy() {
         let (_store, coordinator) = setup_coordinator().await;
         for (class, status, hint, action, max_attempts) in [
@@ -10410,7 +10351,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn last_provider_failure_is_durable_without_replacing_initial_policy() {
         let (store, coordinator) = setup_coordinator().await;
         let mut initial =
@@ -10557,7 +10498,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_failure_inside_recovery_requeues_same_job() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_same_recovery_job";
@@ -10610,7 +10551,7 @@ mod tests {
         assert_eq!(reloaded.run_count, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_http_403_cooldown_replay_and_reload_preserve_attempt_budget() {
         let (store, coordinator) = setup_coordinator().await;
         let now = 1_700_000_000;
@@ -10748,7 +10689,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_cooldown_defers_initial_recovery_until_declared_reset() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let now_unix = 1_700_000_000;
@@ -10790,7 +10731,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn renewed_provider_cooldown_suspends_recovery_wall_clock_budget() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let now_unix = 1_700_000_000;
@@ -10854,7 +10795,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn new_failure_reuses_existing_open_recovery_for_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_reuses_open_recovery";
@@ -10904,7 +10845,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn timeout_reuses_existing_open_recovery_for_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_timeout_reuses_open_recovery";
@@ -10949,7 +10890,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn tool_timeout_recovery_uses_persisted_tool_policy_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_tool_policy_snapshot";
@@ -11031,7 +10972,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn tool_timeout_without_snapshot_uses_deterministic_conservative_policy() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_tool_missing_policy_snapshot";
@@ -11083,7 +11024,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn cli_binding_rehydration_precedes_missing_tool_replay_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_cli_timeout_rehydrate";
@@ -11178,7 +11119,7 @@ mod tests {
         assert!(job.policy_snapshot.get("tool_recovery_policy").is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn backfill_does_not_enqueue_recovery_for_terminal_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let timestamp = 1_700_000_000;
@@ -11186,7 +11127,7 @@ mod tests {
             id: Set("ws_terminal_backfill".to_owned()),
             name: Set("Terminal backfill".to_owned()),
             is_active: Set(true),
-            is_current: Set(true),
+            is_current: Set(false),
             ..Default::default()
         }
         .insert(&crud_store.database_connection())
@@ -11337,7 +11278,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn timeout_backfill_suppresses_recovery_when_turn_progressed_after_item() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let timestamp = 1_700_000_000;
@@ -11389,7 +11330,7 @@ mod tests {
                 id: sea_orm::Set(thread.workspace_id.clone()),
                 name: sea_orm::Set("Observation fixture".to_owned()),
                 is_active: sea_orm::Set(true),
-                is_current: sea_orm::Set(true),
+                is_current: sea_orm::Set(false),
                 ..Default::default()
             })
             .exec(&crud_store.database_connection())
@@ -11507,7 +11448,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn late_provider_failure_after_timeout_is_stale_noop() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_late_provider_failure";
@@ -11650,7 +11591,7 @@ mod tests {
         assert!(reloaded.active_attempt_id.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unavailable_cli_runtime_reconciliation_requeues_without_consuming_an_attempt() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -11705,7 +11646,7 @@ mod tests {
         assert!(stale_events.is_empty());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn active_recovery_watchdog_does_not_use_hidden_three_minute_ceiling() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_active_recovery_watchdog";
@@ -11746,7 +11687,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn due_drain_does_not_expire_active_episode_but_audit_does() {
         let (store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -11789,7 +11730,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn watchdog_commit_rejects_progress_after_preparation_and_retains_episode() {
         let (store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_watchdog_progress_race";
@@ -11867,7 +11808,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn watchdog_preserves_strict_budget_and_backwards_clock_retry() {
         let (store, coordinator) = setup_coordinator().await;
         let start = 1_700_000_000;
@@ -11925,11 +11866,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn active_scan_advances_through_healthy_and_legacy_raw_poison_values() {
         let (store, coordinator) = setup_coordinator().await;
         let now = chrono::Utc::now().timestamp();
-        let mut jobs = Vec::new();
         for index in 0..5 {
             let job = coordinator
                 .enqueue_provider_failure_job(
@@ -11963,9 +11903,15 @@ mod tests {
                     .unwrap(),
                 ClaimedRecoveryActivation::Activated
             ));
-            jobs.push(job);
         }
-        jobs.sort_by(|a, b| a.id.cmp(&b.id));
+        // Use the same SQL ordering as the watchdog. Native locale ordering
+        // can differ from Rust's bytewise comparison of mixed-case IDs.
+        let upper = store.active_recovery_job_upper_id().await.unwrap().unwrap();
+        let jobs = store
+            .list_active_recovery_job_page(None, &upper, 5)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 5);
         materialize_turn_with_tool_item(
             store.as_ref(),
             "ws_scan",
@@ -11981,15 +11927,15 @@ mod tests {
                 .await
                 .unwrap()
         );
-        // Legacy corruption fixture through the application's scoped Entity DB
-        // path. The fallback {} policy must still permit later rows to progress.
+        // The schema enforces valid JSON. A value with the wrong policy shape
+        // must still let later rows progress through the active scan.
         let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[1].id.clone())
             .one(&store.database_connection())
             .await
             .unwrap()
             .unwrap();
         let mut row: pioneer_entity::recovery_job::ActiveModel = row.into();
-        row.policy_snapshot = Set("invalid legacy JSON".into());
+        row.policy_snapshot = Set(serde_json::json!("invalid policy shape").to_string());
         row.update(&store.database_connection()).await.unwrap();
         for (index, unknown_action) in [(2, true), (3, false)] {
             let row = pioneer_entity::recovery_job::Entity::find_by_id(jobs[index].id.clone())
@@ -12044,7 +11990,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn supervision_storage_error_does_not_hide_independent_due_terminal_job() {
         let (store, coordinator) = setup_coordinator().await;
         let active = coordinator
@@ -12097,7 +12043,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn changed_policy_rejects_prepared_watchdog_and_next_audit_uses_new_budget() {
         let (store, coordinator) = setup_coordinator().await;
         let start = 1_700_000_000;
@@ -12171,7 +12117,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn terminal_active_recovery_exhausts_after_duplicate_pending_job_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_terminal_active_cancels_pending";
@@ -12210,10 +12156,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_901, 64)
@@ -12249,7 +12192,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn duplicate_terminal_job_is_rejected_while_turn_has_active_recovery() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_pending_waits_for_active_recovery";
@@ -12288,10 +12231,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved terminal episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let events = coordinator
             .run_ready_jobs(1_700_000_002, 64)
@@ -12318,7 +12258,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_failure_inside_recovery_exhausts_same_job_when_attempts_are_spent() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -12361,7 +12301,7 @@ mod tests {
         assert_eq!(reloaded.provider_attempt_number, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn tool_recovery_success_closes_job_before_turn_completion() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_tool_recovery_success";
@@ -12421,7 +12361,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn turn_completion_succeeds_after_duplicate_pending_recovery_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_completion_cancels_pending";
@@ -12461,10 +12401,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -12493,7 +12430,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn turn_block_marks_active_recovery_blocked_without_exhausted_event() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_block_blocks_recovery";
@@ -12533,10 +12470,7 @@ mod tests {
             )
             .await
             .expect_err("a second unresolved recovery episode must be rejected");
-        assert!(
-            format!("{duplicate_error:#}")
-                .contains("UNIQUE constraint failed: recovery_job.turn_id")
-        );
+        assert_duplicate_recovery(&duplicate_error);
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -12574,7 +12508,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn active_transient_recovery_uses_persisted_policy_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_persisted_policy_snapshot";
@@ -12634,7 +12568,7 @@ mod tests {
         assert_eq!(reloaded.run_count, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn non_retryable_provider_failure_inside_active_recovery_is_not_rescheduled() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -12685,7 +12619,7 @@ mod tests {
         assert_eq!(reloaded.run_count, 1);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn invalid_request_provider_policy_marks_failed_without_retry() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -12723,7 +12657,7 @@ mod tests {
         assert_eq!(reloaded.run_count, 0);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn provider_rejected_policy_marks_failed_without_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -12766,7 +12700,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn persisted_legacy_retry_policy_cannot_replay_rejected_request() {
         let (_crud_store, coordinator) = setup_coordinator().await;
 
@@ -12818,7 +12752,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unsupported_streaming_requires_an_actual_transport_change() {
         let (_crud_store, coordinator) = setup_coordinator().await;
 
@@ -12843,7 +12777,7 @@ mod tests {
         assert!(non_stream_plan.terminal_reason.is_some());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unsupported_tool_calling_plan_disables_tools_without_terminal_reason() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedToolCalling, "stream");
@@ -12859,7 +12793,7 @@ mod tests {
         assert!(plan.terminal_reason.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn unsupported_image_input_plan_removes_images_without_terminal_reason() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedImageInput, "non_stream");
@@ -12875,7 +12809,7 @@ mod tests {
         assert!(plan.terminal_reason.is_none());
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn model_not_found_without_explicit_fallback_blocks_recovery_instead_of_failing() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator
@@ -12919,7 +12853,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn explicit_resume_requeues_blocked_turn_recovery_for_same_turn() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_resume_blocked";
@@ -13019,7 +12953,7 @@ mod tests {
         assert_eq!(turn.error, None);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn explicit_resume_requeues_blocked_tool_recovery_with_runtime_snapshot() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_resume_blocked_tool";
@@ -13097,7 +13031,7 @@ mod tests {
         assert_eq!(turn.status, TurnStatus::InProgress);
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn due_pending_mark_failed_repair_terminalizes_without_claim() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let job = coordinator

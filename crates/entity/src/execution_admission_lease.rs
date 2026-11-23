@@ -7,18 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "execution_admission_lease")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_execution_admission_lease_subject")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_execution_admission_lease_subject"
+    )]
     pub subject_kind: String,
-    #[sea_orm(unique_key = "uq_execution_admission_lease_subject")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_execution_admission_lease_subject"
+    )]
     pub subject_id: String,
+    #[sea_orm(column_type = "Text")]
     pub operation_class: String,
+    #[sea_orm(column_type = "Text")]
     pub quota_bucket: String,
+    #[sea_orm(column_type = "Text")]
     pub principal_id: String,
+    #[sea_orm(column_type = "Text")]
     pub role_key: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub policy_fingerprint: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub released_at: Option<DateTimeWithTimeZone>,

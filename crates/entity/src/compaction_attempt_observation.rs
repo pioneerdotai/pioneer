@@ -11,8 +11,7 @@ pub struct Model {
     pub operation_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub attempt: i64,
-    #[sea_orm(column_type = "Text")]
-    pub observation: String,
+    pub observation: Json,
     #[sea_orm(
         belongs_to,
         from = "operation_id",
@@ -20,7 +19,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

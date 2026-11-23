@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_timeline_projection_meta")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub projection_key: String,
     pub projection_version: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub source_thread_count: i64,
     pub source_turn_count: i64,

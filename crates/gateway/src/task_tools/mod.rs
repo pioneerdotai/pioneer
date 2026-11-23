@@ -6489,328 +6489,342 @@ mod tests {
 
     #[tokio::test]
     async fn member_task_tools_reject_foreign_private_task_ids() {
-        use crate::tests::authorization::{
-            IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID,
-            WORKSPACE_RED_ID,
-        };
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                use crate::tests::authorization::{
+                    IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID,
+                    WORKSPACE_RED_ID,
+                };
 
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("create isolated Epic 4 task-tool fixture");
-        harness
-            .database
-            .execute_unprepared(
-                "INSERT INTO task(\
-                    id,workspace_id,owner_kind,owner_id,created_by_thread_id,\
-                    root_task_id,parent_task_id,executor_kind,status,title,goal\
-                 ) VALUES(\
-                    'K0000000000000000000A','W00000000000000000001','user',\
-                    'P0000000000000000000A','T00000000000000000001',NULL,NULL,\
-                    'agent','waiting','Member A task','Member A task'),(\
-                    'K0000000000000000000B','W00000000000000000001','user',\
-                    'P0000000000000000000B','T00000000000000000002',NULL,NULL,\
-                    'agent','waiting','Member B task','Member B task');",
-            )
-            .await
-            .expect("materialize two private task roots");
-        let store = CrudStore::new(harness.database.clone());
-        let scope = TaskToolAuthorizationScope {
-            granted_actions: task_tool_specs()
-                .iter()
-                .map(|spec| task_tool_resource_action(&spec.spec.name).unwrap())
-                .collect(),
-            principal: crate::auth::AuthenticatedSessionPrincipal {
-                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
-                    .expect("gateway id"),
-                principal_id: pioneer_protocol::PrincipalId::new(MEMBER_A_ID)
-                    .expect("Member principal id"),
-                kind: PrincipalKind::User,
-                role_key: Some(pioneer_protocol::RoleKey::member()),
-                device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
-                    .expect("device id"),
-                session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
-                    .expect("session id"),
-                access_jti: "task-tool-test".to_owned(),
-                access_expires_at_unix: u64::MAX,
-            },
-            workspace_id: WORKSPACE_RED_ID.to_owned(),
-            root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
-        };
-
-        scope
-            .authorize_task(
-                &store,
-                "K0000000000000000000A",
-                crate::authorization::ResourceAction::TaskRead,
-            )
-            .await
-            .expect("Member may read task rooted in its authorized private thread");
-        scope
-            .authorize_task(
-                &store,
-                "K0000000000000000000A",
-                crate::authorization::ResourceAction::TaskReview,
-            )
-            .await
-            .expect("initiating Member may manage its task");
-        assert!(
-            scope
-                .task_configuration_allowed(&store, "K0000000000000000000A")
-                .await,
-            "a principal that may manage the exact Task may inspect its safe configuration"
-        );
-
-        let mut read_only_scope = scope.clone();
-        for action in [
-            crate::authorization::ResourceAction::TaskRead,
-            crate::authorization::ResourceAction::TaskCancel,
-            crate::authorization::ResourceAction::TaskScheduleManage,
-            crate::authorization::ResourceAction::TaskReview,
-        ] {
-            let mut narrowed = scope.clone();
-            narrowed.granted_actions.remove(&action);
-            assert!(
-                narrowed
-                    .authorize_task(&store, "K0000000000000000000A", action)
+                let harness = IsolatedEpic4Harness::new(test_database)
                     .await
-                    .is_err(),
-                "current principal permissions cannot widen the immutable execution grant"
-            );
-            if action == crate::authorization::ResourceAction::TaskScheduleManage {
+                    .expect("create isolated Epic 4 task-tool fixture");
+                harness
+                    .database
+                    .execute_unprepared(
+                        "INSERT INTO task(\
+                            id,workspace_id,owner_kind,owner_id,created_by_thread_id,\
+                            root_task_id,parent_task_id,executor_kind,status,title,goal\
+                         ) VALUES(\
+                            'K0000000000000000000A','W00000000000000000001','user',\
+                            'P0000000000000000000A','T00000000000000000001',NULL,NULL,\
+                            'agent','waiting','Member A task','Member A task'),(\
+                            'K0000000000000000000B','W00000000000000000001','user',\
+                            'P0000000000000000000B','T00000000000000000002',NULL,NULL,\
+                            'agent','waiting','Member B task','Member B task');",
+                    )
+                    .await
+                    .expect("materialize two private task roots");
+                let store = CrudStore::new(harness.database.clone());
+                let scope = TaskToolAuthorizationScope {
+                    granted_actions: task_tool_specs()
+                        .iter()
+                        .map(|spec| task_tool_resource_action(&spec.spec.name).unwrap())
+                        .collect(),
+                    principal: crate::auth::AuthenticatedSessionPrincipal {
+                        gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
+                            .expect("gateway id"),
+                        principal_id: pioneer_protocol::PrincipalId::new(MEMBER_A_ID)
+                            .expect("Member principal id"),
+                        kind: PrincipalKind::User,
+                        role_key: Some(pioneer_protocol::RoleKey::member()),
+                        device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
+                            .expect("device id"),
+                        session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
+                            .expect("session id"),
+                        access_jti: "task-tool-test".to_owned(),
+                        access_expires_at_unix: u64::MAX,
+                    },
+                    workspace_id: WORKSPACE_RED_ID.to_owned(),
+                    root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
+                };
+
+                scope
+                    .authorize_task(
+                        &store,
+                        "K0000000000000000000A",
+                        crate::authorization::ResourceAction::TaskRead,
+                    )
+                    .await
+                    .expect("Member may read task rooted in its authorized private thread");
+                scope
+                    .authorize_task(
+                        &store,
+                        "K0000000000000000000A",
+                        crate::authorization::ResourceAction::TaskReview,
+                    )
+                    .await
+                    .expect("initiating Member may manage its task");
                 assert!(
-                    !narrowed
+                    scope
+                        .task_configuration_allowed(&store, "K0000000000000000000A")
+                        .await,
+                    "a principal that may manage the exact Task may inspect its safe configuration"
+                );
+
+                let mut read_only_scope = scope.clone();
+                for action in [
+                    crate::authorization::ResourceAction::TaskRead,
+                    crate::authorization::ResourceAction::TaskCancel,
+                    crate::authorization::ResourceAction::TaskScheduleManage,
+                    crate::authorization::ResourceAction::TaskReview,
+                ] {
+                    let mut narrowed = scope.clone();
+                    narrowed.granted_actions.remove(&action);
+                    assert!(
+                        narrowed
+                            .authorize_task(&store, "K0000000000000000000A", action)
+                            .await
+                            .is_err(),
+                        "current principal permissions cannot widen the immutable execution grant"
+                    );
+                    if action == crate::authorization::ResourceAction::TaskScheduleManage {
+                        assert!(
+                            !narrowed
+                                .task_configuration_allowed(&store, "K0000000000000000000A")
+                                .await
+                        );
+                    }
+                }
+                read_only_scope.principal.role_key = Some(
+                    pioneer_protocol::RoleKey::new("synthetic_observer")
+                        .expect("synthetic observer role key"),
+                );
+                read_only_scope
+                    .authorize_task(
+                        &store,
+                        "K0000000000000000000A",
+                        crate::authorization::ResourceAction::TaskRead,
+                    )
+                    .await
+                    .expect("read-only observer may inspect Task status");
+                assert!(
+                    !read_only_scope
+                        .task_configuration_allowed(&store, "K0000000000000000000A")
+                        .await,
+                    "read-only Task access must not disclose management configuration"
+                );
+                assert!(
+                    scope
+                        .authorize_task(
+                            &store,
+                            "K0000000000000000000B",
+                            crate::authorization::ResourceAction::TaskRead,
+                        )
+                        .await
+                        .is_err(),
+                    "a guessed task id from another private thread must fail closed"
+                );
+                assert!(
+                    !scope
+                        .task_configuration_allowed(&store, "K0000000000000000000B")
+                        .await,
+                    "management authority over one root must not disclose another root's Task configuration"
+                );
+                assert_eq!(
+                    scope
+                        .task_root_access_filter()
+                        .expect("Member list must be root-scoped")
+                        .allowed_root_thread_ids,
+                    vec![THREAD_RED_PRIVATE_A_ID.to_owned()]
+                );
+                assert_ne!(THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID);
+                harness.database.execute_unprepared(
+                    "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000A' AND workspace_id='W00000000000000000001'"
+                ).await.expect("revoke fixture membership");
+                for action in [
+                    crate::authorization::ResourceAction::TaskRead,
+                    crate::authorization::ResourceAction::TaskCancel,
+                    crate::authorization::ResourceAction::TaskScheduleManage,
+                    crate::authorization::ResourceAction::TaskReview,
+                ] {
+                    assert!(
+                        scope
+                            .authorize_task(&store, "K0000000000000000000A", action)
+                            .await
+                            .is_err(),
+                        "an admitted scope must not retain access after membership revocation"
+                    );
+                }
+                assert!(
+                    !scope
                         .task_configuration_allowed(&store, "K0000000000000000000A")
                         .await
                 );
-            }
-        }
-        read_only_scope.principal.role_key = Some(
-            pioneer_protocol::RoleKey::new("synthetic_observer")
-                .expect("synthetic observer role key"),
-        );
-        read_only_scope
-            .authorize_task(
-                &store,
-                "K0000000000000000000A",
-                crate::authorization::ResourceAction::TaskRead,
-            )
-            .await
-            .expect("read-only observer may inspect Task status");
-        assert!(
-            !read_only_scope
-                .task_configuration_allowed(&store, "K0000000000000000000A")
-                .await,
-            "read-only Task access must not disclose management configuration"
-        );
-        assert!(
-            scope
-                .authorize_task(
-                    &store,
-                    "K0000000000000000000B",
-                    crate::authorization::ResourceAction::TaskRead,
-                )
-                .await
-                .is_err(),
-            "a guessed task id from another private thread must fail closed"
-        );
-        assert!(
-            !scope
-                .task_configuration_allowed(&store, "K0000000000000000000B")
-                .await,
-            "management authority over one root must not disclose another root's Task configuration"
-        );
-        assert_eq!(
-            scope
-                .task_root_access_filter()
-                .expect("Member list must be root-scoped")
-                .allowed_root_thread_ids,
-            vec![THREAD_RED_PRIVATE_A_ID.to_owned()]
-        );
-        assert_ne!(THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID);
-        harness.database.execute_unprepared(
-            "DELETE FROM workspace_membership WHERE principal_id='P0000000000000000000A' AND workspace_id='W00000000000000000001'"
-        ).await.expect("revoke fixture membership");
-        for action in [
-            crate::authorization::ResourceAction::TaskRead,
-            crate::authorization::ResourceAction::TaskCancel,
-            crate::authorization::ResourceAction::TaskScheduleManage,
-            crate::authorization::ResourceAction::TaskReview,
-        ] {
-            assert!(
-                scope
-                    .authorize_task(&store, "K0000000000000000000A", action)
-                    .await
-                    .is_err(),
-                "an admitted scope must not retain access after membership revocation"
-            );
-        }
-        assert!(
-            !scope
-                .task_configuration_allowed(&store, "K0000000000000000000A")
-                .await
-        );
+            }.await;
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
     async fn member_task_delivery_is_limited_to_authorized_threads_and_safe_modes() {
-        use crate::tests::authorization::{
-            IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_INTERNAL_ID, THREAD_RED_PRIVATE_A_ID,
-            THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID,
-        };
+        pioneer_postgres_test::with_database(async |test_database| {
+            async {
+                use crate::tests::authorization::{
+                    IsolatedEpic4Harness, MEMBER_A_ID, THREAD_RED_INTERNAL_ID,
+                    THREAD_RED_PRIVATE_A_ID, THREAD_RED_PRIVATE_B_ID, WORKSPACE_RED_ID,
+                };
 
-        let harness = IsolatedEpic4Harness::new()
-            .await
-            .expect("create isolated Epic 4 delivery fixture");
-        let store = CrudStore::new(harness.database.clone());
-        let scope = TaskToolAuthorizationScope {
-            granted_actions: task_tool_specs()
-                .iter()
-                .map(|spec| task_tool_resource_action(&spec.spec.name).unwrap())
-                .collect(),
-            principal: crate::auth::AuthenticatedSessionPrincipal {
-                gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
-                    .expect("gateway id"),
-                principal_id: pioneer_protocol::PrincipalId::new(MEMBER_A_ID)
-                    .expect("Member principal id"),
-                kind: PrincipalKind::User,
-                role_key: Some(pioneer_protocol::RoleKey::member()),
-                device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
-                    .expect("device id"),
-                session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
-                    .expect("session id"),
-                access_jti: "task-delivery-test".to_owned(),
-                access_expires_at_unix: u64::MAX,
-            },
-            workspace_id: WORKSPACE_RED_ID.to_owned(),
-            root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
-        };
-        let parent_turn_id = "U0000000000000000000A";
-        let root_thread = store
-            .get_thread_model(THREAD_RED_PRIVATE_A_ID)
-            .await
-            .expect("delivery root lookup should succeed")
-            .expect("delivery root should exist");
-        store
-            .materialize_turn_start(
-                &root_thread,
-                pioneer_protocol::SandboxMode::FullAccess,
-                &pioneer_protocol::Turn {
-                    work_owner: Default::default(),
-                    id: parent_turn_id.to_owned(),
-                    status: pioneer_protocol::TurnStatus::InProgress,
-                    turn_kind: pioneer_protocol::TurnKind::Conversation,
-                    origin: pioneer_protocol::TurnOrigin::User,
-                    mode: Default::default(),
-                    author: None,
-                    reply_to_turn_id: None,
-                    mentions: Vec::new(),
-                    message_revision: 0,
-                    message_deleted: false,
-                    error: None,
-                    prompt_manifest: None,
-                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
-                    ),
-                },
-                &[],
-                pioneer_protocol::PersistedActorRef::Principal(
-                    scope.principal.principal_id.clone(),
-                ),
-            )
-            .await
-            .expect("delivery parent turn should persist");
-        let parent_authority = crate::authorization::ExecutionAuthorizationContext::for_test(
-            &scope.principal,
-            WORKSPACE_RED_ID,
-            THREAD_RED_PRIVATE_A_ID,
-            &pioneer_protocol::default_turn_permission_profile_snapshot(),
-            None,
-        )
-        .to_persisted_json()
-        .expect("delivery parent authority should serialize");
-        assert!(
-            store
-                .set_turn_execution_authorization_context(parent_turn_id, &parent_authority)
-                .await
-                .expect("delivery parent authority should persist")
-        );
-        harness
-            .database
-            .execute_unprepared(
-                format!(
-                    "UPDATE thread_lineage SET created_by_turn_id='{parent_turn_id}' \
-                     WHERE child_thread_id='{THREAD_RED_INTERNAL_ID}'"
-                )
-                .as_str(),
-            )
-            .await
-            .expect("delivery child lineage should reference its typed parent execution");
-        let policy =
-            |mode, thread_id: Option<&str>, webhook_url: Option<&str>| TaskDeliveryPolicy {
-                mode,
-                thread_target: (mode == TaskDeliveryMode::Thread)
-                    .then_some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
-                thread_id: thread_id.map(str::to_owned),
-                webhook_url: webhook_url.map(str::to_owned),
-                include_result: true,
-                format: pioneer_protocol::TaskDeliveryFormat::Summary,
-            };
+                let harness = IsolatedEpic4Harness::new(test_database)
+                    .await
+                    .expect("create isolated Epic 4 delivery fixture");
+                let store = CrudStore::new(harness.database.clone());
+                let scope = TaskToolAuthorizationScope {
+                    granted_actions: task_tool_specs()
+                        .iter()
+                        .map(|spec| task_tool_resource_action(&spec.spec.name).unwrap())
+                        .collect(),
+                    principal: crate::auth::AuthenticatedSessionPrincipal {
+                        gateway_id: pioneer_protocol::GatewayId::new("G00000000000000000001")
+                            .expect("gateway id"),
+                        principal_id: pioneer_protocol::PrincipalId::new(MEMBER_A_ID)
+                            .expect("Member principal id"),
+                        kind: PrincipalKind::User,
+                        role_key: Some(pioneer_protocol::RoleKey::member()),
+                        device_id: pioneer_protocol::DeviceId::new("D0000000000000000000A")
+                            .expect("device id"),
+                        session_id: pioneer_protocol::AuthSessionId::new("S0000000000000000000A")
+                            .expect("session id"),
+                        access_jti: "task-delivery-test".to_owned(),
+                        access_expires_at_unix: u64::MAX,
+                    },
+                    workspace_id: WORKSPACE_RED_ID.to_owned(),
+                    root_thread_id: THREAD_RED_PRIVATE_A_ID.to_owned(),
+                };
+                let parent_turn_id = "U0000000000000000000A";
+                let root_thread = store
+                    .get_thread_model(THREAD_RED_PRIVATE_A_ID)
+                    .await
+                    .expect("delivery root lookup should succeed")
+                    .expect("delivery root should exist");
+                store
+                    .materialize_turn_start(
+                        &root_thread,
+                        pioneer_protocol::SandboxMode::FullAccess,
+                        &pioneer_protocol::Turn {
+                            work_owner: Default::default(),
+                            id: parent_turn_id.to_owned(),
+                            status: pioneer_protocol::TurnStatus::InProgress,
+                            turn_kind: pioneer_protocol::TurnKind::Conversation,
+                            origin: pioneer_protocol::TurnOrigin::User,
+                            mode: Default::default(),
+                            author: None,
+                            reply_to_turn_id: None,
+                            mentions: Vec::new(),
+                            message_revision: 0,
+                            message_deleted: false,
+                            error: None,
+                            prompt_manifest: None,
+                            permission_profile:
+                                pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        },
+                        &[],
+                        pioneer_protocol::PersistedActorRef::Principal(
+                            scope.principal.principal_id.clone(),
+                        ),
+                    )
+                    .await
+                    .expect("delivery parent turn should persist");
+                let parent_authority =
+                    crate::authorization::ExecutionAuthorizationContext::for_test(
+                        &scope.principal,
+                        WORKSPACE_RED_ID,
+                        THREAD_RED_PRIVATE_A_ID,
+                        &pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        None,
+                    )
+                    .to_persisted_json()
+                    .expect("delivery parent authority should serialize");
+                assert!(
+                    store
+                        .set_turn_execution_authorization_context(parent_turn_id, &parent_authority)
+                        .await
+                        .expect("delivery parent authority should persist")
+                );
+                harness
+                    .database
+                    .execute_unprepared(
+                        format!(
+                            "UPDATE thread_lineage SET created_by_turn_id='{parent_turn_id}' \
+                             WHERE child_thread_id='{THREAD_RED_INTERNAL_ID}'"
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .expect("delivery child lineage should reference its typed parent execution");
+                let policy =
+                    |mode, thread_id: Option<&str>, webhook_url: Option<&str>| TaskDeliveryPolicy {
+                        mode,
+                        thread_target: (mode == TaskDeliveryMode::Thread)
+                            .then_some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
+                        thread_id: thread_id.map(str::to_owned),
+                        webhook_url: webhook_url.map(str::to_owned),
+                        include_result: true,
+                        format: pioneer_protocol::TaskDeliveryFormat::Summary,
+                    };
 
-        for mode in [TaskDeliveryMode::None, TaskDeliveryMode::UserNotification] {
-            scope
-                .authorize_delivery_policy(&store, Some(&policy(mode, None, None)))
-                .await
-                .expect("safe Member delivery mode");
-        }
-        scope
-            .authorize_delivery_policy(
-                &store,
-                Some(&policy(
-                    TaskDeliveryMode::Thread,
-                    Some(THREAD_RED_PRIVATE_A_ID),
-                    None,
-                )),
-            )
-            .await
-            .expect("Member may deliver to its authorized root thread");
-        scope
-            .authorize_delivery_policy(
-                &store,
-                Some(&policy(
-                    TaskDeliveryMode::Thread,
-                    Some(THREAD_RED_INTERNAL_ID),
-                    None,
-                )),
-            )
-            .await
-            .expect("Member task result may return through persisted child-thread lineage");
-        assert!(
-            scope
-                .authorize_delivery_policy(
-                    &store,
-                    Some(&policy(
-                        TaskDeliveryMode::Thread,
-                        Some(THREAD_RED_PRIVATE_B_ID),
-                        None,
-                    )),
-                )
-                .await
-                .is_err(),
-            "delivery to another Member's private thread must fail closed"
-        );
-        assert!(
-            scope
-                .authorize_delivery_policy(
-                    &store,
-                    Some(&policy(
-                        TaskDeliveryMode::Webhook,
-                        None,
-                        Some("https://example.invalid/result"),
-                    )),
-                )
-                .await
-                .is_err(),
-            "detached webhook egress requires a future explicit capability"
-        );
+                for mode in [TaskDeliveryMode::None, TaskDeliveryMode::UserNotification] {
+                    scope
+                        .authorize_delivery_policy(&store, Some(&policy(mode, None, None)))
+                        .await
+                        .expect("safe Member delivery mode");
+                }
+                scope
+                    .authorize_delivery_policy(
+                        &store,
+                        Some(&policy(
+                            TaskDeliveryMode::Thread,
+                            Some(THREAD_RED_PRIVATE_A_ID),
+                            None,
+                        )),
+                    )
+                    .await
+                    .expect("Member may deliver to its authorized root thread");
+                scope
+                    .authorize_delivery_policy(
+                        &store,
+                        Some(&policy(
+                            TaskDeliveryMode::Thread,
+                            Some(THREAD_RED_INTERNAL_ID),
+                            None,
+                        )),
+                    )
+                    .await
+                    .expect("Member task result may return through persisted child-thread lineage");
+                assert!(
+                    scope
+                        .authorize_delivery_policy(
+                            &store,
+                            Some(&policy(
+                                TaskDeliveryMode::Thread,
+                                Some(THREAD_RED_PRIVATE_B_ID),
+                                None,
+                            )),
+                        )
+                        .await
+                        .is_err(),
+                    "delivery to another Member's private thread must fail closed"
+                );
+                assert!(
+                    scope
+                        .authorize_delivery_policy(
+                            &store,
+                            Some(&policy(
+                                TaskDeliveryMode::Webhook,
+                                None,
+                                Some("https://example.invalid/result"),
+                            )),
+                        )
+                        .await
+                        .is_err(),
+                    "detached webhook egress requires a future explicit capability"
+                );
+            }
+            .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

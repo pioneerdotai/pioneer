@@ -1,0 +1,2449 @@
+use crate::drop_tables;
+use sea_orm_migration::prelude::*;
+use sea_orm_migration::schema::{
+    big_integer, big_integer_null, binary, boolean, double_null, json, json_binary_null, json_null,
+    small_integer, text, text_null, timestamp_with_time_zone, timestamp_with_time_zone_null,
+};
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table("task")
+                    .col(text("id").primary_key())
+                    .col(text("workspace_id"))
+                    .col(text("owner_kind"))
+                    .col(text_null("owner_id"))
+                    .col(text_null("created_by_thread_id"))
+                    .col(text_null("created_by_turn_id"))
+                    .col(text_null("root_task_id"))
+                    .col(text_null("parent_task_id"))
+                    .col(text("executor_kind"))
+                    .col(text("status"))
+                    .col(text("title"))
+                    .col(text("goal"))
+                    .col(big_integer("priority").default(0))
+                    .col(json_binary_null("lifecycle_policy_json"))
+                    .col(json_null("delivery_policy_json"))
+                    .col(json_binary_null("retry_policy_json"))
+                    .col(json_binary_null("timeout_policy_json"))
+                    .col(json_null("concurrency_policy_json"))
+                    .col(json_null("metadata_json"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
+                    .col(big_integer("revision").default(0))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_workspace_status")
+                    .table("task")
+                    .col("workspace_id")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_workspace_owner")
+                    .table("task")
+                    .col("workspace_id")
+                    .col("owner_kind")
+                    .col("owner_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_parent")
+                    .table("task")
+                    .col("parent_task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_root")
+                    .table("task")
+                    .col("root_task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_created_by_thread")
+                    .table("task")
+                    .col("created_by_thread_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_executor_status")
+                    .table("task")
+                    .col("executor_kind")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("compaction_task_creator")
+                    .table("task")
+                    .col("workspace_id")
+                    .col("created_by_thread_id")
+                    .col("created_by_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_inbox_workspace_id")
+                    .table("task")
+                    .col("workspace_id")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager.create_index(
+            Index::create().name("compaction_root_live_composer").table("task")
+                .col("workspace_id")
+                .col("created_by_thread_id")
+                .col("status")
+                .and_where(Expr::cust(r#""status" NOT IN ('completed', 'failed', 'blocked', 'cancelled') AND "metadata_json" IS NOT NULL"#))
+                .to_owned(),
+        ).await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_child_creator")
+                    .table("task")
+                    .col("created_by_thread_id")
+                    .col("created_by_turn_id")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_trigger")
+                    .col(text("id").extra(r#"COLLATE "C""#).primary_key())
+                    .col(text("task_id"))
+                    .col(text("kind"))
+                    .col(text("status"))
+                    .col(json("spec_json"))
+                    .col(timestamp_with_time_zone_null("next_fire_at"))
+                    .col(timestamp_with_time_zone_null("last_fire_at"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(text_null("webhook_secret_ref"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_trigger_task")
+                    .table("task_trigger")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_trigger_due")
+                    .table("task_trigger")
+                    .col("status")
+                    .col("next_fire_at")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_trigger_kind_status")
+                    .table("task_trigger")
+                    .col("kind")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_trigger_task_created")
+                    .table("task_trigger")
+                    .col("task_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run")
+                    .col(text("id").extra(r#"COLLATE "C""#).primary_key())
+                    .col(text("task_id"))
+                    .col(text_null("trigger_id"))
+                    .col(text_null("parent_run_id"))
+                    .col(text("run_group_id"))
+                    .col(big_integer("attempt_number").default(1))
+                    .col(text_null("retry_of_run_id"))
+                    .col(timestamp_with_time_zone_null("ready_at"))
+                    .col(big_integer("run_number"))
+                    .col(text("status"))
+                    .col(text("executor_kind"))
+                    .col(timestamp_with_time_zone_null("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .col(timestamp_with_time_zone_null("heartbeat_at"))
+                    .col(text_null("locked_by"))
+                    .col(timestamp_with_time_zone_null("lock_expires_at"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(big_integer_null("inbox_sequence"))
+                    // A webhook can contain an escaped NUL. Preserve the serialized
+                    // input across the driver's JSONB bind and exact retry checks.
+                    .col(text_null("trigger_input_json"))
+                    .check(Expr::cust(
+                        "trigger_input_json IS NULL OR trigger_input_json IS JSON",
+                    ))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_task")
+                    .table("task_run")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_status")
+                    .table("task_run")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_lock")
+                    .table("task_run")
+                    .col("locked_by")
+                    .col("lock_expires_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_parent")
+                    .table("task_run")
+                    .col("parent_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_ready")
+                    .table("task_run")
+                    .col("status")
+                    .col("ready_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_retry_of")
+                    .table("task_run")
+                    .col("retry_of_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_group_attempt")
+                    .table("task_run")
+                    .unique()
+                    .col("task_id")
+                    .col("run_group_id")
+                    .col("attempt_number")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_task_number")
+                    .table("task_run")
+                    .unique()
+                    .col("task_id")
+                    .col("run_number")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_task_id")
+                    .table("task_run")
+                    .col("task_id")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_status_id")
+                    .table("task_run")
+                    .col("status")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_inbox_epoch")
+                    .table("task_run")
+                    .col("task_id")
+                    .col(Expr::cust(
+                        r#"( floor(extract(epoch FROM completed_at AT TIME ZONE 'UTC'))::bigint )"#,
+                    ))
+                    .col("id")
+                    .col("status")
+                    .col("completed_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_write_lock")
+                    .col(text("id").primary_key())
+                    .col(text("workspace_id"))
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text("scope_kind"))
+                    .col(text("scope_path"))
+                    .col(text("status"))
+                    .col(timestamp_with_time_zone("acquired_at"))
+                    .col(timestamp_with_time_zone_null("expires_at"))
+                    .col(timestamp_with_time_zone_null("released_at"))
+                    .col(text("conflict_policy"))
+                    .col(text_null("reason"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_write_lock_workspace_status")
+                    .table("task_write_lock")
+                    .col("workspace_id")
+                    .col("status")
+                    .col("expires_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_write_lock_run")
+                    .table("task_write_lock")
+                    .col("task_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_write_lock_scope")
+                    .table("task_write_lock")
+                    .col("workspace_id")
+                    .col("scope_path")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager.create_table(
+            Table::create().table("task_delivery")
+                .col(text("id").primary_key())
+                .col(text("workspace_id"))
+                .col(text("task_id"))
+                .col(text("run_id"))
+                .col(text("delivery_key"))
+                .col(text("mode"))
+                .col(text_null("target_thread_id"))
+                .col(text_null("target_user_id"))
+                .col(text_null("webhook_url"))
+                .col(text_null("webhook_url_fingerprint"))
+                .col(text("status"))
+                .col(timestamp_with_time_zone_null("next_attempt_at"))
+                .col(big_integer("attempt_count").default(0))
+                .col(big_integer("max_attempts").default(1))
+                .col(json_null("result_snapshot_json"))
+                .col(json_null("error_snapshot_json"))
+                .col(text_null("delivered_turn_id").extra(r#"COLLATE "C""#))
+                .col(text_null("delivered_notification_id"))
+                .col(timestamp_with_time_zone_null("delivered_at"))
+                .col(text_null("last_error"))
+                .col(timestamp_with_time_zone("created_at").default(Expr::cust(r#"statement_timestamp()"#)))
+                .col(timestamp_with_time_zone("updated_at").default(Expr::cust(r#"statement_timestamp()"#)))
+                .col(text_null("thread_target"))
+                .check(Expr::cust(r#"thread_target IS NULL OR thread_target IN ( 'origin_thread' , 'current_thread' , 'collaboration_root' , 'exact_thread' )"#))
+                .to_owned(),
+        ).await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_due")
+                    .table("task_delivery")
+                    .col("workspace_id")
+                    .col("status")
+                    .col("next_attempt_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_task_run")
+                    .table("task_delivery")
+                    .col("task_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_delivery_key")
+                    .table("task_delivery")
+                    .unique()
+                    .col("delivery_key")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("compaction_delivery_turn")
+                    .table("task_delivery")
+                    .col("workspace_id")
+                    .col("target_thread_id")
+                    .col("delivered_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("compaction_delivery_source")
+                    .table("task_delivery")
+                    .col("task_id")
+                    .col("workspace_id")
+                    .col("target_thread_id")
+                    .col("status")
+                    .col("delivered_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_recovery_source")
+                    .table("task_delivery")
+                    .col("status")
+                    .col("updated_at")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_fanout_pending")
+                    .table("task_delivery")
+                    .col("task_id")
+                    .col("run_id")
+                    .col("workspace_id")
+                    .col("updated_at")
+                    .and_where(Expr::cust(r#"status IN ('pending','delivering')"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_inbox_result")
+                    .table("task_delivery")
+                    .col("workspace_id")
+                    .col("target_thread_id")
+                    .col("delivered_turn_id")
+                    .col("task_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_delivery_attempt")
+                    .col(text("id").primary_key())
+                    .col(text("delivery_id"))
+                    .col(big_integer("attempt_number"))
+                    .col(text("status"))
+                    .col(timestamp_with_time_zone("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .col(big_integer_null("http_status"))
+                    .col(text_null("error"))
+                    .col(text_null("response_fingerprint"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_attempt_delivery")
+                    .table("task_delivery_attempt")
+                    .col("delivery_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_delivery_attempt_number")
+                    .table("task_delivery_attempt")
+                    .unique()
+                    .col("delivery_id")
+                    .col("attempt_number")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_agent_spec")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text_null("run_id"))
+                    .col(text_null("agent_role"))
+                    .col(text_null("agent_nickname"))
+                    .col(text_null("model"))
+                    .col(text_null("model_provider"))
+                    .col(json("prompt_json"))
+                    .col(json_null("context_policy_json"))
+                    .col(json_null("tool_policy_json"))
+                    .col(json_null("result_contract_json"))
+                    .col(json_null("review_policy_json"))
+                    .col(big_integer("depth"))
+                    .col(big_integer("max_depth"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(json_null("permission_cap_json"))
+                    .col(json_null("security_cap_json"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_task")
+                    .table("task_agent_spec")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_run")
+                    .table("task_agent_spec")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_depth")
+                    .table("task_agent_spec")
+                    .col("depth")
+                    .col("max_depth")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_task_updated")
+                    .table("task_agent_spec")
+                    .col("task_id")
+                    .col("updated_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_run_updated")
+                    .table("task_agent_spec")
+                    .col("run_id")
+                    .col("updated_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_task_created")
+                    .table("task_agent_spec")
+                    .col("task_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_agent_spec_run_created")
+                    .table("task_agent_spec")
+                    .col("run_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_dependency")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("depends_on_task_id"))
+                    .col(text("kind"))
+                    .col(json_null("condition_json"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_dependency_task")
+                    .table("task_dependency")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_dependency_depends_on")
+                    .table("task_dependency")
+                    .col("depends_on_task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_dependency_pair_kind")
+                    .table("task_dependency")
+                    .unique()
+                    .col("task_id")
+                    .col("depends_on_task_id")
+                    .col("kind")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_event")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text_null("run_id"))
+                    .col(text_null("thread_id"))
+                    .col(text_null("turn_id"))
+                    .col(big_integer("sequence"))
+                    .col(text("event_type"))
+                    .col(binary("payload_json"))
+                    .col(small_integer("payload_json_codec"))
+                    .col(big_integer("payload_json_bytes"))
+                    .col(big_integer("payload_json_chars"))
+                    .col(binary("payload_json_sha256"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(text_null("idempotency_key"))
+                    .check(Expr::cust(
+                        "payload_json_codec IN (0, 1)
+                         AND payload_json_chars BETWEEN 0 AND payload_json_bytes
+                         AND octet_length(payload_json_sha256) = 32
+                         AND ((payload_json_codec = 0 AND octet_length(payload_json) = payload_json_bytes)
+                              OR (payload_json_codec = 1 AND octet_length(payload_json) + 2 < payload_json_bytes))",
+                    ))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_event_task_sequence")
+                    .table("task_event")
+                    .col("task_id")
+                    .col("sequence")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_event_run")
+                    .table("task_event")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_event_thread_turn")
+                    .table("task_event")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_event_type")
+                    .table("task_event")
+                    .col("event_type")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_event_task_sequence")
+                    .table("task_event")
+                    .unique()
+                    .col("task_id")
+                    .col("sequence")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_event_task_idempotency_key")
+                    .table("task_event")
+                    .unique()
+                    .col("task_id")
+                    .col("idempotency_key")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .get_connection()
+            .execute_unprepared(include_str!("sql/m20261119_000006_tasks/storage.sql"))
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_run")
+                    .col(text("id").primary_key())
+                    .col(text("idempotency_key"))
+                    .col(text("subscription_id"))
+                    .col(text("hook_id"))
+                    .col(text("phase"))
+                    .col(text("status"))
+                    .col(text_null("scope_kind"))
+                    .col(text_null("scope_id"))
+                    .col(text_null("workspace_id"))
+                    .col(text_null("thread_id"))
+                    .col(text_null("turn_id"))
+                    .col(text_null("task_id"))
+                    .col(text_null("agent_id"))
+                    .col(text_null("actor_kind"))
+                    .col(text_null("actor_id"))
+                    .col(text_null("context_mode"))
+                    .col(big_integer("attempt_count").default(0))
+                    .col(big_integer("contribution_count").default(0))
+                    .col(big_integer("diagnostic_count").default(0))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
+                    .col(text_null("error_code"))
+                    .col(text_null("error_message_preview"))
+                    .col(boolean("error_retryable").default(false))
+                    .col(boolean("error_safe_for_user").default(true))
+                    .col(text("metadata_json").default("{}"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(timestamp_with_time_zone_null("queued_at"))
+                    .col(timestamp_with_time_zone_null("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .col(timestamp_with_time_zone_null("deadline_at"))
+                    .col(text_null("resume_state_json"))
+                    .check(Expr::cust(
+                        "resume_state_json IS NULL OR resume_state_json IS JSON",
+                    ))
+                    .check(Expr::cust("metadata_json IS JSON"))
+                    .check(Expr::cust("contribution_hashes_json IS JSON"))
+                    .check(Expr::cust("diagnostic_previews_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_hook_run_idempotency_key")
+                    .table("hook_run")
+                    .unique()
+                    .col("idempotency_key")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_phase_status")
+                    .table("hook_run")
+                    .col("phase")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_workspace_phase")
+                    .table("hook_run")
+                    .col("workspace_id")
+                    .col("phase")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_thread_turn")
+                    .table("hook_run")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_task_id")
+                    .table("hook_run")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_agent_id")
+                    .table("hook_run")
+                    .col("agent_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_status_deadline")
+                    .table("hook_run")
+                    .col("status")
+                    .col("deadline_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_created_at")
+                    .table("hook_run")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_status_queued_at")
+                    .table("hook_run")
+                    .col("status")
+                    .col("queued_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_run_attempt")
+                    .col(text("id").primary_key())
+                    .col(text("hook_run_id"))
+                    .col(big_integer("attempt_number"))
+                    .col(text("status"))
+                    .col(big_integer("contribution_count").default(0))
+                    .col(big_integer("diagnostic_count").default(0))
+                    .col(text("contribution_hashes_json").default("[]"))
+                    .col(text("diagnostic_previews_json").default("[]"))
+                    .col(text_null("error_code"))
+                    .col(text_null("error_message_preview"))
+                    .col(boolean("error_retryable").default(false))
+                    .col(boolean("error_safe_for_user").default(true))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(timestamp_with_time_zone_null("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .col(big_integer_null("duration_ms"))
+                    .check(Expr::cust("contribution_hashes_json IS JSON"))
+                    .check(Expr::cust("diagnostic_previews_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_hook_run_attempt_run_number")
+                    .table("hook_run_attempt")
+                    .unique()
+                    .col("hook_run_id")
+                    .col("attempt_number")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_run_id")
+                    .table("hook_run_attempt")
+                    .col("hook_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_status")
+                    .table("hook_run_attempt")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_run_attempt_created_at")
+                    .table("hook_run_attempt")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("hook_audit_event")
+                    .col(text("id").primary_key())
+                    .col(text("hook_run_id"))
+                    .col(text_null("hook_run_attempt_id"))
+                    .col(text("subscription_id"))
+                    .col(text("hook_id"))
+                    .col(text("phase"))
+                    .col(text("event_kind"))
+                    .col(text_null("contribution_hash"))
+                    .col(text_null("workspace_id"))
+                    .col(text_null("thread_id"))
+                    .col(text_null("turn_id"))
+                    .col(text_null("task_id"))
+                    .col(text_null("agent_id"))
+                    .col(text_null("actor_kind"))
+                    .col(text_null("actor_id"))
+                    .col(text_null("context_mode"))
+                    .col(boolean("safe_for_user").default(false))
+                    .col(text("details_json").default("null"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .check(Expr::cust("details_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_run_id")
+                    .table("hook_audit_event")
+                    .col("hook_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_workspace_phase")
+                    .table("hook_audit_event")
+                    .col("workspace_id")
+                    .col("phase")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_thread_turn")
+                    .table("hook_audit_event")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_kind_created_at")
+                    .table("hook_audit_event")
+                    .col("event_kind")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_hook_audit_event_created_at")
+                    .table("hook_audit_event")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_execution")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("task_run_id"))
+                    .col(text("executor_kind"))
+                    .col(text("status"))
+                    .col(text_null("worker_id"))
+                    .col(timestamp_with_time_zone_null("lease_until"))
+                    .col(timestamp_with_time_zone_null("heartbeat_at"))
+                    .col(timestamp_with_time_zone_null("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .col(text_null("result_json"))
+                    .col(text_null("error_json"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .check(Expr::cust("error_json IS NULL OR error_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_execution_run")
+                    .table("task_run_execution")
+                    .unique()
+                    .col("task_run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_execution_task")
+                    .table("task_run_execution")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_execution_status_lease")
+                    .table("task_run_execution")
+                    .col("status")
+                    .col("lease_until")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_thread_binding")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text_null("execution_id"))
+                    .col(text("thread_id"))
+                    .col(text("binding_kind"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_thread_binding_task")
+                    .table("task_run_thread_binding")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_thread_binding_run")
+                    .table("task_run_thread_binding")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_thread_binding_run_kind")
+                    .table("task_run_thread_binding")
+                    .col("run_id")
+                    .col("binding_kind")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_thread_binding_thread")
+                    .table("task_run_thread_binding")
+                    .unique()
+                    .col("thread_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_thread_binding_primary_executor")
+                    .table("task_run_thread_binding")
+                    .unique()
+                    .col("run_id")
+                    .and_where(Expr::cust(r#"binding_kind = 'primary_executor'"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_turn")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text_null("execution_id"))
+                    .col(text("thread_id"))
+                    .col(text("turn_id"))
+                    .col(text("kind"))
+                    .col(big_integer("round"))
+                    .col(big_integer("sequence"))
+                    .col(text("status"))
+                    .col(text_null("reviews_candidate_id"))
+                    .col(text_null("requested_by_candidate_id"))
+                    .col(text_null("requested_by_review_event_id"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(timestamp_with_time_zone_null("started_at"))
+                    .col(timestamp_with_time_zone_null("completed_at"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_task")
+                    .table("task_run_turn")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_run")
+                    .table("task_run_turn")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_thread")
+                    .table("task_run_turn")
+                    .col("thread_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_reviews_candidate")
+                    .table("task_run_turn")
+                    .col("reviews_candidate_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_requested_candidate")
+                    .table("task_run_turn")
+                    .col("requested_by_candidate_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_turn_requested_review")
+                    .table("task_run_turn")
+                    .col("requested_by_review_event_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_turn_turn")
+                    .table("task_run_turn")
+                    .unique()
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_turn_run_sequence")
+                    .table("task_run_turn")
+                    .unique()
+                    .col("run_id")
+                    .col("sequence")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_run_turn_candidate_round")
+                    .table("task_run_turn")
+                    .unique()
+                    .col("run_id")
+                    .col("round")
+                    .and_where(Expr::cust(r#"kind IN ('initial', 'revision', 'recovery')"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_child_link_thread")
+                    .table("task_run_turn")
+                    .col("thread_id")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_result_candidate")
+                    .col(text("id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text("task_run_turn_id"))
+                    .col(text("thread_id"))
+                    .col(text("turn_id"))
+                    .col(big_integer("round"))
+                    .col(text("status"))
+                    .col(text_null("result_json"))
+                    .check(Expr::cust("result_json IS NULL OR result_json IS JSON"))
+                    .col(text_null("extraction_error_json"))
+                    .check(Expr::cust(
+                        "extraction_error_json IS NULL OR extraction_error_json IS JSON",
+                    ))
+                    .col(text_null("summary"))
+                    .col(text_null("diagnostics_json"))
+                    .check(Expr::cust(
+                        "diagnostics_json IS NULL OR diagnostics_json IS JSON",
+                    ))
+                    .col(text_null("final_review_event_id"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(timestamp_with_time_zone_null("resolved_at"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_candidate_task")
+                    .table("task_result_candidate")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_candidate_run")
+                    .table("task_result_candidate")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_candidate_turn")
+                    .table("task_result_candidate")
+                    .col("task_run_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_result_candidate_turn")
+                    .table("task_result_candidate")
+                    .unique()
+                    .col("task_run_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_result_candidate_run_round")
+                    .table("task_result_candidate")
+                    .unique()
+                    .col("run_id")
+                    .col("round")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_result_candidate_active_per_run")
+                    .table("task_result_candidate")
+                    .unique()
+                    .col("run_id")
+                    .and_where(Expr::cust(
+                        r#"status IN ('pending_review', 'extraction_failed')"#,
+                    ))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_result_candidate_accepted_per_run")
+                    .table("task_result_candidate")
+                    .unique()
+                    .col("run_id")
+                    .and_where(Expr::cust(r#"status = 'accepted'"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_candidate_gate")
+                    .table("task_result_candidate")
+                    .col("thread_id")
+                    .col("turn_id")
+                    .col("status")
+                    .col(("updated_at", IndexOrder::Desc))
+                    .col(("id", IndexOrder::Desc))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_conversation_snapshot")
+                    .col(text("run_id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("workspace_id"))
+                    .col(text("conversation_thread_id"))
+                    .col(text_null("source_turn_id"))
+                    .col(text_null("history_json"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(text_null("frozen_manifest_id").default(""))
+                    .col(big_integer("portable_revision").default(0))
+                    .col(text("portable_identity").default(""))
+                    .col(text_null("history_json_payload_id").unique_key())
+                    .col(boolean("history_json_has_array_prefix").default(false))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_task_history_payload")
+                            .from("task_run_conversation_snapshot", "history_json_payload_id")
+                            .to("portable_payload_value", "id"),
+                    )
+                    .check(Expr::cust(
+                        "(history_json IS NULL) <> (history_json_payload_id IS NULL)",
+                    ))
+                    .check(Expr::cust(
+                        "NOT history_json_has_array_prefix OR history_json_payload_id IS NOT NULL",
+                    ))
+                    .col(
+                        ColumnDef::new("insertion_ordinal")
+                            .big_integer()
+                            .not_null()
+                            .unique_key()
+                            .extra("GENERATED ALWAYS AS IDENTITY"),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_conversation_snapshot_task")
+                    .table("task_run_conversation_snapshot")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_conversation_snapshot_thread")
+                    .table("task_run_conversation_snapshot")
+                    .col("conversation_thread_id")
+                    .col("created_at")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("task_run_conversation_snapshot_frozen_root")
+                    .table("task_run_conversation_snapshot")
+                    .col("frozen_manifest_id")
+                    .col("workspace_id")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("task_run_conversation_snapshot_frozen_locator_discovery")
+                    .table("task_run_conversation_snapshot")
+                    .col("frozen_manifest_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_child_accepted_source")
+                    .table("task_run_conversation_snapshot")
+                    .col("source_turn_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_event_fanout_cursor")
+                    .col(text("task_id").primary_key())
+                    .col(big_integer("last_sequence").default(0))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .check(Expr::cust(r#"last_sequence >= 0"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_execution_admission")
+                    .col(text("task_id").primary_key())
+                    .col(text("workspace_id"))
+                    .col(text("root_thread_id"))
+                    .col(text("initiating_principal_id"))
+                    .col(text("authorization_context_json"))
+                    .check(Expr::cust("authorization_context_json IS JSON"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("user_notification_outbox")
+                    .col(text("id").primary_key())
+                    .col(text("task_delivery_id"))
+                    .col(text("workspace_id"))
+                    .col(text("recipient_principal_id"))
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(json("payload_json"))
+                    .col(text("status"))
+                    .col(timestamp_with_time_zone("created_at"))
+                    .col(timestamp_with_time_zone("delivered_at"))
+                    .col(timestamp_with_time_zone_null("acknowledged_at"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uq_user_notification_task_delivery")
+                    .table("user_notification_outbox")
+                    .unique()
+                    .col("task_delivery_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_user_notification_recipient_inbox")
+                    .table("user_notification_outbox")
+                    .col("recipient_principal_id")
+                    .col("workspace_id")
+                    .col("created_at")
+                    .col("id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_user_notification_run_read")
+                    .table("user_notification_outbox")
+                    .col("recipient_principal_id")
+                    .col("run_id")
+                    .col("workspace_id")
+                    .col("task_id")
+                    .col("acknowledged_at")
+                    .and_where(Expr::cust(r#""acknowledged_at" IS NOT NULL"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_actor_contract")
+                    .col(text("task_id").primary_key())
+                    .col(text("workspace_id"))
+                    .col(text("creator_json"))
+                    .col(text_null("creator_snapshot_json"))
+                    .col(text("reviewer_json"))
+                    .col(text("delivery_json"))
+                    .col(text_null("launch_selection_json"))
+                    .col(text_null("requested_identity_json"))
+                    .col(text_null("resolved_identity_id"))
+                    .col(text_null("resolved_profile_id"))
+                    .col(text_null("source_config_fingerprint"))
+                    .col(text_null("derived_child_launch_grant_json"))
+                    .col(text_null("execution_destination_thread_id"))
+                    .col(text_null("execution_route_id"))
+                    .col(text_null("execution_route_receipt_json"))
+                    .col(big_integer_null("execution_route_expires_at_millis"))
+                    .col(text_null("creator_work_graph_root_execution_id"))
+                    .col(text_null("work_graph_root_execution_id"))
+                    .col(text_null("root_resource_scope_id"))
+                    .col(text_null("accounting_attribution_json"))
+                    .col(text_null("controller_principal_id"))
+                    .col(big_integer("revision").default(1))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .check(Expr::cust("creator_json IS JSON"))
+                    .check(Expr::cust("creator_snapshot_json IS NULL OR creator_snapshot_json IS JSON"))
+                    .check(Expr::cust("launch_selection_json IS NULL OR launch_selection_json IS JSON"))
+                    .check(Expr::cust("execution_route_receipt_json IS NULL OR execution_route_receipt_json IS JSON"))
+                    .check(Expr::cust("derived_child_launch_grant_json IS NULL OR derived_child_launch_grant_json IS JSON"))
+                    .check(Expr::cust("accounting_attribution_json IS NULL OR accounting_attribution_json IS JSON"))
+                    .check(Expr::cust("delivery_json IS JSON"))
+                    .check(Expr::cust("reviewer_json IS JSON"))
+                    .check(Expr::cust("requested_identity_json IS NULL OR requested_identity_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_actor_contract_workspace")
+                    .table("task_actor_contract")
+                    .col("workspace_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_occurrence_contract")
+                    .col(text("occurrence_id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text_null("trigger_id"))
+                    .col(text("occurrence_key"))
+                    .col(big_integer("execution_generation").default(1))
+                    .col(text_null("agent_execution_id"))
+                    .col(text_null("work_graph_root_execution_id"))
+                    .col(text_null("root_resource_scope_id"))
+                    .col(text("status").default("queued"))
+                    .col(big_integer_null("queue_position"))
+                    .col(big_integer("retry_attempt").default(0))
+                    .col(text("action_idempotency_key"))
+                    .col(text_null("route_id"))
+                    .col(text_null("result_return_route_id"))
+                    .col(text_null("terminal_reason"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(text_null("delivery_plan_json"))
+                    .index(Index::create().unique().col("action_idempotency_key"))
+                    .index(Index::create().unique().col("run_id"))
+                    .check(Expr::cust(
+                        "delivery_plan_json IS NULL OR delivery_plan_json IS JSON",
+                    ))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_generation")
+                    .table("task_occurrence_contract")
+                    .unique()
+                    .col("task_id")
+                    .col("execution_generation")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_execution_owner")
+                    .table("task_occurrence_contract")
+                    .col("task_id")
+                    .col("agent_execution_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_graph_owner")
+                    .table("task_occurrence_contract")
+                    .col("task_id")
+                    .col("work_graph_root_execution_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_task_status")
+                    .table("task_occurrence_contract")
+                    .col("task_id")
+                    .col("status")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_ready")
+                    .table("task_occurrence_contract")
+                    .col("status")
+                    .col("queue_position")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_delivery_authority")
+                    .col(text("delivery_id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text("author_json"))
+                    .col(text_null("reviewer_json"))
+                    .col(text_null("destination_route_id"))
+                    .col(text_null("route_receipt_json"))
+                    .col(big_integer("disclosure_generation").default(1))
+                    .col(text("idempotency_key"))
+                    .col(text("status").default("pending"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(
+                        timestamp_with_time_zone("updated_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .index(Index::create().unique().col("idempotency_key"))
+                    .check(Expr::cust(
+                        "route_receipt_json IS NULL OR route_receipt_json IS JSON",
+                    ))
+                    .check(Expr::cust("author_json IS JSON"))
+                    .check(Expr::cust("reviewer_json IS NULL OR reviewer_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_authority_task")
+                    .table("task_delivery_authority")
+                    .col("task_id")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_result_review_event")
+                    .col(text("id").primary_key())
+                    .col(text("candidate_id"))
+                    .col(text("task_id"))
+                    .col(text("run_id"))
+                    .col(text("task_run_turn_id"))
+                    .col(text("reviewer_kind"))
+                    .col(text_null("reviewer_thread_id"))
+                    .col(text_null("reviewer_turn_id"))
+                    .col(text_null("reviewer_user_id"))
+                    .col(text_null("reviewer_agent_spec_id"))
+                    .col(text("event_kind"))
+                    .col(text("decision"))
+                    .col(text_null("feedback_text"))
+                    .col(text_null("feedback_json"))
+                    .check(Expr::cust("feedback_json IS NULL OR feedback_json IS JSON"))
+                    .col(double_null("confidence"))
+                    .col(text_null("supersedes_review_event_id"))
+                    .col(text_null("next_task_run_turn_id"))
+                    .col(
+                        timestamp_with_time_zone("created_at")
+                            .default(Expr::cust(r#"statement_timestamp()"#)),
+                    )
+                    .col(text("reviewer_ref_json"))
+                    .check(Expr::cust("reviewer_ref_json IS JSON"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_candidate")
+                    .table("task_result_review_event")
+                    .col("candidate_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_run")
+                    .table("task_result_review_event")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_reviewer_thread")
+                    .table("task_result_review_event")
+                    .col("reviewer_thread_id")
+                    .col("reviewer_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_reviewer_user")
+                    .table("task_result_review_event")
+                    .col("reviewer_user_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_reviewer_agent")
+                    .table("task_result_review_event")
+                    .col("reviewer_agent_spec_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_result_review_event_next_turn")
+                    .table("task_result_review_event")
+                    .col("next_task_run_turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_occurrence_reconcile_pending")
+                    .col(text("run_id").primary_key())
+                    .col(big_integer("generation"))
+                    .col(big_integer("next_attempt_at"))
+                    .col(big_integer("attempt_count").default(0))
+                    .col(text_null("claim_token"))
+                    .check(Expr::cust(r#"generation > 0"#))
+                    .check(Expr::cust(r#" next_attempt_at  IS NOT NULL"#))
+                    .check(Expr::cust(r#""attempt_count" BETWEEN 0 AND 16"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_run_occurrence_reconcile_due")
+                    .table("task_run_occurrence_reconcile_pending")
+                    .col("next_attempt_at")
+                    .col("generation")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_occurrence_reconcile_sequence")
+                    .col(big_integer("singleton").primary_key())
+                    .col(big_integer("generation"))
+                    .check(Expr::cust(r#""singleton" = 1"#))
+                    .check(Expr::cust(r#"generation >= 0"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .exec_stmt(
+                Query::insert()
+                    .into_table("task_run_occurrence_reconcile_sequence")
+                    .columns(["singleton", "generation"])
+                    .values_panic([1_i64.into(), 0_i64.into()])
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_occurrence_reconcile_pending")
+                    .col(text("run_id").primary_key())
+                    .col(big_integer("generation"))
+                    .col(big_integer("next_attempt_at"))
+                    .col(big_integer("attempt_count").default(0))
+                    .col(text_null("claim_token"))
+                    .check(Expr::cust(r#"generation > 0"#))
+                    .check(Expr::cust(r#" next_attempt_at  IS NOT NULL"#))
+                    .check(Expr::cust(r#""attempt_count" BETWEEN 0 AND 16"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_reconcile_due")
+                    .table("task_occurrence_reconcile_pending")
+                    .col("next_attempt_at")
+                    .col("generation")
+                    .col("run_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_occurrence_reconcile_sequence")
+                    .col(big_integer("singleton").primary_key())
+                    .col(big_integer("generation"))
+                    .check(Expr::cust(r#""singleton" = 1"#))
+                    .check(Expr::cust(r#"generation >= 0"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .exec_stmt(
+                Query::insert()
+                    .into_table("task_occurrence_reconcile_sequence")
+                    .columns(["singleton", "generation"])
+                    .values_panic([1_i64.into(), 0_i64.into()])
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_occurrence_reconcile_scope")
+                    .col(text("task_id").primary_key())
+                    .col(big_integer("generation"))
+                    .col(text_null("after_run_id"))
+                    .col(text_null("upper_run_id"))
+                    .check(Expr::cust(r#"generation > 0"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_occurrence_reconcile_scope")
+                    .table("task_occurrence_reconcile_scope")
+                    .col("generation")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_delivery_recovery_retry")
+                    .col(text("delivery_id").primary_key())
+                    .col(text_null("expected_attempt_id"))
+                    .col(big_integer("expected_attempt_count"))
+                    .col(timestamp_with_time_zone("expected_updated_at"))
+                    .col(text("retry_token"))
+                    .col(big_integer("next_probe_at"))
+                    .col(big_integer("attempts"))
+                    .check(Expr::cust(r#" next_probe_at  IS NOT NULL"#))
+                    .check(Expr::cust(r#""attempts" BETWEEN 1 AND 16"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_delivery_recovery_retry_due")
+                    .table("task_delivery_recovery_retry")
+                    .col("next_probe_at")
+                    .col("delivery_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_event_fanout_pending")
+                    .col(text("task_id").primary_key())
+                    .col(big_integer("first_sequence"))
+                    .col(big_integer("newest_sequence"))
+                    .col(big_integer("generation"))
+                    .col(big_integer("due_at"))
+                    .col(text_null("claim_token"))
+                    .col(big_integer("attempts").default(0))
+                    .check(Expr::cust(
+                        r#"first_sequence > 0 AND first_sequence <= newest_sequence"#,
+                    ))
+                    .check(Expr::cust(r#"newest_sequence > 0"#))
+                    .check(Expr::cust(r#"generation > 0"#))
+                    .check(Expr::cust(r#" due_at  IS NOT NULL"#))
+                    .check(Expr::cust(r#""attempts" BETWEEN 0 AND 16"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_event_fanout_due")
+                    .table("task_event_fanout_pending")
+                    .col("due_at")
+                    .col("generation")
+                    .col("task_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("uidx_task_event_fanout_generation")
+                    .table("task_event_fanout_pending")
+                    .unique()
+                    .col("generation")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_event_fanout_sequence")
+                    .col(big_integer("singleton").primary_key())
+                    .col(big_integer("generation"))
+                    .check(Expr::cust(r#""singleton" = 1"#))
+                    .check(Expr::cust(r#"generation >= 0"#))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .exec_stmt(
+                Query::insert()
+                    .into_table("task_event_fanout_sequence")
+                    .columns(["singleton", "generation"])
+                    .values_panic([1_i64.into(), 0_i64.into()])
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_read")
+                    .col(text("principal_id"))
+                    .col(text("run_id"))
+                    .col(text("read_at"))
+                    .primary_key(Index::create().col("principal_id").col("run_id"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_inbox_activation")
+                    .col(big_integer("id").primary_key())
+                    .col(big_integer("started_at"))
+                    .col(big_integer("completion_sequence").default(0))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .exec_stmt(
+                Query::insert()
+                    .into_table("task_inbox_activation")
+                    .columns(["id", "started_at", "completion_sequence"])
+                    .values_panic([
+                        1_i64.into(),
+                        Expr::cust(r#"floor(extract(epoch FROM statement_timestamp()))::bigint"#)
+                            .into(),
+                        0_i64.into(),
+                    ])
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_run_cancellation_actor")
+                    .col(text("run_id").primary_key())
+                    .col(text("task_id"))
+                    .col(text("workspace_id"))
+                    .col(text("principal_id"))
+                    .col(text("origin_turn_id"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_child_reconcile_pending")
+                    .col(text("turn_id").primary_key())
+                    .col(text("thread_id"))
+                    .col(text("revision"))
+                    .col(big_integer_null("next_attempt_at"))
+                    .col(big_integer("attempt_count").default(0))
+                    .col(text_null("claim_token"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_child_pending_due")
+                    .table("task_child_reconcile_pending")
+                    .col("next_attempt_at")
+                    .col("turn_id")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table("task_child_reconcile_scope")
+                    .col(text("scope_kind"))
+                    .col(text("scope_key"))
+                    .col(text("incarnation_token"))
+                    .col(text("requested_revision"))
+                    .col(text_null("pass_revision"))
+                    .col(text_null("cursor"))
+                    .col(text_null("upper_watermark"))
+                    .col(big_integer_null("next_attempt_at"))
+                    .col(big_integer("attempt_count").default(0))
+                    .col(text_null("claim_token"))
+                    .primary_key(Index::create().col("scope_kind").col("scope_key"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_child_scope_due")
+                    .table("task_child_reconcile_scope")
+                    .col("next_attempt_at")
+                    .col("scope_kind")
+                    .col("scope_key")
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        drop_tables(
+            manager,
+            &[
+                "task_child_reconcile_scope",
+                "task_child_reconcile_pending",
+                "task_run_cancellation_actor",
+                "task_inbox_activation",
+                "task_run_read",
+                "task_event_fanout_sequence",
+                "task_event_fanout_pending",
+                "task_delivery_recovery_retry",
+                "task_occurrence_reconcile_scope",
+                "task_occurrence_reconcile_sequence",
+                "task_occurrence_reconcile_pending",
+                "task_run_occurrence_reconcile_sequence",
+                "task_run_occurrence_reconcile_pending",
+                "task_result_review_event",
+                "task_delivery_authority",
+                "task_occurrence_contract",
+                "task_actor_contract",
+                "user_notification_outbox",
+                "task_execution_admission",
+                "task_event_fanout_cursor",
+                "task_run_conversation_snapshot",
+                "task_result_candidate",
+                "task_run_turn",
+                "task_run_thread_binding",
+                "task_run_execution",
+                "hook_audit_event",
+                "hook_run_attempt",
+                "hook_run",
+                "task_event",
+                "task_dependency",
+                "task_agent_spec",
+                "task_delivery_attempt",
+                "task_delivery",
+                "task_write_lock",
+                "task_run",
+                "task_trigger",
+                "task",
+            ],
+        )
+        .await
+    }
+}

@@ -18,9 +18,9 @@ pub struct Model {
         from = "plugin_id",
         to = "id",
         on_update = "NoAction",
-        on_delete = "Restrict"
+        on_delete = "Cascade"
     )]
-    pub package_installation: HasOne<super::package_installation::Entity>,
+    pub package_installation: BelongsTo<super::package_installation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

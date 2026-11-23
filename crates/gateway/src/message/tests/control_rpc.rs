@@ -259,7 +259,7 @@ fn dispatch(
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -378,7 +378,7 @@ async fn blocked_ordinary_allows_exact_cancel_and_wait_without_reordering_binary
     .expect("Cancel and task/wait must bypass the ordinary barrier");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn deferred_count_bytes_single_message_and_control_capacity_close_boundedly() {
     // Cases share the actual blocked domain handler and pump, not a copy of its
     // scheduler. The gate only holds a real dispatcher future before admission.
@@ -591,7 +591,7 @@ enum Loss {
     Renew,
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
     for run in [false, true] {
         for loss in [
@@ -776,7 +776,7 @@ async fn wait_reauthorizes_original_task_and_run_targets_after_initial_proof() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn task_wait_timeout_preserves_pending_result_and_durable_work() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -807,7 +807,7 @@ async fn task_wait_timeout_preserves_pending_result_and_durable_work() {
     .expect("task wait timeout remains an observation timeout");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_session_revocation_during_wait_is_not_hidden_by_original_principal() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -951,7 +951,7 @@ fn get_thread(label: &str) -> Message {
     Message::Text(rpc(label, methods::THREAD_GET, json!({"thread_id":THREAD})).into())
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn independent_read_finishes_before_blocked_peer_and_serial_head_fences_later_reads() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1051,7 +1051,7 @@ async fn independent_read_finishes_before_blocked_peer_and_serial_head_fences_la
     .expect("independent completion and conservative serial/Binary barrier");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wait_slots() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1138,7 +1138,7 @@ async fn full_read_slots_defer_and_reuse_capacity_without_spending_cancel_or_wai
     .expect("bounded read capacity, control reserve, slot reuse and disconnect cleanup");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn read_classification_keeps_actual_dispatcher_validation_and_target_authorization() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1208,7 +1208,7 @@ async fn read_classification_keeps_actual_dispatcher_validation_and_target_autho
     .expect("allowlist cannot supply authority or bypass validation");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn socket_serial_predecessors_finish_before_explicit_and_implicit_reads() {
     use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
     use futures_util::SinkExt;
@@ -1418,7 +1418,7 @@ impl OutboundSocket {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn sealed_normal_writer_delivers_shutdown_and_revoke_fifo_before_close() {
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     let fixtures = [Fixture::new().await, Fixture::new().await];
@@ -1493,7 +1493,7 @@ async fn sealed_normal_writer_delivers_shutdown_and_revoke_fifo_before_close() {
     .expect("sealed writer must attempt terminal control within the existing grace");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_resources() {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -1606,7 +1606,7 @@ async fn normal_writer_deadline_joins_pending_handler_and_cleans_connection_reso
     .expect("writer deadline must terminate the normal owner and its pending children");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn blocked_ordinary_accepts_eighty_voice_frames_without_using_deferred_fifo() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1756,7 +1756,7 @@ fn ingress_frame(session: &str, sequence: u64) -> Message {
     )
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1876,7 +1876,7 @@ async fn paused_audio_ingest_does_not_hold_independent_read_group_or_cancel() {
     .expect("RPC and control progress while audio admission owns active work");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read_group() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1992,7 +1992,7 @@ async fn audio_capacity_failure_is_terminal_for_its_recording_and_preserves_read
     .expect("bounded voice overload never retires healthy ordinary transport");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn audio_worker_retirement_releases_active_and_queued_tickets() {
     for terminal in ["shutdown", "drop", "panic"] {
         let mut f = Fixture::new().await;
@@ -2094,7 +2094,7 @@ async fn audio_worker_retirement_releases_active_and_queued_tickets() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn finalize_transport_seal_includes_active_and_queued_audio_and_rejects_late_tail() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -2208,7 +2208,7 @@ async fn revoke_unrelated_voice_acl(processor: &MessageProcessor, other: &str) {
         .await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unrelated_committed_policy_change_reauthorizes_same_audio_without_loss() {
     let mut f = Fixture::new().await;
     let context = f
@@ -2254,7 +2254,7 @@ async fn unrelated_committed_policy_change_reauthorizes_same_audio_without_loss(
     f.processor.connection_closed(f.connection).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer() {
     for buffered in [false, true] {
         let phase = std::cell::Cell::new("fixture setup");
@@ -2443,7 +2443,7 @@ async fn domain_finalize_drains_slow_tail_with_recording_and_buffered_recognizer
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_data() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -2585,7 +2585,7 @@ async fn real_ack_capacity_wait_preserves_rpc_and_controls_with_full_ordinary_da
     .expect("audio ACK pressure must preserve positively completed ordinary work");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
     for publish in [false, true] {
         let mut f = Fixture::new().await;
@@ -2786,7 +2786,7 @@ async fn durable_revoke_before_publication_is_rechecked_before_audio_effect() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn audio_delivery_capacity_wait_revalidates_renewal_expiry_and_physical_owner() {
     for action in ["renewal", "expiry", "disconnect", "replacement"] {
         let mut f = Fixture::new().await;
@@ -2884,7 +2884,7 @@ async fn audio_delivery_capacity_wait_revalidates_renewal_expiry_and_physical_ow
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unpolled_audio_owner_drops_queued_payload_and_completion_ticket() {
     let f = Fixture::new().await;
     let mut context = f
@@ -2940,7 +2940,7 @@ async fn unpolled_audio_owner_drops_queued_payload_and_completion_ticket() {
     f.processor.connection_closed(f.connection).await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_socket_audio_demultiplex_keeps_normal_rpc_and_exact_pcm() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WireMessage;
@@ -3054,7 +3054,7 @@ async fn idle_socket_audio_demultiplex_keeps_normal_rpc_and_exact_pcm() {
     .expect("idle normal owner must positively service audio then RPC");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
     for action in ["renewal", "expiry", "disconnect", "replacement"] {
         let mut f = Fixture::new().await;
@@ -3128,7 +3128,7 @@ async fn queued_and_active_audio_revalidate_current_lease_and_exact_socket() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn fail_cancel_restart_while_terminal_delivery_is_full_preserves_new_recording() {
     let mut f = Fixture::new().await;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -3303,7 +3303,7 @@ async fn fail_cancel_restart_while_terminal_delivery_is_full_preserves_new_recor
     .expect("old terminal delivery must not own a replacement recording");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn production_cancel_dispatch_keeps_other_class_admissible_after_reply() {
     for voice_first in [false, true] {
         let mut f = Fixture::new().await;

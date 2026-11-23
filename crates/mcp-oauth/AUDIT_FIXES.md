@@ -21,7 +21,7 @@ are uncommitted. No tests have been executed for this correction pass.
 | F9 | Clear sign-in/account is available in non-active failed/denied/timed-out/AuthRequired states, including saved redirect mismatch. Clearing uses the authorized disconnect/cleanup path; fresh sign-in can register again. Temporary recovery and terminal failures have different copy. | Desktop-MCP `src/oauth.rs`, eight Desktop-MCP locales |
 
 All paths in the table are relative to their named crate. `src/` without a
-crate prefix means `crates/mcp-oauth/src/`. No primary SQLite migration was
+crate prefix means `crates/mcp-oauth/src/`. No Gateway database migration was
 introduced. No tokens, client secrets or verifier fields were added to management
 DTOs, bridge configuration or FFI projections.
 
@@ -44,7 +44,7 @@ the shared completion registry before enumerating records and deletes under the
 same lease. Thus neither an absent pre-commit read nor cancellation of an earlier
 drain lets an old put run after final cleanup and resurrect its identity.
 
-Guards span network/keystore ownership, but no SQLite permit or transaction does.
+Guards span network/keystore ownership, but no database permit or transaction does.
 An OS/keystore blocking call cannot safely be force-killed: its owned completion
 must return before final cleanup/shutdown can complete. Cancellation still frees
 the RPC queue and suppresses Authorized/browser effects immediately. This is an
@@ -69,7 +69,7 @@ callback and late completion cannot authorize a retired installation.
 - Equal config/timeout update keeps callback and one browser effect; retired
   operation cannot cancel a replacement client presentation.
 - Maintenance-scoped restart through the actual actor/catalog/audit paths, with
-  query_only reader pool, read-class observations and writer-class observations.
+  read-only reader pool, read-class observations and writer-class observations.
 - Failed token endpoint on a live tool call → successful background recovery,
   credentials retained and no tool replay/additional browser; recovery event once
   and none for normal rotation; Gateway generation and unrelated degradation kept.
@@ -156,7 +156,7 @@ pending candidate and the complete previous record; credential readers use only
 the previous record, including independent adapters and restart. Bind retries
 pending rollback under the file lease and reports failure if storage still fails; it does not
 report durable success. Replacement, disconnect and GC keep the F2 actual-I/O
-ownership/drain rules. No SQLite capacity spans these operations.
+ownership/drain rules. No database capacity spans these operations.
 
 ### Observation and runtime fencing
 
@@ -202,7 +202,7 @@ fallback URL without a listener or prepares a replacement redirect implicitly.
   Cancel and timeout during retry backoff are included.
 - Real AuthService with finite authenticated management leases: old Interactive
   actor shutdown in live/startup/backoff/AuthRequired and live recovery use
-  Maintenance physical reader/query_only and catalog/audit writer routes.
+  Maintenance read-only pool and catalog/audit writer routes.
 - Production consumer paused after notification: late Authorized, AuthRequired
   and Recovered versus same-name new UUID or same-UUID resource replacement must
   preserve the new runtime generation/state/reason. Equal-identity updates keep
@@ -614,7 +614,7 @@ write before deleting the account. A leftover promoted pending record therefore
 exposes only the previous grant to independent readers when storage becomes
 readable; an absent account exposes none. Failure installing the fence, deleting
 the account, or deleting the fence remains an error, never acknowledged cleanup.
-The actual closure owns the refresh/file lease until completion; SQLite capacity
+The actual closure owns the refresh/file lease until completion; database capacity
 is not held across IO, waits or notifications. Permanent inability to write/read
 storage cannot guarantee cleanup or repair an already-uncertain durable outcome.
 

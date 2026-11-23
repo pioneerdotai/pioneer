@@ -4,7 +4,7 @@ use crate::cli_runtime::session_instance::CliSessionInstanceId;
 use crate::post_startup::PostStartupSupervisor;
 use tokio_util::sync::CancellationToken;
 
-// Advance only the monotonic idle clock; SQLite/authorization timestamps keep
+// Advance only the monotonic idle clock; PostgreSQL/authorization timestamps keep
 // their real wall clock. No sleeps or provider activity simulate idleness.
 async fn elapse(duration: Duration) {
     tokio::time::pause();
@@ -12,7 +12,7 @@ async fn elapse(duration: Duration) {
     tokio::time::resume();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_continuation() {
     let mut harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     let processor = harness.processor.clone();
@@ -86,7 +86,7 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     .expect("real admission must persist its running binding");
     // The running binding precedes the execution-window commit and MCP
     // activation. Let admission release its transition gate before advancing
-    // Tokio's clock, or pending SQLite waits can expire during the jump.
+    // Tokio's clock, or pending PostgreSQL waits can expire during the jump.
     let key = CLIAgentRuntimeSessionKey::new(
         &harness.workspace_id,
         "codex",
@@ -210,7 +210,7 @@ async fn idle_cleanup_preserves_real_admission_silent_turn_terminal_effects_and_
     processor.shutdown_cli_runtime_manager().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_defers_gates_recovered_continuation_and_activity_lookup_error() {
     use pioneer_entity::turn_cli_runtime_binding as binding;
     use sea_orm::sea_query::Expr;
@@ -300,7 +300,7 @@ impl CLIAgentRuntimeSessionLifecycle for IdleLifecycle {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lifecycle() {
     let (mut processor, _, rx, workspace, _, _) = cli_runtime_approval_processor().await;
     drop(rx);
@@ -365,14 +365,15 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     *session.close_pause.lock().await = Some((entered.clone(), release.clone()));
-    tokio::time::pause();
     let mut supervisor = PostStartupSupervisor::start(move |scope| async move {
-        // The same registration entry point is called by Gateway startup.
-        processor.spawn_cli_runtime_idle_cleanup(&scope);
+        // Advance to the idle state before launching the real periodic worker.
+        // PostgreSQL IO and pool deadlines must run on the real clock.
+        processor.spawn_cli_runtime_idle_cleanup_with_period(&scope, Duration::from_millis(5));
         scope.cancellation().cancelled().await;
     });
-    entered.notified().await;
-    tokio::time::resume();
+    timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("periodic cleanup should enter the native lifecycle hook");
     assert!(manager.existing_session(&key).await.is_none());
     let mut shutdown = Box::pin(supervisor.shutdown());
     assert!(futures_util::poll!(&mut shutdown).is_pending());
@@ -387,7 +388,7 @@ async fn idle_worker_continues_after_close_error_and_shutdown_joins_inflight_lif
     assert_eq!(lifecycle.events.lock().await.len(), 7);
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_keeps_response_generation_pinned_after_lane_removal_through_interrupt() {
     let (processor, connection, mut rx, workspace, store, session) =
         cli_runtime_approval_processor().await;
@@ -465,29 +466,20 @@ async fn idle_cleanup_keeps_response_generation_pinned_after_lane_removal_throug
     processor.shutdown_cli_runtime_manager().await;
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_process_io() {
-    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteExecutor};
-    use sea_orm::ConnectOptions;
+    use pioneer_postgres_pools::{
+        PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresWriteExecutor,
+    };
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("idle-cleanup.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    let (_, _, workspace) = setup_workspace_manager_with_connection(writer.clone()).await;
-    writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
-        .await
-        .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(1)
-        .map_sqlx_sqlite_opts(|opts| opts.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let postgres_fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let (_, _, workspace) = setup_postgres_workspace_manager(&postgres_fixture).await;
+    let writer = postgres_fixture.connect_with_limit(1).await.unwrap();
+    let reader = postgres_fixture.connect_read_only().await.unwrap();
     let observer = Arc::new(NativeSchedulingObserver::default());
-    let database = SqliteDatabase::from_executor_with_read_observer(
+    let database = PostgresDatabase::from_executor_with_read_observer(
         reader,
-        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        PostgresWriteExecutor::with_observer(writer, observer.clone()),
         observer.clone(),
     );
     let store = Arc::new(CrudStore::new(database.clone()));
@@ -525,15 +517,15 @@ async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_proce
         let reads = observer.reads.lock().unwrap();
         assert!(reads.iter().any(|event| matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Maintenance,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Maintenance,
                 ..
             }
         )));
         assert!(reads.iter().all(|event| !matches!(
             event,
-            SqliteReadEvent::OperationFinished {
-                class: SqliteReadClass::Interactive,
+            PostgresReadEvent::OperationFinished {
+                class: PostgresReadClass::Interactive,
                 ..
             }
         )));
@@ -551,14 +543,14 @@ async fn idle_cleanup_uses_maintenance_reader_and_releases_capacity_before_proce
         .unwrap()
         .is_none()
     );
-    assert!(database.reader_query_only_enabled().await.unwrap());
+    assert!(database.reader_is_read_only().await.unwrap());
     release.notify_one();
     assert_eq!(cleanup.await, 1);
     manager.close_all().await.unwrap();
     database.close().await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn idle_retirement_fences_late_transport_recovery_before_replacement_publication() {
     let harness = setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
     let key =

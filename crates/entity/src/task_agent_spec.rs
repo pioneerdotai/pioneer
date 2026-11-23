@@ -7,32 +7,31 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_agent_spec")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    pub task_id: String,
-    pub run_id: Option<String>,
-    pub agent_role: Option<String>,
-    pub agent_nickname: Option<String>,
-    pub model: Option<String>,
-    pub model_provider: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub prompt_json: String,
+    pub task_id: String,
     #[sea_orm(column_type = "Text", nullable)]
-    pub context_policy_json: Option<String>,
+    pub run_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub tool_policy_json: Option<String>,
+    pub agent_role: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub result_contract_json: Option<String>,
+    pub agent_nickname: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub review_policy_json: Option<String>,
+    pub model: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub model_provider: Option<String>,
+    pub prompt_json: Json,
+    pub context_policy_json: Option<Json>,
+    pub tool_policy_json: Option<Json>,
+    pub result_contract_json: Option<Json>,
+    pub review_policy_json: Option<Json>,
     pub depth: i64,
     pub max_depth: i64,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub permission_cap_json: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub security_cap_json: Option<String>,
+    pub permission_cap_json: Option<Json>,
+    pub security_cap_json: Option<Json>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

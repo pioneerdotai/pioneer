@@ -75,7 +75,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         turn_id: turn_id.to_owned(),
         thread_id: thread_id.to_owned(),
         workspace_id: workspace_id.to_owned(),
-        mode_json: to_snapshot_json(&mode, "thread mode")?,
+        mode,
         model: model.to_owned(),
         provider_name: provider_name.to_owned(),
         reasoning_effort: reasoning_effort.map(str::to_owned),
@@ -151,7 +151,7 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     Ok(RestoredRecoveryTurnRequest {
         turn_id: snapshot.turn_id.clone(),
         execution_window_index: 1,
-        mode: from_snapshot_json(&snapshot.mode_json, "thread mode")?,
+        mode: snapshot.mode,
         hook_runtime_context,
         model: snapshot.model.clone(),
         provider_name: snapshot.provider_name.clone(),
@@ -497,14 +497,13 @@ fn from_snapshot_json<T: DeserializeOwned>(value: &str, label: &str) -> Result<T
 
 #[cfg(test)]
 mod tests {
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::TurnRuntimeSnapshotRecord;
     use pioneer_protocol::{
         SkillId, SkillPackId, TurnCapability, TurnCapabilityKind, skill_capability_key,
         skill_pack_capability_key,
     };
     use pioneer_skills::AgentSkillRuntimeEntry;
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     use super::{
         agent_skill_version_pins_from_snapshot, agent_skill_versions_json,
@@ -523,7 +522,7 @@ mod tests {
             turn_id: "turn_pinned_snapshot".to_owned(),
             thread_id: "thread_pinned_snapshot".to_owned(),
             workspace_id: WORKSPACE.to_owned(),
-            mode_json: r#""Agent""#.to_owned(),
+            mode: pioneer_protocol::ThreadMode::Agent,
             model: "model".to_owned(),
             provider_name: "provider".to_owned(),
             reasoning_effort: None,
@@ -639,87 +638,93 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_loads_only_exact_pinned_versions_and_fails_closed_on_drift() {
-        let database = Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory SQLite must open");
-        Migrator::up(&database, None)
-            .await
-            .expect("migrations must apply");
-        database
-            .execute_unprepared(&format!(
-                "INSERT INTO workspace (id, name, is_active, is_current) VALUES \
-                    ('{WORKSPACE}', 'Pinned Agent skill', 1, 1); \
-                 INSERT INTO agent_skill (id, workspace_id, slug) VALUES \
-                    ('{SKILL_ID}', '{WORKSPACE}', 'stable-procedure'); \
-                 INSERT INTO agent_skill_version (
-                    id, skill_id, version_number, source_run_id, parent_version_id,
-                    candidate_key, display_name, skill_markdown, instruction_body,
-                    when_to_use, when_not_to_use, fingerprint, source_turn_ids_json
-                 ) VALUES
-                    ('{VERSION_ONE}', '{SKILL_ID}', 1, NULL, NULL, 'candidate-one',
-                     'Stable procedure v1', '# v1', 'Exact immutable body v1.',
-                     'Use v1', 'Do not use v1', 'fingerprint-one', '[]'),
-                    ('{VERSION_TWO}', '{SKILL_ID}', 2, NULL, '{VERSION_ONE}', 'candidate-two',
-                     'Stable procedure v2', '# v2', 'Exact immutable body v2.',
-                     'Use v2', 'Do not use v2', 'fingerprint-two', '[]'); \
-                 UPDATE agent_skill SET active_version_id = '{VERSION_TWO}'
-                 WHERE id = '{SKILL_ID}';"
-            ))
-            .await
-            .expect("pinned version fixtures must insert");
-        let store = pioneer_crud::CrudStore::new(database.clone());
+        pioneer_postgres_test::with_database(async |test_database| {
+            let database = test_database.connection().clone();
+            database
+                .execute_unprepared(&format!(
+                    "INSERT INTO workspace (id, name, is_active, is_current) VALUES \
+                        ('{WORKSPACE}', 'Pinned Agent skill', TRUE, FALSE); \
+                     INSERT INTO agent_skill (id, workspace_id, slug) VALUES \
+                        ('{SKILL_ID}', '{WORKSPACE}', 'stable-procedure'); \
+                     INSERT INTO agent_skill_version (
+                        id, skill_id, version_number, source_run_id, parent_version_id,
+                        candidate_key, display_name, skill_markdown, instruction_body,
+                        when_to_use, when_not_to_use, fingerprint, source_turn_ids_json
+                     ) VALUES
+                        ('{VERSION_ONE}', '{SKILL_ID}', 1, NULL, NULL, 'candidate-one',
+                         'Stable procedure v1', '# v1', 'Exact immutable body v1.',
+                         'Use v1', 'Do not use v1', 'fingerprint-one', '[]'),
+                        ('{VERSION_TWO}', '{SKILL_ID}', 2, NULL, '{VERSION_ONE}', 'candidate-two',
+                         'Stable procedure v2', '# v2', 'Exact immutable body v2.',
+                         'Use v2', 'Do not use v2', 'fingerprint-two', '[]'); \
+                     UPDATE agent_skill SET active_version_id = '{VERSION_TWO}'
+                     WHERE id = '{SKILL_ID}';"
+                ))
+                .await
+                .expect("pinned version fixtures must insert");
+            let store = pioneer_crud::CrudStore::new(database.clone());
 
-        assert!(
-            restore_agent_skill_overlay_from_snapshot(&store, WORKSPACE, &runtime_snapshot(None),)
+            assert!(
+                restore_agent_skill_overlay_from_snapshot(
+                    &store,
+                    WORKSPACE,
+                    &runtime_snapshot(None),
+                )
                 .await
                 .expect("an empty pin list must stay empty")
                 .is_empty(),
-            "a skill activated after the turn snapshot must not appear in recovery"
-        );
+                "a skill activated after the turn snapshot must not appear in recovery"
+            );
 
-        let pinned_v1 = runtime_snapshot(Some(pin_json(VERSION_ONE, "fingerprint-one")));
-        let restored_v1 = restore_agent_skill_overlay_from_snapshot(&store, WORKSPACE, &pinned_v1)
-            .await
-            .expect("an update after turn start must not replace the pinned version");
-        assert_eq!(restored_v1[0].version_id, VERSION_ONE);
-        assert_eq!(restored_v1[0].body, "Exact immutable body v1.");
+            let pinned_v1 = runtime_snapshot(Some(pin_json(VERSION_ONE, "fingerprint-one")));
+            let restored_v1 =
+                restore_agent_skill_overlay_from_snapshot(&store, WORKSPACE, &pinned_v1)
+                    .await
+                    .expect("an update after turn start must not replace the pinned version");
+            assert_eq!(restored_v1[0].version_id, VERSION_ONE);
+            assert_eq!(restored_v1[0].body, "Exact immutable body v1.");
 
-        database
-            .execute_unprepared(&format!(
-                "UPDATE agent_skill SET active_version_id = '{VERSION_ONE}' \
-                 WHERE id = '{SKILL_ID}'"
-            ))
-            .await
-            .expect("rollback pointer fixture must apply");
-        let pinned_v2 = runtime_snapshot(Some(pin_json(VERSION_TWO, "fingerprint-two")));
-        let restored_v2 = restore_agent_skill_overlay_from_snapshot(&store, WORKSPACE, &pinned_v2)
-            .await
-            .expect("rollback after turn start must not replace the pinned version");
-        assert_eq!(restored_v2[0].version_id, VERSION_TWO);
-        assert_eq!(restored_v2[0].body, "Exact immutable body v2.");
+            database
+                .execute_unprepared(&format!(
+                    "UPDATE agent_skill SET active_version_id = '{VERSION_ONE}' \
+                     WHERE id = '{SKILL_ID}'"
+                ))
+                .await
+                .expect("rollback pointer fixture must apply");
+            let pinned_v2 = runtime_snapshot(Some(pin_json(VERSION_TWO, "fingerprint-two")));
+            let restored_v2 =
+                restore_agent_skill_overlay_from_snapshot(&store, WORKSPACE, &pinned_v2)
+                    .await
+                    .expect("rollback after turn start must not replace the pinned version");
+            assert_eq!(restored_v2[0].version_id, VERSION_TWO);
+            assert_eq!(restored_v2[0].body, "Exact immutable body v2.");
 
-        assert!(
-            restore_agent_skill_overlay_from_snapshot(
-                &store,
-                WORKSPACE,
-                &runtime_snapshot(Some(pin_json(VERSION_TWO, "wrong-fingerprint"))),
-            )
-            .await
-            .is_err(),
-            "fingerprint mismatch must fail recovery closed"
-        );
-        assert!(
-            restore_agent_skill_overlay_from_snapshot(
-                &store,
-                WORKSPACE,
-                &runtime_snapshot(Some(pin_json(
-                    "999999999999999999999",
-                    "fingerprint-missing",
-                ))),
-            )
-            .await
-            .is_err(),
-            "missing pinned version must fail recovery closed"
-        );
+            assert!(
+                restore_agent_skill_overlay_from_snapshot(
+                    &store,
+                    WORKSPACE,
+                    &runtime_snapshot(Some(pin_json(VERSION_TWO, "wrong-fingerprint"))),
+                )
+                .await
+                .is_err(),
+                "fingerprint mismatch must fail recovery closed"
+            );
+            assert!(
+                restore_agent_skill_overlay_from_snapshot(
+                    &store,
+                    WORKSPACE,
+                    &runtime_snapshot(Some(pin_json(
+                        "999999999999999999999",
+                        "fingerprint-missing",
+                    ))),
+                )
+                .await
+                .is_err(),
+                "missing pinned version must fail recovery closed"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

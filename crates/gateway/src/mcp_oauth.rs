@@ -77,7 +77,7 @@ pub(crate) async fn consume_oauth_events(
         }
         // Delivery is an effect too: a late URL must not cross uninstall or
         // identity replacement while recipient authorization is awaiting. This
-        // gate holds no SQLite capacity; re-read after acquiring admission.
+        // gate holds no PostgreSQL capacity; re-read after acquiring admission.
         let delivery = service
             .installation_lifecycle_guard(&event.scope_kind, &event.scope_key, &row.name)
             .await;

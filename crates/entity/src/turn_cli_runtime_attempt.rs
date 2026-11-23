@@ -7,14 +7,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_cli_runtime_attempt")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_turn_cli_runtime_attempt_turn_index")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_turn_cli_runtime_attempt_turn_index"
+    )]
     pub turn_id: String,
     #[sea_orm(unique_key = "uidx_turn_cli_runtime_attempt_turn_index")]
     pub attempt_index: i64,
-    #[sea_orm(unique_key = "uidx_turn_cli_runtime_attempt_runtime_native_turn")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_turn_cli_runtime_attempt_runtime_native_turn"
+    )]
     pub runtime_id: String,
+    #[sea_orm(column_type = "Text")]
     pub runtime_kind: String,
     #[sea_orm(column_type = "Text")]
     pub native_thread_id: String,
@@ -24,10 +31,12 @@ pub struct Model {
         unique_key = "uidx_turn_cli_runtime_attempt_runtime_native_turn"
     )]
     pub native_turn_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub recovery_job_id: Option<String>,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", nullable, unique)]
     pub recovery_attempt_id: Option<String>,
     pub execution_window_index: Option<i64>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub failure_reason: Option<String>,

@@ -907,8 +907,6 @@ impl HookRuntime {
                 tracing::error!(
                     operation = "list_recoverable_runs",
                     cause_class = diagnostic.cause_class.as_str(),
-                    sqlite_primary_code = diagnostic.sqlite_primary_code,
-                    sqlite_extended_code = diagnostic.sqlite_extended_code,
                     "failed to discover recoverable hook runs"
                 );
                 HookRuntimeError::RecoveryStorageUnavailable
@@ -1920,8 +1918,8 @@ impl HookRunPersistence {
             operation,
             phase = self.execution_phase.as_str(),
             cause_class = diagnostic.cause_class.as_str(),
-            sqlite_primary_code = diagnostic.sqlite_primary_code,
-            sqlite_extended_code = diagnostic.sqlite_extended_code,
+
+
             "failed to persist hook run lifecycle"
         );
         if self.durable_phase.is_some() && self.failure_operation.is_none() {
@@ -3182,9 +3180,7 @@ mod tests {
         let error = crate::HookRunStoreError::internal_with_diagnostic(
             "failed to append hook audit events",
             crate::HookRunStoreDiagnostic {
-                cause_class: crate::HookRunStoreCauseClass::SqliteBusy,
-                sqlite_primary_code: Some(5),
-                sqlite_extended_code: Some(517),
+                cause_class: crate::HookRunStoreCauseClass::PostgresContention,
             },
         );
         let mut events = sentry::test::with_captured_events(|| {
@@ -3197,9 +3193,7 @@ mod tests {
         assert_eq!(event.level, sentry::Level::Error);
         let fields = persistence_event_fields(&event);
         assert_eq!(fields["operation"], "append_audit_events");
-        assert_eq!(fields["cause_class"], "sqlite_busy");
-        assert_eq!(fields["sqlite_primary_code"], 5);
-        assert_eq!(fields["sqlite_extended_code"], 517);
+        assert_eq!(fields["cause_class"], "postgres_contention");
         assert!(event.exception.values.is_empty());
         event
     }

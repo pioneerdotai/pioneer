@@ -13,9 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = runpy.run_path(str(Path(__file__).with_name("collect-symbols.py")))
 CUA = runpy.run_path(str(Path(__file__).with_name("cua-driver.py")))
 PLATFORMS = {
-    "x86_64-unknown-linux-gnu": ("linux-x86_64", "gz"),
-    "aarch64-unknown-linux-gnu": ("linux-aarch64", "gz"),
-    "aarch64-apple-darwin": ("macos-aarch64", "gz"),
+    "x86_64-unknown-linux-gnu": ("linux-x86_64", "zip"),
+    "aarch64-unknown-linux-gnu": ("linux-aarch64", "zip"),
+    "aarch64-apple-darwin": ("macos-aarch64", "zip"),
     "x86_64-apple-darwin": ("macos-x86_64", "zip"),
     "x86_64-pc-windows-msvc": ("windows-x86_64", "zip"),
     "aarch64-pc-windows-msvc": ("windows-aarch64", "zip"),

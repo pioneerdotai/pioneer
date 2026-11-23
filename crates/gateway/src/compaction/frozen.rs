@@ -546,7 +546,9 @@ async fn read_accepted_imports(
             let origin = references
                 .get(index)
                 .ok_or_else(|| anyhow::anyhow!("accepted own import has no canonical message"))?;
-            record.validate_preview_archive(store, workspace).await?;
+            record
+                .validate_preview_archive(&store.database_connection(), workspace)
+                .await?;
             let direct_source = record.matches_render_target(origin);
             let checkpoint_target = match origin.sources.as_slice() {
                 [source] if source.scope.starts_with("checkpoint:") => Some(ScopedHistorySource {
@@ -765,6 +767,35 @@ fn authorize(
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) struct TaskOutputHistoryChanged;
+
+impl std::fmt::Display for TaskOutputHistoryChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("child history changed while freezing its completed output")
+    }
+}
+
+impl std::error::Error for TaskOutputHistoryChanged {}
+
+async fn existing_task_output(
+    store: &CrudStore,
+    workspace: &str,
+    turn: &pioneer_protocol::TaskRunTurn,
+) -> Result<Option<pioneer_crud::compaction::TaskOutputSnapshot>> {
+    let snapshot = store.compaction_task_output(workspace, &turn.id).await?;
+    if let Some(snapshot) = &snapshot {
+        ensure!(
+            snapshot.task_id == turn.task_id
+                && snapshot.run_id == turn.run_id
+                && snapshot.source_thread == turn.thread_id
+                && snapshot.source_turn == turn.turn_id,
+            "Task output snapshot execution identity changed"
+        );
+    }
+    Ok(snapshot)
+}
+
 /// Capture a completed result-producing turn before publishing its candidate.
 /// An accepted review or delayed delivery subsequently refers to this exact
 /// work. Retries reuse the original manifest and never read newer child turns.
@@ -775,14 +806,7 @@ pub(crate) async fn capture_task_output(
 ) -> Result<pioneer_crud::compaction::TaskOutputSnapshot> {
     // Preserve the caller's scope: live completion is request work, while
     // recovery callers already carry maintenance reads/critical writes.
-    if let Some(snapshot) = store.compaction_task_output(workspace, &turn.id).await? {
-        ensure!(
-            snapshot.task_id == turn.task_id
-                && snapshot.run_id == turn.run_id
-                && snapshot.source_thread == turn.thread_id
-                && snapshot.source_turn == turn.turn_id,
-            "Task output snapshot execution identity changed"
-        );
+    if let Some(snapshot) = existing_task_output(store, workspace, turn).await? {
         return Ok(snapshot);
     }
     let started = std::time::Instant::now();
@@ -815,13 +839,15 @@ pub(crate) async fn capture_task_output(
     )
     .await?;
     let history = &prepared.descriptor;
-    ensure!(
-        store
-            .compaction_projection_version(workspace, &turn.thread_id)
+    if store
+        .compaction_projection_version(workspace, &turn.thread_id)
+        .await?
+        != epoch
+    {
+        return existing_task_output(store, workspace, turn)
             .await?
-            == epoch,
-        "child history changed while freezing its completed output"
-    );
+            .ok_or_else(|| TaskOutputHistoryChanged.into());
+    }
     let output = store
         .compaction_record_task_output(workspace, &turn.id, &history)
         .await?;
@@ -3315,13 +3341,6 @@ async fn capture_with_imports_prepared_using_renderer(
                 if let [full_source] = reference.sources.as_slice()
                     && let Some(turn) = full_source.scope.strip_prefix("item:")
                 {
-                    super::history::prepare_references(
-                        store,
-                        workspace,
-                        &reference.source_thread,
-                        std::slice::from_ref(full_source),
-                    )
-                    .await?;
                     let payload = super::history::reference_payload(
                         &store,
                         workspace,
@@ -3406,7 +3425,6 @@ async fn capture_with_imports_prepared_using_renderer(
             for (thread, sources) in context_sources {
                 let sources = sources.into_iter().collect::<Vec<_>>();
                 for page in bounded_context_source_pages(&sources)? {
-                    super::history::prepare_references(store, workspace, &thread, page).await?;
                     ensure!(
                         store
                             .compaction_model_context_sources_current(workspace, &thread, page)
@@ -6306,6 +6324,7 @@ fn source_turn(source: &SourceRef) -> Option<&str> {
 
 /// Verify a frozen rendering while its original canonical source still exists.
 /// Persist only the diagnostic wire hash; no HTML/image bytes are duplicated.
+#[cfg(test)]
 pub(crate) async fn prepare_html_preview_archive_witness(
     store: &CrudStore,
     witness: &pioneer_crud::HtmlPreviewArchiveWitness,
@@ -6786,10 +6805,19 @@ fn frozen_payload_batchable(reference: &FrozenMessageRef) -> bool {
         )
 }
 
+fn frozen_row_batchable(reference: &FrozenMessageRef) -> bool {
+    frozen_payload_batchable(reference)
+        || (reference.tool_name.as_deref() != Some("html_preview")
+            && reference.source_aliases.is_empty()
+            && matches!(reference.sources.as_slice(), [source]
+                if matches!(source.scope.split_once(':'), Some(("event" | "item", _)))))
+}
+
 /// Select whole entries from the sequential restore path, scoped to one thread.
 /// Count exact JSON-array bytes before copying an entry and stop at the first
 /// boundary. An oversized entry keeps its old preparation path instead of
 /// introducing a new history size limit.
+#[cfg(test)]
 fn bounded_preparation_group(references: &[FrozenMessageRef]) -> Result<(usize, Vec<SourceRef>)> {
     let Some(first) = references.first() else {
         return Ok((0, Vec::new()));
@@ -6907,63 +6935,38 @@ async fn restore_entries_page_with_projection(
             index += 1;
             continue;
         }
-        if !frozen_payload_batchable(reference) {
-            let (entries, sources) = bounded_preparation_group(&references[index..])?;
-            // A singleton cannot save a query. False retains legacy registration
-            // immediately before each restore; errors still abort the operation.
-            let prepared = entries > 1
-                && store
-                    .compaction_references_current(workspace, &reference.source_thread, &sources)
-                    .await?;
-            // The completed precheck has released all database capacity.
-            #[cfg(test)]
-            if prepared {
-                pause_after_preparation_precheck().await;
-            }
-            for entry in &references[index..index + entries.max(1)] {
-                if !prepared {
-                    let mut sources = entry.sources.clone();
-                    sources.extend(entry.replay_source.iter().cloned());
-                    super::history::prepare_references(
-                        store,
-                        workspace,
-                        &entry.source_thread,
-                        &sources,
-                    )
-                    .await?;
-                }
-                // This precheck is only a metadata fast path, not an access
-                // grant or a snapshot. Keep exact payload reads and all restore
-                // proofs, including sequential execution-state updates.
-                result.push(
-                    restore_entry(
-                        store,
-                        workspace,
-                        allowed_threads,
-                        entry,
-                        checkpoint_graphs,
-                        projection,
-                        state,
-                    )
-                    .await?,
-                );
-            }
-            index += entries.max(1);
+        #[cfg(test)]
+        pause_after_preparation_precheck().await;
+        if !frozen_row_batchable(reference) {
+            result.push(
+                restore_entry(
+                    store,
+                    workspace,
+                    allowed_threads,
+                    reference,
+                    checkpoint_graphs,
+                    projection,
+                    state,
+                )
+                .await?,
+            );
+            index += 1;
             continue;
         }
         let end = references[index..]
             .iter()
             .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
             .take_while(|next| {
-                next.source_thread == reference.source_thread && frozen_payload_batchable(next)
+                next.source_thread == reference.source_thread && frozen_row_batchable(next)
             })
             .count();
         let sources = references[index..index + end]
             .iter()
-            .map(|entry| entry.sources[0].clone())
-            .collect::<Vec<_>>();
-        super::history::prepare_references(store, workspace, &reference.source_thread, &sources)
-            .await?;
+            .map(|entry| {
+                entry.validate()?;
+                Ok(entry.sources[0].clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let (consumed, payloads) = store
             .compaction_reference_payload_batch(workspace, &reference.source_thread, &sources)
             .await?;

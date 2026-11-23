@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Read retained usage only. No Pioneer imports, model calls, or database writes.
 
+Use the running Gateway runtime home and Python 3.14 or later for compressed events.
 Use --turn for turn events, --owner for service-operation journal owners. Old
 purpose attribution is explicit (--purpose OBSERVATION_ID=PURPOSE), never guessed
 from sequence position. Codex session totals are separate, never turn charges.
 """
 import argparse
-import ctypes
-import ctypes.util
 import datetime
 import hashlib
 import json
+import os
 import pathlib
-import sqlite3
+import shutil
+import subprocess
 from collections import defaultdict
 
 
@@ -33,40 +34,150 @@ def timestamp(value):
     return parsed.timestamp()
 
 
-class Decoder:
-    """Same compact zstd format as sqlite/src/zstd/basic.rs, including dicts."""
-    def __init__(self, connection):
-        self.connection = connection
-        self.lib = None
+MAX_EVENT_BYTES = 8 * 1024 * 1024
+BLOCK_BYTES = 64 * 1024
 
-    def decode(self, payload, dictionary_id):
-        if dictionary_id is None:
-            return payload.decode('utf-8') if isinstance(payload, bytes) else payload
-        if self.lib is None:
-            self.lib = ctypes.CDLL(ctypes.util.find_library('zstd'))
-            self.lib.ZSTD_createDCtx.restype = ctypes.c_void_p
-            self.lib.ZSTD_freeDCtx.argtypes = [ctypes.c_void_p]
-            self.lib.ZSTD_decompress_usingDict.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-            self.lib.ZSTD_decompress_usingDict.restype = ctypes.c_size_t
-            self.lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
-            self.lib.ZSTD_isError.restype = ctypes.c_uint
-        dictionary = b'' if dictionary_id == -1 else self.connection.execute(
-            'SELECT dict FROM _zstd_dicts WHERE id=?', (dictionary_id,)
-        ).fetchone()[0]
-        frame = b'\x28\xb5\x2f\xfd' + payload
-        # Usage events are small. Fail explicitly instead of silently truncating
-        # or retaining an unbounded decoded conversation record.
-        output = ctypes.create_string_buffer(8 * 1024 * 1024)
-        context = self.lib.ZSTD_createDCtx()
-        if not context:
-            raise RuntimeError('zstd context allocation failed')
-        try:
-            size = self.lib.ZSTD_decompress_usingDict(context, output, len(output), frame, len(frame), dictionary, len(dictionary))
-            if self.lib.ZSTD_isError(size):
-                raise ValueError('cannot decode compact zstd event (8 MiB limit)')
-            return output.raw[:size].decode('utf-8')
-        finally:
-            self.lib.ZSTD_freeDCtx(context)
+
+def decode_frame(codec, body, size, chars, digest):
+    data = bytes.fromhex(body)
+    if codec == 1:
+        # Import only for a compressed frame. The read has already released
+        # the database connection and the frame cannot expand past its header.
+        from compression.zstd import ZstdDecompressor
+
+        if len(data) + 2 >= size:
+            raise ValueError("invalid compressed event size")
+        decoder = ZstdDecompressor()
+        data = decoder.decompress(data, max_length=size + 1)
+        if not decoder.eof or decoder.unused_data:
+            raise ValueError("invalid or trailing event frame data")
+    elif codec != 0:
+        raise ValueError("unknown event encoding")
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError("event frame checksum or length mismatch")
+    text = data.decode("utf-8")
+    if len(text) != chars:
+        raise ValueError("event frame character length mismatch")
+    return text
+
+
+def decode_payload(inline, size, chars, digest, codec, body, parts):
+    if inline is not None:
+        if len(inline.encode("utf-8")) > MAX_EVENT_BYTES:
+            raise ValueError("event exceeds the diagnostic byte limit")
+        return inline
+    if size is None or not 0 <= size <= MAX_EVENT_BYTES:
+        raise ValueError("missing event payload or event exceeds the diagnostic byte limit")
+    if codec is not None:
+        if size > BLOCK_BYTES or parts:
+            raise ValueError("invalid whole event payload")
+        return decode_frame(codec, body, size, chars, digest)
+    text = []
+    consumed_bytes = consumed_chars = 0
+    original_hash = hashlib.sha256()
+    for offset, char_offset, block_codec, block_body, length, count, checksum in parts or ():
+        if (offset != consumed_bytes or char_offset != consumed_chars or
+                not 0 < length <= BLOCK_BYTES or consumed_bytes + length > size):
+            raise ValueError("invalid event block range")
+        part = decode_frame(block_codec, block_body, length, count, checksum)
+        text.append(part)
+        original_hash.update(part.encode("utf-8"))
+        consumed_bytes += length
+        consumed_chars += count
+    if (size <= BLOCK_BYTES or consumed_bytes != size or consumed_chars != chars or
+            original_hash.hexdigest() != digest):
+        raise ValueError("event payload checksum or length mismatch")
+    return "".join(text)
+
+
+class GatewayPostgres:
+    """Read one bounded result at a time via the PostgreSQL client shipped by Gateway."""
+
+    def __init__(self, gateway, runtime_home):
+        executable = pathlib.Path(gateway).resolve(strict=True)
+        if executable.match("Pioneer Gateway.app/Contents/MacOS/pioneer"):
+            runtime = executable.parents[3] / "postgres"
+        else:
+            runtime = executable.parent / "cua" / "postgres"
+        self.psql = runtime / "bin" / ("psql.exe" if os.name == "nt" else "psql")
+        postgres = pathlib.Path(runtime_home) / "postgres"
+        pid = (postgres / "data" / "postmaster.pid").read_text().splitlines()
+        port = int(pid[3])
+        password = (postgres / "reader-password").read_text().strip()
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
+        self.env.update(
+            PGHOST="127.0.0.1", PGPORT=str(port), PGUSER="pioneer_reader", PGDATABASE="pioneer",
+            PGPASSWORD=password, PGSSLMODE="disable", PGCLIENTENCODING="UTF8",
+            PGOPTIONS="-c default_transaction_read_only=on",
+        )
+        if os.name == "posix":
+            self.env["LD_LIBRARY_PATH"] = str(runtime / "lib")
+
+    def read(self, sql, *parameters):
+        command = [self.psql, "-XwqAt", "-v", "ON_ERROR_STOP=1"]
+        for index, parameter in enumerate(parameters, start=1):
+            command.extend(("-v", f"arg{index}={parameter}"))
+        process = subprocess.run(
+            command, input=sql + ";\n", text=True, encoding="utf-8", env=self.env,
+            capture_output=True, timeout=30,
+        )
+        if process.returncode:
+            raise RuntimeError("could not read PostgreSQL usage evidence from the configured Gateway")
+        return [json.loads(line) for line in process.stdout.splitlines()]
+
+    def runtime_snapshot(self, turn):
+        rows = self.read("""
+            SELECT json_build_array(workspace_id, thread_id, hook_runtime_context_json::text)
+            FROM turn_runtime_snapshot WHERE turn_id = :'arg1'
+        """, turn)
+        return rows[0] if rows else None
+
+    def task_bindings(self, turn):
+        return self.read("""
+            SELECT json_build_array(
+                b.task_id, b.thread_id, t.workspace_id, t.owner_kind, t.owner_id,
+                t.created_by_thread_id, t.created_by_turn_id, t.executor_kind,
+                t.lifecycle_policy_json::text, t.metadata_json::text, e.workspace_id, x.thread_id,
+                p.workspace_id, o.thread_id, r.task_id)
+            FROM task_run_turn b LEFT JOIN task t ON t.id = b.task_id
+            LEFT JOIN task_run r ON r.id = b.run_id
+            LEFT JOIN thread e ON e.id = b.thread_id LEFT JOIN turn x ON x.id = b.turn_id
+            LEFT JOIN thread p ON p.id = t.owner_id LEFT JOIN turn o ON o.id = t.created_by_turn_id
+            WHERE b.turn_id = :'arg1' LIMIT 2
+        """, turn)
+
+    def event_page(self, turn, after):
+        rows = self.read("""
+            WITH events AS (
+                SELECT id, thread_id, sequence, created_at, payload, payload_payload_id
+                FROM turn_event
+                WHERE turn_id = :'arg1' AND sequence > :'arg2'::bigint
+                ORDER BY sequence LIMIT 16
+            )
+            SELECT json_build_array(
+                e.id, e.thread_id, e.sequence, e.created_at,
+                CASE WHEN octet_length(e.payload::text) <= 8388608 THEN e.payload::text END,
+                v.original_bytes, v.original_chars, encode(v.sha256, 'hex'), v.codec,
+                CASE WHEN v.original_bytes <= 8388608 THEN encode(v.body, 'hex') END, p.parts)
+            FROM events e
+            LEFT JOIN portable_payload_value v ON v.id = e.payload_payload_id
+            LEFT JOIN LATERAL (
+                SELECT json_agg(json_build_array(
+                    byte_offset, char_offset, codec, encode(body, 'hex'), original_bytes,
+                    original_chars, encode(sha256, 'hex')) ORDER BY byte_offset) AS parts
+                FROM portable_payload_part
+                WHERE payload_id = v.id AND v.codec IS NULL AND v.original_bytes <= 8388608
+            ) p ON true
+            ORDER BY e.sequence
+        """, turn, after)
+        return [(*row[:4], decode_payload(*row[4:])) for row in rows]
+
+    def journal(self, owner):
+        return self.read("""
+            SELECT json_build_array(id, workspace_id, operation_kind, status, usage_json, started_at, updated_at)
+            FROM provider_usage_observation WHERE owner_id = :'arg1'
+            ORDER BY started_at, updated_at, id
+        """, owner)
 
 
 def merge(target, update):
@@ -107,7 +218,7 @@ def execution_cohort(row):
     return ('unattributed_sources', None, None)
 
 
-def turn_conversation_evidence(connection, tables, turn, thread, workspace, runtime):
+def turn_conversation_evidence(source, turn, thread, workspace, runtime):
     """Admit retained hook or exact durable Composer launch; never Task ancestry.
 
     Terminal reconciliation deletes runtime snapshots, but retains Task/run/turn
@@ -137,17 +248,8 @@ def turn_conversation_evidence(connection, tables, turn, thread, workspace, runt
                 result['task_id'] = task
                 owners.add(owner if owner and owner.strip() else thread)
                 sources.append('runtime_snapshot')
-    if {'task_run_turn', 'task', 'task_run', 'thread', 'turn'} <= tables:
-        # LEFT JOIN retains contradictory/dangling bindings as negative evidence.
-        rows = connection.execute(
-            'SELECT b.task_id,b.thread_id,t.workspace_id,t.owner_kind,t.owner_id,'
-            't.created_by_thread_id,t.created_by_turn_id,t.executor_kind,t.lifecycle_policy_json,'
-            't.metadata_json,e.workspace_id,x.thread_id,p.workspace_id,o.thread_id,r.task_id '
-            'FROM task_run_turn b LEFT JOIN task t ON t.id=b.task_id '
-            'LEFT JOIN task_run r ON r.id=b.run_id '
-            'LEFT JOIN thread e ON e.id=b.thread_id LEFT JOIN turn x ON x.id=b.turn_id '
-            'LEFT JOIN thread p ON p.id=t.owner_id LEFT JOIN turn o ON o.id=t.created_by_turn_id '
-            'WHERE b.turn_id=? LIMIT 2', (turn,)).fetchall()
+    rows = source.task_bindings(turn)
+    if rows:
         if len(rows) > 1:
             conflict = True
         elif rows:
@@ -361,33 +463,24 @@ def aggregate(rows):
     return report
 
 
-def load(connection, turns, owners, purposes):
-    decoder = Decoder(connection)
-    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
+def load(source, turns, owners, purposes):
     snapshots, cumulative = [], {}
     unavailable_cli_updates = 0
     for turn in turns:
-        runtime = None
-        if 'turn_runtime_snapshot' in tables:
-            runtime = connection.execute(
-                'SELECT workspace_id,thread_id,hook_runtime_context_json FROM turn_runtime_snapshot WHERE turn_id=?',
-                (turn,)).fetchone()
+        runtime = source.runtime_snapshot(turn)
         relationships = {}
-        sql = ('SELECT id,thread_id,sequence,created_at,payload,_payload_dict FROM _turn_event_zstd WHERE turn_id=? ORDER BY sequence'
-               if '_turn_event_zstd' in tables else
-               'SELECT id,thread_id,sequence,created_at,payload,NULL FROM turn_event WHERE turn_id=? ORDER BY sequence')
         # Fetch bounded batches; decoding never holds a DB transaction/stream.
         after = 0
         turn_completed = False
         first_snapshot = len(snapshots)
         while True:
             # sequence is the immutable per-turn cursor.
-            rows = connection.execute(sql.replace('ORDER BY sequence', 'AND sequence>? ORDER BY sequence LIMIT 128'), (turn, after)).fetchall()
+            rows = source.event_page(turn, after)
             if not rows:
                 break
             after = rows[-1][2]
-            for event_id, thread, sequence, created, payload, dictionary_id in rows:
-                event = json.loads(decoder.decode(payload, dictionary_id))
+            for event_id, thread, sequence, created, payload in rows:
+                event = json.loads(payload)
                 if event.get('kind') == 'turn_completed' and event.get('payload', {}).get('turn', {}).get('status') == 'completed':
                     turn_completed = True
                 notification = event.get('payload', {})
@@ -395,7 +488,7 @@ def load(connection, turns, owners, purposes):
                 identity = (thread, workspace)
                 if identity not in relationships:
                     relationships[identity] = turn_conversation_evidence(
-                        connection, tables, turn, thread, workspace, runtime)
+                        source, turn, thread, workspace, runtime)
                 provenance = dict(source='turn_event', thread_id=thread, turn_id=turn, owner_id=thread,
                                   **relationships[identity])
                 item = notification.get('item', {})
@@ -443,20 +536,19 @@ def load(connection, turns, owners, purposes):
             for snapshot in snapshots[first_snapshot:]:
                 if snapshot['source'] == 'cli_turn':
                     snapshot['status'] = 'completed'
-    if 'provider_usage_observation' in tables:
-        for owner in sorted(set(turns + owners)):
-            for row in connection.execute('SELECT id,workspace_id,operation_kind,status,usage_json,started_at,updated_at FROM provider_usage_observation WHERE owner_id=?', (owner,)).fetchall():
-                ident, workspace, purpose, status, payload, started, updated = row
-                usage = json.loads(payload)
-                metadata = usage.get('_pioneer_journal') if isinstance(usage, dict) else None
-                authority = metadata.get('connection_id') if isinstance(metadata, dict) and metadata.get('schema_version') == 1 else None
-                if not isinstance(authority, str) or not authority or len(authority.encode('utf-8')) > 256:
-                    authority = None
-                snapshots.append(dict(source='operation_journal', id=ident, purpose=purpose, status=status, usage=usage if isinstance(usage, dict) else {},
-                                      connection=authority,
-                                      time=float(updated), first_time=float(started), sequence=0,
-                                      provenance=[dict(source='operation_journal', observation_id=ident,
-                                                       workspace_id=workspace, owner_id=owner, connection_id=authority)]))
+    for owner in sorted(set(turns + owners)):
+        for row in source.journal(owner):
+            ident, workspace, purpose, status, payload, started, updated = row
+            usage = json.loads(payload)
+            metadata = usage.get('_pioneer_journal') if isinstance(usage, dict) else None
+            authority = metadata.get('connection_id') if isinstance(metadata, dict) and metadata.get('schema_version') == 1 else None
+            if not isinstance(authority, str) or not authority or len(authority.encode('utf-8')) > 256:
+                authority = None
+            snapshots.append(dict(source='operation_journal', id=ident, purpose=purpose, status=status, usage=usage if isinstance(usage, dict) else {},
+                                  connection=authority,
+                                  time=float(updated), first_time=float(started), sequence=0,
+                                  provenance=[dict(source='operation_journal', observation_id=ident,
+                                                   workspace_id=workspace, owner_id=owner, connection_id=authority)]))
     return dict(groups=aggregate(snapshots), snapshots=len(snapshots), cumulative_cli=list(cumulative.values()),
                 unavailable_cli_usage_updates=unavailable_cli_updates,
                 notes=['First observed is within the retained execution cohort; it does not prove a cold provider cache.',
@@ -469,7 +561,8 @@ def load(connection, turns, owners, purposes):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--db', required=True)
+    parser.add_argument('--runtime-home', required=True, help='runtime_home from pioneer status --json')
+    parser.add_argument('--gateway', default=shutil.which("pioneer"), help='path to installed pioneer')
     parser.add_argument('--turn', action='append', default=[])
     parser.add_argument('--owner', action='append', default=[])
     parser.add_argument('--purpose', action='append', default=[], metavar='OBSERVATION=PURPOSE')
@@ -477,10 +570,10 @@ def main():
     if not args.turn and not args.owner:
         parser.error('select at least one --turn or --owner')
     purposes = dict(value.split('=', 1) for value in args.purpose)
-    uri = pathlib.Path(args.db).resolve().as_uri() + '?mode=ro'
-    with sqlite3.connect(uri, uri=True) as connection:
-        connection.execute('PRAGMA query_only=ON')
-        result = load(connection, args.turn, args.owner, purposes)
+    if not args.gateway:
+        parser.error('provide --gateway or put the installed pioneer on PATH')
+    source = GatewayPostgres(args.gateway, args.runtime_home)
+    result = load(source, args.turn, args.owner, purposes)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

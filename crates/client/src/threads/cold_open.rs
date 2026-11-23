@@ -54,6 +54,7 @@ pub(super) struct ColdApplyEffects {
     pub(super) drafts: Vec<ClientPublicationDraft>,
     pub(super) actions: Vec<SemanticTimelineRequestAction>,
     pub(super) retirement: Option<Arc<retirement::ThreadRetirement>>,
+    pub(super) promoted_draft: bool,
 }
 
 impl ClientCore {
@@ -180,6 +181,9 @@ impl ClientCore {
         );
         drop(registry);
         drop(identity);
+        if effects.promoted_draft {
+            self.refresh_thread_capabilities_after_promotion(id);
+        }
         if let Some(ticket) = effects.retirement {
             self.notify_send_readiness();
             #[cfg(test)]
@@ -329,18 +333,18 @@ impl ClientCore {
                 if r.tick_conversation {
                     store.coordinator.conversation.tick();
                 }
-                if r.promote_thread_from_draft {
-                    registry
-                        .navigation
-                        .apply(crate::navigation::NavigationIntent::PromoteThread {
+                let promoted_draft = r.promote_thread_from_draft
+                    && registry.navigation.apply(
+                        crate::navigation::NavigationIntent::PromoteThread {
                             thread_id: id.to_owned(),
-                        });
-                }
+                        },
+                    ) == crate::core::ClientTransitionOutcome::Changed;
                 let drafts = registry.navigation_change().into_iter().collect();
                 return ColdApplyEffects {
                     pending: r.pending_requests.into_iter().collect(),
                     drafts,
                     actions,
+                    promoted_draft,
                     ..Default::default()
                 };
             }

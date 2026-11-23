@@ -14,13 +14,13 @@ use crate::apply_patch::history::{
     AggregateFileChange, AppliedPatchDelta, AppliedPatchRecord, AppliedStep, CommittedPatchChange,
     CommittedTextSnapshot, ContentAddressedSnapshotRef, FileHistoryEntry, HistoryCoverage,
     HistoryPage, HistoryQueryError, HistoryQueryLimits, HistoryRenderedDiff, IntentStatus,
-    InvocationIdentity, PatchHistoryCoverage, RecordStoreError, SnapshotDomain,
-    SqliteCommitIntentStore, SqliteSnapshotStore, StoredPatchRecord, ThreadHistoryCursor,
-    TurnDiffExactness, TurnRecordProjector,
+    InvocationIdentity, PatchHistoryCoverage, PostgresCommitIntentStore, PostgresSnapshotStore,
+    RecordStoreError, SnapshotDomain, StoredPatchRecord, ThreadHistoryCursor, TurnDiffExactness,
+    TurnRecordProjector,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -75,7 +75,7 @@ impl PreparedAppliedPatchRecord {
         validate_record(record).map_err(|error| anyhow!(error))?;
         validate_fingerprint(plan_fingerprint)?;
         let id = record_id(&record.identity, record.commit_ordinal.0);
-        let commit_ordinal = sqlite_ordinal(record.commit_ordinal)?;
+        let commit_ordinal = postgres_ordinal(record.commit_ordinal)?;
         let change_index_rows = record
             .changes
             .iter()
@@ -173,14 +173,14 @@ pub(crate) fn decode_persisted_record_delta(
 }
 
 #[derive(Clone)]
-pub struct SqliteAppliedPatchStore {
-    db: SqliteDatabase,
+pub struct PostgresAppliedPatchStore {
+    db: PostgresDatabase,
     #[cfg(test)]
     fail_next_record_insert: Arc<AtomicBool>,
 }
 
-impl SqliteAppliedPatchStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresAppliedPatchStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self {
             db: db.into(),
             #[cfg(test)]
@@ -193,7 +193,7 @@ impl SqliteAppliedPatchStore {
         self.fail_next_record_insert.store(true, Ordering::SeqCst);
     }
 
-    pub fn database(&self) -> &SqliteDatabase {
+    pub fn database(&self) -> &PostgresDatabase {
         &self.db
     }
 
@@ -233,7 +233,8 @@ impl SqliteAppliedPatchStore {
             })
             .transpose()?
             .flatten();
-        let snapshot_store = crate::apply_patch::history::SqliteSnapshotStore::new(self.db.clone());
+        let snapshot_store =
+            crate::apply_patch::history::PostgresSnapshotStore::new(self.db.clone());
         let prepared_snapshots = snapshot_store.prepare_snapshots(domain, snapshots)?;
         let prepared_record = PreparedAppliedPatchRecord::prepare(&record, plan_fingerprint)?;
         let transaction = self
@@ -245,7 +246,7 @@ impl SqliteAppliedPatchStore {
         // filesystem write.  Remove it inside the same transaction that
         // interns the record's actual blobs: a rollback restores the
         // reservation and keeps the tracked invocation fail-closed.
-        SqliteSnapshotStore::release_reservation_in_transaction(&transaction, &record.identity)
+        PostgresSnapshotStore::release_reservation_in_transaction(&transaction, &record.identity)
             .await?;
         let existing = crud::find_applied_patch_record_by_invocation(
             &transaction,
@@ -280,7 +281,7 @@ impl SqliteAppliedPatchStore {
                     &transaction,
                     &domain.id(),
                     &content_hash,
-                    sqlite_u64(byte_len, "snapshot byte length")?,
+                    postgres_u64(byte_len, "snapshot byte length")?,
                     required,
                 )
                 .await
@@ -358,7 +359,7 @@ impl SqliteAppliedPatchStore {
             transaction,
             &record.identity.thread_id,
             &record.identity.turn_id,
-            sqlite_ordinal(record.commit_ordinal)?,
+            postgres_ordinal(record.commit_ordinal)?,
         )
         .await
         .context("check patch record ordinal uniqueness")?;
@@ -424,7 +425,7 @@ impl SqliteAppliedPatchStore {
 
     /// Materialize one durable record's exact delta from its content-addressed
     /// snapshot references.  This is used only by lifecycle repair paths when
-    /// the process-local observer still has a record but its SQLite promotion
+    /// the process-local observer still has a record but its PostgreSQL promotion
     /// was interrupted.  It never reads the live workspace or substitutes the
     /// pre-mutation recovery plan, which would be incorrect for a contextual
     /// Update that was replanned against unrelated external edits.
@@ -434,7 +435,7 @@ impl SqliteAppliedPatchStore {
             "pioneer",
             "thread_history",
         );
-        let snapshots = SqliteSnapshotStore::new(self.db.clone());
+        let snapshots = PostgresSnapshotStore::new(self.db.clone());
         let load = |reference: Option<&crate::apply_patch::history::TextSnapshotRef>| {
             let snapshots = snapshots.clone();
             let domain_id = domain.id();
@@ -587,7 +588,7 @@ impl SqliteAppliedPatchStore {
             }
         }
 
-        let intents = SqliteCommitIntentStore::new(self.db.clone());
+        let intents = PostgresCommitIntentStore::new(self.db.clone());
         let mut statuses = Vec::new();
         let mut status_cursor = after_ordinal;
         let mut reached_status_end = false;
@@ -693,7 +694,7 @@ impl SqliteAppliedPatchStore {
     ) -> Result<String> {
         let domain =
             SnapshotDomain::new(format!("thread:{thread_id}"), "pioneer", "thread_history");
-        let snapshots = SqliteSnapshotStore::new(self.db.clone());
+        let snapshots = PostgresSnapshotStore::new(self.db.clone());
         let mut resolved = HashMap::<([u8; 32], u64), Vec<u8>>::new();
         let mut decompressed_bytes = 0usize;
         for reference in changes.iter().flat_map(|change| {
@@ -753,7 +754,7 @@ impl SqliteAppliedPatchStore {
 
     /// Read one bounded keyset page of records for deterministic projection
     /// replay.  Callers must advance `after_ordinal` to the last returned
-    /// ordinal; SQLite never materializes the remainder of the turn here.
+    /// ordinal; PostgreSQL never materializes the remainder of the turn here.
     pub async fn records_for_turn_page(
         &self,
         thread_id: &str,
@@ -768,7 +769,7 @@ impl SqliteAppliedPatchStore {
             &self.db,
             thread_id,
             turn_id,
-            after_ordinal.map(sqlite_ordinal).transpose()?,
+            after_ordinal.map(postgres_ordinal).transpose()?,
             u64::try_from(limit).map_err(|_| anyhow!("patch replay page size is out of range"))?,
         )
         .await
@@ -788,7 +789,7 @@ impl SqliteAppliedPatchStore {
             bail!("invalid patch replay page size")
         }
         let after = match after {
-            Some(cursor) => Some((cursor.turn_id.as_str(), sqlite_ordinal(cursor.ordinal)?)),
+            Some(cursor) => Some((cursor.turn_id.as_str(), postgres_ordinal(cursor.ordinal)?)),
             None => None,
         };
         let rows = crud::list_applied_patch_records_for_thread(
@@ -816,7 +817,7 @@ impl SqliteAppliedPatchStore {
                 cursor.committed_at_unix_ms,
                 cursor.thread_id.as_str(),
                 cursor.turn_id.as_str(),
-                sqlite_ordinal(cursor.ordinal)?,
+                postgres_ordinal(cursor.ordinal)?,
             )),
             None => None,
         };
@@ -846,7 +847,7 @@ impl SqliteAppliedPatchStore {
         Ok((
             count,
             max_ordinal
-                .map(sqlite_decode_ordinal)
+                .map(decode_postgres_ordinal)
                 .transpose()?
                 .map(crate::apply_patch::history::CommitOrdinal),
         ))
@@ -869,7 +870,7 @@ impl SqliteAppliedPatchStore {
             &self.db,
             thread_id,
             turn_id,
-            sqlite_ordinal(after_ordinal)?,
+            postgres_ordinal(after_ordinal)?,
         )
         .await
         .context("check for later applied patch turn records")
@@ -884,7 +885,7 @@ impl SqliteAppliedPatchStore {
             &self.db,
             thread_id,
             &after.turn_id,
-            sqlite_ordinal(after.ordinal)?,
+            postgres_ordinal(after.ordinal)?,
         )
         .await
         .context("check for later applied patch thread records")
@@ -975,7 +976,7 @@ impl SqliteAppliedPatchStore {
                 .map(|snapshot| {
                     Ok((
                         snapshot.content_hash,
-                        sqlite_u64(snapshot.byte_len, "snapshot byte length")?,
+                        postgres_u64(snapshot.byte_len, "snapshot byte length")?,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1024,7 +1025,7 @@ impl SqliteAppliedPatchStore {
                 &transaction,
                 thread_id,
                 &current_turn_id,
-                sqlite_ordinal(current_ordinal)?,
+                postgres_ordinal(current_ordinal)?,
             )
             .await
             .context("delete one patch record for thread")?;
@@ -1035,7 +1036,7 @@ impl SqliteAppliedPatchStore {
                 &transaction,
                 thread_id,
                 &current_turn_id,
-                sqlite_ordinal(current_ordinal)?,
+                postgres_ordinal(current_ordinal)?,
             )
             .await
             .context("delete one patch change index for thread")?;
@@ -1051,7 +1052,7 @@ impl SqliteAppliedPatchStore {
     }
 
     /// Durable adapters expose the same bounded query contract as the pure
-    /// in-memory query layer. Records are loaded from SQLite and folded by the
+    /// in-memory query layer. Records are loaded from PostgreSQL and folded by the
     /// canonical query implementation; no workspace or Git read is involved.
     pub async fn query_turn_steps(
         &self,
@@ -1407,7 +1408,7 @@ impl SqliteAppliedPatchStore {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<HistoryCoverage, HistoryQueryError> {
-        let intents = crate::apply_patch::history::SqliteCommitIntentStore::new(self.db.clone());
+        let intents = crate::apply_patch::history::PostgresCommitIntentStore::new(self.db.clone());
         let mut accumulator = HistoryCoverageAccumulator::new();
         let mut record_cursor = None;
         let mut record_page = VecDeque::new();
@@ -1494,7 +1495,7 @@ impl SqliteAppliedPatchStore {
         &self,
         thread_id: &str,
     ) -> Result<HistoryCoverage, HistoryQueryError> {
-        let intents = crate::apply_patch::history::SqliteCommitIntentStore::new(self.db.clone());
+        let intents = crate::apply_patch::history::PostgresCommitIntentStore::new(self.db.clone());
         // Both source streams are ordered by `(turn_id, commit_ordinal)`, so
         // only the current turn's ordinal watermark is needed.  Keeping one
         // accumulator per historical turn would make a thread-wide coverage
@@ -1724,7 +1725,7 @@ fn combined_history_coverage(
 }
 
 async fn query_index_rows(
-    db: &SqliteDatabase,
+    db: &PostgresDatabase,
     thread_id: &str,
     aliases: &BTreeSet<String>,
     cursor: Option<&IndexCursor>,
@@ -1865,7 +1866,7 @@ fn decode_index_row(row: crud::AppliedPatchChangeIndexRow) -> Result<IndexedFile
     Ok(IndexedFileChange {
         environment_id,
         turn_id,
-        ordinal: crate::apply_patch::history::CommitOrdinal(sqlite_decode_ordinal(ordinal)?),
+        ordinal: crate::apply_patch::history::CommitOrdinal(decode_postgres_ordinal(ordinal)?),
         sequence: sequence as u32,
         invocation_id,
         source_path,
@@ -1923,7 +1924,9 @@ fn decode_row(row: &crud::AppliedPatchRecordRow) -> Result<StoredPatchRecord> {
         schema_version: schema_version as u16,
         identity,
         environment_id,
-        commit_ordinal: crate::apply_patch::history::CommitOrdinal(sqlite_decode_ordinal(ordinal)?),
+        commit_ordinal: crate::apply_patch::history::CommitOrdinal(decode_postgres_ordinal(
+            ordinal,
+        )?),
         authority,
         provenance,
         exactness,
@@ -2102,14 +2105,14 @@ async fn ensure_prepared_change_index(
     Ok(())
 }
 
-fn sqlite_ordinal(ordinal: crate::apply_patch::history::CommitOrdinal) -> Result<i64> {
-    i64::try_from(ordinal.0).map_err(|_| anyhow!("patch record ordinal exceeds SQLite range"))
+fn postgres_ordinal(ordinal: crate::apply_patch::history::CommitOrdinal) -> Result<i64> {
+    i64::try_from(ordinal.0).map_err(|_| anyhow!("patch record ordinal exceeds PostgreSQL range"))
 }
 
-fn sqlite_u64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
+fn postgres_u64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds PostgreSQL integer range"))
 }
 
-fn sqlite_decode_ordinal(value: i64) -> Result<u64> {
+fn decode_postgres_ordinal(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| anyhow!("stored patch commit ordinal cannot be negative"))
 }

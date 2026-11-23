@@ -1,0 +1,3 @@
+[profile.ci]
+# A stuck test must fail by name while the shard can still run its remaining cases.
+slow-timeout = { period = "60s", terminate-after = 5 }

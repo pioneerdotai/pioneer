@@ -20,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_run: HasOne<super::task_run::Entity>,
+    pub task_run: BelongsTo<super::task_run::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

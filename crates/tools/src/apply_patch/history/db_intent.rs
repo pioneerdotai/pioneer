@@ -6,7 +6,7 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::TransactionTrait;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::Digest;
@@ -34,7 +34,7 @@ const MAX_RECOVERY_PAGE_SIZE: i64 = 256;
 // A recovery plan may retain bounded source and successor snapshots for one
 // patch. The default patch limits permit 128 MiB of observed input and 64 MiB
 // of generated output; JSON/base64 framing and move-overwrite lineage require
-// a larger, still finite SQLite boundary. The matching encode guard below
+// a larger, still finite PostgreSQL boundary. The matching encode guard below
 // ensures no row is ever written above this decode limit.
 const MAX_INTENT_JSON_BYTES: usize = 384 * 1024 * 1024;
 const MAX_INTENT_OPERATIONS: usize = 256;
@@ -45,7 +45,7 @@ const MAX_INTENT_PATH_BYTES: usize = 4096;
 const MAX_INTENT_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INTENT_ID_BYTES: usize = 4096;
 
-// SQLite does not provide a portable per-turn `MAX(ordinal)+1` allocator
+// PostgreSQL does not provide a portable per-turn `MAX(ordinal)+1` allocator
 // under two deferred write transactions. Serialize only admissions for the
 // same logical turn; unrelated turns must not queue behind one stalled
 // database transaction. Weak entries keep this process-local registry bounded,
@@ -78,12 +78,12 @@ pub enum BeginNextOutcome {
     Existing(PatchCommitIntent),
 }
 
-/// SQLite-backed operational intent state. AppliedPatchRecord remains the
+/// PostgreSQL-backed operational intent state. AppliedPatchRecord remains the
 /// immutable source log; this table only closes the crash window around the
 /// filesystem executor and is safe to replay or terminalize as a gap.
 #[derive(Clone)]
-pub struct SqliteCommitIntentStore {
-    db: SqliteDatabase,
+pub struct PostgresCommitIntentStore {
+    db: PostgresDatabase,
 }
 
 #[derive(Clone, Debug)]
@@ -99,8 +99,8 @@ struct PendingKey {
     identity: InvocationIdentity,
 }
 
-impl SqliteCommitIntentStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresCommitIntentStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self { db: db.into() }
     }
 
@@ -206,7 +206,7 @@ impl SqliteCommitIntentStore {
             crud::next_patch_commit_ordinal(&transaction, &identity.thread_id, &identity.turn_id)
                 .await
                 .context("allocate next patch intent ordinal")?;
-        let commit_ordinal = CommitOrdinal(sqlite_decode_ordinal(next_ordinal)?);
+        let commit_ordinal = CommitOrdinal(decode_postgres_ordinal(next_ordinal)?);
         let intent = PatchCommitIntent {
             identity,
             commit_ordinal,
@@ -222,7 +222,7 @@ impl SqliteCommitIntentStore {
                 thread_id: intent.identity.thread_id.clone(),
                 turn_id: intent.identity.turn_id.clone(),
                 invocation_id: intent.identity.invocation_id.clone(),
-                commit_ordinal: sqlite_ordinal(intent.commit_ordinal)?,
+                commit_ordinal: postgres_ordinal(intent.commit_ordinal)?,
                 plan_fingerprint: intent.plan_fingerprint.to_vec(),
                 operations_json,
                 recovery_json,
@@ -244,7 +244,7 @@ impl SqliteCommitIntentStore {
         if intent.plan_fingerprint.iter().all(|byte| *byte == 0) {
             bail!("patch intent plan fingerprint must not be all zeroes");
         }
-        let expected_ordinal = sqlite_ordinal(intent.commit_ordinal)?;
+        let expected_ordinal = postgres_ordinal(intent.commit_ordinal)?;
         let current = crud::find_patch_commit_intent(
             &self.db,
             &intent.identity.thread_id,
@@ -654,7 +654,7 @@ impl SqliteCommitIntentStore {
             &self.db,
             thread_id,
             turn_id,
-            after_ordinal.map(sqlite_ordinal).transpose()?,
+            after_ordinal.map(postgres_ordinal).transpose()?,
             limit as u64,
         )
         .await
@@ -666,7 +666,7 @@ impl SqliteCommitIntentStore {
                     bail!("patch ordinal status cannot be negative");
                 }
                 let status = parse_status(&row.status)?;
-                Ok((CommitOrdinal(sqlite_decode_ordinal(ordinal)?), status))
+                Ok((CommitOrdinal(decode_postgres_ordinal(ordinal)?), status))
             })
             .collect()
     }
@@ -688,7 +688,7 @@ impl SqliteCommitIntentStore {
         if ordinal < 0 {
             bail!("patch turn commit ordinal cannot be negative");
         }
-        Ok(Some(CommitOrdinal(sqlite_decode_ordinal(ordinal)?)))
+        Ok(Some(CommitOrdinal(decode_postgres_ordinal(ordinal)?)))
     }
 
     /// Read a bounded keyset page of non-promoted statuses across a thread.
@@ -704,7 +704,7 @@ impl SqliteCommitIntentStore {
             bail!("invalid patch thread ordinal-status page size");
         }
         let after = match after {
-            Some((turn_id, ordinal)) => Some((turn_id, sqlite_ordinal(ordinal)?)),
+            Some((turn_id, ordinal)) => Some((turn_id, postgres_ordinal(ordinal)?)),
             None => None,
         };
         let rows = crud::list_non_promoted_patch_statuses_for_thread(
@@ -725,7 +725,7 @@ impl SqliteCommitIntentStore {
                 let status = parse_status(&row.status)?;
                 Ok((
                     turn_id,
-                    CommitOrdinal(sqlite_decode_ordinal(ordinal)?),
+                    CommitOrdinal(decode_postgres_ordinal(ordinal)?),
                     status,
                 ))
             })
@@ -753,7 +753,7 @@ impl SqliteCommitIntentStore {
     /// unresolvable filesystem state remains an explicit gap.
     pub async fn terminalize_pending_gaps(
         &self,
-        records: &crate::apply_patch::history::SqliteAppliedPatchStore,
+        records: &crate::apply_patch::history::PostgresAppliedPatchStore,
     ) -> Result<u64> {
         let mut terminalized = 0u64;
         let mut cursor = None;
@@ -945,7 +945,7 @@ impl SqliteCommitIntentStore {
 
     async fn project_recovered_turn(
         &self,
-        records: &crate::apply_patch::history::SqliteAppliedPatchStore,
+        records: &crate::apply_patch::history::PostgresAppliedPatchStore,
         record: &crate::apply_patch::history::AppliedPatchRecord,
     ) -> Result<()> {
         let replay = crate::apply_patch::history::replay_turn_pages(
@@ -968,7 +968,7 @@ impl SqliteCommitIntentStore {
             replay.revision,
             false,
         );
-        crate::apply_patch::history::SqliteTurnDiffStore::new(self.db.clone())
+        crate::apply_patch::history::PostgresTurnDiffStore::new(self.db.clone())
             .repair_live(&state)
             .await?;
         Ok(())
@@ -1482,7 +1482,7 @@ fn decode_row(
     validate_progress(&committed_changes)?;
     Ok(PatchCommitIntent {
         identity: identity.clone(),
-        commit_ordinal: CommitOrdinal(sqlite_decode_ordinal(row.commit_ordinal)?),
+        commit_ordinal: CommitOrdinal(decode_postgres_ordinal(row.commit_ordinal)?),
         plan_fingerprint,
         planned_operation_fingerprints,
         recovery_plan,
@@ -1511,7 +1511,7 @@ fn decode_terminal_row(
     validate_operation_fingerprints(&planned_operation_fingerprints)?;
     Ok(PatchCommitIntent {
         identity: identity.clone(),
-        commit_ordinal: CommitOrdinal(sqlite_decode_ordinal(row.commit_ordinal)?),
+        commit_ordinal: CommitOrdinal(decode_postgres_ordinal(row.commit_ordinal)?),
         plan_fingerprint,
         planned_operation_fingerprints,
         recovery_plan: None,
@@ -1753,11 +1753,11 @@ fn validate_side_effects(
     Ok(())
 }
 
-fn sqlite_ordinal(ordinal: CommitOrdinal) -> Result<i64> {
-    i64::try_from(ordinal.0).map_err(|_| anyhow!("patch intent ordinal exceeds SQLite range"))
+fn postgres_ordinal(ordinal: CommitOrdinal) -> Result<i64> {
+    i64::try_from(ordinal.0).map_err(|_| anyhow!("patch intent ordinal exceeds PostgreSQL range"))
 }
 
-fn sqlite_decode_ordinal(value: i64) -> Result<u64> {
+fn decode_postgres_ordinal(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| anyhow!("patch intent commit ordinal cannot be negative"))
 }
 

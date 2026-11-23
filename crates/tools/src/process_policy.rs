@@ -256,6 +256,14 @@ where
     let allow_list_active = !policy.inherit || !allowed_vars.is_empty();
 
     let mut host_environment = host_environment.into_iter().collect::<BTreeMap<_, _>>();
+    let inherited_database_urls = host_environment
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case("DATABASE_URL"))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in &inherited_database_urls {
+        host_environment.remove(key);
+    }
     for (key, value) in invocation_environment {
         host_environment.insert(key.clone(), value.clone());
     }
@@ -273,6 +281,7 @@ where
                 !allowed_vars.contains(&key.to_ascii_uppercase()) || env_denied(policy, key)
             })
             .cloned()
+            .chain(inherited_database_urls)
             .collect::<Vec<_>>();
         return (false, environment, removed_environment);
     }
@@ -286,6 +295,7 @@ where
         .keys()
         .filter(|key| env_denied(policy, key))
         .cloned()
+        .chain(inherited_database_urls)
         .collect::<Vec<_>>();
 
     (policy.inherit, environment, removed_environment)
@@ -494,6 +504,18 @@ mod tests {
         assert!(plan.removed_environment.contains(&"SAFE_VALUE".to_owned()));
         assert!(plan.removed_environment.contains(&"API_TOKEN".to_owned()));
         assert!(plan.removed_environment.contains(&"DB_PASSWORD".to_owned()));
+    }
+
+    #[test]
+    fn unrestricted_spawn_removes_gateway_database_url_from_inherited_environment() {
+        let (inherits, environment, removed) = sanitize_environment(
+            &TurnEnvironmentPolicy::unrestricted(),
+            &BTreeMap::new(),
+            [("DATABASE_URL".to_owned(), "gateway-db-canary".to_owned())],
+        );
+        assert!(inherits);
+        assert!(!environment.contains_key("DATABASE_URL"));
+        assert_eq!(removed, ["DATABASE_URL"]);
     }
 
     #[test]

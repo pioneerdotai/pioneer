@@ -31,21 +31,25 @@ fn run(scenario: Scenario) {
                 runtime.handle(),
                 pioneer_observability::runtime::RuntimeRole::GatewayPatch,
             );
-            _runtime_observer.block_on(
-                &runtime,
-                message_future(run_interrupted_cli_runtime_turn_recovery_scenario(
-                    matches!(
-                        scenario,
-                        Scenario::ObservationActiveBeforeOpen
-                            | Scenario::ObservationActiveSubscribed
-                            | Scenario::ObservationActiveRestoreFailure
-                    ),
-                    false,
-                    matches!(scenario, Scenario::ExecutionChild),
-                    false,
-                    Some(scenario),
-                )),
-            );
+            _runtime_observer
+                .block_on(
+                    &runtime,
+                    message_future(pioneer_postgres_test::with_test_databases(
+                        run_interrupted_cli_runtime_turn_recovery_scenario(
+                            matches!(
+                                scenario,
+                                Scenario::ObservationActiveBeforeOpen
+                                    | Scenario::ObservationActiveSubscribed
+                                    | Scenario::ObservationActiveRestoreFailure
+                            ),
+                            false,
+                            matches!(scenario, Scenario::ExecutionChild),
+                            false,
+                            Some(scenario),
+                        ),
+                    )),
+                )
+                .expect("close isolated PostgreSQL test databases");
         })
         .unwrap();
     thread.join().unwrap();

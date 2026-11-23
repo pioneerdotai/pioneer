@@ -18,22 +18,20 @@ pub type HookRunStoreResult<T> = Result<T, HookRunStoreError>;
 pub enum HookRunStoreCauseClass {
     #[default]
     Unclassified,
-    SqliteBusy,
-    SqliteLocked,
-    SqliteCantOpen,
-    SqliteConstraint,
-    SqliteOther,
+    PostgresConstraint,
+    PostgresConnection,
+    PostgresContention,
+    PostgresOther,
 }
 
 impl HookRunStoreCauseClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unclassified => "unclassified",
-            Self::SqliteBusy => "sqlite_busy",
-            Self::SqliteLocked => "sqlite_locked",
-            Self::SqliteCantOpen => "sqlite_cantopen",
-            Self::SqliteConstraint => "sqlite_constraint",
-            Self::SqliteOther => "sqlite_other",
+            Self::PostgresConstraint => "postgres_constraint",
+            Self::PostgresConnection => "postgres_connection",
+            Self::PostgresContention => "postgres_contention",
+            Self::PostgresOther => "postgres_other",
         }
     }
 }
@@ -41,8 +39,6 @@ impl HookRunStoreCauseClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HookRunStoreDiagnostic {
     pub cause_class: HookRunStoreCauseClass,
-    pub sqlite_primary_code: Option<i32>,
-    pub sqlite_extended_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,9 +536,7 @@ mod tests {
     #[test]
     fn diagnostics_preserve_internal_variant_display_and_value_traits() {
         let diagnostic = HookRunStoreDiagnostic {
-            cause_class: HookRunStoreCauseClass::SqliteLocked,
-            sqlite_primary_code: Some(6),
-            sqlite_extended_code: Some(262),
+            cause_class: HookRunStoreCauseClass::PostgresContention,
         };
         let error = HookRunStoreError::internal_with_diagnostic("safe message", diagnostic);
         assert_eq!(error.clone(), error);

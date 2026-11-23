@@ -1,18 +1,28 @@
-# Gateway Data Migrations
+# Gateway Database Lifecycle
 
-- This module owns data-migration orchestration. Register startup work through
-  [startup/mod.rs](startup/mod.rs) and reuse the existing lifecycle; do not move
-  database backfills into feature modules or invent a parallel migration runner.
-- Keep schema changes in the [migration crate](../../../migration/AGENTS.md).
-  Delegate database operations to [CRUD repositories](../../../crud/AGENTS.md).
-- Run heavy historical backfill through existing background maintenance, using
-  bounded batches, durable progress and restart-safe, idempotent operations.
-  Reuse the project's database quantum and cancellation mechanisms.
-- A blocking startup gate needs a concrete correctness invariant and explicit
-  ordering before affected runtime work. Background data preparation should not
-  become an unconditional startup scan of the database.
-- Completion markers must describe committed durable results. Retry, failure,
-  cancellation or restart must not mark unfinished work complete or skip it.
-- Keep database migration ownership separate from runtime watchers/services.
-  Reuse [maintenance](maintenance/mod.rs) for ongoing database maintenance;
-  preserve the root rules for scheduling, resource lifetimes and transactions.
+- Gateway uses the shipped PostgreSQL runtime by default. Keep the cluster
+  under the private runtime home, outside the installation. Start the bundled
+  postmaster directly, and close application connections before waiting for it
+  to exit.
+- Gateway and database operator commands use `DATABASE_URL` from the process
+  environment or the runtime home's `.env` to select an external application
+  database. Development also reads the URL passed to `pioneer start` and the
+  workspace `.env`, in that order before the runtime home's `.env`. An explicit
+  dev-only `gateway.database.development_url` takes precedence. Keep URL values
+  out of logs and inherited agent environments. The test administrative URL
+  belongs to the test runner.
+- Treat external PostgreSQL as an independently managed service. Gateway owns
+  the pools and applies its schema migrations. Use one active Gateway per
+  database and connect to the cluster's writable endpoint.
+- Gateway uses the managed `public` schema for Pioneer and pgvector. Configure
+  connection search paths as `public, pg_temp`, which searches `pg_catalog`
+  implicitly first. The routing policy relies on the managed functions,
+  operators and types in these schemas.
+- Apply the registered migrations to an empty PostgreSQL database at initial
+  setup. Keep application reads and ongoing maintenance on PostgreSQL under
+  their scoped handles.
+- Schema changes belong in the [migration crate](../../../migration/AGENTS.md).
+  Delegate ordinary database operations to [CRUD repositories](../../../crud/AGENTS.md).
+- Keep work needed for current PostgreSQL data bounded, restart-safe and
+  cancellation-aware. Publish signals after the atomic transition and after
+  releasing database capacity. Follow the [root rules](../../../../AGENTS.md).

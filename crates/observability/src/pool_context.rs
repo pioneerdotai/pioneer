@@ -1,4 +1,4 @@
-//! Fixed SQLite pool attribution, installed only while polling or dropping an operation.
+//! Fixed PostgreSQL pool attribution, installed only while polling or dropping an operation.
 //! No SQL, work payload, or caller identity is retained here.
 use std::{cell::Cell, marker::PhantomData, rc::Rc};
 

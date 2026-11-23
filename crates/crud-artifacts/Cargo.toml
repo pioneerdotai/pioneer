@@ -1,0 +1,34 @@
+[package]
+name = "pioneer-crud-artifacts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+pioneer-crud-signals.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+pioneer-compaction.workspace = true
+pioneer-crud-access.workspace = true
+pioneer-crud-conversations.workspace = true
+pioneer-entity.workspace = true
+pioneer-protocol.workspace = true
+pioneer-postgres-pools.workspace = true
+hex.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-postgres"] }
+
+[dev-dependencies]
+futures-util.workspace = true
+pioneer-migration.workspace = true
+pioneer-postgres-test.workspace = true

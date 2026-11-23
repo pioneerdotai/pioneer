@@ -112,14 +112,13 @@ pub(crate) fn agent_skill_runtime_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         AcceptedAgentSkillCreate, FinalizeSelfImprovementRunInput,
         FinalizeSelfImprovementRunResult, NewSelfImprovementRun, SelfImprovementFinalOutcome,
         SelfImprovementFinalizationAuthority,
     };
     use pioneer_protocol::{PrincipalId, SkillId};
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::ConnectionTrait;
 
     const NOW: i64 = 1_900_400_000;
     const WORKSPACE: &str = "W0000000000000000000O";
@@ -129,13 +128,12 @@ mod tests {
         PrincipalId::new(MEMBER_ID).expect("Member fixture ID must be valid")
     }
 
-    async fn active_store() -> CrudStore {
-        let database = Database::connect("sqlite::memory:")
+    async fn active_store(fixture: &pioneer_postgres_test::TestDatabase) -> CrudStore {
+        let database = fixture.connection().clone();
+        database
+            .execute_unprepared("DELETE FROM workspace")
             .await
-            .expect("in-memory SQLite must open");
-        Migrator::up(&database, None)
-            .await
-            .expect("migrations must apply");
+            .unwrap();
         database
             .execute_unprepared(
                 "INSERT INTO gateway_identity (
@@ -150,7 +148,7 @@ mod tests {
                     'active', 'Member', 'member', 'member'
                  ); \
                  INSERT INTO workspace (id, name, is_active, is_current) VALUES \
-                 ('W0000000000000000000O', 'Overlay', 1, 1); \
+                 ('W0000000000000000000O', 'Overlay', TRUE, TRUE); \
                  INSERT INTO workspace_membership (
                     principal_id, workspace_id, granted_by_actor_kind, created_at, updated_at
                  ) VALUES (
@@ -166,7 +164,10 @@ mod tests {
                  ); \
                  INSERT INTO turn (id, thread_id, status, turn_kind, origin) VALUES \
                      ('turn_context', 'thread_overlay', 'completed', 'conversation', 'user'), \
-                     ('turn_anchor', 'thread_overlay', 'completed', 'conversation', 'user');",
+                     ('turn_anchor', 'thread_overlay', 'completed', 'conversation', 'user');
+                 INSERT INTO turn_event (id, thread_id, turn_id, sequence, event_type, payload) VALUES
+                     ('event_context', 'thread_overlay', 'turn_context', 1, 'turn/completed', '{}'),
+                     ('event_anchor', 'thread_overlay', 'turn_anchor', 1, 'turn/completed', '{}');",
             )
             .await
             .expect("history fixtures must insert");
@@ -272,127 +273,136 @@ mod tests {
 
     #[tokio::test]
     async fn materializes_exact_active_version_only_while_workspace_is_enabled() {
-        let store = active_store().await;
-        let restarted_store = CrudStore::new(store.database_connection());
-        drop(store);
-        let entries = load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
-            .await
-            .expect("overlay must load after service restart");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].version_id, "111111111111111111111");
-        assert_eq!(entries[0].body, "Exact immutable body");
-        assert_eq!(
-            entries[0].runtime_description,
-            "Use for the stable procedure. Do not use when: The procedure does not apply."
-        );
-
-        restarted_store
-            .deactivate_self_improvement_workspace(WORKSPACE, NOW + 4)
-            .await
-            .expect("workspace must deactivate");
-        assert!(
-            load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
+        pioneer_postgres_test::with_database(async |fixture| {
+            let store = active_store(fixture).await;
+            let restarted_store = CrudStore::new(store.database_connection());
+            drop(store);
+            let entries = load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
                 .await
-                .expect("disabled overlay lookup must succeed")
-                .is_empty()
-        );
+                .expect("overlay must load after service restart");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].version_id, "111111111111111111111");
+            assert_eq!(entries[0].body, "Exact immutable body");
+            assert_eq!(
+                entries[0].runtime_description,
+                "Use for the stable procedure. Do not use when: The procedure does not apply."
+            );
+
+            restarted_store
+                .deactivate_self_improvement_workspace(WORKSPACE, NOW + 4)
+                .await
+                .expect("workspace must deactivate");
+            assert!(
+                load_active_agent_skill_overlay(&restarted_store, WORKSPACE)
+                    .await
+                    .expect("disabled overlay lookup must succeed")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn member_overlay_accepts_private_sources_with_workspace_membership_and_policy() {
-        use pioneer_crud::WorkspaceSkillPolicyRecord;
-        use sea_orm::ConnectionTrait;
+        pioneer_postgres_test::with_database(async |fixture| {
+            use pioneer_crud::WorkspaceSkillPolicyRecord;
 
-        let store = active_store().await;
-        let principal_id = member_id();
-        store
-            .database_connection()
-            .execute_unprepared(
-                "DELETE FROM workspace_membership \
-                 WHERE principal_id = 'P00000000000000000002' \
-                   AND workspace_id = 'W0000000000000000000O'",
-            )
-            .await
-            .expect("Member membership must be removable");
-        assert!(
-            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            let store = active_store(fixture).await;
+            let principal_id = member_id();
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "DELETE FROM workspace_membership \
+                     WHERE principal_id = 'P00000000000000000002' \
+                       AND workspace_id = 'W0000000000000000000O'",
+                )
                 .await
-                .expect("missing workspace membership must fail closed without error")
-                .is_empty()
-        );
-        store
-            .database_connection()
-            .execute_unprepared(
-                "INSERT INTO workspace_membership (
-                    principal_id, workspace_id, granted_by_actor_kind, created_at, updated_at
-                 ) VALUES (
-                    'P00000000000000000002', 'W0000000000000000000O', 'system',
-                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                 )",
-            )
-            .await
-            .expect("Member membership must be restorable");
-        store
-            .database_connection()
-            .execute_unprepared(
-                "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'",
-            )
-            .await
-            .expect("source thread must become workspace-visible");
-        assert!(
-            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .expect("Member membership must be removable");
+            assert!(
+                load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                    .await
+                    .expect("missing workspace membership must fail closed without error")
+                    .is_empty()
+            );
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "INSERT INTO workspace_membership (
+                        principal_id, workspace_id, granted_by_actor_kind, created_at, updated_at
+                     ) VALUES (
+                        'P00000000000000000002', 'W0000000000000000000O', 'system',
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                     )",
+                )
                 .await
-                .expect("missing policy must fail closed without error")
-                .is_empty()
-        );
-        store
-            .upsert_workspace_skill_policy(
-                &WorkspaceSkillPolicyRecord {
-                    id: "member_overlay_policy".to_owned(),
-                    workspace_id: WORKSPACE.to_owned(),
-                    skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("skill id"),
-                    enabled: Some(true),
-                    allow_implicit_invocation: Some(true),
-                },
-                NOW + 5,
-            )
-            .await
-            .expect("explicit workspace policy must persist");
-        let eligible = load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
-            .await
-            .expect("workspace-only learned version must resolve");
-        assert_eq!(eligible.len(), 1);
-        assert_eq!(eligible[0].version_id, "111111111111111111111");
+                .expect("Member membership must be restorable");
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'",
+                )
+                .await
+                .expect("source thread must become workspace-visible");
+            assert!(
+                load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                    .await
+                    .expect("missing policy must fail closed without error")
+                    .is_empty()
+            );
+            store
+                .upsert_workspace_skill_policy(
+                    &WorkspaceSkillPolicyRecord {
+                        id: "member_overlay_policy".to_owned(),
+                        workspace_id: WORKSPACE.to_owned(),
+                        skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("skill id"),
+                        enabled: Some(true),
+                        allow_implicit_invocation: Some(true),
+                    },
+                    NOW + 5,
+                )
+                .await
+                .expect("explicit workspace policy must persist");
+            let eligible = load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .await
+                .expect("workspace-only learned version must resolve");
+            assert_eq!(eligible.len(), 1);
+            assert_eq!(eligible[0].version_id, "111111111111111111111");
 
-        store
-            .database_connection()
-            .execute_unprepared(
-                "UPDATE thread SET access_class = 'private' WHERE id = 'thread_overlay'",
-            )
-            .await
-            .expect("source thread must become private");
-        assert_eq!(
-            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "UPDATE thread SET access_class = 'private' WHERE id = 'thread_overlay'",
+                )
                 .await
-                .expect("private source skills must remain available to workspace members")
-                .len(),
-            1
-        );
-        store
-            .database_connection()
-            .execute_unprepared(
-                "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'; \
-                 DELETE FROM workspace_membership \
-                 WHERE principal_id = 'P00000000000000000002' \
-                   AND workspace_id = 'W0000000000000000000O'",
-            )
-            .await
-            .expect("Member membership revoke must persist");
-        assert!(
-            load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                .expect("source thread must become private");
+            assert_eq!(
+                load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                    .await
+                    .expect("private source skills must remain available to workspace members")
+                    .len(),
+                1
+            );
+            store
+                .database_connection()
+                .execute_unprepared(
+                    "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_overlay'; \
+                     DELETE FROM workspace_membership \
+                     WHERE principal_id = 'P00000000000000000002' \
+                       AND workspace_id = 'W0000000000000000000O'",
+                )
                 .await
-                .expect("revoked membership must invalidate overlay without error")
-                .is_empty()
-        );
+                .expect("Member membership revoke must persist");
+            assert!(
+                load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
+                    .await
+                    .expect("revoked membership must invalidate overlay without error")
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

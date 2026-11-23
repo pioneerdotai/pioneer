@@ -7,21 +7,33 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_item_attempt")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_item_attempt_turn_item_attempt_number"
+    )]
     pub turn_id: String,
-    #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_turn_item_attempt_turn_item_attempt_number"
+    )]
     pub item_id: String,
+    #[sea_orm(column_type = "Text")]
     pub item_type: String,
     #[sea_orm(unique_key = "uq_turn_item_attempt_turn_item_attempt_number")]
     pub attempt_number: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub timeout_reason: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub failure_reason: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub recovery_action: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub idempotency_key: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub trace_id: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub payload: String,
@@ -32,10 +44,11 @@ pub struct Model {
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
     pub updated_at: DateTimeWithTimeZone,
     pub started_event_sequence: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub recovery_suppressed_reason: Option<String>,
     pub recovery_suppressed_at: Option<DateTimeWithTimeZone>,
+    pub recovery_suppression_context_json: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
-    pub recovery_suppression_context_json: Option<String>,
     pub execution_class: Option<String>,
 }
 

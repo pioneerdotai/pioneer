@@ -250,13 +250,6 @@ pub(crate) async fn admit_operation(
     let mut manifest = Vec::with_capacity(prepared.manifest.len());
     for mut entry in prepared.manifest {
         if entry.source.scope.starts_with("event:") || entry.source.scope.starts_with("item:") {
-            store
-                .compaction_prepare_references(
-                    workspace,
-                    &entry.thread_id,
-                    std::slice::from_ref(&entry.source),
-                )
-                .await?;
             let payload = store
                 .compaction_reference_payload(workspace, &entry.thread_id, &entry.source)
                 .await?

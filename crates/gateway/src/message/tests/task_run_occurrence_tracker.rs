@@ -9,20 +9,6 @@ const NOW: i64 = 4_000_000_000;
 async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
     let (processor, store, workspace) =
         setup_execution_window_terminal_turn("tracker_thread", "tracker_0").await;
-    // This fixture's direct source inserts exercise the released tracker.
-    // Restore it through the real cutover down owner, retaining current schema.
-    let db = store.database_connection();
-    pioneer_sqlite::apply_sqlite_pragmas(&db).await.unwrap();
-    let tx = db.begin().await.unwrap();
-    let cutover = Migrator::migrations()
-        .into_iter()
-        .find(|m| m.name() == "m20261101_000102_idle_task_occurrence_tracking_cutover")
-        .unwrap();
-    cutover
-        .down(&migration::SchemaManager::new(&*tx))
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
     let thread = processor
         .thread_manager
         .thread_get("tracker_thread")
@@ -86,7 +72,8 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
             .exec(&store.database_connection())
             .await
             .unwrap();
-        task_run::Entity::insert(task_run::ActiveModel {
+        let tx = store.database_connection().begin().await.unwrap();
+        let run = task_run::Entity::insert(task_run::ActiveModel {
             id: Set(id.clone()),
             task_id: Set("tracker_task".into()),
             run_group_id: Set(id.clone()),
@@ -96,13 +83,20 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
             executor_kind: Set("agent".into()),
             ..Default::default()
         })
-        .exec(&store.database_connection())
+        .exec_with_returning(&*tx)
         .await
         .unwrap();
+        pioneer_crud_tasks::task_occurrence_producers::run_change(&*tx, None, Some(&run))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
     }
     // First generation is poison; the next 63 must still make progress.
     turn::Entity::update_many()
-        .col_expr(turn::Column::PromptManifestJson, Expr::val("{"))
+        .col_expr(
+            turn::Column::PromptManifestJson,
+            Expr::val(r#""invalid prompt manifest""#),
+        )
         .filter(turn::Column::Id.eq("tracker_0"))
         .exec(&store.database_connection())
         .await
@@ -110,7 +104,7 @@ async fn fixture() -> (MessageProcessor, Arc<CrudStore>) {
     (processor, store)
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn poison_candidate_does_not_abort_batch_and_all_selected_rows_consume_budget() {
     let (processor, store) = fixture().await;
     let result = processor
@@ -161,7 +155,7 @@ async fn poison_candidate_does_not_abort_batch_and_all_selected_rows_consume_bud
     assert!(repaired.first_error.is_none());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_success_is_not_reported_as_recovery_and_diagnostics_are_allowlisted() {
     use sentry::SentryFutureExt;
     use tracing::instrument::WithSubscriber;
@@ -200,7 +194,7 @@ async fn partial_success_is_not_reported_as_recovery_and_diagnostics_are_allowli
     assert!(!serialized.contains("reconciliation recovered after observed failures"));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_post_commit_notification_does_not_restore_pending_or_repeat_domain_change() {
     let (processor, store) = fixture().await;
     let candidate = store
@@ -250,7 +244,7 @@ async fn failed_post_commit_notification_does_not_restore_pending_or_repeat_doma
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget() {
     use sea_orm::ConnectionTrait;
     let (processor, store) = fixture().await;
@@ -260,15 +254,25 @@ async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget(
         .exec(&store.database_connection())
         .await
         .unwrap();
-    // A real SQLite rejection with a message accepted by the existing broad
-    // transient-access retry classifier. It must stay one candidate error,
-    // rather than rerunning discovery/reserving additional attempts in this pass.
-    store.database_connection().execute_unprepared("CREATE TRIGGER reject_tracker_claim BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending WHEN OLD.run_id='tracker_0' BEGIN SELECT RAISE(ABORT,'failed to acquire connection from pool'); END").await.unwrap();
+    // A serialization failure must consume one candidate attempt, even though
+    // the same SQLSTATE can safely retry a complete transaction.
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE FUNCTION reject_tracker_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'fixture conflict'; END $$;
+         CREATE TRIGGER reject_tracker_claim BEFORE UPDATE OF claim_token
+         ON task_run_occurrence_reconcile_pending FOR EACH ROW
+         WHEN (OLD.run_id = 'tracker_0' AND NEW.claim_token IS NOT NULL)
+         EXECUTE FUNCTION reject_tracker_claim()",
+        )
+        .await
+        .unwrap();
     let result = processor
         .reconcile_task_run_occurrences_at(NOW, 64)
         .await
         .unwrap();
-    assert!(pioneer_sqlite::is_anyhow_sqlite_transient_access(
+    assert!(pioneer_postgres_pools::is_anyhow_database_transient_access(
         result.first_error.as_ref().unwrap()
     ));
     assert_eq!(result.selected, 64);
@@ -317,7 +321,9 @@ async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget(
     assert_eq!(deferred.next_attempt_at, NOW + 15);
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_tracker_claim")
+        .execute_unprepared(
+            "DROP TRIGGER reject_tracker_claim ON task_run_occurrence_reconcile_pending",
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -337,7 +343,7 @@ async fn transient_retry_classifier_error_does_not_replenish_whole_batch_budget(
     assert_eq!(next.pending, Some(false));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_budget_to_progress()
 {
     use sea_orm::ConnectionTrait;
@@ -348,9 +354,19 @@ async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_b
         .exec(&store.database_connection())
         .await
         .unwrap();
-    // SQLite trigger DDL requires raw SQL. Refuse precisely the first 64
-    // generations on token UPDATE; due/count CAS writes remain available.
-    store.database_connection().execute_unprepared("CREATE TRIGGER reject_first_claims BEFORE UPDATE OF claim_token ON task_run_occurrence_reconcile_pending WHEN OLD.generation <= 64 BEGIN SELECT RAISE(ABORT,'individual claim refusal'); END").await.unwrap();
+    // Refuse precisely the first 64 claims while allowing the deferral update.
+    store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE FUNCTION reject_first_claims() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'individual claim refusal'; END $$;
+         CREATE TRIGGER reject_first_claims BEFORE UPDATE OF claim_token
+         ON task_run_occurrence_reconcile_pending FOR EACH ROW
+         WHEN (split_part(OLD.run_id, '_', 2)::integer < 64 AND NEW.claim_token IS NOT NULL)
+         EXECUTE FUNCTION reject_first_claims()",
+        )
+        .await
+        .unwrap();
     let first = processor
         .reconcile_task_run_occurrences_at(NOW, 10000)
         .await
@@ -404,7 +420,9 @@ async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_b
     );
     store
         .database_connection()
-        .execute_unprepared("DROP TRIGGER reject_first_claims")
+        .execute_unprepared(
+            "DROP TRIGGER reject_first_claims ON task_run_occurrence_reconcile_pending",
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -424,14 +442,17 @@ async fn sixty_four_persistent_claim_refusals_defer_and_allow_candidates_after_b
     assert_eq!(repaired.pending, Some(false));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn long_pass_uses_each_claim_reservation_time_instead_of_batch_start() {
     use std::sync::atomic::{AtomicI64, Ordering};
     let (processor, store) = fixture().await;
     // Leave every selected repair unresolved so its actual reserved due time
     // remains observable. Non-significant JSON edits do not wake/reset tracking.
     turn::Entity::update_many()
-        .col_expr(turn::Column::PromptManifestJson, Expr::val("{"))
+        .col_expr(
+            turn::Column::PromptManifestJson,
+            Expr::val(r#""invalid prompt manifest""#),
+        )
         .filter(turn::Column::ThreadId.eq("tracker_thread"))
         .exec(&store.database_connection())
         .await
@@ -456,7 +477,7 @@ async fn long_pass_uses_each_claim_reservation_time_instead_of_batch_start() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn occurrence_reporting_waits_through_idle_backoff_until_background_or_event_repair_resolves_queue()
  {
     use sentry::SentryFutureExt;
@@ -557,7 +578,7 @@ async fn occurrence_reporting_waits_through_idle_backoff_until_background_or_eve
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_pending_observation_and_unknown_state_never_report_occurrence_recovery() {
     use sentry::SentryFutureExt;
     use tracing::instrument::WithSubscriber;
@@ -595,70 +616,4 @@ async fn failed_pending_observation_and_unknown_state_never_report_occurrence_re
             b.message.as_deref() != Some("reconciliation recovered after observed failures")
         })
     }));
-}
-
-#[tokio::test]
-async fn compatibility_audit_failure_keeps_partial_summary_while_healthy_tickets_repair() {
-    let (processor, store) = fixture().await;
-    let db = store.database_connection();
-    turn::Entity::update_many()
-        .col_expr(turn::Column::PromptManifestJson, Expr::val("{}"))
-        .filter(turn::Column::Id.eq("tracker_0"))
-        .exec(&db)
-        .await
-        .unwrap();
-    // Leave a genuine missed obligation behind an ineffective producer.
-    db.execute_unprepared("CREATE TRIGGER task_run_occurrence_reconcile_foreign AFTER UPDATE OF status ON turn BEGIN SELECT 1; END").await.unwrap();
-    pending::Entity::delete_by_id("tracker_0")
-        .exec(&db)
-        .await
-        .unwrap();
-    db.execute_unprepared("CREATE TRIGGER reject_compatibility_parent BEFORE INSERT ON task_run_occurrence_reconcile_pending WHEN NEW.run_id='tracker_0' BEGIN SELECT RAISE(ABORT,'missed obligation'); END").await.unwrap();
-    let summary = processor
-        .reconcile_task_run_occurrences_at(NOW, 64)
-        .await
-        .unwrap();
-    assert_eq!(
-        summary.changed, 64,
-        "healthy durable tickets survive discovery failure"
-    );
-    assert!(summary.first_error.is_some());
-    assert_eq!(summary.queue_state_errors, 1);
-    assert_eq!(
-        summary.pending, None,
-        "queue emptiness cannot establish complete historical coverage"
-    );
-    assert!(
-        pending::Entity::find_by_id("tracker_0")
-            .one(&db)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    db.execute_unprepared("DROP TRIGGER reject_compatibility_parent")
-        .await
-        .unwrap();
-    for _ in 0..4 {
-        processor
-            .reconcile_task_run_occurrences_at(NOW, 64)
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        turn::Entity::find_by_id("tracker_0")
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "completed"
-    );
-    assert_eq!(
-        processor
-            .reconcile_task_run_occurrences_at(NOW, 64)
-            .await
-            .unwrap()
-            .pending,
-        Some(false)
-    );
 }

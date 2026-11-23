@@ -1,6 +1,7 @@
 //! Reporting only: no database handles, retry decisions, or error strings live here.
+#[cfg(test)]
 use sea_orm::sqlx::error::DatabaseError;
-use sea_orm::{ConnAcquireErr, RuntimeErr, SqlxError, SqlxSqliteError};
+use sea_orm::{ConnAcquireErr, RuntimeErr, SqlxError, SqlxPostgresError};
 use std::time::{Duration, Instant};
 
 const REPORT_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -23,15 +24,12 @@ impl Operation {
 enum Cause {
     Unclassified,
     MissingDependency,
-    SqliteCantOpen,
-    SqliteBusy,
-    SqliteLocked,
-    SqliteIo,
-    SqliteFull,
-    SqliteReadOnly,
-    SqliteCorrupt,
-    SqliteNotADatabase,
-    SqliteOther,
+    PostgresConnection,
+    PostgresContention,
+    PostgresIo,
+    PostgresFull,
+    PostgresReadOnly,
+    PostgresCorrupt,
     PoolTimeout,
     PoolClosed,
 }
@@ -40,24 +38,18 @@ impl Cause {
         match self {
             Self::Unclassified => "unclassified",
             Self::MissingDependency => "missing_dependency",
-            Self::SqliteCantOpen => "sqlite_cantopen",
-            Self::SqliteBusy => "sqlite_busy",
-            Self::SqliteLocked => "sqlite_locked",
-            Self::SqliteIo => "sqlite_io",
-            Self::SqliteFull => "sqlite_full",
-            Self::SqliteReadOnly => "sqlite_readonly",
-            Self::SqliteCorrupt => "sqlite_corrupt",
-            Self::SqliteNotADatabase => "sqlite_notadb",
-            Self::SqliteOther => "sqlite_other",
+            Self::PostgresConnection => "postgres_connection",
+            Self::PostgresContention => "postgres_contention",
+            Self::PostgresIo => "postgres_io",
+            Self::PostgresFull => "postgres_full",
+            Self::PostgresReadOnly => "postgres_read_only",
+            Self::PostgresCorrupt => "postgres_corrupt",
             Self::PoolTimeout => "pool_timeout",
             Self::PoolClosed => "pool_closed",
         }
     }
     fn confirmed_storage(self) -> bool {
-        !matches!(
-            self,
-            Self::Unclassified | Self::SqliteOther | Self::MissingDependency
-        )
+        !matches!(self, Self::Unclassified | Self::MissingDependency)
     }
 }
 
@@ -67,8 +59,7 @@ struct Diagnostic {
     cause: Cause,
     phase: Option<&'static str>,
     reason: Option<&'static str>,
-    sqlite_primary_code: Option<i32>,
-    sqlite_code: Option<i32>,
+    sqlstate: Option<[u8; 5]>,
 }
 impl Diagnostic {
     fn new(operation: Operation, cause: Cause) -> Self {
@@ -77,42 +68,34 @@ impl Diagnostic {
             cause,
             phase: None,
             reason: None,
-            sqlite_primary_code: None,
-            sqlite_code: None,
+            sqlstate: None,
         }
     }
-    fn sqlite(operation: Operation, error: &SqlxSqliteError) -> Self {
-        // Parse only the typed SQLite driver's numeric code, never Display/Debug.
-        let code = error
-            .code()
-            .and_then(|code| code.parse::<i32>().ok())
-            .filter(|code| *code > 0);
-        let primary = code.map(|code| code & 0xff);
-        let cause = match primary {
-            Some(14) => Cause::SqliteCantOpen,
-            Some(5) => Cause::SqliteBusy,
-            Some(6) => Cause::SqliteLocked,
-            Some(10) => Cause::SqliteIo,
-            Some(13) => Cause::SqliteFull,
-            Some(8) => Cause::SqliteReadOnly,
-            Some(11) => Cause::SqliteCorrupt,
-            Some(26) => Cause::SqliteNotADatabase,
-            _ => Cause::SqliteOther,
+    fn postgres(operation: Operation, error: &SqlxPostgresError) -> Self {
+        let cause = match error.code().as_bytes() {
+            [b'0', b'8', ..] | b"57P01" | b"57P02" | b"57P03" => Cause::PostgresConnection,
+            b"40001" | b"40P01" | b"55P03" => Cause::PostgresContention,
+            b"58030" => Cause::PostgresIo,
+            b"53100" => Cause::PostgresFull,
+            b"25006" => Cause::PostgresReadOnly,
+            b"XX001" | b"XX002" => Cause::PostgresCorrupt,
+            _ => Cause::Unclassified,
         };
-        Self {
-            operation,
-            cause,
-            phase: None,
-            reason: None,
-            sqlite_primary_code: primary,
-            sqlite_code: code,
+        let mut diagnostic = Self::new(operation, cause);
+        let code = error.code().as_bytes();
+        if code
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+        {
+            diagnostic.sqlstate = code.try_into().ok();
         }
+        diagnostic
     }
     fn sqlx(operation: Operation, error: &SqlxError) -> Option<Self> {
         match error {
             SqlxError::Database(database) => database
-                .try_downcast_ref::<SqlxSqliteError>()
-                .map(|error| Self::sqlite(operation, error)),
+                .try_downcast_ref::<SqlxPostgresError>()
+                .map(|error| Self::postgres(operation, error)),
             SqlxError::PoolTimedOut => Some(Self::new(operation, Cause::PoolTimeout)),
             SqlxError::PoolClosed => Some(Self::new(operation, Cause::PoolClosed)),
             _ => None,
@@ -145,8 +128,8 @@ impl Diagnostic {
             {
                 return diagnostic;
             }
-            if let Some(error) = source.downcast_ref::<SqlxSqliteError>() {
-                return Self::sqlite(operation, error);
+            if let Some(error) = source.downcast_ref::<SqlxPostgresError>() {
+                return Self::postgres(operation, error);
             }
             if let Some(error) = source.downcast_ref::<ConnAcquireErr>() {
                 return Self::new(
@@ -178,7 +161,7 @@ struct Episode {
 
 /// Owned by each worker outside its loop, including panic containment. Fixed
 /// size: one episode and the last permitted storage cause. Identity is operation
-/// + cause + primary code + full received code. A changed confirmed cause emits
+/// + cause + SQLSTATE. A changed confirmed cause emits
 /// immediately and replaces the remembered cause. Unknown/non-storage errors
 /// and success retain it. No mutex: only the owning worker updates this state.
 pub(super) struct Reporter {
@@ -324,8 +307,10 @@ impl Snapshot {
                     cause = diagnostic.cause.as_str(),
                     phase = diagnostic.phase,
                     reason = diagnostic.reason,
-                    sqlite_primary_code = diagnostic.sqlite_primary_code,
-                    sqlite_code = diagnostic.sqlite_code,
+                    sqlstate = diagnostic
+                        .sqlstate
+                        .as_ref()
+                        .and_then(|code| std::str::from_utf8(code).ok()),
                     final_failures = self.failures,
                     suppressed_messages = self.suppressed,
                     suppressed_since_report = self.suppressed_since_report,

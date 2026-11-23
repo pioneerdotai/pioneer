@@ -7,26 +7,38 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_action_receipt")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub action_id: String,
+    #[sea_orm(column_type = "Text")]
     pub actor_kind: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub actor_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub decision: String,
+    #[sea_orm(column_type = "Text")]
     pub policy_fingerprint: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub execution_grant_fingerprint: Option<String>,
     pub execution_grant_policy_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub source_scope_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub destination_scope_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub action_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub authorized_resource_action: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub subject_role_key: Option<String>,
     pub execution_generation: Option<i64>,
     pub source_policy_generation: Option<i64>,
     pub destination_policy_generation: Option<i64>,
     pub route_generation: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub disclosure_class: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub decision_fingerprint: Option<String>,
     pub committed_at: DateTimeWithTimeZone,
     #[sea_orm(column_type = "Text", nullable)]
@@ -40,7 +52,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub agent_action: HasOne<super::agent_action::Entity>,
+    pub agent_action: BelongsTo<super::agent_action::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

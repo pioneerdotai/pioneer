@@ -700,8 +700,8 @@ fn help_text() -> String {
                                 Use selected local Gateway/workspace; --gateway/--workspace override
   {command} status [--json]     Show gateway service status
   {command} device create [--json]  Create a pending device session and one-time activation code
-  {command} task-invariants --db <path> [--json] [--stale-turn-after-seconds <seconds>]
-                                Scan task/subagent runtime invariants in a SQLite gateway DB
+  {command} task-invariants [--json] [--stale-turn-after-seconds <seconds>]
+                                Scan task/subagent runtime invariants in a PostgreSQL gateway DB
   {command} secrets status [--json]  Show keystore status without secret values
   {command} secrets garbage-collection [--dry-run] [--json]  Clean orphan MCP secret values
   {command} stop                Stop and uninstall the persistent gateway service
@@ -809,8 +809,8 @@ mod tests {
             .expect_err("unknown secrets command should fail");
         assert!(is_usage_error(&error));
 
-        let error = run_with_args(args(&["task-invariants", "--json"]))
-            .expect_err("missing task-invariants db should fail");
+        let error = run_with_args(args(&["task-invariants", "--unexpected"]))
+            .expect_err("unknown task-invariants option should fail");
         assert!(is_usage_error(&error));
     }
 }

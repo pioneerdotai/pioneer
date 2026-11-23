@@ -1,40 +1,11 @@
 use super::{HookRunStoreCauseClass, HookRunStoreDiagnostic, append_audit_error};
-use pioneer_sqlite::{SqliteDatabase, sqlite_connection_url};
-use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DbBackend, DbErr, RuntimeErr, SqlxError, Statement,
-    TransactionTrait,
+use crate::tests::postgres_failures::{
+    lock_unavailable, rejected_snapshot, rejected_statement, sqlstate,
 };
+use sea_orm::{DbErr, RuntimeErr, SqlxError};
 
-// Follow the existing managed SQLite fixture pattern: one physical connection
-// per handle, with all statements and transactions through SqliteDatabase.
-async fn open_fixture_database(url: &str) -> SqliteDatabase {
-    let mut options = ConnectOptions::new(url);
-    options.max_connections(1).sqlx_logging(false);
-    let database = SqliteDatabase::from_single_connection(
-        Database::connect(options)
-            .await
-            .expect("open isolated SQLite fixture"),
-    );
-    database
-        .execute_unprepared("PRAGMA busy_timeout = 0")
-        .await
-        .unwrap();
-    database
-}
-
-fn assert_typed_diagnostic(error: DbErr, code: i32, class: HookRunStoreCauseClass) {
-    let DbErr::Exec(RuntimeErr::SqlxError(sqlx)) = &error else {
-        panic!("fixture must produce SeaORM's typed SQLx execution error");
-    };
-    let SqlxError::Database(database) = sqlx.as_ref() else {
-        panic!("fixture must produce a typed database error");
-    };
-    assert!(
-        database
-            .try_downcast_ref::<sea_orm::SqlxSqliteError>()
-            .is_some()
-    );
-    assert_eq!(database.code().unwrap().parse::<i32>().unwrap(), code);
+fn assert_typed_diagnostic(error: DbErr, code: &str, class: HookRunStoreCauseClass) {
+    assert_eq!(sqlstate(&error), code);
     for error in [
         anyhow::Error::new(error.clone()),
         anyhow::Error::new(error)
@@ -43,11 +14,7 @@ fn assert_typed_diagnostic(error: DbErr, code: i32, class: HookRunStoreCauseClas
         let safe = append_audit_error(error);
         assert_eq!(
             safe.diagnostic(),
-            HookRunStoreDiagnostic {
-                cause_class: class,
-                sqlite_primary_code: Some(code & 0xff),
-                sqlite_extended_code: Some(code),
-            }
+            HookRunStoreDiagnostic { cause_class: class }
         );
         for canary in [
             "SQL_CANARY",
@@ -61,66 +28,30 @@ fn assert_typed_diagnostic(error: DbErr, code: i32, class: HookRunStoreCauseClas
     }
 }
 
-#[tokio::test]
-async fn typed_busy_and_locked_remain_distinct_under_anyhow_context() {
-    for (shared_cache, code, class) in [
-        (false, 5, HookRunStoreCauseClass::SqliteBusy),
-        (true, 262, HookRunStoreCauseClass::SqliteLocked),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut url = sqlite_connection_url(&directory.path().join("PATH_CANARY.sqlite"));
-        if shared_cache {
-            url.push_str("&cache=shared");
-        }
-        let owner = open_fixture_database(&url).await;
-        let contender = open_fixture_database(&url).await;
-        owner
-            .execute_unprepared("CREATE TABLE diagnostic_probe (id INTEGER PRIMARY KEY)")
-            .await
-            .unwrap();
-        // Only necessary DB calls while the fixture lock is held. Schema lock
-        // fails during prepare, before SQLx's shared-cache unlock-notify loop.
-        let transaction = owner.begin().await.unwrap();
-        transaction
-            .execute_unprepared(if shared_cache {
-                "CREATE TABLE pending_schema (id INTEGER PRIMARY KEY)"
-            } else {
-                "INSERT INTO diagnostic_probe VALUES (1)"
-            })
-            .await
-            .unwrap();
-        let error = contender
-            .execute_unprepared("INSERT INTO diagnostic_probe VALUES (2)")
-            .await
-            .unwrap_err();
-        transaction.rollback().await.unwrap();
-        assert_typed_diagnostic(error, code, class);
-        contender.close().await.unwrap();
-        owner.close().await.unwrap();
-    }
+#[pioneer_postgres_test::postgres_test]
+async fn typed_lock_and_serialization_failures_keep_their_class_under_anyhow_context()
+-> anyhow::Result<()> {
+    assert_typed_diagnostic(
+        lock_unavailable(false).await?,
+        "55P03",
+        HookRunStoreCauseClass::PostgresContention,
+    );
+    assert_typed_diagnostic(
+        rejected_snapshot().await?,
+        "40001",
+        HookRunStoreCauseClass::PostgresContention,
+    );
+    Ok(())
 }
 
-#[tokio::test]
-async fn typed_cantopen_retains_code_and_discards_path_under_anyhow_context() {
-    let directory = tempfile::tempdir().unwrap();
-    let missing_file = directory
-        .path()
-        .join("missing_PARENT_CANARY")
-        .join("PATH_CANARY.sqlite");
-    // ATTACH inherits SQLITE_OPEN_MEMORY from an in-memory main database,
-    // which would make even this missing path succeed as an in-memory attach.
-    let url = sqlite_connection_url(&directory.path().join("fixture.sqlite"));
-    let database = open_fixture_database(&url).await;
-    let error = database
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "ATTACH DATABASE ? AS diagnostic_probe",
-            [missing_file.to_string_lossy().into_owned().into()],
-        ))
-        .await
-        .unwrap_err();
-    assert_typed_diagnostic(error, 14, HookRunStoreCauseClass::SqliteCantOpen);
-    database.close().await.unwrap();
+#[pioneer_postgres_test::postgres_test]
+async fn typed_constraint_failure_has_safe_diagnostics() -> anyhow::Result<()> {
+    assert_typed_diagnostic(
+        rejected_statement().await?,
+        "23505",
+        HookRunStoreCauseClass::PostgresConstraint,
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -141,7 +72,7 @@ impl sea_orm::sqlx::error::DatabaseError for OtherDatabaseError {
         "database locked AUDIT_PAYLOAD_CANARY"
     }
     fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-        Some("14".into())
+        Some("55P03".into())
     }
     fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         self
@@ -158,7 +89,7 @@ impl sea_orm::sqlx::error::DatabaseError for OtherDatabaseError {
 }
 
 #[test]
-fn a_database_code_without_sqlite_type_is_unclassified() {
+fn a_database_code_without_postgres_type_is_unclassified() {
     let sqlx = SqlxError::Database(Box::new(OtherDatabaseError));
     let error = DbErr::Exec(RuntimeErr::SqlxError(std::sync::Arc::new(sqlx)));
     let safe = append_audit_error(anyhow::Error::new(error).context("PATH_CANARY"));

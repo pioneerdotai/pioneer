@@ -20,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_task_output: HasOne<super::compaction_task_output::Entity>,
+    pub compaction_task_output: BelongsTo<super::compaction_task_output::Entity>,
     #[sea_orm(
         belongs_to,
         from = "delivery_id",
@@ -28,7 +28,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_delivery: HasOne<super::task_delivery::Entity>,
+    pub task_delivery: BelongsTo<super::task_delivery::Entity>,
     #[sea_orm(
         belongs_to,
         from = "candidate_id",
@@ -36,7 +36,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_result_candidate: HasOne<super::task_result_candidate::Entity>,
+    pub task_result_candidate: BelongsTo<super::task_result_candidate::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

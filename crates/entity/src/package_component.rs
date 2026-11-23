@@ -34,7 +34,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "SetNull"
     )]
-    pub mcp_server_installation: HasOne<super::mcp_server_installation::Entity>,
+    pub mcp_server_installation: BelongsTo<Option<super::mcp_server_installation::Entity>>,
     #[sea_orm(
         belongs_to,
         from = "package_id",
@@ -42,7 +42,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Restrict"
     )]
-    pub package_installation: HasOne<super::package_installation::Entity>,
+    pub package_installation: BelongsTo<super::package_installation::Entity>,
     #[sea_orm(
         belongs_to,
         from = "skill_id",
@@ -50,7 +50,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "SetNull"
     )]
-    pub skill_installation: HasOne<super::skill_installation::Entity>,
+    pub skill_installation: BelongsTo<Option<super::skill_installation::Entity>>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

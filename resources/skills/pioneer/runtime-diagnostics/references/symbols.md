@@ -195,7 +195,7 @@ PDB availability does not add a Windows native capture adapter. Use matching PDB
 with the offline native evidence/readers available for the task, without pausing
 the live host in a debugger.
 
-Main executable symbols do not automatically cover SQLite/framework/system
+Main executable symbols do not automatically cover PostgreSQL/framework/system
 libraries or plugins in a stack. Determine the owning module before resolving an
 address. Use source matching recorded revision/dirty provenance; report source
 mapping gaps rather than claiming the latest checkout supplies exact source lines.

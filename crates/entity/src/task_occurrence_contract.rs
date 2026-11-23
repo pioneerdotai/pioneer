@@ -7,26 +7,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_occurrence_contract")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub occurrence_id: String,
-    #[sea_orm(unique_key = "idx_task_occurrence_generation")]
+    #[sea_orm(column_type = "Text", unique_key = "idx_task_occurrence_generation")]
     pub task_id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub run_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub trigger_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub occurrence_key: String,
     #[sea_orm(unique_key = "idx_task_occurrence_generation")]
     pub execution_generation: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub agent_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub work_graph_root_execution_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub root_resource_scope_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub queue_position: Option<i64>,
     pub retry_attempt: i64,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub action_idempotency_key: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub route_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub result_return_route_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub terminal_reason: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

@@ -6974,11 +6974,8 @@ pub(crate) fn task_error(
 
 #[cfg(test)]
 mod resource_policy_tests {
-    use super::{TaskRuntime, ensure_paginated_response_budget};
-    use pioneer_crud::CrudStore;
-    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteWriteClass};
-    use sea_orm::Database;
-    use std::sync::Arc;
+    use super::ensure_paginated_response_budget;
+    use pioneer_postgres_pools::{PostgresReadClass, PostgresWriteClass};
 
     #[test]
     fn page_size_target_never_hides_a_single_logical_record() {
@@ -6990,41 +6987,40 @@ mod resource_policy_tests {
 
     #[tokio::test]
     async fn runtime_services_preserve_independent_read_and_write_classes() {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("open test database");
-        let store = Arc::new(CrudStore::new(SqliteDatabase::from_single_connection(
-            connection,
-        )));
-        let runtime = TaskRuntime::new(store);
+        pioneer_postgres_test::with_database(async |fixture| {
+            let runtime = crate::tests::postgres_runtime(fixture).await;
 
-        let cases = [
-            (
-                runtime.service(),
-                SqliteReadClass::Interactive,
-                SqliteWriteClass::Interactive,
-            ),
-            (
-                runtime.critical_service(),
-                SqliteReadClass::Interactive,
-                SqliteWriteClass::Critical,
-            ),
-            (
-                runtime.maintenance_service(),
-                SqliteReadClass::Maintenance,
-                SqliteWriteClass::Maintenance,
-            ),
-            (
-                runtime.background_control_service(),
-                SqliteReadClass::Maintenance,
-                SqliteWriteClass::Critical,
-            ),
-        ];
+            let cases = [
+                (
+                    runtime.service(),
+                    PostgresReadClass::Interactive,
+                    PostgresWriteClass::Interactive,
+                ),
+                (
+                    runtime.critical_service(),
+                    PostgresReadClass::Interactive,
+                    PostgresWriteClass::Critical,
+                ),
+                (
+                    runtime.maintenance_service(),
+                    PostgresReadClass::Maintenance,
+                    PostgresWriteClass::Maintenance,
+                ),
+                (
+                    runtime.background_control_service(),
+                    PostgresReadClass::Maintenance,
+                    PostgresWriteClass::Critical,
+                ),
+            ];
 
-        for (service, expected_read, expected_write) in cases {
-            let database = service.store().database_connection();
-            assert_eq!(database.read_class(), expected_read);
-            assert_eq!(database.write_class(), expected_write);
-        }
+            for (service, expected_read, expected_write) in cases {
+                let database = service.store().database_connection();
+                assert_eq!(database.read_class(), expected_read);
+                assert_eq!(database.write_class(), expected_write);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

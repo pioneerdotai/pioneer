@@ -1,26 +1,25 @@
 use super::*;
-use migration::{Migrator, MigratorTrait};
-use pioneer_sqlite::{
-    SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteEvent,
-    SqliteWriteExecutor, SqliteWriteObserver,
+use pioneer_postgres_pools::{
+    PostgresDatabase, PostgresReadClass, PostgresReadEvent, PostgresReadObserver,
+    PostgresWriteEvent, PostgresWriteExecutor, PostgresWriteObserver,
 };
-use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+use sea_orm::ConnectionTrait;
 
 #[derive(Default)]
 pub(super) struct Observer {
-    pub(super) reads: StdMutex<Vec<SqliteReadClass>>,
-    pub(super) writes: StdMutex<Vec<SqliteWriteClass>>,
+    pub(super) reads: StdMutex<Vec<PostgresReadClass>>,
+    pub(super) writes: StdMutex<Vec<PostgresWriteClass>>,
 }
-impl SqliteReadObserver for Observer {
-    fn observe(&self, event: SqliteReadEvent) {
-        if let SqliteReadEvent::OperationFinished { class, .. } = event {
+impl PostgresReadObserver for Observer {
+    fn observe(&self, event: PostgresReadEvent) {
+        if let PostgresReadEvent::OperationFinished { class, .. } = event {
             self.reads.lock().unwrap().push(class);
         }
     }
 }
-impl SqliteWriteObserver for Observer {
-    fn observe(&self, event: SqliteWriteEvent) {
-        if let SqliteWriteEvent::Acquired { class, .. } = event {
+impl PostgresWriteObserver for Observer {
+    fn observe(&self, event: PostgresWriteEvent) {
+        if let PostgresWriteEvent::Acquired { class, .. } = event {
             self.writes.lock().unwrap().push(class);
         }
     }
@@ -31,7 +30,7 @@ pub(super) struct Harness {
     pub(super) processor: Arc<MessageProcessor>,
     pub(super) workspace: pioneer_entity::workspace::Model,
     pub(super) observer: Arc<Observer>,
-    pub(super) writer: SqliteWriteExecutor,
+    pub(super) writer: PostgresWriteExecutor,
 }
 
 pub(super) async fn harness() -> Harness {
@@ -44,25 +43,29 @@ async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
     // Production jobs use physical roots. Keep fixture paths physical too,
     // including when the platform's temporary directory is a symlink.
     let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-    let path = directory.path().join("skills.sqlite");
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
-    options.max_connections(1).sqlx_logging(false);
-    let writer = Database::connect(options).await.unwrap();
-    Migrator::up(&writer, None).await.unwrap();
+    let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+    let writer = fixture.connect_with_limit(1).await.unwrap();
     writer
-        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .execute_unprepared("DELETE FROM workspace")
         .await
         .unwrap();
-    let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_read_only_connection_url(&path));
-    options
-        .max_connections(2)
-        .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
-    let reader = Database::connect(options).await.unwrap();
+    let reader = fixture
+        .connect_with_options(|options| {
+            options
+                .max_connections(2)
+                .map_sqlx_postgres_opts(|options| {
+                    options.options([("default_transaction_read_only", "on")])
+                });
+        })
+        .await
+        .unwrap();
     let observer = Arc::new(Observer::default());
-    let writer = SqliteWriteExecutor::with_observer(writer, observer.clone());
-    let database =
-        SqliteDatabase::from_executor_with_read_observer(reader, writer.clone(), observer.clone());
+    let writer = PostgresWriteExecutor::with_observer(writer, observer.clone());
+    let database = PostgresDatabase::from_executor_with_read_observer(
+        reader,
+        writer.clone(),
+        observer.clone(),
+    );
     let manager = Arc::new(crate::workspace::WorkspaceManager::new(database.clone()));
     manager
         .create_workspace("ws", Some("Skills test"))
@@ -129,7 +132,7 @@ async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
         )
         .with_runtime_home_for_tests(directory.path().join("runtime")),
     );
-    let processor = processor.with_database_class(SqliteWriteClass::Maintenance);
+    let processor = processor.with_database_class(PostgresWriteClass::Maintenance);
     observer.reads.lock().unwrap().clear();
     observer.writes.lock().unwrap().clear();
     Harness {
@@ -279,7 +282,7 @@ async fn shutdown_joins_an_owned_blocking_quantum() {
     assert!(joined.load(Ordering::Acquire));
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shared_system_roots_are_registered_once_with_all_workspace_scopes() {
     let harness = harness().await;
     harness
@@ -396,7 +399,7 @@ async fn native_atomic_save_and_rename_mark_dirty_without_hash_polling() {
         .unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 #[ignore = "native OS delivery and idle integration; run explicitly after review"]
 async fn worker_idle_has_no_periodic_select_and_notifies_only_real_changes() {
     let harness = harness().await;
@@ -469,7 +472,7 @@ fn repeated_backend_events_cannot_cancel_the_recovery_delay() {
 
 // These exercise the actual worker, including subscriptions, deadlines, jobs and
 // sleeping, rather than an isolated Duration expression.
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn partial_snapshot_startup_backoff_and_late_event_recovery() {
     let harness = harness().await;
     let source = harness.directory.path().join("source/pkg");
@@ -525,7 +528,7 @@ async fn partial_snapshot_startup_backoff_and_late_event_recovery() {
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated() {
     let harness = harness_with_bad_root(true).await;
     let source = harness.directory.path().join("source/pkg");
@@ -732,7 +735,7 @@ fn bounded_native_directory_registration_and_shared_sentinel_replacement() {
     );
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn shutdown_preserves_protected_last_copy_discovered_after_restart() {
     let harness = harness().await;
     let config = harness.processor.managed_root_scan_config("ws").unwrap();
@@ -805,7 +808,7 @@ fn prepared_guard_never_waits_for_the_callback_mutex_under_writer_capacity() {
     assert!(!guard.valid());
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn unavailable_backend_keeps_real_worker_initial_reconciliation_and_idle_backoff() {
     let harness = harness().await;
     let source = harness.directory.path().join("source/pkg");
@@ -876,7 +879,7 @@ async fn settled(signals: &Signals) {
     .expect("real worker must settle");
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
@@ -916,7 +919,7 @@ async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own_round() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
@@ -962,7 +965,7 @@ async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn degraded_clean_roots_do_not_rescan_at_each_failed_constructor_retry() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
@@ -990,7 +993,7 @@ async fn degraded_clean_roots_do_not_rescan_at_each_failed_constructor_retry() {
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn late_registration_barrier_fences_old_job_and_observes_previously_unwatched_bytes() {
     let harness = harness().await;
     std::fs::create_dir_all(harness.directory.path().join("source")).unwrap();
@@ -1059,7 +1062,7 @@ async fn late_registration_barrier_fences_old_job_and_observes_previously_unwatc
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn owned_linux_folder_events_do_not_restart_an_overlapping_import() {
     let harness = harness_with_layout(false, true).await;
     let root = harness.directory.path().join("managed/ws/user");
@@ -1279,7 +1282,7 @@ fn local_native_registration_failures_keep_a_and_c_and_retry_only_b() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn registration_unwind_keeps_the_worker_alive_with_backoff_and_shutdown() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
@@ -1337,7 +1340,7 @@ async fn registration_unwind_keeps_the_worker_alive_with_backoff_and_shutdown() 
     worker.await.unwrap();
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn local_registration_recovery_fences_a_degraded_job_before_its_old_ack() {
     let harness = harness().await;
     let source = harness.directory.path().join("source");
@@ -1686,7 +1689,7 @@ fn every_job_map_removal_revokes_ownership_before_physical_cleanup() {
     }
 }
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn real_worker_keeps_active_claims_and_cleans_retired_owners_while_neighbor_advances() {
     for cancel in [false, true] {
         let harness = harness_with_layout(false, true).await;

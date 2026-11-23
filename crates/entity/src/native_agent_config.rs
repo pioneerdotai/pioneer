@@ -7,15 +7,25 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "native_agent_config")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uq_native_agent_config_workspace_system_key")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uq_native_agent_config_workspace_system_key"
+    )]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uq_native_agent_config_workspace_system_key")]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uq_native_agent_config_workspace_system_key"
+    )]
     pub system_key: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub display_name: String,
+    #[sea_orm(column_type = "Text")]
     pub nickname: String,
     pub enabled: bool,
+    #[sea_orm(column_type = "Text", nullable)]
     pub avatar_revision: Option<String>,
     pub config_revision: i64,
     pub created_at: DateTimeWithTimeZone,
@@ -27,7 +37,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub workspace: HasOne<super::workspace::Entity>,
+    pub workspace: BelongsTo<super::workspace::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

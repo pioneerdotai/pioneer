@@ -1,0 +1,53 @@
+name: Release model catalog
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  generate-model-catalog:
+    name: generate-model-catalog
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-model-catalog-v1
+
+      - name: generate-and-validate-model-catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --timings --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
+
+      - name: upload-cargo-timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: cargo-timings-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: target/cargo-timings/cargo-timing-*.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: upload-model-catalog
+        uses: actions/upload-artifact@v6
+        with:
+          name: pioneer-release-model-catalog-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: release-model-catalog/catalog.json
+          if-no-files-found: error

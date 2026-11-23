@@ -1,0 +1,31 @@
+[package]
+name = "pioneer-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fs4.workspace = true
+pgconfig = { git = "https://github.com/momoi-labs/pgconfig.git", rev = "de1c43a5aa2689104172a5923c5c8617357baad3" }
+pioneer-migration.workspace = true
+process-wrap = { workspace = true, features = ["tokio1"] }
+sea-orm = { workspace = true, features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sysinfo = { version = "0.31.4", default-features = false, features = ["disk", "system"] }
+tempfile.workspace = true
+thiserror = "2"
+tokio.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

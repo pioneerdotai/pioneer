@@ -25,7 +25,7 @@ pub struct Model {
     pub invocation_id: String,
     #[sea_orm(unique_key = "uq_patch_commit_terminal_commit_ordinal")]
     pub commit_ordinal: i64,
-    #[sea_orm(column_type = "Binary(1)")]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub plan_fingerprint: Vec<u8>,
     #[sea_orm(column_type = "Text")]
     pub operations_json: String,

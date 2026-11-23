@@ -7,15 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_upload_session")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub upload_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
     pub connection_id: i64,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text")]
     pub file_name: String,
+    #[sea_orm(column_type = "Text")]
     pub archive_format: String,
     pub compressed_size_bytes: i64,
     pub received_bytes: i64,
+    #[sea_orm(column_type = "Text")]
     pub sha256: String,
     #[sea_orm(column_type = "Text")]
     pub payload_path: String,

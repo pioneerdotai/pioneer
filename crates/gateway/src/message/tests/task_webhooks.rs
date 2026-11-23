@@ -7,7 +7,7 @@ use pioneer_protocol::TaskGetParams;
 use std::collections::BTreeSet;
 use tower::ServiceExt as _;
 
-#[tokio::test]
+#[pioneer_postgres_test::postgres_test]
 async fn webhook_http_admits_distinct_durable_runs_and_create_get_recover_the_same_url() {
     let (processor, sessions, _, _notifications, _, workspace_id) =
         setup_workspace_message_processor().await;
@@ -224,7 +224,7 @@ async fn webhook_http_admits_distinct_durable_runs_and_create_get_recover_the_sa
     let polling_started_at = std::time::Instant::now();
     loop {
         // Keep the runtime runnable while the real handler authenticates through
-        // SQLite. Paused time must not auto-advance to a DB acquisition timeout.
+        // PostgreSQL. Paused time must not auto-advance to a DB acquisition timeout.
         assert!(
             polling_started_at.elapsed() < std::time::Duration::from_secs(5),
             "the handler never started reading the request body"

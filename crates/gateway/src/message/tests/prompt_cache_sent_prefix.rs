@@ -325,7 +325,7 @@ async fn start_fixture_turn(
     (thread, turn, committed)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wires() {
     for responses in [true, false] {
         crate::compaction::load_test_catalog();
@@ -730,7 +730,7 @@ async fn actual_loop_sent_prefix_survives_cold_and_accepted_restore_on_both_wire
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_disclosure_appends_to_the_sent_gateway_input() {
     crate::compaction::load_test_catalog();
     let (root, mut wire, server) = scripted_transport(true, "done", |round| {
@@ -909,7 +909,7 @@ async fn responses_disclosure_appends_to_the_sent_gateway_input() {
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output() {
     crate::compaction::load_test_catalog();
     let (root, mut wire, server) = scripted_transport(false, "done", |round| {
@@ -1047,7 +1047,7 @@ async fn chat_completions_bounds_new_result_under_pressure_and_keeps_sent_output
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[pioneer_postgres_test::postgres_test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_no_tools_round_keeps_only_supported_wire_prefix() {
     crate::compaction::load_test_catalog();
     for public_responses in [true, false] {

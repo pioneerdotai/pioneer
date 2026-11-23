@@ -19,6 +19,7 @@ use serde_json::json;
 pub(super) struct TaskChildReconciliationFailures {
     reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
     independent: Vec<String>,
+    independent_transient_storage_access: bool,
     pending_projection: usize,
 }
 
@@ -34,15 +35,17 @@ impl TaskChildReconciliationFailures {
             failure.report_in_place();
             self.reported.push(failure.descriptor().clone());
         } else {
-            // Preserve the former independent-error diagnostic and retry input.
+            // Classify the typed error before retaining its diagnostic.
+            // The aggregate exposes no private source through its error chain.
+            self.independent_transient_storage_access |=
+                is_anyhow_database_transient_access(&error);
             self.independent
                 .push(format!("{thread_id}/{turn_id}: {error:#}"));
         }
     }
 
     pub(super) fn retry_transient_storage_access(&self) -> bool {
-        !self.independent.is_empty()
-            && is_anyhow_sqlite_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+        self.independent_transient_storage_access
     }
 
     pub(super) fn report_worker_failure(&self) {
@@ -90,7 +93,7 @@ pub(super) fn retry_task_child_reconciliation_error(error: &anyhow::Error) -> bo
     if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
         return batch.retry_transient_storage_access();
     }
-    is_anyhow_sqlite_transient_access(error)
+    is_anyhow_database_transient_access(error)
 }
 
 pub(super) fn report_task_child_reconciliation_error(mut error: anyhow::Error) {
@@ -188,18 +191,6 @@ impl MessageProcessor {
         let store = self.crud_store.with_maintenance_access();
         let clock = || chrono::Utc::now().timestamp();
         let mut errors = TaskChildReconciliationFailures::default();
-        let ready = match store.child_work_queues_ready().await {
-            Ok(ready) => ready,
-            Err(error) => {
-                errors.push("", "", error);
-                false
-            }
-        };
-        if !ready {
-            if let Err(error) = store.discover_legacy_child_work(limit).await {
-                errors.push("", "", error);
-            }
-        }
         let mut scope_pass = self.task_child_scope_cursor.lock().await.clone();
         let scope_candidate = async {
             if scope_pass.upper.is_none() {
@@ -231,7 +222,7 @@ impl MessageProcessor {
                 }
                 *self.task_child_scope_cursor.lock().await = scope_pass;
                 if let Err(error) = store
-                    .expand_child_scope_candidate_with_clock(&candidate, &clock, false)
+                    .expand_child_scope_candidate_with_clock(&candidate, &clock)
                     .await
                 {
                     errors.push("", "", error);
@@ -417,20 +408,15 @@ impl MessageProcessor {
     ) -> Result<TaskRunOccurrenceReconcileSummary> {
         // Exactly one advisory discovery per pass. Every selected candidate
         // consumes budget, including lost claims and failed preparations.
-        let discovery = self
+        let candidates = self
             .crud_store
-            .discover_task_run_occurrence_reconcile_with_audit(clock(), limit)
+            .discover_task_run_occurrence_reconcile(clock(), limit)
             .await?;
         let mut summary = TaskRunOccurrenceReconcileSummary {
-            selected: discovery.candidates.len(),
+            selected: candidates.len(),
             ..Default::default()
         };
-        let audit_failed = discovery.audit_error.is_some();
-        if let Some(error) = discovery.audit_error {
-            summary.queue_state_errors += 1;
-            summary.record_error(error);
-        }
-        for candidate in discovery.candidates {
+        for candidate in candidates {
             let claim = match self
                 .crud_store
                 .claim_task_run_occurrence_reconcile(&candidate, clock)
@@ -509,9 +495,6 @@ impl MessageProcessor {
                 .has_pending_task_run_occurrence_reconcile()
                 .await,
         );
-        if audit_failed {
-            summary.pending = None;
-        }
         Ok(summary)
     }
 
@@ -1970,7 +1953,7 @@ mod task_child_failure_tests {
                     TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Policy)
                         .with_correlation_id("existing-correlation".to_owned()),
                 )
-                .context("PRIVATE_SQL_PATH_HISTORY_SECRET unable to open database file"),
+                .context("PRIVATE_SQL_PATH_HISTORY_SECRET PostgreSQL connection failed"),
             );
             assert!(!batch.retry_transient_storage_access());
             let display = format!("{batch}");
@@ -1988,7 +1971,9 @@ mod task_child_failure_tests {
             batch.push(
                 "independent-thread",
                 "independent-turn",
-                anyhow::anyhow!("unable to open database file"),
+                anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+                    sea_orm::ConnAcquireErr::Timeout,
+                )),
             );
             assert!(batch.retry_transient_storage_access());
             batch.report_worker_failure();

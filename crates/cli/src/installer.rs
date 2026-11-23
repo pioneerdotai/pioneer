@@ -261,33 +261,25 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         },
     )?;
 
-    let (install_root, bin_dir, target_binary, staged_binary, rollback_binary) =
-        observe_install_stage(
-            &mut stage_timings,
-            install_started,
-            "installer.paths.prepare",
-            || {
-                let install_root = install_root_path(&config)?;
-                fs::create_dir_all(install_root.join("bin"))
-                    .context("failed to create managed install directory")?;
-                let install_root = canonical_install_path(&install_root)
-                    .context("failed to resolve managed install root")?;
-                let bin_dir = install_root.join("bin");
-                let target_binary = installed_binary_path(&config, &install_root)?;
-                let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
-                let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
-                fs::create_dir_all(&bin_dir).with_context(|| {
-                    format!("failed to create install directory `{}`", bin_dir.display())
-                })?;
-                Ok((
-                    install_root,
-                    bin_dir,
-                    target_binary,
-                    staged_binary,
-                    rollback_binary,
-                ))
-            },
-        )?;
+    let (install_root, bin_dir, staged_binary, rollback_binary) = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.paths.prepare",
+        || {
+            let install_root = install_root_path(&config)?;
+            fs::create_dir_all(install_root.join("bin"))
+                .context("failed to create managed install directory")?;
+            let install_root = canonical_install_path(&install_root)
+                .context("failed to resolve managed install root")?;
+            let bin_dir = install_root.join("bin");
+            let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
+            let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
+            fs::create_dir_all(&bin_dir).with_context(|| {
+                format!("failed to create install directory `{}`", bin_dir.display())
+            })?;
+            Ok((install_root, bin_dir, staged_binary, rollback_binary))
+        },
+    )?;
 
     observe_install_stage(
         &mut stage_timings,
@@ -313,7 +305,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         },
     )?;
 
-    observe_install_stage(
+    let layout = observe_install_stage(
         &mut stage_timings,
         install_started,
         "installer.asset.unpack",
@@ -327,21 +319,25 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("staged binary metadata unavailable"),
             }
-            if bin_dir.join("cua.rollback").exists() {
-                bail!("CUA rollback payload exists; explicit recovery is required before updating");
-            }
-            unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
+            anyhow::ensure!(
+                GatewayLayout::ALL
+                    .iter()
+                    .all(|layout| !layout.backup(&bin_dir).exists()),
+                "Gateway runtime rollback payload exists; explicit recovery is required before updating"
+            );
+            let layout = unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
             if !macos_cu_layout() {
                 make_binary_executable(&staged_binary)?;
             }
-            Ok(())
+            Ok(layout)
         },
     )?;
+    let target_binary = layout.installed_binary(&config, &bin_dir)?;
 
     // Keep the exact candidate that will be activated beside its own libraries
     // during schema admission; live libraries must remain untouched until then.
     let staged_binary = if macos_cu_layout() {
-        bin_dir.join("cua.next").join(GATEWAY_APP_EXECUTABLE)
+        bin_dir.join(STAGED_RUNTIME).join(GATEWAY_APP_EXECUTABLE)
     } else {
         staged_binary
     };
@@ -549,7 +545,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         || {
             let activation = (|| -> Result<()> {
                 retired_binary.retain()?;
-                activate_install_companions(&bin_dir)?;
+                activate_install_companions(&bin_dir, layout)?;
                 if macos_cu_layout() {
                     Ok(())
                 } else {
@@ -697,7 +693,9 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                     ));
                 }
             }
-            let _ = fs::remove_dir_all(bin_dir.join("cua.rollback"));
+            for layout in GatewayLayout::ALL {
+                let _ = fs::remove_dir_all(layout.backup(&bin_dir));
+            }
             if macos_cu_layout() {
                 cleanup_macos_cu_artifacts(&config, &bin_dir)?;
             }
@@ -1137,12 +1135,7 @@ fn gateway_asset_file_name_for(os: &str, arch: &str, computer_use: bool) -> Resu
     } else {
         ""
     };
-    let extension = if computer_use || os == "windows" || (os == "macos" && arch == "x86_64") {
-        "zip"
-    } else {
-        "gz"
-    };
-    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.{extension}"))
+    Ok(format!("pioneer-gateway-{os}-{arch}{suffix}.zip"))
 }
 
 fn persist_install_state(
@@ -1314,7 +1307,7 @@ fn rollback_installation(
     };
     if previous_binary.is_none() {
         let binary = (|| -> Result<()> {
-            restore_cua_payload(&directory)?;
+            restore_install_companions(&directory)?;
             if !is_bundle_executable(target_binary) && target_binary.is_file() {
                 fs::remove_file(target_binary)?;
             }
@@ -1331,7 +1324,9 @@ fn rollback_installation(
     }
     // A failed rename may leave the prior installation untouched after stop.
     if !rollback_binary.exists()
-        && !directory.join("cua.rollback").exists()
+        && GatewayLayout::ALL
+            .iter()
+            .all(|layout| !layout.backup(&directory).exists())
         && previous_binary.is_some_and(Path::is_file)
     {
         return RollbackOutcome {
@@ -1355,10 +1350,10 @@ fn rollback_installation(
             safety,
         );
     }
-    // macOS variant changes cross the app/standalone boundary. Restore the
-    // matching package first, then publish/restart its own executable.
+    // On macOS a variant or archive layout change can move the executable.
+    // Restore the matching package before republishing its executable.
     let binary = (|| -> Result<()> {
-        restore_cua_payload(&directory)?;
+        restore_install_companions(&directory)?;
         if !is_bundle_executable(previous) {
             restore_binary_preserving_backup(previous, rollback_binary)?;
         } else if target_binary.is_file() {
@@ -1412,7 +1407,7 @@ fn rollback_and_restore(
     if !is_bundle_executable(target_binary)
         && let Some(directory) = target_binary.parent()
     {
-        if let Err(error) = restore_cua_payload(directory) {
+        if let Err(error) = restore_install_companions(directory) {
             outcome.binary = RestoreOutcome::Failed {
                 kind: restore_error_kind(&error),
             };
@@ -1445,7 +1440,7 @@ fn restore_binary_and_config(
     let binary = if is_bundle_executable(target_binary) {
         restore_outcome(
             installed_payload_directory(target_binary)
-                .and_then(|directory| restore_cua_payload(&directory)),
+                .and_then(|directory| restore_install_companions(&directory)),
         )
     } else {
         restore_outcome(restore_binary_preserving_backup(
@@ -1505,7 +1500,7 @@ fn prepare_candidate_probe_layout(binary: &Path) -> Result<(tempfile::TempDir, P
         .prefix(".pioneer-candidate-")
         .tempdir_in(directory)
         .context("failed to create isolated candidate probe layout")?;
-    restore_native_libraries(&directory.join("cua.next"), layout.path())?;
+    restore_native_libraries(&directory.join(STAGED_RUNTIME), layout.path())?;
     let candidate = layout
         .path()
         .join(binary.file_name().context("candidate binary has no name")?);
@@ -1734,7 +1729,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()> {
+fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<GatewayLayout> {
     let is_zip = asset_path
         .extension()
         .and_then(OsStr::to_str)
@@ -1750,7 +1745,7 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
         let payload = target_binary
             .parent()
             .context("candidate has no parent")?
-            .join("cua.next");
+            .join(STAGED_RUNTIME);
         if payload.exists() {
             fs::remove_dir_all(&payload)?;
         }
@@ -1760,7 +1755,7 @@ fn unpack_asset_to_binary(asset_path: &Path, target_binary: &Path) -> Result<()>
         if std::io::copy(&mut decoder, &mut output)? > 512 * 1024 * 1024 {
             bail!("Gateway archive exceeds binary budget");
         }
-        Ok(())
+        Ok(GatewayLayout::Legacy)
     } else {
         bail!("Gateway archive format does not match this build variant and target")
     }
@@ -1791,14 +1786,14 @@ fn copy_zip_member<R: Read>(
     Ok(())
 }
 
-fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
+fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<GatewayLayout> {
     let input = File::open(asset_path)
         .with_context(|| format!("failed to open asset `{}`", asset_path.display()))?;
     let mut archive = zip::ZipArchive::new(input)
         .with_context(|| format!("failed to parse zip archive `{}`", asset_path.display()))?;
 
     let expected_binary_name = if macos_cu_layout() {
-        "cua/Pioneer Gateway.app/Contents/MacOS/pioneer"
+        GATEWAY_APP_EXECUTABLE
     } else if cfg!(windows) {
         "pioneer.exe"
     } else {
@@ -1807,11 +1802,11 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     let target_dir = target_binary
         .parent()
         .context("staged binary path has no parent directory")?;
-    let payload = target_dir.join("cua.next");
+    let payload = target_dir.join(STAGED_RUNTIME);
     if payload.exists() {
-        fs::remove_dir_all(&payload).context("failed to clear staged CUA payload")?;
+        fs::remove_dir_all(&payload).context("failed to clear staged Gateway runtime")?;
     }
-    fs::create_dir(&payload).context("failed to create staged CUA payload")?;
+    fs::create_dir(&payload).context("failed to create staged Gateway runtime directory")?;
     anyhow::ensure!(
         archive.len() <= 32768,
         "Gateway archive has too many members"
@@ -1819,6 +1814,7 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
     let mut total_bytes = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     let mut found = false;
+    let mut archive_layout = None;
     #[cfg(target_os = "macos")]
     let mut companion_dylibs = 0usize;
     for index in 0..archive.len() {
@@ -1873,20 +1869,30 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         if entry.size() > 512 * 1024 * 1024 || total_bytes > 2 * 1024 * 1024 * 1024 {
             bail!("Gateway archive exceeds payload budget");
         }
-        if macos_cu_layout() && relative == Path::new(expected_binary_name) {
-            found = true;
-            #[cfg(unix)]
+        if let Some((layout, companion)) = GatewayLayout::ALL.into_iter().find_map(|layout| {
+            relative
+                .strip_prefix(layout.directory())
+                .ok()
+                .map(|path| (layout, path))
+        }) {
             anyhow::ensure!(
-                entry.unix_mode().unwrap_or(0) & 0o111 != 0,
-                "Gateway bundle executable is not executable"
+                archive_layout.is_none_or(|previous| previous == layout),
+                "Gateway archive mixes runtime layouts"
             );
-        }
-        if let Ok(companion) = relative.strip_prefix("cua") {
-            if !cfg!(feature = "computer-use") {
+            archive_layout = Some(layout);
+            if macos_cu_layout() && companion == Path::new(expected_binary_name) {
+                found = true;
+                #[cfg(unix)]
+                anyhow::ensure!(
+                    mode & 0o111 != 0,
+                    "Gateway bundle executable is not executable"
+                );
+            }
+            if !cfg!(feature = "computer-use") && !companion.starts_with("postgres") {
                 bail!("server archive must not contain a CUA payload");
             }
             if companion.as_os_str().is_empty() {
-                bail!("invalid CUA payload member");
+                bail!("invalid Gateway runtime member");
             }
             let destination = payload.join(companion);
             fs::create_dir_all(destination.parent().context("CUA member has no parent")?)?;
@@ -1972,21 +1978,41 @@ fn unpack_zip_asset(asset_path: &Path, target_binary: &Path) -> Result<()> {
         );
     }
 
-    if cfg!(feature = "computer-use") {
-        validate_cua_payload(&payload)?;
+    let layout = archive_layout.unwrap_or(GatewayLayout::Legacy);
+    if layout == GatewayLayout::Runtime {
+        let postgres = payload.join("postgres");
+        for program in ["postgres", "initdb", "pg_ctl", "psql"] {
+            anyhow::ensure!(
+                postgres
+                    .join("bin")
+                    .join(format!("{program}{}", std::env::consts::EXE_SUFFIX))
+                    .is_file(),
+                "Gateway runtime is missing PostgreSQL program {program}"
+            );
+        }
+        anyhow::ensure!(
+            postgres.join("share/extension/vector.control").is_file(),
+            "Gateway runtime is missing pgvector"
+        );
     }
-    Ok(())
+    if cfg!(feature = "computer-use") {
+        validate_cua_payload(&payload, layout)?;
+    }
+    Ok(layout)
 }
 
-// Server installs do not require a CUA package. A transition from CU still
-// retires its managed payload in the same recovery unit as the executable.
-fn activate_install_companions(directory: &Path) -> Result<()> {
+fn activate_install_companions(directory: &Path, layout: GatewayLayout) -> Result<()> {
+    let next = directory.join(STAGED_RUNTIME);
     if cfg!(feature = "computer-use") {
-        return activate_cua_payload(directory);
+        validate_cua_payload(&next, layout)?;
     }
-    let current = directory.join("cua");
-    let next = directory.join("cua.next");
-    if !current.exists() && !next.join("native-libs").exists() {
+    if !cfg!(feature = "computer-use")
+        && GatewayLayout::ALL
+            .iter()
+            .all(|layout| !directory.join(layout.directory()).exists())
+        && !next.join("native-libs").exists()
+        && !next.join("postgres").exists()
+    {
         if next.exists() {
             fs::remove_dir_all(next)?;
         }
@@ -1995,23 +2021,18 @@ fn activate_install_companions(directory: &Path) -> Result<()> {
     if !next.exists() {
         fs::create_dir(&next)?;
     }
-    replace_install_companions(directory)
+    replace_install_companions(directory, layout)
 }
 
-fn validate_cua_payload(payload: &Path) -> Result<()> {
+fn validate_cua_payload(payload: &Path, layout: GatewayLayout) -> Result<()> {
+    let driver_dir = layout.driver_dir(payload);
+    let manifest_path = driver_dir.join("manifest.json");
     anyhow::ensure!(
-        fs::metadata(payload.join("manifest.json"))?.len() <= 16 * 1024,
+        fs::metadata(&manifest_path)?.len() <= 4 * 1024 * 1024,
         "CUA manifest exceeds size budget"
     );
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(payload.join("manifest.json"))?)?;
-    let daemon = if cfg!(target_os = "macos") {
-        "Pioneer Gateway.app/Contents/Helpers/cua-driver"
-    } else if cfg!(windows) {
-        "cua-driver.exe"
-    } else {
-        "cua-driver"
-    };
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    let daemon = layout.daemon();
     let os = match std::env::consts::OS {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
@@ -2025,13 +2046,13 @@ fn validate_cua_payload(payload: &Path) -> Result<()> {
         || manifest["daemon"] != daemon
         || manifest["permission_owner"] != "gateway"
         || manifest["sha256"].as_str() != Some(sha256_file(&payload.join(daemon))?.as_str())
-        || !payload.join("LICENSE.cua-driver.md").is_file()
-        || !payload.join("THIRD_PARTY_NOTICES.md").is_file()
+        || !driver_dir.join("LICENSE.cua-driver.md").is_file()
+        || !driver_dir.join("THIRD_PARTY_NOTICES.md").is_file()
     {
         bail!("Gateway CUA package identity or contents mismatch");
     }
     #[cfg(windows)]
-    if !payload.join("cua-driver-uia.exe").is_file() {
+    if !driver_dir.join("cua-driver-uia.exe").is_file() {
         bail!("Gateway CUA Windows UIA companion is missing");
     }
     #[cfg(target_os = "macos")]
@@ -2047,23 +2068,28 @@ fn validate_cua_payload(payload: &Path) -> Result<()> {
     Ok(())
 }
 
-fn activate_cua_payload(directory: &Path) -> Result<()> {
-    let next = directory.join("cua.next");
-    validate_cua_payload(&next)?;
-    replace_install_companions(directory)
-}
-
-fn replace_install_companions(directory: &Path) -> Result<()> {
-    let current = directory.join("cua");
-    let backup = directory.join("cua.rollback");
-    let next = directory.join("cua.next");
-    if backup.exists() {
-        bail!("CUA rollback payload exists; retain it for explicit recovery before updating");
-    }
-    if current.exists() {
-        fs::rename(&current, &backup)?;
+fn replace_install_companions(directory: &Path, layout: GatewayLayout) -> Result<()> {
+    let current = directory.join(layout.directory());
+    let next = directory.join(STAGED_RUNTIME);
+    let installed = GatewayLayout::ALL.map(|layout| directory.join(layout.directory()).exists());
+    anyhow::ensure!(
+        !installed.iter().all(|exists| *exists),
+        "multiple installed Gateway runtime layouts require explicit recovery"
+    );
+    anyhow::ensure!(
+        GatewayLayout::ALL
+            .iter()
+            .all(|layout| !layout.backup(directory).exists()),
+        "Gateway runtime rollback payload exists; retain it for explicit recovery before updating"
+    );
+    let previous = GatewayLayout::ALL
+        .into_iter()
+        .zip(installed)
+        .find_map(|(layout, exists)| exists.then_some(layout));
+    let backup = previous.unwrap_or(layout).backup(directory);
+    if let Some(previous) = previous {
+        fs::rename(directory.join(previous.directory()), &backup)?;
     } else {
-        // An empty backup represents an installation that previously had no CUA.
         fs::create_dir(&backup)?;
     }
     #[cfg(all(target_os = "macos", not(feature = "computer-use")))]
@@ -2085,16 +2111,22 @@ fn replace_install_companions(directory: &Path) -> Result<()> {
             }
         }
     }
-    fs::rename(next, &current).context("failed to activate staged CUA payload")?;
+    fs::rename(next, &current).context("failed to activate staged Gateway runtime")?;
     #[cfg(all(target_os = "macos", not(feature = "computer-use")))]
     restore_native_libraries(&current, directory)?;
     Ok(())
 }
 
-fn restore_cua_payload(directory: &Path) -> Result<()> {
-    let backup = directory.join("cua.rollback");
-    if backup.exists() {
-        let current = directory.join("cua");
+fn restore_install_companions(directory: &Path) -> Result<()> {
+    let Some(layout) = GatewayLayout::ALL
+        .into_iter()
+        .find(|layout| layout.backup(directory).exists())
+    else {
+        return Ok(());
+    };
+    let backup = layout.backup(directory);
+    for candidate in GatewayLayout::ALL {
+        let current = directory.join(candidate.directory());
         if current.exists() {
             #[cfg(all(target_os = "macos", not(feature = "computer-use")))]
             if current.join("native-libs").is_dir() {
@@ -2105,14 +2137,15 @@ fn restore_cua_payload(directory: &Path) -> Result<()> {
                     }
                 }
             }
-            fs::remove_dir_all(&current)?;
+            fs::remove_dir_all(current)?;
         }
-        // Preserve the sole known-good payload if a later config/service restore
-        // fails, just as restore_binary_preserving_backup retains the executable.
-        copy_cua_payload(&backup, &current).context("failed to restore CUA rollback payload")?;
-        #[cfg(all(target_os = "macos", not(feature = "computer-use")))]
-        restore_native_libraries(&backup, directory)?;
     }
+    // The directory name is part of the previous binary's startup contract.
+    // Retain its backup until config and service recovery have also succeeded.
+    copy_runtime_payload(&backup, &directory.join(layout.directory()))
+        .context("failed to restore Gateway runtime rollback payload")?;
+    #[cfg(all(target_os = "macos", not(feature = "computer-use")))]
+    restore_native_libraries(&backup, directory)?;
     Ok(())
 }
 
@@ -2128,18 +2161,18 @@ fn restore_native_libraries(payload: &Path, directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_cua_payload(source: &Path, destination: &Path) -> Result<()> {
+fn copy_runtime_payload(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let target = destination.join(entry.file_name());
         if kind.is_dir() {
-            copy_cua_payload(&entry.path(), &target)?;
+            copy_runtime_payload(&entry.path(), &target)?;
         } else if kind.is_file() {
             fs::copy(entry.path(), target)?;
         } else {
-            bail!("invalid CUA rollback payload member");
+            bail!("invalid Gateway runtime rollback payload member");
         }
     }
     Ok(())
@@ -2288,6 +2321,56 @@ fn restore_runtime_toml(runtime_home: &Path, backup: &RuntimeConfigBackup) -> Re
 
 const GATEWAY_APP_EXECUTABLE: &str = "Pioneer Gateway.app/Contents/MacOS/pioneer";
 
+const STAGED_RUNTIME: &str = "runtime.next";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayLayout {
+    Runtime,
+    Legacy,
+}
+
+impl GatewayLayout {
+    const ALL: [Self; 2] = [Self::Runtime, Self::Legacy];
+
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Legacy => "cua",
+        }
+    }
+
+    fn backup(self, bin: &Path) -> PathBuf {
+        bin.join(format!("{}.rollback", self.directory()))
+    }
+
+    fn driver_dir(self, payload: &Path) -> PathBuf {
+        match self {
+            Self::Runtime => payload.join("cua"),
+            Self::Legacy => payload.to_path_buf(),
+        }
+    }
+
+    fn daemon(self) -> &'static str {
+        if cfg!(target_os = "macos") {
+            return "Pioneer Gateway.app/Contents/Helpers/cua-driver";
+        }
+        match (self, cfg!(windows)) {
+            (Self::Runtime, true) => "cua/cua-driver.exe",
+            (Self::Runtime, false) => "cua/cua-driver",
+            (Self::Legacy, true) => "cua-driver.exe",
+            (Self::Legacy, false) => "cua-driver",
+        }
+    }
+
+    fn installed_binary(self, config: &AppConfig, bin: &Path) -> Result<PathBuf> {
+        Ok(if macos_cu_layout() {
+            bin.join(self.directory()).join(GATEWAY_APP_EXECUTABLE)
+        } else {
+            bin.join(config.install_binary_file_name()?)
+        })
+    }
+}
+
 fn macos_cu_layout() -> bool {
     cfg!(all(target_os = "macos", feature = "computer-use"))
 }
@@ -2328,17 +2411,23 @@ pub(crate) fn canonical_install_path(path: &Path) -> Result<PathBuf> {
 
 pub(crate) fn installed_binary_path(config: &AppConfig, install_root: &Path) -> Result<PathBuf> {
     let bin = install_root.join("bin");
-    Ok(if macos_cu_layout() {
-        bin.join("cua").join(GATEWAY_APP_EXECUTABLE)
-    } else {
-        bin.join(config.install_binary_file_name()?)
-    })
+    let installed = GatewayLayout::Runtime.installed_binary(config, &bin)?;
+    if macos_cu_layout() && !installed.exists() {
+        let legacy = GatewayLayout::Legacy.installed_binary(config, &bin)?;
+        if legacy.is_file() {
+            return Ok(legacy);
+        }
+    }
+    Ok(installed)
 }
 
 fn is_installed_layout_path(config: &AppConfig, root: &Path, binary: &Path) -> Result<bool> {
     let bin = root.join("bin");
     Ok(binary == bin.join(config.install_binary_file_name()?)
-        || (cfg!(target_os = "macos") && binary == bin.join("cua").join(GATEWAY_APP_EXECUTABLE)))
+        || (cfg!(target_os = "macos")
+            && GatewayLayout::ALL
+                .into_iter()
+                .any(|layout| binary == bin.join(layout.directory()).join(GATEWAY_APP_EXECUTABLE))))
 }
 
 fn previous_installed_binary(
@@ -2347,8 +2436,8 @@ fn previous_installed_binary(
     selected: &Path,
 ) -> Result<Option<PathBuf>> {
     let previous = pioneer_config::load_install_state(&config.install_state_path()?)?;
-    // Install-state chooses a prior variant explicitly; never search for another
-    // executable. The selected runtime remains authoritative when it exists.
+    // Install-state chooses a prior variant explicitly. A macOS CU installation
+    // can also be located at its other managed layout when state is missing.
     let path = match fs::symlink_metadata(selected) {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -2364,6 +2453,7 @@ fn previous_installed_binary(
             {
                 state.binary_path
             }
+            _ if macos_cu_layout() => installed_binary_path(config, root)?,
             _ => return Ok(None),
         },
         Err(error) => return Err(error).context("installed binary metadata unavailable"),
@@ -2383,7 +2473,7 @@ fn is_bundle_executable(binary: &Path) -> bool {
 }
 
 fn installed_payload_directory(binary: &Path) -> Result<PathBuf> {
-    // bin/cua/Pioneer Gateway.app/Contents/MacOS/pioneer -> bin
+    // bin/runtime/Pioneer Gateway.app/Contents/MacOS/pioneer -> bin (also legacy cua)
     binary
         .ancestors()
         .nth(5)
@@ -3086,6 +3176,8 @@ mod tests {
     use std::net::TcpListener;
     #[cfg(not(windows))]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(feature = "computer-use")]
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(not(windows))]
@@ -3351,8 +3443,8 @@ mod tests {
                 !rollback.exists(),
                 "CLI link was moved into regular-executable rollback"
             );
-            write_cua_fixture(&bin.join("cua.next"), "candidate");
-            super::activate_install_companions(&bin).unwrap();
+            write_cua_fixture(&bin.join(super::STAGED_RUNTIME), "candidate");
+            super::activate_install_companions(&bin, super::GatewayLayout::Legacy).unwrap();
             super::publish_unix_command_link(&link, &bundle).unwrap();
             if fail_before_start {
                 let blocker = root.join("blocked-state");
@@ -3420,7 +3512,7 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
         write_cua_fixture(&bin.join("cua"), "prior");
-        write_cua_fixture(&bin.join("cua.next"), "candidate");
+        write_cua_fixture(&bin.join(super::STAGED_RUNTIME), "candidate");
         let bundle = bin.join("cua").join(super::GATEWAY_APP_EXECUTABLE);
         let external = bin.join("pioneer");
         let rollback = bin.join("pioneer.rollback");
@@ -3444,7 +3536,7 @@ mod tests {
         let retained = super::RetiredBinary::new(Some(external.clone()), rollback.clone());
         retained.retain().unwrap();
         assert!(!external.exists());
-        super::activate_install_companions(&bin).unwrap();
+        super::activate_install_companions(&bin, super::GatewayLayout::Legacy).unwrap();
         let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"invalid\0target".to_vec()));
         assert!(super::publish_unix_command_link(&link, &invalid).is_err());
         let outcome = super::rollback_installation(
@@ -3847,17 +3939,41 @@ mod tests {
 
     #[cfg(feature = "computer-use")]
     fn write_cua_fixture(payload: &std::path::Path, release: &str) -> &'static str {
-        let daemon = if cfg!(target_os = "macos") {
-            "Pioneer Gateway.app/Contents/Helpers/cua-driver"
-        } else if cfg!(windows) {
-            "cua-driver.exe"
-        } else {
-            "cua-driver"
-        };
+        write_cua_layout_fixture(payload, release, super::GatewayLayout::Legacy)
+    }
+
+    #[cfg(feature = "computer-use")]
+    fn write_cua_layout_fixture(
+        payload: &Path,
+        release: &str,
+        layout: super::GatewayLayout,
+    ) -> &'static str {
+        let daemon = layout.daemon();
+        let driver_dir = layout.driver_dir(payload);
+        fs::create_dir_all(&driver_dir).unwrap();
+        if layout == super::GatewayLayout::Runtime {
+            let postgres = payload.join("postgres");
+            fs::create_dir_all(postgres.join("bin")).unwrap();
+            fs::create_dir_all(postgres.join("share/extension")).unwrap();
+            for program in ["postgres", "initdb", "pg_ctl", "psql"] {
+                fs::write(
+                    postgres
+                        .join("bin")
+                        .join(format!("{program}{}", std::env::consts::EXE_SUFFIX)),
+                    format!("{release} {program}"),
+                )
+                .unwrap();
+            }
+            fs::write(postgres.join("share/extension/vector.control"), b"fixture").unwrap();
+        }
         fs::create_dir_all(payload.join(daemon).parent().unwrap()).unwrap();
         fs::write(payload.join(daemon), format!("{release} daemon bytes")).unwrap();
-        fs::write(payload.join("LICENSE.cua-driver.md"), b"fixture license").unwrap();
-        fs::write(payload.join("THIRD_PARTY_NOTICES.md"), b"fixture notices").unwrap();
+        fs::write(driver_dir.join("LICENSE.cua-driver.md"), b"fixture license").unwrap();
+        fs::write(
+            driver_dir.join("THIRD_PARTY_NOTICES.md"),
+            b"fixture notices",
+        )
+        .unwrap();
         #[cfg(target_os = "macos")]
         {
             let contents = payload.join("Pioneer Gateway.app/Contents");
@@ -3884,7 +4000,11 @@ mod tests {
             .unwrap();
         }
         #[cfg(windows)]
-        fs::write(payload.join("cua-driver-uia.exe"), format!("{release} UIA")).unwrap();
+        fs::write(
+            driver_dir.join("cua-driver-uia.exe"),
+            format!("{release} UIA"),
+        )
+        .unwrap();
         let os = if cfg!(target_os = "macos") {
             "apple-darwin"
         } else if cfg!(windows) {
@@ -3892,7 +4012,7 @@ mod tests {
         } else {
             "unknown-linux-gnu"
         };
-        fs::write(payload.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
+        fs::write(driver_dir.join("manifest.json"), serde_json::to_vec(&serde_json::json!({
             "schema_version": 1, "repository": "https://github.com/trycua/cua",
             "target": format!("{}-{os}", std::env::consts::ARCH),
             "revision": "upstream-revision", "version": release, "daemon": daemon,
@@ -3904,15 +4024,24 @@ mod tests {
     #[test]
     #[cfg(feature = "computer-use")]
     fn installer_rollback_restores_the_prior_daemon_payload() {
-        for previously_installed in [false, true] {
+        use super::GatewayLayout::{Legacy, Runtime};
+        for (layout, previously_installed) in [(Legacy, false), (Runtime, false), (Runtime, true)] {
             let temporary = tempfile::tempdir().unwrap();
             let directory = temporary.path();
             let source = directory.join("fixture");
-            let daemon = write_cua_fixture(&source, "candidate");
+            let daemon = write_cua_layout_fixture(&source, "candidate", layout);
+            let installed = directory.join(layout.directory());
+            let prior = directory.join("cua");
+            let prior_daemon = Legacy.daemon();
             if previously_installed {
-                write_cua_fixture(&directory.join("cua"), "prior");
+                write_cua_fixture(&prior, "prior");
             }
-            let manifest_bytes = fs::read(source.join("manifest.json")).unwrap();
+            let manifest_member = if layout == Runtime {
+                "cua/manifest.json"
+            } else {
+                "manifest.json"
+            };
+            let manifest_bytes = fs::read(source.join(manifest_member)).unwrap();
             let mut defects = vec!["manifest", "owner", "hash", "companion", "none"];
             if cfg!(target_os = "macos") {
                 defects.insert(0, "external executable");
@@ -3955,20 +4084,24 @@ mod tests {
                             .unwrap()
                             .to_string_lossy()
                             .replace('\\', "/");
-                        let companion = if cfg!(windows) {
-                            "cua-driver-uia.exe"
-                        } else if cfg!(target_os = "macos") {
-                            "Pioneer Gateway.app/Contents/Info.plist"
+                        let companion = if cfg!(target_os = "macos") {
+                            PathBuf::from("Pioneer Gateway.app/Contents/Info.plist")
                         } else {
-                            "THIRD_PARTY_NOTICES.md"
+                            layout.driver_dir(Path::new("")).join(if cfg!(windows) {
+                                "cua-driver-uia.exe"
+                            } else {
+                                "THIRD_PARTY_NOTICES.md"
+                            })
                         };
-                        if (defect == "companion" && name == companion)
-                            || (defect == "manifest" && name == "manifest.json")
+                        if (defect == "companion" && Path::new(&name) == companion)
+                            || (defect == "manifest" && name == manifest_member)
                         {
                             continue;
                         }
-                        archive.start_file(format!("cua/{name}"), options).unwrap();
-                        let bytes = if name == "manifest.json" {
+                        archive
+                            .start_file(format!("{}/{name}", layout.directory()), options)
+                            .unwrap();
+                        let bytes = if name == manifest_member {
                             serde_json::to_vec(&manifest).unwrap()
                         } else {
                             fs::read(&path).unwrap()
@@ -3983,12 +4116,9 @@ mod tests {
                 if defect != "none" {
                     assert!(result.is_err(), "accepted corrupt {defect} archive");
                     assert!(!directory.join("cua.rollback").exists());
-                    assert_eq!(
-                        directory.join("cua").join(daemon).exists(),
-                        previously_installed
-                    );
+                    assert_eq!(prior.join(prior_daemon).exists(), previously_installed);
                 } else {
-                    result.unwrap();
+                    assert_eq!(result.unwrap(), layout);
                     if cfg!(target_os = "macos") {
                         assert!(
                             !candidate.exists(),
@@ -3998,7 +4128,7 @@ mod tests {
                             fs::read(
                                 admission
                                     .path()
-                                    .join("cua.next")
+                                    .join(super::STAGED_RUNTIME)
                                     .join(super::GATEWAY_APP_EXECUTABLE)
                             )
                             .unwrap(),
@@ -4008,20 +4138,20 @@ mod tests {
                         assert_eq!(fs::read(candidate).unwrap(), b"candidate Gateway bytes");
                     }
                     fs::rename(
-                        admission.path().join("cua.next"),
-                        directory.join("cua.next"),
+                        admission.path().join(super::STAGED_RUNTIME),
+                        directory.join(super::STAGED_RUNTIME),
                     )
                     .unwrap();
                 }
             }
-            super::activate_install_companions(directory).unwrap();
+            super::activate_install_companions(directory, layout).unwrap();
             assert_eq!(
-                fs::read(directory.join("cua").join(daemon)).unwrap(),
+                fs::read(installed.join(daemon)).unwrap(),
                 b"candidate daemon bytes"
             );
             #[cfg(target_os = "macos")]
             {
-                let contents = directory.join("cua/Pioneer Gateway.app/Contents");
+                let contents = installed.join("Pioneer Gateway.app/Contents");
                 assert!(!directory.join("pioneer").exists());
                 assert_eq!(
                     fs::read(contents.join("MacOS/pioneer")).unwrap(),
@@ -4033,12 +4163,19 @@ mod tests {
                 );
                 assert!(!contents.join("MacOS/libonnxruntime.prior.dylib").exists());
             }
+            if previously_installed && layout == Runtime {
+                assert!(
+                    !prior.exists(),
+                    "the old layout must be retired after activation"
+                );
+            }
+            let backup = if previously_installed { Legacy } else { layout }.backup(directory);
             for _ in 0..2 {
-                super::restore_cua_payload(directory).unwrap();
-                assert!(directory.join("cua.rollback").is_dir());
+                super::restore_install_companions(directory).unwrap();
+                assert!(backup.is_dir());
                 if previously_installed {
                     assert_eq!(
-                        fs::read(directory.join("cua").join(daemon)).unwrap(),
+                        fs::read(prior.join(prior_daemon)).unwrap(),
                         b"prior daemon bytes"
                     );
                     #[cfg(target_os = "macos")]
@@ -4063,10 +4200,28 @@ mod tests {
                         );
                     }
                 } else {
-                    assert!(!directory.join("cua").join(daemon).exists());
+                    assert!(!installed.join(daemon).exists());
                 }
             }
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "computer-use"))]
+    fn finds_legacy_bundle_for_update_without_an_install_state() {
+        let mut config: pioneer_config::AppConfig =
+            toml::from_str(include_str!("../../../config/default.toml")).unwrap();
+        let home = tempfile::tempdir_in(dirs::home_dir().unwrap()).unwrap();
+        config.home_directory = home.path().file_name().unwrap().to_str().unwrap().into();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        write_cua_fixture(&bin.join("cua"), "prior");
+        let previous = bin.join("cua/Pioneer Gateway.app/Contents/MacOS/pioneer");
+        let candidate = bin.join("runtime/Pioneer Gateway.app/Contents/MacOS/pioneer");
+        assert_eq!(
+            super::previous_installed_binary(&config, root.path(), &candidate).unwrap(),
+            Some(previous)
+        );
     }
 
     #[test]
@@ -4079,8 +4234,8 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let directory = temporary.path();
             write_cua_fixture(&directory.join("cua"), "prior");
-            write_cua_fixture(&directory.join("cua.next"), "candidate");
-            super::activate_install_companions(directory).unwrap();
+            write_cua_fixture(&directory.join(super::STAGED_RUNTIME), "candidate");
+            super::activate_install_companions(directory, super::GatewayLayout::Legacy).unwrap();
             let target = directory.join("cua").join(super::GATEWAY_APP_EXECUTABLE);
             let outcome = super::rollback_installation(
                 &target,
@@ -4140,9 +4295,9 @@ mod tests {
         let directory = temporary.path();
         fs::write(directory.join("libonnxruntime.dylib"), b"live library").unwrap();
         fs::write(directory.join("libonnxruntime.prior.dylib"), b"prior only").unwrap();
-        fs::create_dir_all(directory.join("cua.next/native-libs")).unwrap();
+        fs::create_dir_all(directory.join("runtime.next/native-libs")).unwrap();
         fs::write(
-            directory.join("cua.next/native-libs/libonnxruntime.dylib"),
+            directory.join("runtime.next/native-libs/libonnxruntime.dylib"),
             b"candidate library",
         )
         .unwrap();
@@ -4224,7 +4379,7 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
             super::unpack_asset_to_binary(&archive_path, &temporary.path().join("candidate"))
                 .unwrap_err();
         assert!(error.to_string().contains("links, special files"));
-        assert!(!temporary.path().join("cua.next/link").exists());
+        assert!(!temporary.path().join("runtime.next/link").exists());
     }
 
     #[test]
@@ -4233,19 +4388,19 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
             (
                 "linux",
                 "x86_64",
-                "pioneer-gateway-linux-x86_64.gz",
+                "pioneer-gateway-linux-x86_64.zip",
                 "pioneer-gateway-linux-x86_64-computer-use-package.zip",
             ),
             (
                 "linux",
                 "aarch64",
-                "pioneer-gateway-linux-aarch64.gz",
+                "pioneer-gateway-linux-aarch64.zip",
                 "pioneer-gateway-linux-aarch64-computer-use-package.zip",
             ),
             (
                 "macos",
                 "aarch64",
-                "pioneer-gateway-macos-aarch64.gz",
+                "pioneer-gateway-macos-aarch64.zip",
                 "pioneer-gateway-macos-aarch64-computer-use-package.zip",
             ),
             (
@@ -4360,7 +4515,7 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
     fn server_transition_retires_cu_app_and_preserves_recovery() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path();
-        super::activate_install_companions(directory).unwrap();
+        super::activate_install_companions(directory, super::GatewayLayout::Legacy).unwrap();
         assert!(!directory.join("cua").exists());
         assert!(!directory.join("cua.rollback").exists());
         fs::create_dir_all(directory.join("cua/Pioneer Gateway.app")).unwrap();
@@ -4372,14 +4527,14 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
                 b"prior Intel library",
             )
             .unwrap();
-            fs::create_dir_all(directory.join("cua.next/native-libs")).unwrap();
+            fs::create_dir_all(directory.join("runtime.next/native-libs")).unwrap();
             fs::write(
-                directory.join("cua.next/native-libs/libonnxruntime.dylib"),
+                directory.join("runtime.next/native-libs/libonnxruntime.dylib"),
                 b"server Intel library",
             )
             .unwrap();
         }
-        super::activate_install_companions(directory).unwrap();
+        super::activate_install_companions(directory, super::GatewayLayout::Legacy).unwrap();
         #[cfg(target_os = "macos")]
         assert_eq!(
             fs::read(directory.join("libonnxruntime.dylib")).unwrap(),
@@ -4387,7 +4542,7 @@ printf '%s\n' '{"version":"candidate","compiled_database_migrations":["candidate
         );
         assert!(!directory.join("cua/Pioneer Gateway.app").exists());
         assert!(!directory.join("cua/prior-daemon").exists());
-        super::restore_cua_payload(directory).unwrap();
+        super::restore_install_companions(directory).unwrap();
         assert_eq!(
             fs::read(directory.join("cua/prior-daemon")).unwrap(),
             b"prior"

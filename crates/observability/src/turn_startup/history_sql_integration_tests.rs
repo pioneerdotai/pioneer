@@ -1,25 +1,23 @@
-//! R1: real startup stages -> exact SQLite poll/drop adapter -> real SeaORM
+//! Real startup stages -> Gateway's poll/drop adapter -> real SeaORM
 //! callback installer + limiter -> completed SDK history.capture attributes.
 use super::{Input, Outcome, Runtime, Stage};
 use crate::DatabaseRole;
 use crate::gateway_query_observer_fixture::install_query_observer;
 use crate::pool_context::PoolContext::ReaderInteractive;
+use crate::postgres_query_scope::{PoolFutureExt, open_stream};
 use crate::query_fingerprint_fixture::{QueryFingerprintLimiter, QueryFingerprintState};
-use crate::sqlite_query_scope::{PoolFutureExt, open_stream};
 use crate::telemetry::tests::{gateway_test_state_with_tracer, with_test_state};
 use futures_util::StreamExt;
 use opentelemetry::trace::{SpanId, TraceContextExt};
 use opentelemetry::{Array, Context, KeyValue, Value};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
-use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
-    StreamTrait,
-};
+use pioneer_postgres_test::TestDatabase;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, StreamTrait};
 use std::sync::{Arc, Mutex};
 
-const FIRST: &str = "SELECT 1 AS owner_a UNION ALL SELECT 2";
-const SECOND: &str = "SELECT 3 AS owner_b";
+const FIRST: &str = "SELECT 1::bigint AS owner_a UNION ALL SELECT 2::bigint";
+const SECOND: &str = "SELECT 3::bigint AS owner_b";
 
 #[derive(Clone, Debug, Default)]
 struct Spans(Arc<Mutex<Vec<SpanData>>>);
@@ -96,7 +94,7 @@ fn current_span_id() -> SpanId {
     Context::current().span().span_context().span_id()
 }
 fn statement(sql: &str) -> Statement {
-    Statement::from_string(DbBackend::Sqlite, sql.to_owned())
+    Statement::from_string(DbBackend::Postgres, sql.to_owned())
 }
 fn limiter() -> Arc<QueryFingerprintLimiter> {
     Arc::new(QueryFingerprintLimiter {
@@ -120,18 +118,14 @@ fn identity(limiter: &QueryFingerprintLimiter, sql: &str) -> String {
     assert_ne!(canonical, 0);
     format!("{canonical:016x}")
 }
-async fn connection(limiter: Arc<QueryFingerprintLimiter>) -> DatabaseConnection {
-    let mut options = ConnectOptions::new("sqlite::memory:");
-    options.max_connections(1).min_connections(1);
-    let mut connection = Database::connect(options).await.unwrap();
-    connection
-        .execute_unprepared("PRAGMA query_only=ON")
-        .await
-        .unwrap();
-    // Exact production set_metric_callback, not an alternate test callback.
-    // Deliberately do not register the returned weak resource observer.
+async fn connection(
+    fixture: &TestDatabase,
+    limiter: Arc<QueryFingerprintLimiter>,
+) -> anyhow::Result<DatabaseConnection> {
+    let mut connection = fixture.connect_read_only().await?;
+    // Use Gateway's callback installer. The fixture only observes query attribution.
     let _observer = install_query_observer(&mut connection, DatabaseRole::Reader, limiter);
-    connection
+    Ok(connection)
 }
 fn expect_summary(span: &SpanData, fingerprint: Option<&str>, count: i64) {
     let attrs = &span.attributes;
@@ -189,12 +183,12 @@ fn real_sql_callback_uses_startup_capture_and_canonical_identity_across_foreign_
             .enable_all()
             .build()
             .unwrap()
-            .block_on(async {
+            .block_on(pioneer_postgres_test::with_database(async |fixture| {
                 let limiter = limiter();
                 let first_fp = identity(&limiter, FIRST);
                 let second_fp = identity(&limiter, SECOND);
                 assert_ne!(first_fp, second_fp);
-                let db = connection(limiter).await;
+                let db = connection(fixture, limiter).await?;
                 let first = Startup::begin("sql-attribution-scalar-first");
                 let second = Startup::begin("sql-attribution-scalar-second");
                 let (first_id, second_id) =
@@ -240,8 +234,9 @@ fn real_sql_callback_uses_startup_capture_and_canonical_identity_across_foreign_
                     .await;
                 expect_summary(&spans.capture(first_id), Some(&first_fp), 2);
                 expect_summary(&spans.capture(second_id), Some(&second_fp), 1);
-                db.close().await.unwrap();
-            });
+                Ok(())
+            }))
+            .unwrap();
     });
 }
 
@@ -255,11 +250,11 @@ fn real_metric_stream_keeps_creator_or_absence_at_eof_and_early_drop() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(async {
+            .block_on(pioneer_postgres_test::with_database(async |fixture| {
                 let limiter = limiter();
                 let first_fp = identity(&limiter, FIRST);
                 let second_fp = identity(&limiter, SECOND);
-                let db = connection(limiter).await;
+                let db = connection(fixture, limiter).await?;
                 for owned in [true, false] {
                     for eof in [true, false] {
                         let first = Startup::begin("sql-attribution-stream-first");
@@ -339,7 +334,8 @@ fn real_metric_stream_keeps_creator_or_absence_at_eof_and_early_drop() {
                         expect_summary(&spans.capture(second_id), Some(&second_fp), 1);
                     }
                 }
-                db.close().await.unwrap();
-            });
+                Ok(())
+            }))
+            .unwrap();
     });
 }

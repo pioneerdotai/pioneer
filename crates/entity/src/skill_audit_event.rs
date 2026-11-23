@@ -7,15 +7,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "skill_audit_event")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub turn_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub skill_id: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub skill_owner: Option<String>,
+    #[sea_orm(column_type = "Text")]
     pub skill_slug: String,
+    #[sea_orm(column_type = "Text")]
     pub source_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub action: String,
+    #[sea_orm(column_type = "Text")]
     pub decision: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub reason_code: Option<String>,
     #[sea_orm(column_type = "Text")]
     pub details_json: String,

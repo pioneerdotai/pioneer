@@ -81,7 +81,9 @@ macOS、Windows、Linux向けの[Pioneerをダウンロード](https://github.co
 
 ## 技術構成
 
-Pioneerは、ネイティブなGPUIデスクトップアプリとSQLiteを使うゲートウェイからなるRustワークスペースです。クライアントはWebSocket経由のJSON-RPC APIで接続します。
+Pioneerは、ネイティブなGPUIデスクトップアプリとPostgreSQLを使うゲートウェイからなるRustワークスペースです。クライアントはWebSocket経由のJSON-RPC APIで接続します。
+
+Gatewayの配布パッケージにはPostgreSQL 19とpgvectorが含まれます。初回起動時にデータディレクトリが作成され、再起動やPostgreSQLの同じメジャーバージョン内でのアップデート後も同じデータを使用します。DesktopのローカルGatewayにも同じデータベース環境がインストールされます。
 
 ```mermaid
 flowchart TB

@@ -4,10 +4,10 @@
 //! near-limit fixtures and wall-clock ceilings. Run them serially on release
 //! hardware with:
 //!
-//! `cargo test -p pioneer-gateway --test apply_patch_qualification -- --ignored --nocapture --test-threads=1`
+//! `cargo run --locked -p pioneer-postgres-test -- cargo test -p pioneer-gateway --test apply_patch_qualification -- --ignored --nocapture --test-threads=1`
 
-use migration::{Migrator, MigratorTrait};
 use pioneer_crud::patch_history as crud;
+use pioneer_postgres_test::with_database;
 use pioneer_tools::apply_patch::file_mutation::{
     AllowAllReadAccess, PaginatedReader, PatchLimits, PatchRequest, PatchRequestSource,
     ReadRequest, SnapshotLimits, TargetResolver,
@@ -15,14 +15,14 @@ use pioneer_tools::apply_patch::file_mutation::{
 use pioneer_tools::apply_patch::history::{
     AppliedPatchRecord, AppliedPatchRecordOutcome, ChangeKind, CommitOrdinal,
     CommittedTextSnapshot, DurablePatchChange, HistoryQueryLimits, InvocationIdentity, LineEnding,
-    LineEndingMetadata, PatchSideEffects, SnapshotDomain, SqliteAppliedPatchStore,
-    SqliteCommitIntentStore, SqliteSnapshotStore, SqliteTurnDiffStore, TextEncoding,
-    TextSnapshotRef, TurnDiffAuthority, TurnDiffState, replay_turn_pages,
+    LineEndingMetadata, PatchSideEffects, PostgresAppliedPatchStore, PostgresCommitIntentStore,
+    PostgresSnapshotStore, PostgresTurnDiffStore, SnapshotDomain, TextEncoding, TextSnapshotRef,
+    TurnDiffAuthority, TurnDiffState, replay_turn_pages,
 };
 use pioneer_tools::apply_patch::{
     Hunk, HunkLine, UpdateFile, apply_update_with_candidate_limit, parse,
 };
-use sea_orm::Database;
+use sea_orm::ConnectionTrait;
 use serde_json::json;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -174,200 +174,217 @@ fn parser_matcher_and_streaming_read_resource_gates() {
 #[tokio::test]
 #[ignore = "explicit apply-patch release qualification"]
 async fn durable_history_storage_and_query_resource_gates() {
-    let database = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&database, None).await.unwrap();
-    let records = SqliteAppliedPatchStore::new(database.clone());
-    let snapshots = SqliteSnapshotStore::new(database.clone());
-    let intents = SqliteCommitIntentStore::new(database.clone());
-    let projections = SqliteTurnDiffStore::new(database.clone());
-    let domain = SnapshotDomain::new("thread:qualification", "pioneer", "thread_history");
-    let alpha = snapshot(b"alpha\n");
-    let beta = snapshot(b"beta\n");
-    let mut append_samples = Vec::with_capacity(CONFIGURED_MAX_RECORD_FIXTURE);
-    let append_started = Instant::now();
-    for ordinal in 0..CONFIGURED_MAX_RECORD_FIXTURE {
-        let (before, after) = if ordinal % 2 == 0 {
-            (&alpha, &beta)
-        } else {
-            (&beta, &alpha)
-        };
-        let change = DurablePatchChange {
-            operation_index: 0,
-            commit_step: 0,
-            sequence: 0,
-            kind: ChangeKind::Update,
-            source_path: "a.txt".to_owned(),
-            destination_path: None,
-            before: Some(TextSnapshotRef::from_snapshot(before)),
-            after: Some(TextSnapshotRef::from_snapshot(after)),
-            overwritten_destination: None,
-            side_effects: PatchSideEffects::default(),
-        };
-        let mut record = AppliedPatchRecord::new(
-            InvocationIdentity::new("qualification", "turn", format!("invocation-{ordinal:03}"))
-                .unwrap(),
-            CommitOrdinal(ordinal as u64),
-            AppliedPatchRecordOutcome::Applied,
-            vec![change],
-        );
-        record.environment_id = "workspace".to_owned();
-        record.committed_at_unix_ms = ordinal as i64;
-        let mut plan_fingerprint = [ordinal as u8; 32];
-        plan_fingerprint[0] = (ordinal as u8).wrapping_add(1);
-        let started = Instant::now();
-        records
-            .insert_with_snapshots(
-                record,
-                plan_fingerprint,
-                &domain,
-                &[before.clone(), after.clone()],
+    with_database(async |fixture| {
+        let database = fixture.connection().clone();
+        database
+            .execute_unprepared(
+                "INSERT INTO workspace(id,name) VALUES ('workspace','Qualification');
+         INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status)
+         VALUES ('qualification','workspace','','agent','model','provider','active');
+         INSERT INTO turn(id,thread_id,status) VALUES ('turn','qualification','in_progress');",
             )
             .await
             .unwrap();
-        append_samples.push(started.elapsed());
-    }
-    let append_total = append_started.elapsed();
-    let append_p50 = percentile(&append_samples, 50);
-    let append_p95 = percentile(&append_samples, 95);
-    let append_p99 = percentile(&append_samples, 99);
-    assert!(append_total < ABSOLUTE_APPEND_TOTAL_CEILING);
-    assert!(append_p95 < ABSOLUTE_APPEND_P95_CEILING);
+        let records = PostgresAppliedPatchStore::new(database.clone());
+        let snapshots = PostgresSnapshotStore::new(database.clone());
+        let intents = PostgresCommitIntentStore::new(database.clone());
+        let projections = PostgresTurnDiffStore::new(database.clone());
+        let domain = SnapshotDomain::new("thread:qualification", "pioneer", "thread_history");
+        let alpha = snapshot(b"alpha\n");
+        let beta = snapshot(b"beta\n");
+        let mut append_samples = Vec::with_capacity(CONFIGURED_MAX_RECORD_FIXTURE);
+        let append_started = Instant::now();
+        for ordinal in 0..CONFIGURED_MAX_RECORD_FIXTURE {
+            let (before, after) = if ordinal % 2 == 0 {
+                (&alpha, &beta)
+            } else {
+                (&beta, &alpha)
+            };
+            let change = DurablePatchChange {
+                operation_index: 0,
+                commit_step: 0,
+                sequence: 0,
+                kind: ChangeKind::Update,
+                source_path: "a.txt".to_owned(),
+                destination_path: None,
+                before: Some(TextSnapshotRef::from_snapshot(before)),
+                after: Some(TextSnapshotRef::from_snapshot(after)),
+                overwritten_destination: None,
+                side_effects: PatchSideEffects::default(),
+            };
+            let mut record = AppliedPatchRecord::new(
+                InvocationIdentity::new(
+                    "qualification",
+                    "turn",
+                    format!("invocation-{ordinal:03}"),
+                )
+                .unwrap(),
+                CommitOrdinal(ordinal as u64),
+                AppliedPatchRecordOutcome::Applied,
+                vec![change],
+            );
+            record.environment_id = "workspace".to_owned();
+            record.committed_at_unix_ms = ordinal as i64;
+            let mut plan_fingerprint = [ordinal as u8; 32];
+            plan_fingerprint[0] = (ordinal as u8).wrapping_add(1);
+            let started = Instant::now();
+            records
+                .insert_with_snapshots(
+                    record,
+                    plan_fingerprint,
+                    &domain,
+                    &[before.clone(), after.clone()],
+                )
+                .await
+                .unwrap();
+            append_samples.push(started.elapsed());
+        }
+        let append_total = append_started.elapsed();
+        let append_p50 = percentile(&append_samples, 50);
+        let append_p95 = percentile(&append_samples, 95);
+        let append_p99 = percentile(&append_samples, 99);
+        assert!(append_total < ABSOLUTE_APPEND_TOTAL_CEILING);
+        assert!(append_p95 < ABSOLUTE_APPEND_P95_CEILING);
 
-    let snapshot_metrics = snapshots.metrics().await.unwrap();
-    assert_eq!(snapshot_metrics.blobs, 2);
-    assert_eq!(snapshot_metrics.references, 512);
-    assert_eq!(
-        snapshot_metrics.referenced_logical_bytes,
-        CONFIGURED_MAX_RECORD_FIXTURE as u64 * (alpha.bytes.len() + beta.bytes.len()) as u64
-    );
-    assert!(snapshot_metrics.physical_bytes < snapshot_metrics.referenced_logical_bytes);
+        let snapshot_metrics = snapshots.metrics().await.unwrap();
+        assert_eq!(snapshot_metrics.blobs, 2);
+        assert_eq!(snapshot_metrics.references, 512);
+        assert_eq!(
+            snapshot_metrics.referenced_logical_bytes,
+            CONFIGURED_MAX_RECORD_FIXTURE as u64 * (alpha.bytes.len() + beta.bytes.len()) as u64
+        );
+        assert!(snapshot_metrics.physical_bytes < snapshot_metrics.referenced_logical_bytes);
 
-    let replay_started = Instant::now();
-    let replay = replay_turn_pages(&records, &intents, "qualification", "turn", 64)
-        .await
-        .unwrap();
-    let replay_elapsed = replay_started.elapsed();
-    assert!(replay_elapsed < ABSOLUTE_REPLAY_CEILING);
-    assert_eq!(
-        replay.aggregate.record_count,
-        CONFIGURED_MAX_RECORD_FIXTURE as u64
-    );
-    assert!(
-        replay.aggregate.changes.is_empty(),
-        "alternating edits are net-zero"
-    );
-
-    let projection = TurnDiffState::from_aggregate(
-        replay.aggregate,
-        TurnDiffAuthority::NativePatchEngine,
-        replay.revision,
-        false,
-    );
-    assert!(projections.upsert(&projection).await.unwrap());
-    for _ in 0..10 {
-        assert!(!projections.upsert(&projection).await.unwrap());
-    }
-    let projection_rows = usize::from(
-        crud::find_turn_diff_state(&database, "qualification", "turn")
+        let replay_started = Instant::now();
+        let replay = replay_turn_pages(&records, &intents, "qualification", "turn", 64)
             .await
-            .unwrap()
-            .is_some(),
-    );
-    assert_eq!(
-        projection_rows, 1,
-        "live revisions must coalesce into one row"
-    );
+            .unwrap();
+        let replay_elapsed = replay_started.elapsed();
+        assert!(replay_elapsed < ABSOLUTE_REPLAY_CEILING);
+        assert_eq!(
+            replay.aggregate.record_count,
+            CONFIGURED_MAX_RECORD_FIXTURE as u64
+        );
+        assert!(
+            replay.aggregate.changes.is_empty(),
+            "alternating edits are net-zero"
+        );
 
-    let query_started = Instant::now();
-    let history = records
-        .query_file_history(
+        let projection = TurnDiffState::from_aggregate(
+            replay.aggregate,
+            TurnDiffAuthority::NativePatchEngine,
+            replay.revision,
+            false,
+        );
+        assert!(projections.upsert(&projection).await.unwrap());
+        for _ in 0..10 {
+            assert!(!projections.upsert(&projection).await.unwrap());
+        }
+        let projection_rows = usize::from(
+            crud::find_turn_diff_state(&database, "qualification", "turn")
+                .await
+                .unwrap()
+                .is_some(),
+        );
+        assert_eq!(
+            projection_rows, 1,
+            "live revisions must coalesce into one row"
+        );
+
+        let query_started = Instant::now();
+        let history = records
+            .query_file_history(
+                "qualification",
+                "a.txt",
+                None,
+                HistoryQueryLimits {
+                    max_page_records: CONFIGURED_MAX_RECORD_FIXTURE,
+                    max_page_bytes: 16 * 1024 * 1024,
+                    max_decompressed_bytes: 16 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        let query_elapsed = query_started.elapsed();
+        assert!(query_elapsed < ABSOLUTE_QUERY_CEILING);
+        assert_eq!(history.items.len(), CONFIGURED_MAX_RECORD_FIXTURE);
+
+        let source_plan = crud::explain_patch_change_index_path_query(
+            &database,
             "qualification",
-            "a.txt",
-            None,
-            HistoryQueryLimits {
-                max_page_records: CONFIGURED_MAX_RECORD_FIXTURE,
-                max_page_bytes: 16 * 1024 * 1024,
-                max_decompressed_bytes: 16 * 1024 * 1024,
-            },
+            &["a.txt".to_owned()],
+            true,
         )
         .await
         .unwrap();
-    let query_elapsed = query_started.elapsed();
-    assert!(query_elapsed < ABSOLUTE_QUERY_CEILING);
-    assert_eq!(history.items.len(), CONFIGURED_MAX_RECORD_FIXTURE);
+        assert!(
+            source_plan
+                .iter()
+                .any(|detail| detail.contains("idx_patch_change_index_thread_source_order")),
+            "source-path history query must use its path index: {source_plan:?}"
+        );
+        let destination_plan = crud::explain_patch_change_index_path_query(
+            &database,
+            "qualification",
+            &["a.txt".to_owned()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            destination_plan
+                .iter()
+                .any(|detail| detail.contains("idx_patch_change_index_thread_destination_order")),
+            "destination-path history query must use its path index: {destination_plan:?}"
+        );
 
-    let source_plan = crud::explain_patch_change_index_path_query(
-        &database,
-        "qualification",
-        &["a.txt".to_owned()],
-        true,
-    )
+        let stored_shapes = crud::list_applied_patch_records_for_turn(
+            &database,
+            "qualification",
+            "turn",
+            None,
+            CONFIGURED_MAX_RECORD_FIXTURE as u64,
+        )
+        .await
+        .unwrap();
+        assert!(
+            stored_shapes
+                .iter()
+                .all(|row| !row.changes_json.contains("alpha\\n")
+                    && !row.changes_json.contains("beta\\n"))
+        );
+
+        println!(
+            "{}",
+            json!({
+                "gate": "patch_history_storage_query",
+                "records": CONFIGURED_MAX_RECORD_FIXTURE,
+                "append": {
+                    "total_ms": milliseconds(append_total),
+                    "p50_ms": milliseconds(append_p50),
+                    "p95_ms": milliseconds(append_p95),
+                    "p99_ms": milliseconds(append_p99),
+                },
+                "replay_ms": milliseconds(replay_elapsed),
+                "query_ms": milliseconds(query_elapsed),
+                "query_plan": {
+                    "source": source_plan,
+                    "destination": destination_plan,
+                },
+                "snapshot": {
+                    "blobs": snapshot_metrics.blobs,
+                    "references": snapshot_metrics.references,
+                    "logical_bytes": snapshot_metrics.logical_bytes,
+                    "referenced_logical_bytes": snapshot_metrics.referenced_logical_bytes,
+                    "physical_bytes": snapshot_metrics.physical_bytes,
+                },
+                "projection_rows": projection_rows,
+            })
+        );
+        Ok(())
+    })
     .await
     .unwrap();
-    assert!(
-        source_plan
-            .iter()
-            .any(|detail| detail.contains("idx_patch_change_index_thread_source_order")),
-        "source-path history query must use its path index: {source_plan:?}"
-    );
-    let destination_plan = crud::explain_patch_change_index_path_query(
-        &database,
-        "qualification",
-        &["a.txt".to_owned()],
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(
-        destination_plan
-            .iter()
-            .any(|detail| detail.contains("idx_patch_change_index_thread_destination_order")),
-        "destination-path history query must use its path index: {destination_plan:?}"
-    );
-
-    let stored_shapes = crud::list_applied_patch_records_for_turn(
-        &database,
-        "qualification",
-        "turn",
-        None,
-        CONFIGURED_MAX_RECORD_FIXTURE as u64,
-    )
-    .await
-    .unwrap();
-    assert!(
-        stored_shapes
-            .iter()
-            .all(|row| !row.changes_json.contains("alpha\\n")
-                && !row.changes_json.contains("beta\\n"))
-    );
-
-    println!(
-        "{}",
-        json!({
-            "gate": "patch_history_storage_query",
-            "records": CONFIGURED_MAX_RECORD_FIXTURE,
-            "append": {
-                "total_ms": milliseconds(append_total),
-                "p50_ms": milliseconds(append_p50),
-                "p95_ms": milliseconds(append_p95),
-                "p99_ms": milliseconds(append_p99),
-            },
-            "replay_ms": milliseconds(replay_elapsed),
-            "query_ms": milliseconds(query_elapsed),
-            "query_plan": {
-                "source": source_plan,
-                "destination": destination_plan,
-            },
-            "snapshot": {
-                "blobs": snapshot_metrics.blobs,
-                "references": snapshot_metrics.references,
-                "logical_bytes": snapshot_metrics.logical_bytes,
-                "referenced_logical_bytes": snapshot_metrics.referenced_logical_bytes,
-                "physical_bytes": snapshot_metrics.physical_bytes,
-            },
-            "projection_rows": projection_rows,
-        })
-    );
 }
 
 fn add_patch(operations: usize) -> String {

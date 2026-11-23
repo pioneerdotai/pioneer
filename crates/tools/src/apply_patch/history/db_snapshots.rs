@@ -7,7 +7,7 @@ use crate::apply_patch::history::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::patch_history as crud;
-use pioneer_sqlite::SqliteDatabase;
+use pioneer_postgres_pools::PostgresDatabase;
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use sha2::Digest;
 const RECONCILIATION_PAGE_SIZE: u64 = 32;
@@ -25,8 +25,8 @@ pub struct SnapshotReconciliationReport {
 }
 
 #[derive(Clone)]
-pub struct SqliteSnapshotStore {
-    db: SqliteDatabase,
+pub struct PostgresSnapshotStore {
+    db: PostgresDatabase,
     limits: SnapshotStoreLimits,
 }
 
@@ -39,15 +39,15 @@ pub(crate) struct PreparedSnapshot {
     compressed_bytes: Vec<u8>,
 }
 
-impl SqliteSnapshotStore {
-    pub fn new(db: impl Into<SqliteDatabase>) -> Self {
+impl PostgresSnapshotStore {
+    pub fn new(db: impl Into<PostgresDatabase>) -> Self {
         Self {
             db: db.into(),
             limits: SnapshotStoreLimits::default(),
         }
     }
 
-    pub fn with_limits(db: impl Into<SqliteDatabase>, limits: SnapshotStoreLimits) -> Self {
+    pub fn with_limits(db: impl Into<PostgresDatabase>, limits: SnapshotStoreLimits) -> Self {
         Self {
             db: db.into(),
             limits,
@@ -111,7 +111,7 @@ impl SqliteSnapshotStore {
                 domain_id: domain_id.to_owned(),
                 snapshot: TextSnapshotRef::from_snapshot(snapshot),
             },
-            byte_len_sql: sqlite_i64(byte_len, "snapshot byte length")?,
+            byte_len_sql: postgres_i64(byte_len, "snapshot byte length")?,
             encoding_json: serde_json::to_string(&snapshot.encoding)?,
             line_endings_json: serde_json::to_string(&snapshot.line_endings)?,
             compressed_bytes,
@@ -297,8 +297,8 @@ impl SqliteSnapshotStore {
             identity.thread_id.clone(),
             identity.turn_id.clone(),
             identity.invocation_id.clone(),
-            sqlite_i64(logical_bytes, "logical reservation")?,
-            sqlite_i64(physical_bytes, "physical reservation")?,
+            postgres_i64(logical_bytes, "logical reservation")?,
+            postgres_i64(physical_bytes, "physical reservation")?,
         )
         .await
         .context("insert patch snapshot admission")?;
@@ -382,20 +382,23 @@ impl SqliteSnapshotStore {
         })
     }
 
-    /// Reconcile ref counts from the immutable record log. This is a bounded
-    /// startup repair for blobs left by older writers or an interrupted
-    /// pre-transaction promotion; it never invents bytes for a missing blob.
-    ///
-    /// Every scan and mutation is cursor-paginated. Expected counts live in a
-    /// connection-local TEMP table, while record decoding runs before a short
-    /// writer transaction. A crash can leave only a partially repaired count;
-    /// the next startup rebuilds the scratch table and deterministically
-    /// completes the remaining idempotent repairs.
+    /// Reconcile reference counts from the immutable log. The scan owns its
+    /// persisted counts, even when its bounded transactions use different pool
+    /// connections. Decode each record before reserving writer capacity.
     pub async fn reconcile_references(&self) -> Result<SnapshotReconciliationReport> {
-        crud::prepare_expected_patch_snapshot_references(&self.db)
-            .await
-            .context("prepare snapshot reference repair scratch state")?;
+        let scan = crud::begin_patch_snapshot_scan(&self.db).await?;
+        let result = self.reconcile_snapshot_scan(&scan).await;
+        let cleanup = crud::finish_patch_snapshot_scan(&self.db, &scan).await;
+        match (result, cleanup) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("clear failed snapshot scan: {cleanup:#}")))
+            }
+        }
+    }
 
+    async fn reconcile_snapshot_scan(&self, scan: &str) -> Result<SnapshotReconciliationReport> {
         let mut reservation_cursor = None;
         loop {
             let reservations = crud::list_patch_snapshot_reservations(
@@ -459,6 +462,7 @@ impl SqliteSnapshotStore {
             if rows.is_empty() {
                 break;
             }
+            crud::touch_patch_snapshot_scan(&self.db, scan).await?;
             for row in rows {
                 last_id = row.id;
                 if row.changes_json.len() > MAX_RECORD_JSON_BYTES {
@@ -494,7 +498,7 @@ impl SqliteSnapshotStore {
                     .map(|snapshot| {
                         Ok((
                             snapshot.content_hash,
-                            sqlite_i64(snapshot.byte_len, "snapshot byte length")?,
+                            postgres_i64(snapshot.byte_len, "snapshot byte length")?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -510,6 +514,7 @@ impl SqliteSnapshotStore {
                     for (content_hash, byte_len) in reference_batch {
                         crud::increment_expected_patch_snapshot_reference(
                             &transaction,
+                            scan,
                             &domain_id,
                             content_hash,
                             *byte_len,
@@ -537,8 +542,10 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin expected snapshot validation batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             let expected = crud::list_expected_patch_snapshot_references(
                 &transaction,
+                scan,
                 expected_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -593,8 +600,10 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin snapshot reference repair batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             let expected = crud::list_expected_patch_snapshot_references(
                 &transaction,
+                scan,
                 expected_cursor.as_ref(),
                 RECONCILIATION_PAGE_SIZE,
             )
@@ -666,9 +675,11 @@ impl SqliteSnapshotStore {
                 .begin()
                 .await
                 .context("begin orphan snapshot collection batch")?;
+            crud::touch_patch_snapshot_scan(&transaction, scan).await?;
             for snapshot in &snapshots {
                 if !crud::expected_patch_snapshot_reference_exists(
                     &transaction,
+                    scan,
                     &snapshot.domain_id,
                     &snapshot.content_hash,
                     snapshot.byte_len,
@@ -708,9 +719,6 @@ impl SqliteSnapshotStore {
                 break;
             }
         }
-        crud::drop_expected_patch_snapshot_references(&self.db)
-            .await
-            .context("drop snapshot reference repair scratch state")?;
         Ok(SnapshotReconciliationReport {
             repaired_references,
             collected_blobs,
@@ -743,7 +751,7 @@ impl SqliteSnapshotStore {
         }
     }
 
-    /// Intern one snapshot while the caller owns the surrounding SQLite
+    /// Intern one snapshot while the caller owns the surrounding PostgreSQL
     /// transaction. `add_reference` is true for a newly inserted history
     /// record and false when repairing a pre-existing record's missing or
     /// corrupt blob. Keeping blob admission and record insertion in one
@@ -901,7 +909,7 @@ impl SqliteSnapshotStore {
             &self.db,
             &reference.domain_id,
             &reference.snapshot.content_hash,
-            sqlite_i64(reference.snapshot.byte_len, "snapshot byte length")?,
+            postgres_i64(reference.snapshot.byte_len, "snapshot byte length")?,
             self.limits.max_physical_bytes,
         )
         .await
@@ -961,7 +969,7 @@ impl SqliteSnapshotStore {
         {
             bail!("snapshot reference exceeds the configured byte limit");
         }
-        let byte_len = sqlite_i64(reference.snapshot.byte_len, "snapshot byte length")?;
+        let byte_len = postgres_i64(reference.snapshot.byte_len, "snapshot byte length")?;
         let encoding_json = serde_json::to_string(&reference.snapshot.encoding)?;
         let line_endings_json = serde_json::to_string(&reference.snapshot.line_endings)?;
         let transaction = self.db.begin().await.context("begin snapshot release")?;
@@ -1081,7 +1089,7 @@ async fn load_snapshot_bounded<C: ConnectionTrait>(
         domain_id,
         content_hash,
         byte_len,
-        sqlite_i64(max_physical_bytes, "snapshot physical-byte limit")?,
+        postgres_i64(max_physical_bytes, "snapshot physical-byte limit")?,
         MAX_SNAPSHOT_METADATA_BYTES as i64,
     )
     .await?
@@ -1097,8 +1105,8 @@ async fn load_snapshot_bounded<C: ConnectionTrait>(
     Ok(Some(row))
 }
 
-fn sqlite_i64(value: u64, label: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds SQLite integer range"))
+fn postgres_i64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{label} exceeds PostgreSQL integer range"))
 }
 
 fn decode_nonnegative_i64(value: i64, label: &str) -> Result<u64> {

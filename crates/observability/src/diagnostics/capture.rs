@@ -762,7 +762,7 @@ fn capture_inventory(path: &Path, sql_cpu: bool) -> Result<Vec<ArtifactFile>> {
         storage::inventory(path)
     }
 }
-// The diagnostic owner performs serialization/checksums, never a SQLite worker.
+// The diagnostic owner performs serialization and checksums outside database operations.
 fn store_sql_cpu(
     path: &Path,
     target: &TargetSnapshot,
@@ -818,7 +818,7 @@ fn store_sql_cpu(
         "limitations": snapshot.limitations,
         "started_monotonic_ms": snapshot.started_monotonic_ms,
         "ended_monotonic_ms": snapshot.ended_monotonic_ms,
-        "scope": "Observed SQLx command CPU only; aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
+        "scope": "Observed client-side CPU in Gateway PostgreSQL query scopes. Aggregation completeness is independent of unknown identities, measurement gaps and native profile status. measured_unknown overlaps groups/residual; never add it to accounted.",
     });
     match stored {
         Ok((files, bytes)) => {
@@ -942,7 +942,7 @@ impl SqlCpuCapture {
         } else {
             slice
         };
-        // No collector mutex, SQL scope or SQLite capacity is held while waiting.
+        // No collector mutex, SQL scope or PostgreSQL capacity is held while waiting.
         std::thread::sleep(remaining);
     }
     fn wait(&mut self, epoch: u64, pid: u32, start: &str, stop: &AtomicBool, cancel: &AtomicBool) {

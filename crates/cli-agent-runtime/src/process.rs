@@ -747,6 +747,9 @@ fn inherited_sensitive_environment_names() -> Vec<String> {
 
 fn inherited_environment_name_is_sensitive(key: &str) -> bool {
     let normalized = key.to_ascii_uppercase();
+    if normalized == "DATABASE_URL" {
+        return true;
+    }
     [
         "TOKEN",
         "SECRET",
@@ -827,6 +830,7 @@ mod tests {
             "OPENAI_API_TOKEN",
             "SERVICE_SECRET",
             "DATABASE_PASSWORD",
+            "DATABASE_URL",
             "AWS_ACCESS_KEY_ID",
             "PIONEER_CLI_MCP_GRANT",
         ] {

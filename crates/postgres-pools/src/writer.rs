@@ -1,0 +1,2079 @@
+use crate::query_scope::{
+    DiagnosticStream, PoolFutureExt, ScopedFuture, observe_control, open_stream,
+};
+use async_trait::async_trait;
+use futures_util::Stream;
+use pioneer_observability::query_cpu::{self, QueryScope};
+use sea_orm::{
+    AccessMode, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
+    ExecResult, IsolationLevel, QueryResult, QueryStream, RuntimeErr, Statement, StreamTrait,
+    TransactionError, TransactionOptions, TransactionSession, TransactionStream, TransactionTrait,
+};
+use sea_orm_migration::MigratorTrait;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::ops::Deref;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+use crate::reader::{PostgresMaintenanceReadPermit, PostgresReadOperation, PostgresReadOutcome};
+
+pub const DEFAULT_MAX_CRITICAL_BURST: usize = 8;
+pub const DEFAULT_MAX_NON_MAINTENANCE_BURST: usize = 16;
+pub const DEFAULT_MAX_MAINTENANCE_WAIT_MS: u64 = 2_000;
+
+/// Scheduling class for every operation which can mutate the Gateway PostgreSQL
+/// database. The class is carried by a scoped database handle; callers never
+/// acquire scheduler permits themselves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PostgresWriteClass {
+    Critical,
+    #[default]
+    Interactive,
+    Maintenance,
+}
+
+impl PostgresWriteClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::Interactive => "interactive",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+fn writer_pool_context(
+    class: PostgresWriteClass,
+) -> pioneer_observability::pool_context::PoolContext {
+    use pioneer_observability::pool_context::PoolContext;
+    match class {
+        PostgresWriteClass::Critical => PoolContext::WriterCritical,
+        PostgresWriteClass::Interactive => PoolContext::WriterInteractive,
+        PostgresWriteClass::Maintenance => PoolContext::WriterMaintenance,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostgresWriteGrantReason {
+    Uncontended,
+    OnlyClass,
+    Priority,
+    InteractiveFairness,
+    MaintenanceFairness,
+}
+
+impl PostgresWriteGrantReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uncontended => "uncontended",
+            Self::OnlyClass => "only_class",
+            Self::Priority => "priority",
+            Self::InteractiveFairness => "interactive_fairness",
+            Self::MaintenanceFairness => "maintenance_fairness",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PostgresWriteQueueSnapshot {
+    pub critical: usize,
+    pub interactive: usize,
+    pub maintenance: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PostgresWriteEvent {
+    Enqueued {
+        class: PostgresWriteClass,
+        queue: PostgresWriteQueueSnapshot,
+    },
+    Acquired {
+        class: PostgresWriteClass,
+        reason: PostgresWriteGrantReason,
+        waited: Duration,
+        queue: PostgresWriteQueueSnapshot,
+    },
+    Released {
+        class: PostgresWriteClass,
+        held: Duration,
+        queue: PostgresWriteQueueSnapshot,
+    },
+    Cancelled {
+        class: PostgresWriteClass,
+        waited: Duration,
+        queue: PostgresWriteQueueSnapshot,
+    },
+}
+
+pub trait PostgresWriteObserver: Send + Sync + 'static {
+    fn observe(&self, event: PostgresWriteEvent);
+
+    /// Atomic observation adapter. Called after the native state lock is released.
+    fn observe_admission(
+        &self,
+        event: PostgresWriteEvent,
+        snapshot: crate::PostgresAdmissionSnapshot,
+    ) {
+        self.observe(event);
+        self.observe_queue_snapshot(snapshot);
+    }
+
+    /// Pure current owner snapshot after mutation, including the oldest of
+    /// the three FIFO class heads. No queue scan or readiness query.
+    fn observe_queue_snapshot(&self, _snapshot: crate::PostgresAdmissionSnapshot) {}
+
+    /// Test-only pause after `execute_raw` owns its writer permit. The Gateway
+    /// enables this feature only for tests; normal builds omit the hook.
+    #[cfg(feature = "test-support")]
+    fn pause_execute_raw_after_acquire_for_test(
+        &self,
+        _class: PostgresWriteClass,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct NoopPostgresWriteObserver;
+
+impl PostgresWriteObserver for NoopPostgresWriteObserver {
+    fn observe(&self, _event: PostgresWriteEvent) {}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostgresWritePolicy {
+    pub max_critical_burst: usize,
+    pub max_non_maintenance_burst: usize,
+    pub max_maintenance_wait: Duration,
+}
+
+impl Default for PostgresWritePolicy {
+    fn default() -> Self {
+        Self {
+            max_critical_burst: DEFAULT_MAX_CRITICAL_BURST,
+            max_non_maintenance_burst: DEFAULT_MAX_NON_MAINTENANCE_BURST,
+            max_maintenance_wait: Duration::from_millis(DEFAULT_MAX_MAINTENANCE_WAIT_MS),
+        }
+    }
+}
+
+struct Waiter {
+    id: u64,
+    enqueued_at: Instant,
+    sender: oneshot::Sender<Reservation>,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    observation_revision: u64,
+    active: usize,
+    active_maintenance: usize,
+    critical: VecDeque<Waiter>,
+    interactive: VecDeque<Waiter>,
+    maintenance: VecDeque<Waiter>,
+    consecutive_critical: usize,
+    consecutive_non_maintenance: usize,
+}
+
+impl AdmissionState {
+    fn snapshot(&self) -> PostgresWriteQueueSnapshot {
+        PostgresWriteQueueSnapshot {
+            critical: self.critical.len(),
+            interactive: self.interactive.len(),
+            maintenance: self.maintenance.len(),
+        }
+    }
+
+    fn queue_mut(&mut self, class: PostgresWriteClass) -> &mut VecDeque<Waiter> {
+        match class {
+            PostgresWriteClass::Critical => &mut self.critical,
+            PostgresWriteClass::Interactive => &mut self.interactive,
+            PostgresWriteClass::Maintenance => &mut self.maintenance,
+        }
+    }
+}
+
+struct AdmissionInner {
+    state: Mutex<AdmissionState>,
+    next_waiter_id: AtomicU64,
+    capacity: usize,
+    policy: PostgresWritePolicy,
+    observer: Arc<dyn PostgresWriteObserver>,
+}
+
+struct Dispatch {
+    sender: oneshot::Sender<Reservation>,
+    reservation: Reservation,
+}
+
+struct Reservation {
+    inner: Arc<AdmissionInner>,
+    class: PostgresWriteClass,
+    reason: PostgresWriteGrantReason,
+    enqueued_at: Instant,
+    acquired_at: Instant,
+    queue: PostgresWriteQueueSnapshot,
+    started: bool,
+}
+
+impl Reservation {
+    fn start(&mut self) {
+        self.started = true;
+        let snapshot = self.inner.queue_observation();
+        self.inner.observer.observe_admission(
+            PostgresWriteEvent::Acquired {
+                class: self.class,
+                reason: self.reason,
+                waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
+                queue: self.queue,
+            },
+            snapshot,
+        );
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        let (queue, snapshot, dispatch) = self.inner.release(self.class);
+        if self.started {
+            self.inner.observer.observe_admission(
+                PostgresWriteEvent::Released {
+                    class: self.class,
+                    held,
+                    queue,
+                },
+                snapshot,
+            );
+        } else {
+            // The waiter can be cancelled after the scheduler has selected it
+            // but before the receiving future constructs its permit. That
+            // race still has to close the observer lifecycle; otherwise an
+            // `Enqueued` event would have neither `Acquired` nor `Cancelled`.
+            self.inner.observer.observe_admission(
+                PostgresWriteEvent::Cancelled {
+                    class: self.class,
+                    waited: self.acquired_at.saturating_duration_since(self.enqueued_at),
+                    queue,
+                },
+                snapshot,
+            );
+        }
+        AdmissionInner::dispatch(dispatch);
+    }
+}
+
+struct WaitRegistration {
+    inner: Arc<AdmissionInner>,
+    id: u64,
+    class: PostgresWriteClass,
+    enqueued_at: Instant,
+    armed: bool,
+}
+
+impl WaitRegistration {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some((queue, snapshot, dispatch)) = self.inner.cancel(self.id, self.class) else {
+            return;
+        };
+        self.inner.observer.observe_admission(
+            PostgresWriteEvent::Cancelled {
+                class: self.class,
+                waited: self.enqueued_at.elapsed(),
+                queue,
+            },
+            snapshot,
+        );
+        AdmissionInner::dispatch(dispatch);
+    }
+}
+
+#[derive(Clone)]
+struct PostgresWritePermit {
+    // The reservation is released only after the final owner disappears.
+    // Nested transactions clone this lease so dropping the root wrapper
+    // cannot expose the physical writer while a savepoint is still alive.
+    _reservation: Arc<Reservation>,
+}
+
+impl PostgresWritePermit {
+    fn new(mut reservation: Reservation) -> Self {
+        reservation.start();
+        Self {
+            _reservation: Arc::new(reservation),
+        }
+    }
+
+    fn class(&self) -> PostgresWriteClass {
+        self._reservation.class
+    }
+}
+
+impl AdmissionInner {
+    fn queue_observation(&self) -> crate::PostgresAdmissionSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::queue_observation_locked(&mut state)
+    }
+
+    fn queue_observation_locked(state: &mut AdmissionState) -> crate::PostgresAdmissionSnapshot {
+        state.observation_revision = state.observation_revision.saturating_add(1);
+        let oldest = [
+            state.critical.front(),
+            state.interactive.front(),
+            state.maintenance.front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|waiter| waiter.enqueued_at)
+        .min();
+        let queue = state.snapshot();
+        crate::PostgresAdmissionSnapshot::capture(
+            state.observation_revision,
+            queue
+                .critical
+                .saturating_add(queue.interactive)
+                .saturating_add(queue.maintenance),
+            oldest,
+        )
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        class: PostgresWriteClass,
+    ) -> (oneshot::Receiver<Reservation>, WaitRegistration) {
+        let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+        let enqueued_at = Instant::now();
+        let (sender, receiver) = oneshot::channel();
+        let waiter = Waiter {
+            id,
+            enqueued_at,
+            sender,
+        };
+        let (queue, snapshot, dispatch) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.queue_mut(class).push_back(waiter);
+            let queue = state.snapshot();
+            let dispatch = self.grant_next_locked(&mut state, true);
+            let snapshot = Self::queue_observation_locked(&mut state);
+            (queue, snapshot, dispatch)
+        };
+        self.observer
+            .observe_admission(PostgresWriteEvent::Enqueued { class, queue }, snapshot);
+        Self::dispatch(dispatch);
+        (
+            receiver,
+            WaitRegistration {
+                inner: self.clone(),
+                id,
+                class,
+                enqueued_at,
+                armed: true,
+            },
+        )
+    }
+
+    fn cancel(
+        self: &Arc<Self>,
+        id: u64,
+        class: PostgresWriteClass,
+    ) -> Option<(
+        PostgresWriteQueueSnapshot,
+        crate::PostgresAdmissionSnapshot,
+        Option<Dispatch>,
+    )> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let position = state
+            .queue_mut(class)
+            .iter()
+            .position(|waiter| waiter.id == id)?;
+        state.queue_mut(class).remove(position);
+        let snapshot = state.snapshot();
+        let dispatch = self.grant_next_locked(&mut state, false);
+        let current = Self::queue_observation_locked(&mut state);
+        Some((snapshot, current, dispatch))
+    }
+
+    fn release(
+        self: &Arc<Self>,
+        class: PostgresWriteClass,
+    ) -> (
+        PostgresWriteQueueSnapshot,
+        crate::PostgresAdmissionSnapshot,
+        Option<Dispatch>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(
+            state.active > 0,
+            "database writer released without an owner"
+        );
+        state.active -= 1;
+        if class == PostgresWriteClass::Maintenance {
+            state.active_maintenance -= 1;
+        }
+        let queue = state.snapshot();
+        let dispatch = self.grant_next_locked(&mut state, false);
+        let current = Self::queue_observation_locked(&mut state);
+        (queue, current, dispatch)
+    }
+
+    fn grant_next_locked(
+        self: &Arc<Self>,
+        state: &mut AdmissionState,
+        newly_uncontended: bool,
+    ) -> Option<Dispatch> {
+        if state.active >= self.capacity {
+            return None;
+        }
+        let now = Instant::now();
+        let critical = !state.critical.is_empty();
+        let interactive = !state.interactive.is_empty();
+        let maintenance = !state.maintenance.is_empty() && state.active_maintenance == 0;
+        let class_count =
+            usize::from(critical) + usize::from(interactive) + usize::from(maintenance);
+
+        let maintenance_aged = state
+            .maintenance
+            .front()
+            .is_some_and(|waiter| waiter.enqueued_at.elapsed() >= self.policy.max_maintenance_wait);
+        let maintenance_due = maintenance
+            && (maintenance_aged
+                || state.consecutive_non_maintenance
+                    >= self.policy.max_non_maintenance_burst.max(1));
+        let interactive_due = interactive
+            && critical
+            && state.consecutive_critical >= self.policy.max_critical_burst.max(1);
+
+        let (class, reason) = if class_count == 0 {
+            return None;
+        } else if newly_uncontended && class_count == 1 {
+            debug_assert_eq!(class_count, 1);
+            let class = if critical {
+                PostgresWriteClass::Critical
+            } else if interactive {
+                PostgresWriteClass::Interactive
+            } else {
+                PostgresWriteClass::Maintenance
+            };
+            (class, PostgresWriteGrantReason::Uncontended)
+        } else if class_count == 1 {
+            let class = if critical {
+                PostgresWriteClass::Critical
+            } else if interactive {
+                PostgresWriteClass::Interactive
+            } else {
+                PostgresWriteClass::Maintenance
+            };
+            (class, PostgresWriteGrantReason::OnlyClass)
+        } else if maintenance_due {
+            (
+                PostgresWriteClass::Maintenance,
+                PostgresWriteGrantReason::MaintenanceFairness,
+            )
+        } else if interactive_due {
+            (
+                PostgresWriteClass::Interactive,
+                PostgresWriteGrantReason::InteractiveFairness,
+            )
+        } else if critical {
+            (
+                PostgresWriteClass::Critical,
+                PostgresWriteGrantReason::Priority,
+            )
+        } else if interactive {
+            (
+                PostgresWriteClass::Interactive,
+                PostgresWriteGrantReason::Priority,
+            )
+        } else {
+            (
+                PostgresWriteClass::Maintenance,
+                PostgresWriteGrantReason::Priority,
+            )
+        };
+
+        match reason {
+            PostgresWriteGrantReason::Uncontended | PostgresWriteGrantReason::OnlyClass => {
+                // Fairness debt is meaningful only while classes contend.
+                // Work which ran alone must not make a future waiter jump the
+                // queue based on activity which predated that waiter.
+                state.consecutive_critical = 0;
+                state.consecutive_non_maintenance = 0;
+            }
+            PostgresWriteGrantReason::Priority
+            | PostgresWriteGrantReason::InteractiveFairness
+            | PostgresWriteGrantReason::MaintenanceFairness => match class {
+                PostgresWriteClass::Critical => {
+                    state.consecutive_critical = state.consecutive_critical.saturating_add(1);
+                    state.consecutive_non_maintenance =
+                        state.consecutive_non_maintenance.saturating_add(1);
+                }
+                PostgresWriteClass::Interactive => {
+                    state.consecutive_critical = 0;
+                    state.consecutive_non_maintenance =
+                        state.consecutive_non_maintenance.saturating_add(1);
+                }
+                PostgresWriteClass::Maintenance => {
+                    state.consecutive_critical = 0;
+                    state.consecutive_non_maintenance = 0;
+                }
+            },
+        }
+
+        let waiter = state
+            .queue_mut(class)
+            .pop_front()
+            .expect("selected PostgreSQL writer queue must contain a waiter");
+        state.active += 1;
+        if class == PostgresWriteClass::Maintenance {
+            state.active_maintenance += 1;
+        }
+        let queue = state.snapshot();
+        Some(Dispatch {
+            sender: waiter.sender,
+            reservation: Reservation {
+                inner: self.clone(),
+                class,
+                reason,
+                enqueued_at: waiter.enqueued_at,
+                acquired_at: now,
+                queue,
+                started: false,
+            },
+        })
+    }
+
+    fn dispatch(dispatch: Option<Dispatch>) {
+        let Some(dispatch) = dispatch else {
+            return;
+        };
+        if let Err(reservation) = dispatch.sender.send(dispatch.reservation) {
+            drop(reservation);
+        }
+    }
+}
+
+/// Write pool and its scheduling queue. A write cannot reach the pool without
+/// a classed reservation.
+#[derive(Clone)]
+pub struct PostgresWriteExecutor {
+    connection: DatabaseConnection,
+    admission: Arc<AdmissionInner>,
+    work_signals: Arc<Mutex<std::collections::BTreeMap<&'static str, crate::WorkSignal>>>,
+    settlement: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl std::fmt::Debug for PostgresWriteExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PostgresWriteExecutor")
+    }
+}
+
+impl PostgresWriteExecutor {
+    pub(crate) fn runtime_identity(&self) -> usize {
+        Arc::as_ptr(&self.admission) as usize
+    }
+
+    pub fn new(connection: DatabaseConnection) -> Self {
+        Self::with_policy_and_observer(
+            connection,
+            PostgresWritePolicy::default(),
+            Arc::new(NoopPostgresWriteObserver),
+        )
+    }
+
+    pub fn with_observer(
+        connection: DatabaseConnection,
+        observer: Arc<dyn PostgresWriteObserver>,
+    ) -> Self {
+        Self::with_policy_and_observer(connection, PostgresWritePolicy::default(), observer)
+    }
+
+    pub fn with_policy_and_observer(
+        connection: DatabaseConnection,
+        policy: PostgresWritePolicy,
+        observer: Arc<dyn PostgresWriteObserver>,
+    ) -> Self {
+        let capacity = match connection.get_database_backend() {
+            DbBackend::Postgres if !connection.is_mock_connection() => connection
+                .get_postgres_connection_pool()
+                .options()
+                .get_max_connections()
+                as usize,
+            _ => 1,
+        };
+        Self {
+            connection,
+            work_signals: Default::default(),
+            settlement: Default::default(),
+            admission: Arc::new(AdmissionInner {
+                state: Mutex::new(AdmissionState::default()),
+                next_waiter_id: AtomicU64::new(1),
+                capacity,
+                policy,
+                observer,
+            }),
+        }
+    }
+
+    pub(crate) fn connection(&self, class: PostgresWriteClass) -> PostgresWriteConnection {
+        PostgresWriteConnection {
+            executor: self.clone(),
+            class,
+        }
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        self.connection
+            .get_postgres_connection_pool()
+            .options()
+            .get_max_connections()
+    }
+
+    pub(crate) fn work_signal(&self, domain: &'static str) -> crate::WorkSignal {
+        self.work_signals
+            .lock()
+            .unwrap()
+            .entry(domain)
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) async fn settle_dispatched_writes(
+        &self,
+        class: PostgresWriteClass,
+    ) -> Result<(), DbErr> {
+        let backend = self.connection.get_database_backend();
+        if backend != DbBackend::Postgres || self.connection.is_mock_connection() {
+            self.connection(class)
+                .query_one_raw(Statement::from_string(backend, "SELECT 1"))
+                .await?;
+            return Ok(());
+        }
+
+        // SQLx flushes outstanding protocol responses before returning a
+        // connection to the pool. Reserve each slot after an unknown outcome
+        // so discovery cannot run before another session's pending COMMIT
+        // or rollback. Normal writes never take the settlement lock.
+        let _settlement = self.settlement.lock().await;
+        let permit = self.acquire(class).await;
+        let pool = self.connection.get_postgres_connection_pool();
+        let capacity = pool.options().get_max_connections();
+        observe_control(
+            async {
+                let mut sessions = Vec::with_capacity(capacity as usize);
+                for _ in 0..capacity {
+                    sessions.push(
+                        pool.acquire()
+                            .await
+                            .map_err(|error| DbErr::Conn(RuntimeErr::SqlxError(error.into())))?,
+                    );
+                }
+                Ok(())
+            },
+            "settle",
+        )
+        .in_pool(writer_pool_context(permit.class()))
+        .await
+    }
+
+    pub async fn close(self) -> Result<(), DbErr> {
+        self.connection.close().await
+    }
+
+    /// Validates the physical writer connection under the same typed
+    /// reservation and pool-attribution contract as every other operation.
+    pub async fn ping(&self, class: PostgresWriteClass) -> Result<(), DbErr> {
+        let permit = self.acquire(class).await;
+        observe_control(self.connection.ping(), "ping")
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    /// Applies one SeaORM migrator while the physical writer is exclusively
+    /// reserved. Keeping the generic migration entry point here prevents a
+    /// bootstrap callback from cloning and leaking the raw connection.
+    pub async fn run_migrations<M>(
+        &self,
+        class: PostgresWriteClass,
+        steps: Option<u32>,
+    ) -> Result<(), DbErr>
+    where
+        M: MigratorTrait,
+    {
+        let permit = self.acquire(class).await;
+        observe_control(M::up(&self.connection, steps), "bootstrap")
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    async fn acquire(&self, class: PostgresWriteClass) -> PostgresWritePermit {
+        let _startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbAdmission,
+        );
+        let (receiver, mut registration) = self.admission.enqueue(class);
+        let reservation = receiver
+            .await
+            .expect("PostgreSQL writer executor must outlive its queued reservations");
+        registration.disarm();
+        PostgresWritePermit::new(reservation)
+    }
+}
+
+/// A class-scoped view of the writer executor. It exposes SeaORM traits but
+/// never the underlying physical connection.
+#[derive(Clone, Debug)]
+pub(crate) struct PostgresWriteConnection {
+    executor: PostgresWriteExecutor,
+    class: PostgresWriteClass,
+}
+
+#[async_trait]
+impl ConnectionTrait for PostgresWriteConnection {
+    fn get_database_backend(&self) -> DbBackend {
+        self.executor.connection.get_database_backend()
+    }
+
+    async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        #[cfg(feature = "test-support")]
+        if let Some(pause) = self
+            .executor
+            .admission
+            .observer
+            .pause_execute_raw_after_acquire_for_test(self.class)
+        {
+            pause.await;
+        }
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        query_cpu::observe(self.executor.connection.execute_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        query_cpu::observe(self.executor.connection.execute_unprepared(sql))
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        query_cpu::observe(self.executor.connection.query_one_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        query_cpu::observe(self.executor.connection.query_all_raw(statement))
+            .in_pool(writer_pool_context(permit.class()))
+            .await
+    }
+
+    fn support_returning(&self) -> bool {
+        self.executor.connection.support_returning()
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        self.executor.connection.is_mock_connection()
+    }
+}
+
+/// Stream wrapper which retains either the writer reservation or the
+/// maintenance-read permit until the returned rows have been consumed or the
+/// stream is dropped.
+pub struct PostgresQueryStream {
+    inner: DiagnosticStream<QueryStream>,
+    writer_permit: Option<PostgresWritePermit>,
+    maintenance_read_permit: Option<PostgresMaintenanceReadPermit>,
+    read_operation: Option<PostgresReadOperation>,
+}
+
+impl PostgresQueryStream {
+    pub(crate) fn read(
+        inner: DiagnosticStream<QueryStream>,
+        permit: Option<PostgresMaintenanceReadPermit>,
+        operation: PostgresReadOperation,
+    ) -> Self {
+        Self {
+            inner,
+            writer_permit: None,
+            maintenance_read_permit: permit,
+            read_operation: Some(operation),
+        }
+    }
+
+    fn write(inner: DiagnosticStream<QueryStream>, permit: PostgresWritePermit) -> Self {
+        Self {
+            inner,
+            writer_permit: Some(permit),
+            maintenance_read_permit: None,
+            read_operation: None,
+        }
+    }
+}
+
+impl Stream for PostgresQueryStream {
+    type Item = Result<QueryResult, DbErr>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = Pin::new(&mut self.inner).poll_next(context);
+        match &result {
+            Poll::Ready(None) => {
+                if let Some(operation) = self.read_operation.as_mut() {
+                    operation.finish(PostgresReadOutcome::Ok);
+                }
+                self.read_operation.take();
+                self.writer_permit.take();
+                self.maintenance_read_permit.take();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                if let Some(operation) = self.read_operation.as_mut() {
+                    operation.finish(PostgresReadOutcome::Error);
+                }
+                self.read_operation.take();
+            }
+            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+        }
+        result
+    }
+}
+
+impl StreamTrait for PostgresWriteConnection {
+    type Stream<'a> = PostgresQueryStream;
+
+    fn get_database_backend(&self) -> DbBackend {
+        self.executor.connection.get_database_backend()
+    }
+
+    fn stream_raw<'a>(
+        &'a self,
+        statement: Statement,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
+        Box::pin(async move {
+            let permit = self.executor.acquire(self.class).await;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
+            let effective_class = permit.class();
+            let stream = open_stream(self.executor.connection.stream_raw(statement))
+                .in_pool(writer_pool_context(effective_class))
+                .await?;
+            Ok(PostgresQueryStream::write(stream, permit))
+        })
+    }
+}
+
+/// Transaction returned by the writer executor. The reservation is released
+/// only after the SeaORM transaction commits, rolls back, or is dropped.
+pub struct PostgresTransaction {
+    inner: Option<DatabaseTransaction>,
+    _permit: Option<PostgresWritePermit>,
+}
+
+impl std::fmt::Debug for PostgresTransaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PostgresTransaction")
+    }
+}
+
+impl PostgresTransaction {
+    fn root(inner: DatabaseTransaction, permit: PostgresWritePermit) -> Self {
+        Self {
+            inner: Some(inner),
+            _permit: Some(permit),
+        }
+    }
+
+    fn nested(inner: DatabaseTransaction, permit: PostgresWritePermit) -> Self {
+        Self {
+            inner: Some(inner),
+            _permit: Some(permit),
+        }
+    }
+
+    fn inner(&self) -> &DatabaseTransaction {
+        self.inner
+            .as_ref()
+            .expect("PostgreSQL transaction was already completed")
+    }
+
+    fn pool_context(&self) -> pioneer_observability::pool_context::PoolContext {
+        writer_pool_context(
+            self._permit
+                .as_ref()
+                .expect("PostgreSQL transaction must retain a writer permit")
+                .class(),
+        )
+    }
+
+    pub async fn commit(mut self) -> Result<(), DbErr> {
+        let _startup_commit = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbCommit,
+        );
+        observe_control(
+            self.inner
+                .take()
+                .expect("PostgreSQL transaction was already completed")
+                .commit(),
+            "commit",
+        )
+        .in_pool(self.pool_context())
+        .await
+    }
+
+    pub async fn rollback(mut self) -> Result<(), DbErr> {
+        observe_control(
+            self.inner
+                .take()
+                .expect("PostgreSQL transaction was already completed")
+                .rollback(),
+            "rollback",
+        )
+        .in_pool(self.pool_context())
+        .await
+    }
+}
+
+impl Deref for PostgresTransaction {
+    type Target = DatabaseTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner()
+    }
+}
+
+// Drop-triggered rollback is its own control command, never a successful SQL query.
+impl Drop for PostgresTransaction {
+    fn drop(&mut self) {
+        if self.inner.is_some() {
+            let _pool = self.pool_context().enter();
+            let scope = QueryScope::control("rollback_drop");
+            let _entered = scope.enter();
+            drop(self.inner.take());
+        }
+    }
+}
+
+#[async_trait]
+impl TransactionSession for PostgresTransaction {
+    async fn commit(self) -> Result<(), DbErr> {
+        PostgresTransaction::commit(self).await
+    }
+
+    async fn rollback(self) -> Result<(), DbErr> {
+        PostgresTransaction::rollback(self).await
+    }
+}
+
+#[async_trait]
+impl ConnectionTrait for PostgresTransaction {
+    fn get_database_backend(&self) -> DbBackend {
+        ConnectionTrait::get_database_backend(self.inner())
+    }
+
+    async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
+        query_cpu::observe(self.inner().execute_raw(statement))
+            .in_pool(self.pool_context())
+            .await
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+        query_cpu::observe(self.inner().execute_unprepared(sql))
+            .in_pool(self.pool_context())
+            .await
+    }
+
+    async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
+        query_cpu::observe(self.inner().query_one_raw(statement))
+            .in_pool(self.pool_context())
+            .await
+    }
+
+    async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        query_cpu::observe(self.inner().query_all_raw(statement))
+            .in_pool(self.pool_context())
+            .await
+    }
+
+    fn support_returning(&self) -> bool {
+        self.inner().support_returning()
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        self.inner().is_mock_connection()
+    }
+}
+
+impl StreamTrait for PostgresTransaction {
+    type Stream<'a> = DiagnosticStream<TransactionStream<'a>>;
+
+    fn get_database_backend(&self) -> DbBackend {
+        StreamTrait::get_database_backend(self.inner())
+    }
+
+    fn stream_raw<'a>(
+        &'a self,
+        statement: Statement,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
+        Box::pin(async move {
+            let scope = QueryScope::new();
+            let result = ScopedFuture::new(self.inner().stream_raw(statement), &scope)
+                .in_pool(self.pool_context())
+                .await;
+            match result {
+                Ok(stream) => Ok(DiagnosticStream::new(
+                    stream,
+                    scope,
+                    Some(self.pool_context()),
+                )),
+                Err(error) => {
+                    scope.finish(false);
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+async fn finish_callback<T, E>(
+    transaction: PostgresTransaction,
+    result: Result<T, E>,
+) -> Result<T, TransactionError<E>>
+where
+    E: std::fmt::Display + std::fmt::Debug + Send,
+{
+    match result {
+        Ok(value) => {
+            transaction
+                .commit()
+                .await
+                .map_err(TransactionError::Connection)?;
+            Ok(value)
+        }
+        Err(error) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(TransactionError::Connection)?;
+            Err(TransactionError::Transaction(error))
+        }
+    }
+}
+
+#[async_trait]
+impl TransactionTrait for PostgresWriteConnection {
+    type Transaction = PostgresTransaction;
+
+    async fn begin(&self) -> Result<Self::Transaction, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        let effective_class = permit.class();
+        let transaction = observe_control(self.executor.connection.begin(), "begin")
+            .in_pool(writer_pool_context(effective_class))
+            .await?;
+        Ok(PostgresTransaction::root(transaction, permit))
+    }
+
+    async fn begin_with_config(
+        &self,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<Self::Transaction, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        let effective_class = permit.class();
+        let transaction = observe_control(
+            self.executor
+                .connection
+                .begin_with_config(isolation_level, access_mode),
+            "begin",
+        )
+        .in_pool(writer_pool_context(effective_class))
+        .await?;
+        Ok(PostgresTransaction::root(transaction, permit))
+    }
+
+    async fn begin_with_options(
+        &self,
+        options: TransactionOptions,
+    ) -> Result<Self::Transaction, DbErr> {
+        let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
+        let effective_class = permit.class();
+        let transaction = observe_control(
+            self.executor.connection.begin_with_options(options),
+            "begin",
+        )
+        .in_pool(writer_pool_context(effective_class))
+        .await?;
+        Ok(PostgresTransaction::root(transaction, permit))
+    }
+
+    async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c Self::Transaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        let transaction = self.begin().await.map_err(TransactionError::Connection)?;
+        let result = callback(&transaction).await;
+        finish_callback(transaction, result).await
+    }
+
+    async fn transaction_with_config<F, T, E>(
+        &self,
+        callback: F,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c Self::Transaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        let transaction = self
+            .begin_with_config(isolation_level, access_mode)
+            .await
+            .map_err(TransactionError::Connection)?;
+        let result = callback(&transaction).await;
+        finish_callback(transaction, result).await
+    }
+}
+
+#[async_trait]
+impl TransactionTrait for PostgresTransaction {
+    type Transaction = PostgresTransaction;
+
+    async fn begin(&self) -> Result<Self::Transaction, DbErr> {
+        Ok(PostgresTransaction::nested(
+            observe_control(self.inner().begin(), "begin")
+                .in_pool(self.pool_context())
+                .await?,
+            self._permit
+                .as_ref()
+                .expect("PostgreSQL transaction must retain a writer permit")
+                .clone(),
+        ))
+    }
+
+    async fn begin_with_config(
+        &self,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<Self::Transaction, DbErr> {
+        Ok(PostgresTransaction::nested(
+            observe_control(
+                self.inner().begin_with_config(isolation_level, access_mode),
+                "begin",
+            )
+            .in_pool(self.pool_context())
+            .await?,
+            self._permit
+                .as_ref()
+                .expect("PostgreSQL transaction must retain a writer permit")
+                .clone(),
+        ))
+    }
+
+    async fn begin_with_options(
+        &self,
+        options: TransactionOptions,
+    ) -> Result<Self::Transaction, DbErr> {
+        Ok(PostgresTransaction::nested(
+            observe_control(self.inner().begin_with_options(options), "begin")
+                .in_pool(self.pool_context())
+                .await?,
+            self._permit
+                .as_ref()
+                .expect("PostgreSQL transaction must retain a writer permit")
+                .clone(),
+        ))
+    }
+
+    async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c Self::Transaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        let transaction = self.begin().await.map_err(TransactionError::Connection)?;
+        let result = callback(&transaction).await;
+        finish_callback(transaction, result).await
+    }
+
+    async fn transaction_with_config<F, T, E>(
+        &self,
+        callback: F,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c Self::Transaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: std::fmt::Display + std::fmt::Debug + Send,
+    {
+        let transaction = self
+            .begin_with_config(isolation_level, access_mode)
+            .await
+            .map_err(TransactionError::Connection)?;
+        let result = callback(&transaction).await;
+        finish_callback(transaction, result).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio::sync::{Notify, mpsc};
+
+    fn admission(policy: PostgresWritePolicy) -> Arc<AdmissionInner> {
+        Arc::new(AdmissionInner {
+            state: Mutex::new(AdmissionState::default()),
+            next_waiter_id: AtomicU64::new(1),
+            capacity: 1,
+            policy,
+            observer: Arc::new(NoopPostgresWriteObserver),
+        })
+    }
+
+    #[test]
+    fn native_current_snapshot_carries_source_order_and_oldest_without_sql() {
+        let inner = admission(PostgresWritePolicy::default());
+        let (sender, _receiver) = oneshot::channel();
+        inner.state.lock().unwrap().maintenance.push_back(Waiter {
+            id: 1,
+            enqueued_at: Instant::now() - Duration::from_millis(90),
+            sender,
+        });
+        let old = inner.queue_observation();
+        inner.state.lock().unwrap().maintenance.clear();
+        let new = inner.queue_observation();
+        assert_eq!((old.depth, new.depth), (1, 0));
+        assert!(old.oldest_waited_ms.unwrap() >= 90);
+        assert_eq!(new.oldest_waited_ms, None);
+        assert!(new.revision > old.revision);
+        assert!(new.sampled_monotonic_ms >= old.sampled_monotonic_ms);
+        // Existing observers still only implement observe; snapshot callback is optional.
+        NoopPostgresWriteObserver.observe_queue_snapshot(new);
+        NoopPostgresWriteObserver.observe_queue_snapshot(old);
+    }
+    async fn acquire(
+        inner: &Arc<AdmissionInner>,
+        class: PostgresWriteClass,
+    ) -> PostgresWritePermit {
+        let (receiver, mut registration) = inner.enqueue(class);
+        let reservation = receiver.await.expect("reservation");
+        registration.disarm();
+        PostgresWritePermit::new(reservation)
+    }
+
+    fn spawn_waiter(
+        inner: Arc<AdmissionInner>,
+        class: PostgresWriteClass,
+        name: &'static str,
+        acquired: mpsc::UnboundedSender<&'static str>,
+        release: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _permit = acquire(&inner, class).await;
+            acquired.send(name).expect("receiver lives");
+            release.notified().await;
+        })
+    }
+
+    async fn wait_for_queue(inner: &Arc<AdmissionInner>, expected: PostgresWriteQueueSnapshot) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .snapshot();
+                if snapshot == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue should reach expected state");
+    }
+
+    #[tokio::test]
+    async fn critical_precedes_interactive_and_maintenance() {
+        let inner = admission(PostgresWritePolicy::default());
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let critical_release = Arc::new(Notify::new());
+        let interactive_release = Arc::new(Notify::new());
+        let maintenance_release = Arc::new(Notify::new());
+        let maintenance = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Maintenance,
+            "maintenance",
+            acquired_tx.clone(),
+            maintenance_release.clone(),
+        );
+        let interactive = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Interactive,
+            "interactive",
+            acquired_tx.clone(),
+            interactive_release.clone(),
+        );
+        let critical = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical",
+            acquired_tx,
+            critical_release.clone(),
+        );
+        wait_for_queue(
+            &inner,
+            PostgresWriteQueueSnapshot {
+                critical: 1,
+                interactive: 1,
+                maintenance: 1,
+            },
+        )
+        .await;
+        drop(blocker);
+
+        assert_eq!(acquired_rx.recv().await, Some("critical"));
+        critical_release.notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("interactive"));
+        interactive_release.notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("maintenance"));
+        maintenance_release.notify_one();
+        critical.await.unwrap();
+        interactive.await.unwrap();
+        maintenance.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_progress_is_bounded_under_continuous_critical_load() {
+        let inner = admission(PostgresWritePolicy {
+            max_critical_burst: 2,
+            max_non_maintenance_burst: 32,
+            max_maintenance_wait: Duration::from_secs(60),
+        });
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let releases = (0..4).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
+        let interactive = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Interactive,
+            "interactive",
+            acquired_tx.clone(),
+            releases[0].clone(),
+        );
+        let critical_one = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-1",
+            acquired_tx.clone(),
+            releases[1].clone(),
+        );
+        let critical_two = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-2",
+            acquired_tx.clone(),
+            releases[2].clone(),
+        );
+        let critical_three = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-3",
+            acquired_tx,
+            releases[3].clone(),
+        );
+        wait_for_queue(
+            &inner,
+            PostgresWriteQueueSnapshot {
+                critical: 3,
+                interactive: 1,
+                maintenance: 0,
+            },
+        )
+        .await;
+
+        drop(blocker);
+        assert_eq!(acquired_rx.recv().await, Some("critical-1"));
+        releases[1].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("critical-2"));
+        releases[2].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("interactive"));
+        releases[0].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("critical-3"));
+        releases[3].notify_one();
+
+        for waiter in [interactive, critical_one, critical_two, critical_three] {
+            waiter.await.expect("writer waiter should join");
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_progress_is_bounded_under_mixed_non_maintenance_load() {
+        let inner = admission(PostgresWritePolicy {
+            max_critical_burst: 2,
+            max_non_maintenance_burst: 3,
+            max_maintenance_wait: Duration::from_secs(60),
+        });
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let releases = (0..5).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
+        let maintenance = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Maintenance,
+            "maintenance",
+            acquired_tx.clone(),
+            releases[0].clone(),
+        );
+        let interactive = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Interactive,
+            "interactive",
+            acquired_tx.clone(),
+            releases[1].clone(),
+        );
+        let critical_one = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-1",
+            acquired_tx.clone(),
+            releases[2].clone(),
+        );
+        let critical_two = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-2",
+            acquired_tx.clone(),
+            releases[3].clone(),
+        );
+        let critical_three = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical-3",
+            acquired_tx,
+            releases[4].clone(),
+        );
+        wait_for_queue(
+            &inner,
+            PostgresWriteQueueSnapshot {
+                critical: 3,
+                interactive: 1,
+                maintenance: 1,
+            },
+        )
+        .await;
+
+        drop(blocker);
+        assert_eq!(acquired_rx.recv().await, Some("critical-1"));
+        releases[2].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("critical-2"));
+        releases[3].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("interactive"));
+        releases[1].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("maintenance"));
+        releases[0].notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("critical-3"));
+        releases[4].notify_one();
+
+        for waiter in [
+            maintenance,
+            interactive,
+            critical_one,
+            critical_two,
+            critical_three,
+        ] {
+            waiter.await.expect("writer waiter should join");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_waiter_does_not_leak_writer_capacity() {
+        let inner = admission(PostgresWritePolicy::default());
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
+        let cancelled = tokio::spawn({
+            let inner = inner.clone();
+            async move {
+                let _permit = acquire(&inner, PostgresWriteClass::Maintenance).await;
+            }
+        });
+        wait_for_queue(
+            &inner,
+            PostgresWriteQueueSnapshot {
+                critical: 0,
+                interactive: 0,
+                maintenance: 1,
+            },
+        )
+        .await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        wait_for_queue(&inner, PostgresWriteQueueSnapshot::default()).await;
+        drop(blocker);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire(&inner, PostgresWriteClass::Critical),
+        )
+        .await
+        .expect("cancelled waiter must release queue capacity");
+    }
+
+    #[tokio::test]
+    async fn maintenance_wait_deadline_overrides_priority_at_the_next_boundary() {
+        let inner = admission(PostgresWritePolicy {
+            max_critical_burst: 32,
+            max_non_maintenance_burst: 32,
+            max_maintenance_wait: Duration::from_millis(10),
+        });
+        let blocker = acquire(&inner, PostgresWriteClass::Interactive).await;
+        let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
+        let maintenance_release = Arc::new(Notify::new());
+        let critical_release = Arc::new(Notify::new());
+        let maintenance = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Maintenance,
+            "maintenance",
+            acquired_tx.clone(),
+            maintenance_release.clone(),
+        );
+        let critical = spawn_waiter(
+            inner.clone(),
+            PostgresWriteClass::Critical,
+            "critical",
+            acquired_tx,
+            critical_release.clone(),
+        );
+        wait_for_queue(
+            &inner,
+            PostgresWriteQueueSnapshot {
+                critical: 1,
+                interactive: 0,
+                maintenance: 1,
+            },
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        drop(blocker);
+        assert_eq!(acquired_rx.recv().await, Some("maintenance"));
+        maintenance_release.notify_one();
+        assert_eq!(acquired_rx.recv().await, Some("critical"));
+        critical_release.notify_one();
+        maintenance.await.expect("maintenance waiter should join");
+        critical.await.expect("critical waiter should join");
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        acquired: Mutex<Vec<PostgresWriteClass>>,
+        cancelled: Mutex<Vec<PostgresWriteClass>>,
+    }
+
+    impl PostgresWriteObserver for RecordingObserver {
+        fn observe(&self, event: PostgresWriteEvent) {
+            match event {
+                PostgresWriteEvent::Acquired { class, .. } => self
+                    .acquired
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(class),
+                PostgresWriteEvent::Cancelled { class, .. } => self
+                    .cancelled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(class),
+                PostgresWriteEvent::Enqueued { .. } | PostgresWriteEvent::Released { .. } => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_dispatch_closes_observer_lifecycle_and_releases_capacity() {
+        let observer = Arc::new(RecordingObserver::default());
+        let inner = Arc::new(AdmissionInner {
+            state: Mutex::new(AdmissionState::default()),
+            next_waiter_id: AtomicU64::new(1),
+            capacity: 1,
+            policy: PostgresWritePolicy::default(),
+            observer: observer.clone(),
+        });
+
+        // With an idle executor enqueue dispatches synchronously. Dropping the
+        // receiver exercises cancellation after selection but before the
+        // future can construct a PostgresWritePermit.
+        let (receiver, registration) = inner.enqueue(PostgresWriteClass::Critical);
+        drop(receiver);
+        drop(registration);
+
+        assert_eq!(
+            *observer
+                .cancelled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![PostgresWriteClass::Critical]
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire(&inner, PostgresWriteClass::Interactive),
+        )
+        .await
+        .expect("dispatched cancellation must release writer capacity");
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn class_scoped_connections_reach_the_executor_with_their_declared_class() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let observer = Arc::new(RecordingObserver::default());
+        let executor = PostgresWriteExecutor::with_observer(connection, observer.clone());
+
+        executor
+            .connection(PostgresWriteClass::Critical)
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("critical write");
+        executor
+            .connection(PostgresWriteClass::Interactive)
+            .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+            .await
+            .expect("interactive write");
+        executor
+            .connection(PostgresWriteClass::Maintenance)
+            .execute_unprepared("DELETE FROM probe WHERE id = 1")
+            .await
+            .expect("maintenance write");
+
+        assert_eq!(
+            *observer
+                .acquired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                PostgresWriteClass::Critical,
+                PostgresWriteClass::Interactive,
+                PostgresWriteClass::Maintenance,
+            ]
+        );
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn each_statement_obtains_its_own_classed_reservation() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let observer = Arc::new(RecordingObserver::default());
+        let executor = PostgresWriteExecutor::with_observer(connection, observer.clone());
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let critical = executor.connection(PostgresWriteClass::Critical);
+
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+        maintenance
+            .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+            .await
+            .expect("maintenance insert");
+        critical
+            .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+            .await
+            .expect("critical insert");
+
+        assert_eq!(
+            *observer
+                .acquired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                PostgresWriteClass::Maintenance,
+                PostgresWriteClass::Maintenance,
+                PostgresWriteClass::Critical,
+            ]
+        );
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn unrelated_await_between_statements_does_not_hold_writer_capacity() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let between_statements = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let maintenance_task = tokio::spawn({
+            let between_statements = between_statements.clone();
+            let resume = resume.clone();
+            async move {
+                maintenance
+                    .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+                    .await?;
+                between_statements.notify_one();
+                resume.notified().await;
+                maintenance
+                    .execute_unprepared("INSERT INTO probe (id) VALUES (3)")
+                    .await
+            }
+        });
+        between_statements.notified().await;
+
+        let interactive_task = tokio::spawn(async move {
+            interactive
+                .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), interactive_task)
+            .await
+            .expect("interactive write must not wait for unrelated maintenance work")
+            .expect("interactive task should join")
+            .expect("interactive write should succeed");
+        assert!(!maintenance_task.is_finished());
+        resume.notify_one();
+        maintenance_task
+            .await
+            .expect("maintenance task should join")
+            .expect("second maintenance write should succeed");
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn transaction_holds_executor_until_commit() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let transaction = maintenance.begin().await.expect("begin maintenance");
+        transaction
+            .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+            .await
+            .expect("insert in transaction");
+        let interactive_task = tokio::spawn(async move {
+            interactive
+                .execute_unprepared("INSERT INTO probe (id) VALUES (2)")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!interactive_task.is_finished());
+        transaction.commit().await.expect("commit maintenance");
+        interactive_task
+            .await
+            .expect("join interactive")
+            .expect("interactive write");
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn dropped_transaction_releases_executor_capacity() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let transaction = maintenance.begin().await.expect("begin maintenance");
+        let interactive_task = tokio::spawn(async move {
+            interactive
+                .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!interactive_task.is_finished());
+        drop(transaction);
+        tokio::time::timeout(Duration::from_secs(1), interactive_task)
+            .await
+            .expect("dropped transaction must release writer executor")
+            .expect("interactive task should join")
+            .expect("interactive write should succeed");
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn nested_transaction_retains_executor_after_root_wrapper_is_dropped() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let connection = fixture.connect_with_limit(1).await.expect("connect");
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        let root = maintenance.begin().await.expect("begin root transaction");
+        let nested = root.begin().await.expect("begin nested transaction");
+        drop(root);
+        let interactive_task = tokio::spawn(async move {
+            interactive
+                .execute_unprepared("INSERT INTO probe (id) VALUES (1)")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!interactive_task.is_finished());
+
+        drop(nested);
+        tokio::time::timeout(Duration::from_secs(1), interactive_task)
+            .await
+            .expect("final nested transaction owner must release writer executor")
+            .expect("interactive task should join")
+            .expect("interactive write should succeed");
+    }
+
+    #[pioneer_postgres_test::postgres_test]
+    async fn write_stream_holds_executor_until_stream_drop() {
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let mut connection = fixture.connect_with_limit(1).await.expect("connect");
+        // Exercise the actual SeaORM MetricStream destructor, which reports
+        // failed=false even for an early drop. The wrapper owns the outcome.
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_contexts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        connection.set_metric_callback({
+            let callbacks = callbacks.clone();
+            let callback_contexts = callback_contexts.clone();
+            move |_| {
+                callbacks.fetch_add(1, Ordering::Relaxed);
+                if tracing::Span::current().metadata().is_some_and(|metadata| {
+                    metadata.target() == "pioneer_postgres_pools::query_cpu"
+                }) {
+                    callback_contexts.fetch_add(1, Ordering::Relaxed);
+                }
+                query_cpu::record_fingerprint(Some(17));
+            }
+        });
+        let executor = PostgresWriteExecutor::new(connection);
+        let maintenance = executor.connection(PostgresWriteClass::Maintenance);
+        let interactive = executor.connection(PostgresWriteClass::Interactive);
+        maintenance
+            .execute_unprepared("CREATE TABLE probe (id BIGINT PRIMARY KEY)")
+            .await
+            .expect("create table");
+
+        pioneer_observability::init_tracing(false);
+        let epoch = pioneer_observability::telemetry_consent_snapshot().1;
+        let session = query_cpu::Session::start(60, epoch).expect("start isolated local capture");
+        callbacks.store(0, Ordering::Relaxed);
+        callback_contexts.store(0, Ordering::Relaxed);
+
+        let mut stream = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO probe (id) VALUES (1) RETURNING id",
+            ))
+            .await
+            .expect("create returning stream");
+        let interactive_task = tokio::spawn(async move {
+            interactive
+                .execute_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "INSERT INTO probe (id) VALUES (2)",
+                ))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!interactive_task.is_finished());
+        assert!(
+            stream
+                .next()
+                .await
+                .transpose()
+                .expect("stream row")
+                .is_some()
+        );
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), interactive_task)
+            .await
+            .expect("dropped stream must release writer executor")
+            .expect("interactive task should join")
+            .expect("interactive write should succeed");
+
+        // A borrowed transaction stream must release its connection guard on
+        // cancellation, then transaction Drop must roll back before the next
+        // writer can observe data. Neither operation proves query success.
+        let transaction = maintenance.begin().await.expect("begin transaction");
+        transaction
+            .execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO probe (id) VALUES (3)",
+            ))
+            .await
+            .expect("transaction write");
+        let mut transaction_stream = StreamTrait::stream_raw(
+            &transaction,
+            Statement::from_string(DbBackend::Postgres, "SELECT id FROM probe ORDER BY id"),
+        )
+        .await
+        .expect("transaction stream");
+        assert!(
+            transaction_stream
+                .next()
+                .await
+                .transpose()
+                .expect("transaction row")
+                .is_some()
+        );
+        drop(transaction_stream);
+        drop(transaction);
+        let row = maintenance
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT COUNT(*) AS count FROM probe WHERE id = 3",
+            ))
+            .await
+            .expect("query after rollback")
+            .expect("count row");
+        assert_eq!(row.try_get::<i64>("", "count").unwrap(), 0);
+
+        // MetricStream still reports failed=false on this destructor. The
+        // wrapper must keep the error observed from poll_next instead.
+        let mut invalid = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT missing_column FROM probe",
+            ))
+            .await
+            .expect("construct failing stream");
+        assert!(invalid.next().await.expect("one stream error").is_err());
+        drop(invalid);
+
+        let snapshot = session.finish();
+        let errors: u64 = snapshot.groups.iter().map(|g| g.totals.errors).sum::<u64>()
+            + snapshot.group_overflow.errors;
+        assert_eq!(
+            errors, 1,
+            "stream drop callback cannot erase the poll error"
+        );
+        assert!(callbacks.load(Ordering::Relaxed) >= 5);
+        assert_eq!(
+            callbacks.load(Ordering::Relaxed),
+            callback_contexts.load(Ordering::Relaxed),
+            "every real metric callback, including inner stream Drop, must retain its query span"
+        );
+        let cancelled: u64 = snapshot
+            .groups
+            .iter()
+            .map(|group| group.totals.cancelled)
+            .sum::<u64>()
+            + snapshot.group_overflow.cancelled;
+        assert!(
+            cancelled >= 3,
+            "both early stream drops and rollback_drop stay cancelled"
+        );
+        assert_eq!(snapshot.coverage.missing_local_layer, 0);
+
+        // GCPU-F01: retain an exhausted wrapper across capture finalization.
+        // EOF must release its caller scope without waiting for wrapper Drop.
+        let session = query_cpu::Session::start(60, epoch).expect("start EOF capture");
+        callbacks.store(0, Ordering::Relaxed);
+        callback_contexts.store(0, Ordering::Relaxed);
+        let mut exhausted = maintenance
+            .stream_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT id FROM probe ORDER BY id",
+            ))
+            .await
+            .expect("create EOF stream");
+        let mut ids = Vec::new();
+        while let Some(row) = exhausted.next().await {
+            ids.push(
+                row.expect("EOF stream row")
+                    .try_get::<i64>("", "id")
+                    .unwrap(),
+            );
+        }
+        assert_eq!(ids, vec![1, 2]);
+        assert!(exhausted.next().await.is_none(), "EOF stays exhausted");
+        executor.close().await.expect("close writer pool");
+        let snapshot = session.finish();
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(callback_contexts.load(Ordering::Relaxed), 1);
+        assert_eq!(snapshot.coverage.registered_scopes, 1);
+        assert_eq!(snapshot.coverage.incomplete_scopes, 0);
+        assert_eq!(snapshot.coverage.scopes_without_callback, 0);
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].totals.completed_calls, 1);
+        assert_eq!(snapshot.groups[0].totals.incomplete, 0);
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            assert!(snapshot.groups[0].totals.measured_segments > 0);
+            assert!(snapshot.groups[0].totals.cpu_ns.is_some());
+        }
+        assert_eq!(snapshot.measured_unknown.completed_calls, 0);
+        // Keep the empty wrapper alive through the snapshot; another poll must
+        // neither recreate a scope nor produce another row/result.
+        assert!(exhausted.next().await.is_none());
+        drop(exhausted);
+    }
+}

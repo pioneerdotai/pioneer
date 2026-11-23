@@ -7,19 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_external_ref")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
     pub artifact_id: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_artifact_external_ref"
+    )]
     pub artifact_version_id: Option<String>,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
     pub provider: String,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(
+        column_type = "Text",
+        nullable,
+        unique_key = "uidx_artifact_external_ref"
+    )]
     pub model_family: Option<String>,
-    #[sea_orm(unique_key = "uidx_artifact_external_ref")]
+    #[sea_orm(column_type = "Text", unique_key = "uidx_artifact_external_ref")]
     pub transport_kind: String,
     #[sea_orm(column_type = "Text")]
     pub external_id: String,
@@ -27,8 +35,7 @@ pub struct Model {
     pub external_uri: Option<String>,
     pub expires_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
-    #[sea_orm(column_type = "Text")]
-    pub metadata_json: String,
+    pub metadata_json: Json,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

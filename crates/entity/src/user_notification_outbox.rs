@@ -7,16 +7,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "user_notification_outbox")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique)]
+    #[sea_orm(column_type = "Text", unique)]
     pub task_delivery_id: String,
-    pub workspace_id: String,
-    pub recipient_principal_id: String,
-    pub task_id: String,
-    pub run_id: String,
     #[sea_orm(column_type = "Text")]
-    pub payload_json: String,
+    pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub recipient_principal_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub task_id: String,
+    #[sea_orm(column_type = "Text")]
+    pub run_id: String,
+    pub payload_json: Json,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
     pub created_at: DateTimeWithTimeZone,
     pub delivered_at: DateTimeWithTimeZone,
@@ -28,7 +32,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task_delivery: HasOne<super::task_delivery::Entity>,
+    pub task_delivery: BelongsTo<super::task_delivery::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

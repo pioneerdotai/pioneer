@@ -7,19 +7,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "artifact_blob")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
-    #[sea_orm(unique_key = "uidx_artifact_blob_workspace_sha_size_backend")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_artifact_blob_workspace_sha_size_backend"
+    )]
     pub workspace_id: String,
-    #[sea_orm(unique_key = "uidx_artifact_blob_workspace_sha_size_backend")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_artifact_blob_workspace_sha_size_backend"
+    )]
     pub sha256: String,
     #[sea_orm(unique_key = "uidx_artifact_blob_workspace_sha_size_backend")]
     pub size_bytes: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub mime_type: Option<String>,
-    #[sea_orm(unique_key = "uidx_artifact_blob_workspace_sha_size_backend")]
+    #[sea_orm(
+        column_type = "Text",
+        unique_key = "uidx_artifact_blob_workspace_sha_size_backend"
+    )]
     pub storage_backend: String,
     #[sea_orm(column_type = "Text")]
     pub storage_key: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub encryption_key_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub last_verified_at: Option<DateTimeWithTimeZone>,

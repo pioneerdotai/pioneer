@@ -30,8 +30,23 @@ members = [
   "crates/desktop-updater",
   "crates/cli",
   "crates/crud",
+  "crates/crud-access",
+  "crates/crud-artifacts",
+  "crates/crud-compaction",
+  "crates/crud-conversations",
+  "crates/crud-execution",
+  "crates/crud-memory",
+  "crates/crud-packages",
+  "crates/crud-payloads",
+  "crates/crud-self-improvement",
+  "crates/crud-signals",
+  "crates/crud-tasks",
+  "crates/crud-timeline",
   "crates/entity",
   "crates/migration",
+  "crates/postgres",
+  "crates/postgres-test",
+  "crates/postgres-test-macros",
   "crates/mcp",
   "crates/mcp-oauth",
   "crates/memory",
@@ -43,7 +58,7 @@ members = [
   "crates/plugins",
   "crates/packages",
   "crates/apps",
-  "crates/sqlite",
+  "crates/postgres-pools",
   "crates/tasks",
   "crates/tools",
   "crates/terminal",
@@ -88,8 +103,22 @@ pioneer-desktop-task-notifications = { path = "crates/desktop-task-notifications
 pioneer-app-updater = { path = "crates/desktop-updater" }
 pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }
+pioneer-crud-access = { path = "crates/crud-access" }
+pioneer-crud-artifacts = { path = "crates/crud-artifacts" }
+pioneer-crud-compaction = { path = "crates/crud-compaction" }
+pioneer-crud-conversations = { path = "crates/crud-conversations" }
+pioneer-crud-execution = { path = "crates/crud-execution" }
+pioneer-crud-memory = { path = "crates/crud-memory" }
+pioneer-crud-packages = { path = "crates/crud-packages" }
+pioneer-crud-payloads = { path = "crates/crud-payloads" }
+pioneer-crud-self-improvement = { path = "crates/crud-self-improvement" }
+pioneer-crud-signals = { path = "crates/crud-signals" }
+pioneer-crud-tasks = { path = "crates/crud-tasks" }
+pioneer-crud-timeline = { path = "crates/crud-timeline" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
+pioneer-postgres = { path = "crates/postgres" }
+pioneer-postgres-test = { path = "crates/postgres-test" }
 pioneer-mcp-oauth = { path = "crates/mcp-oauth" }
 pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
@@ -103,7 +132,7 @@ pioneer-packages = { path = "crates/packages" }
 pioneer-apps = { path = "crates/apps" }
 pioneer-tasks = { path = "crates/tasks" }
 pioneer-tools = { path = "crates/tools" }
-pioneer-sqlite = { path = "crates/sqlite" }
+pioneer-postgres-pools = { path = "crates/postgres-pools" }
 pioneer-promt = { path = "crates/promt" }
 
 # Native skills directory notifications (FSEvents on macOS).
@@ -136,7 +165,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Tracing
 log = "0.4"
-env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
 sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "debug-images", "panic", "transport", "tracing"] }
@@ -175,11 +203,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 tempfile = "3"
 fs4 = "1.1"
-lazy_static = "1.5"
-lru_time_cache = "0.11"
-owning_ref = "0.4"
-names = { version = "0.14", default-features = false }
-pretty_assertions = "1"
 shell-words = "1.1"
 keepawake = "0.6"
 cpal = "0.18"
@@ -219,7 +242,6 @@ windows-sys = "0.61"
 # Database
 sea-orm = "2.0"
 sea-orm-migration = "2.0"
-rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
 zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP

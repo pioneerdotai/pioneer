@@ -586,7 +586,7 @@ pub(crate) fn record_pool_snapshot(
             crate::DatabaseRole::Writer => (1, "writer"),
         };
         let size = snapshot.size.min(capacity);
-        state.pools[index]=Some(PoolSnapshot{role:role.into(),sampled_ms:monotonic_ms(),size_connections:size,idle_connections:snapshot.idle.min(size),capacity_connections:capacity,source:"existing SQLx size/num_idle exporter callback; no acquire/query/probe; freshness relative to SDK collection, not resource sampler cadence".into(),waiters:None,wait_coverage:"SQLx pool waiter count and foreign SQLite-worker wait unavailable from pinned public owner API; no inferred zero".into()});
+        state.pools[index]=Some(PoolSnapshot{role:role.into(),sampled_ms:monotonic_ms(),size_connections:size,idle_connections:snapshot.idle.min(size),capacity_connections:capacity,source:"existing SQLx size/num_idle exporter callback; no acquire/query/probe; freshness relative to SDK collection, not resource sampler cadence".into(),waiters:None,wait_coverage:"SQLx pool waiter count is unavailable through the public pool API".into()});
     });
 }
 pub fn snapshot() -> Option<LiveSnapshot> {

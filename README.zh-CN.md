@@ -81,7 +81,9 @@
 
 ## 技术结构
 
-Pioneer 是一个 Rust workspace，包含基于 GPUI 的原生桌面应用和使用 SQLite 的网关。客户端通过 WebSocket 上的 JSON-RPC API 连接。
+Pioneer 是一个 Rust workspace，包含基于 GPUI 的原生桌面应用和使用 PostgreSQL 的网关。客户端通过 WebSocket 上的 JSON-RPC API 连接。
+
+Gateway 安装包包含 PostgreSQL 19 和 pgvector。Gateway 首次启动时会创建数据目录，在相同的 PostgreSQL 主版本内重启或更新后会继续使用原有数据。Desktop 在安装本地 Gateway 时会安装同样的数据库运行环境。
 
 ```mermaid
 flowchart TB

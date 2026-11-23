@@ -350,7 +350,7 @@ pub(crate) fn test_config() -> AppConfig {
             voice: GatewayVoiceConfig::default(),
             provider: GatewayProviderConfig::default(),
             database: GatewayDatabaseConfig {
-                file_name: "gateway.db".to_owned(),
+                development_url: None,
                 max_connections: 10,
                 connect_timeout_ms: 5_000,
                 acquire_timeout_ms: 5_000,

@@ -1822,7 +1822,8 @@ impl MessageProcessor {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to validate workspace for thread/move: {message}"),
                     ),
@@ -2000,7 +2001,8 @@ impl MessageProcessor {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to validate workspace for thread/folder/create: {message}"),
                     ),
@@ -2124,7 +2126,8 @@ impl MessageProcessor {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to validate workspace for thread/folder/move: {message}"),
                     ),
@@ -2245,7 +2248,8 @@ impl MessageProcessor {
             Ok(workspace_id) => workspace_id,
             Err(error) => {
                 let (code, message) = match &error {
-                    WorkspaceError::Internal(message) => (
+                    WorkspaceError::Internal(message)
+                    | WorkspaceError::DatabaseConflict(message) => (
                         INVALID_REQUEST_CODE,
                         format!("failed to validate workspace for thread/folder/delete: {message}"),
                     ),

@@ -11,8 +11,7 @@ pub struct Model {
     pub operation_id: String,
     pub source_count: i64,
     pub reference_count: i64,
-    #[sea_orm(column_type = "Text")]
-    pub descriptor: String,
+    pub descriptor: Json,
     pub ready: i64,
     #[sea_orm(
         belongs_to,
@@ -21,7 +20,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub compaction_operation: HasOne<super::compaction_operation::Entity>,
+    pub compaction_operation: BelongsTo<super::compaction_operation::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

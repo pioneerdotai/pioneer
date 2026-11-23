@@ -12,12 +12,12 @@ pub struct Model {
     pub schema_version: i64,
     #[sea_orm(
         column_type = "Text",
-        unique_key = "uq_applied_patch_record_invocation"
+        unique_key = "uq_applied_patch_record_commit_ordinal"
     )]
     pub thread_id: String,
     #[sea_orm(
         column_type = "Text",
-        unique_key = "uq_applied_patch_record_invocation"
+        unique_key = "uq_applied_patch_record_commit_ordinal"
     )]
     pub turn_id: String,
     #[sea_orm(
@@ -36,7 +36,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub exactness: String,
     pub committed_at_unix_ms: i64,
-    #[sea_orm(column_type = "Binary(1)")]
+    #[sea_orm(column_type = "VarBinary(StringLen::None)")]
     pub plan_fingerprint: Vec<u8>,
     #[sea_orm(column_type = "Text")]
     pub outcome_json: String,

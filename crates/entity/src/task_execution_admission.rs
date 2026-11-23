@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_execution_admission")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub task_id: String,
+    #[sea_orm(column_type = "Text")]
     pub workspace_id: String,
+    #[sea_orm(column_type = "Text")]
     pub root_thread_id: String,
+    #[sea_orm(column_type = "Text")]
     pub initiating_principal_id: String,
     #[sea_orm(column_type = "Text")]
     pub authorization_context_json: String,
@@ -22,7 +25,7 @@ pub struct Model {
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
-    pub task: HasOne<super::task::Entity>,
+    pub task: BelongsTo<super::task::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

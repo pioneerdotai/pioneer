@@ -44,21 +44,21 @@ pub(crate) async fn ensure_test_superuser_execution_authority(crud_store: &CrudS
     crud_store
         .database_connection()
         .execute_unprepared(
-            "INSERT OR IGNORE INTO gateway_identity(\
+            "INSERT INTO gateway_identity(\
                 id,singleton_key,identity_bootstrap_version,auth_schema_version,auth_ready_at,\
                 created_at,updated_at\
              ) VALUES(\
                 'G00000000000000000001',1,1,2,CURRENT_TIMESTAMP,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP\
-             );\
-             INSERT OR IGNORE INTO gateway_principal(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO gateway_principal(\
                 id,gateway_id,kind,role_key,status,display_name,nickname,nickname_key,\
                 created_at,updated_at,removed_at\
              ) VALUES(\
                 'P00000000000000000001','G00000000000000000001','superuser',NULL,'active',\
                 'Superuser','superuser','superuser',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO device(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO device(\
                 id,gateway_id,principal_id,installation_id,display_name,client_kind,\
                 platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
              ) VALUES(\
@@ -66,8 +66,8 @@ pub(crate) async fn ensure_test_superuser_execution_authority(crud_store: &CrudS
                 'P00000000000000000001','gateway-test-superuser','Gateway Test Superuser',\
                 'desktop','test','1','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
                 CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_session(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO auth_session(\
                 id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
                 activation_token_hash,activation_locator_hash,activation_failed_attempts,\
                 activation_expires_at,activated_at,status,refresh_generation,created_at,\
@@ -76,18 +76,18 @@ pub(crate) async fn ensure_test_superuser_execution_authority(crud_store: &CrudS
              ) VALUES(\
                 'S00000000000000000001','G00000000000000000001',\
                 'P00000000000000000001','D00000000000000000001',\
-                'F00000000000000000001',NULL,randomblob(32),randomblob(32),0,\
-                datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                'F00000000000000000001',NULL,decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),0,\
+                CURRENT_TIMESTAMP + INTERVAL '10 minutes',CURRENT_TIMESTAMP,'active',0,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_refresh_credential(\
+                CURRENT_TIMESTAMP + INTERVAL '90 days',NULL,NULL\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO auth_refresh_credential(\
                 id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
              ) VALUES(\
                 'R00000000000000000001','S00000000000000000001',\
-                'F00000000000000000001',0,randomblob(32),CURRENT_TIMESTAMP,\
-                datetime('now','+90 days')\
-             );",
+                'F00000000000000000001',0,decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),CURRENT_TIMESTAMP,\
+                CURRENT_TIMESTAMP + INTERVAL '90 days'\
+             ) ON CONFLICT DO NOTHING;",
         )
         .await
         .expect("test Superuser execution authority should materialize");
@@ -98,7 +98,7 @@ pub(crate) async fn ensure_test_superuser_secondary_session_authority(crud_store
     crud_store
         .database_connection()
         .execute_unprepared(
-            "INSERT OR IGNORE INTO device(\
+            "INSERT INTO device(\
                 id,gateway_id,principal_id,installation_id,display_name,client_kind,\
                 platform,client_version,status,created_at,updated_at,last_seen_at,revoked_at\
              ) VALUES(\
@@ -106,8 +106,8 @@ pub(crate) async fn ensure_test_superuser_secondary_session_authority(crud_store
                 'P00000000000000000001','gateway-test-superuser-secondary',\
                 'Gateway Test Superuser Secondary','mobile','test','1','active',\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_session(\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO auth_session(\
                 id,gateway_id,principal_id,device_id,token_family_id,created_by_session_id,\
                 activation_token_hash,activation_locator_hash,activation_failed_attempts,\
                 activation_expires_at,activated_at,status,refresh_generation,created_at,\
@@ -116,18 +116,18 @@ pub(crate) async fn ensure_test_superuser_secondary_session_authority(crud_store
              ) VALUES(\
                 'S00000000000000000002','G00000000000000000001',\
                 'P00000000000000000001','D00000000000000000002',\
-                'F00000000000000000002','S00000000000000000001',randomblob(32),\
-                randomblob(32),0,datetime('now','+10 minutes'),CURRENT_TIMESTAMP,'active',0,\
+                'F00000000000000000002','S00000000000000000001',decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),\
+                decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),0,CURRENT_TIMESTAMP + INTERVAL '10 minutes',CURRENT_TIMESTAMP,'active',0,\
                 CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,\
-                datetime('now','+90 days'),NULL,NULL\
-             );\
-             INSERT OR IGNORE INTO auth_refresh_credential(\
+                CURRENT_TIMESTAMP + INTERVAL '90 days',NULL,NULL\
+             ) ON CONFLICT DO NOTHING;\
+             INSERT INTO auth_refresh_credential(\
                 id,session_id,token_family_id,generation,token_hash,issued_at,expires_at\
              ) VALUES(\
                 'R00000000000000000002','S00000000000000000002',\
-                'F00000000000000000002',0,randomblob(32),CURRENT_TIMESTAMP,\
-                datetime('now','+90 days')\
-             );",
+                'F00000000000000000002',0,decode(replace(gen_random_uuid()::text,'-','') || replace(gen_random_uuid()::text,'-',''),'hex'),CURRENT_TIMESTAMP,\
+                CURRENT_TIMESTAMP + INTERVAL '90 days'\
+             ) ON CONFLICT DO NOTHING;",
         )
         .await
         .expect("secondary test Superuser session authority should materialize");

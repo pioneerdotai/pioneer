@@ -7,17 +7,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "agent_memory_repair_job")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
+    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
+    #[sea_orm(column_type = "Text")]
     pub job_kind: String,
+    #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[sea_orm(column_type = "Text", nullable)]
     pub workspace_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub scope_kind: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub scope_key_hash: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub memory_id: Option<String>,
     pub priority: i64,
     pub attempts: i64,
     pub max_attempts: i64,
+    #[sea_orm(column_type = "Text", nullable)]
     pub locked_by: Option<String>,
     pub lock_expires_at: Option<DateTimeWithTimeZone>,
     pub scheduled_at: DateTimeWithTimeZone,
