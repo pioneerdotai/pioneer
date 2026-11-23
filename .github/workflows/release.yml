@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: pioneer-gateway-linux-x86_64.zip
             cu_asset: pioneer-gateway-linux-x86_64-computer-use-package.zip
