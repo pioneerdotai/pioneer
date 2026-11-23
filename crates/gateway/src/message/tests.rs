@@ -31113,6 +31113,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                     let parent = "thr_composer_cli_pack";
                     let source = "turn_composer_cli_pack";
                     let model = match runtime_kind {
+                        CLIAgentRuntimeKind::Acp => unreachable!("native skill installer fixture"),
                         CLIAgentRuntimeKind::Codex => "gpt-5",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
                         CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
