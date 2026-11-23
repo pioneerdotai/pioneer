@@ -14090,7 +14090,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn acp_task_extraction_uses_only_the_exact_prompt_final_candidate() {
         use pioneer_cli_agent_runtime::acp::{
             reducer::{Context as AcpContext, Reducer},

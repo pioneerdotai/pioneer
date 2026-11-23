@@ -393,7 +393,6 @@ mod tests {
     use super::{CLIAgentRuntimeRecoveryRuntime, CLIAgentRuntimeTurnRecoveryOutcome};
     use crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING;
     use chrono::{FixedOffset, TimeZone};
-    use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, NewCliRuntimeTurnBinding};
     use pioneer_entity::turn;
     use pioneer_protocol::{
@@ -401,16 +400,21 @@ mod tests {
         ThreadStatus, Turn, TurnStatus, UserInput,
     };
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
-    use sea_orm::{Database, EntityTrait};
+    use sea_orm::{ConnectionTrait, EntityTrait};
 
     async fn test_store() -> CrudStore {
-        let connection = Database::connect("sqlite::memory:")
+        let fixture = pioneer_postgres_test::scoped_database().await.unwrap();
+        let writer = fixture.connection().clone();
+        writer
+            .execute_unprepared(
+                "INSERT INTO workspace (id, name) VALUES ('ws_cli_recovery', 'Runtime')",
+            )
             .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        CrudStore::new(connection)
+            .expect("workspace fixture must insert");
+        CrudStore::new(pioneer_postgres_pools::PostgresDatabase::new(
+            fixture.connect_read_only().await.unwrap(),
+            writer,
+        ))
     }
 
     fn timestamp(secs: i64) -> DateTimeWithTimeZone {
@@ -513,7 +517,7 @@ mod tests {
                 continuation_thread_id: thread_id.to_owned(),
                 workspace_id: "ws_cli_recovery".to_owned(),
                 runtime_id: runtime_id.to_owned(),
-                runtime_kind: "codex".to_owned(),
+                runtime_kind: "acp".to_owned(),
                 native_thread_id: format!("native-thread-{thread_id}"),
                 native_turn_id: (status == CLI_RUNTIME_TURN_STATUS_RUNNING)
                     .then(|| format!("native-turn-{turn_id}")),
@@ -531,7 +535,7 @@ mod tests {
             .expect("binding should persist");
     }
 
-    #[tokio::test]
+    #[pioneer_postgres_test::postgres_test]
     async fn ready_acp_session_does_not_prove_unknown_prompt_outcome() {
         let store = test_store().await;
         materialize_in_progress_turn(&store, "acp-child", "acp-turn").await;
@@ -543,12 +547,11 @@ mod tests {
             CLI_RUNTIME_TURN_STATUS_RUNNING,
         )
         .await;
-        let mut binding = store
+        let binding = store
             .get_cli_runtime_turn_binding("acp-turn")
             .await
             .unwrap()
             .unwrap();
-        binding.runtime_kind = "acp".into();
         let mut ready = runtime("arbitrary-agent", RuntimeStatus::Ready);
         ready.runtime_kind = "acp".into();
         for current in [None, Some(&ready)] {
