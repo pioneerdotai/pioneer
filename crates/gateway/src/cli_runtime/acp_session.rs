@@ -1199,12 +1199,21 @@ impl SessionHost {
                 )
                 .map_err(wire_error)?;
                 let permit = reserve_patch_history_capacity().await.map_err(wire_error)?;
-                let observer = PostgresPatchObserver::new(
+                let observer = Arc::new(PostgresPatchObserver::new(
                     self.services.store.database_connection(),
                     identity.clone(),
                     permit,
-                );
-                let output = pioneer_tools::handlers::ApplyPatchHandler.handle_with_source_and_observer(invocation, trace, pioneer_tools::apply_patch::file_mutation::PatchRequestSource::NativeFunction, &identity, &observer).await.map_err(wire_error)?;
+                ));
+                let output = pioneer_tools::handlers::ApplyPatchHandler
+                    .handle_with_source_and_observer(
+                        invocation,
+                        trace,
+                        pioneer_tools::apply_patch::file_mutation::PatchRequestSource::NativeFunction,
+                        &identity,
+                        observer,
+                    )
+                    .await
+                    .map_err(wire_error)?;
                 if !output.success() {
                     return Err(wire_error(output.raw_text()));
                 }

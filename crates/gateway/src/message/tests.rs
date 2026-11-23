@@ -3183,6 +3183,7 @@ async fn capability_persistence_order_impl() {
                     CLIAgentRuntimeKind::Codex => "codex",
                     CLIAgentRuntimeKind::Claude => "claude",
                     CLIAgentRuntimeKind::OpenCode => "opencode",
+                    CLIAgentRuntimeKind::Acp => "acp",
                 },
             );
             let request = cli_runtime_turn_start_request_with_capabilities(
