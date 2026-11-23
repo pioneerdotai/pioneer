@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     mcp_service::McpService,
-    patch_history_observer::{SqlitePatchObserver, reserve_patch_history_capacity},
+    patch_history_observer::{PostgresPatchObserver, reserve_patch_history_capacity},
     turn_mcp::invoker::TurnMcpInvoker,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -1199,7 +1199,7 @@ impl SessionHost {
                 )
                 .map_err(wire_error)?;
                 let permit = reserve_patch_history_capacity().await.map_err(wire_error)?;
-                let observer = SqlitePatchObserver::new(
+                let observer = PostgresPatchObserver::new(
                     self.services.store.database_connection(),
                     identity.clone(),
                     permit,

@@ -3419,10 +3419,10 @@ async fn capability_persistence_order_impl() {
                         ("selected Skill input", "- $beta", "- $alpha", "Codex")
                     }
                     CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
-                    CLIAgentRuntimeKind::Claude => unreachable!(),
+                    CLIAgentRuntimeKind::Claude | CLIAgentRuntimeKind::Acp => unreachable!(),
                 };
                 assert!(context.contains(directive));
-                assert!(!native_turn.elevated_instructions.text().contains(directive));
+                assert!(!native_turn.instructions.elevated().unwrap().text().contains(directive));
                 let beta = context
                     .find(beta_label)
                     .unwrap_or_else(|| panic!("{runtime_label} turn context should include beta"));
@@ -3451,7 +3451,7 @@ async fn capability_persistence_order_impl() {
                     .expect("turn context should precede native user input");
                 let directive = "Invoke every selected skill through Claude's native Skill tool";
                 assert!(context.contains(directive));
-                assert!(!native_turn.elevated_instructions.text().contains(directive));
+                assert!(!native_turn.instructions.elevated().unwrap().text().contains(directive));
                 let beta = context
                     .find("- beta")
                     .expect("Claude turn context should include beta");
@@ -3994,8 +3994,22 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
         let directive = "Invoke every selected skill through Claude's native Skill tool";
         assert!(context.contains(directive));
         assert!(context.contains("- refresh"));
-        assert!(!native.elevated_instructions.text().contains(directive));
-        assert!(!native.elevated_instructions.text().contains("- refresh"));
+        assert!(
+            !native
+                .instructions
+                .elevated()
+                .unwrap()
+                .text()
+                .contains(directive)
+        );
+        assert!(
+            !native
+                .instructions
+                .elevated()
+                .unwrap()
+                .text()
+                .contains("- refresh")
+        );
         assert_eq!(
             input
                 .iter()
