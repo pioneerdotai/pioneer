@@ -34,11 +34,11 @@ impl Request {
     }
 }
 
-pub(super) fn install(
-    attributes: &mut wry::WebViewAttributes<'_>,
+pub(super) fn install<'a>(
+    builder: wry::WebViewBuilder<'a>,
     development: bool,
     url: &str,
-) -> anyhow::Result<Receiver<Request>> {
+) -> anyhow::Result<(wry::WebViewBuilder<'a>, Receiver<Request>)> {
     let token = format!("{:032x}", rand::random::<u128>());
     let origin = if development {
         serde_json::Value::String(url::Url::parse(url)?.origin().ascii_serialization())
@@ -48,20 +48,16 @@ pub(super) fn install(
     let script = include_str!("view_bridge.js")
         .replace("__PIONEER_ORIGIN__", &origin.to_string())
         .replace("__PIONEER_TOKEN__", &serde_json::to_string(&token)?);
-    attributes
-        .initialization_scripts
-        .push(wry::InitializationScript {
-            script,
-            for_main_frame_only: true,
-        });
     let (sender, receiver) = channel(32);
-    attributes.ipc_handler = Some(Box::new(move |request| {
-        if let Some(request) = parse(request.body(), &token) {
-            // The native callback never blocks or mutates GPUI reentrantly.
-            let _ = sender.try_send(request);
-        }
-    }));
-    Ok(receiver)
+    let builder = builder
+        .with_initialization_script(script)
+        .with_ipc_handler(move |request| {
+            if let Some(request) = parse(request.body(), &token) {
+                // The native callback never blocks or mutates GPUI reentrantly.
+                let _ = sender.try_send(request);
+            }
+        });
+    Ok((builder, receiver))
 }
 
 fn parse(body: &str, token: &str) -> Option<Request> {
