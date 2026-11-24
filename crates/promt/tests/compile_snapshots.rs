@@ -187,7 +187,11 @@ fn assert_continuation_prompt_contract(compiled: &CompiledPromptBundle) {
     assert!(compiled.full_system_text.contains("apply_patch"));
     assert!(!compiled.full_system_text.contains("write_file"));
     assert!(!compiled.full_system_text.contains("edit_file"));
-    assert!(compiled.full_system_text.contains("call request_tools"));
+    assert!(
+        compiled
+            .full_system_text
+            .contains("Call request_tools to open a domain.")
+    );
     assert!(
         !compiled
             .full_system_text

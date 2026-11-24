@@ -70,7 +70,7 @@ mod tests {
     fn request_tools_hidden_domain_catalog_lists_build_available_domains() {
         for computer_use_available in [false, true] {
             let catalog = render_request_tools_hidden_domain_catalog_prompt(computer_use_available);
-            assert!(catalog.contains("call request_tools"));
+            assert!(catalog.contains("Call request_tools to open a domain."));
             for domain in ["threads", "memory", "task", "artifact"] {
                 assert!(catalog.contains(&format!("- {domain}: ")));
             }
@@ -133,7 +133,11 @@ mod tests {
             section.title.as_deref(),
             Some(REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_TITLE)
         );
-        assert!(section.content.contains("call request_tools"));
+        assert!(
+            section
+                .content
+                .contains("Call request_tools to open a domain.")
+        );
     }
 
     #[test]

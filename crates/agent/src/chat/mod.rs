@@ -12729,7 +12729,7 @@ mod tests {
             assert!(
                 plan.bundle
                     .dynamic_system_text
-                    .contains("call request_tools"),
+                    .contains("Call request_tools to open a domain."),
                 "tool-enabled instructions must explain how to open hidden domains"
             );
             for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {
