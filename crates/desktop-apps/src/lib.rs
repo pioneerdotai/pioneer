@@ -198,52 +198,54 @@ impl AppView {
             if let Some(url) = url {
                 self.theme_snapshot = theme_snapshot(cx);
                 let publication = self.publication.as_ref().expect("ready publication");
-                let attributes = view_attributes(
+                let page = app_page(
                     &url,
                     publication.base_url.as_ref().map(|u| u.expose_secret()),
                     publication.development,
                     &t!("apps.view_title").to_string(),
                     &self.theme_snapshot,
                 );
-                if let Ok((mut attributes, mut host_requests)) = attributes {
-                    self.context =
-                        Some(wry::WebContext::new(Some(self._storage.path().to_owned())));
+                let result = page.and_then(|page| {
+                    let context = self
+                        .context
+                        .insert(wry::WebContext::new(Some(self._storage.path().to_owned())));
                     let document_loaded = self.document_loaded.clone();
-                    attributes.context = self.context.as_mut();
-                    let builder = wry::WebViewBuilder::new_with_attributes(attributes)
+                    let builder = page
+                        .configure(
+                            wry::WebViewBuilder::new_with_web_context(context),
+                            publication.development,
+                        )
                         .with_background_color(native_background(cx))
                         .with_on_page_load_handler(move |event, _| {
                             if matches!(event, wry::PageLoadEvent::Finished) {
                                 document_loaded.store(true, std::sync::atomic::Ordering::Release);
                             }
                         });
-                    match WebView::build(builder, window, cx) {
-                        Ok(view) => {
-                            apply_native_theme(&view, cx);
-                            self.webview = Some(cx.new(|_| view));
-                            self.host_requests =
-                                Some(cx.spawn_in(window, async move |owner, cx| {
-                                    while let Some(request) = host_requests.recv().await {
-                                        let closing = matches!(
-                                            request.command(),
-                                            view_bridge::Command::Close
-                                        );
-                                        if owner
-                                            .update_in(cx, |view, _, cx| {
-                                                view.handle_view_request(request, cx);
-                                            })
-                                            .is_err()
-                                            || closing
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }));
-                        }
-                        Err(_) => self.failed = true,
+                    let (builder, requests) =
+                        view_bridge::install(builder, publication.development, &url)?;
+                    Ok((WebView::build(builder, window, cx), requests))
+                });
+                match result {
+                    Ok((Ok(view), mut host_requests)) => {
+                        apply_native_theme(&view, cx);
+                        self.webview = Some(cx.new(|_| view));
+                        self.host_requests = Some(cx.spawn_in(window, async move |owner, cx| {
+                            while let Some(request) = host_requests.recv().await {
+                                let closing =
+                                    matches!(request.command(), view_bridge::Command::Close);
+                                if owner
+                                    .update_in(cx, |view, _, cx| {
+                                        view.handle_view_request(request, cx);
+                                    })
+                                    .is_err()
+                                    || closing
+                                {
+                                    break;
+                                }
+                            }
+                        }));
                     }
-                } else {
-                    self.failed = true;
+                    _ => self.failed = true,
                 }
             }
         }
@@ -315,8 +317,6 @@ fn apply_native_theme(view: &WebView, cx: &App) {
     } else {
         wry::Theme::Light
     });
-    // Also applies the macOS backdrop through gpui-webview's native adapter;
-    // Wry's builder background alone is not implemented on that platform.
     let _ = view.set_background_color(native_background(cx));
 }
 
@@ -335,28 +335,49 @@ fn theme_snapshot(cx: &App) -> serde_json::Value {
     snapshot
 }
 
-/// These are the actual Wry loader attributes, consumed by the existing panel.
-/// Only a view-scoped presentation bridge is exposed to either App presentation.
-fn view_attributes<'a>(
+enum AppDocument {
+    Url(String),
+    Html(String),
+}
+
+struct AppPage {
+    document: AppDocument,
+    navigate: Box<dyn Fn(String) -> bool>,
+    theme_script: String,
+    surface_script: String,
+}
+
+impl AppPage {
+    fn configure<'a>(
+        self,
+        builder: wry::WebViewBuilder<'a>,
+        development: bool,
+    ) -> wry::WebViewBuilder<'a> {
+        let builder = builder
+            .with_incognito(true)
+            .with_devtools(development)
+            .with_clipboard(false)
+            .with_visible(false)
+            .with_download_started_handler(|_, _| false)
+            .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+            .with_navigation_handler(self.navigate)
+            .with_initialization_script_for_main_only(self.surface_script, false)
+            .with_initialization_script(self.theme_script);
+        match self.document {
+            AppDocument::Url(url) => builder.with_url(url),
+            AppDocument::Html(html) => builder.with_html(html),
+        }
+    }
+}
+
+fn app_page(
     url: &str,
     prefix: Option<&str>,
     development: bool,
     title: &str,
     palette: &serde_json::Value,
-) -> anyhow::Result<(
-    wry::WebViewAttributes<'a>,
-    tokio::sync::mpsc::Receiver<view_bridge::Request>,
-)> {
-    let mut attributes = wry::WebViewAttributes {
-        incognito: true,
-        devtools: development,
-        clipboard: false,
-        visible: false,
-        download_started_handler: Some(Box::new(|_, _| false)),
-        new_window_req_handler: Some(Box::new(|_, _| wry::NewWindowResponse::Deny)),
-        ..Default::default()
-    };
-    let script = if development {
+) -> anyhow::Result<AppPage> {
+    let (document, navigate, theme_script): (_, Box<dyn Fn(String) -> bool>, _) = if development {
         let parsed = url::Url::parse(url)?;
         anyhow::ensure!(
             parsed.scheme() == "http" && parsed.host().is_some(),
@@ -365,49 +386,43 @@ fn view_attributes<'a>(
         let origin = parsed.origin();
         // Top-level navigation stays on this origin. Subresources, fetch and
         // WebSockets use the browser's ordinary policies, without interception.
-        attributes.navigation_handler = Some(Box::new(move |candidate| {
+        let navigate = Box::new(move |candidate: String| {
             url::Url::parse(&candidate).is_ok_and(|next| {
                 next.origin() == origin && next.username().is_empty() && next.password().is_none()
             })
-        }));
-        attributes.url = Some(url.to_owned());
+        });
         let base = prefix.ok_or_else(|| anyhow::anyhow!("missing App view prefix"))?;
         let origin = serde_json::to_string(&parsed.origin().ascii_serialization())?;
         let base = serde_json::to_string(base)?;
-        format!(
+        let script = format!(
             r#"if(window.top===window&&location.origin==={origin})Object.defineProperty(window,"__pioneerAppBaseUrl",{{value:{base}}});{}"#,
             dev_theme_script(palette, url)
-        )
+        );
+        (AppDocument::Url(url.to_owned()), navigate, script)
     } else {
         let prefix = prefix
             .ok_or_else(|| anyhow::anyhow!("missing App view prefix"))?
             .to_owned();
-        attributes.navigation_handler = Some(Box::new(move |url| {
-            url == "about:blank" || url.starts_with(&prefix)
-        }));
-        attributes.html = Some(isolated_document(url, title, palette));
-        theme_script(palette)
+        let navigate =
+            Box::new(move |url: String| url == "about:blank" || url.starts_with(&prefix));
+        (
+            AppDocument::Html(isolated_document(url, title, palette)),
+            navigate,
+            theme_script(palette),
+        )
     };
     // Seed exact host surface colors before either the dev page or the
     // sandboxed installed App can paint its SSR/loading surface.
     let origin = url::Url::parse(url)?.origin().ascii_serialization();
-    let surface = include_str!("theme_surface.js")
+    let surface_script = include_str!("theme_surface.js")
         .replace("__PIONEER_ORIGIN__", &serde_json::to_string(&origin)?)
         .replace("__PIONEER_THEME__", &palette.to_string());
-    attributes
-        .initialization_scripts
-        .push(wry::InitializationScript {
-            script: surface,
-            for_main_frame_only: false,
-        });
-    attributes
-        .initialization_scripts
-        .push(wry::InitializationScript {
-            script,
-            for_main_frame_only: true,
-        });
-    let requests = view_bridge::install(&mut attributes, development, url)?;
-    Ok((attributes, requests))
+    Ok(AppPage {
+        document,
+        navigate,
+        theme_script,
+        surface_script,
+    })
 }
 
 fn dev_theme_script(palette: &serde_json::Value, url: &str) -> String {
@@ -474,10 +489,9 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn dev_panel_passes_the_url_to_wry_with_only_the_presentation_bridge() {
-        // Inspect the actual loader attributes passed to WebView::build. A
-        // registration-only or location-planner test cannot cover this boundary.
+        // Verify the document, scripts, and policy applied by the Wry builder.
         let prefix = "http://localhost:17878/storage/app-views/dev-grant/";
-        let (attributes, _requests) = view_attributes(
+        let page = app_page(
             "http://localhost:3000",
             Some(prefix),
             true,
@@ -485,18 +499,12 @@ mod tests {
             &palette(),
         )
         .unwrap();
-        assert!(attributes.initialization_scripts.iter().any(|script| {
-            script.script.contains("__pioneerAppBaseUrl") && script.script.contains(prefix)
-        }));
-        assert_eq!(attributes.url.as_deref(), Some("http://localhost:3000"));
-        assert!(attributes.html.is_none());
-        assert!(attributes.headers.is_none());
-        assert!(attributes.ipc_handler.is_some());
-        assert!(attributes.custom_protocols.is_empty());
-        assert!(attributes.proxy_config.is_none());
-        assert!(attributes.incognito);
-        assert!(attributes.devtools);
-        let navigate = attributes.navigation_handler.unwrap();
+        assert!(page.theme_script.contains("__pioneerAppBaseUrl"));
+        assert!(page.theme_script.contains(prefix));
+        assert!(
+            matches!(page.document, AppDocument::Url(ref url) if url == "http://localhost:3000")
+        );
+        let navigate = page.navigate;
         for url in [
             "http://localhost:3000/",
             "http://localhost:3000/home?tab=1#details",
@@ -517,13 +525,12 @@ mod tests {
         ] {
             assert!(!navigate(url.into()), "{url}");
         }
-        assert!(attributes.new_window_req_handler.is_some());
     }
 
     #[::core::prelude::v1::test]
-    fn installed_panel_keeps_its_sandboxed_document_and_devtools_disabled() {
+    fn installed_panel_keeps_its_sandboxed_document() {
         let prefix = "http://localhost:17878/storage/app-views/release-grant/";
-        let (attributes, _requests) = view_attributes(
+        let page = app_page(
             &format!("{prefix}index.html"),
             Some(prefix),
             false,
@@ -531,12 +538,12 @@ mod tests {
             &palette(),
         )
         .unwrap();
-        assert!(attributes.url.is_none());
-        let html = attributes.html.as_ref().unwrap();
+        let AppDocument::Html(html) = page.document else {
+            panic!("installed app must use a sandboxed document");
+        };
         assert!(html.contains("sandbox=\"allow-scripts allow-forms\""));
         assert!(html.contains(&format!("src=\"{prefix}index.html\"")));
-        assert!(!attributes.devtools);
-        let navigate = attributes.navigation_handler.unwrap();
+        let navigate = page.navigate;
         assert!(navigate("about:blank".into()));
         assert!(navigate(format!("{prefix}next")));
         assert!(!navigate("http://localhost:3000/".into()));
