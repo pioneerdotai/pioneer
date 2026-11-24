@@ -11367,7 +11367,8 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Task.tool_names(),
             [
-                "threads_start_options",
+                "task_start_options",
+                "task_identity_models_list",
                 "task_create",
                 "task_wait",
                 "task_result",

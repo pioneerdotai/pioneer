@@ -7468,7 +7468,8 @@ impl MessageProcessor {
                     crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                         &tool.server_installation_id,
                     ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks)
-                        && tool.raw_tool_name != "threads_start_options"
+                        && !crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                            .is_launch_catalog(&tool.raw_tool_name)
                 }) {
             Some(TurnItem::AgentMessage {
                 id: pioneer_crud::canonical_agent_id(

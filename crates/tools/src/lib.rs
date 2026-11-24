@@ -46,8 +46,9 @@ pub use context::{
 pub use domain::{
     ARTIFACT_DOMAIN_TOOL_NAMES, BUILTIN_TOOL_DOMAIN_MAP, BuiltinToolDomain,
     COMPUTER_USE_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, REQUEST_TOOLS_DOMAIN_VALUES,
-    TASK_DOMAIN_TOOL_NAMES, THREADS_DOMAIN_TOOL_NAMES, builtin_tool_domain_map,
-    builtin_tool_domain_names, registered_domain_tool_names,
+    TASK_DOMAIN_TOOL_NAMES, TASK_IDENTITY_MODELS_LIST_TOOL, TASK_START_OPTIONS_TOOL,
+    THREADS_DOMAIN_TOOL_NAMES, builtin_tool_domain_map, builtin_tool_domain_names,
+    registered_domain_tool_names, task_launch_catalog_alias,
 };
 pub use error::ToolError;
 pub use events::{
@@ -112,6 +113,7 @@ pub use permissions::{
     PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
     PermissionRequestKey, PermissionRequestScope, ProfileToolPermissionEvaluator,
     StaticPermissionApprovalBroker, ToolPermissionEvaluator, extract_permission_intent,
+    policy_denies_tool_name,
 };
 pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_process_cwd};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
