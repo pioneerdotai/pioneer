@@ -1688,6 +1688,10 @@ mod tests {
         for (operations, explicit) in [
             (vec![], false),
             (vec!["threads_start_options"], false),
+            (
+                vec!["task_start_options", "task_identity_models_list"],
+                false,
+            ),
             (vec!["threads_list", "threads_start_options"], false),
             (vec![], true),
         ] {

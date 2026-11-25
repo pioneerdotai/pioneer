@@ -187,7 +187,11 @@ fn assert_continuation_prompt_contract(compiled: &CompiledPromptBundle) {
     assert!(compiled.full_system_text.contains("apply_patch"));
     assert!(!compiled.full_system_text.contains("write_file"));
     assert!(!compiled.full_system_text.contains("edit_file"));
-    assert!(compiled.full_system_text.contains("call request_tools"));
+    assert!(
+        compiled
+            .full_system_text
+            .contains("Call request_tools to open a domain.")
+    );
     assert!(
         !compiled
             .full_system_text
@@ -425,13 +429,13 @@ section_ids:
 - recovery_continuation
 
 ## Hidden Tool Domains
-For hidden tools, call request_tools to open a domain.
-Shared tools open with any listed domain.
+Call request_tools to open a domain.
+Open shared tools through any listed domain.
 
 Domains:
 - threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_run_now, task_pause, task_resume.
+- task: task_start_options, task_identity_models_list, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_run_now, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 
@@ -492,13 +496,13 @@ section_ids:
 - recovery_continuation
 
 ## Hidden Tool Domains
-For hidden tools, call request_tools to open a domain.
-Shared tools open with any listed domain.
+Call request_tools to open a domain.
+Open shared tools through any listed domain.
 
 Domains:
 - threads: threads_tools_result_read, threads_list, threads_history_read, threads_search, threads_children_list, threads_start_options, threads_identity_models_list, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_run_now, task_pause, task_resume.
+- task: task_start_options, task_identity_models_list, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_finish, task_update, task_detach, task_list, task_get, task_reschedule, task_run_now, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: cua_click, cua_clipboard_read, cua_clipboard_write, cua_drag, cua_get_cursor_position, cua_get_desktop_state, cua_get_screen_size, cua_get_window_state, cua_hotkey, cua_invoke_menu, cua_list_apps, cua_list_windows, cua_press_key, cua_scroll, cua_set_window_frame, cua_type_text, cua_verify_state, cua_get_browser_state, cua_browser_prepare, cua_browser_navigate, cua_browser_click, cua_browser_type, cua_browser_select, cua_browser_dialog, cua_browser_set_input_files.
 

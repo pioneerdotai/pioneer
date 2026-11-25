@@ -3154,29 +3154,32 @@ pub(crate) async fn materialize_with_proof(
     let mut bundle = ToolExtensionBundle::default();
     for entry in catalog {
         let name = entry.name.as_str().to_owned();
-        bundle
-            .specs
-            .push(ConfiguredToolSpec::with_output_projection(
-                ToolSpec::new(
-                    name.clone(),
-                    entry.description,
-                    entry.parameters,
-                    PayloadKind::Function,
-                )
-                .with_recovery(agent_tool_recovery(entry.name)),
-                ExecutionClass::Shared,
-                dynamic_unknown_output_policy(),
-                pioneer_tools::ToolOutputProjectionKind::DynamicGeneric,
-            ));
-        bundle.handlers.push((
-            name,
-            Arc::new(AgentActionToolHandler {
-                adapter: adapter.clone(),
-                tool: entry.name,
-                processor: Arc::downgrade(&processor),
-                context: context.clone(),
-            }) as Arc<dyn ToolHandler>,
-        ));
+        let spec = ConfiguredToolSpec::with_output_projection(
+            ToolSpec::new(
+                name.clone(),
+                entry.description,
+                entry.parameters,
+                PayloadKind::Function,
+            )
+            .with_recovery(agent_tool_recovery(entry.name)),
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+            pioneer_tools::ToolOutputProjectionKind::DynamicGeneric,
+        );
+        let handler: Arc<dyn ToolHandler> = Arc::new(AgentActionToolHandler {
+            adapter: adapter.clone(),
+            tool: entry.name,
+            processor: Arc::downgrade(&processor),
+            context: context.clone(),
+        });
+        if let Some(alias) = pioneer_tools::task_launch_catalog_alias(&name) {
+            let mut alias_spec = spec.clone();
+            alias_spec.spec.name = alias.to_owned();
+            bundle.specs.push(alias_spec);
+            bundle.handlers.push((alias.to_owned(), handler.clone()));
+        }
+        bundle.specs.push(spec);
+        bundle.handlers.push((name, handler));
     }
 
     Ok(pioneer_agent::TurnToolMaterialization {
