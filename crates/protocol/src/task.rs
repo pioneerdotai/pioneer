@@ -1429,15 +1429,7 @@ impl TaskRunTurn {
         if turn_id == initial {
             return Some(0);
         }
-        let (attempt, source) = turn_id
-            .strip_prefix("revision_retry_")
-            .or_else(|| turn_id.strip_prefix("revision_manual_retry_"))?
-            .split_once('_')?;
-        if source != initial {
-            return None;
-        }
-        let attempt = attempt.parse().ok()?;
-        (attempt > 0).then_some(attempt)
+        parse_revision_retry(turn_id, initial).map(|(attempt, _)| attempt)
     }
 
     pub fn is_retried_revision_execution(&self) -> bool {
@@ -1446,20 +1438,50 @@ impl TaskRunTurn {
     }
 
     pub fn is_manual_revision_retry(&self) -> bool {
-        self.turn_id.starts_with("revision_manual_retry_")
-            && self.revision_execution_retry(&self.turn_id).is_some()
+        self.kind == TaskRunTurnKind::Revision
+            && self.id.strip_prefix("trt_").is_some_and(|initial| {
+                parse_revision_retry(&self.turn_id, initial)
+                    .is_some_and(|(_, automatic)| !automatic)
+            })
     }
 
     pub fn revision_retry_turn_id(&self, retry: u32, automatic: bool) -> Option<String> {
-        let initial = self.id.strip_prefix("trt_")?;
         self.revision_execution_retry(&self.turn_id)?;
-        let label = if automatic {
-            "revision_retry"
-        } else {
-            "revision_manual_retry"
-        };
-        Some(format!("{label}_{retry}_{initial}"))
+        let initial = self.id.strip_prefix("trt_")?;
+        (retry > 0).then(|| stable_revision_retry_turn_id(initial, retry, automatic))
     }
+}
+
+fn stable_revision_retry_turn_id(initial: &str, retry: u32, automatic: bool) -> String {
+    let mode = if automatic { 'a' } else { 'm' };
+    let prefix = format!("rr1_{mode}_{retry:08x}_");
+    crate::stable_derived_id(&prefix, &[initial])
+}
+
+fn parse_revision_retry(turn_id: &str, initial: &str) -> Option<(u32, bool)> {
+    if let Some(rest) = turn_id.strip_prefix("rr1_") {
+        let (mode, rest) = rest.split_once('_')?;
+        let automatic = match mode {
+            "a" => true,
+            "m" => false,
+            _ => return None,
+        };
+        let (attempt, _) = rest.split_once('_')?;
+        let attempt = u32::from_str_radix(attempt, 16).ok()?;
+        return (attempt > 0
+            && stable_revision_retry_turn_id(initial, attempt, automatic) == turn_id)
+            .then_some((attempt, automatic));
+    }
+
+    // Older retry IDs carry the original conversation Turn ID verbatim.
+    let (rest, automatic) = if let Some(rest) = turn_id.strip_prefix("revision_retry_") {
+        (rest, true)
+    } else {
+        (turn_id.strip_prefix("revision_manual_retry_")?, false)
+    };
+    let (attempt, source) = rest.split_once('_')?;
+    let attempt = attempt.parse().ok()?;
+    (source == initial && attempt > 0).then_some((attempt, automatic))
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
