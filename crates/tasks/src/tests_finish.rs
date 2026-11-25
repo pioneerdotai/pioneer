@@ -410,6 +410,7 @@ async fn finish_idle_creates_no_result_and_cannot_be_undone_by_resume_update_or_
                 .resume_task(
                     TaskMutationContext::default(),
                     TaskResumeParams {
+                        retry_revision_turn_id: None,
                         task_id: created.task.id.clone(),
                         reason: None,
                     }

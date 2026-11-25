@@ -115,6 +115,21 @@ pub(super) async fn exact_agent_execution_author(
     Ok(presentation.to_turn_author_snapshot())
 }
 
+async fn task_revision_graph_authority(
+    processor: &MessageProcessor,
+    execution_id: &str,
+) -> Result<String> {
+    // The graph uses the original admission identity. The new Turn receives
+    // its own current, revalidated authorization below.
+    Ok(pioneer_crud::load_agent_execution(
+        &processor.crud_store.database_connection(),
+        execution_id,
+    )
+    .await?
+    .context("revision execution has no original graph admission")?
+    .authorization_context_fingerprint)
+}
+
 async fn agent_turn_response_input(
     processor: &Arc<MessageProcessor>,
     turn_id: &str,
@@ -1252,6 +1267,14 @@ async fn restore_task_agent_action_binding(
         bail!("Task launch selection was not resolved at create/schedule commit")
     })
     .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RevisionRetryOutcome {
+    Admitted,
+    Busy,
+    Obsolete,
+    Rejected(pioneer_protocol::TaskRevisionRetryBlocker),
 }
 
 #[derive(Debug, Clone)]
@@ -3162,7 +3185,9 @@ impl TaskAgentExecutor {
         let dispatched = message_fresh_task(async move {
             // The snapshot/handle above are authoritative for all remaining
             // admission phases, including ordinary authority and lock errors.
-            handle.pin_agent_attempt(&execution.id).await?;
+            if !child_runtime.task_run_turn.is_retried_revision_execution() {
+                handle.pin_agent_attempt(&execution.id).await?;
+            }
             let authority_processor = Arc::clone(&revision_processor);
             let authority_task_response = task_response.clone();
             let root_still_has_authority = message_fresh_task(async move {
@@ -3521,6 +3546,45 @@ impl TaskAgentExecutor {
             .context("failed to resolve revision CLI execution authorization")?;
             let child_authorization_context = child_authorization.context;
             let child_authorization_revalidation = child_authorization.revalidation;
+            let (action_adapter, action_options, action_capabilities) =
+                if child_runtime.task_run_turn.is_retried_revision_execution() {
+                    let original_authority =
+                        task_revision_graph_authority(processor, &execution.id).await?;
+                    let graph = persist_task_agent_execution_graph(
+                        processor,
+                        task_response,
+                        run,
+                        agent_spec,
+                        &parent,
+                        &action_facts,
+                        &original_authority,
+                    )
+                    .await?;
+                    if graph.queued {
+                        return Ok(());
+                    }
+                    handle.pin_agent_attempt(&execution.id).await?;
+                    // Restore again after the durable resource attempt
+                    // advances. The old adapter carries the previous fence.
+                    let (mut adapter, options, capabilities) =
+                        materialize_task_agent_action_binding_for_execution(
+                            processor,
+                            task,
+                            agent_spec,
+                            &execution.id,
+                            &run.id,
+                            &parent.root_thread_id,
+                            action_policy_generation,
+                            false,
+                        )
+                        .await?;
+                    bind_existing_task_agent_graph(processor, &run.id, &execution.id, &mut adapter)
+                        .await?;
+                    (adapter, options, capabilities)
+                } else {
+                    (action_adapter, action_options, action_capabilities)
+                };
+
             if frozen_conversation_scope.is_none() {
                 load_task_execution_conversation_scope(
                     processor,
@@ -4437,6 +4501,12 @@ impl TaskAgentExecutor {
                     {
                         bail!("persisted Task CLI binding differs from its pinned profile");
                     }
+                    let graph_authority =
+                        if child_runtime.task_run_turn.is_retried_revision_execution() {
+                            task_revision_graph_authority(processor, &execution.id).await?
+                        } else {
+                            child_authorization_fingerprint
+                        };
                     let graph = persist_task_agent_execution_graph(
                         processor,
                         task_response,
@@ -4444,7 +4514,7 @@ impl TaskAgentExecutor {
                         agent_spec,
                         &parent,
                         &action_facts,
-                        child_authorization_fingerprint.as_str(),
+                        graph_authority.as_str(),
                     )
                     .await
                     .context("failed to restore agent domain task execution graph")?;
@@ -4977,6 +5047,285 @@ impl TaskAgentExecutor {
             .await
     }
 
+    pub(crate) async fn retry_blocked_revision(
+        &self,
+        task_id: &str,
+        turn_id: &str,
+        action: Option<&pioneer_crud::AgentCommitInput>,
+    ) -> Result<pioneer_protocol::TaskResumeResponse> {
+        let processor = self.processor()?;
+        let load = || processor.crud_store.get_task(task_id);
+        let response = load()
+            .await?
+            .context("Task disappeared before revision retry")?;
+        let conflict = || anyhow::Error::new(pioneer_tasks::TaskOperationError::StateConflict);
+        let revision = response
+            .task_run_turns
+            .iter()
+            .find(|revision| revision.revision_execution_retry(turn_id).is_some())
+            .ok_or_else(conflict)?;
+        let requested = revision
+            .revision_execution_retry(turn_id)
+            .ok_or_else(conflict)?;
+        let current = revision
+            .revision_execution_retry(&revision.turn_id)
+            .ok_or_else(conflict)?;
+        if requested > current {
+            return Err(conflict());
+        }
+        let (_, turn) = processor
+            .crud_store
+            .get_turn(&revision.thread_id, turn_id)
+            .await?
+            .ok_or(pioneer_protocol::TaskRevisionRetryBlocker::MissingRevisionTurn)?;
+        let reason = turn.error.as_deref().unwrap_or_default();
+        if turn.status != TurnStatus::Blocked
+            || !pioneer_protocol::is_missing_cli_mcp_activation_block(reason)
+        {
+            return Err(conflict());
+        }
+
+        if revision.turn_id == turn_id {
+            let outcome = Self::retry_settled_revision(
+                &processor,
+                &revision.thread_id,
+                turn_id,
+                reason,
+                false,
+                action,
+            )
+            .await?;
+            if let RevisionRetryOutcome::Rejected(blocker) = outcome {
+                return Err(blocker.into());
+            }
+            if outcome != RevisionRetryOutcome::Admitted {
+                // Another admitted request can win between the read and the
+                // commit. Return its current status, without starting another.
+                let current = load()
+                    .await?
+                    .context("Task disappeared during revision retry")?;
+                if !current
+                    .task_run_turns
+                    .iter()
+                    .any(|current| current.id == revision.id && current.turn_id != turn_id)
+                {
+                    return Err(conflict());
+                }
+                if let Some(action) = action {
+                    processor
+                        .crud_store
+                        .append_task_events_with_agent_action(
+                            Vec::new(),
+                            now_timestamp_secs(),
+                            action.clone(),
+                        )
+                        .await?;
+                }
+            }
+        } else if let Some(action) = action {
+            processor
+                .crud_store
+                .append_task_events_with_agent_action(
+                    Vec::new(),
+                    now_timestamp_secs(),
+                    action.clone(),
+                )
+                .await?;
+        }
+
+        let current = load()
+            .await?
+            .context("Task disappeared after revision retry")?;
+        Ok(pioneer_protocol::TaskResumeResponse {
+            task: current.task,
+            triggers: current.triggers,
+        })
+    }
+
+    async fn retry_settled_revision(
+        processor: &Arc<MessageProcessor>,
+        thread_id: &str,
+        turn_id: &str,
+        reason: &str,
+        automatic: bool,
+        action: Option<&pioneer_crud::AgentCommitInput>,
+    ) -> Result<RevisionRetryOutcome> {
+        use RevisionRetryOutcome::{Admitted, Busy, Obsolete, Rejected};
+        use pioneer_protocol::TaskRevisionRetryBlocker as Blocker;
+        let Some(revision) = processor
+            .crud_store
+            .get_task_run_turn_by_turn(thread_id, turn_id)
+            .await?
+        else {
+            return Ok(Obsolete);
+        };
+        if revision.status != TaskRunTurnStatus::Blocked {
+            return Ok(Obsolete);
+        }
+        let Some(run) = processor.crud_store.get_task_run(&revision.run_id).await? else {
+            return Ok(Obsolete);
+        };
+        if let Some(blocker) = run
+            .error
+            .as_ref()
+            .and_then(|error| Blocker::from_code(&error.code))
+        {
+            return Ok(Rejected(blocker));
+        }
+        let pending = run
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING);
+        if run.status != TaskRunStatus::Blocked || automatic != pending {
+            return Ok(Obsolete);
+        }
+        let Some(task) = processor.crud_store.get_task(&run.task_id).await? else {
+            return Ok(Obsolete);
+        };
+        if let Some(blocker) = processor
+            .crud_store
+            .task_revision_retry_blocker(&task.task, &run, &revision)
+            .await?
+        {
+            return Ok(Rejected(blocker));
+        }
+        let Some(binding) = processor
+            .crud_store
+            .get_cli_runtime_turn_binding_control(turn_id)
+            .await?
+        else {
+            return Ok(Rejected(Blocker::MissingBinding));
+        };
+        if binding.thread_id != thread_id || binding.continuation_thread_id != thread_id {
+            return Ok(Rejected(Blocker::BindingScopeChanged));
+        }
+        if binding.mcp.is_some() || binding.native_turn_id.is_some() {
+            return Ok(Rejected(Blocker::NativeExecutionRecorded));
+        }
+        let Some(transition) = processor
+            .cli_runtime_turn_resume_transition(turn_id)
+            .await?
+        else {
+            return Ok(Rejected(Blocker::MissingBinding));
+        };
+        let transition = Arc::new(transition);
+        // A replay must not close the session of a newer attempt. Check the
+        // exact link again while holding the same gate as the CLI launcher.
+        if processor
+            .crud_store
+            .get_task_run_turn_by_turn(thread_id, turn_id)
+            .await?
+            .as_ref()
+            != Some(&revision)
+        {
+            return Ok(Obsolete);
+        }
+        let Some(manager) = &processor.cli_runtime_manager else {
+            return Ok(Busy);
+        };
+        let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )?;
+        let active = processor
+            .crud_store
+            .list_cli_runtime_turn_binding_controls(pioneer_crud::CliRuntimeTurnBindingListFilter {
+                workspace_id: Some(binding.workspace_id.clone()),
+                runtime_id: Some(binding.runtime_id.clone()),
+                continuation_thread_id: Some(thread_id.to_owned()),
+                statuses: vec!["starting".to_owned(), "running".to_owned()],
+                ..Default::default()
+            })
+            .await?;
+        if active.iter().any(|active| active.turn_id != turn_id) {
+            return Ok(Busy);
+        }
+        if !processor
+            .cleanup_cli_runtime_terminal_turn_status_with_transition(
+                &binding,
+                TurnStatus::Blocked,
+                reason,
+                Some(&transition),
+            )
+            .await
+        {
+            return Ok(Busy);
+        }
+        if processor
+            .cli_runtime_turn_start_blocker_for_thread(&key)
+            .await?
+            .is_some()
+        {
+            return Ok(Busy);
+        }
+        let Some(original) = processor
+            .crud_store
+            .get_task_execution_admission(&run.task_id)
+            .await?
+        else {
+            return Ok(Rejected(Blocker::MissingTaskAdmission));
+        };
+        let Ok(seed) =
+            crate::authorization::ExecutionAuthorizationContext::task_revision_admission_seed(
+                &original,
+            )
+        else {
+            return Ok(Rejected(Blocker::MissingTaskAdmission));
+        };
+        let admission = seed.for_task(&task.task, &task.triggers)?;
+
+        // Ordinary terminal cleanup may only request shutdown if it ran in
+        // the provider callback. Here we must await the owned process drain
+        // before publishing the successor reservation.
+        manager.close_session(&key).await?;
+        let ticket = processor
+            .task_runtime
+            .event_bus()
+            .closing_lifecycle_ticket();
+        let outcome = processor
+            .crud_store
+            .retry_task_revision_execution(
+                thread_id,
+                turn_id,
+                automatic,
+                &admission,
+                now_timestamp_secs(),
+                action,
+            )
+            .await?;
+        if let Some(pioneer_crud::TaskOwnedTurnResumeOutcome::Resumed {
+            observation_sequence,
+            task,
+            run,
+            ..
+        }) = &outcome
+        {
+            processor.task_runtime.event_bus().admit_closing_run(
+                ticket,
+                &task.id,
+                &run.id,
+                *observation_sequence,
+                true,
+            );
+            return Ok(Admitted);
+        }
+        Ok(match outcome {
+            Some(pioneer_crud::TaskOwnedTurnResumeOutcome::RevisionRejected(blocker)) => {
+                Rejected(blocker)
+            }
+            Some(pioneer_crud::TaskOwnedTurnResumeOutcome::RevisionQuotaExhausted(error)) => {
+                if automatic {
+                    Busy
+                } else {
+                    return Err(error.into());
+                }
+            }
+            None => Obsolete,
+            _ => Busy,
+        })
+    }
+
     /// Reopen and dispatch a blocked task child through the native
     /// `TaskExecutor` path.  Generic Turn recovery must not be allowed to
     /// start an actor while TaskRun/execution/locks remain terminal.
@@ -5022,6 +5371,14 @@ impl TaskAgentExecutor {
         };
         let outcome = match outcome {
             pioneer_crud::TaskOwnedTurnResumeOutcome::NotFound => TaskChildResumeOutcome::NotFound,
+            pioneer_crud::TaskOwnedTurnResumeOutcome::RevisionQuotaExhausted(error) => {
+                return Err(error.into());
+            }
+            pioneer_crud::TaskOwnedTurnResumeOutcome::RevisionRejected(blocker) => {
+                TaskChildResumeOutcome::Conflict {
+                    reason: blocker.message().to_owned(),
+                }
+            }
             pioneer_crud::TaskOwnedTurnResumeOutcome::MissingRuntimeSnapshot {
                 recovery_job_id,
             } => TaskChildResumeOutcome::MissingRuntimeSnapshot { recovery_job_id },
@@ -5373,6 +5730,51 @@ impl TaskAgentExecutor {
         else {
             return Ok(true);
         };
+        if child_runtime.task_run_turn.status == TaskRunTurnStatus::Blocked
+            && child_runtime
+                .task_run_turn
+                .revision_execution_retry(turn_id)
+                .is_some()
+            && pioneer_protocol::is_missing_cli_mcp_activation_block(reason)
+        {
+            let Some(run) = processor
+                .crud_store
+                .get_task_run(&child_runtime.task_run_turn.run_id)
+                .await?
+            else {
+                return Ok(true);
+            };
+            if !run
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING)
+            {
+                return Ok(true);
+            }
+            // Live terminal callbacks can still own the CLI transition gate.
+            // The durable child point survives restart and owns the retry.
+            if matches!(origin, TaskChildReconciliationOrigin::DurableBackground) {
+                return match Self::retry_settled_revision(
+                    &processor, thread_id, turn_id, reason, true, None,
+                )
+                .await?
+                {
+                    RevisionRetryOutcome::Admitted | RevisionRetryOutcome::Obsolete => Ok(true),
+                    RevisionRetryOutcome::Busy => Ok(false),
+                    RevisionRetryOutcome::Rejected(blocker) => {
+                        processor
+                            .crud_store
+                            .stop_pending_task_revision_retry(
+                                &child_runtime.task_run_turn,
+                                blocker,
+                                now_timestamp_secs(),
+                            )
+                            .await
+                    }
+                };
+            }
+            return Ok(false);
+        }
         // A terminal run must never enter extraction/execution again. Its
         // retained capsule belongs to the receipt-gated cleanup continuation.
         if let Some(ready) = processor
@@ -6956,7 +7358,7 @@ impl TaskAgentExecutor {
             .with_database_class(PostgresWriteClass::Critical);
         let handle = handle.with_critical_writes();
         let blocked_at = now_timestamp_secs();
-        let error = match start_failure {
+        let mut error = match start_failure {
             Some(descriptor) => {
                 descriptor.task_error(Some(child_runtime.task_run_turn.run_id.clone()))
             }
@@ -6978,6 +7380,46 @@ impl TaskAgentExecutor {
                 error
             }
         };
+        if pioneer_protocol::is_missing_cli_mcp_activation_block(reason)
+            && let Some(retries) = child_runtime
+                .task_run_turn
+                .revision_execution_retry(&child_runtime.task_run_turn.turn_id)
+        {
+            let revision = &child_runtime.task_run_turn;
+            let task = processor
+                .crud_store
+                .get_task_record(&revision.task_id)
+                .await?
+                .context("revision Task disappeared before block")?;
+            let run = processor
+                .crud_store
+                .get_task_run(&revision.run_id)
+                .await?
+                .context("revision run disappeared before block")?;
+            if let Some(blocker) = processor
+                .crud_store
+                .task_revision_retry_blocker(&task, &run, revision)
+                .await?
+            {
+                blocker.apply(&mut error);
+            } else {
+                let automatic = retries < pioneer_protocol::TASK_REVISION_AUTOMATIC_RETRIES
+                    && !revision.is_manual_revision_retry();
+                error.code = if automatic {
+                    pioneer_protocol::TASK_REVISION_RETRY_PENDING
+                } else {
+                    pioneer_protocol::TASK_REVISION_RETRY_REQUIRED
+                }
+                .to_owned();
+                error.message = if automatic {
+                    "CLI recovery lost the MCP activation contract. A fresh revision execution is pending."
+                } else {
+                    "CLI recovery lost the MCP activation contract. The revision requires a manual restart."
+                }.to_owned();
+                error.class = TaskErrorClass::Internal;
+                error.recovery_diagnostic = None;
+            }
+        }
         let block_reason = error
             .recovery_public_message()
             .unwrap_or_else(|| reason.to_owned());
@@ -7038,6 +7480,7 @@ impl TaskAgentExecutor {
             error.details.take(),
         ));
         let message = error.message.clone();
+        let retry_pending = error.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING;
         match status {
             TaskRunTurnStatus::Blocked => {
                 handle
@@ -7047,8 +7490,14 @@ impl TaskAgentExecutor {
                         completed_at,
                     )
                     .await?;
-                mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, &message)
+                if !retry_pending {
+                    mark_task_run_occurrence_turn_blocked(
+                        &processor,
+                        &child_runtime.lineage,
+                        &message,
+                    )
                     .await?;
+                }
             }
             TaskRunTurnStatus::Failed => {
                 handle
@@ -11346,7 +11795,7 @@ async fn materialize_child_task_prompt(
             review_event: &context.review_event,
             additional_instructions: &context.additional_instructions,
         });
-    Ok(TaskRunPromptCompiler::new().compile(TaskRunPromptInput {
+    let mut prompt = TaskRunPromptCompiler::new().compile(TaskRunPromptInput {
         task: &task_response.task,
         run,
         trigger,
@@ -11356,7 +11805,11 @@ async fn materialize_child_task_prompt(
         output_instructions: agent_spec.prompt.output_instructions.as_deref(),
         effective_permission_profile,
         revision,
-    }))
+    });
+    if task_run_turn.is_some_and(TaskRunTurn::is_retried_revision_execution) {
+        prompt.push_str("\n\nThis is a fresh execution of the same revision. First inspect the existing worktree, including staged, unstaged and untracked changes. Preserve partial work and continue from the actual diff.");
+    }
+    Ok(prompt)
 }
 
 fn materialize_child_task_input(prompt: String, agent_spec: &TaskAgentSpec) -> Vec<UserInput> {

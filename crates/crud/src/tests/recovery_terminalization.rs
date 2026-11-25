@@ -12,11 +12,13 @@ async fn recovery_diagnostic_rolls_back_with_outbox_and_survives_restart() {
 #[tokio::test]
 async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_restart() {
     pioneer_postgres_test::with_database(async |fixture| {
+        let turn_id = format!("revise_{}_3", "x".repeat(117));
+        assert_eq!(turn_id.len(), 126);
         let (store, _, _) = postgres_store_with_started_turn(
             fixture,
             "ws_recovery_terminal_outbox",
             "thr_recovery_terminal_outbox",
-            "turn_recovery_outbox",
+            &turn_id,
         )
         .await;
         store
@@ -24,7 +26,7 @@ async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_rest
                 ItemStartedNotification {
                     workspace_id: "ws_recovery_terminal_outbox".to_owned(),
                     thread_id: "thr_recovery_terminal_outbox".to_owned(),
-                    turn_id: "turn_recovery_outbox".to_owned(),
+                    turn_id: turn_id.clone(),
                     item: safe_web_fetch_item("tool_recovery_outbox"),
                 },
                 1_700_000_001,
@@ -33,7 +35,7 @@ async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_rest
             .expect("tool item should start");
         let job = store
             .enqueue_recovery_job(
-                "turn_recovery_outbox".to_owned(),
+                turn_id.clone(),
                 "tool_recovery_outbox".to_owned(),
                 TurnItemType::WebFetch,
                 None,
@@ -96,12 +98,17 @@ async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_rest
             .records;
         assert_eq!(cleanup.len(), 1);
         assert_eq!(cleanup[0].runtime_generation, 77);
+        let unbounded_effect_id = format!("{turn_id}:terminal-effect:attached-task-cleanup");
+        assert!(unbounded_effect_id.len() > 128);
+        let effect_id =
+            pioneer_protocol::NativeTerminalEffectPreparation::bounded_id(unbounded_effect_id);
+        assert_eq!(cleanup[0].effect_id, effect_id);
         assert!(matches!(
             cleanup[0].payload,
             pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup { .. }
         ));
         let (_, terminal) = restarted
-            .get_turn("thr_recovery_terminal_outbox", "turn_recovery_outbox")
+            .get_turn("thr_recovery_terminal_outbox", &turn_id)
             .await
             .expect("turn lookup should succeed")
             .expect("turn should exist");
@@ -109,7 +116,7 @@ async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_rest
         assert_eq!(terminal.error.as_deref(), Some("Recovery failed."));
         assert!(
             restarted
-                .get_failed_turn_recovery_diagnostic("turn_recovery_outbox")
+                .get_failed_turn_recovery_diagnostic(&turn_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -117,7 +124,7 @@ async fn terminal_recovery_job_outbox_atomically_closes_item_and_turn_after_rest
 
         let item = pioneer_crud_conversations::turn_reads::find_turn_item(
             &restarted.connection,
-            "turn_recovery_outbox",
+            &turn_id,
             "tool_recovery_outbox",
         )
         .await

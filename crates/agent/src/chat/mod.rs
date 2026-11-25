@@ -11367,7 +11367,8 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Task.tool_names(),
             [
-                "threads_start_options",
+                "task_start_options",
+                "task_identity_models_list",
                 "task_create",
                 "task_wait",
                 "task_result",
@@ -12728,7 +12729,7 @@ mod tests {
             assert!(
                 plan.bundle
                     .dynamic_system_text
-                    .contains("call request_tools"),
+                    .contains("Call request_tools to open a domain."),
                 "tool-enabled instructions must explain how to open hidden domains"
             );
             for (domain, tool_names) in pioneer_tools::builtin_tool_domain_map() {

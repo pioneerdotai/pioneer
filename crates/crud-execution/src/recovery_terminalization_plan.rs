@@ -21,7 +21,9 @@ use pioneer_crud_conversations::{
     turn_payload, turn_reads as turn,
 };
 use pioneer_postgres_pools::PostgresDatabase;
-use pioneer_protocol::{RecoveryJobStatus, ToolCallStatus, Turn, TurnItem, TurnStatus};
+use pioneer_protocol::{
+    NativeTerminalEffectPreparation, RecoveryJobStatus, ToolCallStatus, Turn, TurnItem, TurnStatus,
+};
 use sea_orm::{EntityTrait, entity::prelude::DateTimeWithTimeZone};
 use std::future::Future;
 
@@ -225,34 +227,36 @@ where
     };
     let already_terminal = current_status == desired_status;
     let cleanup_reason = terminal_error.chars().take(4_096).collect::<String>();
-    let terminal_effects = native_terminal_effect_outbox::prepare_input(
-        pioneer_protocol::NativeTerminalEffectPreparation {
-            batch_id: format!(
-                "{}:terminal-effects:recovery:{}",
-                record.turn_id, cleanup_plan.runtime_generation
-            ),
-            workspace_id: thread_model.workspace_id.clone(),
-            thread_id: turn_model.thread_id.clone(),
-            turn_id: record.turn_id.clone(),
-            runtime_generation: cleanup_plan.runtime_generation,
-            effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
-                effect_id: format!("{}:terminal-effect:attached-task-cleanup", record.turn_id),
-                effect_kind: pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup,
-                gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
-                payload: pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
-                    reason: cleanup_reason,
-                    runtime_contract: cleanup_plan.runtime_contract.clone(),
-                },
-                max_attempts: 5,
-            }],
-        },
-    )
-    .map_err(|error| {
-        permanent_recovery_terminalization_error(
-            "invalid_terminal_cleanup_plan",
-            format!("failed to prepare recovery terminal cleanup: {error:#}"),
-        )
-    })?;
+    let cleanup_preparation = NativeTerminalEffectPreparation {
+        batch_id: NativeTerminalEffectPreparation::bounded_id(format!(
+            "{}:terminal-effects:recovery:{}",
+            record.turn_id, cleanup_plan.runtime_generation
+        )),
+        workspace_id: thread_model.workspace_id.clone(),
+        thread_id: turn_model.thread_id.clone(),
+        turn_id: record.turn_id.clone(),
+        runtime_generation: cleanup_plan.runtime_generation,
+        effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+            effect_id: NativeTerminalEffectPreparation::bounded_id(format!(
+                "{}:terminal-effect:attached-task-cleanup",
+                record.turn_id
+            )),
+            effect_kind: pioneer_protocol::NativeTerminalEffectKind::AttachedTaskCleanup,
+            gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+            payload: pioneer_protocol::NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: cleanup_reason,
+                runtime_contract: cleanup_plan.runtime_contract.clone(),
+            },
+            max_attempts: 5,
+        }],
+    };
+    let terminal_effects = native_terminal_effect_outbox::prepare_input(cleanup_preparation)
+        .map_err(|error| {
+            permanent_recovery_terminalization_error(
+                "invalid_terminal_cleanup_plan",
+                format!("failed to prepare recovery terminal cleanup: {error:#}"),
+            )
+        })?;
     let terminal_turn = if already_terminal {
         // An older Gateway may have committed the terminal Turn before
         // consuming this outbox row. No new terminal event is needed, so

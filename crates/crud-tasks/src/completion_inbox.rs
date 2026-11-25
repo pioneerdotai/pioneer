@@ -600,6 +600,15 @@ fn relation_with_access(
                 .map(task_run_status_to_db),
             ),
         )
+        // A blocked physical attempt can still lead to a new result for
+        // this run ID. Every inbox read and receipt must wait for settlement.
+        .and_where(
+            crate::projection::pending_revision_retry_predicate(
+                Expr::col((A::Run, task_run::Column::Status)),
+                Expr::col((A::Run, task_run::Column::ErrorJson)),
+            )
+            .not(),
+        )
         .and_where(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
         .cond_where(access_condition(access, unread_access))
         .and_where(internal_completion().not());

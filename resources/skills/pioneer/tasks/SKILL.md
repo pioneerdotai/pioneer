@@ -3,7 +3,7 @@ name: tasks
 slug: tasks
 owner: pioneer
 description: "Use this skill when Pioneer should create, inspect, update, reschedule, pause, resume, finish, cancel, troubleshoot, or configure delivery for durable tasks, scheduled tasks, recurring tasks, interval tasks, cron jobs, background work, or existing task state."
-version: "0.1.4"
+version: "0.1.5"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -17,6 +17,11 @@ Durable tasks are product objects that can outlive the current turn. They have t
 When observing a task with `task_get`, distinguish task, run, and execution status. A `running` run is unfinished; no result or unchanged `updatedAt` does not prove a stall. The execution heartbeat is periodic liveness, while `lastActivityAt` is confirmed activity only when recorded. Missing activity is unknown. Do not cancel or repeat work solely because it is taking time or repeated observations are unchanged. A `task_wait` timeout ends only that wait window and permits another wait for active attached work.
 
 Use this skill for future, recurring, background, or already-existing task work. For attached child agents created to help with the current turn, read `system:pioneer/subagents` instead.
+
+If a review revision loses its MCP session before execution starts, inspect
+`task_get.revisionExecutions` for the affected run and round. Wait while
+`automaticRetryPending` is true. When `requiresIntervention` is true, follow
+[Retry a blocked revision](references/tool-schemas.md#retry-a-blocked-revision).
 
 ## Product Model
 
@@ -78,7 +83,7 @@ If a needed task tool is hidden and `request_tools` is visible, request the task
 
 Do not request individual task tool names. Request the `task` domain.
 
-The `task` domain also exposes `threads_start_options`; opening `threads` separately is unnecessary to inspect task launch options. Call it when you need to choose an identity, execution profile, or permitted destination explicitly. For a task that inherits the parent's identity and profile in the current execution, omit `launch` and `targetOptionId`; no preliminary options call is required. Options do not grant permission to create or run a task. See `references/tool-schemas.md` for the exact fields.
+The `task` domain exposes both launch catalogs. Use `task_start_options` for identities, compatible profiles, or destinations. For direct selection, call `task_identity_models_list` with an admitted identity ID to find the provider or CLI runtime, model, and reasoning options. To inherit the current execution's launch settings and use the default destination, omit `launch` and `targetOptionId` and skip both catalogs. See `references/tool-schemas.md` for the exact fields and authorization rules.
 
 If the task domain cannot be opened, do not pretend the task was created, updated, rescheduled, paused, resumed, finished, cancelled, or inspected.
 

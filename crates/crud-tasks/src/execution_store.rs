@@ -786,6 +786,31 @@ impl TaskExecutionStore<'_> {
         let released_at = chrono::Utc::now().fixed_offset();
         let mut released = 0usize;
         for lease in leases {
+            if lease.subject_kind == "task" {
+                let tx = self.connection.begin().await?;
+                // Task terminalization and readmission use this same row
+                // lock. A stale observation cannot release a reacquired slot.
+                let terminal_or_missing =
+                    pioneer_entity::task::Entity::find_by_id(&lease.subject_id)
+                        .lock_exclusive()
+                        .one(&tx)
+                        .await?
+                        .is_none_or(|task| {
+                            task_status_from_db(task.status.as_str())
+                                .is_none_or(|status| status.is_terminal())
+                        });
+                let changed = terminal_or_missing
+                    && execution_admission_lease::release_by_subject(
+                        &tx,
+                        "task",
+                        &lease.subject_id,
+                        released_at,
+                    )
+                    .await?;
+                tx.commit().await?;
+                released += usize::from(changed);
+                continue;
+            }
             let terminal_or_missing = match lease.subject_kind.as_str() {
                 "turn" => pioneer_entity::turn::Entity::find_by_id(lease.subject_id.clone())
                     .one(self.connection)
@@ -793,13 +818,6 @@ impl TaskExecutionStore<'_> {
                     .is_none_or(|turn| {
                         turn_status_from_db(turn.status.as_str())
                             .is_none_or(|status| status != TurnStatus::InProgress)
-                    }),
-                "task" => pioneer_entity::task::Entity::find_by_id(lease.subject_id.clone())
-                    .one(self.connection)
-                    .await?
-                    .is_none_or(|task| {
-                        task_status_from_db(task.status.as_str())
-                            .is_none_or(|status| status.is_terminal())
                     }),
                 _ => true,
             };

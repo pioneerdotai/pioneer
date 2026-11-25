@@ -86,7 +86,7 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             || !bindings.is_empty()
         {
             return Err(invalid(anyhow!(
-                "CLI recovery has frozen MCP tools but no activated MCP session contract"
+                pioneer_protocol::CLI_MCP_ACTIVATION_CONTRACT_MISSING
             )));
         }
         return Ok(CliMcpSessionLaunch::Disabled);

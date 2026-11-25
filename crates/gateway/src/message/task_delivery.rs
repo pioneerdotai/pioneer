@@ -1022,13 +1022,17 @@ impl MessageProcessor {
                 )
                 .await?;
             if workspace_id != delivery.workspace_id
-                || match (&public_failure, &item) {
-                    (Some(error), None) => {
+                || match (delivery.error_snapshot.as_ref(), &public_failure, &item) {
+                    (Some(error), Some(message), None) => {
                         existing_turn.status != pioneer_protocol::TurnStatus::Failed
-                            || existing_turn.error.as_deref() != Some(error.as_str())
+                            || !matches_saved_task_delivery_failure(
+                                error,
+                                message,
+                                existing_turn.error.as_deref(),
+                            )
                             || existing_item.is_some()
                     }
-                    (None, Some(item)) => {
+                    (None, None, Some(item)) => {
                         existing_turn.status != pioneer_protocol::TurnStatus::Completed
                             || existing_turn.error.is_some()
                             || existing_item.as_ref() != Some(item)
@@ -1651,6 +1655,23 @@ fn delivery_result_item(delivery: &TaskDelivery) -> TurnItem {
 }
 
 fn task_delivery_failure_message(error: &pioneer_protocol::TaskError) -> String {
+    crate::task_projection::task_failure_detail(error)
+        .unwrap_or_else(|| legacy_task_delivery_failure_message(error))
+}
+
+fn matches_saved_task_delivery_failure(
+    error: &pioneer_protocol::TaskError,
+    current: &str,
+    saved: Option<&str>,
+) -> bool {
+    // A destination commit can outlive its acknowledgement and a Gateway upgrade.
+    // Accept the exact previous rendering for this immutable error snapshot.
+    saved.is_some_and(|saved| {
+        saved == current || saved == legacy_task_delivery_failure_message(error)
+    })
+}
+
+fn legacy_task_delivery_failure_message(error: &pioneer_protocol::TaskError) -> String {
     if let Some(message) = error.recovery_public_message() {
         return message;
     }
@@ -1725,6 +1746,50 @@ fn is_private_ip(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod recovery_failure_tests {
+    #[test]
+    fn revision_failure_delivery_uses_public_detail_and_replays_the_legacy_turn() {
+        use pioneer_protocol::{
+            TASK_REVISION_RETRY_REQUIRED, TaskError, TaskErrorClass, TaskRevisionRetryBlocker,
+        };
+
+        for (code, allows_restart) in [
+            (TASK_REVISION_RETRY_REQUIRED, true),
+            (TaskRevisionRetryBlocker::MissingBinding.code(), false),
+        ] {
+            let error = TaskError {
+                code: code.to_owned(),
+                message: "private response /secret".to_owned(),
+                class: TaskErrorClass::Internal,
+                details: None,
+                failed_run_id: None,
+                recovery_diagnostic: None,
+            };
+            let message = super::task_delivery_failure_message(&error);
+            assert_eq!(
+                message,
+                crate::task_projection::project_error(&error).error.message
+            );
+            assert_eq!(message.contains("task_resume"), allows_restart);
+            assert!(!message.contains("/secret"));
+            for saved in [message.as_str(), "Scheduled task failed."] {
+                assert!(super::matches_saved_task_delivery_failure(
+                    &error,
+                    &message,
+                    Some(saved)
+                ));
+            }
+            for saved in [
+                None,
+                Some("Scheduled task could not start."),
+                Some(error.message.as_str()),
+            ] {
+                assert!(!super::matches_saved_task_delivery_failure(
+                    &error, &message, saved
+                ));
+            }
+        }
+    }
+
     #[test]
     fn existing_delivery_turn_uses_typed_recovery_reason_and_keeps_fallback() {
         let mut error = pioneer_protocol::TaskError {

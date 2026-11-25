@@ -25,6 +25,48 @@ pub struct TaskExecutionAdmissionSeed {
     pub task_resources: pioneer_protocol::TaskResourceBudget,
 }
 
+impl TaskExecutionAdmissionSeed {
+    pub fn for_task(
+        self,
+        task: &pioneer_protocol::Task,
+        triggers: &[pioneer_protocol::TaskTrigger],
+    ) -> crate::TaskRuntimeResult<pioneer_crud::NewTaskExecutionAdmission> {
+        let seed = self;
+        if seed.workspace_id != task.workspace_id {
+            anyhow::bail!("Task execution admission belongs to another workspace");
+        }
+        let scheduled = triggers.iter().any(|trigger| {
+            matches!(
+                trigger.kind(),
+                TaskTriggerKind::ScheduledAt | TaskTriggerKind::Interval | TaskTriggerKind::Cron
+            ) || is_webhook_spec(&trigger.spec)
+        });
+        Ok(pioneer_crud::NewTaskExecutionAdmission {
+            task_id: task.id.clone(),
+            workspace_id: seed.workspace_id,
+            root_thread_id: seed.root_thread_id,
+            initiating_principal_id: seed.initiating_principal_id.clone(),
+            authorization_context_json: seed.authorization_context_json,
+            created_at: chrono::Utc::now().fixed_offset(),
+            execution_lease: Some(pioneer_crud::NewExecutionAdmissionLease {
+                id: format!("quota:task:{}", task.id),
+                subject_kind: "task".to_owned(),
+                subject_id: task.id.clone(),
+                operation_class: if scheduled {
+                    pioneer_crud::ExecutionAdmissionClass::ScheduledTask
+                } else {
+                    pioneer_crud::ExecutionAdmissionClass::QueuedTask
+                },
+                principal_id: seed.initiating_principal_id,
+                role_key: seed.role_key,
+                workspace_id: task.workspace_id.clone(),
+                policy_fingerprint: seed.policy_fingerprint,
+                policy: seed.execution_resources,
+            }),
+        })
+    }
+}
+
 /// Immutable Agent authorization ceiling captured together with a resolved
 /// Task launch.  The Tasks layer persists this opaque security snapshot; only
 /// Gateway derives or revalidates its fingerprint against the role registry.

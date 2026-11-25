@@ -1,11 +1,17 @@
 //! Execution revision, tariff, journal and restart regressions on PostgreSQL.
 use migration::{Migrator, MigratorTrait};
+use pioneer_crud_conversations::events::TurnEventPayload;
 use pioneer_crud_execution::execution_observability::{
-    ExecutionObservationInput, ExecutionObservationRepository,
+    ExecutionObservationInput, ExecutionObservationRepository, prepare_event,
 };
 use pioneer_crud_execution::provider_usage::ProviderUsageObservation;
 use pioneer_entity::{execution_observation, execution_tariff};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use pioneer_protocol::{
+    ItemRecoveryOpenedNotification, ItemStartedNotification, RecoveryAction, RecoveryTrigger,
+    SystemEventLevel, ToolCallStatus, ToolDisplayPayload, ToolObservation,
+    ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem, TurnItemType,
+};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 
 async fn open_store(
     database: &pioneer_postgres_test::TestDatabase,
@@ -308,6 +314,288 @@ async fn native_cumulative_redelivery_is_one_leaf_and_cannot_roll_back_same_seco
             .await
             .is_err()
     );
+}
+
+async fn insert_observation_turn(db: &pioneer_postgres_pools::PostgresDatabase, turn: &str) {
+    pioneer_entity::turn::Entity::insert(pioneer_entity::turn::ActiveModel {
+        id: Set(turn.to_owned()),
+        thread_id: Set("thread_observe".into()),
+        status: Set("in_progress".into()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .unwrap();
+}
+
+fn start_observation_item(turn: &str, item: TurnItem) -> TurnEventPayload {
+    TurnEventPayload::ItemStarted(ItemStartedNotification {
+        workspace_id: "ws_observe".into(),
+        thread_id: "thread_observe".into(),
+        turn_id: turn.into(),
+        item,
+    })
+}
+
+fn system_observation_item(id: &str, code: &str, details: serde_json::Value) -> TurnItem {
+    TurnItem::SystemEvent {
+        id: id.into(),
+        level: SystemEventLevel::Info,
+        message: String::new(),
+        code: Some(code.into()),
+        details: Some(details),
+    }
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn compact_item_and_tool_parents_are_addressable_and_legacy_phase_can_replay() {
+    let db = fixture().await;
+    let store = ExecutionObservationRepository::new(&db);
+    let turn = "t".repeat(126);
+    let item = "i".repeat(130);
+    insert_observation_turn(&db, &turn).await;
+    let tool = |observation| TurnItem::DynamicToolCall {
+        id: item.clone(),
+        tool_name: "test_tool".into(),
+        arguments: serde_json::json!({}),
+        status: ToolCallStatus::InProgress,
+        execution_class: Default::default(),
+        recovery_policy: None,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("test_tool"),
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::None,
+        recovery: None,
+        success: None,
+        outcome: None,
+        observation,
+    };
+    let item_parent = start_observation_item(&turn, tool(None));
+    let tool_parent = start_observation_item(
+        &turn,
+        tool(Some(ToolObservation {
+            parent_operation_id: None,
+            phase_boundaries: Vec::new(),
+            omitted_phase_boundaries: 0,
+            output_sizes: None,
+            process_run_id: None,
+            trace_id: "trace".into(),
+            turn_id: turn.clone(),
+            tool_call_id: item.clone(),
+            attempt_id: 1,
+            pipeline_stage: "dispatch".into(),
+            ts_unix_ms: 1_700_000_000_000,
+            mono_ns: 1,
+            event_seq: 1,
+        })),
+    );
+    let raw_item_id = format!("item:{turn}:{item}");
+    let raw_tool_id = format!("tool:{turn}:{item}:1");
+    assert!(raw_item_id.len() > 256 && raw_tool_id.len() > 256);
+    let details = serde_json::json!({"phase":"tool_dispatched","parent_operation_id":raw_tool_id});
+    let tool_phase = |id| {
+        start_observation_item(
+            &turn,
+            system_observation_item(id, "runtime_phase", details.clone()),
+        )
+    };
+    let recovery = TurnEventPayload::ItemRecoveryOpened(ItemRecoveryOpenedNotification {
+        workspace_id: "ws_observe".into(),
+        thread_id: "thread_observe".into(),
+        turn_id: turn.clone(),
+        item_id: item,
+        item_type: TurnItemType::DynamicToolCall,
+        recovery_job_id: "recovery".into(),
+        trigger: RecoveryTrigger::Timeout,
+        action: RecoveryAction::RetryWithBackoff,
+        attempt_number: 1,
+    });
+    for payload in [item_parent, tool_parent, recovery, tool_phase("new_phase")] {
+        store
+            .record_execution_observation(prepare_event(&payload).unwrap().unwrap())
+            .await
+            .unwrap();
+    }
+
+    // Recreate a durable producer fact written under the old raw parent spelling.
+    let legacy_phase_id = format!("item:{turn}:legacy_phase");
+    let mut legacy = attempt(&legacy_phase_id, 0, "2");
+    legacy.turn_id = Some(turn.clone());
+    legacy.owner_id = turn.clone();
+    legacy.parent_operation_id = Some(raw_tool_id.clone());
+    legacy.kind = "runtime_phase".into();
+    legacy.purpose = "wait".into();
+    legacy.provider = None;
+    legacy.model = None;
+    legacy.status = "running".into();
+    legacy.facts = details.clone();
+    legacy.tariff_evidence = None;
+    store
+        .record_execution_observation(legacy.prepare().unwrap())
+        .await
+        .unwrap();
+    store
+        .record_execution_observation(prepare_event(&tool_phase("legacy_phase")).unwrap().unwrap())
+        .await
+        .unwrap();
+    let frontier = store
+        .execution_observation_frontier("ws_observe", "thread_observe")
+        .await
+        .unwrap();
+    for (raw, expected) in [
+        (raw_item_id, "recovery_opened"),
+        (raw_tool_id.clone(), "tool_dispatched"),
+    ] {
+        let parent = ExecutionObservationInput::bounded_operation_id(raw);
+        let fact = store
+            .execution_observation_latest("ws_observe", "thread_observe", &parent)
+            .await
+            .unwrap()
+            .unwrap();
+        let children = store
+            .execution_children_page(
+                "ws_observe",
+                Some("thread_observe"),
+                &fact.operation_id,
+                0,
+                frontier,
+                32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        let facts: serde_json::Value = serde_json::from_str(&children[0].facts_json).unwrap();
+        assert_eq!(facts.get("details").unwrap_or(&facts)["phase"], expected);
+    }
+    let historical = store
+        .execution_observation_latest("ws_observe", "thread_observe", &legacy_phase_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        historical.parent_operation_id.as_deref(),
+        Some(raw_tool_id.as_str())
+    );
+    assert_eq!(historical.revision, 0);
+}
+
+#[tokio::test]
+async fn upgraded_turn_cleanup_deletes_compact_native_usage_only_for_the_deleted_source() {
+    pioneer_postgres_test::with_empty_database(async |database| {
+        let connection = database.connection();
+        let preceding = Migrator::migrations()
+            .iter()
+            .position(|migration| {
+                migration.name() == "m20261125_000013_compact_observation_turn_cleanup"
+            })
+            .expect("compact observation cleanup migration is registered");
+        Migrator::up(connection, Some(u32::try_from(preceding)?)).await?;
+        let db = open_store(database, true).await;
+        let store = ExecutionObservationRepository::new(&db);
+        let turn = "t".repeat(230);
+        insert_observation_turn(&db, &turn).await;
+        let compact_item = "p".repeat(21);
+        let other_item = "provider_other";
+        assert!(format!("provider:{turn}:{compact_item}").len() > 256);
+
+        // Persist a legacy journal entry before upgrading the existing database.
+        let record = |turn: &str, id: &str| {
+            let usage = serde_json::json!({"physical_attempt_id":id,"input_tokens":10});
+            (
+                start_observation_item(
+                    turn,
+                    system_observation_item(
+                        id,
+                        "provider_usage",
+                        serde_json::json!({"provider":"openai","usage":usage.clone()}),
+                    ),
+                ),
+                usage,
+            )
+        };
+        let (legacy, other_usage) = record("turn_observe", other_item);
+        store
+            .record_execution_observation(prepare_event(&legacy)?.unwrap())
+            .await?;
+        store
+            .record_native_provider_usage(
+                "ws_observe",
+                "thread_observe",
+                "turn_observe",
+                other_item,
+                1,
+                other_usage,
+            )
+            .await?;
+        Migrator::up(connection, Some(1)).await?;
+        Migrator::down(connection, Some(1)).await?;
+        Migrator::up(connection, None).await?;
+
+        let (payload, usage) = record(&turn, &compact_item);
+        store
+            .record_execution_observation(prepare_event(&payload)?.unwrap())
+            .await?;
+        store
+            .record_native_provider_usage(
+                "ws_observe",
+                "thread_observe",
+                &turn,
+                &compact_item,
+                1,
+                usage,
+            )
+            .await?;
+        let ids = vec![compact_item.clone(), other_item.into()];
+        assert_eq!(
+            store
+                .execution_live_usage("ws_observe", "thread_observe", ids.clone())
+                .await?
+                .len(),
+            2
+        );
+
+        // A compact fact that names another journal must not delete that journal.
+        let mut decoy = attempt("obs1_decoy", 0, "2");
+        decoy.turn_id = Some(turn.clone());
+        decoy.owner_id = turn.clone();
+        decoy.parent_operation_id = Some(format!("turn:{turn}"));
+        decoy.facts = serde_json::json!({"provider_source_item_id":other_item});
+        store.record_execution_observation(decoy.prepare()?).await?;
+        pioneer_entity::turn::Entity::delete_by_id(turn.clone())
+            .exec(&db)
+            .await?;
+        let remaining = store
+            .execution_live_usage("ws_observe", "thread_observe", ids)
+            .await?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, other_item);
+        assert_eq!(
+            execution_observation::Entity::find()
+                .filter(execution_observation::Column::TurnId.eq(turn))
+                .count(&db)
+                .await?,
+            0
+        );
+        assert!(
+            pioneer_entity::thread::Entity::find_by_id("thread_observe")
+                .one(&db)
+                .await?
+                .is_some()
+        );
+
+        // The legacy operation format still participates in Turn cleanup.
+        pioneer_entity::turn::Entity::delete_by_id("turn_observe")
+            .exec(&db)
+            .await?;
+        assert!(
+            store
+                .execution_live_usage("ws_observe", "thread_observe", vec![other_item.into()])
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
 }
 
 #[pioneer_postgres_test::postgres_test]

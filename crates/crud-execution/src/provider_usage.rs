@@ -5,6 +5,7 @@ use pioneer_entity::provider_usage_observation as journal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, Statement, TransactionSession, TransactionTrait,
+    sea_query::LockType,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,17 +220,19 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
                 [record.id.clone().into(), 0x7069_6f6e_7573_6701_i64.into()],
             ))
             .await?;
+            let mut workspace = pioneer_entity::workspace::Entity::find_by_id(&record.workspace_id);
+            let mut owner = pioneer_entity::thread::Entity::find_by_id(&record.owner_id);
+            if native_turn.is_some() {
+                // Hold the native source owners through journal publication so
+                // the Turn-delete trigger sees the committed snapshot or wins first.
+                workspace = workspace.lock(LockType::KeyShare);
+                owner = owner.lock(LockType::KeyShare);
+            }
             ensure!(
-                pioneer_entity::workspace::Entity::find_by_id(&record.workspace_id)
-                    .one(&tx)
-                    .await?
-                    .is_some(),
+                workspace.one(&tx).await?.is_some(),
                 "usage workspace missing"
             );
-            if let Some(owner) = pioneer_entity::thread::Entity::find_by_id(&record.owner_id)
-                .one(&tx)
-                .await?
-            {
+            if let Some(owner) = owner.one(&tx).await? {
                 ensure!(
                     owner.workspace_id == record.workspace_id,
                     "usage owner workspace conflict"
@@ -251,6 +254,7 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
                     "native usage source owner conflict"
                 );
                 let owner = pioneer_entity::turn::Entity::find_by_id(turn)
+                    .lock(LockType::KeyShare)
                     .one(&tx)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("native usage turn missing"))?;
@@ -380,20 +384,24 @@ impl<C: ConnectionTrait + TransactionTrait> ExecutionObservationRepository<'_, C
         revision: i64,
         mut usage: serde_json::Value,
     ) -> Result<()> {
-        use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+        let raw_operation_id = format!("provider:{turn}:{id}");
+        let operation_id =
+            ExecutionObservationInput::bounded_operation_id(raw_operation_id.clone());
+        let compact = operation_id != raw_operation_id;
         let source = pioneer_entity::execution_observation::Entity::find()
             .filter(pioneer_entity::execution_observation::Column::WorkspaceId.eq(workspace))
             .filter(pioneer_entity::execution_observation::Column::ThreadId.eq(thread))
             .filter(pioneer_entity::execution_observation::Column::TurnId.eq(turn))
-            .filter(
-                pioneer_entity::execution_observation::Column::OperationId
-                    .eq(format!("provider:{turn}:{id}")),
-            )
+            .filter(pioneer_entity::execution_observation::Column::OperationId.eq(operation_id))
             .order_by_asc(pioneer_entity::execution_observation::Column::Sequence)
             .one(self.connection)
             .await?
             .ok_or_else(|| anyhow::anyhow!("native usage attempt was not prepared durably"))?;
         let prepared: serde_json::Value = serde_json::from_str(&source.facts_json)?;
+        ensure!(
+            !compact || prepared["provider_source_item_id"].as_str() == Some(id),
+            "native usage source item conflict"
+        );
         ensure!(
             prepared["usage"]["physical_attempt_id"].is_string()
                 && prepared["usage"]["physical_attempt_id"] == usage["physical_attempt_id"],
@@ -501,7 +509,11 @@ async fn find_usage_causal_parent<C: sea_orm::ConnectionTrait>(
     use pioneer_entity::execution_observation as fact;
     let exact = fact::Entity::find()
         .filter(fact::Column::WorkspaceId.eq(workspace_id))
-        .filter(fact::Column::OperationId.eq(requested))
+        .filter(
+            fact::Column::OperationId.eq(ExecutionObservationInput::bounded_operation_id(
+                requested.to_owned(),
+            )),
+        )
         .order_by_desc(fact::Column::Revision)
         .one(db)
         .await?;
@@ -515,7 +527,11 @@ async fn find_usage_causal_parent<C: sea_orm::ConnectionTrait>(
     if let Some((turn_id, item_id)) = logical {
         let item = fact::Entity::find()
             .filter(fact::Column::WorkspaceId.eq(workspace_id))
-            .filter(fact::Column::OperationId.eq(format!("item:{turn_id}:{item_id}")))
+            .filter(
+                fact::Column::OperationId.eq(ExecutionObservationInput::bounded_operation_id(
+                    format!("item:{turn_id}:{item_id}"),
+                )),
+            )
             .order_by_desc(fact::Column::Revision)
             .one(db)
             .await?;

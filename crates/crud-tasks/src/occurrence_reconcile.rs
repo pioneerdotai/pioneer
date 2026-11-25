@@ -2,12 +2,14 @@
 //! bookkeeping never borrows the critical scope of the domain repair.
 use anyhow::Result;
 use pioneer_entity::{task_run, task_run_occurrence_reconcile_pending as pending, turn, workspace};
-use pioneer_protocol::{TaskRunStatus, TurnStatus};
+use pioneer_protocol::{TASK_REVISION_RETRY_PENDING, TaskRunStatus, TurnStatus};
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, Query, SelectStatement, SimpleExpr};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
     QuerySelect, Select, TransactionSession, TransactionTrait,
 };
+
+use crate::projection::pending_revision_retry_predicate;
 
 pub const OCCURRENCE_RECONCILE_BUDGET: u64 = 64;
 // Policy choices, not measured timings: tolerate short fanout gaps, then keep
@@ -128,7 +130,26 @@ fn mismatch_query(run_id: &str) -> SelectStatement {
             r(task_run::Column::Status).into(),
             t(turn::Column::Status).into(),
         ))
+        .and_where(
+            pending_revision_retry_predicate(
+                r(task_run::Column::Status).into(),
+                r(task_run::Column::ErrorJson).into(),
+            )
+            .not(),
+        )
         .to_owned()
+}
+
+pub(crate) fn has_pending_revision_retry(run: &task_run::Model) -> bool {
+    run.status == "blocked"
+        && run
+            .error_json
+            .as_deref()
+            .and_then(|error| serde_json::from_str::<serde_json::Value>(error).ok())
+            .is_some_and(|error| {
+                error.get("code").and_then(serde_json::Value::as_str)
+                    == Some(TASK_REVISION_RETRY_PENDING)
+            })
 }
 
 /// The authoritative terminal status for the occurrence Turn of a finished run.

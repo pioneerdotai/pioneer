@@ -1211,7 +1211,13 @@ fn task_tool_authorization_error() -> ToolError {
     ToolError::Rejected("task_access_denied: unavailable to this execution; this does not confirm absence or cancellation".to_owned())
 }
 
+const TASK_REVISION_QUOTA_FULL: &str =
+    "task_quota_exhausted: Task execution quota is full. Retry when capacity is available.";
+
 fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError {
+    if let Some(blocker) = error.downcast_ref::<pioneer_protocol::TaskRevisionRetryBlocker>() {
+        return ToolError::Rejected(blocker.code().to_owned());
+    }
     match error.downcast_ref::<pioneer_tasks::TaskOperationError>() {
         Some(pioneer_tasks::TaskOperationError::AccessDenied) => task_tool_authorization_error(),
         Some(pioneer_tasks::TaskOperationError::StateConflict) => ToolError::Rejected(
@@ -1223,9 +1229,17 @@ fn task_runtime_tool_error(error: pioneer_tasks::TaskRuntimeError) -> ToolError 
 
 pub(crate) fn sanitize_task_tool_error(error: ToolError) -> ToolError {
     match error {
+        ToolError::Rejected(code)
+            if pioneer_protocol::TaskRevisionRetryBlocker::from_code(&code).is_some() =>
+        {
+            let blocker = pioneer_protocol::TaskRevisionRetryBlocker::from_code(&code)
+                .expect("allowlisted blocker");
+            ToolError::Rejected(format!("{}: {}", blocker.code(), blocker.message()))
+        }
         ToolError::Rejected(message)
             if message.starts_with("task_access_denied:")
-                || message == "task_state_conflict: reload the task before changing it" =>
+                || message == "task_state_conflict: reload the task before changing it"
+                || message == TASK_REVISION_QUOTA_FULL =>
         {
             // Only server-authored constants enter these variants.
             if message.starts_with("task_access_denied:") {
@@ -1627,8 +1641,12 @@ impl TaskToolHandler {
         Ok(contents)
     }
 
-    fn uses_cli_or_run_now_receipt(&self, tool: &str) -> bool {
-        self.cli_replay || tool == TASK_RUN_NOW_TOOL
+    fn uses_durable_mutation_receipt(&self, invocation: &ToolInvocation) -> bool {
+        self.cli_replay
+            || invocation.tool_name == TASK_RUN_NOW_TOOL
+            || (invocation.tool_name == TASK_RESUME_TOOL
+                && matches!(&invocation.payload, ToolPayload::Function { arguments }
+                    if arguments.get("retryRevisionTurnId").is_some_and(JsonValue::is_string)))
     }
 
     fn mutation_arguments_fingerprint(
@@ -1657,7 +1675,7 @@ impl TaskToolHandler {
         plan: &mut crate::authorization::AgentActionCommitPlan,
         api_create_receipt: bool,
     ) -> Result<(), ToolError> {
-        if !api_create_receipt && !self.uses_cli_or_run_now_receipt(&invocation.tool_name) {
+        if !api_create_receipt && !self.uses_durable_mutation_receipt(invocation) {
             return Ok(());
         }
         let fingerprint = self.mutation_arguments_fingerprint(invocation)?;
@@ -1723,7 +1741,7 @@ impl TaskToolHandler {
         api_create_receipt: bool,
     ) -> Result<Option<JsonValue>, ToolError> {
         if let Some(cache_key) = cache_key
-            && (self.uses_cli_or_run_now_receipt(&invocation.tool_name)
+            && (self.uses_durable_mutation_receipt(invocation)
                 || invocation.tool_name == TASK_CREATE_TOOL)
         {
             let fingerprint = self.mutation_arguments_fingerprint(invocation)?;
@@ -2924,13 +2942,19 @@ impl TaskToolHandler {
         let _observation = authorization
             .acquire_observation_page(self.processor.as_ref())
             .await?;
-        let response = self
+        let mut response = self
             .processor
             .task_runtime
             .service()
             .get_task(params)
             .await
             .map_err(task_runtime_tool_error)?;
+        crate::task_projection::observe_revision_recovery(
+            self.processor.crud_store.as_ref(),
+            &mut response,
+        )
+        .await
+        .map_err(task_runtime_tool_error)?;
         let run_ids = response
             .runs
             .iter()
@@ -3267,6 +3291,32 @@ impl TaskToolHandler {
                 AgentToolCapability::TaskControl,
             )
             .await?;
+        if let Some(turn_id) = params.retry_revision_turn_id.as_deref() {
+            let response = self
+                .processor
+                .task_agent_executor
+                .retry_blocked_revision(
+                    &params.task_id,
+                    turn_id,
+                    action_plan.as_ref().map(|plan| &plan.input),
+                )
+                .await
+                .map_err(|error| {
+                    if error.is::<pioneer_crud::ExecutionAdmissionQuotaExhausted>() {
+                        ToolError::Rejected(TASK_REVISION_QUOTA_FULL.to_owned())
+                    } else {
+                        task_runtime_tool_error(error)
+                    }
+                })?;
+            let mut output = json!({
+                "task": task_summary(&response.task),
+                "triggers": task_trigger_details_output(&response.triggers),
+            });
+            Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
+            self.cache_mutation_output(cache_key.as_deref(), &output)
+                .await;
+            return Ok(function_output(output));
+        }
         let execution_admission = self
             .processor
             .task_execution_readmission_seed(
@@ -3436,7 +3486,7 @@ impl TaskToolHandler {
     ) -> Result<Option<JsonValue>, ToolError> {
         let current_key = invocation.idempotency_key.as_deref().map(str::trim);
         if api_create_receipt
-            || (self.uses_cli_or_run_now_receipt(&invocation.tool_name)
+            || (self.uses_durable_mutation_receipt(invocation)
                 && current_key.is_some_and(|key| !key.is_empty()))
         {
             let binding = self
@@ -3743,13 +3793,14 @@ struct TaskCreateToolInput {
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque destination from threads_start_options. Omit for the current
+    /// Opaque destination from task_start_options. Omit for the current
     /// thread. A routed option is revalidated at Task commit and again for
     /// every occurrence; raw thread or route ids are never accepted here.
     target_option_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional child identity/profile and additional Skill/MCP selection from
-    /// threads_start_options. Immediate tasks in the current capsule inherit the
+    /// Optional launch. Use task_start_options for identity, exact profiles and
+    /// additional Skill/MCP selection, or task_identity_models_list for an explicit
+    /// provider/model pair and its reasoning options. Immediate tasks in the current capsule inherit the
     /// current Turn's selected capabilities. Empty lists keep that inheritance.
     /// Set useDefaultReasoning=true to use the model's native default instead
     /// of inheriting effort; this cannot be combined with reasoning.
@@ -4550,6 +4601,9 @@ struct TaskResumeToolInput {
     /// Task id to resume. Pioneer entity ids are exactly 21 characters.
     #[schemars(length(min = 21, max = 21))]
     task_id: String,
+    /// Exact turnId from task_get revisionExecutions when requiresIntervention is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_revision_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Optional human-readable resume reason.
     reason: Option<String>,
@@ -4566,6 +4620,11 @@ impl TaskResumeToolInput {
     fn into_params(self) -> Result<TaskResumeParams, ToolError> {
         Ok(TaskResumeParams {
             task_id: validate_entity_id(self.task_id, "taskId")?,
+            retry_revision_turn_id: self
+                .retry_revision_turn_id
+                .as_deref()
+                .map(|turn_id| required_tool_string(Some(turn_id), "retryRevisionTurnId"))
+                .transpose()?,
             reason: clean_optional_string(self.reason),
         })
     }
@@ -4575,7 +4634,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -4674,7 +4733,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         task_tool_spec(
             TASK_RESUME_TOOL,
-            "Resume a paused task through the task service and recompute its next scheduled fire.",
+            "Resume a paused task and recompute its next scheduled fire. To restart a blocked revision in a fresh execution, pass retryRevisionTurnId from task_get revisionExecutions where requiresIntervention is true. This continues the same review round. Repeating the same turn ID cannot start another attempt.",
             task_resume_schema(),
             safe_mutation_recovery(),
         ),
@@ -4713,6 +4772,27 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
         can_resume: false,
         max_wall_clock_secs: None,
     }
+}
+
+// Frozen CLI bindings still carry these schema descriptions in their hash.
+pub(crate) fn restore_legacy_task_create_catalog(spec: &mut ToolSpec) {
+    spec.description = spec.description.replacen(
+        "Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup.",
+        "For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup.",
+        1,
+    );
+    spec.parameters["properties"]["targetOptionId"]["description"] = json!(concat!(
+        "Opaque destination from threads_start_options. Omit for the current\n",
+        "thread. A routed option is revalidated at Task commit and again for\n",
+        "every occurrence; raw thread or route ids are never accepted here."
+    ));
+    spec.parameters["properties"]["launch"]["description"] = json!(concat!(
+        "Optional child identity/profile and additional Skill/MCP selection from\n",
+        "threads_start_options. Immediate tasks in the current capsule inherit the\n",
+        "current Turn's selected capabilities. Empty lists keep that inheritance.\n",
+        "Set useDefaultReasoning=true to use the model's native default instead\n",
+        "of inheriting effort; this cannot be combined with reasoning."
+    ));
 }
 
 fn task_create_schema() -> JsonValue {
@@ -4838,7 +4918,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
 fn task_tool_argument_hint(tool_name: &str) -> &'static str {
     match tool_name {
         TASK_CREATE_TOOL => {
-            "Expected fields: title, goal, instructions, inputText or input, outputInstructions, and optional trigger. For cron set trigger.kind to cron, trigger.cronExpr to 0 7 * * *, and trigger.timezone to Europe/Moscow. Do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
+            "Expected fields: title, goal, instructions, inputText or input, outputInstructions, and optional trigger. Use task_start_options for explicit launch profiles and destinations, and task_identity_models_list for provider/model options. For cron set trigger.kind to cron, trigger.cronExpr to 0 7 * * *, and trigger.timezone to Europe/Moscow. Do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
         }
         TASK_RESCHEDULE_TOOL => {
             "Expected fields: taskId and trigger. For scheduled_at set trigger.scheduledAt to a Unix timestamp such as 1893456000 and optional trigger.timezone to UTC. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec."
@@ -6165,6 +6245,20 @@ pub(crate) async fn task_turn_item_from_context(
         }
         None => Default::default(),
     };
+    let status = task_anchor_status(task, run);
+    let error = run
+        .and_then(|run| run.error.as_ref())
+        .or(task.error.as_ref());
+    let (progress_preview, error_preview) = if status == TaskStatus::Waiting
+        && error.is_some_and(TaskError::is_revision_retry_pending)
+    {
+        (
+            error.and_then(crate::task_projection::task_failure_detail),
+            None,
+        )
+    } else {
+        (progress_preview, error_preview(error))
+    };
     Ok(TaskTurnItem {
         id: item_id,
         task_id: task.id.clone(),
@@ -6173,7 +6267,7 @@ pub(crate) async fn task_turn_item_from_context(
         parent_task_id: task.parent_task_id.clone(),
         root_task_id: task.root_task_id.clone(),
         title: task.title.clone(),
-        status: task_anchor_status(task.status, run),
+        status,
         attachment: task
             .lifecycle_policy
             .as_ref()
@@ -6200,21 +6294,16 @@ pub(crate) async fn task_turn_item_from_context(
             run.and_then(|run| run.result.as_ref())
                 .or(task.result.as_ref()),
         ),
-        error_preview: error_preview(
-            run.and_then(|run| run.error.as_ref())
-                .or(task.error.as_ref()),
-        ),
+        error_preview,
         started_at: run.and_then(|run| run.started_at),
         created_at: task.created_at,
-        updated_at: task_anchor_updated_at(task.updated_at, run),
+        updated_at: task_anchor_updated_at(task, run),
     })
 }
 
-fn task_anchor_status(task_status: TaskStatus, run: Option<&TaskRun>) -> TaskStatus {
-    let Some(run) = run else {
-        return task_status;
-    };
-    task_run_anchor_status(run.status)
+fn task_anchor_status(task: &Task, run: Option<&TaskRun>) -> TaskStatus {
+    run.map(|run| task_run_anchor_status(run.effective_status(task)))
+        .unwrap_or_else(|| task.effective_status())
 }
 
 fn task_run_anchor_status(status: TaskRunStatus) -> TaskStatus {
@@ -6230,9 +6319,13 @@ fn task_run_anchor_status(status: TaskRunStatus) -> TaskStatus {
     }
 }
 
-fn task_anchor_updated_at(task_updated_at: i64, run: Option<&TaskRun>) -> i64 {
-    run.map(|run| run.completed_at.unwrap_or(run.updated_at))
-        .unwrap_or(task_updated_at)
+fn task_anchor_updated_at(task: &Task, run: Option<&TaskRun>) -> i64 {
+    run.map(|run| {
+        run.completed_at
+            .filter(|_| run.effective_status(task) == run.status)
+            .unwrap_or(run.updated_at)
+    })
+    .unwrap_or(task.updated_at)
 }
 
 fn select_task_anchor_run(response: &TaskGetResponse) -> Option<&TaskRun> {
@@ -6285,7 +6378,7 @@ fn result_preview(result: Option<&TaskResult>) -> Option<String> {
 
 fn error_preview(error: Option<&TaskError>) -> Option<String> {
     error.map(|error| {
-        if let Some(message) = error.recovery_public_message() {
+        if let Some(message) = crate::task_projection::task_failure_detail(error) {
             return message;
         }
         match error.class {
@@ -6480,19 +6573,21 @@ mod tests {
 
     #[test]
     fn task_run_anchor_status_is_independent_of_recurring_task_status() {
+        let mut task = sample_task(TaskStatus::Scheduled);
+        task.updated_at = 110;
         let mut succeeded_run = sample_run(TaskRunStatus::Succeeded);
         succeeded_run.completed_at = Some(90);
         succeeded_run.updated_at = 100;
         assert_eq!(
-            task_anchor_status(TaskStatus::Scheduled, Some(&succeeded_run)),
+            task_anchor_status(&task, Some(&succeeded_run)),
             TaskStatus::Completed
         );
         assert_eq!(
-            task_anchor_updated_at(110, Some(&succeeded_run)),
+            task_anchor_updated_at(&task, Some(&succeeded_run)),
             90,
             "a terminal occurrence must retain its actual completion timestamp"
         );
-        assert_eq!(task_anchor_updated_at(110, None), 110);
+        assert_eq!(task_anchor_updated_at(&task, None), 110);
         assert_eq!(
             task_run_anchor_status(TaskRunStatus::TimedOut),
             TaskStatus::Failed
@@ -6501,10 +6596,7 @@ mod tests {
             task_run_anchor_status(TaskRunStatus::WaitingReview),
             TaskStatus::WaitingReview
         );
-        assert_eq!(
-            task_anchor_status(TaskStatus::Scheduled, None),
-            TaskStatus::Scheduled
-        );
+        assert_eq!(task_anchor_status(&task, None), TaskStatus::Scheduled);
     }
 
     #[test]
@@ -6521,7 +6613,10 @@ mod tests {
                 .tool_names()
                 .iter()
                 .copied()
-                .filter(|name| name.starts_with("task_"))
+                .filter(
+                    |name| !crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                        .is_launch_catalog(name)
+                )
                 .collect::<Vec<_>>()
         );
     }

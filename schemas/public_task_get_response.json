@@ -37,6 +37,12 @@
         "$ref": "#/$defs/PublicTaskWaitReviewItem"
       }
     },
+    "revisionExecutions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PublicTaskRevisionExecution"
+      }
+    },
     "runs": {
       "type": "array",
       "default": [],
@@ -1232,6 +1238,52 @@
       "enum": [
         "text",
         "json"
+      ]
+    },
+    "PublicTaskRevisionExecution": {
+      "type": "object",
+      "properties": {
+        "automaticRetryLimit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "automaticRetryPending": {
+          "type": "boolean"
+        },
+        "requiresIntervention": {
+          "type": "boolean"
+        },
+        "retryNumber": {
+          "description": "Zero identifies the initial execution of this revision.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "round": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "runId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskRunTurnStatus"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId",
+        "round",
+        "turnId",
+        "status",
+        "retryNumber",
+        "automaticRetryLimit",
+        "automaticRetryPending",
+        "requiresIntervention"
       ]
     },
     "PublicTaskRun": {

@@ -2492,7 +2492,7 @@ async fn large_later_catalog_stays_out_of_task_and_execution_grants_and_replay()
     );
     assert!(root_grant.grant_json.len() < 131_072);
     extra_models.store(4097, Ordering::SeqCst);
-    call(&tools, "threads_start_options", "large-options", json!({})).await;
+    call(&tools, "task_start_options", "large-options", json!({})).await;
     crate::message::agent_action_tools::resolve_tool_launch(
         &processor,
         &context,
@@ -2811,6 +2811,14 @@ async fn identity_models_catalog_exposes_model_reasoning_without_secrets_and_rej
         json!({"identityId":identity}),
     )
     .await;
+    let task_result = call(
+        &tools,
+        "task_identity_models_list",
+        "task-models",
+        json!({"identityId":identity}),
+    )
+    .await;
+    assert_eq!(task_result, result);
     let result: pioneer_protocol::AgentIdentityModelsToolResult =
         serde_json::from_value(result).unwrap();
     let executor = result

@@ -9,6 +9,13 @@
         "null"
       ]
     },
+    "retryRevisionTurnId": {
+      "description": "Explicitly restart this exact blocked revision execution in a fresh Turn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "taskId": {
       "type": "string"
     }

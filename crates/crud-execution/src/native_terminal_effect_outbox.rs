@@ -186,9 +186,9 @@ pub async fn post_turn_batch_exists<C: ConnectionTrait>(
     turn_id: &str,
     batch_id: &str,
 ) -> Result<bool> {
-    Ok(native_terminal_effect_outbox::Entity::find_by_id(format!(
-        "{turn_id}:terminal-effect:post-turn"
-    ))
+    Ok(native_terminal_effect_outbox::Entity::find_by_id(
+        NativeTerminalEffectPreparation::post_turn_effect_id(turn_id),
+    )
     .filter(native_terminal_effect_outbox::Column::TurnId.eq(turn_id))
     .filter(native_terminal_effect_outbox::Column::BatchId.eq(batch_id))
     .filter(native_terminal_effect_outbox::Column::Status.ne(STATUS_SUPERSEDED))
@@ -207,7 +207,8 @@ pub async fn prepare_post_turn_once(
     let input = &prepared.preparation;
     if input.effects.len() != 1
         || input.effects[0].effect_kind != NativeTerminalEffectKind::PostTurnHook
-        || input.effects[0].effect_id != format!("{}:terminal-effect:post-turn", input.turn_id)
+        || input.effects[0].effect_id
+            != NativeTerminalEffectPreparation::post_turn_effect_id(&input.turn_id)
     {
         bail!("post-turn preparation requires exactly one canonical hook obligation");
     }
@@ -2279,13 +2280,17 @@ fn validate_preparation(preparation: &NativeTerminalEffectPreparation) -> Result
     if preparation.effects.len() > MAX_EFFECTS_PER_TURN {
         bail!("terminal-effect batch exceeds the per-Turn effect limit");
     }
-    if preparation.batch_id.is_empty() || preparation.batch_id.chars().count() > 128 {
+    if preparation.batch_id.is_empty()
+        || preparation.batch_id.chars().count() > NativeTerminalEffectPreparation::MAX_ID_CHARS
+    {
         bail!("terminal-effect batch id is invalid");
     }
     let mut kinds = HashSet::new();
     let mut ids = HashSet::new();
     for effect in &preparation.effects {
-        if effect.effect_id.is_empty() || effect.effect_id.chars().count() > 128 {
+        if effect.effect_id.is_empty()
+            || effect.effect_id.chars().count() > NativeTerminalEffectPreparation::MAX_ID_CHARS
+        {
             bail!("terminal-effect id is invalid");
         }
         if !ids.insert(effect.effect_id.as_str()) || !kinds.insert(effect.effect_kind) {

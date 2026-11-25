@@ -26701,7 +26701,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         .expect("agent spec should exist")
         .review_policy = Some(TaskAgentReviewPolicy {
         mode: TaskAgentReviewMode::UserApproval,
-        max_revision_rounds: 1,
+        max_revision_rounds: 3,
         require_explicit_acceptance: true,
         disable_timeout_acceptance: false,
         reviewers: Vec::new(),
@@ -26715,75 +26715,99 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         .run
         .clone()
         .expect("immediate task should create run");
-    let first_candidate = wait_for_result_candidate_status(
+    let mut next_candidate = wait_for_result_candidate_status(
         crud_store.clone(),
         run.id.as_str(),
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
-    assert_eq!(first_candidate.round, 0);
+    assert_eq!(next_candidate.round, 0);
 
-    let request_id = generate_test_request_id("taskrevise", "rpc");
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": request_id.clone(),
-        "method": pioneer_protocol::constants::methods::TASK_REVISE,
-        "params": {
-            "taskId": response.task.id.clone(),
-            "runId": run.id.clone(),
-            "candidateId": first_candidate.id,
-            "feedback": "Add precipitation chance and return a complete corrected result.",
-            "additionalInstructions": ["Preserve the original task objective."]
-        }
-    });
-    let request_payload = request.to_string();
-    message_future(processor.process_request_for_connection(connection_id, &request_payload)).await;
-    let rpc_response = recv_response_by_id(&mut rx, request_id.as_str()).await;
-    let revised: TaskReviseResponse =
-        serde_json::from_value(rpc_response.result).expect("task/revise response should decode");
+    let mut revision_turn_ids = std::collections::HashSet::new();
+    for round in 1..=3 {
+        let request_id = generate_test_request_id("taskrevise", &format!("rpc{round}"));
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id.clone(),
+            "method": pioneer_protocol::constants::methods::TASK_REVISE,
+            "params": {
+                "taskId": response.task.id.clone(),
+                "runId": run.id.clone(),
+                "candidateId": next_candidate.id,
+                "feedback": "Add precipitation chance and return a complete corrected result.",
+                "additionalInstructions": ["Preserve the original task objective."]
+            }
+        });
+        let request_payload = request.to_string();
+        message_future(processor.process_request_for_connection(connection_id, &request_payload))
+            .await;
+        let rpc_response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let revised: TaskReviseResponse = serde_json::from_value(rpc_response.result)
+            .expect("task/revise response should decode");
 
-    assert!(revised.requested);
-    assert_eq!(
-        revised.review_event.decision,
-        TaskResultReviewDecision::RequestChanges
-    );
-    assert_eq!(
-        revised.review_event.next_task_run_turn_id.as_deref(),
-        Some(revised.task_run_turn.id.as_str())
-    );
-    assert_eq!(revised.task_run_turn.kind, TaskRunTurnKind::Revision);
-    assert_eq!(revised.task_run_turn.round, 1);
-    assert_eq!(revised.child_thread_id, revised.candidate.thread_id);
-    assert_ne!(revised.child_turn_id, revised.candidate.turn_id);
+        assert!(revised.requested);
+        assert!(!revised.already_requested);
+        assert_eq!(
+            revised.review_event.decision,
+            TaskResultReviewDecision::RequestChanges
+        );
+        assert_eq!(
+            revised.review_event.next_task_run_turn_id.as_deref(),
+            Some(revised.task_run_turn.id.as_str())
+        );
+        assert_eq!(revised.task_run_turn.kind, TaskRunTurnKind::Revision);
+        assert_eq!(revised.task_run_turn.round, round);
+        assert_eq!(revised.child_thread_id, revised.candidate.thread_id);
+        assert_ne!(revised.child_turn_id, revised.candidate.turn_id);
+        assert_eq!(revised.child_turn_id.len(), 44);
+        assert!(revision_turn_ids.insert(revised.child_turn_id.clone()));
 
-    let next_candidate = wait_for_result_candidate_status(
-        crud_store.clone(),
-        run.id.as_str(),
-        TaskResultCandidateStatus::PendingReview,
-    )
-    .await;
-    assert_admitted_turn_owner(&processor, &revised.child_thread_id, &revised.child_turn_id).await;
-    assert_eq!(next_candidate.round, 1);
-    assert_eq!(next_candidate.thread_id, revised.child_thread_id);
-    assert_eq!(next_candidate.turn_id, revised.child_turn_id);
-    assert_eq!(next_candidate.task_run_turn_id, revised.task_run_turn.id);
-    assert_eq!(
-        next_candidate
-            .result
-            .as_ref()
-            .and_then(|result| result.summary.as_deref()),
-        Some("fixed after review")
-    );
+        next_candidate = wait_for_result_candidate_status(
+            crud_store.clone(),
+            run.id.as_str(),
+            TaskResultCandidateStatus::PendingReview,
+        )
+        .await;
+        assert_admitted_turn_owner(&processor, &revised.child_thread_id, &revised.child_turn_id)
+            .await;
+        assert_eq!(next_candidate.round, round);
+        assert_eq!(next_candidate.thread_id, revised.child_thread_id);
+        assert_eq!(next_candidate.turn_id, revised.child_turn_id);
+        assert_eq!(next_candidate.task_run_turn_id, revised.task_run_turn.id);
+        assert_eq!(
+            next_candidate
+                .result
+                .as_ref()
+                .and_then(|result| result.summary.as_deref()),
+            Some("fixed after review")
+        );
+
+        let replay_id = generate_test_request_id("taskrevise", &format!("replay{round}"));
+        let mut replay_request = request;
+        replay_request["id"] = json!(replay_id.clone());
+        let replay_payload = replay_request.to_string();
+        message_future(processor.process_request_for_connection(connection_id, &replay_payload))
+            .await;
+        let replay_response = recv_response_by_id(&mut rx, replay_id.as_str()).await;
+        let replayed: TaskReviseResponse = serde_json::from_value(replay_response.result)
+            .expect("task/revise replay should decode");
+        assert!(replayed.already_requested);
+        assert_eq!(replayed.task_run_turn.id, revised.task_run_turn.id);
+        assert_eq!(replayed.child_turn_id, revised.child_turn_id);
+    }
 
     let candidates = crud_store
         .list_task_result_candidates(run.id.as_str())
         .await
         .expect("candidates should list after revision");
-    assert_eq!(candidates.len(), 2);
-    assert!(candidates.iter().any(|candidate| {
-        candidate.id == revised.candidate.id
-            && candidate.status == TaskResultCandidateStatus::Rejected
-    }));
+    assert_eq!(candidates.len(), 4);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.status == TaskResultCandidateStatus::Rejected)
+            .count(),
+        3
+    );
     assert!(candidates.iter().any(|candidate| {
         candidate.id == next_candidate.id
             && candidate.status == TaskResultCandidateStatus::PendingReview
@@ -26824,7 +26848,7 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
         .iter()
         .find(|review| review.candidate.id == next_candidate.id)
         .expect("revised candidate should be waiting for review");
-    assert_eq!(review.max_revision_rounds, 1);
+    assert_eq!(review.max_revision_rounds, 3);
     assert_eq!(review.remaining_revision_rounds, 0);
     assert_eq!(
         review.revision_blocked_reason,
@@ -26844,8 +26868,8 @@ async fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_i
     assert_eq!(execution.status, TaskRunExecutionStatus::WaitingReview);
 
     assert!(
-        provider.snapshot_requests().len() >= 2,
-        "initial and revision child turns should both reach the provider"
+        provider.snapshot_requests().len() >= 4,
+        "initial and three revision child turns should reach the provider"
     );
 }
 
@@ -63079,10 +63103,22 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
         .expect("turn lookup should succeed")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Completed);
-    processor
-        .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-        .await
-        .unwrap();
+    // Terminalization wakes a background worker that can already own the hook.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if crud_store
+                .native_terminal_effect_status("codex-turn-command:terminal-effect:post-turn")
+                .await
+                .unwrap()
+                .is_some_and(|effect| effect.status == "succeeded")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("snapshot post-turn hook should finish");
     assert_eq!(
         post_turn_calls.lock().unwrap().len(),
         1,

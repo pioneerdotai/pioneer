@@ -286,11 +286,11 @@ impl TaskChildWorkRepository {
         else {
             return Ok(None);
         };
-        let Some(run_status) = task_run::Entity::find_by_id(run_id)
+        let Some((run_status, run_error)) = task_run::Entity::find_by_id(run_id)
             .filter(task_run::Column::TaskId.eq(&task_id))
             .select_only()
-            .column(task_run::Column::Status)
-            .into_tuple::<String>()
+            .columns([task_run::Column::Status, task_run::Column::ErrorJson])
+            .into_tuple::<(String, Option<String>)>()
             .one(&self.connection)
             .await?
         else {
@@ -347,7 +347,20 @@ impl TaskChildWorkRepository {
         ) && (link_status == "in_progress"
             || (link_status == "candidate_created" && run_status != "waiting_review")
             || (link_status == "cancelled" && turn_status == "interrupted"));
-        if !terminal && !active {
+        // An automatic revision retry is a continuation of a terminal CLI
+        // child reconciliation. A settled block can be acknowledged without
+        // entering the executor again.
+        let blocked_revision_retry = run_status == "blocked"
+            && link_status == "blocked"
+            && turn_status == "blocked"
+            && turn_error
+                .as_deref()
+                .is_some_and(pioneer_protocol::is_missing_cli_mcp_activation_block)
+            && crate::values::optional_typed_json_from_db::<pioneer_protocol::TaskError>(
+                run_error,
+            )?
+            .is_some_and(|error| error.code == pioneer_protocol::TASK_REVISION_RETRY_PENDING);
+        if !terminal && !active && !blocked_revision_retry {
             return Ok(None);
         }
         Ok(Some(UnreconciledTerminalTaskChildTurnRecord {

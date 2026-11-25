@@ -8693,7 +8693,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         prompt
             .full_system_text
-            .contains("When request_tools is available, open hidden tools by domain")
+            .contains("When request_tools is available, use Hidden Tool Domains")
     );
     let user_input = requests[0]
         .messages
@@ -8703,7 +8703,7 @@ async fn phase_10_prompt_compile_receives_final_visible_tools_not_registered_mem
     assert!(
         user_input
             .content
-            .contains("For hidden tools, call request_tools to open a domain.")
+            .contains("Call request_tools to open a domain.")
     );
     assert!(
         !prompt.full_system_text.contains("Available memory tools:"),

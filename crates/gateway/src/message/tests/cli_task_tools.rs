@@ -136,7 +136,7 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
             &processor,
             &parent,
             "launch-options",
-            "threads_start_options",
+            "task_start_options",
             json!({}),
         )
         .await
@@ -154,6 +154,31 @@ fn cli_explicit_model_and_reasoning_reach_native_launch_and_survive_mcp_replay()
             })
             .unwrap();
         let provider = format!("cli_runtime:{}", harness.runtime_id);
+        let models = invoke_task(
+            &processor,
+            &parent,
+            "launch-models",
+            "task_identity_models_list",
+            json!({"identityId":identity.id}),
+        )
+        .await
+        .unwrap();
+        assert!(!models.is_error, "{models:?}");
+        let executors: Vec<pioneer_protocol::AgentToolExecutorModels> =
+            serde_json::from_value(models.structured_content.unwrap()["executors"].clone())
+                .unwrap();
+        assert!(executors.iter().any(|executor| {
+            executor.provider_id == provider
+                && executor.models.iter().any(|model| {
+                    model.id == "catalog-cli-choice"
+                        && model.reasoning.as_ref().is_some_and(|reasoning| {
+                            reasoning
+                                .effort_options
+                                .iter()
+                                .any(|effort| effort == "high")
+                        })
+                })
+        }));
         let arguments = json!({
             "title":"Explicit CLI model", "goal":"Use the selected CLI model and effort",
             "launch":{"identity":{"kind":"exact","id":identity.id},
@@ -3025,7 +3050,7 @@ fn cli_tasks_share_authorization_schemas_skills_and_durable_replay_for_all_provi
                 &processor,
                 &turn_id,
                 "options",
-                "threads_start_options",
+                "task_start_options",
                 json!({}),
             )
             .await
@@ -6128,6 +6153,13 @@ fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_g
             (false, vec!["thread_create"], vec![], true, false),
             (
                 false,
+                vec![],
+                vec!["threads_identity_models_list"],
+                true,
+                false,
+            ),
+            (
+                false,
                 vec!["thread_create"],
                 vec!["thread_create"],
                 false,
@@ -6156,6 +6188,12 @@ fn cli_threads_permission_matrix_preserves_restricted_names_denies_and_missing_g
                 bindings
                     .iter()
                     .any(|binding| binding.raw_tool_name == "threads_identity_models_list"),
+                expect_models
+            );
+            assert_eq!(
+                bindings
+                    .iter()
+                    .any(|binding| binding.raw_tool_name == "task_identity_models_list"),
                 expect_models
             );
             assert!(

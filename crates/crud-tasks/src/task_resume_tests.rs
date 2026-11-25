@@ -540,3 +540,289 @@ async fn task_owned_resume_rejects_an_overlapping_cross_task_workspace_lock() {
         TaskRunStatus::Blocked
     );
 }
+
+fn missing_mcp_activation_reason() -> String {
+    format!(
+        "CLI runtime recovery is blocked: frozen CLI runtime MCP projection is invalid: {}",
+        CLI_MCP_ACTIVATION_CONTRACT_MISSING
+    )
+}
+
+#[test]
+fn revision_execution_budget_is_separate_from_the_review_round() {
+    let mut revision = TaskRunTurn {
+        id: "trt_revise_candidate_8".into(),
+        task_id: "task".into(),
+        run_id: "run".into(),
+        execution_id: Some("exec".into()),
+        thread_id: "thread".into(),
+        turn_id: "revise_candidate_8".into(),
+        kind: TaskRunTurnKind::Revision,
+        round: 8,
+        sequence: 9,
+        status: TaskRunTurnStatus::Blocked,
+        reviews_candidate_id: None,
+        requested_by_candidate_id: Some("candidate".into()),
+        requested_by_review_event_id: Some("review-event".into()),
+        created_at: 1,
+        started_at: Some(1),
+        completed_at: Some(2),
+    };
+    let mut run = sample_task_run(1);
+    run.error = Some(TaskError {
+        recovery_diagnostic: None,
+        code: TASK_REVISION_RETRY_PENDING.into(),
+        message: "MCP activation contract missing".into(),
+        class: TaskErrorClass::Provider,
+        details: None,
+        failed_run_id: None,
+    });
+    assert!(next_revision_execution(&revision, &run, false, 3).is_none());
+
+    for retry in 1..=3 {
+        let next = next_revision_execution(&revision, &run, true, i64::from(retry) + 2)
+            .expect("automatic recovery within the budget");
+        assert_eq!(next.revision_execution_retry(&next.turn_id), Some(retry));
+        assert_eq!(next.id, revision.id);
+        assert_eq!(next.round, revision.round);
+        assert_eq!(next.sequence, revision.sequence);
+        assert_eq!(
+            next.requested_by_review_event_id,
+            revision.requested_by_review_event_id
+        );
+        assert_ne!(next.turn_id, revision.turn_id);
+        revision = next;
+        revision.status = TaskRunTurnStatus::Blocked;
+    }
+    assert!(next_revision_execution(&revision, &run, true, 6).is_none());
+    run.error.as_mut().unwrap().code = TASK_REVISION_RETRY_REQUIRED.into();
+    let manual = next_revision_execution(&revision, &run, false, 7).unwrap();
+    assert_eq!(manual.revision_execution_retry(&manual.turn_id), Some(4));
+    assert!(manual.is_manual_revision_retry());
+    assert_eq!(
+        manual.revision_execution_retry("revise_another_candidate_8"),
+        None
+    );
+    assert!(is_missing_cli_mcp_activation_block(
+        &missing_mcp_activation_reason()
+    ));
+    assert!(!is_missing_cli_mcp_activation_block(
+        "CLI runtime recovery is blocked: frozen CLI runtime MCP projection is invalid: tool drift"
+    ));
+}
+
+#[pioneer_postgres_test::postgres_test]
+async fn a_settled_legacy_revision_gets_one_fresh_execution_under_concurrent_retry() {
+    use pioneer_entity::{task_run_turn as link, turn as child, turn_cli_runtime_binding as cli};
+    use sea_orm::{ColumnTrait, QueryFilter, sea_query::Expr};
+
+    let (store, task, run, job, thread_id, turn_id) =
+        task_owned_resume_conflict_fixture("ws_task_revision_retry", "revision_retry").await;
+    let now = job.updated_at_unix + 10;
+    let at = unix_to_datetime(now);
+    let logical_id = format!("trt_{turn_id}");
+    link::Entity::update_many()
+        .filter(link::Column::RunId.eq(&run.id))
+        .col_expr(link::Column::Id, Expr::value(logical_id.clone()))
+        .col_expr(link::Column::Kind, Expr::value("revision"))
+        .col_expr(link::Column::Round, Expr::value(3_i64))
+        .exec(&store.connection)
+        .await
+        .unwrap();
+    child::Entity::update_many()
+        .filter(child::Column::Id.eq(&turn_id))
+        .col_expr(
+            child::Column::Error,
+            Expr::value(missing_mcp_activation_reason()),
+        )
+        .exec(&store.connection)
+        .await
+        .unwrap();
+
+    turn_execution::insert_immutable(
+        &store.connection,
+        turn_execution::NewTurnExecution {
+            turn_id: turn_id.clone(),
+            thread_id: thread_id.clone(),
+            workspace_id: task.workspace_id.clone(),
+            executor_kind: turn_execution::TurnExecutorKind::CliRuntime,
+            executor_key: Some("codex".into()),
+            status: turn_execution::TurnExecutionStatus::Starting,
+            owner_id: "previous-gateway".into(),
+            lease_until: unix_to_datetime(now + 20),
+            created_at: at,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        turn_execution::mark_terminal(
+            &store.connection,
+            &turn_id,
+            turn_execution::TurnExecutionStatus::Blocked,
+            at,
+        )
+        .await
+        .unwrap()
+    );
+    cli::Entity::insert(cli::ActiveModel {
+        turn_id: Set(turn_id.clone()),
+        thread_id: Set(thread_id.clone()),
+        continuation_thread_id: Set(thread_id.clone()),
+        workspace_id: Set(task.workspace_id.clone()),
+        runtime_id: Set("codex".into()),
+        runtime_kind: Set("codex".into()),
+        native_thread_id: Set("previous-native-thread".into()),
+        frozen_manifest_id: Set(None),
+        status: Set("blocked".into()),
+        created_at: Set(at),
+        updated_at: Set(at),
+        ..Default::default()
+    })
+    .exec(&store.connection)
+    .await
+    .unwrap();
+
+    use pioneer_crud_execution::execution_admission_lease::{
+        self as quota, ExecutionAdmissionClass, ExecutionAdmissionQuotaPolicy,
+        ExecutionQuotaCeilings, NewExecutionAdmissionLease,
+    };
+    let ceiling = ExecutionQuotaCeilings {
+        per_principal: 1,
+        per_role: 1,
+        per_workspace: 1,
+        gateway: 1,
+    };
+    let mut admission = NewTaskExecutionAdmission {
+        task_id: task.id.clone(),
+        workspace_id: task.workspace_id.clone(),
+        root_thread_id: thread_id.clone(),
+        initiating_principal_id: "test-principal".to_owned(),
+        authorization_context_json: "{}".to_owned(),
+        created_at: at,
+        execution_lease: Some(NewExecutionAdmissionLease {
+            id: format!("quota:task:{}", task.id),
+            subject_kind: "task".to_owned(),
+            subject_id: task.id.clone(),
+            operation_class: ExecutionAdmissionClass::ScheduledTask,
+            principal_id: "test-principal".to_owned(),
+            role_key: "test".to_owned(),
+            workspace_id: task.workspace_id.clone(),
+            policy_fingerprint: "test".to_owned(),
+            policy: ExecutionAdmissionQuotaPolicy {
+                active: ceiling,
+                queued: ceiling,
+                scheduled: ceiling,
+            },
+        }),
+    };
+    let tx = store.connection.begin().await.unwrap();
+    task_execution_admission::insert_immutable(&tx, admission.clone())
+        .await
+        .unwrap();
+    quota::release_by_subject(&tx, "task", &task.id, at)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // A changed schedule must not move the original quota reservation.
+    admission.execution_lease.as_mut().unwrap().operation_class =
+        ExecutionAdmissionClass::QueuedTask;
+    let quota_status = || async {
+        let lease = quota::find_by_subject(&store.connection, "task", &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.quota_bucket, "scheduled");
+        lease.status
+    };
+
+    let registries = Registries::default();
+    let wake = Arc::new(Notify::new());
+    let failed = store
+        .retry_task_revision_execution(
+            &registries,
+            &wake,
+            &thread_id,
+            &turn_id,
+            false,
+            &admission,
+            now,
+            |_| Box::pin(async { anyhow::bail!("injected receipt commit failure") }),
+        )
+        .await;
+    assert!(
+        failed
+            .unwrap_err()
+            .to_string()
+            .contains("injected receipt commit failure")
+    );
+    assert_eq!(
+        task_run_turn::find_turn_by_id(&store.connection, &logical_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .turn_id,
+        turn_id,
+    );
+
+    assert_eq!(quota_status().await, quota::EXECUTION_LEASE_STATUS_RELEASED);
+    let retry = || {
+        store.retry_task_revision_execution(
+            &registries,
+            &wake,
+            &thread_id,
+            &turn_id,
+            false,
+            &admission,
+            now,
+            |_| Box::pin(async { Ok(()) }),
+        )
+    };
+    let (one, two) = tokio::join!(retry(), retry());
+    let admitted = [one.unwrap(), two.unwrap()]
+        .into_iter()
+        .filter(|outcome| matches!(outcome, Some(TaskOwnedTurnResumeOutcome::Resumed { .. })))
+        .count();
+    assert_eq!(admitted, 1);
+    assert_eq!(quota_status().await, quota::EXECUTION_LEASE_STATUS_ACTIVE);
+    assert!(!matches!(
+        retry().await.unwrap(),
+        Some(TaskOwnedTurnResumeOutcome::Resumed { .. })
+    ));
+
+    let latest = task_run_turn_from_db_model(
+        task_run_turn::find_turn_by_id(&store.connection, &logical_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(latest.revision_execution_retry(&latest.turn_id), Some(1));
+    assert!(latest.is_manual_revision_retry());
+    assert_eq!(latest.status, TaskRunTurnStatus::InProgress);
+    assert_eq!(latest.round, 3);
+    assert_eq!(latest.run_id, run.id);
+    assert_eq!(
+        turn_execution::find(&store.connection, &turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        turn_execution::TurnExecutionStatus::Blocked,
+    );
+    assert!(
+        child::Entity::find_by_id(latest.turn_id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        task_actor_contract::find_task_occurrence_by_run_id(&store.connection, &run.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .retry_attempt,
+        1,
+    );
+}

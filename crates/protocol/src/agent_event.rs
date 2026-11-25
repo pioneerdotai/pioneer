@@ -283,6 +283,24 @@ pub struct NativeTerminalEffectPreparation {
     pub effects: Vec<NativeTerminalEffectSpec>,
 }
 
+impl NativeTerminalEffectPreparation {
+    pub const MAX_ID_CHARS: usize = 128;
+
+    pub fn post_turn_effect_id(turn_id: &str) -> String {
+        Self::bounded_id(format!("{turn_id}:terminal-effect:post-turn"))
+    }
+
+    /// Bound producer-generated IDs while keeping every previously admissible ID.
+    /// Call before creating a plan or looking it up. Stored IDs stay opaque.
+    pub fn bounded_id(id: String) -> String {
+        if id.chars().count() <= Self::MAX_ID_CHARS {
+            id
+        } else {
+            crate::stable_derived_id("terminal_id_v1_", &[&id])
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum DurableEventCausalityKey {

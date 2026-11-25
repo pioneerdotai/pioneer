@@ -304,6 +304,7 @@ async fn webhook_rejects_paused_cancelled_and_finish_requested_tasks_and_resume_
                     .resume_task(
                         TaskMutationContext::default(),
                         TaskResumeParams {
+                            retry_revision_turn_id: None,
                             task_id: created.task.id.clone(),
                             reason: None,
                         },

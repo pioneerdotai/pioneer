@@ -3,7 +3,7 @@ name: subagents
 slug: subagents
 owner: pioneer
 description: "Use this skill when Pioneer should delegate current-turn work to attached task-backed subagents, coordinate parallel child agents, wait for child results, review/revise/accept/cancel/detach attached work, or synthesize accepted child results into the parent answer."
-version: "0.2.3"
+version: "0.2.4"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -82,7 +82,7 @@ If a needed task tool is hidden and `request_tools` is visible, request the task
 
 Do not request individual task tool names. Request the `task` domain.
 
-The `task` domain also exposes `threads_start_options`; opening `threads` separately is unnecessary to inspect task launch options. Call it when you need to choose an identity, execution profile, or permitted destination explicitly. For an ordinary attached task that inherits the parent's identity and profile, omit `launch` and `targetOptionId`; no preliminary options call is required. Options list permitted selections but do not grant execution rights. See `references/tool-schemas.md` for the exact fields.
+The `task` domain exposes both launch catalogs. Use `task_start_options` for identities, compatible profiles, or destinations. For direct selection, call `task_identity_models_list` with an admitted identity ID to find the provider or CLI runtime, model, and reasoning options. For an ordinary attached subagent that inherits the parent's launch settings and uses the default destination, omit `launch` and `targetOptionId` and skip both catalogs. The subagent runs in its own hidden child thread. See `references/tool-schemas.md` for the exact fields and authorization rules.
 
 If the task domain cannot be opened, do not pretend a subagent was created, waited on, accepted, revised, cancelled, or detached.
 
@@ -146,6 +146,8 @@ For an authorized result reader, `reviewRequired.reviewContent` contains the rev
 Always read by `candidateId`, not by `taskId`: a task may have several immutable revision rounds, and the review decision must apply to the exact content that was inspected.
 
 Use `task_revise` when the result is close but incomplete or incorrectly shaped. Give concrete feedback: what is wrong, what to add/remove/correct, and what the revised output must look like.
+
+If the child's MCP session is lost before the revision starts, the feedback already belongs to that round. Read `task_get.revisionExecutions` for its run and round. Wait while `automaticRetryPending` is true. When `requiresIntervention` is true, use `task_resume` with the child's `taskId` and the entry's `turnId` as `retryRevisionTurnId`. Continue waiting for the revised candidate.
 
 Use `task_accept` only after the candidate is good enough to use. Use accepted child results in the parent synthesis.
 

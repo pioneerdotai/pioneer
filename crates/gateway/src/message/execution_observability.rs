@@ -631,16 +631,7 @@ impl MessageProcessor {
         );
         let mut facts: Value = serde_json::from_str(&row.facts_json)?;
         let mut expected_live = None;
-        let ledger_id = row
-            .operation_id
-            .strip_prefix("provider:journal:")
-            .map(str::to_owned)
-            .or_else(|| {
-                row.turn_id
-                    .as_ref()
-                    .and_then(|turn| row.operation_id.strip_prefix(&format!("provider:{turn}:")))
-                    .map(str::to_owned)
-            });
+        let ledger_id = observation_journal_id(&row, &facts);
         if let Some(ledger_id) = &ledger_id {
             let live = store
                 // IDs come exclusively from this authorized immutable fact.
@@ -792,23 +783,15 @@ impl MessageProcessor {
         _thread: &str,
         rows: Vec<pioneer_entity::execution_observation::Model>,
     ) -> anyhow::Result<Vec<(pioneer_entity::execution_observation::Model, Value)>> {
-        fn journal_id(row: &pioneer_entity::execution_observation::Model) -> Option<String> {
-            if row.kind != "provider_attempt" {
-                return None;
-            }
-            row.operation_id
-                .strip_prefix("provider:journal:")
-                .map(str::to_owned)
-                .or_else(|| {
-                    row.turn_id
-                        .as_ref()
-                        .and_then(|turn| {
-                            row.operation_id.strip_prefix(&format!("provider:{turn}:"))
-                        })
-                        .map(str::to_owned)
-                })
-        }
-        let ids = rows.iter().filter_map(journal_id).collect();
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let facts: Value = serde_json::from_str(&row.facts_json)?;
+                let journal_id = observation_journal_id(&row, &facts);
+                Ok((row, facts, journal_id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ids = rows.iter().filter_map(|(_, _, id)| id.clone()).collect();
         let live = self
             .crud_store
             .execution_scoped_live_usage(workspace, None, ids)
@@ -825,8 +808,7 @@ impl MessageProcessor {
             );
         }
         let mut out = Vec::with_capacity(rows.len());
-        for mut row in rows {
-            let mut facts: Value = serde_json::from_str(&row.facts_json)?;
+        for (mut row, mut facts, journal_id) in rows {
             if row.kind == "tool_invocation" {
                 facts["phase_intervals"] = tool_phase_intervals(&facts["observation"]);
             }
@@ -838,7 +820,8 @@ impl MessageProcessor {
                 facts["recovery"] = json!({"source_status":row.status,"state":"previous_process_unconfirmed","terminal_confirmed":false,"send_state":"send_unknown_without_dispatch_evidence"});
             }
 
-            if let Some((usage, updated, hash)) = journal_id(&row).and_then(|id| latest.get(&id)) {
+            if let Some((usage, updated, hash)) = journal_id.as_ref().and_then(|id| latest.get(id))
+            {
                 if !overlay_live_usage(&facts, usage) {
                     facts["usage_overlay_coverage"] =
                         if facts["usage_source_fingerprint"].as_str() == Some(hash.as_str()) {
@@ -1277,6 +1260,27 @@ impl MessageProcessor {
                 "full_prompts_exported":false}),
         })
     }
+}
+
+fn observation_journal_id(
+    row: &pioneer_entity::execution_observation::Model,
+    facts: &Value,
+) -> Option<String> {
+    if row.kind != "provider_attempt" {
+        return None;
+    }
+    if let Some(id) = row.operation_id.strip_prefix("provider:journal:") {
+        return Some(id.to_owned());
+    }
+    let turn = row.turn_id.as_deref()?;
+    if let Some(id) = row.operation_id.strip_prefix(&format!("provider:{turn}:")) {
+        return Some(id.to_owned());
+    }
+    let id = facts["provider_source_item_id"].as_str()?;
+    let operation = pioneer_crud::ExecutionObservationInput::bounded_operation_id(format!(
+        "provider:{turn}:{id}"
+    ));
+    (operation == row.operation_id).then(|| id.to_owned())
 }
 
 fn observation_record(

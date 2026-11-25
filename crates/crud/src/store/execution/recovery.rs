@@ -708,6 +708,59 @@ impl CrudStore {
             .await
     }
 
+    pub async fn retry_task_revision_execution(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        automatic: bool,
+        admission: &crate::NewTaskExecutionAdmission,
+        now_unix: i64,
+        action: Option<&crate::AgentCommitInput>,
+    ) -> Result<Option<TaskOwnedTurnResumeOutcome>> {
+        self.task_event_store()
+            .retry_task_revision_execution(
+                &self.execution_heartbeats,
+                &self.recovery_work,
+                thread_id,
+                turn_id,
+                automatic,
+                admission,
+                now_unix,
+                |tx| {
+                    let action = action.cloned();
+                    Box::pin(async move {
+                        if let Some(action) = action {
+                            super::agent_transactions::commit_agent_action(tx, &action).await?;
+                        }
+                        Ok(())
+                    })
+                },
+            )
+            .await
+    }
+
+    pub async fn task_revision_retry_blocker(
+        &self,
+        task: &pioneer_protocol::Task,
+        run: &pioneer_protocol::TaskRun,
+        revision: &pioneer_protocol::TaskRunTurn,
+    ) -> Result<Option<pioneer_protocol::TaskRevisionRetryBlocker>> {
+        self.task_event_store()
+            .task_revision_retry_blocker(task, run, revision)
+            .await
+    }
+
+    pub async fn stop_pending_task_revision_retry(
+        &self,
+        revision: &pioneer_protocol::TaskRunTurn,
+        blocker: pioneer_protocol::TaskRevisionRetryBlocker,
+        now: i64,
+    ) -> Result<bool> {
+        self.task_event_store()
+            .stop_pending_task_revision_retry(revision, blocker, now)
+            .await
+    }
+
     /// Compact reader probe; errors remain unknown rather than proving empty.
     pub async fn active_recovery_job_upper_id(&self) -> Result<Option<String>> {
         self.recovery_store().active_recovery_job_upper_id().await

@@ -2,6 +2,7 @@ use nanoid::nanoid;
 use schemars::JsonSchema;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
@@ -21,6 +22,17 @@ const ALPHANUMERIC: [char; 62] = [
 
 pub fn generate_id(len: usize) -> String {
     nanoid!(len, &ALPHANUMERIC)
+}
+
+/// Version the namespace at the call site. Length framing keeps distinct
+/// component sequences distinct before hashing. The suffix carries 160 bits.
+pub fn stable_derived_id(namespace: &str, components: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for component in std::iter::once(namespace).chain(components.iter().copied()) {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    format!("{namespace}{}", hex::encode(&digest.finalize()[..20]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

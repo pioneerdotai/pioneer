@@ -11,7 +11,9 @@ use pioneer_hooks::{
     TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
     TurnPostTurnToolStatus,
 };
-use pioneer_protocol::{AgentMessagePhase, TaskAttachmentMode, TurnItem};
+use pioneer_protocol::{
+    AgentMessagePhase, NativeTerminalEffectPreparation, TaskAttachmentMode, TurnItem,
+};
 
 use crate::message::MessageProcessor;
 
@@ -25,11 +27,11 @@ impl MessageProcessor {
         let final_id = final_item
             .map(TurnItem::item_id)
             .unwrap_or("no-final-message");
-        let batch_id = format!(
+        let batch_id = NativeTerminalEffectPreparation::bounded_id(format!(
             "{}:cli-post-turn:{}:{final_id}",
             binding.turn_id,
             attempt_index.max(1)
-        );
+        ));
         if self
             .crud_store
             .post_turn_batch_exists(&binding.turn_id, &batch_id)

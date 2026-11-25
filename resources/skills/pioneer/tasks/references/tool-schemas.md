@@ -30,15 +30,24 @@ Only call tools visible in the current turn. If a needed task tool is hidden and
 
 If the tool remains unavailable, do not fake the operation.
 
-`threads_start_options` is available through the `task` domain when permitted. Call it with `{}` only when you need to select an identity, execution profile, or destination explicitly:
+### Task launch catalogs
 
-- Use `identities[].id` in `task_create.launch.identity` as `{"kind":"exact","id":"IDENTITY_ID"}`.
-- Use a compatible `profiles[].id` in `launch.profile` as `{"kind":"exact","id":"PROFILE_ID"}`.
-- If setting `launch.reasoning` or `launch.permissionProfile`, stay within the selected profile's `allowedReasoning` and `allowedPermissionProfiles` and the response's `maxPermissionProfile`.
-- If setting `launch.skillIds` or `launch.mcpServerIds`, choose from `allowedSkillIds` or `allowedMcpServerIds`.
-- Use `targetOptions[].id` as `task_create.targetOptionId` for a permitted destination.
+Both tools are available through the `task` domain when permitted. Use the callable names from the current catalog in CLI runtimes.
 
-`inheritParentIdentityAvailable` and `inheritParentProfileAvailable` indicate whether inheritance can be selected. `defaultPioneerIdentityAvailable` and `derivedEphemeralIdentityAvailable` indicate whether `launch.identity.kind` can be `default_pioneer` or `server_derived_ephemeral`. For a task that inherits the current parent's identity and profile, omit both `launch` and `targetOptionId`; no options lookup is required. The server rechecks authorization when `task_create` runs.
+Call `task_start_options` with `{}` to choose an identity, an exact execution profile, or a destination. It accepts optional `limit` (1–100, default 100) and `cursor`.
+
+- Use `identities[].id` in `launch.identity` as `{"kind":"exact","id":"IDENTITY_ID"}`.
+- For a ready-made profile, use `{"kind":"exact","id":"PROFILE_ID"}` in `launch.profile`. Select a returned profile whose `compatibleIdentityIds` includes the identity. Honor its `allowedReasoning` and `allowedPermissionProfiles` and the response's `maxPermissionProfile`.
+- Choose `launch.skillIds` and `launch.mcpServerIds` from `allowedSkillIds` and `allowedMcpServerIds`.
+- For a permitted alternate destination, use the current execution's opaque `targetOptions[].id` as `task_create.targetOptionId`.
+
+For direct selection, call `task_identity_models_list` with `{"identityId":"IDENTITY_ID"}`. Use an identity admitted by `task_start_options`. The model catalog also accepts `limit` (1–100, default 100) and `cursor`. Each returned executor identifies the configured provider or runtime via `providerId` and its `backend`. Use that exact `providerId` and an associated `models[].id` in `launch.profile` as `{"kind":"model","providerId":"PROVIDER_ID","modelId":"MODEL_ID"}`. For a CLI executor, `providerId` identifies the configured runtime instance.
+
+Use the selected model's `reasoning.effort_options` for explicit `launch.reasoning` as `{"effort":"EFFORT"}`. Use an explicit effort only when the catalog lists it for the selected model. Missing metadata or an empty effort list leaves available efforts unknown. Set `launch.useDefaultReasoning:true` to use the model's native default. Leave `launch.reasoning` unset in that case.
+
+For either catalog, follow `nextCursor` with the original arguments and the same `limit` (and `identityId` for the model catalog) until `eof`. Reassemble any oversized entry from `fragments` by entry and offsets, then decode its JSON. Restart from the first page if the cursor becomes stale.
+
+`inheritParentIdentityAvailable` and `inheritParentProfileAvailable` indicate whether inheritance can be selected. `defaultPioneerIdentityAvailable` and `derivedEphemeralIdentityAvailable` indicate whether `launch.identity.kind` can be `default_pioneer` or `server_derived_ephemeral`. To inherit launch settings without choosing an explicit destination, omit `launch` and `targetOptionId` and skip both catalogs. Launch requires separate authorization, which `task_create` rechecks along with selection compatibility.
 
 ## task_create For Scheduled Or Background Tasks
 
@@ -263,6 +272,26 @@ The pause response includes `scheduleOutcome`:
 
 For schedule behavior and verification, see
 [Pausing And Resuming Schedules](delivery-and-scheduled.md#pausing-and-resuming-schedules).
+
+### Retry a blocked revision
+
+When a review revision loses its MCP session before execution starts, Pioneer
+can retry the same round automatically up to three times. Read `task_get` and
+match the entry in `revisionExecutions` by `runId` and `round`. While
+`automaticRetryPending` is true, let the automatic retry proceed, including
+while it waits for execution capacity.
+
+If `requiresIntervention` is true, an authorized caller can pass the exact
+`turnId` from that entry to `task_resume`:
+
+```json
+{"taskId":"TASK_ID","retryRevisionTurnId":"TURN_ID_FROM_REVISION_EXECUTIONS"}
+```
+
+This starts a fresh execution for the same run, round and feedback. Replaying
+the same turn ID after admission cannot start a second worker. Read `task_get`
+again to verify progress. On `task_quota_exhausted`, wait for capacity and
+recheck the entry. A plain schedule resume uses only `taskId`.
 
 ## task_finish
 

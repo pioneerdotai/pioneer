@@ -43,7 +43,11 @@ pub const ASSISTANT_SAFETY_LINES: [&str; 7] = [
     "If constraints conflict, ask for clarification before acting.",
 ];
 
-pub const SKILL_USAGE_POLICY_PROMPT: &str = "Follow each available tool's current description and input schema exactly; they define the complete call format. When a skill is relevant and read_skill plus its supplied exact skill:<id> reference are available, call read_skill before specialized actions and follow the returned immutable version and bindings. Read each guide named by a capability policy below before the operations listed in that policy. For package skills, resolve relative assets under the returned skill_asset_root and prefer absolute paths built from that root. An empty explicit selection does not inherit earlier selections and does not prohibit independently choosing a suitable skill. When request_tools is available, open hidden tools by domain, requesting the domain rather than individual names. Do not assume a discovery mechanism exists.";
+pub const SKILL_USAGE_POLICY_PROMPT: &str = concat!(
+    "Follow each available tool's current description and input schema exactly; they define the complete call format. Use the most recent Internal Skill References and Hidden Tool Domains supplied by Pioneer in the current request, including sections retained from earlier turns. A newer replacement or withdrawal supersedes the previous contents of the corresponding section.\n\n",
+    "When a skill is relevant and read_skill plus its supplied exact skill:<id> reference are available, call read_skill before specialized actions and follow the returned immutable version and bindings. Read each guide named by a capability policy below before the operations listed in that policy. For package skills, resolve relative assets under the returned skill_asset_root and prefer absolute paths built from that root. Explicit selection applies only to the current turn. A skill selected in an earlier turn can be used again if the user selects it again or the skill is independently available in the current turn.\n\n",
+    "When request_tools is available, use Hidden Tool Domains to identify the relevant domain. Request the domain rather than individual tool names. Call the needed tool once it is available in the current turn. Do not assume a discovery mechanism exists.",
+);
 
 pub const CLI_SKILL_USAGE_POLICY_PROMPT: &str = concat!(
     "Pioneer supplies trusted runtime instructions separately from ordinary turn context.\n",

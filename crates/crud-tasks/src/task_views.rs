@@ -362,7 +362,7 @@ async fn agenda_page<C: ConnectionTrait>(
     }
     if !params.include_completed {
         tasks = tasks.filter(
-            TaskField::Status.is_not_in(
+            crate::projection::effective_task_status_expr().is_not_in(
                 [
                     TaskStatus::Completed,
                     TaskStatus::Failed,
@@ -375,7 +375,8 @@ async fn agenda_page<C: ConnectionTrait>(
     }
     if !params.statuses.is_empty() {
         tasks = tasks.filter(
-            TaskField::Status.is_in(params.statuses.iter().copied().map(task_status_to_db)),
+            crate::projection::effective_task_status_expr()
+                .is_in(params.statuses.iter().copied().map(task_status_to_db)),
         );
     }
     QueryTrait::query(&mut tasks)
