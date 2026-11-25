@@ -63079,10 +63079,22 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
         .expect("turn lookup should succeed")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Completed);
-    processor
-        .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
-        .await
-        .unwrap();
+    // Terminalization wakes a background worker that can already own the hook.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if crud_store
+                .native_terminal_effect_status("codex-turn-command:terminal-effect:post-turn")
+                .await
+                .unwrap()
+                .is_some_and(|effect| effect.status == "succeeded")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("snapshot post-turn hook should finish");
     assert_eq!(
         post_turn_calls.lock().unwrap().len(),
         1,
