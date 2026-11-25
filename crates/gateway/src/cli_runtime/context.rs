@@ -589,14 +589,15 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
     }
     explicit_tools.sort();
     explicit_tools.dedup();
+    use crate::turn_mcp::native_tools::{NativeToolFamily, exact_definition, is_threads_operation};
     Some(CliRuntimeSelectedCapabilitiesInput {
         native_threads_tools: projection
             .tools
             .iter()
             .filter(|tool| {
-                crate::turn_mcp::native_tools::is_threads_operation(tool)
+                is_threads_operation(tool)
                     || (tool.raw_tool_name == "threads_start_options"
-                        && crate::turn_mcp::native_tools::exact_definition(tool).is_some())
+                        && exact_definition(tool) == Some(NativeToolFamily::Threads))
             })
             .map(|tool| tool.canonical_callable_name.clone())
             .collect(),
@@ -609,7 +610,7 @@ pub(crate) fn cli_runtime_mcp_capabilities_input(
         native_task_tools: projection
             .tools
             .iter()
-            .filter(|tool| crate::turn_mcp::native_tools::is_task_operation(tool))
+            .filter(|tool| exact_definition(tool) == Some(NativeToolFamily::Tasks))
             .map(|tool| tool.canonical_callable_name.clone())
             .collect(),
         total_tool_count: projection.tools.len(),

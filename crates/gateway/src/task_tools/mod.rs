@@ -3704,13 +3704,14 @@ struct TaskCreateToolInput {
     /// Short concrete objective for the task executor. Put durable run instructions in instructions, task data in inputText/input, and result format in outputInstructions.
     goal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque destination from threads_start_options. Omit for the current
+    /// Opaque destination from task_start_options. Omit for the current
     /// thread. A routed option is revalidated at Task commit and again for
     /// every occurrence; raw thread or route ids are never accepted here.
     target_option_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Optional child identity/profile and additional Skill/MCP selection from
-    /// threads_start_options. Immediate tasks in the current capsule inherit the
+    /// Optional launch. Use task_start_options for identity, exact profiles and
+    /// additional Skill/MCP selection, or task_identity_models_list for an explicit
+    /// provider/model pair and its reasoning options. Immediate tasks in the current capsule inherit the
     /// current Turn's selected capabilities. Empty lists keep that inheritance.
     /// Set useDefaultReasoning=true to use the model's native default instead
     /// of inheriting effort; this cannot be combined with reasoning.
@@ -4533,7 +4534,7 @@ pub(crate) fn task_tool_specs() -> Vec<ConfiguredToolSpec> {
     vec![
         task_tool_spec(
             TASK_CREATE_TOOL,
-            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
+            "Create a durable task or attached subagent for delegation. threads_turn_start starts a thread turn without creating a task. Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup. Use existing fields: goal is the short objective, instructions is the self-contained future-run prompt, inputText/input is task data, and outputInstructions is the final result format. For ordinary immediate attached subagents omit trigger and background. The runtime carries the current Turn's selected Skills and MCP into immediate subagents in the same capsule, including background subagents; launch selections add to that set. When the user explicitly asks to run immediate work in the background, omit trigger and set background=true; this creates detached work, returns immediately without task_wait, keeps running after the parent turn, and defaults to automatic completion with origin_thread delivery. requireReview defaults to false for every task type and attachment. Set requireReview=true when each run result needs explicit acceptance or same-worker revision, including scheduled, interval, cron and webhook runs; enabled review has no timeout acceptance. For reviewed background, the default delivery is none; an explicit permitted deliveryPolicy takes precedence. Review-required work remains observable through task_get/task_result; its delivery policy also governs terminal errors. For incoming HTTP POST requests, choose trigger kind external and source webhook; creation returns webhookUrl and webhookScope, waits without launching an agent, and each POST creates its own run. Use the full returned URL; authorized task_get retrieves its current address later. For scheduled, interval, cron, and webhook work, instructions and outputInstructions are required; instructions must tell the future agent to use currently available tools/skills/MCP/built-ins by capability and fail clearly if required capability or data is unavailable. For scheduled work use trigger directly, choose the trigger kind, and fill trigger leaf fields such as cronExpr and timezone. Do not wrap trigger in spec. Parent/root/depth context is derived by runtime and must not be supplied.",
             task_create_schema(),
             ToolRecoveryMetadata {
                 retry_class: ToolRetryClass::Arguments,
@@ -4673,6 +4674,27 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
     }
 }
 
+// Frozen CLI bindings still carry these schema descriptions in their hash.
+pub(crate) fn restore_legacy_task_create_catalog(spec: &mut ToolSpec) {
+    spec.description = spec.description.replacen(
+        "Use task_start_options for an explicit identity, exact launch profile, or destination. Use task_identity_models_list for an explicit provider/model pair and its reasoning options. Inherited launch needs no lookup.",
+        "For explicit launch or destination selection, call threads_start_options from the task domain; inherited launch needs no lookup.",
+        1,
+    );
+    spec.parameters["properties"]["targetOptionId"]["description"] = json!(concat!(
+        "Opaque destination from threads_start_options. Omit for the current\n",
+        "thread. A routed option is revalidated at Task commit and again for\n",
+        "every occurrence; raw thread or route ids are never accepted here."
+    ));
+    spec.parameters["properties"]["launch"]["description"] = json!(concat!(
+        "Optional child identity/profile and additional Skill/MCP selection from\n",
+        "threads_start_options. Immediate tasks in the current capsule inherit the\n",
+        "current Turn's selected capabilities. Empty lists keep that inheritance.\n",
+        "Set useDefaultReasoning=true to use the model's native default instead\n",
+        "of inheriting effort; this cannot be combined with reasoning."
+    ));
+}
+
 fn task_create_schema() -> JsonValue {
     tool_input_schema::<TaskCreateToolInput>()
 }
@@ -4796,7 +4818,7 @@ fn task_tool_schema_for_name(tool_name: &str) -> JsonValue {
 fn task_tool_argument_hint(tool_name: &str) -> &'static str {
     match tool_name {
         TASK_CREATE_TOOL => {
-            "Expected fields: title, goal, instructions, inputText or input, outputInstructions, and optional trigger. For cron set trigger.kind to cron, trigger.cronExpr to 0 7 * * *, and trigger.timezone to Europe/Moscow. Do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
+            "Expected fields: title, goal, instructions, inputText or input, outputInstructions, and optional trigger. Use task_start_options for explicit launch profiles and destinations, and task_identity_models_list for provider/model options. For cron set trigger.kind to cron, trigger.cronExpr to 0 7 * * *, and trigger.timezone to Europe/Moscow. Do not use trigger.spec, trigger.schedule, or top-level cron/timezone."
         }
         TASK_RESCHEDULE_TOOL => {
             "Expected fields: taskId and trigger. For scheduled_at set trigger.scheduledAt to a Unix timestamp such as 1893456000 and optional trigger.timezone to UTC. For cron set trigger.cronExpr to 0 7 * * * and trigger.timezone to Europe/Moscow. Do not use trigger.spec."
@@ -6491,7 +6513,10 @@ mod tests {
                 .tool_names()
                 .iter()
                 .copied()
-                .filter(|name| name.starts_with("task_"))
+                .filter(
+                    |name| !crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                        .is_launch_catalog(name)
+                )
                 .collect::<Vec<_>>()
         );
     }

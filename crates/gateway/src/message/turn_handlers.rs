@@ -4808,19 +4808,12 @@ impl MessageProcessor {
             })
         {
             let thread_reader = family.is_thread_reader(&spec.spec.name);
-            if pioneer_tools::THREADS_DOMAIN_TOOL_NAMES.contains(&spec.spec.name.as_str())
-                && (permission
-                    .effective_policy
-                    .denied_tools
-                    .iter()
-                    .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))
-                    || ((permission.effective_policy.allowed_tools_restricted
-                        || !permission.effective_policy.allowed_tools.is_empty())
-                        && !permission
-                            .effective_policy
-                            .allowed_tools
-                            .iter()
-                            .any(|name| name.trim().eq_ignore_ascii_case(&spec.spec.name))))
+            if (family == NativeToolFamily::Threads || family.is_launch_catalog(&spec.spec.name))
+                && pioneer_tools::policy_denies_tool_name(
+                    &permission.effective_policy,
+                    &spec.spec.name,
+                )
+                .is_some()
             {
                 continue;
             }
@@ -4843,10 +4836,9 @@ impl MessageProcessor {
             if let Some(binding) = binding.as_ref() {
                 let visible = if thread_reader {
                     true
-                } else if matches!(
-                    spec.spec.name.as_str(),
-                    "threads_start_options" | "threads_identity_models_list" | "threads_turn_start"
-                ) {
+                } else if family.is_launch_catalog(&spec.spec.name)
+                    || spec.spec.name == "threads_turn_start"
+                {
                     binding
                         .capabilities
                         .contains(&pioneer_protocol::AgentToolCapability::ChildStart)
@@ -9947,7 +9939,8 @@ impl MessageProcessor {
                 crate::turn_mcp::native_tools::NativeToolFamily::from_server_id(
                     &tool.server_installation_id,
                 ) == Some(crate::turn_mcp::native_tools::NativeToolFamily::Tasks)
-                    && tool.raw_tool_name != "threads_start_options"
+                    && !crate::turn_mcp::native_tools::NativeToolFamily::Tasks
+                        .is_launch_catalog(&tool.raw_tool_name)
             });
         let renew_mcp = task_continuation || task_projection || opencode;
         if renew_mcp && !opencode {

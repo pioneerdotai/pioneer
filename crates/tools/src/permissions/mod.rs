@@ -435,7 +435,9 @@ fn extract_computer_use_permission_intent(invocation: &ToolInvocation) -> Option
 }
 
 fn extract_agent_action_permission_intent(invocation: &ToolInvocation) -> Option<PermissionIntent> {
-    let (operation, mutation) = match invocation.tool_name.as_str() {
+    let name = invocation.tool_name.as_str();
+    let original = crate::domain::task_launch_catalog_original(name).unwrap_or(name);
+    let (operation, mutation) = match original {
         "threads_start_options" => ("read agent start options", false),
         "threads_identity_models_list" => ("read identity model options", false),
         "thread_message_send" => ("send message to thread", true),
@@ -2012,27 +2014,26 @@ fn mark_unknown_capability(
     scope
 }
 
-fn policy_denies_tool_name(
+pub fn policy_denies_tool_name(
     policy: &ToolPermissionPolicySnapshot,
     tool_name: &str,
 ) -> Option<String> {
-    let normalized_tool_name = normalize_policy_value(tool_name);
-    if policy
-        .denied_tools
-        .iter()
-        .map(|value| normalize_policy_value(value))
-        .any(|value| value == normalized_tool_name)
-    {
+    let name = tool_name.trim();
+    let normalized = name.to_ascii_lowercase();
+    // Existing policies on the original catalog also apply to its task alias.
+    let original = crate::domain::task_launch_catalog_original(&normalized);
+    let matches = |value: &String| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case(name)
+            || original.is_some_and(|original| value.eq_ignore_ascii_case(original))
+    };
+    if policy.denied_tools.iter().any(matches) {
         return Some(format!(
             "tool `{tool_name}` denied by turn permission profile"
         ));
     }
     if (policy.allowed_tools_restricted || !policy.allowed_tools.is_empty())
-        && !policy
-            .allowed_tools
-            .iter()
-            .map(|value| normalize_policy_value(value))
-            .any(|value| value == normalized_tool_name)
+        && !policy.allowed_tools.iter().any(matches)
     {
         return Some(format!(
             "tool `{tool_name}` is not allowed by turn permission profile"
@@ -2097,10 +2098,6 @@ fn intent_paths(intent: &PermissionIntent) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
-}
-
-fn normalize_policy_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
 }
 
 fn normalize_policy_path(value: &str) -> String {
@@ -2266,6 +2263,8 @@ mod tests {
             ),
             ("read_skill", PermissionActionKind::Internal),
             ("threads_start_options", PermissionActionKind::Internal),
+            ("task_start_options", PermissionActionKind::Internal),
+            ("task_identity_models_list", PermissionActionKind::Internal),
             (
                 "threads_identity_models_list",
                 PermissionActionKind::Internal,
@@ -2293,7 +2292,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 69, "native tool inventory changed");
+        assert_eq!(registered.len(), 71, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions
@@ -3464,6 +3463,24 @@ mod tests {
             ProfileToolPermissionEvaluator.evaluate(&context, &remember, &remember_intent),
             PermissionDecision::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn task_catalog_names_respect_existing_thread_catalog_policy() {
+        let context = test_context(pioneer_protocol::TurnPermissionMode::Supervised);
+        let mut policy = context.permission_profile.effective_policy;
+        for (original, alias) in [
+            ("threads_start_options", "task_start_options"),
+            ("threads_identity_models_list", "task_identity_models_list"),
+        ] {
+            policy.allowed_tools = vec![original.to_owned()];
+            policy.denied_tools.clear();
+            assert!(policy_denies_tool_name(&policy, alias).is_none());
+            policy.allowed_tools = vec![alias.to_owned()];
+            assert!(policy_denies_tool_name(&policy, alias).is_none());
+            policy.denied_tools.push(original.to_owned());
+            assert!(policy_denies_tool_name(&policy, alias).is_some());
+        }
     }
 
     #[test]

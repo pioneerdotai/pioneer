@@ -7,8 +7,36 @@ pub const MEMORY_DOMAIN_TOOL_NAMES: &[&str] = &[
     "memory_remember",
     "memory_forget",
 ];
+pub const TASK_START_OPTIONS_TOOL: &str = "task_start_options";
+pub const TASK_IDENTITY_MODELS_LIST_TOOL: &str = "task_identity_models_list";
+
+const TASK_LAUNCH_CATALOG_ALIASES: [(&str, &str); 2] = [
+    (
+        pioneer_protocol::AgentModelToolName::AgentStartOptions.as_str(),
+        TASK_START_OPTIONS_TOOL,
+    ),
+    (
+        pioneer_protocol::AgentModelToolName::IdentityModelsList.as_str(),
+        TASK_IDENTITY_MODELS_LIST_TOOL,
+    ),
+];
+
+/// The task names share the original Thread catalog operations.
+pub fn task_launch_catalog_alias(original: &str) -> Option<&'static str> {
+    TASK_LAUNCH_CATALOG_ALIASES
+        .iter()
+        .find_map(|&(name, alias)| (name == original).then_some(alias))
+}
+
+pub(crate) fn task_launch_catalog_original(alias: &str) -> Option<&'static str> {
+    TASK_LAUNCH_CATALOG_ALIASES
+        .iter()
+        .find_map(|&(name, tools_alias)| (tools_alias == alias).then_some(name))
+}
+
 pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
-    "threads_start_options",
+    TASK_START_OPTIONS_TOOL,
+    TASK_IDENTITY_MODELS_LIST_TOOL,
     "task_create",
     "task_wait",
     "task_result",
@@ -224,7 +252,8 @@ mod tests {
         assert_eq!(
             BuiltinToolDomain::Task.tool_names(),
             [
-                "threads_start_options",
+                "task_start_options",
+                "task_identity_models_list",
                 "task_create",
                 "task_wait",
                 "task_result",

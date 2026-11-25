@@ -82,7 +82,7 @@ If a needed task tool is hidden and `request_tools` is visible, request the task
 
 Do not request individual task tool names. Request the `task` domain.
 
-The `task` domain also exposes `threads_start_options`; opening `threads` separately is unnecessary to inspect task launch options. Call it when you need to choose an identity, execution profile, or permitted destination explicitly. For an ordinary attached task that inherits the parent's identity and profile, omit `launch` and `targetOptionId`; no preliminary options call is required. Options list permitted selections but do not grant execution rights. See `references/tool-schemas.md` for the exact fields.
+The `task` domain exposes both launch catalogs. Use `task_start_options` for identities, compatible profiles, or destinations. For direct selection, call `task_identity_models_list` with an admitted identity ID to find the provider or CLI runtime, model, and reasoning options. For an ordinary attached subagent that inherits the parent's launch settings and uses the default destination, omit `launch` and `targetOptionId` and skip both catalogs. The subagent runs in its own hidden child thread. See `references/tool-schemas.md` for the exact fields and authorization rules.
 
 If the task domain cannot be opened, do not pretend a subagent was created, waited on, accepted, revised, cancelled, or detached.
 

@@ -376,9 +376,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_tool_is_added_once_across_domains_and_still_obeys_registration_and_policy() {
+    async fn task_and_threads_disclose_separate_catalog_names_and_obey_policy() {
         let catalog = [
             "request_tools",
+            "task_start_options",
+            "task_identity_models_list",
             "threads_start_options",
             "threads_identity_models_list",
             "threads_turn_start",
@@ -401,20 +403,20 @@ mod tests {
             }))
             .await
             .expect("task domain resolves");
+        assert_eq!(task_only.added.len(), 1);
         assert_eq!(
-            task_only.added.get("task"),
-            Some(&vec!["threads_start_options".to_owned()])
+            task_only.added["task"],
+            ["task_start_options", "task_identity_models_list"]
         );
-        assert!(!task_only.added.values().flatten().any(|name| {
-            matches!(
-                name.as_str(),
-                "thread_create"
-                    | "thread_message_send"
-                    | "threads_turn_start"
-                    | "threads_identity_models_list"
-            )
-        }));
+        snapshot
+            .set_visible_by_name(&[
+                "request_tools".to_owned(),
+                "task_start_options".to_owned(),
+                "task_identity_models_list".to_owned(),
+            ])
+            .await;
         assert!(!snapshot.contains_name("threads_start_options").await);
+        assert!(!snapshot.contains_name("threads_identity_models_list").await);
 
         let both = handler
             .resolve(&serde_json::json!({
@@ -422,49 +424,24 @@ mod tests {
             }))
             .await
             .expect("both domains resolve");
-        assert_eq!(both.added["threads"].len(), 5);
-        assert!(both.added["threads"].contains(&"threads_identity_models_list".to_owned()));
-        assert!(!snapshot.contains_name("threads_identity_models_list").await);
-        assert!(!both.added.contains_key("task"));
+        assert_eq!(both.added.len(), 1);
         assert_eq!(
-            both.already_visible["task"],
-            vec!["threads_start_options".to_owned()]
+            both.added["threads"],
+            [
+                "threads_start_options",
+                "threads_identity_models_list",
+                "thread_message_send",
+                "thread_create",
+                "threads_turn_start",
+            ]
         );
-
-        snapshot
-            .set_visible_by_name(&[
-                "request_tools".to_owned(),
-                "threads_start_options".to_owned(),
-            ])
-            .await;
-        assert!(snapshot.contains_name("threads_start_options").await);
-        let repeated = handler
-            .resolve(&serde_json::json!({
-                "domains": ["task", "threads"], "reason": "Use both domains again."
-            }))
-            .await
-            .expect("repeated domains resolve");
-        assert!(
-            !repeated
-                .added
-                .values()
-                .flatten()
-                .any(|name| name == "threads_start_options")
-        );
-        assert_eq!(
-            repeated.already_visible["task"],
-            vec!["threads_start_options".to_owned()]
-        );
-        assert_eq!(
-            repeated.already_visible["threads"],
-            vec!["threads_start_options".to_owned()]
-        );
+        assert_eq!(both.already_visible["task"], task_only.added["task"]);
 
         let restricted_visibility = visibility(&catalog);
         let blocked =
-            RequestToolsHandler::new(restricted_visibility, ["threads_start_options".to_owned()])
+            RequestToolsHandler::new(restricted_visibility, ["task_start_options".to_owned()])
                 .with_blocked_tool_names([(
-                    "threads_start_options".to_owned(),
+                    "task_start_options".to_owned(),
                     "blocked_by_host_policy".to_owned(),
                 )]);
         let restricted = blocked
@@ -474,13 +451,9 @@ mod tests {
             .await
             .expect("restricted domains resolve");
         assert!(restricted.added.is_empty());
-        assert_eq!(restricted.blocked.len(), 2);
-        assert!(
-            restricted
-                .blocked
-                .iter()
-                .all(|entry| { entry.tools == vec!["threads_start_options".to_owned()] })
-        );
+        assert_eq!(restricted.blocked.len(), 1);
+        assert_eq!(restricted.blocked[0].domain, "task");
+        assert_eq!(restricted.blocked[0].tools, ["task_start_options"]);
         assert!(restricted.unknown_or_unavailable.iter().any(|entry| {
             entry.domain == "threads" && entry.tools.contains(&"thread_create".to_owned())
         }));
