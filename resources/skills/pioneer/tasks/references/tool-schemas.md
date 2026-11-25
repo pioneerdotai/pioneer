@@ -264,6 +264,26 @@ The pause response includes `scheduleOutcome`:
 For schedule behavior and verification, see
 [Pausing And Resuming Schedules](delivery-and-scheduled.md#pausing-and-resuming-schedules).
 
+### Retry a blocked revision
+
+When a review revision loses its MCP session before execution starts, Pioneer
+can retry the same round automatically up to three times. Read `task_get` and
+match the entry in `revisionExecutions` by `runId` and `round`. While
+`automaticRetryPending` is true, let the automatic retry proceed, including
+while it waits for execution capacity.
+
+If `requiresIntervention` is true, an authorized caller can pass the exact
+`turnId` from that entry to `task_resume`:
+
+```json
+{"taskId":"TASK_ID","retryRevisionTurnId":"TURN_ID_FROM_REVISION_EXECUTIONS"}
+```
+
+This starts a fresh execution for the same run, round and feedback. Replaying
+the same turn ID after admission cannot start a second worker. Read `task_get`
+again to verify progress. On `task_quota_exhausted`, wait for capacity and
+recheck the entry. A plain schedule resume uses only `taskId`.
+
 ## task_finish
 
 Permanently stop future runs at the user's request while allowing already started work to finish, preserve its results, and use configured delivery. Call only when visible and authorized, including when the user's instructions explicitly define a stop condition that has been met. Do not call after every ordinary answer, successful run, or recurring check.

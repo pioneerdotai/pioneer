@@ -3,7 +3,7 @@ name: tasks
 slug: tasks
 owner: pioneer
 description: "Use this skill when Pioneer should create, inspect, update, reschedule, pause, resume, finish, cancel, troubleshoot, or configure delivery for durable tasks, scheduled tasks, recurring tasks, interval tasks, cron jobs, background work, or existing task state."
-version: "0.1.4"
+version: "0.1.5"
 user-invocable: true
 disable-model-invocation: false
 implicit-invocation: required
@@ -17,6 +17,11 @@ Durable tasks are product objects that can outlive the current turn. They have t
 When observing a task with `task_get`, distinguish task, run, and execution status. A `running` run is unfinished; no result or unchanged `updatedAt` does not prove a stall. The execution heartbeat is periodic liveness, while `lastActivityAt` is confirmed activity only when recorded. Missing activity is unknown. Do not cancel or repeat work solely because it is taking time or repeated observations are unchanged. A `task_wait` timeout ends only that wait window and permits another wait for active attached work.
 
 Use this skill for future, recurring, background, or already-existing task work. For attached child agents created to help with the current turn, read `system:pioneer/subagents` instead.
+
+If a review revision loses its MCP session before execution starts, inspect
+`task_get.revisionExecutions` for the affected run and round. Wait while
+`automaticRetryPending` is true. When `requiresIntervention` is true, follow
+[Retry a blocked revision](references/tool-schemas.md#retry-a-blocked-revision).
 
 ## Product Model
 
